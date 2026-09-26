@@ -1336,34 +1336,82 @@ type policyEntry struct {
 	explicit bool
 }
 
-// computePolicy resolves the effective value for a single policy key by
-// applying upstream TS priority cascade + per-key aggregator. baseVal is
-// the merged default+meta value used when a role specifies useDefault=true
-// or when no role has an override. extra carries effective-policy provider
-// contributions for the key (already validated & type-checked by the host);
-// it is merged into the same priority cascade as the role overrides.
-func computePolicy(key string, baseVal any, roleOverrides []map[string]rolePolicyOverride, extra []policyEntry) any {
-	// 各 role について本 policy の override を組み立てる。entry 無し =
-	// priority=0, useDefault=true (= base にフォールバック) として扱う。
-	collected := make([]policyEntry, 0, len(roleOverrides)+len(extra))
-	for _, m := range roleOverrides {
-		if m == nil {
-			collected = append(collected, policyEntry{priority: 0, value: baseVal})
-			continue
-		}
-		p, ok := m[key]
-		if !ok {
-			collected = append(collected, policyEntry{priority: 0, value: baseVal})
-			continue
-		}
-		if p.UseDefault {
-			collected = append(collected, policyEntry{priority: p.Priority, value: baseVal})
-		} else {
-			collected = append(collected, policyEntry{priority: p.Priority, value: p.Value, explicit: true})
-		}
+// rolePolicyInput は 1 つのロールが集約に贈るものの全体:
+//
+//   - roleID: どのロールか（置換の対象を突き合わせるため）
+//   - overrides: `Role.Policies` を key ごとに decode した結果
+//   - replacements: provider がこの要求で「native contribution の代わりに使う」と
+//     宣言した entry（key ごと）。provider が置換しなかったロールは nil。
+//
+// **aggregator は一切知らない。** entry を 1 つ選んで priority cascade に積むだけなので、
+// 置換の有無は関数内で完結する。
+type rolePolicyInput struct {
+	roleID    string
+	overrides map[string]rolePolicyOverride
+	// replacements はこのロールの置換 entry。provider が置換しなかったロールでは
+	// nil のまま（= native entry が使われる）。
+	replacements map[string]policyEntry
+}
+
+// entry は、このロールが key に対して贈る entry を返す。置換されていれば置換 entry
+// （**元 native entry の priority を引き継ぐ**）、されていなければ native entry。
+func (in rolePolicyInput) entry(key string, baseVal any) policyEntry {
+	if replacement, ok := in.replacements[key]; ok {
+		return replacement
 	}
-	// provider contribution は同じ priority cascade に参加させる
-	// (= native と provider は同一 priority グループ内で aggregate される)。
+	return rolePolicyEntry(in.overrides, key, baseVal)
+}
+
+// rolePolicyEntry は置換されていないロールが key に贈る entry。**この role が key を
+// 宣言していない場合は base 値を priority 0 で参加させる**という upstream 互換の既定が
+// ここに入る。
+func rolePolicyEntry(overrides map[string]rolePolicyOverride, key string, baseVal any) policyEntry {
+	p, ok := overrides[key]
+	if !ok {
+		return policyEntry{priority: 0, value: baseVal}
+	}
+	if p.UseDefault {
+		return policyEntry{priority: p.Priority, value: baseVal}
+	}
+	return policyEntry{priority: p.Priority, value: p.Value, explicit: true}
+}
+
+// newRolePolicyInputs は解決したロールを「ロールIDつきで集約できる」形へ変換する。
+// `Role.Policies` が空 / パース不能なロールは overrides が nil のまま入り、集約では
+// base 参加 = 従来と同じ。
+func newRolePolicyInputs(roles []*model.Role) []rolePolicyInput {
+	out := make([]rolePolicyInput, 0, len(roles))
+	for _, r := range roles {
+		if r == nil {
+			out = append(out, rolePolicyInput{})
+			continue
+		}
+		if len(r.Policies) == 0 {
+			out = append(out, rolePolicyInput{roleID: r.ID})
+			continue
+		}
+		out = append(out, rolePolicyInput{roleID: r.ID, overrides: parseRolePolicies(r.Policies)})
+	}
+	return out
+}
+
+// computePolicy resolves the effective value for a single policy key by
+// applying upstream TS priority cascade + per-key aggregator. baseVal is the
+// merged default+meta value used when a role specifies useDefault=true or when
+// no role has an override. inputs carries each role's parsed policies plus the
+// replacement entries an effective-policy provider supplied for it. extra
+// carries effective-policy provider contributions for the key (already validated
+// & type-checked by the host); it is merged into the same priority cascade as the
+// role overrides.
+func computePolicy(key string, baseVal any, inputs []rolePolicyInput, extra []policyEntry) any {
+	// 各 role がこの policy に贈る entry を組み立てる。entry 無し = priority=0,
+	// useDefault=true (= base にフォールバック) として扱う。
+	collected := make([]policyEntry, 0, len(inputs)+len(extra))
+	for _, in := range inputs {
+		collected = append(collected, in.entry(key, baseVal))
+	}
+	// provider contribution は同じ priority cascade に参加させる (= native と provider は
+	// 同一 priority グループ内で aggregate される)。
 	collected = append(collected, extra...)
 	// upstream: priority 2 → 1 → 0 の順で「該当 priority に少なくとも 1 件
 	// あればそのグループだけ aggregate」。fallback の priority 0 は全 role

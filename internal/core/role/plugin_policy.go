@@ -214,18 +214,11 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 	if len(roles) == 0 && len(providers) == 0 {
 		return s.applyServerCaps(base), nil
 	}
-	roleOverrides := make([]map[string]rolePolicyOverride, 0, len(roles))
-	for _, r := range roles {
-		if r == nil || len(r.Policies) == 0 {
-			roleOverrides = append(roleOverrides, nil)
-			continue
-		}
-		roleOverrides = append(roleOverrides, parseRolePolicies(r.Policies))
-	}
+	roleInputs := newRolePolicyInputs(roles)
 
 	out = make(map[string]any, len(base))
 	for key, baseVal := range base {
-		out[key] = computePolicy(key, baseVal, roleOverrides, nil)
+		out[key] = computePolicy(key, baseVal, roleInputs, nil)
 	}
 	if len(providers) == 0 {
 		return s.applyServerCaps(out), nil
@@ -296,7 +289,7 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 	}
 
 	for key, entries := range contribs {
-		out[key] = computePolicy(key, base[key], roleOverrides, entries)
+		out[key] = computePolicy(key, base[key], roleInputs, entries)
 	}
 
 	for key := range failed {
