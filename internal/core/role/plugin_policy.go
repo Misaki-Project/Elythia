@@ -170,7 +170,8 @@ func (s *Service) GetUserPoliciesChecked(userID string) (map[string]any, error) 
 // their wrapped repository error without invoking providers. An unreadable
 // instance base (`meta.policies`) is reported as a wrapped error too: falling
 // back to the native default silently would answer "allowed" for a base
-// override the admin may have set to deny.
+// override the admin may have set to deny. Concurrent failures (base and
+// role input) are joined, so neither cause is dropped.
 func (s *Service) resolvePolicies(userID string) (out map[string]any, err error) {
 	providers := s.snapshotPolicyProviders()
 	// applyMetaBasePolicies が base を mutate するため共有 cache ではなく clone を使う。
@@ -183,12 +184,11 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 		// また許可側になる。return を続けず下の native 経路を通すのはそのため。
 		//
 		// provider は宣言 key の base 値が分からず集約の起点が壊れているの
-		// で呼ばない。error はこの defer で fixed に載せる — 下の return は
+		// で呼ばない。error はこの defer で 1 箇所に載せる — 下の return は
 		// 5 箇所あるので、1 箇所で確実に確認できる。
 		providers = nil
-		defer func() {
-			err = fmt.Errorf("role: effective policy base: %w", baseErr)
-		}()
+		basePolicyErr := fmt.Errorf("role: effective policy base: %w", baseErr)
+		defer func() { err = joinBasePolicyError(basePolicyErr, err) }()
 	}
 	if userID == "" && len(providers) == 0 {
 		return s.applyServerCaps(base), nil
@@ -291,6 +291,23 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 		return out, ErrEffectivePolicyProvider
 	}
 	return out, nil
+}
+
+// joinBasePolicyError adds the unreadable-base failure to whatever the rest of
+// the resolution already reported. **base の error で無条件に上書きしない。**
+// 上書きすると、base と role 入力が同時に壊れた instance で role 入力側の原因が
+// 黙って消え「片方だけ直せば戻った」ように見える。`errors.Join` なら
+// `errors.Is` がどちらの原因も辿れるので、呼び出し側の fail closed 判断と
+// 運用者の原因切り分けの両方を失わない。
+//
+// 原因が base だけのときは join せずそのまま返す。合成すると 1 行の error が
+// 改行区切りになり、`errors.Unwrap` も切られて、1 原因の経路の読みやすさを
+// 保つ。
+func joinBasePolicyError(baseErr, resolveErr error) error {
+	if resolveErr == nil {
+		return baseErr
+	}
+	return errors.Join(baseErr, resolveErr)
 }
 
 // log returns the logger captured when the runtime was built, falling back to

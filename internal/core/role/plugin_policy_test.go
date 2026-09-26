@@ -624,6 +624,7 @@ func TestEffectivePolicy_RoleLookupErrorSkipsProvidersAndRemainsDistinct(t *test
 // unchecked 経路 (`GetUserPolicies`) は error を捨てて **role override まで
 // 従来どおり反映した** map を返すことを固定する — ここで素の base に落とすと
 // role の拒否 (silence 等) を失い、同じ理由で fail open になる。
+// provider 抑制 (呼ばない) も両経路で回数により固定する。
 func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *testing.T) {
 	deny := datatypes.JSON([]byte(`{"canDeleteAccount":false}`))
 	for _, tt := range []struct {
@@ -647,6 +648,22 @@ func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *t
 			svc, roleRepo, assignRepo, metaRepo := newTestService(t)
 			metaRepo.Meta = &model.Meta{ID: "x", Policies: deny}
 			tt.breaksMeta(metaRepo)
+			// **provider は base が読めないあいだ呼ばない。** 宣言 key の base 値が
+			// 分からず集約の起点が壊れているためで、単に contribution を捨てる
+			// ではない。実 provider を登録して**呼ばれた回数**で固定する — mock の
+			// 存在を検査するのではなく、解決経路が provider を起動しなかったという
+			// 観測可能な副作用を見る。返り値は priority 2 の `false` にしてあるので、
+			// 呼ばれていれば下の fallback map の `true` も壊れる (二重の証拠)。
+			var providerCalls atomic.Int32
+			registerProvider(t, svc, "account-policy", []string{role.PolicyCanDeleteAccount},
+				func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+					providerCalls.Add(1)
+					return []plugin.EffectivePolicyContribution{{
+						Key:      role.PolicyCanDeleteAccount,
+						Priority: 2,
+						Value:    false,
+					}}, nil
+				})
 
 			policies, err := svc.GetUserPoliciesChecked("u1")
 			require.Error(t, err, "base policy を読めないのに checked 解決が error を返さないと削除認可が fail open する")
@@ -654,9 +671,13 @@ func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *t
 			assert.ErrorContains(t, err, "role: effective policy base")
 			assert.Equal(t, true, policies[role.PolicyCanDeleteAccount],
 				"fallback map は native 既定を保つ (error を受ける側で停止するのが責務)")
+			assert.Zero(t, providerCalls.Load(),
+				"checked 解決は base を読み損ねた窓で provider を起動しない")
 
 			assert.Equal(t, true, svc.GetUserPolicies("u1")[role.PolicyCanDeleteAccount],
 				"unchecked 経路は fail-soft のまま (既存 consumer を壊さない)")
+			assert.Zero(t, providerCalls.Load(),
+				"unchecked 経路も provider を起動しない (error を捨てるだけで解決経路は同一)")
 
 			// **base を落とした early return は不可。** role override まで
 			// 反映した map を返さないと、base 障害の窓で role の拒否が
@@ -671,8 +692,74 @@ func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *t
 			svc.InvalidateUserRoleCache("u1") // 直上の解決が user cache を埋めている
 			assert.Equal(t, false, svc.GetUserPolicies("u1")[role.PolicyCanDeleteAccount],
 				"unchecked map must still carry the role override while base is unreadable")
+			assert.Zero(t, providerCalls.Load(),
+				"role override を反映した解決でも provider を起動しない")
 		})
 	}
+}
+
+// base の読み損ねと role 入力の読み損ねは**別の原因**で、片方だけを直しても
+// 認可の答えはまだ trusted されない。`resolvePolicies` は base の error を
+// 無条件の `defer` で上書きしていたので、role 入力側の失敗が黙って落ちていた
+// (base だけを登録した error になり、meta と role の両方が壊れた instance でも
+// 「片方だけ直せば戻った」ように見える)。**両方の失敗を保持する**ことを固定する。
+// `errors.Is` で各原因を辿れ、既存の文脈 (`role: effective policy base` /
+// `role: effective policy inputs`) も残ることを一起に確認する。
+func TestEffectivePolicy_MetaBaseAndRoleInputFailuresBothReported(t *testing.T) {
+	baseErr := errors.New("meta unavailable")
+	roleErr := errors.New("role lookup failed")
+	newServiceWithBothFailures := func(t *testing.T) *role.Service {
+		t.Helper()
+		roleRepo := testutil.NewMockRoleRepository()
+		assignRepo := &failingPolicyAssignmentRepo{
+			MockRoleAssignmentRepository: testutil.NewMockRoleAssignmentRepository(roleRepo),
+			err:                          roleErr,
+		}
+		metaRepo := newTestMetaRepository()
+		metaRepo.FetchErr = baseErr
+		idGen, _ := id.NewGenerator("aidx")
+		return role.NewService(roleRepo, assignRepo, metaRepo, idGen)
+	}
+
+	t.Run("both failures survive", func(t *testing.T) {
+		svc := newServiceWithBothFailures(t)
+		policies, err := svc.GetUserPoliciesChecked("u1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, baseErr, "base の読み損ねは meta 側の障害なので残る必要がある")
+		assert.ErrorIs(t, err, roleErr, "role 入力の読み損ねまで落ちると role 経路が壊れていると悟れない")
+		assert.ErrorContains(t, err, "role: effective policy base")
+		assert.ErrorContains(t, err, "role: effective policy inputs")
+		assert.Equal(t, true, policies[role.PolicyCanDeleteAccount],
+			"fallback map は native 既定を保つ")
+	})
+
+	t.Run("sole base failure stays a single cause", func(t *testing.T) {
+		roleRepo := testutil.NewMockRoleRepository()
+		assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
+		metaRepo := newTestMetaRepository()
+		metaRepo.FetchErr = baseErr
+		idGen, _ := id.NewGenerator("aidx")
+		svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
+
+		_, err := svc.GetUserPoliciesChecked("u1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, baseErr)
+		assert.ErrorContains(t, err, "role: effective policy base")
+		// 原因が 1 つなら複数 error の合成にしない。合成は改行区切りになって
+		// 既存の読みやすさを壊し、chain も `errors.Unwrap` で切られる (join は
+		// `Unwrap() []error` しか持たないため単一原因の wrap と区別できる)。
+		assert.Equal(t, baseErr, errors.Unwrap(err),
+			"sole failure must stay a plain single-cause wrap, not a joined error")
+		assert.NotContains(t, err.Error(), "\n", "sole failure must stay one readable line")
+	})
+
+	t.Run("ordinary GetUserPolicies stays fail-soft", func(t *testing.T) {
+		svc := newServiceWithBothFailures(t)
+		policies := svc.GetUserPolicies("u1")
+		require.NotNil(t, policies)
+		assert.Equal(t, true, policies[role.PolicyCanDeleteAccount],
+			"unchecked 経路は error を捨てて native 既定を返す (既存 consumer を壊さない)")
+	})
 }
 
 func TestEffectivePolicy_ProviderPanicCheckedRestoresDeclaredKeys(t *testing.T) {
