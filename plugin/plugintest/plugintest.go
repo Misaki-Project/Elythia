@@ -344,9 +344,14 @@ func (h *Harness) EffectivePolicies(def plugin.Definition) plugin.EffectivePolic
 			// **ActiveAssignments も複製して渡す。** 本番 (core/role/plugin_policy.go) が
 			// 複製しているのと同じで、テストが production より緩くないようにする。
 			req.ActiveAssignments = append([]plugin.ActiveRoleAssignment(nil), req.ActiveAssignments...)
+			// **置換してよい role は resolver を呼ぶ前に確定させる。** 上で複製した slice は
+			// 共有されているので resolver が書き換えられる。複製し直してから判定すると
+			// 「active な role を差し替えた」置換が harness を通ってしまうので、
+			// 本番 (core/role/plugin_policy.go) と同じ形で**呼び出し前**の集合を採る。
+			replaceableRoleIDs := plugintestActiveRoleIDs(req.ActiveAssignments)
 			contributions, err := resolver(ctx, req)
 			if err == nil && !effectivepolicy.ValidateContributions(
-				registration.Keys, plugintestActiveRoleIDs(req.ActiveAssignments), contributions,
+				registration.Keys, replaceableRoleIDs, contributions,
 			) {
 				h.t.Errorf("plugintest: EffectivePolicies の出力が不正です")
 				return nil, fmt.Errorf("plugintest: effective policy output is invalid")

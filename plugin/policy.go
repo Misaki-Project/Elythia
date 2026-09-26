@@ -48,9 +48,14 @@ type EffectivePolicyContribution struct {
 	Priority   int
 	UseDefault bool
 	Value      any
-	// Order distinguishes multiple contributions for the same key and controls
-	// their deterministic provider-local order. Each (Key, Order) pair must be
-	// unique within one resolver result.
+	// Order distinguishes multiple **additive** contributions for the same key and
+	// controls their deterministic provider-local order. Each (Key, Order) pair must
+	// be unique within one resolver result.
+	//
+	// **A replacement cannot use Order.** A contribution that sets
+	// [EffectivePolicyContribution.ReplaceRoleID] must leave Order at 0, and
+	// replacements of the same key are told apart by ReplaceRoleID instead: each
+	// (Key, ReplaceRoleID) pair must be unique.
 	Order int
 	// ReplaceRoleID turns this contribution into a **replacement** of one active
 	// manual role's native contribution for Key, instead of an additional

@@ -432,9 +432,18 @@ func resolvePolicyProviderCached(provider policyProvider, req plugin.EffectivePo
 	provider.runtime.flights[key] = flight
 	provider.runtime.cacheMu.Unlock()
 
+	// **置換してよい role は resolver を呼ぶ前に確定させる。** request は値渡しだが
+	// `ActiveAssignments` の slice は共有されているので、resolver は自分の要素を書き換え
+	// られる。戻ってきた後に `req` を読んではいけない — 「active な role を conditional
+	// な role に差し替えて」置換を通してしまう。**呼び出し前に ID を取り出した集合**を
+	// 使うので、resolver 側の書き込みは判定に入らない。
+	//
+	// cache hit / flight 共有は上で return 済みなので、この取り出しは cache miss の経路
+	// にだけかかる。
+	replaceableRoleIDs := activeRoleIDsFromAssignments(req.ActiveAssignments)
 	contributions, ok := invokePolicyProvider(provider, req, key, flight)
 	if ok {
-		ok = effectivepolicy.ValidateContributions(provider.reg.Keys, activeRoleIDsFromAssignments(req.ActiveAssignments), contributions)
+		ok = effectivepolicy.ValidateContributions(provider.reg.Keys, replaceableRoleIDs, contributions)
 	}
 	if ok {
 		contributions = clonePolicyContributions(contributions)

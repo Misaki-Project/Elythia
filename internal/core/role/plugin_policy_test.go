@@ -2530,3 +2530,78 @@ func TestEffectivePolicy_ReplacementChoosingAPriorityFailsTheProvider(t *testing
 	require.Equal(t, role.ErrEffectivePolicyProvider, err)
 	assert.Equal(t, 10, policies["mentionLimit"])
 }
+
+// **置換の target は resolver を呼ぶ前に確定していなければならない。** host は resolver に
+// `ActiveAssignments` を**複製して**渡すので、resolver は自分の slice を書き換えられる。
+// 複製し直してから「置換してよい role」を判定すると、resolver が「active な role を
+// conditional な role に差し替えて」置換を通できてしまう。
+//
+// 攻撃者は `RoleIDs` を見るだけで conditional role の ID を知れるので、差し込む ID は
+// 実際に手に入る:
+//
+//	r1 (manual, active):      mentionLimit priority 1 = 10
+//	r-conditional (条件一致): mentionLimit priority 1 = 20 → native は max(10, 20) = 20
+//	                        RoleIDs には出るが ActiveAssignments には出ない
+//
+// 差し替えが通る (修正前): priority 1 group が max(10, 40) = 40 になる
+// 差し替えが弾かれる (修正後): provider 全体が失敗扱いで native の 20 に戻る
+func TestEffectivePolicy_ReplacementCannotForgeTheTargetThroughTheRequest(t *testing.T) {
+	svc, roleRepo, assignRepo, _ := newTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual,
+		Policies: datatypes.JSON([]byte(`{"mentionLimit":{"priority":1,"value":10}}`))}
+	roleRepo.Roles["r-conditional"] = &model.Role{ID: "r-conditional", Name: "C", Target: model.RoleTargetConditional,
+		CondFormula: datatypes.JSON([]byte(`{"type":"isLocal"}`)),
+		Policies:    datatypes.JSON([]byte(`{"mentionLimit":{"priority":1,"value":20}}`))}
+	assign(t, assignRepo, "u1", "r1")
+	userRepo := testutil.NewMockUserRepository()
+	userRepo.Users["u1"] = &model.User{ID: "u1"} // Host nil なので isLocal が真
+	svc.SetUserRepo(userRepo)
+
+	registerProvider(t, svc, "level", []string{"mentionLimit"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			// r1 は実際に active な手動ロールなのに、resolver が自分の slice を conditional
+			// な role に書き換えて、その target の置換を返す。
+			req.ActiveAssignments[0].RoleID = "r-conditional"
+			return []plugin.EffectivePolicyContribution{{
+				Key: "mentionLimit", Value: 40, ReplaceRoleID: "r-conditional",
+			}}, nil
+		})
+
+	policies, err := svc.GetUserPoliciesChecked("u1")
+	// **assert 2 つで報告する。** 「差し替えが通った」証拠は error が nil なことと
+	// 値が 40 になることの両方で出る。require で止めると片方しか見えない。
+	assert.Equal(t, role.ErrEffectivePolicyProvider, err, "resolver が書き換えた target は置換先にならない")
+	assert.Equal(t, 20, policies["mentionLimit"], "宣言 key は native へ戻る")
+}
+
+// **逆に、request を書き換えても「本来の対象」は置換できる。** target の判定は
+// **resolver 呼び出し前**の集合で行うので、resolver 側の書き込みで本来 active だった
+// role まで失ってはいけない（= 置換をすべて不正扱いにするような過大な修正の防線）。
+//
+//	r1 を 40 に置換 → priority 1 group が max(40, r-conditional の 20) = 40
+func TestEffectivePolicy_RequestMutationDoesNotHideTheGenuineReplacementTarget(t *testing.T) {
+	svc, roleRepo, assignRepo, _ := newTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual,
+		Policies: datatypes.JSON([]byte(`{"mentionLimit":{"priority":1,"value":10}}`))}
+	roleRepo.Roles["r-conditional"] = &model.Role{ID: "r-conditional", Name: "C", Target: model.RoleTargetConditional,
+		CondFormula: datatypes.JSON([]byte(`{"type":"isLocal"}`)),
+		Policies:    datatypes.JSON([]byte(`{"mentionLimit":{"priority":1,"value":20}}`))}
+	assign(t, assignRepo, "u1", "r1")
+	userRepo := testutil.NewMockUserRepository()
+	userRepo.Users["u1"] = &model.User{ID: "u1"} // Host nil なので isLocal が真
+	svc.SetUserRepo(userRepo)
+
+	registerProvider(t, svc, "level", []string{"mentionLimit"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			// 書き換えるのは snapshot 済みの slice だけ。返す置換は実際に active だった r1 を
+			// 名乗るので、呼び出し前に確定した集合なら通る。
+			req.ActiveAssignments[0].RoleID = "r-conditional"
+			return []plugin.EffectivePolicyContribution{{
+				Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1",
+			}}, nil
+		})
+
+	policies, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err, "resolver が request を書き換えたこと自体は provider 失敗ではない")
+	assert.Equal(t, 40, policies["mentionLimit"], "呼び出し前に確定した active な role は置換できる")
+}
