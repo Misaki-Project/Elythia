@@ -4,15 +4,17 @@
 
 **Goal:** `shiroha-a/mk` へ PR 出せる汎用Plugin APIを足す — active manual assignment の文脈と、1つのactive manual roleのnative policy contributionだけを1対1で置換する境界 — を、Misaki固有のlevel計算なしで公開面に載せる。
 
-**Architecture:** 公開型は `plugin/` への**追加だけ**（`ActiveRoleAssignment`、`EffectivePolicyRequest.ActiveAssignments`、`EffectivePolicyContribution.ReplaceRoleID`）。hostは既存のper-user role cache entryにactive manual assignmentを一緒に積み、`ActiveAssignments` をそのcacheから出して既存 `RoleIDs` と並べて渡す。置換は「provider結果 → `rolePolicyInput`（ロールごとの集約entry）」の段で、置換entryの`priority`を**元のnative entryのpriority**にして差し替える。集約のpriority cascade・aggregator・instance/server cap・管理者判定は一切変えない。競合は(role, key)単位でnativeへ戻し、checked resolverだけが固定sentinelを返す。
+**Architecture:** 公開型は `plugin/` への**追加だけ**（`ActiveRoleAssignment`、`EffectivePolicyRequest.ActiveAssignments`、`EffectivePolicyContribution.ReplaceRoleID`）。hostは native ロール解決を `userRoleSnapshot{roles, activeAssignments}` に一本化し、**1 回の `ListByUser` 読取**から両方を出して既存のper-user cache entry に一緒に積む。`resolvePolicies` はその内部スナップショットを直接使い、repository の失敗は握り潰さず provider を起動する前に checked error として返す。provider の成功結果 cache key には assignment ID を含める。置換は「provider結果 → `rolePolicyInput`（ロールごとの集約entry）」の段で、置換entryの `priority` を**元のnative entryのpriority**にして差し替える。集約のpriority cascade・aggregator・instance/server cap・管理者判定は一切変えない。競合は (role, key) 単位でnativeへ戻し、checked resolver だけが固定sentinelを返す。
 
-**Tech Stack:** Go 1.27.1、Echo、testify、`internal/effectivepolicy`（native policy schema）、`internal/pluginspec`（公開面golden）、`plugin/plugintest`、`gh` CLI
+**Tech Stack:** Go 1.27.1、Echo、testify、`internal/effectivepolicy`（native policy schema）、`internal/pluginspec`（公開面golden）、`plugin/plugintest`、`gh` CLI、Python 3（`tests/plugin-doc/extract.py`）
 
 ## Global Constraints
 
 - 対象は**upstream可能な汎用Plugin API変更だけ**。Misaki固有のroleLevel計算・XP・storage・route・UI・frontendをこの計画に混ぜない（別計画の担当）。
+- **全taskでREDを先に観察する。** 最小の test / gate を先に書いて実行し、期待どおりの RED を見た後に限り production / docs を書き、GREEN を確認する。実装前から緑になる test は **regression guard** としてその旨を明示し、RED と称さない。
 - 破壊的変更はゼロ。`plugin.APIVersion` は `1` のまま維持する（`docs/plugins/compatibility.md` の additive 契約に従う）。
-- `RoleIDs` の意味・並び・重複除去・非nil空sliceという既存契約は**変えない**。`ActiveAssignments` は `RoleIDs` を置き換えず、并んで渡す。
+- `RoleIDs` の意味・並び・重複除去・非nil空sliceという既存契約は**変えない**。`ActiveAssignments` は `RoleIDs` を置き換えず、並んで渡す。
+- **roles と activeAssignments は必ず 1 回の `ListByUser` 読取から同時に作る。** `GetUserRoles` を呼んでから別の accessor で assignment を読む、という2段構えにしない。repository の読み損ねは**握り潰さず** checked error にする（空 slice に落とさない）。
 - `ActiveAssignments` には**active な手動assignmentだけ**を入れる。conditional role・期限切れ・削除済み・`role` 行が無いorphanは入れない。よって `ActiveAssignments` の role ID は常に `RoleIDs` の部分集合になる。
 - `ActiveAssignments` は**1つのactive manual roleにつき高々1件**（同じroleのassignmentが複数あればassignment IDの最小値1件だけ残す）。1対1置換が成立するために必要なhost側の保証。
 - 置換は**active manual roleだけ**を対象にできる。conditional role にはassignment IDが無く `ActiveAssignments` に現れないので、置換先としては指定できない。
@@ -24,6 +26,7 @@
 - 既存provider（`plugins/trustlevel`）は `RoleIDs` しか読まないため無変更で動く。`ReplaceRoleID` 未設定は追加contributionのまま。
 - 変更は `Misaki-Project/mk` の `feature/role-level-plugin` で進め、upstream PR用のbranchを**別worktree**に作る（`upstream/develop` 起点）。`upstream/develop` へ直接pushしない。
 - upstream PR には Misaki 固有の差分（`canDeleteAccount` policy、`applyMetaBasePolicies` のerror化、`joinBasePolicyError`）を**入れない**。Task 6 のleak検査で機械的に確かめる。
+- **upstream の HEAD をハードコードしない。** `git fetch upstream develop` 後に `git rev-parse upstream/develop` を取り、その値を以降の Step と記録に使う。
 - この作業ツリーの**full suiteは元から落ちている**。新規regressionの判定は下記のfocused commandだけで行う。
 
 ### Baseline failures（変更前から起きているもの。**修正しない**）
@@ -72,7 +75,56 @@ Remove-Item Env:GOWORK
 & (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -w internal\core\role\role_service.go
 ```
 
-CIが真のgate（`make test` / `make lint` / `make golangci-lint` / `make plugin-doc-check` / `make plugin-vet`）。この作業ツリーには `bash` と `make` が無いので `make plugin-doc-check` は Task 5 で CI に任せる（等価な `bash ./tests/plugin-doc/check-snippets.sh` は WSL bash が使えれば実行可）。
+CIが真のgate（`make test` / `make lint` / `make golangci-lint` / `make plugin-doc-check` / `make plugin-vet`）。この作業ツリーには `bash` と `make` が無いので、`make plugin-doc-check` の判定を Windows で再現したものを下に置く。
+
+### authoring.md の Go fence コンパイル gate（Windows で `make plugin-doc-check` 相当）
+
+`PYTHONUTF8=1` を付けないと `extract.py` が cp932 で死ぬので必ず付ける。判定は `check-snippets.sh` と同じく「3 variant (top/any/err) が**全部**失敗した fence だけを NG」とする。`go.mod` は here-string を使わず配列結合で組み立てている（入れ子 here-string を避ける）。
+
+```powershell
+$w = "$env:TEMP\rlp-docgate"
+Remove-Item -Recurse -Force $w -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $w | Out-Null
+$env:PYTHONUTF8 = "1"
+python tests/plugin-doc/extract.py docs/plugins/authoring.md $w
+Remove-Item Env:PYTHONUTF8
+$testify = (Select-String -Path go.mod -Pattern '^\tgithub.com/stretchr/testify v' | Select-Object -First 1).Line.Trim()
+$gov = (Select-String -Path go.mod -Pattern '^go ' | Select-Object -First 1).Line -replace '^go ', ''
+$modLines = @(
+  'module docsnipcheck',
+  '',
+  "go $gov",
+  '',
+  'require (',
+  "`tgithub.com/shiroha-a/mk v0.0.0",
+  "`t$testify",
+  ')',
+  '',
+  "replace github.com/shiroha-a/mk => $((Get-Location).Path)",
+  ''
+)
+Set-Content -Path "$w\go.mod" -Value ($modLines -join "`n") -Encoding utf8NoBOM
+Copy-Item go.sum "$w\go.sum"
+Push-Location $w
+$env:GOFLAGS = "-mod=mod"
+$env:GOWORK = "off"
+$out = (go build -gcflags=-e ./snippets/... 2>&1 | Out-String)
+Remove-Item Env:GOFLAGS
+Remove-Item Env:GOWORK
+Pop-Location
+$bad = @()
+1..40 | ForEach-Object {
+  $f = "s{0:d2}" -f $_
+  if ($out -match "snippets[\\/]$f[\\/]") {
+    $survived = $false
+    foreach ($v in @("top", "any", "err")) { if ($out -match "snippets[\\/]$($f)_$v[\\/]") { $survived = $true } }
+    if (-not $survived) { $bad += $f }
+  }
+}
+if ($bad.Count -eq 0) { "SNIPPET GATE OK" } else { "NG: all variants failed for " + ($bad -join ", ") }
+```
+
+Expected（現状の `docs/plugins/authoring.md`）: `SNIPPET GATE OK`。**このブロックは Task 5 Step 1 で一度 RED になることを確認してから使う。**
 
 ---
 
@@ -81,11 +133,10 @@ CIが真のgate（`make test` / `make lint` / `make golangci-lint` / `make plugi
 `EffectivePolicyRequest` に「どのactive manual roleに、どのassignment IDがあるか」を渡す。既存providerは `RoleIDs` だけを読むので挙動は変わらない。
 
 **Files:**
-- Modify: `plugin/policy.go:8-15` (`ActiveRoleAssignment` を新規追加)、`:15-27` (`EffectivePolicyRequest` に `ActiveAssignments` を追加)
-- Test: `plugin/policy_test.go`
-- Modify: `internal/entitycompat/testdata/golden_plugin_surface.txt`（`go run ./tools/pluginspec -write` で再生成）
-- Modify: `docs/plugins/authoring.md:813-815`（Go公開面一覧の `EffectivePolicyRequest`）
-- Modify: `docs/plugins/compatibility.md:29` の直後（additive 追記）
+- Test: `plugin/policy_test.go`（新規 test）
+- Modify: `plugin/policy.go`（`ActiveRoleAssignment` を新規追加、`EffectivePolicyRequest` に `ActiveAssignments` を追加）
+- Modify: `internal/entitycompat/testdata/golden_plugin_surface.txt`（`go run ./tools/pluginspec -write` で再生成。**派生物**）
+- Modify: `docs/plugins/authoring.md`（Go公開面一覧）、`docs/plugins/compatibility.md`（additive 追記）
 
 **Interfaces:**
 - Consumes: なし（最初のtask）
@@ -93,7 +144,38 @@ CIが真のgate（`make test` / `make lint` / `make golangci-lint` / `make plugi
 - Produces: `plugin.EffectivePolicyRequest.ActiveAssignments []ActiveRoleAssignment`
 - Preserves: `plugin.EffectivePolicyRequest.RoleIDs` の意味・並び（非nil空slice）
 
-- [ ] **Step 1: 公開型を追加する**
+- [ ] **Step 1: 最小の失敗 test を先に書く**
+
+`plugin/policy_test.go` に追記する:
+
+```go
+func TestEffectivePolicyRequest_CarriesActiveAssignmentsAlongsideRoleIDs(t *testing.T) {
+	// plugin作者は RoleID と AssignmentID を別々に読む。片方だけを持つ型に
+	// 戻ると「XP を role に紐づけられた」と誤って付け替えられる。
+	assignment := ActiveRoleAssignment{RoleID: "r1", AssignmentID: "a1"}
+
+	request := EffectivePolicyRequest{
+		UserID:            "u1",
+		RoleIDs:           []string{"r1", "r2"},
+		ActiveAssignments: []ActiveRoleAssignment{assignment},
+	}
+
+	assert.Equal(t, "r1", request.ActiveAssignments[0].RoleID)
+	assert.Equal(t, "a1", request.ActiveAssignments[0].AssignmentID)
+	// ActiveAssignments は RoleIDs を置き換えず、並んで運ぶ。
+	assert.Equal(t, []string{"r1", "r2"}, request.RoleIDs)
+}
+```
+
+- [ ] **Step 2: RED を観察する**
+
+```powershell
+go test ./plugin -count=1 -run TestEffectivePolicyRequest_CarriesActiveAssignmentsAlongsideRoleIDs
+```
+
+Expected: **コンパイルエラー**。`undefined: ActiveRoleAssignment`。型がまだ無いので当然 red。
+
+- [ ] **Step 3: production に公開型を追加する**
 
 `plugin/policy.go` の `// EffectivePolicyRequest is the input to an effective policy resolver.` の**直前**に次の型を追加する:
 
@@ -128,52 +210,39 @@ type ActiveRoleAssignment struct {
 	// - anonymous requests receive a non-nil empty slice
 	//
 	// **RoleIDs を置き換えない。** 既存providerはこのsliceだけを見ている。
-	// 追加contributionだけ"`
-	// 返す実装には RoleIDs があれば十分。
+	// 追加contributionだけ返す実装には RoleIDs があれば十分。
 	ActiveAssignments []ActiveRoleAssignment
 ```
 
-コメント末尾の2行は次の1行に置き換える（そのまま貼る）:
-
-```go
-	// **RoleIDs を置き換えない。** 既存providerはこのsliceだけを見ている。
-	// 追加contributionだけ返す実装には RoleIDs があれば十分。
-```
-
-- [ ] **Step 2: 公開面の形を固定するtestを書く**
-
-`plugin/policy_test.go` に追記する:
-
-```go
-func TestEffectivePolicyRequest_CarriesActiveAssignmentsAlongsideRoleIDs(t *testing.T) {
-	// plugin作者は RoleID と AssignmentID を別々に読む。片方だけ持つ型に
-	// 戻ると「XP を role に紐づけられた」と誤って付け替えられる。
-	assignment := ActiveRoleAssignment{RoleID: "r1", AssignmentID: "a1"}
-
-	request := EffectivePolicyRequest{
-		UserID:            "u1",
-		RoleIDs:           []string{"r1", "r2"},
-		ActiveAssignments: []ActiveRoleAssignment{assignment},
-	}
-
-	assert.Equal(t, "r1", request.ActiveAssignments[0].RoleID)
-	assert.Equal(t, "a1", request.ActiveAssignments[0].AssignmentID)
-	// ActiveAssignments は RoleIDs を置き換えず、并んで運ぶ。
-	assert.Equal(t, []string{"r1", "r2"}, request.RoleIDs)
-}
-```
-
-- [ ] **Step 3: docの公開面一覧がREDであることを確認する**
-
-まだ doc を更新する前に gate が落ちることを確かめる:
+- [ ] **Step 4: GREEN を確認する**
 
 ```powershell
+& (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -l plugin\policy.go plugin\policy_test.go
+go test ./plugin -count=1
+```
+
+Expected: `gofmt -l` が無出力、`go test ./plugin` が PASS。
+
+- [ ] **Step 5: golden を再生成して doc gate を RED にする**
+
+golden は production から生成される**派生物**。先に golden を更新すると、doc 側の公開面一覧が古くなることが gate として見える:
+
+```powershell
+go run ./tools/pluginspec -write
+git diff --stat internal/entitycompat/testdata/golden_plugin_surface.txt
 go test ./internal/entitycompat -run TestPluginDoc -count=1
 ```
 
-Expected: FAIL。`ActiveRoleAssignment` / `ActiveAssignments` が `docs/plugins/authoring.md` の公開面一覧に無いと報告される。
+Expected: golden に4行が追加される（下の Expected 参照）。**`go test` は FAIL** する — `ActiveRoleAssignment` / `ActiveAssignments` が `docs/plugins/authoring.md` の公開面一覧に無いと報告される。
 
-- [ ] **Step 4: authoring.md の公開面一覧を更新する**
+```
+plugin:   field ActiveRoleAssignment.AssignmentID string
+plugin:   field ActiveRoleAssignment.RoleID string
+plugin:   field EffectivePolicyRequest.ActiveAssignments []ActiveRoleAssignment
+plugin: type ActiveRoleAssignment struct
+```
+
+- [ ] **Step 6: docs を書いて GREEN にする**
 
 `docs/plugins/authoring.md` の `### Go (github.com/shiroha-a/mk/plugin)` 節にある
 
@@ -198,112 +267,74 @@ type EffectivePolicyRequest struct
 
 **型は golden の文字列と一字一句同じに書くこと。** `TestPluginDoc_SurfaceFieldsMatchGolden` が `Type.Field 型` を逐語照合する。
 
-- [ ] **Step 5: compatibility.md に additive 契約を追記する**
-
 `docs/plugins/compatibility.md` の「`Definition.EffectivePolicies`と関連型の追加はこのadditive契約に従い…」の段落の**後**に追記する:
 
 ```markdown
 `EffectivePolicyRequest.ActiveAssignments` と `plugin.ActiveRoleAssignment` の追加も同じ扱い。**`RoleIDs` は変更されない**ので既存providerの挙動は変わらず、新sliceを無視する実装は害がない。`APIVersion`は1のまま。
 ```
 
-- [ ] **Step 6: golden を再生成する**
-
-```powershell
-go run ./tools/pluginspec -write
-git diff --stat internal/entitycompat/testdata/golden_plugin_surface.txt
-```
-
-Expected: golden に次の3行が追加され、他の行は動かない（`SurfaceAll` はソートするので `field ActiveRoleAssignment.*` が `plugin:` ブロックの先頭付近、`type ActiveRoleAssignment struct` が `type` 群の `EffectivePolicyContribution` の直前に入る）:
-
-```
-plugin:   field ActiveRoleAssignment.AssignmentID string
-plugin:   field ActiveRoleAssignment.RoleID string
-plugin:   field EffectivePolicyRequest.ActiveAssignments []ActiveRoleAssignment
-plugin: type ActiveRoleAssignment struct
-```
-
-- [ ] **Step 7: focused command で GREEN を確認する**
+- [ ] **Step 7: GREEN を確認する**
 
 ```powershell
 go test ./plugin -count=1
 go test ./internal/entitycompat -run TestPluginDoc -count=1
+go run ./tools/pluginspec > "$env:TEMP\rlp-surface.txt"
+$golden = (Get-Content -Raw internal\entitycompat\testdata\golden_plugin_surface.txt) -replace "`r`n","`n"
+$actual = (Get-Content -Raw "$env:TEMP\rlp-surface.txt") -replace "`r`n","`n"
+if ($golden -ne $actual) { "SURFACE DRIFT" } else { "SURFACE OK" }
 ```
 
-Expected: 両方 PASS。surface golden の確認は Global Constraints の正規化比較で行う（`go test ./internal/entitycompat -run TestPluginSurfaceDrift` はcheckout状態によって壊れる）。
+Expected: 両方 PASS、`SURFACE OK`。
 
 - [ ] **Step 8: commit する**
 
 ```powershell
-& (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -l plugin\policy.go plugin\policy_test.go
 git diff --check
 git diff -- plugin internal/entitycompat/testdata/golden_plugin_surface.txt docs/plugins/authoring.md docs/plugins/compatibility.md
 git add plugin/policy.go plugin/policy_test.go internal/entitycompat/testdata/golden_plugin_surface.txt docs/plugins/authoring.md docs/plugins/compatibility.md
 git commit -m "Add plugin: hand active role assignments to effective policy providers"
 ```
 
-Expected: 1 commit。`gofmt -l` が無出力、`git diff --check` が無出力。**この commit の SHA を控えておく**（Task 6 のupstream適用で使う）。
+Expected: 1 commit。`git diff --check` が無出力。**この commit の SHA を控えておく**（Task 6 のupstream適用で使う）。
 
 ---
 
-### Task 2: Host-Supplied Active Assignments And Assignment-Aware Cache Key
+### Task 2: One-Read Role Snapshot (Roles + Active Assignments) And Assignment-Aware Cache Key
 
-`ActiveAssignments` を**既存のper-user role cache entry**から出してproviderへ渡す。cache key にはassignment ID を含める。
+native ロール解決を**1 回の `ListByUser` 読取**から `{roles, activeAssignments}` を作る 1 本の操作に束ねる。`GetUserRoles` は互換ラッパとして roles だけを返す。`resolvePolicies` は内部スナップショットを直接使い、repository の失敗を握り潰さず provider 起動前に checked error として返す。
 
 **Files:**
-- Modify: `internal/core/role/role_service.go:240-243` (`roleCacheEntry`)、`:511-571` (`GetUserRoles`)、`:588` の直前（`activeRoleAssignment` 型と生成helper）
-- Modify: `internal/core/role/plugin_policy.go:74-77` (`policyProviderCacheKey`)、`:229-231` (request 構築)、`:333-337` (`resolvePolicyProviderCached` のkey)、`:485` の後（encoding helper）、`:661` の直前（`activeRoleAssignments` accessor）
-- Test: `internal/core/role/plugin_policy_test.go`（外部テスト、`internal/repository` を import に追加）
-- Test: `internal/core/role/plugin_policy_internal_test.go`（内部テスト）
+- Test: `internal/core/role/plugin_policy_test.go`（外部）、`internal/core/role/plugin_policy_internal_test.go`（内部）
+- Modify: `internal/core/role/role_service.go`（`roleCacheEntry`、`userRoleSnapshot`、`resolveUserRoleSnapshot` + `GetUserRoles` ラッパ、`activeRoleAssignment` 型と helper）
+- Modify: `internal/core/role/plugin_policy.go`（`policyProviderCacheKey`、`resolvePolicies` の role 入力段、request 構築、cache key、`encodePolicyProviderAssignments`、`pluginActiveRoleAssignments`）
 
 **Interfaces:**
 - Consumes: `plugin.ActiveRoleAssignment`, `plugin.EffectivePolicyRequest.ActiveAssignments`（Task 1）
-- Produces: 非公開 `role.activeRoleAssignment{roleID string; assignmentID string}`
-- Produces: 非公開 `role.activeRoleAssignmentsFrom([]*model.RoleAssignment) []activeRoleAssignment`
-- Produces: 非公開 `role.cloneActiveRoleAssignments([]activeRoleAssignment) []activeRoleAssignment`
-- Produces: 非公開 `(*role.Service).activeRoleAssignments(userID string) []plugin.ActiveRoleAssignment`
-- Produces: 非公開 `role.pluginActiveRoleAssignments([]activeRoleAssignment) []plugin.ActiveRoleAssignment`
+- Produces: 非公開 `role.userRoleSnapshot{roles []*model.Role; activeAssignments []activeRoleAssignment}` と `(userRoleSnapshot).clone() userRoleSnapshot`
+- Produces: 非公開 `(*role.Service).resolveUserRoleSnapshot(userID string) (userRoleSnapshot, error)` — **戻り値は常に cache と非共有の複製。失敗時は zero snapshot + error（partial を返さない）**
+- Preserves: `(*role.Service).GetUserRoles(userID string) ([]*model.Role, error)` — 戻り値は roles のみ、署名も挙動も互換
+- Produces: 非公開 `role.activeRoleAssignment{roleID, assignmentID string}` / `role.activeRoleAssignmentsFrom([]*model.RoleAssignment) []activeRoleAssignment` / `role.cloneActiveRoleAssignments(...)` / `role.pluginActiveRoleAssignments(...)`
 - Produces: 非公開 `role.encodePolicyProviderAssignments([]plugin.ActiveRoleAssignment) string`
-- Produces: 外部テスト helper `countingAssignmentRepository` と `newCountingTestService`
+- Reuses: `internal/core/role/role_service_test.go` の `countingAssignmentRepo` と `internal/core/role/plugin_policy_test.go` の `failingPolicyAssignmentRepo`（**同じ用途の型を新規に作らない**）
 
-- [ ] **Step 1: query回数カウンタ付きservice builder を追加する**
+- [ ] **Step 1: 外部 test（ホスト経由）を先に書く**
 
-`internal/core/role/plugin_policy_test.go` の `func assign(` helper の**直後**に追記する:
+`internal/core/role/plugin_policy_test.go` の末尾に追記する。`countingAssignmentRepo` は同じ package の `role_service_test.go` にある既存型を再利用し、呼び出しを数える型が2つにならないようにする:
 
 ```go
-// countingAssignmentRepository は ListByUser の呼び出し回数を数える。**atomic
-// にするのは GetUserRoles の single-flight が fetch をどの呼び出し元で走らせ
-// ても良いから**で、`-race` 実行で data race を出さないため。
-type countingAssignmentRepository struct {
-	repository.RoleAssignmentRepository
-	calls atomic.Int64
-}
-
-func (r *countingAssignmentRepository) ListByUser(userID string) ([]*model.RoleAssignment, error) {
-	r.calls.Add(1)
-	return r.RoleAssignmentRepository.ListByUser(userID)
-}
-
-// newCountingTestService は newTestService と同じ形の戻り値に加え、query 回数を
-// 数える wrapper を挟む。`EffectivePolicyRequest.ActiveAssignments` を足す
-// ことで「2 本目の query が出ないこと」を固定する。
-func newCountingTestService(t *testing.T) (*role.Service, *testutil.MockRoleRepository, *testutil.MockRoleAssignmentRepository, *countingAssignmentRepository) {
+// newCountingTestService は newTestService と同じ形の戻り値に、既存の
+// countingAssignmentRepo (role_service_test.go) を挟んだもの。**型を使い回す**
+// ことで「1 query」の主張が全 test で同じ数え方になる。
+func newCountingTestService(t *testing.T) (*role.Service, *testutil.MockRoleRepository, *testutil.MockRoleAssignmentRepository, *countingAssignmentRepo) {
 	t.Helper()
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
 	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	counting := &countingAssignmentRepository{RoleAssignmentRepository: assignRepo}
+	counting := &countingAssignmentRepo{MockRoleAssignmentRepository: assignRepo}
 	return role.NewService(roleRepo, counting, metaRepo, idGen), roleRepo, assignRepo, counting
 }
-```
 
-import に `github.com/shiroha-a/mk/internal/repository` を追加する（この package は `repository` を import していない。`sync/atomic`, `internal/testutil`, `internal/misc/id`, `internal/model`, `time`, `errors`, `gorm.io/datatypes` は既にある）。
-
-- [ ] **Step 2: 外部テストのREDを書く**
-
-`internal/core/role/plugin_policy_test.go` の末尾に追記する:
-
-```go
 func TestEffectivePolicy_ActiveAssignmentsCoverOnlyActiveManualRoles(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
@@ -319,41 +350,44 @@ func TestEffectivePolicy_ActiveAssignmentsCoverOnlyActiveManualRoles(t *testing.
 	userRepo.Users["u1"] = &model.User{ID: "u1"} // Host nil なので isLocal が真
 	svc.SetUserRepo(userRepo)
 
-	var assignments []plugin.ActiveRoleAssignment
-	var roleIDs []string
+	var request plugin.EffectivePolicyRequest
 	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
 		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
-			roleIDs = req.RoleIDs
-			assignments = req.ActiveAssignments
+			request = req
 			return nil, nil
 		})
 
 	_, err := svc.GetUserPoliciesChecked("u1")
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"r1", "r2", "r3"}, roleIDs, "RoleIDs は conditional を含むという既存契約を変えない")
+	assert.Equal(t, []string{"r1", "r2", "r3"}, request.RoleIDs, "RoleIDs は conditional を含むという既存契約を変えない")
 	assert.Equal(t, []plugin.ActiveRoleAssignment{
 		{RoleID: "r1", AssignmentID: "a_u1_r1"},
 		{RoleID: "r2", AssignmentID: "a_u1_r2"},
-	}, assignments, "conditional role と role 行が無い orphan assignment は ActiveAssignments に入らない")
+	}, request.ActiveAssignments, "conditional role と role 行が無い orphan assignment は ActiveAssignments に入らない")
+	// **部分集合の不変条件。** RoleIDs にあるのに ActiveAssignments に入らない、あるいは
+	// 逆が起きたら host 側で契約が壊れている。
+	for _, a := range request.ActiveAssignments {
+		assert.Contains(t, request.RoleIDs, a.RoleID)
+	}
 }
 
 func TestEffectivePolicy_ActiveAssignmentsAreNonNilForAnonymous(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
-	var assignments []plugin.ActiveRoleAssignment
+	var request plugin.EffectivePolicyRequest
 	var seen bool
 	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
 		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
 			seen = true
-			assignments = req.ActiveAssignments
+			request = req
 			return nil, nil
 		})
 
 	_, err := svc.GetUserPoliciesChecked("")
 	require.NoError(t, err)
 	require.True(t, seen, "匿名解決でも provider は呼ばれるので ActiveAssignments は非nil空sliceである必要がある")
-	assert.NotNil(t, assignments)
-	assert.Empty(t, assignments)
+	assert.NotNil(t, request.ActiveAssignments)
+	assert.Empty(t, request.ActiveAssignments)
 }
 
 func TestEffectivePolicy_ActiveAssignmentsExcludeExpiredAssignments(t *testing.T) {
@@ -364,56 +398,250 @@ func TestEffectivePolicy_ActiveAssignmentsExcludeExpiredAssignments(t *testing.T
 	past := time.Now().Add(-time.Hour)
 	assignRepo.Assignments["u1:r2"] = &model.RoleAssignment{ID: "a_u1_r2", UserID: "u1", RoleID: "r2", ExpiresAt: &past}
 
-	var assignments []plugin.ActiveRoleAssignment
+	var request plugin.EffectivePolicyRequest
 	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
 		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			request = req
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}, request.ActiveAssignments)
+}
+
+// **1 回の解決で ListByUser は 1 回だけ。** roles と activeAssignments を別々に
+// 読む設計に戻ると 2 回になり、hot path に query が 1 本増える。
+func TestEffectivePolicy_ResolutionIssuesExactlyOneQuery(t *testing.T) {
+	svc, roleRepo, assignRepo, counting := newCountingTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assign(t, assignRepo, "u1", "r1")
+	var seen int
+	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
+		func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			seen++
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, 1, seen)
+	assert.Equal(t, 1, counting.listByUserCalls, "roles と activeAssignments は 1 回の ListByUser から共に作られる")
+
+	// warm cache: provider 自身が LRU に当たって resolver を呼ばないが、role
+	// スナップショットは native pass の前に必ず通る。ここで 2 本目が出たら検出できる。
+	_, err = svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, 1, counting.listByUserCalls, "warm cache は 2 つとも答える")
+}
+
+// **invalidation は「読み直す」ために存在する。** 空の assignments を返して黙る、
+// という別の故障を許さない。
+func TestEffectivePolicy_InvalidationRefetchesBothInsteadOfEmptyingAssignments(t *testing.T) {
+	svc, roleRepo, assignRepo, counting := newCountingTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assign(t, assignRepo, "u1", "r1")
+	want := []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}
+	var got [][]plugin.ActiveRoleAssignment
+	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			got = append(got, req.ActiveAssignments)
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	svc.InvalidateUserRoleCache("u1")
+	_, err = svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, counting.listByUserCalls, "invalidated な user は読み直す")
+	require.Len(t, got, 2, "provider は 2 回とも呼ばれる")
+	assert.Equal(t, want, got[0])
+	assert.Equal(t, want, got[1], "invalidation 後の解決で assignments が空に堕ちてはいけない")
+}
+
+// **repository の読み損ねは握り潰さない。** activeAssignments を空で埋めた partial
+// snapshot を渡すと、plugin には「その role に active な assignment が無い」という
+// 嘘が見えるので、provider を起動する前に error にする。
+//
+// 既存の `TestEffectivePolicy_RoleLookupErrorSkipsProvidersAndRemainsDistinct` は同じ
+// 経路を「provider を起動しない」角度で固定している。こちらは assignments 側の契約を
+// 明示する **regression guard** で、実装前から緑になる（既存の `GetUserRoles` が既に
+// error を返すため）。RED は Step 2 の内部 test で観測する。
+func TestEffectivePolicy_AssignmentRepositoryFailureSkipsProviders(t *testing.T) {
+	roleRepo := testutil.NewMockRoleRepository()
+	assignRepo := &failingPolicyAssignmentRepo{
+		MockRoleAssignmentRepository: testutil.NewMockRoleAssignmentRepository(roleRepo),
+		err:                          errors.New("assignment lookup failed"),
+	}
+	metaRepo := newTestMetaRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
+	var providerCalls atomic.Int32
+	var assignments []plugin.ActiveRoleAssignment
+	registerProvider(t, svc, "p", []string{"canSearchNotes"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			providerCalls.Add(1)
 			assignments = req.ActiveAssignments
 			return nil, nil
 		})
 
 	_, err := svc.GetUserPoliciesChecked("u1")
-	require.NoError(t, err)
-	assert.Equal(t, []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}, assignments)
-}
 
-func TestEffectivePolicy_ActiveAssignmentsRideTheRoleCache(t *testing.T) {
-	svc, roleRepo, assignRepo, counting := newCountingTestService(t)
-	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
-	assign(t, assignRepo, "u1", "r1")
-
-	var seen []plugin.ActiveRoleAssignment
-	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
-		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
-			seen = req.ActiveAssignments
-			return nil, nil
-		})
-
-	_, err := svc.GetUserPoliciesChecked("u1")
-	require.NoError(t, err)
-	assert.Equal(t, []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}, seen)
-	assert.Equal(t, int64(1), counting.calls.Load(), "assignment 文脈は 2 本目の query を増やさない")
-
-	// 2 回目は provider 自身が LRU にヒットして resolver を呼ばないが、
-	// activeRoleAssignments は native pass の前に必ず走るので、ここが 2 本目に
-	// 出ていたら検出できる。
-	_, err = svc.GetUserPoliciesChecked("u1")
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), counting.calls.Load(), "warm role cache は role と assignment の両方を答える")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "role: effective policy inputs")
+	assert.Zero(t, providerCalls.Load(), "role 入力を読めないとき provider を起動しない")
+	assert.Nil(t, assignments, "assignment を空で埋めた値で provider を起動しない")
 }
 ```
 
-- [ ] **Step 3: 内部テストのREDを書く**
+`atomic`, `errors`, `time`, `datatypes`, `testutil`, `model`, `plugin`, `role`, `id` はすべて既存の import。**`internal/repository` は追加しない**（`countingAssignmentRepo` は `role_service_test.go` 側で `*testutil.MockRoleAssignmentRepository` を埋めている）。
 
-`internal/core/role/plugin_policy_internal_test.go` の末尾に追記する:
+- [ ] **Step 2: 内部 test を先に書いて、RED を観察する**
+
+`internal/core/role/plugin_policy_internal_test.go` に追記する。内部 API を直接叩くので「partial を返さない」「cache hit が両方を返す」をここで固定する:
 
 ```go
+// countingInternalAssignmentRepo は内部 test から ListByUser の回数と失敗を制御
+// する。**plugin_policy_test.go の countingAssignmentRepo とは package が違うので
+// 別型になる**が、外から見える契約は増やさない。
+type countingInternalAssignmentRepo struct {
+	*testutil.MockRoleAssignmentRepository
+	err   error
+	calls int
+}
+
+func (r *countingInternalAssignmentRepo) ListByUser(userID string) ([]*model.RoleAssignment, error) {
+	r.calls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.MockRoleAssignmentRepository.ListByUser(userID)
+}
+
+func newInternalServiceWithCountingRepo(t *testing.T) (*Service, *testutil.MockRoleRepository, *countingInternalAssignmentRepo) {
+	t.Helper()
+	roleRepo := testutil.NewMockRoleRepository()
+	assignRepo := &countingInternalAssignmentRepo{MockRoleAssignmentRepository: testutil.NewMockRoleAssignmentRepository(roleRepo)}
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x"}
+	idGen, _ := id.NewGenerator("aidx")
+	return NewService(roleRepo, assignRepo, metaRepo, idGen), roleRepo, assignRepo
+}
+
+// 1 回の ListByUser から roles と activeAssignments が同時に得られる。
+func TestResolveUserRoleSnapshotReadsOnceAndReturnsBoth(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	snapshot, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.NoError(t, err)
+	require.Len(t, snapshot.roles, 1)
+	assert.Equal(t, "r1", snapshot.roles[0].ID)
+	assert.Equal(t, []activeRoleAssignment{{roleID: "r1", assignmentID: "a1"}}, snapshot.activeAssignments)
+	assert.Equal(t, 1, assignRepo.calls, "roles と activeAssignments は 1 回の読取から共に作られる")
+}
+
+// warm cache は 0 query で両方を返す。**片方だけ返さない。**
+func TestResolveUserRoleSnapshotCacheHitReturnsBothWithoutReading(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	_, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+	cached, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.NoError(t, err)
+	require.Len(t, cached.roles, 1)
+	assert.Equal(t, []activeRoleAssignment{{roleID: "r1", assignmentID: "a1"}}, cached.activeAssignments,
+		"cache hit は roles と activeAssignments の両方を返す")
+	assert.Equal(t, 1, assignRepo.calls, "cache hit は repository を読まない")
+}
+
+// **cache entry は書き込み済みのスナップショットを返す。** 後から repository を壊しても、
+// cache が assignments を空に堕ちさせない。
+func TestResolveUserRoleSnapshotCacheHitSurvivesRepositoryFailure(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+	_, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+
+	assignRepo.err = errors.New("assignment lookup failed")
+	cached, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.NoError(t, err)
+	assert.Equal(t, []activeRoleAssignment{{roleID: "r1", assignmentID: "a1"}}, cached.activeAssignments)
+	assert.Equal(t, 1, assignRepo.calls, "cache hit は repository に触れない")
+}
+
+// **partial snapshot を返さない。** error のとき zero snapshot が返る。
+func TestResolveUserRoleSnapshotPropagatesRepositoryErrorWithoutPartialResult(t *testing.T) {
+	svc, _, assignRepo := newInternalServiceWithCountingRepo(t)
+	readErr := errors.New("assignment lookup failed")
+	assignRepo.err = readErr
+
+	snapshot, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.ErrorIs(t, err, readErr)
+	assert.Empty(t, snapshot.roles, "roles だけ埋まった partial snapshot を返さない")
+	assert.Empty(t, snapshot.activeAssignments, "assignments を空で埋めない")
+}
+
+// 匿名は非nil空の snapshot を error なしで返す（repository にも触らない）。
+func TestResolveUserRoleSnapshotAnonymousIsNonNilAndErrorFree(t *testing.T) {
+	svc, _, assignRepo := newInternalServiceWithCountingRepo(t)
+
+	snapshot, err := svc.resolveUserRoleSnapshot("")
+
+	require.NoError(t, err)
+	assert.NotNil(t, snapshot.activeAssignments)
+	assert.Empty(t, snapshot.activeAssignments)
+	assert.Empty(t, snapshot.roles)
+	assert.Zero(t, assignRepo.calls, "匿名解決は repository を読まない")
+}
+
+// GetUserRoles は互換ラッパ。roles だけを返し、2 回読まない。
+func TestGetUserRolesKeepsItsSignatureAndHidesAssignments(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	roles, err := svc.GetUserRoles("u1")
+
+	require.NoError(t, err)
+	require.Len(t, roles, 1)
+	assert.Equal(t, "r1", roles[0].ID)
+	assert.Equal(t, 1, assignRepo.calls, "ラッパが 2 回読まない")
+}
+
+// 返した snapshot を書き換えても cache は変わらない。
+func TestResolveUserRoleSnapshotReturnsACopy(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	first, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+	first.activeAssignments[0].assignmentID = "mutated"
+
+	second, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+	assert.Equal(t, "a1", second.activeAssignments[0].assignmentID, "cache は非共有の複製を返す")
+	assert.Equal(t, 1, assignRepo.calls)
+}
+
+// assignment 同一性が provider の cache key に入らないと付け外しの直後に古い結果を
+// 返す。**RoleIDs は両者とも空**なので差の出所は assignment だけ。
 func TestPolicyProviderCacheKeySeparatesAssignmentIdentities(t *testing.T) {
 	runtime := newPolicyProviderRuntime(defaultEffectivePolicyProviderCacheEntries)
 	provider := policyProvider{
 		reg: plugin.EffectivePolicyRegistration{
 			Keys: []string{"canSearchNotes"},
-			// RoleIDs は両者とも空。**結果が変わるのは assignment だけ**なので、
-			// これが cache key に assignment 入ったことの直接の証拠になる。
 			Resolve: func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
 				granted := req.ActiveAssignments[0].AssignmentID == "a1"
 				return []plugin.EffectivePolicyContribution{{Key: "canSearchNotes", Priority: 2, Value: granted}}, nil
@@ -446,60 +674,179 @@ func TestEncodePolicyProviderAssignmentsPreventsConcatenationCollision(t *testin
 }
 ```
 
-- [ ] **Step 4: RED を確認する**
+必要な import は `internal/testutil` と `internal/model`。`errors`, `context`, `plugin`, `require`, `assert`, `id` は既にある。
+
+RED を観察する:
 
 ```powershell
 go vet ./internal/core/role
-go test ./internal/core/role -count=1 -run "TestEffectivePolicy_ActiveAssign|TestPolicyProviderCacheKeySeparatesAssignmentIdentities|TestEncodePolicyProviderAssignments"
+go test ./internal/core/role -count=1 -run "TestEffectivePolicy_ActiveAssign|TestEffectivePolicy_ResolutionIssuesExactlyOneQuery|TestEffectivePolicy_InvalidationRefetchesBoth|TestEffectivePolicy_AssignmentRepositoryFailure|TestResolveUserRoleSnapshot|TestGetUserRolesKeepsItsSignature|TestPolicyProviderCacheKeySeparatesAssignmentIdentities|TestEncodePolicyProviderAssignments"
 ```
 
-Expected: コンパイルエラー（`activeRoleAssignments` / `encodePolicyProviderAssignments` が未定義）。`ActiveAssignments` を渡さないので `assert` 側も落ちている。
+Expected: **コンパイルエラー**。`undefined: resolveUserRoleSnapshot` / `undefined: activeRoleAssignment` / `undefined: encodePolicyProviderAssignments` / `unknown field ActiveAssignments`（外部 test 側）。production はまだ1行も変えていない。
 
-- [ ] **Step 5: `roleService` 側でassignmentをcache に積む**
+- [ ] **Step 3: production を実装する（role 側）**
 
-`internal/core/role/role_service.go` の `type roleCacheEntry struct` を次のように変更する:
+`internal/core/role/role_service.go` の `cloneRoles` の**直後**に snapshot 型を追加する:
+
+```go
+// userRoleSnapshot は 1 ユーザーの role 解決結果: 解決済み roles と、それを支撑する
+// active manual assignment。
+//
+// **2 つを返す。1 回で読む。** assignment の唯一の供給源は `ListByUser` なので、
+// roles と同じ操作で読むことが「policy 解決が 1 query のまま」という性質と、
+// 「片方にだけ現れる role がない」という整合性を同時に守る。
+type userRoleSnapshot struct {
+	roles             []*model.Role
+	activeAssignments []activeRoleAssignment
+}
+
+// clone は cache entry と呼び出し側のどちらかが他の変更を観測しないよう値を複製
+// する（GetUserRoles が roles に対してやっていたことと同じ）。
+func (s userRoleSnapshot) clone() userRoleSnapshot {
+	return userRoleSnapshot{
+		roles:             cloneRoles(s.roles),
+		activeAssignments: cloneActiveRoleAssignments(s.activeAssignments),
+	}
+}
+```
+
+`type roleCacheEntry struct` を次のように変更する:
 
 ```go
 type roleCacheEntry struct {
-	roles []*model.Role
-	// assignments は同じ cache entry の active manual assignment。**roles と
-	// 1 回の ListByUser から共に作られる**ので、effective policy の解決が
-	// 2 本目の query を出さずに assignment を渡せる。expiry も roles と同じ
-	// （最も早い assignment の expiresAt との min）。
-	assignments []activeRoleAssignment
-	expiresAt   time.Time
+	// snapshot は roles と activeAssignments の組。**1 回の ListByUser から共に
+	// 積まれる**ので、2 者の整合性が壊れることがなく、解決は 1 query で済む。
+	snapshot  userRoleSnapshot
+	expiresAt time.Time
+}
+```
+
+`GetUserRoles` の実装全体を、**内部操作 + 互換ラッパ**の2つに置き換える（doc も一緒に書く）:
+
+```go
+// resolveUserRoleSnapshot resolves the user's active roles and their active
+// manual assignments, serving the per-user cache when it is warm.
+//
+// **戻り値は常に cache と非共有の複製。** 呼び出し側が書き換えても cache は
+// 変わらない。
+//
+// **partial snapshot を返さない。** `ListByUser` が失敗したら roles も
+// activeAssignments も一切埋めずに error を返す。片方だけ返すと、plugin には
+// 「その role に active な assignment が無い」という嘘が見える。
+func (s *Service) resolveUserRoleSnapshot(userID string) (userRoleSnapshot, error) {
+	if userID == "" {
+		return userRoleSnapshot{roles: nil, activeAssignments: []activeRoleAssignment{}}, nil
+	}
+	s.userRoleCacheMu.RLock()
+	if entry := s.userRoleCache[userID]; entry != nil && time.Now().Before(entry.expiresAt) {
+		snapshot := entry.snapshot.clone()
+		s.userRoleCacheMu.RUnlock()
+		return snapshot, nil
+	}
+	s.userRoleCacheMu.RUnlock()
+
+	s.userRoleCacheMu.Lock()
+	allEpoch := s.allUserRoleEpoch
+	userEpoch := s.userRoleEpoch[userID]
+	s.userRoleFlights[userID]++
+	s.userRoleCacheMu.Unlock()
+	defer s.finishUserRoleFlight(userID)
+
+	// **唯一の読取点。** roles と activeAssignments はこの 1 回から共に作られる。
+	assignments, err := s.assignmentRepo.ListByUser(userID)
+	if err != nil {
+		return userRoleSnapshot{}, err
+	}
+	assignedRoles := make([]*model.Role, 0, len(assignments))
+	for _, a := range assignments {
+		if a.Role != nil {
+			assignedRoles = append(assignedRoles, a.Role)
+		}
+	}
+	activeAssignments := activeRoleAssignmentsFrom(assignments)
+
+	// Conditional role 評価: 全 role を fetch して target=conditional のみを formula
+	// 評価で絞り込む。assigned roles と matched conditional の和集合を返す。upstream
+	// TS の getUserRoles と同じ順 (assigned が先)。
+	//
+	// roleRepo / userRepo どちらかが未配線なら、conditional 評価は skip して
+	// assigned のみを返す (= 旧挙動)。test 経路で userRepo 未注入のケースに
+	// 配慮した soft-fail。
+	condRoles := s.evaluateConditionalRoles(userID, assignedRoles)
+	roles := append(assignedRoles, condRoles...)
+
+	// #2106 S5: cache 失効を「TTL」と「最も早い assignment expiresAt」の min にする。
+	// ListByUser は fetch 時点で有効な assignment しか返さないが、TTL 中に期限切れに
+	// なる time-limited assignment はそのまま cache に残り、最大 roleCacheTTL の間
+	// role/policy として効き続けてしまう (upstream は getUserAssigns で read 毎に
+	// expiresAt を再 filter)。entry を soonest expiry で drop すれば、次 read が
+	// 再 fetch して DB filter が期限切れ assignment を除外する。
+	cacheExpiry := time.Now().Add(roleCacheTTL)
+	for _, a := range assignments {
+		if a.ExpiresAt != nil && a.ExpiresAt.Before(cacheExpiry) {
+			cacheExpiry = *a.ExpiresAt
+		}
+	}
+
+	snapshot := userRoleSnapshot{roles: roles, activeAssignments: activeAssignments}
+	s.userRoleCacheMu.Lock()
+	if s.allUserRoleEpoch == allEpoch && s.userRoleEpoch[userID] == userEpoch {
+		s.userRoleCache[userID] = &roleCacheEntry{snapshot: snapshot.clone(), expiresAt: cacheExpiry}
+	}
+	s.userRoleCacheMu.Unlock()
+	return snapshot.clone(), nil
+}
+
+// GetUserRoles returns all active roles applied to the user. The returned
+// slice is the union of (a) manually assigned roles that have not expired and
+// (b) `target=conditional` roles whose `condFormula` evaluates to true for the
+// user. Mirrors upstream Misskey TS `RoleService.getUserRoles` so
+// admin-authored conditional roles (e.g. "base role for all local users")
+// take effect at gate sites like HasRolePolicy (#1020).
+//
+// 結果は roleCacheTTL 期間 in-memory にキャッシュされる (#300 3-5)。
+// Conditional 評価結果も同じ cache に乗るので、user の followers/notes count
+// などが変動しても最大 5 分の反映遅延がある点に注意 (= upstream TS と同じ
+// trade-off)。
+//
+// **active manual assignment も同時に解決している**が、この公開 API は外へ返さない。
+// assignment を露出するのは resolveUserRoleSnapshot を直接使う effective policy
+// 解決だけ。
+func (s *Service) GetUserRoles(userID string) ([]*model.Role, error) {
+	snapshot, err := s.resolveUserRoleSnapshot(userID)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.roles, nil
 }
 ```
 
 `GetUserAssigns` の**直前**に型と生成helperを追加する:
 
 ```go
-// activeRoleAssignment は active な手動role assignment と、その role の組。
-// effective policy の解決が plugin へ渡す assignment 同一性を、role cache
-// entry の隣で保持する。
+// activeRoleAssignment は active な手動role assignment と、その role の組。role cache
+// entry の隣で保持し、effective policy の解決が plugin へ渡す assignment 同一性を表す。
 type activeRoleAssignment struct {
 	roleID       string
 	assignmentID string
 }
 
-// activeRoleAssignmentsFrom は active manual assignment を「1 role につき
-// 高々 1 件」に還元する。
+// activeRoleAssignmentsFrom は active manual assignment を「1 role につき高々 1 件」
+// に還元する。
 //
-// **`Role` が nil なら入れない。** role 行を消した orphan assignment は
-// GetUserRoles からも掉落しているので、ActiveAssignments に出すと native
-// contribution の無い role を置換できてしまう。
+// **`Role` が nil なら入れない。** role 行を消した orphan assignment は resolved roles
+// からも落ちるので、入れないと「置換対象なのに native contribution の無い role」になる。
 //
-// **conditional role は入れない。** `role_assignment` の行は手動割り当て
-// だけが持つので、`target=conditional` の role を指す行はロールを
-// manual → conditional に切り替えた直後などの残骸であり、置換対象にならない。
-// `target` が空文字のものは通す — DB の `role_target` は既定 `manual` なので、
-// 「conditional ではない」を読めば本番と一致する。
+// **conditional role は入れない。** `role_assignment` の行は手動割り当てだけが持つので、
+// `target=conditional` の role を指す行はロールを manual → conditional に切り替えた
+// 直後などの残骸であり、置換対象にならない。`target` が空文字のものは通す — DB の
+// `role_target` は既定 `manual` なので、「conditional ではない」を読めば本番と一致する。
 //
-// **同じ role が複数行あれば assignment ID の最小値 1 件だけを残す。**
-// `Assign` は先に `Exists` を見るので通常 1 行しか無いが、1 対 1 の置換が
-// 成立するには「active な手動ロールにつき assignment は 1 つ」であることが
-// host の**保証**になっている必要がある。決まっていないと置換対象が一意に
-// 定まらない。
+// **同じ role が複数行あれば assignment ID の最小値 1 件だけを残す。** `Assign` は先に
+// `Exists` を見るので通常 1 行しか無いが、1 対 1 の置換が成立するには「active な手動
+// ロールにつき assignment は 1 つ」であることが host の**保証**になっている必要がある。
+// 決まっていないと置換対象が一意に定まらない。
 func activeRoleAssignmentsFrom(assignments []*model.RoleAssignment) []activeRoleAssignment {
 	out := make([]activeRoleAssignment, 0, len(assignments))
 	at := make(map[string]int, len(assignments))
@@ -528,8 +875,8 @@ func activeRoleAssignmentsFrom(assignments []*model.RoleAssignment) []activeRole
 	return out
 }
 
-// cloneActiveRoleAssignments は cache entry を読んだ側が書き換えないよう値を
-// 複製する（GetUserRoles が roles に対してやるのと同じ方針）。
+// cloneActiveRoleAssignments は値を複製して返す。cache entry を読み出した側が
+// 書き換えないようにする。
 func cloneActiveRoleAssignments(in []activeRoleAssignment) []activeRoleAssignment {
 	if in == nil {
 		return nil
@@ -538,41 +885,55 @@ func cloneActiveRoleAssignments(in []activeRoleAssignment) []activeRoleAssignmen
 }
 ```
 
-`GetUserRoles` の `assignments, err := s.assignmentRepo.ListByUser(userID)` の**直後**に1行挿入する:
+- [ ] **Step 4: production を実装する（host 側）**
+
+`internal/core/role/plugin_policy.go` の `type policyProviderCacheKey struct` にフィールドを1つ追加する:
 
 ```go
-	// **cache entry にも積む。** effective policy の解決は GetUserRoles の
-	// 直後に active assignment を欲しがるので、ここから読むことで 2 本目の
-	// query を出さない (#300 3-5 の cache 方針と同一)。
-	activeAssignments := activeRoleAssignmentsFrom(assignments)
+	// assignments は ActiveAssignments の encoding。**RoleIDs が同じでも assignment が
+	// 違えば結果は違う** plugin がある（assignment ごとに状態を持つ）ので、付けないと
+	// 付け外し / 再割り当ての直後に前の結果を返す。
+	assignments string
 ```
 
-`s.userRoleCache[userID] = &roleCacheEntry{...}` を次のように変更する:
+`resolvePolicies` の
 
 ```go
-		s.userRoleCache[userID] = &roleCacheEntry{
-			roles:       snapshot,
-			assignments: cloneActiveRoleAssignments(activeAssignments),
-			expiresAt:   cacheExpiry,
+	roles := []*model.Role{}
+	if userID != "" {
+		var err error
+		roles, err = s.GetUserRoles(userID)
+		if err != nil {
+			return s.applyServerCaps(base), fmt.Errorf("role: effective policy inputs: %w", err)
 		}
+	}
 ```
 
-- [ ] **Step 6: `plugin_policy.go` 側で request を組み立てる**
-
-`internal/core/role/plugin_policy.go` の
+を次のように置き換える:
 
 ```go
-	// provider には現在 active な native RoleID のみを、ソート + clone して渡す。
-	roleIDs := activeRoleIDs(roles)
+	roles := []*model.Role{}
+	activeAssignments := []activeRoleAssignment{}
+	if userID != "" {
+		// **1 回の読取から roles と activeAssignments を共に得る。** repository が読めない
+		// ときは activeAssignments を空で埋めた snapshot を渡さず、provider を起動する
+		// 前に checked error にする。
+		snapshot, err := s.resolveUserRoleSnapshot(userID)
+		if err != nil {
+			return s.applyServerCaps(base), fmt.Errorf("role: effective policy inputs: %w", err)
+		}
+		roles = snapshot.roles
+		activeAssignments = snapshot.activeAssignments
+	}
 ```
 
-の**直後**に追記する:
+`// provider には現在 active な native RoleID のみを、ソート + clone して渡す。` の**直後**に追記する:
 
 ```go
-	// active manual assignment も渡す。**同じ role cache entry から読む**ので
-	// 2 本目の query は出ない。RoleIDs だけでは「同じ role でもどの assignment
-	// なのか」が分からず、assignment に紐づく状態を持つ plugin が作れないため。
-	assignments := s.activeRoleAssignments(userID)
+	// active manual assignment も渡す。**同じ snapshot から写す**ので 2 本目の query は
+	// 出ない。RoleIDs だけでは「同じ role でもどの assignment なのか」が分からず、
+	// assignment に紐づく状態を持つ plugin が作れないため。戻り値は常に非nil（匿名は空slice）。
+	assignments := pluginActiveRoleAssignments(activeAssignments)
 ```
 
 provider を呼ぶ goroutine 内の request 構築を次のように変更する:
@@ -590,19 +951,6 @@ provider を呼ぶ goroutine 内の request 構築を次のように変更する
 					ActiveAssignments: providerAssignments,
 				},
 			)
-```
-
-`type policyProviderCacheKey struct` にフィールドを1つ追加する:
-
-```go
-type policyProviderCacheKey struct {
-	userID  string
-	roleIDs string
-	// assignments は ActiveAssignments の encoding。**RoleIDs が同じでも
-	// assignment が違えば結果は違う** plugin がある（assignment ごとに状態を
-	// 持つ）ので、付けないと付け外し / 再割り当ての直後に前の結果を返す。
-	assignments string
-}
 ```
 
 `resolvePolicyProviderCached` の先頭にある
@@ -626,8 +974,8 @@ type policyProviderCacheKey struct {
 ```go
 // encodePolicyProviderAssignments は role ID と assignment ID の**両方を**
 // length-prefix して key にする。片方だけ prefix すると
-// `{RoleID: "a", AssignmentID: "bc"}` と `{RoleID: "ab", AssignmentID: "c"}` が
-// 同じ key になり、plugin には別の user の assignment ID が渡る。
+// `{RoleID: "a", AssignmentID: "bc"}` と `{RoleID: "ab", AssignmentID: "c"}` が同じ key に
+// なり、plugin には別の user の assignment ID が渡る。
 func encodePolicyProviderAssignments(assignments []plugin.ActiveRoleAssignment) string {
 	var encoded strings.Builder
 	for _, a := range assignments {
@@ -642,42 +990,11 @@ func encodePolicyProviderAssignments(assignments []plugin.ActiveRoleAssignment) 
 }
 ```
 
-`func activeRoleIDs(` の**直前**に accessor を追加する:
+`func activeRoleIDs(` の**直前**に型変換helperを追加する:
 
 ```go
-// activeRoleAssignments は解決リクエストの active manual role assignment を
-// 返す。**空文字 userID には非nil空sliceを返す**（匿名解決の契約）。
-//
-// **GetUserRoles と同じ per-user cache entry を読む。** 解決経路では直前に
-// GetUserRoles が走っているので、2 本目の query が出ない。cache がないとき
-// だけ repository を直接読む = 単独で呼んでも壊れないが、解決経路では起こら
-// ない。
-//
-// **読み損ねたら空を返す。** 同じ repository 読みの失敗は直前の GetUserRoles
-// が error にしているはずなので、解決経路ではここに到達しない。単独呼び出しで
-// 失敗した場合も「置換しない」= native fallback 側なので、握り潰す向きは安全。
-func (s *Service) activeRoleAssignments(userID string) []plugin.ActiveRoleAssignment {
-	if userID == "" {
-		return []plugin.ActiveRoleAssignment{}
-	}
-	s.userRoleCacheMu.RLock()
-	entry := s.userRoleCache[userID]
-	if entry != nil && time.Now().Before(entry.expiresAt) {
-		cached := pluginActiveRoleAssignments(entry.assignments)
-		s.userRoleCacheMu.RUnlock()
-		return cached
-	}
-	s.userRoleCacheMu.RUnlock()
-	assignments, err := s.assignmentRepo.ListByUser(userID)
-	if err != nil {
-		slog.Warn("role: active assignments を読み込めませんでした", "err", err)
-		return []plugin.ActiveRoleAssignment{}
-	}
-	return pluginActiveRoleAssignments(activeRoleAssignmentsFrom(assignments))
-}
-
-// pluginActiveRoleAssignments は host 内部型を公開plugin型へ写す。戻り値は
-// 常に非nil（len 0 でも make の戻りなので nil にならない）。
+// pluginActiveRoleAssignments は host 内部型を公開plugin型へ写す。戻り値は常に非nil
+//（len 0 でも make の戻りなので nil にならない）— 匿名解決の契約。
 func pluginActiveRoleAssignments(in []activeRoleAssignment) []plugin.ActiveRoleAssignment {
 	out := make([]plugin.ActiveRoleAssignment, len(in))
 	for i, a := range in {
@@ -687,7 +1004,7 @@ func pluginActiveRoleAssignments(in []activeRoleAssignment) []plugin.ActiveRoleA
 }
 ```
 
-- [ ] **Step 7: focused command で GREEN を確認する**
+- [ ] **Step 5: GREEN を確認する**
 
 ```powershell
 & (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -w internal\core\role\role_service.go internal\core\role\plugin_policy.go internal\core\role\plugin_policy_test.go internal\core\role\plugin_policy_internal_test.go
@@ -695,9 +1012,14 @@ go vet ./internal/core/role
 go test ./internal/core/role -count=1
 ```
 
-Expected: PASS。`TestEffectivePolicy_RoleIDsSortedAndCloned` を含む既存のproviderテストも引き続き緑（`RoleIDs` を変えないため）。
+Expected: PASS。**`internal/core/role` の全テストが緑**。特に次の既存テストが落ちないこと:
 
-- [ ] **Step 8: commit する**
+- `TestEffectivePolicy_RoleLookupErrorSkipsProvidersAndRemainsDistinct`（role 入力 error で provider を起動しない）
+- `TestEffectivePolicy_MetaBaseAndRoleInputFailuresBothReported`（`role: effective policy inputs` の wrap 文面）
+- `TestGetUserRoles_CacheExpiryCappedAtAssignmentExpiry` / `TestGetUserRoles_ExpiredEntryPublishesAndReturnsIndependentSnapshot`（`role_s5_internal_test.go` は `entry.expiresAt` を読むだけなので snapshot 化で壊れない）
+- `role_service_test.go` の cache テスト（`listByUserCalls` の既存主張）
+
+- [ ] **Step 6: commit する**
 
 ```powershell
 git diff --check
@@ -706,7 +1028,7 @@ git add internal/core/role/role_service.go internal/core/role/plugin_policy.go i
 git commit -m "Add role: expose active assignments to effective policy providers"
 ```
 
-Expected: 1 commit。query回数・conditional除外・orphan除外・expiry除外・非nil空sliceの test が一緒に並ぶ。**この commit の SHA を控えておく**。
+Expected: 1 commit。query回数・conditional除外・orphan除外・expiry除外・非nil空slice・partial非返却の test が一緒に並ぶ。**この commit の SHA を控えておく**。
 
 ---
 
@@ -715,9 +1037,9 @@ Expected: 1 commit。query回数・conditional除外・orphan除外・expiry除�
 `computePolicy` は「ロールごとに `map[key]override` を持つ」形なので、ロールの identity が失われていて置換を差し込めない。**挙動を変えずに**、ロール ID ごと・置換 entry 任意の `rolePolicyInput` へ持ち替える。Task 4 の差分を最小にするための土台。
 
 **Files:**
-- Modify: `internal/core/role/role_service.go:1220-1234` (`policyEntry` の直後に `rolePolicyInput` / `rolePolicyEntry`)、`:1236-1293` (`computePolicy`)、`:2091` の直前（`newRolePolicyInputs`）
-- Modify: `internal/core/role/plugin_policy.go:208-215`（`roleOverrides` のループを `roleInputs` へ）、`:219`、`:280`
-- Test: `internal/core/role/optout_aggregation_test.go`（`computePolicy` の呼び出し 4 箇所）
+- Test: `internal/core/role/optout_aggregation_test.go`（`policyInputs` helper と `computePolicy` の呼び出し 4 箇所）
+- Modify: `internal/core/role/role_service.go`（`rolePolicyInput` / `rolePolicyEntry` / `newRolePolicyInputs` / `computePolicy`）
+- Modify: `internal/core/role/plugin_policy.go`（`roleOverrides` のループを `roleInputs` へ、呼び出し 2 箇所）
 
 **Interfaces:**
 - Consumes: なし（Task 2 の変更に依存しない純粋な refactor）
@@ -727,14 +1049,14 @@ Expected: 1 commit。query回数・conditional除外・orphan除外・expiry除�
 - Produces: 内部テスト helper `policyInputs(overrides ...map[string]rolePolicyOverride) []rolePolicyInput`
 - Changes: `computePolicy(key string, baseVal any, inputs []rolePolicyInput, extra []policyEntry) any`（第3引数の型が `[]map[string]rolePolicyOverride` から `[]rolePolicyInput` に変わる。internal 関数なので公開面ではない）
 
-- [ ] **Step 1: テストを新しい形へ書き換える（RED を作る）**
+- [ ] **Step 1: test を先に新しい形へ書き換える（RED を作る）**
 
 `internal/core/role/optout_aggregation_test.go` の import 直後に helper を追加する:
 
 ```go
-// policyInputs は「ロールごとの override だけを持つ」test 入力を
-// rolePolicyInput へ包む。roleID は空のままでよい — この file の test は置換を
-// 扱わない（置換は plugin_policy_test.go 側）。
+// policyInputs は「ロールごとの override だけを持つ」test 入力を rolePolicyInput へ
+// 包む。roleID は空のままでよい — この file の test は置換を扱わない（置換は
+// plugin_policy_test.go 側）。
 func policyInputs(overrides ...map[string]rolePolicyOverride) []rolePolicyInput {
 	out := make([]rolePolicyInput, 0, len(overrides))
 	for _, m := range overrides {
@@ -770,6 +1092,106 @@ got := computePolicy(PolicyOptOutNotificationTypes, []string{},
 	), nil)
 ```
 
+**この時点では production に手を入れていない。** `plugin_policy.go` の `roleOverrides` ループも `computePolicy` の呼び出しも、まだ元の形のままにする。
+
+- [ ] **Step 2: RED を観察する**
+
+```powershell
+go vet ./internal/core/role
+```
+
+Expected: コンパイルエラー。`undefined: rolePolicyInput`、および `computePolicy` の引数型が不一致というエラー。production を触っていないので、`rolePolicyInput` が無いことだけが原因になる。
+
+- [ ] **Step 3: production を実装する（型と entry ビルダー）**
+
+`internal/core/role/role_service.go` の `type policyEntry struct` の**直後**に追加する:
+
+```go
+// rolePolicyInput は 1 つのロールが集約に贈るものの全体:
+//
+//	- roleID: どのロールか（置換の対象を突き合わせるため）
+//	- overrides: `Role.Policies` を key ごとに decode した結果
+//	- replacements: provider がこの要求で「native contribution の代わりに使う」と
+//	  宣言した entry（key ごと）。provider が置換しなかったロールは nil。
+//
+// **aggregator は一切知らない。** entry を 1 つ選んで priority cascade に積むだけなので、
+// 置換の有無は関数内で完結する。
+type rolePolicyInput struct {
+	roleID    string
+	overrides map[string]rolePolicyOverride
+	// replacements はこのロールの置換 entry。provider が置換しなかったロールでは
+	// nil のまま（= native entry が使われる）。
+	replacements map[string]policyEntry
+}
+
+// entry は、このロールが key に対して贈る entry を返す。置換されていれば置換 entry
+//（**元 native entry の priority を引き継ぐ**）、されていなければ native entry。
+func (in rolePolicyInput) entry(key string, baseVal any) policyEntry {
+	if replacement, ok := in.replacements[key]; ok {
+		return replacement
+	}
+	return rolePolicyEntry(in.overrides, key, baseVal)
+}
+
+// rolePolicyEntry は置換されていないロールが key に贈る entry。**この role が key を
+// 宣言していない場合は base 値を priority 0 で参加させる**という upstream 互換の既定が
+// ここに入る。
+func rolePolicyEntry(overrides map[string]rolePolicyOverride, key string, baseVal any) policyEntry {
+	p, ok := overrides[key]
+	if !ok {
+		return policyEntry{priority: 0, value: baseVal}
+	}
+	if p.UseDefault {
+		return policyEntry{priority: p.Priority, value: baseVal}
+	}
+	return policyEntry{priority: p.Priority, value: p.Value, explicit: true}
+}
+
+// newRolePolicyInputs は解決したロールを「ロールIDつきで集約できる」形へ変換する。
+// `Role.Policies` が空 / パース不能なロールは overrides が nil のまま入り、集約では
+// base 参加 = 従来と同じ。
+func newRolePolicyInputs(roles []*model.Role) []rolePolicyInput {
+	out := make([]rolePolicyInput, 0, len(roles))
+	for _, r := range roles {
+		if r == nil {
+			out = append(out, rolePolicyInput{})
+			continue
+		}
+		if len(r.Policies) == 0 {
+			out = append(out, rolePolicyInput{roleID: r.ID})
+			continue
+		}
+		out = append(out, rolePolicyInput{roleID: r.ID, overrides: parseRolePolicies(r.Policies)})
+	}
+	return out
+}
+```
+
+`computePolicy` の doc・シグネチャ・**先頭ループだけ**を次のように置き換える（`collected` 以降は変更しない）:
+
+```go
+// computePolicy resolves the effective value for a single policy key by
+// applying upstream TS priority cascade + per-key aggregator. baseVal is the
+// merged default+meta value used when a role specifies useDefault=true or when
+// no role has an override. inputs carries each role's parsed policies plus the
+// replacement entries an effective-policy provider supplied for it. extra
+// carries effective-policy provider contributions for the key (already validated
+// & type-checked by the host); it is merged into the same priority cascade as the
+// role overrides.
+func computePolicy(key string, baseVal any, inputs []rolePolicyInput, extra []policyEntry) any {
+	// 各 role がこの policy に贈る entry を組み立てる。entry 無し = priority=0,
+	// useDefault=true (= base にフォールバック) として扱う。
+	collected := make([]policyEntry, 0, len(inputs)+len(extra))
+	for _, in := range inputs {
+		collected = append(collected, in.entry(key, baseVal))
+	}
+	// provider contribution は同じ priority cascade に参加させる (= native と provider は
+	// 同一 priority グループ内で aggregate される)。
+	collected = append(collected, extra...)
+```
+
+- [ ] **Step 4: production を実装する（呼び出し側）**
+
 `internal/core/role/plugin_policy.go` の `roleOverrides` を組み立てるループ
 
 ```go
@@ -796,104 +1218,7 @@ got := computePolicy(PolicyOptOutNotificationTypes, []string{},
 		out[key] = computePolicy(key, base[key], roleInputs, entries)
 ```
 
-- [ ] **Step 2: コンパイルが RED になることを確認する**
-
-```powershell
-go vet ./internal/core/role
-```
-
-Expected: `rolePolicyInput` / `rolePolicyEntry` / `newRolePolicyInputs` が未定義、`computePolicy` の引数型が不一致というエラー。
-
-- [ ] **Step 3: `rolePolicyInput` と `rolePolicyEntry` を実装する**
-
-`internal/core/role/role_service.go` の `type policyEntry struct` の**直後**に追加する:
-
-```go
-// rolePolicyInput は 1 つのロールが集約に贈るものの全体:
-//
-//	- roleID: どのロールか（置換の対象を突き合わせるため）
-//	- overrides: `Role.Policies` を key ごとに decode した結果
-//	- replacements: provider がこの要求で「native contribution の代わりに使う」
-//	  と宣言した entry（key ごと）。provider が置換しなかったロールは nil。
-//
-// **aggregator は一切知らない。** entry を 1 つ選んで priority cascade に
-// 積むだけなので、置換の有無は関数内で完結する。
-type rolePolicyInput struct {
-	roleID    string
-	overrides map[string]rolePolicyOverride
-	// replacements はこのロールの置換 entry。provider が置換しなかったロール
-	// では nil のまま（= native entry が使われる）。
-	replacements map[string]policyEntry
-}
-
-// entry は、このロールが key に対して贈る entry を返す。置換されていれば
-// 置換 entry（**元 native entry の priority を引き継ぐ**）、されていなければ
-// native entry。
-func (in rolePolicyInput) entry(key string, baseVal any) policyEntry {
-	if replacement, ok := in.replacements[key]; ok {
-		return replacement
-	}
-	return rolePolicyEntry(in.overrides, key, baseVal)
-}
-
-// rolePolicyEntry は置換されていないロールが key に贈る entry。**この role が
-// key を宣言していない場合は base 値を priority 0 で参加させる**という
-// upstream 互換の既定がここに入る。
-func rolePolicyEntry(overrides map[string]rolePolicyOverride, key string, baseVal any) policyEntry {
-	p, ok := overrides[key]
-	if !ok {
-		return policyEntry{priority: 0, value: baseVal}
-	}
-	if p.UseDefault {
-		return policyEntry{priority: p.Priority, value: baseVal}
-	}
-	return policyEntry{priority: p.Priority, value: p.Value, explicit: true}
-}
-
-// newRolePolicyInputs は解決したロールを「ロールIDつきで集約できる」形へ
-// 変換する。`Role.Policies` が空 / パース不能なロールは overrides が nil の
-// まま入り、集約では base 参加 = 従来と同じ。
-func newRolePolicyInputs(roles []*model.Role) []rolePolicyInput {
-	out := make([]rolePolicyInput, 0, len(roles))
-	for _, r := range roles {
-		if r == nil {
-			out = append(out, rolePolicyInput{})
-			continue
-		}
-		if len(r.Policies) == 0 {
-			out = append(out, rolePolicyInput{roleID: r.ID})
-			continue
-		}
-		out = append(out, rolePolicyInput{roleID: r.ID, overrides: parseRolePolicies(r.Policies)})
-	}
-	return out
-}
-```
-
-`computePolicy` の doc とシグネチャ、そして**先頭ループだけ**を次のように置き換える（`collected` 以降は変更しない）:
-
-```go
-// computePolicy resolves the effective value for a single policy key by
-// applying upstream TS priority cascade + per-key aggregator. baseVal is
-// the merged default+meta value used when a role specifies useDefault=true
-// or when no role has an override. inputs carries each role's parsed policies
-// plus the replacement entries an effective-policy provider supplied for it.
-// extra carries effective-policy provider contributions for the key (already
-// validated & type-checked by the host); it is merged into the same priority
-// cascade as the role overrides.
-func computePolicy(key string, baseVal any, inputs []rolePolicyInput, extra []policyEntry) any {
-	// 各 role がこの policy に贈る entry を組み立てる。entry 無し =
-	// priority=0, useDefault=true (= base にフォールバック) として扱う。
-	collected := make([]policyEntry, 0, len(inputs)+len(extra))
-	for _, in := range inputs {
-		collected = append(collected, in.entry(key, baseVal))
-	}
-	// provider contribution は同じ priority cascade に参加させる
-	// (= native と provider は同一 priority グループ内で aggregate される)。
-	collected = append(collected, extra...)
-```
-
-- [ ] **Step 4: 挙動が変わっていないことを確認する（GREEN）**
+- [ ] **Step 5: GREEN を確認する**
 
 ```powershell
 & (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -w internal\core\role\role_service.go internal\core\role\plugin_policy.go internal\core\role\optout_aggregation_test.go
@@ -901,9 +1226,9 @@ go vet ./internal/core/role
 go test ./internal/core/role -count=1
 ```
 
-Expected: PASS。**`internal/core/role` の全テスト（2000行超の `plugin_policy_test.go` / `role_service_test.go`、intersection/priority の `optout_aggregation_test.go`、`cond_formula_test.go` を含む）が1つも落ちないこと**。これが挙動保存の証拠になる。
+Expected: PASS。**`internal/core/role` の全テスト（2000行超の `plugin_policy_test.go` / `role_service_test.go`、intersection/priority の `optout_aggregation_test.go`、`cond_formula_test.go`、`users_with_policy_test.go` を含む）が1つも落ちないこと**。これが挙動保存の証拠になる。
 
-- [ ] **Step 5: commit する**
+- [ ] **Step 6: commit する**
 
 ```powershell
 git diff --check
@@ -918,21 +1243,20 @@ Expected: 1 commit。`git diff --stat` は3ファイル。**この commit の SH
 
 ### Task 4: Role Policy Replacement (Public Contract, Application, Conflict)
 
-`ReplaceRoleID` を公開面に足し、host が「1つのactive manual roleのnative contribution」をそのroleの**宣言済みpriorityのまま**置換できるようにする。競合は(role, key)単位でnativeへ戻し、checked resolver が固定sentinelを返す。
+`ReplaceRoleID` を公開面に足し、host が「1つのactive manual roleのnative contribution」をそのroleの**宣言済みpriorityのまま**置換できるようにする。競合は (role, key) 単位でnativeへ戻し、checked resolver が固定sentinelを返す。
 
 **Files:**
-- Modify: `plugin/policy.go:17-27` (`EffectivePolicyContribution` に `ReplaceRoleID` を追加)
-- Modify: `internal/effectivepolicy/validation.go:138-173` (`ValidateContributions` の署名と置換規則、末尾に `declaresActiveRole`)
-- Test: `internal/effectivepolicy/validation_test.go:32-71`（既存tableに `roles` を足し、置換ケースを追加）、末尾に tie の test
-- Modify: `internal/core/role/plugin_policy.go:24` の後（sentinel）、`:232-236`（map の宣言）、`:266-277`（provider ループ内）、`:279-281`（集約ループ）、`:289-293`（return）、`:642-656`（`lessPolicyContribution`）、`:661` の直前（helper 群）
-- Test: `internal/core/role/plugin_policy_test.go`
-- Modify: `plugin/plugintest/plugintest.go:321-353`
-- Test: `plugin/plugintest/policy_test.go`
+- Test: `internal/effectivepolicy/validation_test.go`
+- Modify: `plugin/policy.go`（`EffectivePolicyContribution` に `ReplaceRoleID`）
+- Modify: `internal/effectivepolicy/validation.go`（`ValidateContributions` の署名と置換規則、末尾に `declaresActiveRole`）
+- Modify: `internal/core/role/plugin_policy.go`（`activeRoleIDsFromAssignments`、sentinel、map 宣言、provider ループ内、集約ループ、return、`lessPolicyContribution`、helper 群）
+- Modify: `plugin/plugintest/plugintest.go`（3引数化 + `plugintestActiveRoleIDs`、後段で `ActiveAssignments` の複製）
+- Test: `internal/core/role/plugin_policy_test.go`、`plugin/plugintest/policy_test.go`
 - Modify: `internal/entitycompat/testdata/golden_plugin_surface.txt`（再生成）
-- Modify: `docs/plugins/authoring.md:817-822`（公開面一覧の `EffectivePolicyContribution`）
+- Modify: `docs/plugins/authoring.md`（公開面一覧の `EffectivePolicyContribution`）
 
 **Interfaces:**
-- Consumes: `plugin.ActiveRoleAssignment` / `ActiveAssignments`（Task 1）、`(*Service).activeRoleAssignments`（Task 2）、`rolePolicyInput` / `rolePolicyEntry`（Task 3）
+- Consumes: `plugin.ActiveRoleAssignment` / `ActiveAssignments`（Task 1）、`resolveUserRoleSnapshot` / `pluginActiveRoleAssignments`（Task 2）、`rolePolicyInput` / `rolePolicyEntry`（Task 3）
 - Produces: `plugin.EffectivePolicyContribution.ReplaceRoleID string`
 - Produces: `effectivepolicy.ValidateContributions(keys, activeRoles []string, contributions []plugin.EffectivePolicyContribution) bool`（第2引数新增）
 - Produces: 非公開 `role.activeRoleIDsFromAssignments([]plugin.ActiveRoleAssignment) []string`
@@ -940,35 +1264,7 @@ Expected: 1 commit。`git diff --stat` は3ファイル。**この commit の SH
 - Produces: 非公開 `role.collectPolicyReplacement(...)` / `role.applyPolicyReplacements(...)` / `role.hasPolicyReplacementConflict(...)`
 - Preserves: `role.ErrEffectivePolicyProvider` は**単独のときは素の sentinel として**返す（既存の `require.Equal` 前提を壊さない）
 
-- [ ] **Step 1: 公開型に `ReplaceRoleID` を追加する**
-
-`plugin/policy.go` の `EffectivePolicyContribution` の `Order int` の**後**にフィールドを追加する:
-
-```go
-	// ReplaceRoleID turns this contribution into a **replacement** of one
-	// active manual role's native contribution for Key, instead of an
-	// additional contribution.
-	//
-	// - "" (the default) keeps the existing additive behaviour.
-	// - non-empty names a role that must appear in
-	//   [EffectivePolicyRequest.ActiveAssignments]. Conditional roles are
-	//   never there, so they cannot be replaced.
-	//
-	// **置換は 1 対 1。** 対象 role/key の native contribution だけを差し替え、
-	// priority は**元 native entry の宣言値を引き継ぐ**。他 role の
-	// contribution と通常の priority / type 集約はそのまま行う。
-	//
-	// **Priority と Order は 0 のまま渡すこと。** 置き換える native entry が
-	// 持った priority を引き継ぐので、plugin が選んでよいと二重定義になる。
-	// host は 0 以外を malformed として provider 全体を失敗扱いにする。
-	//
-	// 同じ role/key を複数 provider が置換した場合は**競合**となり、host は
-	// その pair だけを native contribution に戻す。checked 解決は error、
-	// unchecked 解決は native fallback map を返す。
-	ReplaceRoleID string
-```
-
-- [ ] **Step 2: `ValidateContributions` のテストを先に書く（RED）**
+- [ ] **Step 1: validation の失敗 test を先に書く**
 
 `internal/effectivepolicy/validation_test.go` の `TestValidateContributions` の table struct に `roles []string` フィールドを追加し、実行部を
 
@@ -996,8 +1292,8 @@ Expected: 1 commit。`git diff --stat` は3ファイル。**この commit の SH
 			contributions: []plugin.EffectivePolicyContribution{{Key: "unknown", Value: 40, ReplaceRoleID: "r1"}}},
 		{name: "replacement with a wrong value type", keys: []string{"mentionLimit"}, roles: []string{"r1"},
 			contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: "40", ReplaceRoleID: "r1"}}},
-		// **同じ key でも role が違えば別 tie。** 複数 role を同時に置換する
-		// plugin を「重複」で弾かない。
+		// **同じ key でも role が違えば別 tie。** 複数 role を同時に置換する plugin を
+		// 「重複」で弾かない。
 		{name: "two roles replaced for the same key", keys: []string{"mentionLimit"}, roles: []string{"r1", "r2"},
 			contributions: []plugin.EffectivePolicyContribution{
 				{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"},
@@ -1013,9 +1309,9 @@ Expected: 1 commit。`git diff --stat` は3ファイル。**この commit の SH
 `internal/effectivepolicy/validation_test.go` の末尾に追加する:
 
 ```go
-// **置換は (Key, ReplaceRoleID) で一意。** (Key, Order) だけで判定すると、同じ
-// key の 2 つの role を同時に置換する plugin が「重複」で弾かれる。置換の
-// Order は 0 しか選べないので、role ID を含めないと同時置換ができない。
+// **置換は (Key, ReplaceRoleID) で一意。** (Key, Order) だけで判定すると、同じ key の
+// 2 つの role を同時に置換する plugin が「重複」で弾かれる。置換の Order は 0 しか
+// 選べないので、role ID を含めないと同時置換ができない。
 func TestValidateContributionsReplacementTieUsesRoleID(t *testing.T) {
 	two := []plugin.EffectivePolicyContribution{
 		{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"},
@@ -1031,25 +1327,53 @@ func TestValidateContributionsReplacementTieUsesRoleID(t *testing.T) {
 }
 ```
 
+- [ ] **Step 2: RED を観察する**
+
 ```powershell
 go test ./internal/effectivepolicy -count=1
 ```
 
-Expected: コンパイルエラー（`ValidateContributions` の引数が3つでない）。
+Expected: **コンパイルエラー**。`unknown field ReplaceRoleID` と `not enough arguments in call to ValidateContributions` の両方。公開型も引数もまだ無いので当然 red。
 
-- [ ] **Step 3: `ValidateContributions` を実装する**
+- [ ] **Step 3: production を実装する（公開型 + validation + 呼び出し側配線）**
+
+`plugin/policy.go` の `EffectivePolicyContribution` の `Order int` の**後**にフィールドを追加する:
+
+```go
+	// ReplaceRoleID turns this contribution into a **replacement** of one active
+	// manual role's native contribution for Key, instead of an additional
+	// contribution.
+	//
+	// - "" (the default) keeps the existing additive behaviour.
+	// - non-empty names a role that must appear in
+	//   [EffectivePolicyRequest.ActiveAssignments]. Conditional roles are never
+	//   there, so they cannot be replaced.
+	//
+	// **置換は 1 対 1。** 対象 role/key の native contribution だけを差し替え、priority は
+	// **元 native entry の宣言値を引き継ぐ**。他 role の contribution と通常の
+	// priority / type 集約はそのまま行う。
+	//
+	// **Priority と Order は 0 のまま渡すこと。** 置き換える native entry が持った priority
+	// を引き継ぐので、plugin が選んでよいと二重定義になる。host は 0 以外を malformed
+	// として provider 全体を失敗扱いにする。
+	//
+	// 同じ role/key を複数 provider が置換した場合は**競合**となり、host はその pair だけを
+	// native contribution に戻す。checked 解決は error、unchecked 解決は native fallback
+	// map を返す。
+	ReplaceRoleID string
+```
 
 `internal/effectivepolicy/validation.go` の `ValidateContributions` を置き換える:
 
 ```go
-// ValidateContributions reports whether contributions satisfy the host's
-// native policy schema.
+// ValidateContributions reports whether contributions satisfy the host's native
+// policy schema.
 //
 // activeRoles are the role IDs the request carried in
 // [plugin.EffectivePolicyRequest.ActiveAssignments]. A contribution that sets
 // ReplaceRoleID must name one of them — otherwise it would replace a
-// contribution that does not exist in this request — and must leave Priority
-// and Order at 0, because the replaced entry inherits the role's own declared
+// contribution that does not exist in this request — and must leave Priority and
+// Order at 0, because the replaced entry inherits the role's own declared
 // priority. Breaking either rule fails the whole provider, like any other
 // malformed output.
 func ValidateContributions(keys, activeRoles []string, contributions []plugin.EffectivePolicyContribution) bool {
@@ -1085,9 +1409,8 @@ func ValidateContributions(keys, activeRoles []string, contributions []plugin.Ef
 	return true
 }
 
-// declaresActiveRole reports whether roleID is one of the request's active
-// manual roles. Only a role that carries a native contribution can have it
-// replaced.
+// declaresActiveRole reports whether roleID is one of the request's active manual
+// roles. Only a role that carries a native contribution can have it replaced.
 func declaresActiveRole(activeRoles []string, roleID string) bool {
 	for _, active := range activeRoles {
 		if active == roleID {
@@ -1098,19 +1421,11 @@ func declaresActiveRole(activeRoles []string, roleID string) bool {
 }
 ```
 
-`internal/core/role/plugin_policy.go` の `resolvePolicyProviderCached` 内の呼び出しを3引数にする:
+`internal/core/role/plugin_policy.go` の `func activeRoleIDs(` の**直前**に helper を追加し、`resolvePolicyProviderCached` 内の呼び出しを3引数にする:
 
 ```go
-	if ok {
-		ok = effectivepolicy.ValidateContributions(provider.reg.Keys, activeRoleIDsFromAssignments(req.ActiveAssignments), contributions)
-	}
-```
-
-`internal/core/role/plugin_policy.go` の `func activeRoleIDs(` の**直前**に helper を追加する:
-
-```go
-// activeRoleIDsFromAssignments は request の assignment が覆う role ID を
-// ソート・重複除去して返す。**置換が名乗ってよい target の host 側の姿**。
+// activeRoleIDsFromAssignments は request の assignment が覆う role ID をソート・重複
+// 除去して返す。**置換が名乗ってよい target の host 側の姿**。
 func activeRoleIDsFromAssignments(assignments []plugin.ActiveRoleAssignment) []string {
 	if len(assignments) == 0 {
 		return nil
@@ -1132,7 +1447,59 @@ func activeRoleIDsFromAssignments(assignments []plugin.ActiveRoleAssignment) []s
 }
 ```
 
-- [ ] **Step 4: 置換適用の host テストを RED として書く**
+```go
+	if ok {
+		ok = effectivepolicy.ValidateContributions(provider.reg.Keys, activeRoleIDsFromAssignments(req.ActiveAssignments), contributions)
+	}
+```
+
+`plugin/plugintest/plugintest.go` の wrapper 内で `ValidateContributions(registration.Keys, contributions)` を3引数にし、ファイル末尾に helper を追加する（`sort` は既に使っている）:
+
+```go
+			if err == nil && !effectivepolicy.ValidateContributions(
+				registration.Keys, plugintestActiveRoleIDs(req.ActiveAssignments), contributions,
+			) {
+```
+
+```go
+// plugintestActiveRoleIDs は request の assignment が覆う role ID をソート・重複除去
+// して返す。置換が名乗ってよい target を harness 側で判定するために使う
+//（core/role の activeRoleIDsFromAssignments と同じ形）。
+func plugintestActiveRoleIDs(assignments []plugin.ActiveRoleAssignment) []string {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(assignments))
+	seen := make(map[string]struct{}, len(assignments))
+	for _, a := range assignments {
+		if a.RoleID == "" {
+			continue
+		}
+		if _, duplicate := seen[a.RoleID]; duplicate {
+			continue
+		}
+		seen[a.RoleID] = struct{}{}
+		out = append(out, a.RoleID)
+	}
+	sort.Strings(out)
+	return out
+}
+```
+
+**この段階では置換はまだ適用されない。** validation が通るようになっただけで、host は置換を additive contribution として扱う（既存挙動のまま）。
+
+- [ ] **Step 4: validation の GREEN を確認する**
+
+```powershell
+& (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -w plugin\policy.go plugin\plugintest\plugintest.go internal\effectivepolicy\validation.go internal\effectivepolicy\validation_test.go
+go test ./internal/effectivepolicy -count=1
+go test ./internal/core/role -count=1
+go test ./plugin/plugintest -count=1 -run "TestEffectivePolic"
+```
+
+Expected: 全部 PASS。`internal/core/role` の既存 provider テストが緑であること（まだ置換を適用していないので、既存 contribution の意味は変わっていない）。
+
+- [ ] **Step 5: host 適用の失敗 test を先に書く**
 
 `internal/core/role/plugin_policy_test.go` の末尾に追記する:
 
@@ -1169,10 +1536,10 @@ func TestEffectivePolicy_ReplacementKeepsTheNativePriority(t *testing.T) {
 	assert.Equal(t, 40, policies["mentionLimit"], "置換は native の priority を引き継ぐので r2 の 100 に負けない")
 }
 
-// **置換でも explicit は contribution の値に従う。** explicit は intersection
-// する policy だけで意味を持ち、「そのロールが明示的に設定したか」を表す。
-// どちらのロールも key を宣言していないので native は base 参加 = 明示設定なし
-// として intersection には何も乗らない。r1 を明示値で置換すると初めて乗る。
+// **置換でも explicit は contribution の値に従う。** explicit は intersection する policy
+// だけで意味を持ち、「そのロールが明示的に設定したか」を表す。どちらのロールも key を
+// 宣言していないので native は base 参加 = 明示設定なしとして intersection には何も
+// 乗らない。r1 を明示値で置換すると初めて乗る。
 func TestEffectivePolicy_ReplacementCarriesTheExplicitFlagForIntersection(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
@@ -1197,8 +1564,8 @@ func TestEffectivePolicy_ReplacementCarriesTheExplicitFlagForIntersection(t *tes
 		"明示値での置換だけが intersection に参加する")
 }
 
-// **`UseDefault: true` の置換は「この role の override を base に戻す」** =
-// native の useDefault と同じ扱い。explicit は立たない。
+// **`UseDefault: true` の置換は「この role の override を base に戻す」** = native の
+// useDefault と同じ扱い。explicit は立たない。
 func TestEffectivePolicy_ReplacementWithUseDefaultStaysUnset(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
@@ -1217,16 +1584,9 @@ func TestEffectivePolicy_ReplacementWithUseDefaultStaysUnset(t *testing.T) {
 	assert.Equal(t, []string{}, policies[role.PolicyOptOutNotificationTypes],
 		"UseDefault の置換は明示設定にならず intersection に参加しない")
 }
-```
 
-- [ ] **Step 5: 競合・失敗のテストを RED として書く**
-
-同じファイルに追記する:
-
-```go
-// **競合は pair 単位。** provider 全体を失敗扱いにしてしまうと、その provider の
-// 無関係な key まで native に戻ってしまう。置換したい plugin だけを黙らせる
-// 形の被害を出さない。
+// **競合は pair 単位。** provider 全体を失敗扱いにしてしまうと、その provider の無関係な
+// key まで native に戻ってしまう。置換したい plugin だけを黙らせる形の被害を出さない。
 func TestEffectivePolicy_ReplacementConflictFallsBackToNative(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual,
@@ -1271,8 +1631,8 @@ func TestEffectivePolicy_ReplacementConflictKeepsOtherContributions(t *testing.T
 	assert.Equal(t, 60, policies["userListLimit"], "競合していない key は両 provider の contribution を集約する")
 }
 
-// **provider 失敗は宣言 key を native へ戻す（既存挙動）。** 他 provider の
-// 置換も同じ key なら巻き戻る。既存 sentinel は単独のときは素のまま。
+// **provider 失敗は宣言 key を native へ戻す（既存挙動）。** 他 provider の置換も同じ key
+// なら巻き戻る。既存 sentinel は単独のときは素のまま。
 func TestEffectivePolicy_FailedProviderWinsOverAnotherProvidersReplacement(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual,
@@ -1339,8 +1699,8 @@ func TestEffectivePolicy_ReplacementConflictUncheckedResolutionFallsBack(t *test
 	assert.Equal(t, 10, policies["mentionLimit"])
 }
 
-// **置換が active でない role を名乗れば provider 全体が失敗扱い。** malformed
-// output と同じ扱いなので、宣言 key は native へ戻る。
+// **置換が active でない role を名乗れば provider 全体が失敗扱い。** malformed output と
+// 同じ扱いなので、宣言 key は native へ戻る。
 func TestEffectivePolicy_ReplacementOfInactiveRoleFailsTheProvider(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual,
@@ -1375,20 +1735,27 @@ func TestEffectivePolicy_ReplacementChoosingAPriorityFailsTheProvider(t *testing
 }
 ```
 
-- [ ] **Step 6: `plugin_policy.go` に置換の適用と競合を実装する**
+- [ ] **Step 6: RED を観察する**
+
+```powershell
+go test ./internal/core/role -count=1 -run "TestEffectivePolicy_Replacement|TestEffectivePolicy_FailedProviderWins|TestEffectivePolicy_JoinsProviderFailure"
+```
+
+Expected: **コンパイルエラー**（`undefined: role.ErrEffectivePolicyReplacementConflict`）が最初の RED。sentinel を足した後も、置換がまだ additive 扱いのままなので `TestEffectivePolicy_ReplacementKeepsTheNativePriority` の `assert.Equal(t, 40, ...)` が 100 あたりで落ちている。
+
+- [ ] **Step 7: host の置換適用と競合を実装する**
 
 `internal/core/role/plugin_policy.go` の `ErrEffectivePolicyProvider` 定義の**直後**に sentinel を追加する:
 
 ```go
 // ErrEffectivePolicyReplacementConflict is returned by GetUserPoliciesChecked
 // when two providers replaced the same role and policy key. Fixed and
-// identifier-free, like [ErrEffectivePolicyProvider]: which roles collided is
-// an operator concern and never reaches the caller.
+// identifier-free, like [ErrEffectivePolicyProvider]: which roles collided is an
+// operator concern and never reaches the caller.
 //
-// The contested pair keeps its native contribution; every other contribution
-// in the same result is still applied. It is joined with
-// [ErrEffectivePolicyProvider] when a provider also failed in the same
-// request, so `errors.Is` finds both.
+// The contested pair keeps its native contribution; every other contribution in
+// the same result is still applied. It is joined with [ErrEffectivePolicyProvider]
+// when a provider also failed in the same request, so `errors.Is` finds both.
 var ErrEffectivePolicyReplacementConflict = errors.New("effective policy replacement conflict")
 ```
 
@@ -1412,8 +1779,8 @@ var ErrEffectivePolicyReplacementConflict = errors.New("effective policy replace
 	conflicted := make(map[string]map[string]bool)
 	// 失敗したproviderの宣言keyはplugin貢献をすべて破棄してnative結果へ戻す。
 	failed := make(map[string]bool)
-	// 置換は元の native priority を引き継ぐので、role ごとの overrides を引ける
-	// ようにしておく。
+	// 置換は元の native priority を引き継ぐので、role ごとの overrides を引けるように
+	// しておく。
 	overridesByRole := make(map[string]map[string]rolePolicyOverride, len(roleInputs))
 	for _, in := range roleInputs {
 		if in.roleID != "" {
@@ -1436,8 +1803,8 @@ provider 結果を畳むループの**内側**を次のように変更する:
 				value = baseVal
 			}
 			value = clonePolicyValue(value)
-			// UseDefault のときは base を積むだけなので explicit ではない
-			// (#2898、intersection の集約で「設定していない」と区別する)。
+			// UseDefault のときは base を積むだけなので explicit ではない (#2898、
+			// intersection の集約で「設定していない」と区別する)。
 			contribs[c.Key] = append(contribs[c.Key], policyEntry{priority: c.Priority, value: value, explicit: !c.UseDefault})
 		}
 ```
@@ -1453,14 +1820,14 @@ provider ループの**後**にある集約ループ
 を次のように置き換える:
 
 ```go
-	// 置換が 1 件でもあれば、置換 entry 付きで集約し直す。競合した pair は
-	// accepted から消してあるので、そこは native のままになる。
+	// 置換が 1 件でもあれば、置換 entry 付きで集約し直す。競合した pair は accepted から
+	// 消してあるので、そこは native のままになる。
 	if len(replacements) > 0 {
 		replacedInputs := applyPolicyReplacements(roleInputs, replacements)
 		for key, byRole := range replacements {
 			if len(byRole) == 0 {
-				// **この key の置換が全部競合した。** native 集約の結果 out[key]
-				// をそのまま残し、他の provider の通常contribution だけ足し直す。
+				// **この key の置換が全部競合した。** native 集約の結果 out[key] を
+				// そのまま残し、他の provider の通常contribution だけ足し直す。
 				continue
 			}
 			out[key] = computePolicy(key, base[key], replacedInputs, contribs[key])
@@ -1481,8 +1848,8 @@ provider ループの**後**にある集約ループ
 	providerFailed := len(failed) > 0
 	conflict := hasPolicyReplacementConflict(conflicted)
 	// **単独のときは素の sentinel を返す。** 既存テストも既存呼び出し側も
-	// `err == ErrEffectivePolicyProvider` 相当を前提にしているため、1 つしか
-	// 無いのに join すると等価性が壊れる。
+	// `err == ErrEffectivePolicyProvider` 相当を前提にしているため、1 つしか無いのに join
+	// すると等価性が壊れる。
 	switch {
 	case providerFailed && conflict:
 		return out, errors.Join(ErrEffectivePolicyProvider, ErrEffectivePolicyReplacementConflict)
@@ -1498,8 +1865,7 @@ provider ループの**後**にある集約ループ
 `func activeRoleIDs(` の**直前**に helper 群を追加する:
 
 ```go
-// hasPolicyReplacementConflict reports whether any (key, role) pair was
-// contested.
+// hasPolicyReplacementConflict reports whether any (key, role) pair was contested.
 func hasPolicyReplacementConflict(conflicted map[string]map[string]bool) bool {
 	for _, roles := range conflicted {
 		if len(roles) > 0 {
@@ -1509,16 +1875,16 @@ func hasPolicyReplacementConflict(conflicted map[string]map[string]bool) bool {
 	return false
 }
 
-// collectPolicyReplacement records one accepted replacement, or marks the
-// (key, role) pair as contested when a second provider already replaced it.
+// collectPolicyReplacement records one accepted replacement, or marks the (key,
+// role) pair as contested when a second provider already replaced it.
 //
-// **置く entry は元 native entry を改変したもの**なので、declared priority と
-// `explicit` の既定（その role が key を宣言していなければ base 参加 =
-// explicit でない）を引き継ぎ、値だけ contrib の Value に差し替える。
+// **置く entry は元 native entry を改変したもの**なので、declared priority と `explicit`
+// の既定（その role が key を宣言していなければ base 参加 = explicit でない）を引き継ぎ、
+// 値だけ contrib の Value に差し替える。
 //
-// **競合は pair 単位で落とす。** provider 全体を失敗扱いにしてしまうと、置換
-// していない無関係な key まで native へ戻すことになる。どちらの値も採らな
-// い = 管理者が設定した role の値が残るので、fallback の向きは安全。
+// **競合は pair 単位で落とす。** provider 全体を失敗扱いにしてしまうと、置換していない
+// 無関係な key まで native へ戻すことになる。どちらの値も採らない = 管理者が設定した
+// role の値が残るので、fallback の向きは安全。
 func collectPolicyReplacement(
 	accepted map[string]map[string]policyEntry,
 	conflicted map[string]map[string]bool,
@@ -1545,8 +1911,8 @@ func collectPolicyReplacement(
 		return
 	}
 	entry := rolePolicyEntry(overridesByRole[contribution.ReplaceRoleID], contribution.Key, baseVal)
-	// UseDefault は「この role の override を base に戻す」= native の useDefault
-	// と同じ扱い。値を使う場合は explicit な設定になる。
+	// UseDefault は「この role の override を base に戻す」= native の useDefault と同じ
+	// 扱い。値を使う場合は explicit な設定になる。
 	entry.value = clonePolicyValue(baseVal)
 	entry.explicit = false
 	if !contribution.UseDefault {
@@ -1556,13 +1922,12 @@ func collectPolicyReplacement(
 	byRole[contribution.ReplaceRoleID] = entry
 }
 
-// applyPolicyReplacements returns a copy of inputs with the accepted
-// replacement entries attached. 元の slice は触らないので native pass は
-// 自分の entry を保ったまま。
+// applyPolicyReplacements returns a copy of inputs with the accepted replacement
+// entries attached. 元の slice は触らないので native pass は自分の entry を保ったまま。
 //
-// **roleID が空の input には付けない。** 置換の target は必ず非空の role ID な
-// ので空の role ID に一致するはずはないが、この guard で「読めないロールに置換
-// が混ざる」形を1行で塞ぐ。
+// **roleID が空の input には付けない。** 置換の target は必ず非空の role ID なので空の
+// role ID に一致するはずはないが、この guard で「読めないロールに置換が混ざる」形を1行で
+// 塞ぐ。
 func applyPolicyReplacements(inputs []rolePolicyInput, replacements map[string]map[string]policyEntry) []rolePolicyInput {
 	out := make([]rolePolicyInput, len(inputs))
 	copy(out, inputs)
@@ -1591,8 +1956,8 @@ func lessPolicyContribution(a, b plugin.EffectivePolicyContribution) bool {
 	if a.Order != b.Order {
 		return a.Order < b.Order
 	}
-	// **置換は Order が 0 なので、置換同士は RoleID で順序を決める。** 空文字が
-	// 先に来るので、ReplaceRoleID を持たない contribution の並びは従来と同じ。
+	// **置換は Order が 0 なので、置換同士は RoleID で順序を決める。** 空文字が先に来るので、
+	// ReplaceRoleID を持たない contribution の並びは従来と同じ。
 	if a.ReplaceRoleID != b.ReplaceRoleID {
 		return a.ReplaceRoleID < b.ReplaceRoleID
 	}
@@ -1609,54 +1974,17 @@ func lessPolicyContribution(a, b plugin.EffectivePolicyContribution) bool {
 }
 ```
 
-- [ ] **Step 7: plugintest を production と同じ契約に揃える**
+- [ ] **Step 8: host 適用の GREEN を確認する**
 
-`plugin/plugintest/plugintest.go` の `EffectivePolicies` の resolver wrapper を次のように置き換える:
-
-```go
-	resolver := registration.Resolve
-	if resolver != nil {
-		registration.Resolve = func(ctx context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
-			req.RoleIDs = append([]string(nil), req.RoleIDs...)
-			// **ActiveAssignments も複製して渡す。** 本番 (core/role/plugin_policy.go) が
-			// 複製しているのと同じで、テストが production より緩くないようにする。
-			req.ActiveAssignments = append([]plugin.ActiveRoleAssignment(nil), req.ActiveAssignments...)
-			contributions, err := resolver(ctx, req)
-			if err == nil && !effectivepolicy.ValidateContributions(
-				registration.Keys, plugintestActiveRoleIDs(req.ActiveAssignments), contributions,
-			) {
-				h.t.Errorf("plugintest: EffectivePolicies の出力が不正です")
-				return nil, fmt.Errorf("plugintest: effective policy output is invalid")
-			}
-			return contributions, err
-		}
-	}
-	return registration
-}
-
-// plugintestActiveRoleIDs は request の assignment が覆う role ID を
-// ソート・重複除去して返す。置換が名乗ってよい target を harness 側で判定する
-// ために使う（core/role の activeRoleIDsFromAssignments と同じ形）。
-func plugintestActiveRoleIDs(assignments []plugin.ActiveRoleAssignment) []string {
-	if len(assignments) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(assignments))
-	seen := make(map[string]struct{}, len(assignments))
-	for _, a := range assignments {
-		if a.RoleID == "" {
-			continue
-		}
-		if _, duplicate := seen[a.RoleID]; duplicate {
-			continue
-		}
-		seen[a.RoleID] = struct{}{}
-		out = append(out, a.RoleID)
-	}
-	sort.Strings(out)
-	return out
-}
+```powershell
+& (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -w internal\core\role\plugin_policy.go internal\core\role\plugin_policy_test.go
+go vet ./internal/core/role
+go test ./internal/core/role -count=1
 ```
+
+Expected: PASS。特に既存の `require.Equal(t, role.ErrEffectivePolicyProvider, err)` が素の sentinel 前提で通っていること（join して既定が壊れていない証拠）。
+
+- [ ] **Step 9: plugintest の失敗 test を先に書いて RED を観察する**
 
 `plugin/plugintest/policy_test.go` に追記する:
 
@@ -1714,8 +2042,8 @@ func TestEffectivePoliciesRejectsInvalidReplacement(t *testing.T) {
 			return plugin.EffectivePolicyRegistration{
 				Keys: []string{"mentionLimit"},
 				Resolve: func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
-					// 宣言していない role の置換は host でも不正。harness が本番と
-					// 同じ契約で弾くことを確認する。
+					// 宣言していない role の置換は host でも不正。harness が本番と同じ契約で
+					// 弾くことを確認する。
 					return []plugin.EffectivePolicyContribution{{
 						Key: "mentionLimit", Value: 40, ReplaceRoleID: "role-not-active",
 					}}, nil
@@ -1768,20 +2096,46 @@ func TestEffectivePoliciesRejectsReplacementChoosingAPriority(t *testing.T) {
 }
 ```
 
-- [ ] **Step 8: authoring.md の公開面一覧と golden を更新する**
-
-`docs/plugins/authoring.md` の
-
-```
-type EffectivePolicyContribution struct
-  Key string
-  Priority int
-  UseDefault bool
-  Value any
-  Order int
+```powershell
+go test ./plugin/plugintest -count=1 -run "TestEffectivePolic"
 ```
 
-を次のように置き換える:
+Expected: **`TestEffectivePoliciesCaptureActiveAssignments` だけが FAIL**（`role-a` が `mutated` になる = harness が `ActiveAssignments` を複製していない）。他の3本は Task 4 Step 3 の配線で既に緑なので **regression guard** として扱う。
+
+- [ ] **Step 10: plugintest の実装を入れて GREEN にする**
+
+`plugin/plugintest/plugintest.go` の wrapper 内で `req.RoleIDs = append([]string(nil), req.RoleIDs...)` の**直後**に1行追加する:
+
+```go
+			// **ActiveAssignments も複製して渡す。** 本番 (core/role/plugin_policy.go) が
+			// 複製しているのと同じで、テストが production より緩くないようにする。
+			req.ActiveAssignments = append([]plugin.ActiveRoleAssignment(nil), req.ActiveAssignments...)
+```
+
+```powershell
+& (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -w plugin\plugintest\plugintest.go plugin\plugintest\policy_test.go plugin\policy.go
+go test ./plugin/plugintest -count=1 -run "TestEffectivePolic"
+go test ./plugin ./internal/effectivepolicy -count=1
+go test ./internal/core/role -count=1
+```
+
+Expected: 全部 PASS。
+
+- [ ] **Step 11: golden を再生成して doc gate を RED にする**
+
+**golden を先に書いて doc gate を赤くする**（doc を先に書くと `TestPluginDoc` は緑のままになる）:
+
+```powershell
+go run ./tools/pluginspec -write
+git diff --stat internal/entitycompat/testdata/golden_plugin_surface.txt
+go test ./internal/entitycompat -run TestPluginDoc -count=1
+```
+
+Expected: golden に `plugin:   field EffectivePolicyContribution.ReplaceRoleID string` の1行が加わり、**`go test` は FAIL** する（`ReplaceRoleID` が authoring.md の公開面一覧に無い）。
+
+- [ ] **Step 12: docs を書いて GREEN にする**
+
+`docs/plugins/authoring.md` の `type EffectivePolicyContribution struct` ブロックを次のように置き換える:
 
 ```
 type EffectivePolicyContribution struct
@@ -1794,37 +2148,17 @@ type EffectivePolicyContribution struct
 ```
 
 ```powershell
-go run ./tools/pluginspec -write
-git diff --stat internal/entitycompat/testdata/golden_plugin_surface.txt
-```
-
-Expected: golden に `plugin:   field EffectivePolicyContribution.ReplaceRoleID string` の1行だけ追加される。
-
-- [ ] **Step 9: focused command で GREEN を確認する**
-
-```powershell
-& (Join-Path (go env GOROOT) "bin\gofmt.exe") -s -w plugin\policy.go plugin\plugintest\plugintest.go plugin\plugintest\policy_test.go internal\effectivepolicy\validation.go internal\effectivepolicy\validation_test.go internal\core\role\plugin_policy.go internal\core\role\plugin_policy_test.go
-go vet ./plugin/... ./internal/effectivepolicy ./internal/core/role
-go test ./plugin ./internal/effectivepolicy -count=1
-go test ./internal/core/role -count=1
-go test ./plugin/plugintest -count=1 -run "TestEffectivePolic"
 go test ./internal/entitycompat -run TestPluginDoc -count=1
-```
-
-Expected: 全部 PASS。特に `internal/core/role` の既存テストで `require.Equal(t, role.ErrEffectivePolicyProvider, err)` が素の sentinel 前提で通っていること（join して既定が壊れていない証拠）。
-
-- [ ] **Step 10: surface golden を正規化比較で確認する**
-
-```powershell
 go run ./tools/pluginspec > "$env:TEMP\rlp-surface.txt"
 $golden = (Get-Content -Raw internal\entitycompat\testdata\golden_plugin_surface.txt) -replace "`r`n","`n"
 $actual = (Get-Content -Raw "$env:TEMP\rlp-surface.txt") -replace "`r`n","`n"
-if ($golden -ne $actual) { "SURFACE DRIFT"; Compare-Object ($golden -split "`n") ($actual -split "`n") } else { "SURFACE OK" }
+if ($golden -ne $actual) { "SURFACE DRIFT" } else { "SURFACE OK" }
+go vet ./plugin/... ./internal/effectivepolicy ./internal/core/role
 ```
 
-Expected: `SURFACE OK`。
+Expected: PASS / `SURFACE OK`。
 
-- [ ] **Step 11: commit する**
+- [ ] **Step 13: commit する**
 
 ```powershell
 git diff --check
@@ -1842,23 +2176,43 @@ Expected: 1 commit。**この commit の SHA を控えておく**。
 公開面の一覧（Task 1 / 4 で更新済み）とは別に、**意味と運用**を `docs/plugins/authoring.md` の「効果ポリシー」節に書き足す。置換を書こうとした人が「優先度を書いたら落ちる」「conditional role は置換できない」を知らずに踏み抜けないようにする。
 
 **Files:**
-- Modify: `docs/plugins/authoring.md:330`（resolver の入力契約を説明する段落の末尾）、`:336` の後（contribution の Priority 段落の後）、`:342` の末尾（失敗providerの段落の末尾）、`:346`（純関数とcacheの段落）
-- Modify: `docs/plugins/compatibility.md`（Task 1 で追記した段落の直後）
+- Test/gate: Global Constraints の「authoring.md の Go fence コンパイル gate」
+- Modify: `docs/plugins/authoring.md`（効果ポリシー節 4 箇所）、`docs/plugins/compatibility.md`（replacement の additive 追記）
 
 **Interfaces:**
 - Consumes: Task 1 / 2 / 4 の実契約
 - Produces: なし（ドキュメントのみ）
-- Gate: `go test ./internal/entitycompat -run TestPluginDoc`（ローカル）と `make plugin-doc-check`（CI）
 
-- [ ] **Step 1: resolver の入力契約に assignment を書き足す**
+- [ ] **Step 1: gate が生きていることを RED で証明する**
+
+新しい Go fence を書く前に、**この gate が本当に赤くなる**ことを確認する（以降の Step で使う gate が空振りしていないことの担保）:
+
+```powershell
+$doc = Get-Content -Raw docs/plugins/authoring.md
+$broken = $doc -replace 'func effectivePolicies\(ctx plugin\.Context', 'func effectivePoliciesBROKEN(ctx plugin.Context'
+Set-Content -Path docs/plugins/authoring.md -Value $broken -Encoding utf8NoBOM
+```
+
+Global Constraints の「authoring.md の Go fence コンパイル gate」ブロックをそのまま実行する。
+
+Expected: `NG: all variants failed for s<NN>`（`effectivePolicies` を含む fence の index）**が出る**。出ないなら gate が空振りしているので、判定ロジックを直してから次に進む。
+
+```powershell
+git checkout -- docs/plugins/authoring.md
+git status --short docs/plugins/authoring.md
+```
+
+Expected: 出力が空（ファイルが元に戻っている）。
+
+- [ ] **Step 2: docs を書く（resolver の入力契約）**
 
 `docs/plugins/authoring.md` の「効果ポリシー」節で、`Keys`は空・空文字・重複を許さず…で始まる段落の**末尾**に追記する:
 
 ```markdown
-resolverは`req.UserID`のほかに、activeな手動ロールのassignmentを`req.ActiveAssignments`で受け取る。`RoleIDs`は従来どおりconditionalロールを含むが、`ActiveAssignments`は`role_assignment`の行を持つ手動ロールだけなので、各`RoleID`は`RoleIDs`の部分集合になる。ロールごとに高々1件で、並びは`RoleID`順、匿名解決では非nilの空sliceになる。期限切れ・削除済み・`role`行が無いorphanは含まれない。`RoleIDs`は減っていないので、`ActiveAssignments`を読まないproviderの挙動は変わらない。
+resolverは`req.UserID`のほかに、activeな手動ロールのassignmentを`req.ActiveAssignments`で受け取る。`RoleIDs`は従来どおりconditionalロールを含むが、`ActiveAssignments`は`role_assignment`の行を持つ手動ロールだけなので、各`RoleID`は`RoleIDs`の部分集合になる。ロールごとに高々1件で、並びは`RoleID`順、匿名解決では非nilの空sliceになる。期限切れ・削除済み・`role`行が無いorphanは含まれない。rolesとassignmentはhostの同じ1回の読取から同時に作られるので、両者の間に食い違いの窓は無い。`RoleIDs`は減っていないので、`ActiveAssignments`を読まないproviderの挙動は変わらない。
 ```
 
-- [ ] **Step 2: 置換の契約とコンパイル可能な例を書き足す**
+- [ ] **Step 3: docs を書く（置換の契約とコンパイル可能な例）**
 
 contribution の `Priority` を説明した段落の**直後**に追加する:
 
@@ -1880,8 +2234,8 @@ func effectivePolicies(ctx plugin.Context, inv plugin.EffectivePolicyInvalidator
 		Resolve: func(c context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
 			out := []plugin.EffectivePolicyContribution{}
 			for _, a := range req.ActiveAssignments {
-				// ロールごとに1件の置換を出す。Priority / Order は 0 のまま
-				// 渡す = 元のネイティブentryのpriorityを引き継ぐ。
+				// ロールごとに1件の置換を出す。Priority / Order は 0 のまま渡す =
+				// 元のネイティブentryのpriorityを引き継ぐ。
 				out = append(out, plugin.EffectivePolicyContribution{
 					Key:           "mentionLimit",
 					Value:         40,
@@ -1895,9 +2249,9 @@ func effectivePolicies(ctx plugin.Context, inv plugin.EffectivePolicyInvalidator
 ```
 ````
 
-新しいGo fenceは `tests/plugin-doc/extract.py` の HEADER（`context`, `encoding/json`, `net/http`, `testing`, `plugin`, `peercache`, `plugintest`, `assert`, `require` しか import されない）で必ずコンパイルできる必要がある。上の例は新規 import を使わず、宣言済みの `ctx` / `inv` だけを使うので満たす。
+新しい Go fence は `tests/plugin-doc/extract.py` の HEADER（`context`, `encoding/json`, `net/http`, `testing`, `plugin`, `peercache`, `plugintest`, `assert`, `require` しか import されない）でコンパイルできなければならない。上の例は新規 import を使わず、宣言済みの `ctx` / `inv` だけを使うので満たす。
 
-- [ ] **Step 3: 競合と失敗の章を書き足す**
+- [ ] **Step 4: docs を書く（競合と失敗）**
 
 `docs/plugins/authoring.md` の「未宣言key、unknown key、priority範囲外…」で始まる段落の**末尾**に追記する:
 
@@ -1905,7 +2259,7 @@ func effectivePolicies(ctx plugin.Context, inv plugin.EffectivePolicyInvalidator
 同じ`Key`と`ReplaceRoleID`を複数providerが置換した場合は**競合**になる。hostはそのpairを置換として受け入れず、ネイティブcontributionへ戻す — どちらの値も採らないので、管理者が設定したロールの値が残る。provider全体は失敗扱いにしないので、そのproviderの他のキーへの寄与は生き残る。checked解決は競合を表す固定errorを返し、unchecked解決はネイティブfallback mapを返す。provider失敗と併発した場合は両方のerrorが`errors.Is`で辿れる。provider失敗は宣言keyをネイティブへ戻すので、他のproviderの置換も同じkeyなら巻き戻る。
 ```
 
-- [ ] **Step 4: 純関数とcacheの章を assignment に合わせて更新する**
+- [ ] **Step 5: docs を書く（純関数とcache）**
 
 `docs/plugins/authoring.md` の「`Resolve`は、明示的なinvalidationの間は`UserID`とsorted active `RoleIDs`だけで結果が決まる純粋関数として実装する…」で始まる段落を次の形に置き換える:
 
@@ -1913,7 +2267,7 @@ func effectivePolicies(ctx plugin.Context, inv plugin.EffectivePolicyInvalidator
 `Resolve`は、明示的なinvalidationの間は`UserID`、sorted active `RoleIDs`、`ActiveAssignments`だけで結果が決まる純粋関数として実装する。時刻、request固有情報、未通知の外部状態へ依存してはならない。**同じ`RoleIDs`でも`ActiveAssignments`が違えば結果が違ってもよい**ので、hostはproviderごとの成功結果cache keyにassignment IDを含める（付け外し / 再割り当ての直後に前の結果を返さないため）。cacheはoperator設定`effectivePolicyProviderCacheEntries`（既定10000件、providerごと）のLRUであり、eviction時は同じ入力を再解決する。
 ```
 
-- [ ] **Step 5: compatibility.md に replacement の additive 追記をする**
+- [ ] **Step 6: docs を書く（compatibility.md）**
 
 `docs/plugins/compatibility.md` の Task 1 で追記した段落の**直後**に追記する:
 
@@ -1921,17 +2275,20 @@ func effectivePolicies(ctx plugin.Context, inv plugin.EffectivePolicyInvalidator
 `EffectivePolicyContribution.ReplaceRoleID`の追加も同じ扱い。**未設定なら追加contributionのまま**なので既存providerの挙動は変わらず、pluginは「対象ロールのネイティブcontributionを置き換える」という新しい契約にだけオプトインする。置換の`Priority`/`Order`制約はprovider作者の誤りを弾くもので、既存providerの出力形式は変えない。`APIVersion`は1のまま。
 ```
 
-- [ ] **Step 6: doc gate を確認する**
+- [ ] **Step 7: GREEN を確認する**
+
+Global Constraints の「authoring.md の Go fence コンパイル gate」ブロックを実行する。
+
+Expected: `SNIPPET GATE OK`（新しい fence は3 variant のうち少なくとも1つでコンパイルできる）。
 
 ```powershell
 go test ./internal/entitycompat -run TestPluginDoc -count=1
+git status --short
 ```
 
-Expected: PASS（公開面の一覧は Task 1 / 4 で更新済みなので、surface list 系は緑のまま）。
+Expected: `go test` が PASS、`git status` に `docs/plugins/authoring.md` と `docs/plugins/compatibility.md` だけが変更されていること（Step 1 の `git checkout` が効いていることも確認する）。
 
-`make plugin-doc-check` はbash前提なのでこの作業ツリーでは直接回せない。**CI の `plugin-tests` job で `make plugin-doc-check` が緑になることを確認する**（これが新しいfenceのコンパイルを保証する唯一のgate）。
-
-- [ ] **Step 7: commit する**
+- [ ] **Step 8: commit する**
 
 ```powershell
 git diff --check
@@ -1940,7 +2297,7 @@ git add docs/plugins/authoring.md docs/plugins/compatibility.md
 git commit -m "Docs: describe active assignment context and role policy replacement"
 ```
 
-Expected: 1 commit。**この commit の SHA を控えておく**。
+Expected: 1 commit。**この commit の SHA を控えておく**。CI の `make plugin-doc-check` が緑であることも PR 前に確認する。
 
 ---
 
@@ -1966,27 +2323,39 @@ git log --oneline -8
 git status --short --branch
 ```
 
-Expected: Task 1〜5 の5つの commit が見える。控えた SHA を oldest→newest 順で `$shas` に並べる。
+Expected: Task 1〜5 の5つの commit が見える。控えた SHA を oldest→newest 順で並べ、Step 5 の `$shas` に並べる。
 
-**注意**: `git format-patch upstream/develop..feature/role-level-plugin` は範囲内の**全commit**（canDeleteAccount 相关的 Misaki commit も含む）を対象にしてしまう。**必ず Task 1〜5 の SHA を個別に指定する**（Step 4 参照）。
+**注意**: `git format-patch upstream/develop..feature/role-level-plugin` は範囲内の**全commit**（canDeleteAccount 関連の Misaki commit も含む）を対象にしてしまう。**必ず Task 1〜5 の SHA を個別に指定する**（Step 5 参照）。
 
-- [ ] **Step 2: upstream 起点のworktreeを作る**
+- [ ] **Step 2: upstream を fetch して実際の HEAD SHA を控える**
 
 ```powershell
 git fetch upstream develop
+$upstreamSha = (git rev-parse upstream/develop).Trim()
+$upstreamSha
+git log --oneline -1 $upstreamSha
+```
+
+Expected: SHA が1つ出力され、commit subject が表示される。**この値を以降の Step と記録に使う。ハードコードしない。**（`$upstreamSha` はこの Step のセッション内でだけ有効なので、他 Step へ渡すときは `git rev-parse upstream/develop` で取り直す。）
+
+- [ ] **Step 3: upstream 起点のworktreeを作る**
+
+```powershell
 Test-Path "E:\tmp\opencode\mk-upstream-role-policy"
 ```
 
-Expected: `Test-Path` が `False`。`True` なら別名を使う（`E:\tmp\opencode\mk-upstream-role-policy-2` など）。
+Expected: `False`。`True` なら別名を使う（`E:\tmp\opencode\mk-upstream-role-policy-2` など）。
 
 ```powershell
-git worktree add "E:\tmp\opencode\mk-upstream-role-policy" -b upstream/role-policy-replacement-plugin-api upstream/develop
+$upstreamSha = (git rev-parse upstream/develop).Trim()
+git worktree add "E:\tmp\opencode\mk-upstream-role-policy" -b upstream/role-policy-replacement-plugin-api $upstreamSha
 git -C "E:\tmp\opencode\mk-upstream-role-policy" log --oneline -1
+git -C "E:\tmp\opencode\mk-upstream-role-policy" rev-parse HEAD
 ```
 
-Expected: `1a0f2012 Fix frontend: 復帰直後の再接続で、タイムラインの穴埋めが捨てられる (#3195)`。**これが `upstream/develop` の HEAD**。違う場合は `git fetch upstream` をやり直してからこの値を控える（以降の記録に使う）。
+Expected: HEAD が `$upstreamSha` と一致する。
 
-- [ ] **Step 3: upstream 側に Misaki 差分が既に無いことを確認する**
+- [ ] **Step 4: upstream 側に Misaki 差分が既に無いことを確認する**
 
 ```powershell
 git -C "E:\tmp\opencode\mk-upstream-role-policy" grep -n "canDeleteAccount" -- . | Select-Object -First 5
@@ -1995,7 +2364,7 @@ git -C "E:\tmp\opencode\mk-upstream-role-policy" grep -n "joinBasePolicyError" -
 
 Expected: **どちらも出力なし**。出ているなら worktree を作り直す。
 
-- [ ] **Step 4: generic commit を1つずつ patch にして `git am -3` で積む**
+- [ ] **Step 5: generic commit を1つずつ patch にして `git am -3` で積む**
 
 ```powershell
 $root = "$env:TEMP\rlp-patches"
@@ -2038,7 +2407,7 @@ git show <task-sha> -- <file>
 
 当て直したら `git commit -C <sha>` で **Author と message を保ったまま** commit する。
 
-- [ ] **Step 5: upstream 側で focused test が緑であることを確認する**
+- [ ] **Step 6: upstream 側で focused test が緑であることを確認する**
 
 workdir を `E:\tmp\opencode\mk-upstream-role-policy` に変えて:
 
@@ -2050,44 +2419,54 @@ go test ./internal/entitycompat -run TestPluginDoc -count=1
 go vet ./plugin/... ./internal/effectivepolicy ./internal/core/role
 ```
 
-Expected: 全部 PASS。`internal/core/role` は upstream 側にも `optout_aggregation_test.go` / `plugin_policy_test.go` / `plugin_policy_internal_test.go` があるので、**同じテストが緑になること**。これが generic diff が upstream 側で完結している証拠になる。
+Expected: 全部 PASS。`internal/core/role` は upstream 側にも `optout_aggregation_test.go` / `plugin_policy_test.go` / `plugin_policy_internal_test.go` / `role_s5_internal_test.go` / `role_service_test.go` があるので、**同じテストが緑になること**。これが generic diff が upstream 側で完結している証拠になる。
 
-- [ ] **Step 6: leak 検査を実行する**
+- [ ] **Step 7: leak 検査を実行する**
 
 ```powershell
+$upstreamSha = (git rev-parse upstream/develop).Trim()
 git grep -n "canDeleteAccount" -- . | Select-Object -First 5
 git grep -n "joinBasePolicyError" -- . | Select-Object -First 5
-git diff --stat upstream/develop..HEAD
+git diff --stat "$upstreamSha..HEAD"
 ```
 
 Expected: 2つの `git grep` が**出力なし**。`git diff --stat` に出るのは **Task 1〜5 のファイルだけ**:
 
 ```
- docs/plugins/authoring.md                      |  ...
- docs/plugins/compatibility.md                  |  ...
- internal/core/role/optout_aggregation_test.go  |  ...
- internal/core/role/plugin_policy.go            |  ...
- internal/core/role/plugin_policy_internal_test.go | ...
- internal/core/role/plugin_policy_test.go       |  ...
- internal/core/role/role_service.go             |  ...
- internal/effectivepolicy/validation.go         |  ...
- internal/effectivepolicy/validation_test.go    |  ...
+ docs/plugins/authoring.md                            |  ...
+ docs/plugins/compatibility.md                        |  ...
+ internal/core/role/optout_aggregation_test.go        |  ...
+ internal/core/role/plugin_policy.go                  |  ...
+ internal/core/role/plugin_policy_internal_test.go    |  ...
+ internal/core/role/plugin_policy_test.go             |  ...
+ internal/core/role/role_service.go                   |  ...
+ internal/effectivepolicy/validation.go               |  ...
+ internal/effectivepolicy/validation_test.go          |  ...
  internal/entitycompat/testdata/golden_plugin_surface.txt | ...
- plugin/plugintest/plugintest.go                 |  ...
- plugin/plugintest/policy_test.go                |  ...
- plugin/policy.go                                |  ...
+ plugin/plugintest/plugintest.go                       |  ...
+ plugin/plugintest/policy_test.go                      |  ...
+ plugin/policy.go                                      |  ...
 ```
 
 これ以外のファイルが1つでも出水たら **PR を出す前に upstream/develop 側の版に戻す**。
 
-- [ ] **Step 7: origin へpush して PR を作る**
+- [ ] **Step 8: origin へpush して PR を作る**
 
 ```powershell
-git push -u origin upstream/role-policy-replacement-plugin-api
-gh pr create --repo shiroha-a/mk --base develop --head Misaki-Project/mk:upstream/role-policy-replacement-plugin-api --title "Add generic plugin API: active role assignments and role policy replacement" --body-file "$env:TEMP\rlp-pr-body.md"
+$branch = "upstream/role-policy-replacement-plugin-api"
+git push -u origin $branch
 ```
 
-`$env:TEMP\rlp-pr-body.md` には次を書く:
+cross-repository PR の head は **`<owner>:<branch>`** 形式で指定する（fork のリポジトリ名ではなく owner 名）:
+
+```powershell
+$body = "$env:TEMP\rlp-pr-body.md"
+gh pr create --repo shiroha-a/mk --base develop --head "Misaki-Project:$branch" --title "Add generic plugin API: active role assignments and role policy replacement" --body-file $body
+```
+
+`gh pr create --head` が owner:branch を要する場合はこの形式が正なので、push 先が `Misaki-Project/mk` でも `--head Misaki-Project:<branch>` を使う（`Misaki-Project/mk:<branch>` は owner ではなくリポジトリ名を渡す形なので使わない）。実行して弾かれたら、エラーメッセージが示している形式に合わせる。
+
+`$body` には次を書く:
 
 ```markdown
 ## What
@@ -2097,7 +2476,7 @@ Two additive extensions to the public plugin API, so a plugin can (a) know which
 - `plugin.ActiveRoleAssignment{RoleID, AssignmentID}` and `EffectivePolicyRequest.ActiveAssignments` — the user's active manual role assignments, one per role, sorted, non-nil for anonymous requests. Conditional roles are excluded because they have no `role_assignment` row, so every `RoleID` is a subset of `RoleIDs`. `RoleIDs` itself is unchanged and still covers conditional roles, so providers that read only `RoleIDs` behave exactly as before.
 - `EffectivePolicyContribution.ReplaceRoleID` — a contribution naming an active manual role replaces that role's native contribution for `Key` one-for-one, keeping the role's own declared `priority`. `Priority` and `Order` must both stay `0`. Two providers replacing the same role and key is a conflict: the host keeps the native contribution for that pair and `GetUserPoliciesChecked` returns a fixed `ErrEffectivePolicyReplacementConflict`; the unchecked resolver returns the native fallback map. A failed provider still restores its declared keys to native, unchanged.
 
-The host reads the assignments from the same per-user role cache entry, so resolution costs no extra query, and the per-provider LRU key includes the assignment IDs so unassign/re-assign cannot serve a stale result.
+Roles and active assignments are produced by one internal snapshot read from a single `role_assignment` query, so resolution costs no extra query and the two answers cannot disagree. A failure to read assignments is reported as a checked role-input error before any provider is invoked, never as an empty assignment list. The per-provider LRU key includes the assignment IDs so unassign/re-assign cannot serve a stale result.
 
 ## Why
 
@@ -2121,15 +2500,16 @@ An additional contribution cannot express "this role's value is now X": bool OR 
 
 Expected: PR URL が出る。**この URL を控えておく**。
 
-- [ ] **Step 8: PR の URL を Misaki branch 側に記録する**
+- [ ] **Step 9: PR の URL を Misaki branch 側に記録する**
 
 `E:\tmp\opencode\mk-can-delete-account` に戻り、`docs/superpowers/plans/2026-09-27-role-policy-replacement-plugin-api.md` の**末尾に1節だけ**追記する:
 
 ```markdown
 ## Execution Record
 
-- Upstream PR: <Step 7 で作った URL>
-- Upstream branch: `Misaki-Project/mk:upstream/role-policy-replacement-plugin-api`（base `upstream/develop` @ `1a0f2012`）
+- Upstream PR: <Step 8 で作った URL>
+- Upstream branch: `Misaki-Project/mk` の `upstream/role-policy-replacement-plugin-api`（PR head は `Misaki-Project:upstream/role-policy-replacement-plugin-api`）
+- Base: `upstream/develop` @ `<Step 2 で控えた SHA>`
 - Applied commits (oldest first): `<sha1> <sha2> <sha3> <sha4> <sha5>`
 ```
 
@@ -2138,9 +2518,9 @@ git add docs/superpowers/plans/2026-09-27-role-policy-replacement-plugin-api.md
 git commit -m "Docs: record the upstream role policy replacement PR"
 ```
 
-Expected: 1 commit。**この commit は upstream へ積まない**（Step 4 で SHA を個別指定しているので自動的に外れる）。
+Expected: 1 commit。**この commit は upstream へ積まない**（Step 5 で SHA を個別指定しているので自動的に外れる）。
 
-- [ ] **Step 9: レビューで修正が来たときの follow-up**
+- [ ] **Step 10: レビューで修正が来たときの follow-up**
 
 upstream 側で review が来たら、**同じ branch へ push する**（PR は自動更新される）:
 
@@ -2156,7 +2536,10 @@ upstream 側で contract を変えた場合は `plugin.APIVersion` の要否を*
 
 - **Spec coverage**: `Generic Plugin API Extensions` の「Active Assignment Context」→ Task 1 + 2。「Role Policy Replacement」の契約（active role + 既知keyのみ / 1対1 / native priority維持 / 集約継続 / admin判定対象外 / 競合error / failure fallback / checked error / unchecked map）→ Task 4。「公開Plugin API変更にはcompatibility docs、surface golden、host wiring test、frontend type test」のうち **frontend type test 以外の3つ** → Task 1 / 4 / 5（frontend slot は本計画の明示スコープ外）。「No core DB migration」→ Global Constraints。`Delivery Boundaries` の upstream PR → Task 6。
 - **スコープ外にしたもの**: Misaki固有のroleLevel（level / XP / curve / range / storage / route / UI）、frontend（`admin:role-editor` slot、misskey-ts）、`deliveryTargets`。spec のうち upstream PR に載らないものは別計画で扱う。
-- **Placeholder scan**: 「TODO」「後で埋める」「同様に(Task N)」相当は無い。すべてのコードステップに実コードがある。実装者が判断を迫られる箇所（`SetUserRepo` の存在、formula型、upstream HEADのhash）は、該当する file/line を明示して「必ず確認すること」と書いた。
-- **Type consistency**: `plugin.ActiveRoleAssignment{RoleID, AssignmentID}` / `ActiveAssignments` は Task 1 で定義し、Task 2（host）と Task 4（validation + plugintest）が同じ名前・型を使う。`role.activeRoleAssignment{roleID, assignmentID}` は Task 2 で定義し、Task 3 の `rolePolicyInput` が `overrides` として別物を持つ。`rolePolicyInput.roleID` は Task 3 で定義し、Task 4 の `applyPolicyReplacements` / `overridesByRole` が読む。`ValidateContributions(keys, activeRoles, contributions)` の3引数は Task 4 Step 2（test）→ Step 3（実装）で一致し、2つの呼び出し側（`core/role`、`plugintest`）も同じ形。`ErrEffectivePolicyReplacementConflict` は Task 4 Step 5（test）→ Step 6（実装）で一致。
-- **Forward reference なし**: Task 4 が使う `roleInputs` は Task 3 Step 1 で導入済み。Task 3 は Task 1/2 の型に依存しない。Task 2 の `activeRoleAssignments` は Task 1 の型だけを必要とする。
-- **信頼性**: gate コマンドはすべてこの作業ツリーで実測して緑になることを確認済み（`go test ./internal/core/role -count=1` PASS、`go test ./plugin ./internal/effectivepolicy -count=1` PASS、`go test ./plugin/plugintest -count=1 -run TestEffectivePolic` PASS、`go test ./internal/entitycompat -run TestPluginDoc -count=1` PASS、bundled plugin の `go vet` PASS）。`TestPluginSurfaceDrift` は行末差で元から赤なので、正規化比較を正式な gate にした。`git format-patch -1` の複数rev问题时も実測で把握済み（Step 4 に回避策を書いた）。
+- **Test-first ordering**: 全 task で「最小 test / gate を書く → RED を実行して観察 → production / docs を書く → GREEN」を満たす。Task 1 は plugin package のコンパイル ERROR を RED として観測し、doc gate は golden 更新で RED にしてから docs を書く。Task 2 は内部 API が無いことによるコンパイル ERROR を RED として観測してから `resolveUserRoleSnapshot` を実装する。Task 3 は test を先に新形へ書き換えて RED にしてから型を足す。Task 4 は validation → host 適用 → plugintest の3区画それぞれについて test → RED → 実装 → GREEN の順。Task 5 は gate の生存を RED で証明してから docs を書く。
+- **Regression guard の明示**: 実装前から緑になる test には plan 上でその旨を記した — `TestEffectivePolicy_AssignmentRepositoryFailureSkipsProviders`（Task 2 Step 1）と、plugintest の `TestEffectivePoliciesAcceptsValidReplacement` / `TestEffectivePoliciesRejectsInvalidReplacement` / `TestEffectivePoliciesRejectsReplacementChoosingAPriority`（Task 4 Step 9）。これらは RED を作らない代わりに、実装変更が既存契約を守ったことの固定として残す。
+- **Placeholder scan**: 「TODO」「後で埋める」「同様に(Task N)」相当は無い。すべてのコードステップに実コードがある。実装者が判断を迫られる箇所（`SetUserRepo` の存在、`{"type":"isLocal"}` の可用性、upstream HEAD の SHA、PR head の形式）は file/line またはコマンドを明示して「必ず確認すること」と書いた。
+- **Type consistency**: `plugin.ActiveRoleAssignment{RoleID, AssignmentID}` / `ActiveAssignments` は Task 1 で定義し、Task 2（host）と Task 4（validation + plugintest）が同じ名前・型を使う。`role.userRoleSnapshot{roles, activeAssignments}` と `role.activeRoleAssignment{roleID, assignmentID}` は Task 2 の Interfaces で定義し、Step 3 のコードと一致する。`rolePolicyInput.roleID` / `rolePolicyEntry` は Task 3 で定義し、Task 4 の `overridesByRole` / `applyPolicyReplacements` / `collectPolicyReplacement` が同じ名前で読む。`ValidateContributions(keys, activeRoles, contributions)` の3引数は Task 4 Step 1（test）→ Step 3（実装）で一致し、2つの呼び出し側（`core/role`、`plugintest`）も同じ形。`ErrEffectivePolicyReplacementConflict` は Task 4 Step 5（test）→ Step 6（RED のコンパイルエラー）→ Step 7（実装）で一致。
+- **Forward reference なし**: Task 4 が使う `roleInputs` は Task 3 で導入済み。Task 4 Step 3 が使う `plugintestActiveRoleIDs` / `activeRoleIDsFromAssignments` は同じ Step で定義する。Task 3 は Task 1/2 の型に依存しない。Task 2 の `resolveUserRoleSnapshot` は Task 1 の型だけを使う。
+- **Task 間の型重複の排除**: 呼び出し回数カウンタに `countingAssignmentRepo`（`role_service_test.go`、外部 test package）を、repository 失敗に `failingPolicyAssignmentRepo`（`plugin_policy_test.go`、外部 test package）を再利用する。内部 test package からは既存の mock を直接触れないので `countingInternalAssignmentRepo` だけが新しい型で、これは「外から見える契約を持たない内部 test double」であることをコメントで明示している。
+- **信頼性**: gate コマンドはすべてこの作業ツリーで実測して緑になることを確認済み（`go test ./internal/core/role -count=1` PASS、`go test ./plugin ./internal/effectivepolicy -count=1` PASS、`go test ./plugin/plugintest -count=1 -run TestEffectivePolic` PASS、`go test ./internal/entitycompat -run TestPluginDoc -count=1` PASS、bundled plugin の `go vet` PASS、authoring.md の snippet gate は `SNIPPET GATE OK`）。`TestPluginSurfaceDrift` は行末差で元から赤なので、正規化比較を正式な gate にした。`git format-patch -1` の複数rev問題と `extract.py` の cp932 問題も実測で把握し、回避策を Step に書いた。
