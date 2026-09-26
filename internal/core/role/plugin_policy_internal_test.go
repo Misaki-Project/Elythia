@@ -3,6 +3,7 @@ package role
 import (
 	"bytes"
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -12,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/shiroha-a/mk/plugin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -475,4 +479,174 @@ func TestDisablePolicyProviderWarnsInsideCriticalSection(t *testing.T) {
 
 	assert.Less(t, int(warnPos), int(unlockPos),
 		"warn が Unlock より後にある。CAS に負けた側が、記録される前に戻れてしまう (#2867)")
+}
+
+// countingInternalAssignmentRepo は内部 test から ListByUser の回数と失敗を制御
+// する。**plugin_policy_test.go の countingAssignmentRepo とは package が違うので
+// 別型になる**が、外から見える契約は増やさない。
+type countingInternalAssignmentRepo struct {
+	*testutil.MockRoleAssignmentRepository
+	err   error
+	calls int
+}
+
+func (r *countingInternalAssignmentRepo) ListByUser(userID string) ([]*model.RoleAssignment, error) {
+	r.calls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.MockRoleAssignmentRepository.ListByUser(userID)
+}
+
+func newInternalServiceWithCountingRepo(t *testing.T) (*Service, *testutil.MockRoleRepository, *countingInternalAssignmentRepo) {
+	t.Helper()
+	roleRepo := testutil.NewMockRoleRepository()
+	assignRepo := &countingInternalAssignmentRepo{MockRoleAssignmentRepository: testutil.NewMockRoleAssignmentRepository(roleRepo)}
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x"}
+	idGen, _ := id.NewGenerator("aidx")
+	return NewService(roleRepo, assignRepo, metaRepo, idGen), roleRepo, assignRepo
+}
+
+// 1 回の ListByUser から roles と activeAssignments が同時に得られる。
+func TestResolveUserRoleSnapshotReadsOnceAndReturnsBoth(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	snapshot, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.NoError(t, err)
+	require.Len(t, snapshot.roles, 1)
+	assert.Equal(t, "r1", snapshot.roles[0].ID)
+	assert.Equal(t, []activeRoleAssignment{{roleID: "r1", assignmentID: "a1"}}, snapshot.activeAssignments)
+	assert.Equal(t, 1, assignRepo.calls, "roles と activeAssignments は 1 回の読取から共に作られる")
+}
+
+// warm cache は 0 query で両方を返す。**片方だけ返さない。**
+func TestResolveUserRoleSnapshotCacheHitReturnsBothWithoutReading(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	_, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+	cached, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.NoError(t, err)
+	require.Len(t, cached.roles, 1)
+	assert.Equal(t, []activeRoleAssignment{{roleID: "r1", assignmentID: "a1"}}, cached.activeAssignments,
+		"cache hit は roles と activeAssignments の両方を返す")
+	assert.Equal(t, 1, assignRepo.calls, "cache hit は repository を読まない")
+}
+
+// **cache entry は書き込み済みのスナップショットを返す。** 後から repository を壊しても、
+// cache が assignments を空に堕ちさせない。
+func TestResolveUserRoleSnapshotCacheHitSurvivesRepositoryFailure(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+	_, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+
+	assignRepo.err = errors.New("assignment lookup failed")
+	cached, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.NoError(t, err)
+	assert.Equal(t, []activeRoleAssignment{{roleID: "r1", assignmentID: "a1"}}, cached.activeAssignments)
+	assert.Equal(t, 1, assignRepo.calls, "cache hit は repository に触れない")
+}
+
+// **partial snapshot を返さない。** error のとき zero snapshot が返る。
+func TestResolveUserRoleSnapshotPropagatesRepositoryErrorWithoutPartialResult(t *testing.T) {
+	svc, _, assignRepo := newInternalServiceWithCountingRepo(t)
+	readErr := errors.New("assignment lookup failed")
+	assignRepo.err = readErr
+
+	snapshot, err := svc.resolveUserRoleSnapshot("u1")
+
+	require.ErrorIs(t, err, readErr)
+	assert.Empty(t, snapshot.roles, "roles だけ埋まった partial snapshot を返さない")
+	assert.Empty(t, snapshot.activeAssignments, "assignments を空で埋めない")
+}
+
+// 匿名は非nil空の snapshot を error なしで返す（repository にも触らない）。
+func TestResolveUserRoleSnapshotAnonymousIsNonNilAndErrorFree(t *testing.T) {
+	svc, _, assignRepo := newInternalServiceWithCountingRepo(t)
+
+	snapshot, err := svc.resolveUserRoleSnapshot("")
+
+	require.NoError(t, err)
+	assert.NotNil(t, snapshot.activeAssignments)
+	assert.Empty(t, snapshot.activeAssignments)
+	assert.Empty(t, snapshot.roles)
+	assert.Zero(t, assignRepo.calls, "匿名解決は repository を読まない")
+}
+
+// GetUserRoles は互換ラッパ。roles だけを返し、2 回読まない。
+func TestGetUserRolesKeepsItsSignatureAndHidesAssignments(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	roles, err := svc.GetUserRoles("u1")
+
+	require.NoError(t, err)
+	require.Len(t, roles, 1)
+	assert.Equal(t, "r1", roles[0].ID)
+	assert.Equal(t, 1, assignRepo.calls, "ラッパが 2 回読まない")
+}
+
+// 返した snapshot を書き換えても cache は変わらない。
+func TestResolveUserRoleSnapshotReturnsACopy(t *testing.T) {
+	svc, roleRepo, assignRepo := newInternalServiceWithCountingRepo(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assignRepo.Assignments["u1:r1"] = &model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}
+
+	first, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+	first.activeAssignments[0].assignmentID = "mutated"
+
+	second, err := svc.resolveUserRoleSnapshot("u1")
+	require.NoError(t, err)
+	assert.Equal(t, "a1", second.activeAssignments[0].assignmentID, "cache は非共有の複製を返す")
+	assert.Equal(t, 1, assignRepo.calls)
+}
+
+// assignment 同一性が provider の cache key に入らないと付け外しの直後に古い結果を
+// 返す。**RoleIDs は両者とも空**なので差の出所は assignment だけ。
+func TestPolicyProviderCacheKeySeparatesAssignmentIdentities(t *testing.T) {
+	runtime := newPolicyProviderRuntime(defaultEffectivePolicyProviderCacheEntries)
+	provider := policyProvider{
+		reg: plugin.EffectivePolicyRegistration{
+			Keys: []string{"canSearchNotes"},
+			Resolve: func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+				granted := req.ActiveAssignments[0].AssignmentID == "a1"
+				return []plugin.EffectivePolicyContribution{{Key: "canSearchNotes", Priority: 2, Value: granted}}, nil
+			},
+		},
+		runtime: runtime,
+	}
+	first := plugin.EffectivePolicyRequest{UserID: "u1", ActiveAssignments: []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a1"}}}
+	second := plugin.EffectivePolicyRequest{UserID: "u1", ActiveAssignments: []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a2"}}}
+
+	firstResult, ok := resolvePolicyProviderCached(provider, first)
+	require.True(t, ok)
+	secondResult, ok := resolvePolicyProviderCached(provider, second)
+	require.True(t, ok)
+
+	assert.Equal(t, true, firstResult[0].Value)
+	assert.Equal(t, false, secondResult[0].Value, "別の assignment の結果を再利用してはいけない")
+	assert.Len(t, runtime.cache, 2, "assignment が違えば別 entry")
+}
+
+func TestEncodePolicyProviderAssignmentsPreventsConcatenationCollision(t *testing.T) {
+	assert.NotEqual(t,
+		encodePolicyProviderAssignments([]plugin.ActiveRoleAssignment{{RoleID: "a", AssignmentID: "bc"}}),
+		encodePolicyProviderAssignments([]plugin.ActiveRoleAssignment{{RoleID: "ab", AssignmentID: "c"}}),
+		"role/assignment の境界が曖昧だと別入力を同じ key に押し込める")
+	assert.NotEqual(t,
+		encodePolicyProviderAssignments([]plugin.ActiveRoleAssignment{{RoleID: "r", AssignmentID: "a1"}}),
+		encodePolicyProviderAssignments([]plugin.ActiveRoleAssignment{{RoleID: "r", AssignmentID: "a"}, {RoleID: "1", AssignmentID: ""}}),
+		"entry の境界が曖昧だと別入力を同じ key に押し込める")
 }

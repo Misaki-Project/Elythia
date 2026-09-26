@@ -74,6 +74,10 @@ func newPolicyProviderRuntime(cacheEntries int) *policyProviderRuntime {
 type policyProviderCacheKey struct {
 	userID  string
 	roleIDs string
+	// assignments は ActiveAssignments の encoding。**RoleIDs が同じでも assignment が
+	// 違えば結果は違う** plugin がある（assignment ごとに状態を持つ）ので、付けないと
+	// 付け外し / 再割り当ての直後に前の結果を返す。
+	assignments string
 }
 
 type policyProviderCacheEntry struct {
@@ -195,12 +199,17 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 	}
 
 	roles := []*model.Role{}
+	activeAssignments := []activeRoleAssignment{}
 	if userID != "" {
-		var err error
-		roles, err = s.GetUserRoles(userID)
+		// **1 回の読取から roles と activeAssignments を共に得る。** repository が読めない
+		// ときは activeAssignments を空で埋めた snapshot を渡さず、provider を起動する
+		// 前に checked error にする。
+		snapshot, err := s.resolveUserRoleSnapshot(userID)
 		if err != nil {
 			return s.applyServerCaps(base), fmt.Errorf("role: effective policy inputs: %w", err)
 		}
+		roles = snapshot.roles
+		activeAssignments = snapshot.activeAssignments
 	}
 	if len(roles) == 0 && len(providers) == 0 {
 		return s.applyServerCaps(base), nil
@@ -228,6 +237,10 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 
 	// provider には現在 active な native RoleID のみを、ソート + clone して渡す。
 	roleIDs := activeRoleIDs(roles)
+	// active manual assignment も渡す。**同じ snapshot から写す**ので 2 本目の query は
+	// 出ない。RoleIDs だけでは「同じ role でもどの assignment なのか」が分からず、
+	// assignment に紐づく状態を持つ plugin が作れないため。戻り値は常に非nil（匿名は空slice）。
+	assignments := pluginActiveRoleAssignments(activeAssignments)
 
 	// key -> provider contribution entries (同一 priority cascade に参加させる)。
 	contribs := make(map[string][]policyEntry)
@@ -246,9 +259,15 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 			defer providersWG.Done()
 			providerRoleIDs := make([]string, len(roleIDs))
 			copy(providerRoleIDs, roleIDs)
+			providerAssignments := make([]plugin.ActiveRoleAssignment, len(assignments))
+			copy(providerAssignments, assignments)
 			resolved[i].contributions, resolved[i].ok = resolvePolicyProviderCached(
 				p,
-				plugin.EffectivePolicyRequest{UserID: userID, RoleIDs: providerRoleIDs},
+				plugin.EffectivePolicyRequest{
+					UserID:            userID,
+					RoleIDs:           providerRoleIDs,
+					ActiveAssignments: providerAssignments,
+				},
 			)
 		}()
 	}
@@ -334,7 +353,11 @@ func resolvePolicyProviderCached(provider policyProvider, req plugin.EffectivePo
 	if provider.runtime.disabled.Load() {
 		return nil, false
 	}
-	key := policyProviderCacheKey{userID: req.UserID, roleIDs: encodePolicyProviderRoleIDs(req.RoleIDs)}
+	key := policyProviderCacheKey{
+		userID:      req.UserID,
+		roleIDs:     encodePolicyProviderRoleIDs(req.RoleIDs),
+		assignments: encodePolicyProviderAssignments(req.ActiveAssignments),
+	}
 
 	var flight *policyProviderFlight
 	// **ループではない。** 早期 return を持つ 1 回きりの区間で、`for` は
@@ -480,6 +503,23 @@ func encodePolicyProviderRoleIDs(roleIDs []string) string {
 		encoded.WriteString(strconv.Itoa(len(roleID)))
 		encoded.WriteByte(':')
 		encoded.WriteString(roleID)
+	}
+	return encoded.String()
+}
+
+// encodePolicyProviderAssignments は role ID と assignment ID の**両方を**
+// length-prefix して key にする。片方だけ prefix すると
+// `{RoleID: "a", AssignmentID: "bc"}` と `{RoleID: "ab", AssignmentID: "c"}` が同じ key に
+// なり、plugin には別の user の assignment ID が渡る。
+func encodePolicyProviderAssignments(assignments []plugin.ActiveRoleAssignment) string {
+	var encoded strings.Builder
+	for _, a := range assignments {
+		encoded.WriteString(strconv.Itoa(len(a.RoleID)))
+		encoded.WriteByte(':')
+		encoded.WriteString(a.RoleID)
+		encoded.WriteString(strconv.Itoa(len(a.AssignmentID)))
+		encoded.WriteByte(':')
+		encoded.WriteString(a.AssignmentID)
 	}
 	return encoded.String()
 }
@@ -653,6 +693,16 @@ func lessPolicyContribution(a, b plugin.EffectivePolicyContribution) bool {
 		return !a.UseDefault
 	}
 	return false
+}
+
+// pluginActiveRoleAssignments は host 内部型を公開plugin型へ写す。戻り値は常に非nil
+// （len 0 でも make の戻りなので nil にならない）— 匿名解決の契約。
+func pluginActiveRoleAssignments(in []activeRoleAssignment) []plugin.ActiveRoleAssignment {
+	out := make([]plugin.ActiveRoleAssignment, len(in))
+	for i, a := range in {
+		out[i] = plugin.ActiveRoleAssignment{RoleID: a.roleID, AssignmentID: a.assignmentID}
+	}
+	return out
 }
 
 // activeRoleIDs extracts the currently active role IDs from the resolved

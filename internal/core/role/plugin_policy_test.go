@@ -2043,6 +2043,184 @@ func TestInvalidateRolePolicies_EmptyRoleNoop(t *testing.T) {
 	require.NoError(t, svc.InvalidateRolePolicies(context.Background(), ""))
 }
 
+// newCountingTestService は newTestService と同じ形の戻り値に、既存の
+// countingAssignmentRepo (role_service_test.go) を挟んだもの。**型を使い回す**
+// ことで「1 query」の主張が全 test で同じ数え方になる。
+func newCountingTestService(t *testing.T) (*role.Service, *testutil.MockRoleRepository, *testutil.MockRoleAssignmentRepository, *countingAssignmentRepo) {
+	t.Helper()
+	roleRepo := testutil.NewMockRoleRepository()
+	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
+	metaRepo := newTestMetaRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	counting := &countingAssignmentRepo{MockRoleAssignmentRepository: assignRepo}
+	return role.NewService(roleRepo, counting, metaRepo, idGen), roleRepo, assignRepo, counting
+}
+
+func TestEffectivePolicy_ActiveAssignmentsCoverOnlyActiveManualRoles(t *testing.T) {
+	svc, roleRepo, assignRepo, _ := newTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	roleRepo.Roles["r2"] = &model.Role{ID: "r2", Name: "B", Target: model.RoleTargetManual}
+	// conditional role は condFormula で一致する。assignment row は無い。
+	roleRepo.Roles["r3"] = &model.Role{ID: "r3", Name: "C", Target: model.RoleTargetConditional,
+		CondFormula: datatypes.JSON([]byte(`{"type":"isLocal"}`))}
+	assign(t, assignRepo, "u1", "r1")
+	assign(t, assignRepo, "u1", "r2")
+	// orphan assignment: role_assignment の行だけが残っている。
+	assignRepo.Assignments["u1:r9"] = &model.RoleAssignment{ID: "a_u1_r9", UserID: "u1", RoleID: "r9"}
+	userRepo := testutil.NewMockUserRepository()
+	userRepo.Users["u1"] = &model.User{ID: "u1"} // Host nil なので isLocal が真
+	svc.SetUserRepo(userRepo)
+
+	var request plugin.EffectivePolicyRequest
+	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			request = req
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"r1", "r2", "r3"}, request.RoleIDs, "RoleIDs は conditional を含むという既存契約を変えない")
+	assert.Equal(t, []plugin.ActiveRoleAssignment{
+		{RoleID: "r1", AssignmentID: "a_u1_r1"},
+		{RoleID: "r2", AssignmentID: "a_u1_r2"},
+	}, request.ActiveAssignments, "conditional role と role 行が無い orphan assignment は ActiveAssignments に入らない")
+	// **部分集合の不変条件。** RoleIDs にあるのに ActiveAssignments に入らない、あるいは
+	// 逆が起きたら host 側で契約が壊れている。
+	for _, a := range request.ActiveAssignments {
+		assert.Contains(t, request.RoleIDs, a.RoleID)
+	}
+}
+
+func TestEffectivePolicy_ActiveAssignmentsAreNonNilForAnonymous(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	var request plugin.EffectivePolicyRequest
+	var seen bool
+	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			seen = true
+			request = req
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("")
+	require.NoError(t, err)
+	require.True(t, seen, "匿名解決でも provider は呼ばれるので ActiveAssignments は非nil空sliceである必要がある")
+	assert.NotNil(t, request.ActiveAssignments)
+	assert.Empty(t, request.ActiveAssignments)
+}
+
+func TestEffectivePolicy_ActiveAssignmentsExcludeExpiredAssignments(t *testing.T) {
+	svc, roleRepo, assignRepo, _ := newTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	roleRepo.Roles["r2"] = &model.Role{ID: "r2", Name: "B", Target: model.RoleTargetManual}
+	assign(t, assignRepo, "u1", "r1")
+	past := time.Now().Add(-time.Hour)
+	assignRepo.Assignments["u1:r2"] = &model.RoleAssignment{ID: "a_u1_r2", UserID: "u1", RoleID: "r2", ExpiresAt: &past}
+
+	var request plugin.EffectivePolicyRequest
+	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			request = req
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}, request.ActiveAssignments)
+}
+
+// **1 回の解決で ListByUser は 1 回だけ。** roles と activeAssignments を別々に
+// 読む設計に戻ると 2 回になり、hot path に query が 1 本増える。
+func TestEffectivePolicy_ResolutionIssuesExactlyOneQuery(t *testing.T) {
+	svc, roleRepo, assignRepo, counting := newCountingTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assign(t, assignRepo, "u1", "r1")
+	var seen int
+	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
+		func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			seen++
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, 1, seen)
+	assert.Equal(t, 1, counting.listByUserCalls, "roles と activeAssignments は 1 回の ListByUser から共に作られる")
+
+	// warm cache: provider 自身が LRU に当たって resolver を呼ばないが、role
+	// スナップショットは native pass の前に必ず通る。ここで 2 本目が出たら検出できる。
+	_, err = svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, 1, counting.listByUserCalls, "warm cache は 2 つとも答える")
+}
+
+// **invalidation は「読み直す」ために存在する。** 空の assignments を返して黙る、
+// という別の故障を許さない。
+//
+// `InvalidateUser` (= per-user の role cache と provider cache を落とす公開の
+// 無効化入口) を使う。`InvalidateUserRoleCache` だけだと role snapshot は読み直す
+// ものの provider の成功結果 LRU が同じ key を残したままなので、resolver は2回目に
+// 呼ばれず「解決後に渡された assignments」を観測できない。
+func TestEffectivePolicy_InvalidationRefetchesBothInsteadOfEmptyingAssignments(t *testing.T) {
+	svc, roleRepo, assignRepo, counting := newCountingTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assign(t, assignRepo, "u1", "r1")
+	want := []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}
+	var got [][]plugin.ActiveRoleAssignment
+	registerProvider(t, svc, "ctx", []string{"canSearchNotes"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			got = append(got, req.ActiveAssignments)
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	require.NoError(t, svc.InvalidateUser(context.Background(), "u1"))
+	_, err = svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, counting.listByUserCalls, "invalidated な user は読み直す")
+	require.Len(t, got, 2, "provider は 2 回とも呼ばれる")
+	assert.Equal(t, want, got[0])
+	assert.Equal(t, want, got[1], "invalidation 後の解決で assignments が空に堕ちてはいけない")
+}
+
+// **repository の読み損ねは握り潰さない。** activeAssignments を空で埋めた partial
+// snapshot を渡すと、plugin には「その role に active な assignment が無い」という
+// 嘘が見えるので、provider を起動する前に error にする。
+//
+// 既存の `TestEffectivePolicy_RoleLookupErrorSkipsProvidersAndRemainsDistinct` は同じ
+// 経路を「provider を起動しない」角度で固定している。こちらは assignments 側の契約を
+// 明示する **regression guard** で、実装前から緑になる（既存の `GetUserRoles` が既に
+// error を返すため）。RED は Step 2 の内部 test で観測する。
+func TestEffectivePolicy_AssignmentRepositoryFailureSkipsProviders(t *testing.T) {
+	roleRepo := testutil.NewMockRoleRepository()
+	assignRepo := &failingPolicyAssignmentRepo{
+		MockRoleAssignmentRepository: testutil.NewMockRoleAssignmentRepository(roleRepo),
+		err:                          errors.New("assignment lookup failed"),
+	}
+	metaRepo := newTestMetaRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
+	var providerCalls atomic.Int32
+	var assignments []plugin.ActiveRoleAssignment
+	registerProvider(t, svc, "p", []string{"canSearchNotes"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			providerCalls.Add(1)
+			assignments = req.ActiveAssignments
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "role: effective policy inputs")
+	assert.Zero(t, providerCalls.Load(), "role 入力を読めないとき provider を起動しない")
+	assert.Nil(t, assignments, "assignment を空で埋めた値で provider を起動しない")
+}
+
 func BenchmarkEffectivePolicy_NoProviderAnonymous(b *testing.B) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
