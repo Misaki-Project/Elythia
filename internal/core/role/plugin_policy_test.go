@@ -654,13 +654,23 @@ func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *t
 			// 存在を検査するのではなく、解決経路が provider を起動しなかったという
 			// 観測可能な副作用を見る。返り値は priority 2 の `false` にしてあるので、
 			// 呼ばれていれば下の fallback map の `true` も壊れる (二重の証拠)。
-			var providerCalls atomic.Int32
+			var accountProviderCalls atomic.Int32
 			registerProvider(t, svc, "account-policy", []string{role.PolicyCanDeleteAccount},
 				func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
-					providerCalls.Add(1)
+					accountProviderCalls.Add(1)
 					return []plugin.EffectivePolicyContribution{{
 						Key:      role.PolicyCanDeleteAccount,
 						Priority: 2,
+						Value:    false,
+					}}, nil
+				})
+			var searchProviderCalls atomic.Int32
+			registerProvider(t, svc, "search-policy", []string{"canSearchNotes"},
+				func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+					searchProviderCalls.Add(1)
+					return []plugin.EffectivePolicyContribution{{
+						Key:      "canSearchNotes",
+						Priority: 1,
 						Value:    false,
 					}}, nil
 				})
@@ -671,13 +681,17 @@ func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *t
 			assert.ErrorContains(t, err, "role: effective policy base")
 			assert.Equal(t, true, policies[role.PolicyCanDeleteAccount],
 				"fallback map は native 既定を保つ (error を受ける側で停止するのが責務)")
-			assert.Zero(t, providerCalls.Load(),
-				"checked 解決は base を読み損ねた窓で provider を起動しない")
+			assert.Zero(t, accountProviderCalls.Load(),
+				"checked 解決は base を読み損ねた窓で account provider を起動しない")
+			assert.Zero(t, searchProviderCalls.Load(),
+				"checked 解決は base を読み損ねた窓で search provider を起動しない")
 
 			assert.Equal(t, true, svc.GetUserPolicies("u1")[role.PolicyCanDeleteAccount],
 				"unchecked 経路は fail-soft のまま (既存 consumer を壊さない)")
-			assert.Zero(t, providerCalls.Load(),
-				"unchecked 経路も provider を起動しない (error を捨てるだけで解決経路は同一)")
+			assert.Zero(t, accountProviderCalls.Load(),
+				"unchecked 経路も account provider を起動しない (error を捨てるだけで解決経路は同一)")
+			assert.Zero(t, searchProviderCalls.Load(),
+				"unchecked 経路も search provider を起動しない (error を捨てるだけで解決経路は同一)")
 
 			// **base を落とした early return は不可。** role override まで
 			// 反映した map を返さないと、base 障害の窓で role の拒否が
@@ -692,8 +706,10 @@ func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *t
 			svc.InvalidateUserRoleCache("u1") // 直上の解決が user cache を埋めている
 			assert.Equal(t, false, svc.GetUserPolicies("u1")[role.PolicyCanDeleteAccount],
 				"unchecked map must still carry the role override while base is unreadable")
-			assert.Zero(t, providerCalls.Load(),
-				"role override を反映した解決でも provider を起動しない")
+			assert.Zero(t, accountProviderCalls.Load(),
+				"role override を反映した解決でも account provider を起動しない")
+			assert.Zero(t, searchProviderCalls.Load(),
+				"role override を反映した解決でも search provider を起動しない")
 		})
 	}
 }
