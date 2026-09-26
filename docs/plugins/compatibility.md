@@ -34,7 +34,7 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 
 `EffectivePolicyRequest`をpluginのtestやヘルパーで組み立てる場合は`plugin.Definition`と同じく**keyed struct literalだけ**を互換対象とする（`RoleIDs: ...`のようにフィールド名を書く）。外部プラグインのpositional / unkeyed literalはサポートしない。
 
-`EffectivePolicyContribution`をpluginのコードやtestで組み立てる場合も`plugin.Definition`と同じく**keyed struct literalだけ**を互換対象とする（`Key: ...`のようにフィールド名を書く）。**exported fieldを増やした型はpositional / unkeyed literalがソースで壊れる** — `ReplaceRoleID`の追加で`EffectivePolicyRequest`と`EffectivePolicyContribution`がこれに当たるので、実行時の挙動がadditiveのままであってもコンパイルは通らない。
+`EffectivePolicyContribution`をpluginのコードやtestで組み立てる場合も`plugin.Definition`と同じく**keyed struct literalだけ**を互換対象とする（`Key: ...`のようにフィールド名を書く）。**exported fieldを増やした型はpositional / unkeyed literalがソースで壊れる** — `ActiveAssignments`の追加で`EffectivePolicyRequest`が、`ReplaceRoleID`の追加で`EffectivePolicyContribution`がこれに当たるので、実行時の挙動がadditiveのままであってもコンパイルは通らない。
 
 `Definition.Peer`（#2819）と`Context.Queue()`、`plugin.Queue` / `EnqueueOption`の追加も同じ扱い。`Definition.Peer`は既存プラグインが`Routes`の中でpeerを登録していても壊さない（`RoleBoth`ならそのまま動く）が、**ロールを分割した構成では応答が届かない**ので、移すこと。登録が無いロールでは起動時にwarnが出る。
 
