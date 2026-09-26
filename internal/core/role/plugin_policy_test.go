@@ -202,43 +202,53 @@ func TestEffectivePolicy_RoleIDsIsolatedBetweenProviders(t *testing.T) {
 // host は 1 本の assignments を作って全 provider goroutine へ渡すので、コピーを忘れると
 // 片方の書き換えがもう片方に漏れる (RoleIDs を渡しているのと同じ理屈で守っている)。
 //
-// **観測順を channel で固定する。** 2 provider の実行順は不定なので、beta が自分の
-// request を捕まえた**後**に alpha だけ書き換える。beta は **複製しない** — slice header
-// だけ外へ持ち出すので、array を共有していると alpha の書き換えがそのまま観測値に現れる。
+// **観測順を channel で厳密に固定する。** 2 provider の実行順は不定なので、
+// `beta が自分の slice を捕まえる` → `alpha が自分の slice を書き換える` の順に
+// なります。beta は **複製しない** — slice header だけ外へ持ち出すので、array を
+// 共有していると alpha の書き換えがそのまま観測値に現れる。
 func TestEffectivePolicy_ActiveAssignmentsIsolatedBetweenProviders(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
 	assign(t, assignRepo, "u1", "r1")
 
+	// betaCaptured: beta が自分の request slice を捕まえた。
+	// alphaMutated: alpha が自分の request slice を書き換えた。
 	betaCaptured := make(chan struct{})
+	alphaMutated := make(chan struct{})
 	var alphaBefore []plugin.ActiveRoleAssignment
 	var betaRequest []plugin.ActiveRoleAssignment
 
 	registerProvider(t, svc, "alpha", []string{"canSearchNotes"},
-		func(ctx context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
 			alphaBefore = append([]plugin.ActiveRoleAssignment(nil), req.ActiveAssignments...)
-			// **ctx で打ち切る。** beta が如何に遅れても host の 1s provider deadline を
-			// 丸ごと消費しない。待つ前に beta が捕まえ終わっていれば順序は確定し、
-			// 待てなかった場合も alpha の array は beta の array と別物なので下の
-			// assertion はそのまま有効。
-			select {
-			case <-betaCaptured:
-			case <-ctx.Done():
-			}
+			// **ctx での打ち切りは無い。** beta は自分の resolver で何も待たないので
+			// 必ず捕まえ終わる。ここで host の timeout へ逃がすと「alpha が書き換える前に
+			// assertion が走る」窓が残り、証明が空振りする。
+			<-betaCaptured
 			for i := range req.ActiveAssignments {
 				req.ActiveAssignments[i] = plugin.ActiveRoleAssignment{RoleID: "hacked", AssignmentID: "hacked"}
 			}
+			close(alphaMutated)
 			return nil, nil
 		})
 	registerProvider(t, svc, "beta", []string{"canInvite"},
 		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			// **複製しない。** slice header だけを外へ持ち出す。array を共有していると
+			// alpha の書き換えがそのまま観測値に現れる。
 			betaRequest = req.ActiveAssignments
 			close(betaCaptured)
 			return nil, nil
 		})
 
 	_, err := svc.GetUserPoliciesChecked("u1")
+	// **error なしで戻った = alpha の resolver が return 済み = 書き換え済み。**
+	// providersWG が全 provider を join するので、ここより後で alpha の resolver が
+	// 走ることはない。落ちているならそれ以上待たずに落とす (不正な host に対する
+	// test timeout を避ける)。
 	require.NoError(t, err)
+	// **二重の保証。** 上の happens-before に加えて、alpha の書き換えが終わるまで
+	// assertion へ進まない。先に走ると beta の観測が空振りする。
+	<-alphaMutated
 
 	want := []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}
 	assert.Equal(t, want, alphaBefore, "host must hand every provider the same assignments")
