@@ -825,6 +825,7 @@ type EffectivePolicyContribution struct
   UseDefault bool
   Value any
   Order int
+  ReplaceRoleID string
 
 type EffectivePolicyResolver func(context.Context, EffectivePolicyRequest) ([]EffectivePolicyContribution, error)
 

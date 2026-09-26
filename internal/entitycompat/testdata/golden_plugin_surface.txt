@@ -82,6 +82,7 @@ plugin:   field Definition.Version string
 plugin:   field EffectivePolicyContribution.Key string
 plugin:   field EffectivePolicyContribution.Order int
 plugin:   field EffectivePolicyContribution.Priority int
+plugin:   field EffectivePolicyContribution.ReplaceRoleID string
 plugin:   field EffectivePolicyContribution.UseDefault bool
 plugin:   field EffectivePolicyContribution.Value any
 plugin:   field EffectivePolicyRegistration.Keys []string

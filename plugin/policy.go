@@ -52,6 +52,27 @@ type EffectivePolicyContribution struct {
 	// their deterministic provider-local order. Each (Key, Order) pair must be
 	// unique within one resolver result.
 	Order int
+	// ReplaceRoleID turns this contribution into a **replacement** of one active
+	// manual role's native contribution for Key, instead of an additional
+	// contribution.
+	//
+	// - "" (the default) keeps the existing additive behaviour.
+	// - non-empty names a role that must appear in
+	//   [EffectivePolicyRequest.ActiveAssignments]. Conditional roles are never
+	//   there, so they cannot be replaced.
+	//
+	// **置換は 1 対 1。** 対象 role/key の native contribution だけを差し替え、priority は
+	// **元 native entry の宣言値を引き継ぐ**。他 role の contribution と通常の
+	// priority / type 集約はそのまま行う。
+	//
+	// **Priority と Order は 0 のまま渡すこと。** 置き換える native entry が持った priority
+	// を引き継ぐので、plugin が選んでよいと二重定義になる。host は 0 以外を malformed
+	// として provider 全体を失敗扱いにする。
+	//
+	// 同じ role/key を複数 provider が置換した場合は**競合**となり、host はその pair だけを
+	// native contribution に戻す。checked 解決は error、unchecked 解決は native fallback
+	// map を返す。
+	ReplaceRoleID string
 }
 
 // EffectivePolicyResolver computes effective policy contributions for a user.

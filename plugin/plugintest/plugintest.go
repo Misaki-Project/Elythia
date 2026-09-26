@@ -341,8 +341,13 @@ func (h *Harness) EffectivePolicies(def plugin.Definition) plugin.EffectivePolic
 	if resolver != nil {
 		registration.Resolve = func(ctx context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
 			req.RoleIDs = append([]string(nil), req.RoleIDs...)
+			// **ActiveAssignments も複製して渡す。** 本番 (core/role/plugin_policy.go) が
+			// 複製しているのと同じで、テストが production より緩くないようにする。
+			req.ActiveAssignments = append([]plugin.ActiveRoleAssignment(nil), req.ActiveAssignments...)
 			contributions, err := resolver(ctx, req)
-			if err == nil && !effectivepolicy.ValidateContributions(registration.Keys, contributions) {
+			if err == nil && !effectivepolicy.ValidateContributions(
+				registration.Keys, plugintestActiveRoleIDs(req.ActiveAssignments), contributions,
+			) {
 				h.t.Errorf("plugintest: EffectivePolicies の出力が不正です")
 				return nil, fmt.Errorf("plugintest: effective policy output is invalid")
 			}
@@ -610,4 +615,27 @@ func (r *fakeRequest) Bind(v any) error {
 		return err
 	}
 	return nil
+}
+
+// plugintestActiveRoleIDs は request の assignment が覆う role ID をソート・重複除去
+// して返す。置換が名乗ってよい target を harness 側で判定するために使う
+// （core/role の activeRoleIDsFromAssignments と同じ形）。
+func plugintestActiveRoleIDs(assignments []plugin.ActiveRoleAssignment) []string {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(assignments))
+	seen := make(map[string]struct{}, len(assignments))
+	for _, a := range assignments {
+		if a.RoleID == "" {
+			continue
+		}
+		if _, duplicate := seen[a.RoleID]; duplicate {
+			continue
+		}
+		seen[a.RoleID] = struct{}{}
+		out = append(out, a.RoleID)
+	}
+	sort.Strings(out)
+	return out
 }
