@@ -810,9 +810,14 @@ type Definition struct
 
 func (Definition) Validate() error
 
+type ActiveRoleAssignment struct
+  RoleID string
+  AssignmentID string
+
 type EffectivePolicyRequest struct
   UserID string
   RoleIDs []string
+  ActiveAssignments []ActiveRoleAssignment
 
 type EffectivePolicyContribution struct
   Key string
