@@ -125,7 +125,7 @@ updated_by     text not null
 assignment_id  text primary key
 role_id        text not null
 user_id        text not null
-experience     bigint not null
+experience     bigint not null check (experience between 0 and 9007199254740991)
 created_at     timestamptz not null
 updated_at     timestamptz not null
 ```
@@ -140,7 +140,7 @@ actor_id        text not null
 user_id         text not null
 role_id         text not null
 mode            text not null
-operand         bigint not null
+operand         double precision not null
 desired_exp     bigint
 assignment_id   text
 status          text not null
@@ -212,7 +212,15 @@ linear:      base + additional * n
 exponential: base + additional * exponential^n
 ```
 
-segmentが変わると`n`は0へ戻る。各level-up必要XPは切り上げて整数にしてから累積する。
+segmentが変わると`n`は0へ戻る。各segmentの累積必要XPは浮動小数点の閉形式で計算し、segment間offsetも丸めずに加算する。
+
+```text
+rule 1 offset = 2.5
+rule 2 offset = 3.25
+total offset = 5.75
+```
+
+整数XPがlevel thresholdへ到達したかは浮動小数点の累積値と比較する。thresholdが`10.25`ならXP `11`で到達する。到達後の表示上の`currentLevelExp`は整数XPと浮動小数点thresholdの差をfloorし、`0`として開始する。各level-up costを個別にceilしてから加算してはならない。
 
 validation:
 
@@ -220,11 +228,11 @@ validation:
 - level-up countは1以上のsafe integer。
 - `base`と`additional`はsafe integer範囲の整数。負数も入力できる。
 - `exponential`は0より大きい有限数。
-- 設定範囲内の各level-up必要XPは1以上の有限値。
-- 累積必要XPは`Number.MAX_SAFE_INTEGER`以下。
+- 設定範囲内の各level-up必要XPは0より大きい有限値。
+- ruleごとの累積値と、rule間offsetを加えた全累積必要XPは`Number.MAX_SAFE_INTEGER`以下。
 - 計算途中でNaN、Infinity、overflow、0以下になるcurveは保存時に拒否する。
 
-実装は閉形式とbinary searchを使い、大きなlevel-up countを逐次loopしない。
+実装はrule setを順に評価し、const、linear、exponentialの累積値を閉形式で求め、各rule内をbinary searchする。計算量は`O(rule count * log(level-up count))`、追加memoryは`O(1)`とし、大きなlevel-up countを逐次loopしない。`exponential == 1`は専用式を使い、1に近い値では`Log1p`/`Expm1`相当で桁落ちを避ける。固定のlevel-up回数上限は追加しない。
 
 ### Experience Result
 
@@ -266,7 +274,7 @@ rule:
 
 ## XP Mutation
 
-modeは`set | add | multiplier`とする。計算結果をfloorし、`0..Number.MAX_SAFE_INTEGER`へclampする。
+modeは`set | add | multiplier`とする。operandは有限numberで、`multiplier`は百分率ではなく生の倍率として扱う。例として`1.5`は現在XPを1.5倍する。計算結果をfloorし、`0..Number.MAX_SAFE_INTEGER`へclampする。保存XPとAPI responseはsafe integerなのでJSON numberを使用し、文字列化しない。
 
 既存assignmentでは、Plugin transaction内でXP、audit、operation状態を更新する。commit成功後にuserおよびroleのeffective-policy cacheをinvalidateする。commit前にcacheを更新しない。
 
@@ -298,16 +306,23 @@ modeは`set | add | multiplier`とする。計算結果をfloorし、`0..Number.
 
 ## Plugin Routes
 
+Misskey APIとPlugin routerの契約に合わせ、routeはすべてPOSTとし、IDやpaging条件はrequest bodyで受ける。
+
 ```text
-GET    /api/plugin/role-level/admin/roles
-GET    /api/plugin/role-level/admin/roles/:roleId
-PUT    /api/plugin/role-level/admin/roles/:roleId
-DELETE /api/plugin/role-level/admin/roles/:roleId
-GET    /api/plugin/role-level/admin/users/:userId
-POST   /api/plugin/role-level/admin/change-exp
-GET    /api/plugin/role-level/roles/:roleId/users
-GET    /api/plugin/role-level/users/:userId
+POST /api/plugin/role-level/admin/roles/list
+POST /api/plugin/role-level/admin/roles/show
+POST /api/plugin/role-level/admin/roles/update
+POST /api/plugin/role-level/admin/roles/delete
+POST /api/plugin/role-level/admin/users/show
+POST /api/plugin/role-level/admin/change-exp
+POST /api/plugin/role-level/roles/users
+POST /api/plugin/role-level/users/show
+POST /api/plugin/role-level/admin/audit
+POST /api/plugin/role-level/admin/orphans
+POST /api/plugin/role-level/admin/reconcile
 ```
+
+native roleのassign/unassignはPlugin routeを増やさず、frontendまたはPlugin backendから既存`admin/roles/assign`と`admin/roles/unassign`を呼ぶ。
 
 API errorにはstable codeを付け、validation、authorization、native API failure、storage failure、conflictを区別する。
 
@@ -339,7 +354,9 @@ frontend Pluginは`Misaki-Project/misskey-ts`でbundleする。direct URL、desk
 - 負数、0、正数の`baseLevel`
 - default level 1..100
 - const、linear、exponential curve
-- 小数XP切り上げ、負additional、overflow、NaN、Infinity
+- rule間の浮動小数点offset保持 (`2.5 + 3.25 = 5.75`)
+- 小数thresholdの到達判定と表示上のfloor、負additional、overflow、NaN、Infinity
+- 大きなlevel-up countがrule内binary searchで評価されること
 - range境界に重複・欠落がないこと
 - multiplierが`baseLevel`に影響されないこと
 - 最大levelで`nextLevelExp: null`
