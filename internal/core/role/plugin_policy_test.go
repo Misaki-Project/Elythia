@@ -198,6 +198,54 @@ func TestEffectivePolicy_RoleIDsIsolatedBetweenProviders(t *testing.T) {
 	assert.Equal(t, []string{"r1", "r2"}, seen, "each provider must receive an isolated sorted RoleIDs slice")
 }
 
+// **provider ごとに request の ActiveAssignments も防御的コピーである。** 1 回の解決で
+// host は 1 本の assignments を作って全 provider goroutine へ渡すので、コピーを忘れると
+// 片方の書き換えがもう片方に漏れる (RoleIDs を渡しているのと同じ理屈で守っている)。
+//
+// **観測順を channel で固定する。** 2 provider の実行順は不定なので、beta が自分の
+// request を捕まえた**後**に alpha だけ書き換える。beta は **複製しない** — slice header
+// だけ外へ持ち出すので、array を共有していると alpha の書き換えがそのまま観測値に現れる。
+func TestEffectivePolicy_ActiveAssignmentsIsolatedBetweenProviders(t *testing.T) {
+	svc, roleRepo, assignRepo, _ := newTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A", Target: model.RoleTargetManual}
+	assign(t, assignRepo, "u1", "r1")
+
+	betaCaptured := make(chan struct{})
+	var alphaBefore []plugin.ActiveRoleAssignment
+	var betaRequest []plugin.ActiveRoleAssignment
+
+	registerProvider(t, svc, "alpha", []string{"canSearchNotes"},
+		func(ctx context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			alphaBefore = append([]plugin.ActiveRoleAssignment(nil), req.ActiveAssignments...)
+			// **ctx で打ち切る。** beta が如何に遅れても host の 1s provider deadline を
+			// 丸ごと消費しない。待つ前に beta が捕まえ終わっていれば順序は確定し、
+			// 待てなかった場合も alpha の array は beta の array と別物なので下の
+			// assertion はそのまま有効。
+			select {
+			case <-betaCaptured:
+			case <-ctx.Done():
+			}
+			for i := range req.ActiveAssignments {
+				req.ActiveAssignments[i] = plugin.ActiveRoleAssignment{RoleID: "hacked", AssignmentID: "hacked"}
+			}
+			return nil, nil
+		})
+	registerProvider(t, svc, "beta", []string{"canInvite"},
+		func(_ context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			betaRequest = req.ActiveAssignments
+			close(betaCaptured)
+			return nil, nil
+		})
+
+	_, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+
+	want := []plugin.ActiveRoleAssignment{{RoleID: "r1", AssignmentID: "a_u1_r1"}}
+	assert.Equal(t, want, alphaBefore, "host must hand every provider the same assignments")
+	assert.Equal(t, want, betaRequest,
+		"alpha rewriting its own slice must not be observable in beta's request")
+}
+
 func TestEffectivePolicy_ProviderOnlyGetsActiveRoles(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "A"}
@@ -2063,8 +2111,15 @@ func TestEffectivePolicy_ActiveAssignmentsCoverOnlyActiveManualRoles(t *testing.
 	// conditional role は condFormula で一致する。assignment row は無い。
 	roleRepo.Roles["r3"] = &model.Role{ID: "r3", Name: "C", Target: model.RoleTargetConditional,
 		CondFormula: datatypes.JSON([]byte(`{"type":"isLocal"}`))}
+	// **conditional に切り替えた role を指す残骸行。** `role_assignment` の行はロールを
+	// 切り替えても消えないので、`Role` が populate 済みで `Target=conditional` 走了进来。
+	// resolved roles には入る (native contribution がある) が assignment 同一性は無いので、
+	// ActiveAssignments には入れてはいけない。
+	roleRepo.Roles["r4"] = &model.Role{ID: "r4", Name: "D", Target: model.RoleTargetConditional,
+		CondFormula: datatypes.JSON([]byte(`{"type":"isLocal"}`))}
 	assign(t, assignRepo, "u1", "r1")
 	assign(t, assignRepo, "u1", "r2")
+	assignRepo.Assignments["u1:r4"] = &model.RoleAssignment{ID: "a_u1_r4", UserID: "u1", RoleID: "r4"}
 	// orphan assignment: role_assignment の行だけが残っている。
 	assignRepo.Assignments["u1:r9"] = &model.RoleAssignment{ID: "a_u1_r9", UserID: "u1", RoleID: "r9"}
 	userRepo := testutil.NewMockUserRepository()
@@ -2081,11 +2136,12 @@ func TestEffectivePolicy_ActiveAssignmentsCoverOnlyActiveManualRoles(t *testing.
 	_, err := svc.GetUserPoliciesChecked("u1")
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"r1", "r2", "r3"}, request.RoleIDs, "RoleIDs は conditional を含むという既存契約を変えない")
+	assert.Equal(t, []string{"r1", "r2", "r3", "r4"}, request.RoleIDs, "RoleIDs は conditional を含むという既存契約を変えない")
 	assert.Equal(t, []plugin.ActiveRoleAssignment{
 		{RoleID: "r1", AssignmentID: "a_u1_r1"},
 		{RoleID: "r2", AssignmentID: "a_u1_r2"},
-	}, request.ActiveAssignments, "conditional role と role 行が無い orphan assignment は ActiveAssignments に入らない")
+	}, request.ActiveAssignments,
+		"assignment 行が無い conditional role / conditional を指す残骸行 / role 行が無い orphan は ActiveAssignments に入らない")
 	// **部分集合の不変条件。** RoleIDs にあるのに ActiveAssignments に入らない、あるいは
 	// 逆が起きたら host 側で契約が壊れている。
 	for _, a := range request.ActiveAssignments {
