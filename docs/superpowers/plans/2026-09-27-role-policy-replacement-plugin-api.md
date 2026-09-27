@@ -2591,7 +2591,7 @@ Task 6 を実行した結果。**Task 1〜5 の generic 系列は 13 commit** �
 - Upstream branch: `Misaki-Project/mk` の `upstream/role-policy-replacement-plugin-api`（PR head は `Misaki-Project:upstream/role-policy-replacement-plugin-api`、base は `shiroha-a/mk:develop`）
 - Upstream worktree: `E:\tmp\opencode\mk-upstream-role-policy`（source worktree `E:\tmp\opencode\mk-can-delete-account` と `.git` を共有する別 worktree）
 - Base: `upstream/develop` @ `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43`。`git fetch upstream develop` → `git rev-parse upstream/develop` で取得し、`git ls-remote upstream develop` と一致することも確認した（ハードコードしていない）
-- Applied range: `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43..8e1c4dcf1e2100968f1a4c49094ae5255cbaeb8b`（14 commit = generic 13 + 競合解決の follow-up 1）
+- Applied range: `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43..d347fa1c946c20f108444fe62b3e46c4abdaab27`（15 commit = generic 13 + 競合解決の follow-up 1 + レビュー指摘対応の prose follow-up 1）
 
 ### Source → upstream commit 対応（oldest first）
 
@@ -2610,8 +2610,9 @@ Task 6 を実行した結果。**Task 1〜5 の generic 系列は 13 commit** �
 | 11 | `0971008078c9f59ad4b95a5353b4975596be1793` | `cf48e9e3fd79b25708534db36a56cb057971a046` |
 | 12 | `f27e71c2d4be154a42f6e7b6767bb3cc7b1dafc1` | `5bea37c29134803e7cb2825f03fffdcdae89e217` |
 | 13 | `9abbe34fcd805a68af38f669b7b95b56a9aac9ba` | `e83d0852d37db5e82c828536c0c5d82299eb875b` |
+| 14 | `81a34aee7c241c54c56b31450cc6e37d058c8be9` | `d347fa1c946c20f108444fe62b3e46c4abdaab27` |
 
-`git am -3` で適用したので Author と Author Date は 13 commit すべて保存されている。upstream 側だけにある追加 commit:
+`git am -3` で適用したので Author と Author Date は 13 commit すべて保存されている。14 番目は 13 番目までとは別件で、Task 6 の upstream PR レビュー指摘（`plugin/policy_test.go` のコメントに `XP` 語彙が漏れていた / `ReplaceRoleID` の GoDoc が unchecked 解決を `native fallback map` と説明していた / authoring.md の包含関係の言い換え / 中国語断片の除去）を 1 commit にまとめた prose 修正で、source の `81a34aee` を upstream 側にそのまま適用した。upstream 側だけにある追加 commit:
 
 - `8e1c4dcf1e2100968f1a4c49094ae5255cbaeb8b` — 競合解決（下記2の追随）。`8e1c4dcf Fix role: use upstream's bare meta mock in assignment tests`
 
@@ -2641,7 +2642,7 @@ Task 6 を実行した結果。**Task 1〜5 の generic 系列は 13 commit** �
 | `git diff --check` | — | 無出力 |
 
 - **surface の差分は generic な5行だけ**: `plugin: type ActiveRoleAssignment struct` / `field ActiveRoleAssignment.AssignmentID string` / `field ActiveRoleAssignment.RoleID string` / `field EffectivePolicyRequest.ActiveAssignments []ActiveRoleAssignment` / `field EffectivePolicyContribution.ReplaceRoleID string`。
-- **leak 検査**（`base..HEAD` の全 2079 行の diff に対して）: `canDeleteAccount` / `joinBasePolicyError` / `roleLevel` / `RoleLevel` / `PolicyCanDeleteAccount` / `Misaki` / `can-delete-account` / `newTestMetaRepository` / `superpowers` / `typecheck-task4` / `AutoMigrate` / `migrations` / `experience` / `Experience` / `XP`（case-sensitive）すべて **0 hit**。作業ツリー側の `git grep` でも同-pattern が 0。
+- **leak 検査**: 先の1回目の記録は `git diff` を PowerShell の既定の cp932 で decode して走らせており、**ASCII のパターン文字が日本語文字に続く行では DBCS の後続バイトとして飲み込まれて false negative になっていた**。`XP` を 0 hit と書いたのはこの誤り（`plugin/policy_test.go` に実在した）。修復後、**`[Console]::OutputEncoding = UTF8` を設定したうえで追加行（`+` 行）だけを case-sensitive で走らせる**方法に一本化した。`base..HEAD` = 2303 行（うち追加 1738 行）に対し、`canDeleteAccount` / `joinBasePolicyError` / `roleLevel` / `RoleLevel` / `PolicyCanDeleteAccount` / `Misaki` / `can-delete-account` / `newTestMetaRepository` / `superpowers` / `typecheck-task4` / `AutoMigrate` / `migrations` / `experience` / `Experience` / `XP` / `进来` / `native fallback map` すべて **0 hit**。`部分集合` の 1 hit は `plugin_policy_test.go` の包含不変条件の test コメント（正しい書き方）で、finding 4 の対象ではない。作業ツリー側の `git grep` でも同-pattern が 0。
 - **変更 path**（14）: `docs/plugins/authoring.md`, `docs/plugins/compatibility.md`, `internal/core/role/optout_aggregation_test.go`, `internal/core/role/plugin_policy.go`, `internal/core/role/plugin_policy_internal_test.go`, `internal/core/role/plugin_policy_test.go`, `internal/core/role/role_service.go`, `internal/effectivepolicy/validation.go`, `internal/effectivepolicy/validation_test.go`, `internal/entitycompat/testdata/golden_plugin_surface.txt`, `plugin/plugintest/plugintest.go`, `plugin/plugintest/policy_test.go`, `plugin/policy.go`, `plugin/policy_test.go`。**Task 6 Step 7 の想定リストは `plugin/policy_test.go` も落ちている**ので、この点だけ記録で補足する。
 - **`gofmt`**: 変更した Go 11 file の **blob 内容（LF で checkout して判定）** に対し `gofmt -s -l` が無出力。作業ツリーで `gofmt -l` を走らせると変更していない upstream file（`can_chat_lookup.go` / `cond_formula.go` / `policy_number.go` / `user_roles_lookup.go`）まで全部列挙される。`core.autocrlf=true` の CRLF checkout 由来の**元からある環境条件**なので、判定には blob を使う。
 
@@ -2649,8 +2650,9 @@ Task 6 を実行した結果。**Task 1〜5 の generic 系列は 13 commit** �
 
 - この作業ツリーの `go test ./...` は元から PostgreSQL 未接続 / Windows 非対応（`internal/server` は `syscall.Statfs` 依存で test すら動かない）/ `make` 不在で落ちる。新規 regression の判定は上の focused gate だけで行う。
 - `TestPluginSurfaceDrift` は CRLF checkout で元から赤。判定は正規化比較で行う。
-- **`[Console]::OutputEncoding` が cp932（このホストの既定）の場合**、`go run ./tools/pluginspec > file` の出力が Shift-JIS として解釈され、CRLF の `0x0D` が DBCS の後続バイトとして消費されて**行が結合された擬似的な drift**が出る。比較前に `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` を設定する。設定しないと `SURFACE OK` を通らない。
+- **`[Console]::OutputEncoding` が cp932（このホストの既定）の場合**、native command の stdout が Shift-JIS として解釈される。2 つの影響が実測で確認されている: (1) `go run ./tools/pluginspec > file` では CRLF の `0x0D` が DBCS の後続バイトとして消費されて**行が結合された擬似的な drift**が出る。(2) diff を変数に受けて `Select-String` で leak 検査すると、**行内の日本語に続く ASCII のパターン文字（`XP` など）が DBCS の後続バイトとして飲み込まれ false negative になる** — この 2 番目で PR 1 版の leak 検査が `XP` を見落としていた。比較・検査の前に必ず `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` を設定する。設定しないと `SURFACE OK` を通らず、leak 検査も信用できない。
+- **leak 検査は追加行（`+` 行）だけに走らせる。** 削除行（`-` 行）は直前に漏れていた文字列を必ず含むので、0 hit の証拠として使えない。
 
 ### この記録の commit
 
-この Execution Record と Task 6 の「5 commits」表記の訂正だけが `feature/role-level-plugin` に積まれ、upstream には載らない。
+Task 6 で積んだのは plan だけ（`4713bba3`: Execution Record + 「5 commits」表記の訂正）と、このレビュー対応の記録訂正（plan だけ）。**generic コード修正の `81a34aee` は upstream 側にも積んでおり**、`docs/superpowers/**` は PR に載らない。source の `feature/role-level-plugin` は push しない。
