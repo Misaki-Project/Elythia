@@ -2585,36 +2585,68 @@ upstream 側で contract を変えた場合は `plugin.APIVersion` の要否を*
 
 ## Execution Record
 
-Task 6 を実行した結果。**Task 1〜5 の generic 系列は 13 commit** である — task 数と commit 数は一致しない。レビュー指摘の fix（`014ed8f1` / `355469d8` / `817c02e0` / `4b526808` / `09710080` / `f27e71c2` / `9abbe34f`）も別 commit にして積んでいるため。
+Task 6 を実行した結果。**Task 1〜5 の generic 系列は 13 commit** である — task 数と commit 数は一致しない。レビュー指摘の fix（`014ed8f1` / `355469d8` / `817c02e0` / `4b526808` / `09710080` / `f27e71c2` / `9abbe34f`）も別 commit にして積んでいるため。さらに Task 6 実行中に 2 つの follow-up（競合解決 1 + レビュー prose 1）が加わり、**upstream へ出した source generic commit は 14 個**になった。
 
 - Upstream PR: <https://github.com/shiroha-a/mk/pull/3197>
 - Upstream branch: `Misaki-Project/mk` の `upstream/role-policy-replacement-plugin-api`（PR head は `Misaki-Project:upstream/role-policy-replacement-plugin-api`、base は `shiroha-a/mk:develop`）
 - Upstream worktree: `E:\tmp\opencode\mk-upstream-role-policy`（source worktree `E:\tmp\opencode\mk-can-delete-account` と `.git` を共有する別 worktree）
 - Base: `upstream/develop` @ `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43`。`git fetch upstream develop` → `git rev-parse upstream/develop` で取得し、`git ls-remote upstream develop` と一致することも確認した（ハードコードしていない）
-- Applied range: `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43..d347fa1c946c20f108444fe62b3e46c4abdaab27`（15 commit = generic 13 + 競合解決の follow-up 1 + レビュー指摘対応の prose follow-up 1）
+- Applied range: `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43..bd268aea4e48eadebbbd9f1c19d74ec0c3a12e6f`（**1 commit**）
 
-### Source → upstream commit 対応（oldest first）
+### upstream branch の履歴を 1 commit に畳んだ（finding 3 の是正）
 
-| # | source `feature/role-level-plugin` | upstream `upstream/role-policy-replacement-plugin-api` |
-|---|---|---|
-| 1 | `24514ca270ca6958151c985e0b3b94ef0509af2c` | `703b7e81c4ca1fa05e455b924e92a4a907fe3431` |
-| 2 | `014ed8f1c65d66cf89e9910b388e56185b9a4df3` | `d135bb411f693c912994d72de1a6167e52452156` |
-| 3 | `b675535b425f5354d4b3a9ebd55ea0dd9e4036d5` | `6c041ba424ca1293d5278793266e7981729aaaf0` |
-| 4 | `5e3303be4f46980ab2b2b61184ec6aeec4051497` | `df4ba66f56b50a9859a6ab9c3bd347460174cebe` |
-| 5 | `355469d8eed3202d25c3592eb30ecc53b24cef67` | `20b5c1644ae1ba84911ea8d2fa6457a14127104f` |
-| 6 | `ca8544dac61dd80994bbad68e7a43208eda39cdf` | `0526e1dc166d6d8db7bd79022dcb4d8a97bf5da9` |
-| 7 | `9fab2ca5e6bacd5c87650f7673dfe3d5d6910fc5` | `12d4450a36fe20cb0479c433c4156589a1c5f867` |
-| 8 | `817c02e0db0a44614bedb7177a298f9bbc700a77` | `ad533ce1aa0792b5bd2494e004e5751939915ecb` |
-| 9 | `f862dd2c52b5388202c778b2d1d8877259b515b6` | `0eee7f9f01de0784b58db5428d769a6f6b30e22f` |
-| 10 | `4b52680830f13c2aaeb4b59cb152a4bf4b3226e6` | `bddcce1ea374ec4b38a08dafb1225ffc24482f15` |
-| 11 | `0971008078c9f59ad4b95a5353b4975596be1793` | `cf48e9e3fd79b25708534db36a56cb057971a046` |
-| 12 | `f27e71c2d4be154a42f6e7b6767bb3cc7b1dafc1` | `5bea37c29134803e7cb2825f03fffdcdae89e217` |
-| 13 | `9abbe34fcd805a68af38f669b7b95b56a9aac9ba` | `e83d0852d37db5e82c828536c0c5d82299eb875b` |
-| 14 | `81a34aee7c241c54c56b31450cc6e37d058c8be9` | `d347fa1c946c20f108444fe62b3e46c4abdaab27` |
+- 旧 published HEAD: `d347fa1c946c20f108444fe62b3e46c4abdaab27`（15 commit）を `--force-with-lease` で置換した。**人が明示承認した cleanup のみ。**
+- 理由: **commit metadata の破損**。競合解決で追加した `8e1c4dcf` の commit message に制御文字が混入していた。実測: offset 249 に TAB (0x09)、offset 289 に BEL (0x07)。原因は `git commit -m "..."` を PowerShell のダブルクォートで書き、message 中の `` `testutil `` / `` `applyMetaBasePolicies `` が PowerShell のエスケープ（`` `t `` = TAB, `` `a `` = BEL）と解釈されたこと。**丸括弧を PowerShell のダブルクォートで書くと静かに壊れる**ので、message はシングルクォートか subject だけにする。
+- 新しい upstream commit: **`bd268aea4e48eadebbbd9f1c19d74ec0c3a12e6f`**、subject は **`Add generic role policy replacement plugin API`** の1行だけ（bodyなし）。
+- 手順（source 側の 14 commit を 1 commit に squash）: 一時 safety ref を旧 HEAD に張る → `git checkout --detach $base` → `git merge --squash <safety-ref>` → `git commit -m 'Add generic role policy replacement plugin API'`（シングルクォート）。**tree が一致することを確認してから** branch を移動し push した。remote 検証後に safety ref のみ削除済み。
 
-`git am -3` で適用したので Author と Author Date は 13 commit すべて保存されている。14 番目は 13 番目までとは別件で、Task 6 の upstream PR レビュー指摘（`plugin/policy_test.go` のコメントに `XP` 語彙が漏れていた / `ReplaceRoleID` の GoDoc が unchecked 解決を `native fallback map` と説明していた / authoring.md の包含関係の言い換え / 中国語断片の除去）を 1 commit にまとめた prose 修正で、source の `81a34aee` を upstream 側にそのまま適用した。upstream 側だけにある追加 commit:
+### tree 同一性の証拠（diff を1バイトも変えていない）
 
-- `8e1c4dcf1e2100968f1a4c49094ae5255cbaeb8b` — 競合解決（下記2の追随）。`8e1c4dcf Fix role: use upstream's bare meta mock in assignment tests`
+| 項目 | 旧 `d347fa1c` | 新 `bd268aea` | 判定 |
+|---|---|---|---|
+| tree object | `9a16a9d699f3fe8c1a2679e9237b23057c31f90d` | `9a16a9d699f3fe8c1a2679e9237b23057c31f90d` | **一致** |
+| parent | `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43` | `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43` | 一致 |
+| commit 数 | 15 | 1 | 意図どおり |
+| 変更 file 数 | 14 | 14 | 一致 |
+| `--numstat` 合計 | +1738 / -86 | +1738 / -86 | 一致 |
+| `git diff --binary` の SHA256 | `B026B6F0F3DD773E4A61C66E0E7FBA2AF9F20D060A6D02AEB275239258D4B503` | 同左 | **完全一致** |
+| `diff --check` | clean | clean | 一致 |
+| `--name-only` | 14 file | 14 file | `Compare-Object` 差分 0 |
+
+- `git merge --squash` 直後の **index tree がすでに `9a16a9d6...` で一致していた**ので、commit を作る前から同一性が保証されていた。
+- 新しい commit の **raw commit object は 300 byte、制御文字 0 個**（LF 除く）。message は 47 byte の純 ASCII:
+  `41 64 64 20 67 65 6e 65 72 69 63 ...` = `Add generic role policy replacement plugin API`。`git fsck` も clean。
+- push は `--force-with-lease`（remote-tracking ref = 旧 published HEAD に固定）。**`<expect>:<ref>` 明示形式はこの git 2.49.1 / PowerShell 環境で force にならず（`stale info` ではなく `non-fast-forward` で落ちる）ので使えず**、lease が値に固定されていることを2回の dry-run で証明した: lease を別の実在 SHA にすると `stale info` で拒否、期待値 `d347fa1c...` に戻すと `+ d347fa1c...bd268aea (forced update)` で許可。**source / Misaki 側の branch には一切 force を使っていない。**
+- push 後の remote 検証: PR #3197 は **OPEN / base `develop` / head `Misaki-Project:upstream/role-policy-replacement-plugin-api` のまま、commit 1 個・14 file・+1738/-86・MERGEABLE、body と title は変更なし**。GitHub 側が算出した additions/deletions も 1738/86 でローカル `numstat` と一致。CI は force-push により再起動（呼び出し時点では pending / in-progress、**結果は本記録時点では未確認**）。
+
+### Source → upstream commit 対応
+
+upstream branch は **1 commit に squash 済み**なので、source 側の generic commit 14 個がどの upstream SHA に対応する、という対応表は**もう存在しない**。全部が次の 1 commit にになっている:
+
+| source `feature/role-level-plugin` | upstream `upstream/role-policy-replacement-plugin-api` |
+|---|---|
+| 以下の **14 commit**（oldest first） | **`bd268aea4e48eadebbbd9f1c19d74ec0c3a12e6f`**（`Add generic role policy replacement plugin API`） |
+
+| # | source `feature/role-level-plugin`（oldest first） |
+|---|---|
+| 1 | `24514ca270ca6958151c985e0b3b94ef0509af2c` |
+| 2 | `014ed8f1c65d66cf89e9910b388e56185b9a4df3` |
+| 3 | `b675535b425f5354d4b3a9ebd55ea0dd9e4036d5` |
+| 4 | `5e3303be4f46980ab2b2b61184ec6aeec4051497` |
+| 5 | `355469d8eed3202d25c3592eb30ecc53b24cef67` |
+| 6 | `ca8544dac61dd80994bbad68e7a43208eda39cdf` |
+| 7 | `9fab2ca5e6bacd5c87650f7673dfe3d5d6910fc5` |
+| 8 | `817c02e0db0a44614bedb7177a298f9bbc700a77` |
+| 9 | `f862dd2c52b5388202c778b2d1d8877259b515b6` |
+| 10 | `4b52680830f13c2aaeb4b59cb152a4bf4b3226e6` |
+| 11 | `0971008078c9f59ad4b95a5353b4975596be1793` |
+| 12 | `f27e71c2d4be154a42f6e7b6767bb3cc7b1dafc1` |
+| 13 | `9abbe34fcd805a68af38f669b7b95b56a9aac9ba` |
+| 14 | `81a34aee7c241c54c56b31450cc6e37d058c8be9` |
+
+内訳: 1〜13 は Task 1〜5 の generic 系列（task 数と commit 数が一致しない理由と、レビュー指摘 fix を別 commit にしたものは冒頭に記載）、14 は Task 6 の upstream PR レビュー指摘（`plugin/policy_test.go` のコメントに `XP` 語彙が漏れていた / `ReplaceRoleID` の GoDoc が unchecked 解決を `native fallback map` と説明していた / authoring.md の包含関係の言い換え / 中国語断片の除去）を 1 commit にまとめた prose 修正。
+
+この squash より前に upstream 側で競合解決のために追加した commit（`8e1c4dcf Fix role: use upstream's bare meta mock in assignment tests`）も、同じく 1 commit に畳まれている。**Author と Author Date を保持しないのは意図的で、歴史の commit message に混入していた制御文字をここで消すため。**
 
 ### 除外した commit / ファイル
 
