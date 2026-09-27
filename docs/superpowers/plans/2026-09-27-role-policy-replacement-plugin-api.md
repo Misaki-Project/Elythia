@@ -79,7 +79,15 @@ CIが真のgate（`make test` / `make lint` / `make golangci-lint` / `make plugi
 
 ### authoring.md の Go fence コンパイル gate（Windows で `make plugin-doc-check` 相当）
 
-`PYTHONUTF8=1` を付けないと `extract.py` が cp932 で死ぬので必ず付ける。判定は `check-snippets.sh` と同じく「3 variant (top/any/err) が**全部**失敗した fence だけを NG」とする。`go.mod` は here-string を使わず配列結合で組み立てている（入れ子 here-string を避ける）。
+`PYTHONUTF8=1` を付けないと `extract.py` が cp932 で死ぬので必ず付ける。`go.mod` は here-string を使わず配列結合で組み立てている（入れ子 here-string を避ける）。
+
+**判定の3点だけは `tests/plugin-doc/check-snippets.sh` と必ず一致させる:**
+
+1. **fence ID は実際に抽出されたディレクトリから取る。** `extract.py` は `snippets/<id>_<variant>` という**variant 付き**ディレクトリを作る。`snippets/<id>/` のようなものは存在しないので、その形の検索は1件もHITしない。`1..40` の決め打ちも同じ理由で壊れる（fence 数が増えると取りこぼす）。
+2. **noise を除いた行だけを見る。** `check-snippets.sh` は `undefined: [A-Za-z_][A-Za-z0-9_]*$` に一致する行を捨てている。`extract.py` の HEADER が宣言した `db` / `Plugin` / `time` などが無いのは**意図された**shape なので、これを数えると複数の fence を誤って NG にする（実測で何件になるかは Self-Review の実行記録を参照）。
+3. **NG になるのは top/any/err の3 variant が**すべて**non-noise diagnostic を持つ fence だけ。** 1 variant でも生き残れば、その fence は合格（`check-snippets.sh` と同じ「3 個全部落ちたものだけ出す」規則）。
+
+`go build` の出力は `Out-String` を通さない。コンソール幅で折り返されると path が行をまたいで壊れる。`ForEach-Object { $_.ToString() }` で1行ずつ要素として取り、`-match` を要素に適用する。
 
 ```powershell
 $w = "$env:TEMP\rlp-docgate"
@@ -108,23 +116,33 @@ Copy-Item go.sum "$w\go.sum"
 Push-Location $w
 $env:GOFLAGS = "-mod=mod"
 $env:GOWORK = "off"
-$out = (go build -gcflags=-e ./snippets/... 2>&1 | Out-String)
+$buildLog = @(& go build -gcflags=-e ./snippets/... 2>&1 | ForEach-Object { $_.ToString() })
 Remove-Item Env:GOFLAGS
 Remove-Item Env:GOWORK
 Pop-Location
+
+# variant 名の接尾辞を落として、実在する fence ID を列挙する。
+$variants = @("top", "any", "err")
+$fences = @(Get-ChildItem -Directory (Join-Path $w "snippets") | ForEach-Object {
+  $_.Name -replace '_(top|any|err)$', ''
+} | Sort-Object -Unique)
+
 $bad = @()
-1..40 | ForEach-Object {
-  $f = "s{0:d2}" -f $_
-  if ($out -match "snippets[\\/]$f[\\/]") {
-    $survived = $false
-    foreach ($v in @("top", "any", "err")) { if ($out -match "snippets[\\/]$($f)_$v[\\/]") { $survived = $true } }
-    if (-not $survived) { $bad += $f }
+foreach ($id in $fences) {
+  $diagnosed = @()
+  foreach ($v in $variants) {
+    $pattern = "snippets[\\/]${id}_${v}[\\/]x\.go:\d+:\d+:"
+    $hit = @($buildLog | Where-Object { $_ -match $pattern -and $_ -notmatch 'undefined: [A-Za-z_][A-Za-z0-9_]*$' })
+    if ($hit.Count -gt 0) { $diagnosed += $v }
   }
+  if ($diagnosed.Count -eq $variants.Count) { $bad += $id }
 }
+
+"fences: $($fences.Count)"
 if ($bad.Count -eq 0) { "SNIPPET GATE OK" } else { "NG: all variants failed for " + ($bad -join ", ") }
 ```
 
-Expected（現状の `docs/plugins/authoring.md`）: `SNIPPET GATE OK`。**このブロックは Task 5 Step 1 で一度 RED になることを確認してから使う。**
+Expected: `fences: <n>` の行に続けて `SNIPPET GATE OK`。`<n>` は fence 数なので、doc を触る前後で変わる — **数値は固定しない**。**このブロックは Task 5 Step 1 で一度 RED になることを確認してから使う。**
 
 ---
 
@@ -2185,24 +2203,40 @@ Expected: 1 commit。**この commit の SHA を控えておく**。
 
 - [ ] **Step 1: gate が生きていることを RED で証明する**
 
-新しい Go fence を書く前に、**この gate が本当に赤くなる**ことを確認する（以降の Step で使う gate が空振りしていないことの担保）:
+新しい Go fence を書く前に、**この gate が本当に赤くなる**ことを確認する（以降の Step で使う gate が空振りしていないことの担保）。
+
+**関数名だけ書き換えては RED にならない。** `func effectivePolicies` を別名にリネームしても、その関数はどこからも呼ばれないので**有効な Go のまま**で、gate は赤くならない（最初の案はこれで RED を作れなかった）。**型エラー**を1つだけ入れて、3 variant すべてが落ちることを使う:
 
 ```powershell
 $doc = Get-Content -Raw docs/plugins/authoring.md
-$broken = $doc -replace 'func effectivePolicies\(ctx plugin\.Context', 'func effectivePoliciesBROKEN(ctx plugin.Context'
+# 効果ポリシー節の例。`Priority` は int なので、文字列を代入すると型エラーになる。
+# この literal は authoring.md の中に1箇所しか無いので、他 fence を巻き込まない。
+$broken = $doc -replace '\{Key: "driveCapacityMb", Priority: 1, Value: 1000\}', '{Key: "driveCapacityMb", Priority: "1", Value: 1000}'
+if ($broken -eq $doc) { throw "mutation target not found - authoring.md の driveCapacityMb の例を探す" }
 Set-Content -Path docs/plugins/authoring.md -Value $broken -Encoding utf8NoBOM
+$mutated = @(Select-String -Path docs/plugins/authoring.md -Pattern 'Priority: "1", Value: 1000' -Encoding utf8)
+if ($mutated.Count -ne 1) { throw "mutation must hit exactly one literal, got $($mutated.Count)" }
+"mutated: $($mutated.Count) literal"
 ```
+
+Expected: `mutated: 1 literal`。**0件なら** `-replace` の pattern が literal とずれている、**2件以上なら** target literal が一意ではないので、どちらも先に解消する（どちらも throw で止まる）。
 
 Global Constraints の「authoring.md の Go fence コンパイル gate」ブロックをそのまま実行する。
 
-Expected: `NG: all variants failed for s<NN>`（`effectivePolicies` を含む fence の index）**が出る**。出ないなら gate が空振りしているので、判定ロジックを直してから次に進む。
+Expected: `fences: <n>` の行に続けて、`NG: all variants failed for s<NN>`（1件以上）。**`SNIPPET GATE OK` を出してはいけない。** fence ID は doc を触る前後で変わるので固定しない。壊した fence の `_top` variant には noise でない型エラーの行が出る（形は概ね次のとおり。行番号・ID は固定しない）:
+
+```
+snippets\s<NN>_top\x.go:<line>:<col>: cannot use "1" (untyped string constant) as int value in struct literal
+```
+
+`NG:` が出ない、`SNIPPET GATE OK` が出る、あるいは `NG:` が出るのに上の型エラー行が見えない場合は、gate がまだ空振りしている（あるいは noise 判定が壊れている）ので、Global Constraints 側の判定ロジックを直してから次に進む。`fences: <n>` の行は必ず出るので、`fences:` の行そのものが無いなら `extract.py` の起動自体を疑う。
 
 ```powershell
 git checkout -- docs/plugins/authoring.md
 git status --short docs/plugins/authoring.md
 ```
 
-Expected: 出力が空（ファイルが元に戻っている）。
+Expected: 出力が空（ファイルが元に戻っている）。戻った後にもう1回 gate を実行し、`SNIPPET GATE OK` に戻ることを確認する。
 
 - [ ] **Step 2: docs を書く（resolver の入力契約）**
 
@@ -2279,7 +2313,9 @@ func effectivePolicies(ctx plugin.Context, inv plugin.EffectivePolicyInvalidator
 
 Global Constraints の「authoring.md の Go fence コンパイル gate」ブロックを実行する。
 
-Expected: `SNIPPET GATE OK`（新しい fence は3 variant のうち少なくとも1つでコンパイルできる）。
+Expected: `fences: <n>` の行に続けて `SNIPPET GATE OK`。**`NG: all variants failed for s<NN>` が出てはいけない** — 出ていれば、それは Step 3 で追加した fence が3 variant すべてでコンパイルできないということなので、fence を直すか noise 判定を確認してから次に進む。`<n>` は fence 数なので固定しない（doc を触る前後で変わる）。
+
+noise 判定について: 新しい fence は `Value: 40` を使い、戻り値も返すので3 variant すべてでコンパイルできる。`declared and not used` のような noise でない診断が1つでも出るとその variant は「落ちた」と数えられるので、`Keys` と `out` の両方を必ず使っていること（どちらか片方だけだと未使用変数で落ちる）を再確認する。
 
 ```powershell
 go test ./internal/entitycompat -run TestPluginDoc -count=1
@@ -2542,4 +2578,5 @@ upstream 側で contract を変えた場合は `plugin.APIVersion` の要否を*
 - **Type consistency**: `plugin.ActiveRoleAssignment{RoleID, AssignmentID}` / `ActiveAssignments` は Task 1 で定義し、Task 2（host）と Task 4（validation + plugintest）が同じ名前・型を使う。`role.userRoleSnapshot{roles, activeAssignments}` と `role.activeRoleAssignment{roleID, assignmentID}` は Task 2 の Interfaces で定義し、Step 3 のコードと一致する。`rolePolicyInput.roleID` / `rolePolicyEntry` は Task 3 で定義し、Task 4 の `overridesByRole` / `applyPolicyReplacements` / `collectPolicyReplacement` が同じ名前で読む。`ValidateContributions(keys, activeRoles, contributions)` の3引数は Task 4 Step 1（test）→ Step 3（実装）で一致し、2つの呼び出し側（`core/role`、`plugintest`）も同じ形。`ErrEffectivePolicyReplacementConflict` は Task 4 Step 5（test）→ Step 6（RED のコンパイルエラー）→ Step 7（実装）で一致。
 - **Forward reference なし**: Task 4 が使う `roleInputs` は Task 3 で導入済み。Task 4 Step 3 が使う `plugintestActiveRoleIDs` / `activeRoleIDsFromAssignments` は同じ Step で定義する。Task 3 は Task 1/2 の型に依存しない。Task 2 の `resolveUserRoleSnapshot` は Task 1 の型だけを使う。
 - **Task 間の型重複の排除**: 呼び出し回数カウンタに `countingAssignmentRepo`（`role_service_test.go`、外部 test package）を、repository 失敗に `failingPolicyAssignmentRepo`（`plugin_policy_test.go`、外部 test package）を再利用する。内部 test package からは既存の mock を直接触れないので `countingInternalAssignmentRepo` だけが新しい型で、これは「外から見える契約を持たない内部 test double」であることをコメントで明示している。
-- **信頼性**: gate コマンドはすべてこの作業ツリーで実測して緑になることを確認済み（`go test ./internal/core/role -count=1` PASS、`go test ./plugin ./internal/effectivepolicy -count=1` PASS、`go test ./plugin/plugintest -count=1 -run TestEffectivePolic` PASS、`go test ./internal/entitycompat -run TestPluginDoc -count=1` PASS、bundled plugin の `go vet` PASS、authoring.md の snippet gate は `SNIPPET GATE OK`）。`TestPluginSurfaceDrift` は行末差で元から赤なので、正規化比較を正式な gate にした。`git format-patch -1` の複数rev問題と `extract.py` の cp932 問題も実測で把握し、回避策を Step に書いた。
+- **信頼性**: `go test` 系の gate は全てこの作業ツリーで実測して緑（`go test ./internal/core/role -count=1` PASS、`go test ./plugin ./internal/effectivepolicy -count=1` PASS、`go test ./plugin/plugintest -count=1 -run TestEffectivePolic` PASS、`go test ./internal/entitycompat -run TestPluginDoc -count=1` PASS、bundled plugin の `go vet` PASS）。`TestPluginSurfaceDrift` は行末差で元から赤なので、正規化比較を正式な gate にした。`git format-patch -1` の複数rev問題と `extract.py` の cp932 問題も実測で把握し、回避策を Step に書いた。
+- **authoring.md の snippet gate は「壊れていたので直した」。最初の版は3つとも壊れていて、clean な docs に対して `SNIPPET GATE OK` を出すことすら保証していなかった:** (1) `snippets/<id>/` を検索しており `extract.py` が作る `snippets/<id>_<variant>/` に1件もHITしない、(2) `1..40` の決め打ち、(3) noise を数える上に NG 条件が反転していた。判定ロジックは Global Constraints のブロックを読み直せば分かるのでここでは繰り返さない。**実行証拠（この計画の tree での実測ログであり、計画の期待値ではない）:** 修正後のブロックは **clean docs で `SNIPPET GATE OK`**、Step 1 の型エラー変異を掛けると **`NG: all variants failed for s<NN>`**（当該 fence の `_top` variant が `cannot use "1" (untyped string constant) as int value in struct literal` を出す）、復元後は **`SNIPPET GATE OK`** に戻ることを実測で確認した。Task 5 の新しい fence を含む実装後treeでもGREENを確認済み。**このとき観測された fence 数と ID（`fences: 19` / `s10`）はそのときのtreeでの値にすぎない**ので、Task 5のStep 1 / Step 7には数やIDを書いていない。
