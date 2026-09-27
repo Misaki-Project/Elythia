@@ -89,6 +89,9 @@ plugins/*
 # trustlevel も同梱する (#2586)。#2585 の公開面を実プラグインで検証する台なので、
 # ツリー外に置くと CI で `plugin/` の破壊に気付けない (status と同じ理由)。
 !plugins/trustlevel/
+# roleLevel も同梱する (#12)。他の2つと異なり、**既定で有効** — Misaki の
+# bundled image で level 機能が設定なしで入るのはこれが意図だから。
+!plugins/rolelevel/
 go.work
 go.work.sum
 cmd/misskey/plugins_generated.go
