@@ -48,7 +48,7 @@ func TestEffectivePolicyRegistrationValidate(t *testing.T) {
 
 func TestEffectivePolicyRequest_CarriesActiveAssignmentsAlongsideRoleIDs(t *testing.T) {
 	// plugin作者は RoleID と AssignmentID を別々に読む。片方だけを持つ型に
-	// 戻ると「XP を role に紐づけられた」と誤って付け替えられる。
+	// 戻すと「assignment単位に持つplugin stateが別のroleのもの」と誤って付け替えられる。
 	assignment := ActiveRoleAssignment{RoleID: "r1", AssignmentID: "a1"}
 
 	request := EffectivePolicyRequest{

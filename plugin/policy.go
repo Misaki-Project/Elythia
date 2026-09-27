@@ -75,8 +75,10 @@ type EffectivePolicyContribution struct {
 	// として provider 全体を失敗扱いにする。
 	//
 	// 同じ role/key を複数 provider が置換した場合は**競合**となり、host はその pair だけを
-	// native contribution に戻す。checked 解決は error、unchecked 解決は native fallback
-	// map を返す。
+	// native contribution に戻す。**fallback は pair 単位で、他の role の contribution と
+	// provider の通常 contribution はそのまま結果に残る**（結果が丸ごと native に戻ることは
+	// ない）。checked 解決と unchecked 解決は**同じ結果**を返し、違うのは競合を error として
+	// 報告するかどうかだけ。報告するのは checked 側だけで、競合ごとに固定の sentinel を返す。
 	ReplaceRoleID string
 }
 

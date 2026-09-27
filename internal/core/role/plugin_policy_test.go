@@ -2122,7 +2122,8 @@ func TestEffectivePolicy_ActiveAssignmentsCoverOnlyActiveManualRoles(t *testing.
 	roleRepo.Roles["r3"] = &model.Role{ID: "r3", Name: "C", Target: model.RoleTargetConditional,
 		CondFormula: datatypes.JSON([]byte(`{"type":"isLocal"}`))}
 	// **conditional に切り替えた role を指す残骸行。** `role_assignment` の行はロールを
-	// 切り替えても消えないので、`Role` が populate 済みで `Target=conditional` 走了进来。
+	// 切り替えても消えないので、`Role` が populate 済みで `Target=conditional` にしたまま
+	// 入り込んだ行になる。
 	// resolved roles には入る (native contribution がある) が assignment 同一性は無いので、
 	// ActiveAssignments には入れてはいけない。
 	roleRepo.Roles["r4"] = &model.Role{ID: "r4", Name: "D", Target: model.RoleTargetConditional,
