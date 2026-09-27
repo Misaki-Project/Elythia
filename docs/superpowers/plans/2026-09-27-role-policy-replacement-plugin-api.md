@@ -2359,7 +2359,7 @@ git log --oneline -8
 git status --short --branch
 ```
 
-Expected: Task 1〜5 の5つの commit が見える。控えた SHA を oldest→newest 順で並べ、Step 5 の `$shas` に並べる。
+Expected: **Task 1〜5 の generic commit** が見える。task 数が5 でも commit 数が5 とは限らない — レビュー指摘の fix も別commitにして積んでいるので、generic系列は **13 commit**（`24514ca2` 〜 `9abbe34f`）になる。控えた SHA を oldest→newest 順に並べ、Step 5 の `$shas` に並べる。
 
 **注意**: `git format-patch upstream/develop..feature/role-level-plugin` は範囲内の**全commit**（canDeleteAccount 関連の Misaki commit も含む）を対象にしてしまう。**必ず Task 1〜5 の SHA を個別に指定する**（Step 5 参照）。
 
@@ -2406,7 +2406,7 @@ Expected: **どちらも出力なし**。出ているなら worktree を作り�
 $root = "$env:TEMP\rlp-patches"
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $root | Out-Null
-$shas = @('<task1-sha>','<task2-sha>','<task3-sha>','<task4-sha>','<task5-sha>')
+$shas = @('<generic-sha-01>','<generic-sha-02>',...)  # Task 1〜5 + レビュー fix。全 generic commit を oldest→newest で列挙する
 $i = 1
 foreach ($sha in $shas) {
   $dir = Join-Path $root ("{0:d2}" -f $i)
@@ -2418,13 +2418,13 @@ $patches = Get-ChildItem -Recurse $root -Filter *.patch | Sort-Object FullName |
 $patches.Count
 ```
 
-Expected: `5`。**`git format-patch -1 A B C` は複数revでも最後の1つしか出さない**ので、必ず1つずつ別ディレクトリに出力すること（出力順を `01`〜`05` で固定し、`Sort-Object FullName` で oldest→newest を保つ）。
+Expected: `$shas` の要素数と一致する（実測は **13**）。**`git format-patch -1 A B C` は複数revでも最後の1つしか出さない**ので、必ず1つずつ別ディレクトリに出力すること（出力順を `01`〜`13` で固定し、`Sort-Object FullName` で oldest→newest を保つ）。
 
 ```powershell
 git -C "E:\tmp\opencode\mk-upstream-role-policy" am -3 $patches
 ```
 
-Expected: 5つとも clean apply。
+Expected: 13つとも clean apply。**hunk 単位の競合が出ることがある** — 全体を `git am --abort` するのではなく、generic な hunk だけを残して解決する（下の表の対象は upstream の形を**残すべき**もの＝持ち越さないもの）。
 
 **reject が出たときの対処**:
 
@@ -2546,7 +2546,7 @@ Expected: PR URL が出る。**この URL を控えておく**。
 - Upstream PR: <Step 8 で作った URL>
 - Upstream branch: `Misaki-Project/mk` の `upstream/role-policy-replacement-plugin-api`（PR head は `Misaki-Project:upstream/role-policy-replacement-plugin-api`）
 - Base: `upstream/develop` @ `<Step 2 で控えた SHA>`
-- Applied commits (oldest first): `<sha1> <sha2> <sha3> <sha4> <sha5>`
+- Applied commits (oldest first): generic 系列は **13 commit**（Task 1〜5 + レビュー fix）。`<source-sha-1> → <upstream-sha-1>` の対応と、競合解決で追加した upstream 側 commit をすべて書く
 ```
 
 ```powershell
@@ -2580,3 +2580,77 @@ upstream 側で contract を変えた場合は `plugin.APIVersion` の要否を*
 - **Task 間の型重複の排除**: 呼び出し回数カウンタに `countingAssignmentRepo`（`role_service_test.go`、外部 test package）を、repository 失敗に `failingPolicyAssignmentRepo`（`plugin_policy_test.go`、外部 test package）を再利用する。内部 test package からは既存の mock を直接触れないので `countingInternalAssignmentRepo` だけが新しい型で、これは「外から見える契約を持たない内部 test double」であることをコメントで明示している。
 - **信頼性**: `go test` 系の gate は全てこの作業ツリーで実測して緑（`go test ./internal/core/role -count=1` PASS、`go test ./plugin ./internal/effectivepolicy -count=1` PASS、`go test ./plugin/plugintest -count=1 -run TestEffectivePolic` PASS、`go test ./internal/entitycompat -run TestPluginDoc -count=1` PASS、bundled plugin の `go vet` PASS）。`TestPluginSurfaceDrift` は行末差で元から赤なので、正規化比較を正式な gate にした。`git format-patch -1` の複数rev問題と `extract.py` の cp932 問題も実測で把握し、回避策を Step に書いた。
 - **authoring.md の snippet gate は「壊れていたので直した」。最初の版は3つとも壊れていて、clean な docs に対して `SNIPPET GATE OK` を出すことすら保証していなかった:** (1) `snippets/<id>/` を検索しており `extract.py` が作る `snippets/<id>_<variant>/` に1件もHITしない、(2) `1..40` の決め打ち、(3) noise を数える上に NG 条件が反転していた。判定ロジックは Global Constraints のブロックを読み直せば分かるのでここでは繰り返さない。**実行証拠（この計画の tree での実測ログであり、計画の期待値ではない）:** 修正後のブロックは **clean docs で `SNIPPET GATE OK`**、Step 1 の型エラー変異を掛けると **`NG: all variants failed for s<NN>`**（当該 fence の `_top` variant が `cannot use "1" (untyped string constant) as int value in struct literal` を出す）、復元後は **`SNIPPET GATE OK`** に戻ることを実測で確認した。Task 5 の新しい fence を含む実装後treeでもGREENを確認済み。**このとき観測された fence 数と ID（`fences: 19` / `s10`）はそのときのtreeでの値にすぎない**ので、Task 5のStep 1 / Step 7には数やIDを書いていない。
+
+---
+
+## Execution Record
+
+Task 6 を実行した結果。**Task 1〜5 の generic 系列は 13 commit** である — task 数と commit 数は一致しない。レビュー指摘の fix（`014ed8f1` / `355469d8` / `817c02e0` / `4b526808` / `09710080` / `f27e71c2` / `9abbe34f`）も別 commit にして積んでいるため。
+
+- Upstream PR: <https://github.com/shiroha-a/mk/pull/3197>
+- Upstream branch: `Misaki-Project/mk` の `upstream/role-policy-replacement-plugin-api`（PR head は `Misaki-Project:upstream/role-policy-replacement-plugin-api`、base は `shiroha-a/mk:develop`）
+- Upstream worktree: `E:\tmp\opencode\mk-upstream-role-policy`（source worktree `E:\tmp\opencode\mk-can-delete-account` と `.git` を共有する別 worktree）
+- Base: `upstream/develop` @ `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43`。`git fetch upstream develop` → `git rev-parse upstream/develop` で取得し、`git ls-remote upstream develop` と一致することも確認した（ハードコードしていない）
+- Applied range: `1a0f2012bc13f3a34c92703c7ae3d5a6765a2f43..8e1c4dcf1e2100968f1a4c49094ae5255cbaeb8b`（14 commit = generic 13 + 競合解決の follow-up 1）
+
+### Source → upstream commit 対応（oldest first）
+
+| # | source `feature/role-level-plugin` | upstream `upstream/role-policy-replacement-plugin-api` |
+|---|---|---|
+| 1 | `24514ca270ca6958151c985e0b3b94ef0509af2c` | `703b7e81c4ca1fa05e455b924e92a4a907fe3431` |
+| 2 | `014ed8f1c65d66cf89e9910b388e56185b9a4df3` | `d135bb411f693c912994d72de1a6167e52452156` |
+| 3 | `b675535b425f5354d4b3a9ebd55ea0dd9e4036d5` | `6c041ba424ca1293d5278793266e7981729aaaf0` |
+| 4 | `5e3303be4f46980ab2b2b61184ec6aeec4051497` | `df4ba66f56b50a9859a6ab9c3bd347460174cebe` |
+| 5 | `355469d8eed3202d25c3592eb30ecc53b24cef67` | `20b5c1644ae1ba84911ea8d2fa6457a14127104f` |
+| 6 | `ca8544dac61dd80994bbad68e7a43208eda39cdf` | `0526e1dc166d6d8db7bd79022dcb4d8a97bf5da9` |
+| 7 | `9fab2ca5e6bacd5c87650f7673dfe3d5d6910fc5` | `12d4450a36fe20cb0479c433c4156589a1c5f867` |
+| 8 | `817c02e0db0a44614bedb7177a298f9bbc700a77` | `ad533ce1aa0792b5bd2494e004e5751939915ecb` |
+| 9 | `f862dd2c52b5388202c778b2d1d8877259b515b6` | `0eee7f9f01de0784b58db5428d769a6f6b30e22f` |
+| 10 | `4b52680830f13c2aaeb4b59cb152a4bf4b3226e6` | `bddcce1ea374ec4b38a08dafb1225ffc24482f15` |
+| 11 | `0971008078c9f59ad4b95a5353b4975596be1793` | `cf48e9e3fd79b25708534db36a56cb057971a046` |
+| 12 | `f27e71c2d4be154a42f6e7b6767bb3cc7b1dafc1` | `5bea37c29134803e7cb2825f03fffdcdae89e217` |
+| 13 | `9abbe34fcd805a68af38f669b7b95b56a9aac9ba` | `e83d0852d37db5e82c828536c0c5d82299eb875b` |
+
+`git am -3` で適用したので Author と Author Date は 13 commit すべて保存されている。upstream 側だけにある追加 commit:
+
+- `8e1c4dcf1e2100968f1a4c49094ae5255cbaeb8b` — 競合解決（下記2の追随）。`8e1c4dcf Fix role: use upstream's bare meta mock in assignment tests`
+
+### 除外した commit / ファイル
+
+`d9cc7d71`（roleLevel 設計）、`08f7e32c`（別計画 + 本 plan）、`0584864e` / `9cc0d2c0`（plan の記述修正）、canDeleteAccount / Misaki 固有の commit 群、未追跡の `typecheck-task4.txt`。PR の変更 file は Task 1〜5 の generic 14 file のみで、`docs/superpowers/**` は載っていない。
+
+### upstream 側で解決した競合（2箇所）
+
+1. **`internal/effectivepolicy/validation_test.go`**（`9fab2ca5` 由来）: 源 commit の hunk は Misaki 専用の `TestCanDeleteAccountPolicyContract` に `ValidateContributions` の第2引数 `nil,` を足すもの。upstream にはその test が存在しないので、**test ごと落として** generic な `TestValidateContributionsReplacementTieUsesRoleID` だけを残した。
+2. **`internal/core/role/plugin_policy_test.go`**: 追加した2つの test が呼ぶ `newTestMetaRepository()` は `d452634e`（canDeleteAccount 系の base policy error 化）が入れた helper で、generic 13 commit には含まれないため upstream では `undefined` になる。upstream 自身の `newTestService` と同じ `testutil.NewMockMetaRepository()` に置き換え、upstream 側だけの follow-up commit として積んだ（`role_service_test.go` は upstream の形のまま変更していない）。upstream の `applyMetaBasePolicies` は meta row 不在を「override なし」として fail-soft 処理するので、bare mock で挙動は変わらない。
+
+### 検証（upstream worktree、base `1a0f2012`）
+
+適用前（pristine upstream）の baseline を先に取ってから適用した:
+
+| gate | baseline（適用前） | 適用後 |
+|---|---|---|
+| `go test ./plugin ./internal/effectivepolicy -count=1` | PASS | PASS |
+| `go test ./internal/core/role -count=1` | PASS | PASS |
+| `go test ./plugin/plugintest -count=1 -run TestEffectivePolic` | PASS | PASS |
+| `go test ./internal/entitycompat -run TestPluginDoc -count=1` | PASS | PASS |
+| surface 正規化比較（`tools/pluginspec` vs golden） | `SURFACE OK` | `SURFACE OK` |
+| `go vet ./plugin/... ./internal/effectivepolicy ./internal/core/role` | exit 0 | exit 0 |
+| bundled plugin `go vet ./...`（`plugins/trustlevel`, `plugins/status`） | exit 0 | exit 0 |
+| authoring.md snippet gate | `fences: 18` / `SNIPPET GATE OK` | `fences: 19` / `SNIPPET GATE OK` |
+| `git diff --check` | — | 無出力 |
+
+- **surface の差分は generic な5行だけ**: `plugin: type ActiveRoleAssignment struct` / `field ActiveRoleAssignment.AssignmentID string` / `field ActiveRoleAssignment.RoleID string` / `field EffectivePolicyRequest.ActiveAssignments []ActiveRoleAssignment` / `field EffectivePolicyContribution.ReplaceRoleID string`。
+- **leak 検査**（`base..HEAD` の全 2079 行の diff に対して）: `canDeleteAccount` / `joinBasePolicyError` / `roleLevel` / `RoleLevel` / `PolicyCanDeleteAccount` / `Misaki` / `can-delete-account` / `newTestMetaRepository` / `superpowers` / `typecheck-task4` / `AutoMigrate` / `migrations` / `experience` / `Experience` / `XP`（case-sensitive）すべて **0 hit**。作業ツリー側の `git grep` でも同-pattern が 0。
+- **変更 path**（14）: `docs/plugins/authoring.md`, `docs/plugins/compatibility.md`, `internal/core/role/optout_aggregation_test.go`, `internal/core/role/plugin_policy.go`, `internal/core/role/plugin_policy_internal_test.go`, `internal/core/role/plugin_policy_test.go`, `internal/core/role/role_service.go`, `internal/effectivepolicy/validation.go`, `internal/effectivepolicy/validation_test.go`, `internal/entitycompat/testdata/golden_plugin_surface.txt`, `plugin/plugintest/plugintest.go`, `plugin/plugintest/policy_test.go`, `plugin/policy.go`, `plugin/policy_test.go`。**Task 6 Step 7 の想定リストは `plugin/policy_test.go` も落ちている**ので、この点だけ記録で補足する。
+- **`gofmt`**: 変更した Go 11 file の **blob 内容（LF で checkout して判定）** に対し `gofmt -s -l` が無出力。作業ツリーで `gofmt -l` を走らせると変更していない upstream file（`can_chat_lookup.go` / `cond_formula.go` / `policy_number.go` / `user_roles_lookup.go`）まで全部列挙される。`core.autocrlf=true` の CRLF checkout 由来の**元からある環境条件**なので、判定には blob を使う。
+
+### この環境で守るべき既知 baseline（変更由来と混同しないこと）
+
+- この作業ツリーの `go test ./...` は元から PostgreSQL 未接続 / Windows 非対応（`internal/server` は `syscall.Statfs` 依存で test すら動かない）/ `make` 不在で落ちる。新規 regression の判定は上の focused gate だけで行う。
+- `TestPluginSurfaceDrift` は CRLF checkout で元から赤。判定は正規化比較で行う。
+- **`[Console]::OutputEncoding` が cp932（このホストの既定）の場合**、`go run ./tools/pluginspec > file` の出力が Shift-JIS として解釈され、CRLF の `0x0D` が DBCS の後続バイトとして消費されて**行が結合された擬似的な drift**が出る。比較前に `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` を設定する。設定しないと `SURFACE OK` を通らない。
+
+### この記録の commit
+
+この Execution Record と Task 6 の「5 commits」表記の訂正だけが `feature/role-level-plugin` に積まれ、upstream には載らない。
