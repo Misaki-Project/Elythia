@@ -84,6 +84,8 @@ func TestAllRoutesArePost(t *testing.T) {
 		"POST /admin/change-exp",
 		"POST /roles/users",
 		"POST /users/show",
+		"POST /users/profile-settings",
+		"POST /users/profile-hide",
 		"POST /admin/audit",
 		"POST /admin/orphans",
 		"POST /admin/reconcile",
@@ -137,6 +139,10 @@ func TestAllBodyRoutesRejectNonStrictJSON(t *testing.T) {
 		{"roles-users trailing value", "POST /roles/users", `{"roleId":"r1"} {}`, plugintest.Request{}},
 		{"users-show unknown field", "POST /users/show", `{"userId":"u1","unknown":true}`, plugintest.Request{}},
 		{"users-show trailing value", "POST /users/show", `{"userId":"u1"} {}`, plugintest.Request{}},
+		{"profile-settings unknown field", "POST /users/profile-settings", `{"unknown":true}`, plugintest.Request{UserID: "u1"}},
+		{"profile-settings trailing value", "POST /users/profile-settings", `{} {}`, plugintest.Request{UserID: "u1"}},
+		{"profile-hide unknown field", "POST /users/profile-hide", `{"roleId":"r1","hidden":true,"unknown":true}`, plugintest.Request{UserID: "u1"}},
+		{"profile-hide trailing value", "POST /users/profile-hide", `{"roleId":"r1","hidden":true} {}`, plugintest.Request{UserID: "u1"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -617,6 +623,46 @@ func TestPublicProfileOnlyReturnsAssignedRoles(t *testing.T) {
 	decode(t, res, &got)
 	if len(got.Roles) != 0 {
 		t.Fatalf("assigned private role leaked: %+v", got.Roles)
+	}
+}
+
+func TestProfileVisibilityCanBeChangedByAssignedUser(t *testing.T) {
+	h := routeHarness(t, levelRoleAPI())
+	if _, err := h.Call(t, "POST /admin/roles/update", plugintest.Request{
+		UserID: "a1", Administrator: true,
+		Body: `{"roleId":"r1","baseLevel":1,"experienceCurve":[{"type":"const","levelUps":9,"base":10}],"policyRanges":[{"type":"base","start":1,"end":10}],"revision":0}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Call(t, "POST /users/profile-hide", plugintest.Request{
+		UserID: "u1", Body: `{"roleId":"r1","hidden":true}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := h.Call(t, "POST /users/show", plugintest.Request{Body: `{"userId":"u1"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var public struct {
+		Roles []any `json:"roles"`
+	}
+	decode(t, res, &public)
+	if len(public.Roles) != 0 {
+		t.Fatalf("hidden role leaked: %+v", public.Roles)
+	}
+	res, err = h.Call(t, "POST /users/profile-settings", plugintest.Request{UserID: "u1", Body: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Roles []struct {
+			RoleID string `json:"roleId"`
+			Hidden bool   `json:"hidden"`
+		} `json:"roles"`
+	}
+	decode(t, res, &settings)
+	if len(settings.Roles) != 1 || settings.Roles[0].RoleID != "r1" || !settings.Roles[0].Hidden {
+		t.Fatalf("settings = %+v", settings)
 	}
 }
 

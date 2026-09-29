@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -272,10 +273,40 @@ func (h *Handler) resolveUserIDByURI(uri string) (string, bool) {
 		return "", false
 	}
 	u, err := h.userRepo.FindByURI(uri)
-	if err != nil || u == nil {
+	if err == nil && u != nil {
+		return u.ID, true
+	}
+	return "", false
+}
+
+// resolveLocalMoveTarget also accepts a restored local actor URI whose origin no
+// longer matches the running instance. It must only be used for a local source
+// account; otherwise a remote actor could point at /users/<local-id> on an
+// unrelated host and make the UI display that local account as its destination.
+func (h *Handler) resolveLocalMoveTarget(uri string) (string, bool) {
+	if id, ok := h.resolveUserIDByURI(uri); ok {
+		return id, true
+	}
+
+	// CherryPick の dump を別 URL で復元すると、local user の movedToUri は旧
+	// origin (`https://old.example/users/<id>`) のまま残る一方、local user 自身は
+	// uri=NULL なので FindByURI では解決できない。末尾が users/<id> で、その id が
+	// 実在する local user を指す場合だけ ID fallback を許可する。host を無視して
+	// remote user まで拾うと別 instance の同名 path を誤結合するため、Host==nil を
+	// 必須にする。
+	parsed, parseErr := url.Parse(uri)
+	if parseErr != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", false
 	}
-	return u.ID, true
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 2 || parts[0] != "users" || parts[1] == "" {
+		return "", false
+	}
+	target, findErr := h.userRepo.FindByID(parts[1])
+	if findErr != nil || target == nil || target.Host != nil {
+		return "", false
+	}
+	return target.ID, true
 }
 
 // SetNoteReactionRepo wires the NoteReactionRepository for users/reactions
@@ -657,7 +688,11 @@ func (h *Handler) Show(c echo.Context) error {
 	// movedTo / alsoKnownAs を URI→ローカルID 解決して埋める (#1255)。単一
 	// ユーザー path なので FindByURI は数回で済む。list path (followers 等) は
 	// N+1 を避けるため解決せず null のまま (move banner は profile でのみ表示)。
-	detailed.ResolveMoveTargets(bundle.User, h.resolveUserIDByURI)
+	moveResolver := h.resolveUserIDByURI
+	if bundle.User.Host == nil {
+		moveResolver = h.resolveLocalMoveTarget
+	}
+	detailed.ResolveMoveTargets(bundle.User, moveResolver)
 
 	// remote user の場合は origin instance の /api/users/show から実際の counts
 	// を取得して上書きする (#943)。Misskey TS は自インスタンス観測値のみ集計する

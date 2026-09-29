@@ -300,6 +300,33 @@ func (s *store) DeleteConfigTx(ctx context.Context, q queryer, roleID string, ex
 	return s.deleteConfig(ctx, q, roleID, expectRevision)
 }
 
+func (s *store) ProfileRoleHidden(ctx context.Context, roleID, userID string) (bool, error) {
+	var hidden bool
+	err := s.db.QueryRowContext(ctx, `
+		SELECT hidden FROM role_level_profile_visibility
+		WHERE role_id = $1 AND user_id = $2
+	`, roleID, userID).Scan(&hidden)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return hidden, err
+}
+
+func (s *store) SetProfileRoleHidden(ctx context.Context, roleID, userID string, hidden bool) error {
+	if !hidden {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM role_level_profile_visibility WHERE role_id = $1 AND user_id = $2
+		`, roleID, userID)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO role_level_profile_visibility (role_id, user_id, hidden, updated_at)
+		VALUES ($1, $2, true, now())
+		ON CONFLICT (role_id, user_id) DO UPDATE SET hidden = true, updated_at = now()
+	`, roleID, userID)
+	return err
+}
+
 func (s *store) deleteConfig(ctx context.Context, q queryer, roleID string, expectRevision int64) (bool, error) {
 	res, err := q.ExecContext(ctx,
 		`DELETE FROM role_level_config WHERE role_id = $1 AND revision = $2`, roleID, expectRevision)

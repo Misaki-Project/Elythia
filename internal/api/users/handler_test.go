@@ -43,6 +43,35 @@ func newTestHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	return h, userRepo
 }
 
+func TestResolveUserIDByURI_FallsBackToLocalUserIDAfterOriginMove(t *testing.T) {
+	h, users := newTestHandler(t)
+	h.SetUserRepo(users)
+	users.Users["target"] = &model.User{ID: "target", Username: "new_account", Host: nil}
+
+	id, ok := h.resolveLocalMoveTarget("https://old.example/users/target")
+	require.True(t, ok)
+	assert.Equal(t, "target", id)
+}
+
+func TestResolveUserIDByURI_DoesNotTreatRemoteIDPathAsLocal(t *testing.T) {
+	h, users := newTestHandler(t)
+	h.SetUserRepo(users)
+	host := "remote.example"
+	users.Users["target"] = &model.User{ID: "target", Username: "remote", Host: &host}
+
+	_, ok := h.resolveLocalMoveTarget("https://other.example/users/target")
+	assert.False(t, ok)
+}
+
+func TestResolveUserIDByURI_StrictResolverDoesNotUsePathFallback(t *testing.T) {
+	h, users := newTestHandler(t)
+	h.SetUserRepo(users)
+	users.Users["target"] = &model.User{ID: "target", Username: "local", Host: nil}
+
+	_, ok := h.resolveUserIDByURI("https://unrelated.example/users/target")
+	assert.False(t, ok)
+}
+
 func addTestUser(repo *testutil.MockUserRepository) *model.User {
 	name := "Test User"
 	user := &model.User{

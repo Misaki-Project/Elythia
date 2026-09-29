@@ -154,6 +154,19 @@ var migrations = []plugin.Migration{
 		CREATE INDEX IF NOT EXISTS role_level_experience_role_rank_idx
 			ON role_level_experience (role_id, experience DESC, assignment_id);
 	`},
+	{Version: 5, SQL: `
+		-- プロフィール上のlevel role表示は利用者ごとの設定。native role / assignment
+		-- schemaへ列を足さず、plugin所有schema内だけで保持する。
+		CREATE TABLE role_level_profile_visibility (
+			role_id    text NOT NULL,
+			user_id    text NOT NULL,
+			hidden     boolean NOT NULL DEFAULT true,
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (role_id, user_id)
+		);
+		CREATE INDEX role_level_profile_visibility_user_idx
+			ON role_level_profile_visibility (user_id);
+	`},
 }
 
 // config mirrors the `plugins.role-level` section of the instance config.
@@ -364,7 +377,7 @@ func orphanHandler(rep orphanReporter) plugin.Handler {
 
 // routes registers the plugin's HTTP endpoints.
 //
-// **11 routes, all POST.** path parameter も query string も見ず、すべて body で受ける
+// **13 routes, all POST.** path parameter も query string も見ず、すべて body で受ける
 // (Global Constraints「全部 POST で，全部 body で受ける」)。native の
 // `admin/roles/assign` / `admin/roles/unassign` はここでは作らない。割り当ての操作は
 // native API が行う (Task 6 / Task 8 が使う)。
@@ -773,6 +786,52 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 			return nil, err
 		}
 		return svc.publicProfile(req.Context(), body.UserID)
+	})
+
+	router.POST("/users/profile-settings", func(req plugin.Request) (any, error) {
+		if req.UserID() == "" {
+			return nil, codedErrorf(http.StatusUnauthorized, CodeUnauthenticated, "ログインが必要です")
+		}
+		if err := bindJSON(req, &struct{}{}); err != nil {
+			return nil, err
+		}
+		return svc.profileSettings(req.Context(), req.UserID())
+	})
+
+	router.POST("/users/profile-hide", func(req plugin.Request) (any, error) {
+		if req.UserID() == "" {
+			return nil, codedErrorf(http.StatusUnauthorized, CodeUnauthenticated, "ログインが必要です")
+		}
+		var body struct {
+			RoleID string `json:"roleId"`
+			Hidden bool   `json:"hidden"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if err := validateID("roleId", body.RoleID); err != nil {
+			return nil, err
+		}
+		if _, found, err := svc.loadConfigOrStorageError(req.Context(), svc.store, body.RoleID); err != nil {
+			return nil, err
+		} else if !found {
+			return nil, codedErrorf(http.StatusNotFound, CodeConfigNotFound, "その role には level 設定がありません")
+		}
+		native, err := svc.readNative()
+		if err != nil {
+			return nil, err
+		}
+		assigned, err := native.Assigned(req.Context(), body.RoleID, req.UserID())
+		if err != nil {
+			return nil, err
+		}
+		if !assigned {
+			return nil, codedErrorf(http.StatusForbidden, CodeForbidden, "割り当てられていないroleは変更できません")
+		}
+		if err := svc.store.SetProfileRoleHidden(req.Context(), body.RoleID, req.UserID(), body.Hidden); err != nil {
+			return nil, svc.storageError(req.Context(), "プロフィール表示設定の保存", err)
+		}
+		return map[string]any{"roleId": body.RoleID, "hidden": body.Hidden}, nil
 	})
 
 	return nil

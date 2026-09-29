@@ -32,7 +32,7 @@ plugins:
 
 ## API
 
-全11 routeはPOSTで、query/path parameterはなくstrict JSON bodyです。未知field・trailing JSON・不正JSONは400 `ROLE_LEVEL_VALIDATION_FAILED`。stable error codeは`ROLE_LEVEL_*`です。
+全13 routeはPOSTで、query/path parameterはなくstrict JSON bodyです。未知field・trailing JSON・不正JSONは400 `ROLE_LEVEL_VALIDATION_FAILED`。stable error codeは`ROLE_LEVEL_*`です。
 
 | route | auth | body | response shape |
 |---|---|---|---|
@@ -47,6 +47,8 @@ plugins:
 | `/admin/reconcile` | administrator | `{"mode"?}` | `{"mode","result":{"steps":[…]}}` |
 | `/roles/users` | public | `{"roleId","limit"?,"offset"?}` | `{"roleId","total","truncated","members":[…]}` |
 | `/users/show` | public | `{"userId"}` | `{"userId","roles":[…]}` |
+| `/users/profile-settings` | signed-in user | `{}` | `{"userId","roles":[…]}` |
+| `/users/profile-hide` | signed-in user | `{"roleId","hidden"}` | `{"roleId","hidden"}` |
 
 `/admin/reconcile` modeは`resume-operations`、`reconcile-orphans`、`prune-orphans`、`all`（省略時は`all`）だけです。unknown modeは400です。公開応答はnative visibilityを超えず、未付与roleを返しません。
 

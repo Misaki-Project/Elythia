@@ -8,13 +8,13 @@
 - mk-go implemented (TS の subset): **444**
 - mk-go coverage of TS: **100.0%**
 - TS only (mk-go 未実装): **0**
-- mk-go only (TS spec 外): **85**
+- mk-go only (TS spec 外): **87**
 
 ## TS 側に存在するが mk-go で未実装 (0)
 
 (なし)
 
-## mk-go 側にしかない endpoint (85)
+## mk-go 側にしかない endpoint (87)
 
 ### GET variant 追加 (23)
 
@@ -114,6 +114,8 @@ yojo-art/cherrypick 由来の federated chat 拡張 endpoint。Misskey TS 本家
 | POST | `/api/plugin/role-level/admin/roles/update` |
 | POST | `/api/plugin/role-level/admin/users/show` |
 | POST | `/api/plugin/role-level/roles/users` |
+| POST | `/api/plugin/role-level/users/profile-hide` |
+| POST | `/api/plugin/role-level/users/profile-settings` |
 | POST | `/api/plugin/role-level/users/show` |
 | POST | `/api/roles/assignment-show` |
 | POST | `/api/signin` |

@@ -29,7 +29,7 @@ func TestPluginNameMatchesManifest(t *testing.T) {
 	}
 }
 
-// migration は4つのtableをversionedかつtransactionalに作る。
+// migration はplugin所有tableをversionedかつtransactionalに作る。
 func TestMigrationsCreatePluginTables(t *testing.T) {
 	db := testDB(t)
 	newHarness(t, db, nil).Routes(Plugin)
@@ -37,6 +37,7 @@ func TestMigrationsCreatePluginTables(t *testing.T) {
 	for _, table := range []string{
 		"role_level_config", "role_level_experience",
 		"role_level_operation", "role_level_audit",
+		"role_level_profile_visibility",
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM information_schema.tables
@@ -63,12 +64,13 @@ func TestMigrationCreatesRequiredIndexes(t *testing.T) {
 	newHarness(t, db, nil).Routes(Plugin)
 
 	for name, want := range map[string]string{
-		"role_level_experience_role_user_idx": `(role_id, user_id)`,
-		"role_level_experience_user_idx":      `(user_id)`,
-		"role_level_experience_role_rank_idx": `(role_id, experience DESC, assignment_id)`,
-		"role_level_operation_status_idx":     `(status, updated_at)`,
-		"role_level_audit_role_created_idx":   `(role_id, created_at DESC)`,
-		"role_level_audit_user_created_idx":   `(user_id, created_at DESC)`,
+		"role_level_experience_role_user_idx":    `(role_id, user_id)`,
+		"role_level_experience_user_idx":         `(user_id)`,
+		"role_level_experience_role_rank_idx":    `(role_id, experience DESC, assignment_id)`,
+		"role_level_operation_status_idx":        `(status, updated_at)`,
+		"role_level_audit_role_created_idx":      `(role_id, created_at DESC)`,
+		"role_level_audit_user_created_idx":      `(user_id, created_at DESC)`,
+		"role_level_profile_visibility_user_idx": `(user_id)`,
 	} {
 		var definition string
 		err := db.QueryRow(`SELECT indexdef FROM pg_indexes

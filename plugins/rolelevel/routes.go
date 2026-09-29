@@ -290,6 +290,13 @@ func (s *service) publicProfile(ctx context.Context, userID string) (any, error)
 		if !public {
 			continue
 		}
+		hidden, err := s.store.ProfileRoleHidden(ctx, cfg.RoleID, userID)
+		if err != nil {
+			return nil, s.storageError(ctx, "プロフィール表示設定の読み込み", err)
+		}
+		if hidden {
+			continue
+		}
 		exp, err := cfg.Experience(xp)
 		if err != nil {
 			return nil, s.storageError(ctx, "level の計算", err)
@@ -298,6 +305,39 @@ func (s *service) publicProfile(ctx context.Context, userID string) (any, error)
 			"roleId":     cfg.RoleID,
 			"experience": xp,
 			"level":      exp,
+		})
+	}
+	return map[string]any{"userId": userID, "roles": out}, nil
+}
+
+func (s *service) profileSettings(ctx context.Context, userID string) (any, error) {
+	native, err := s.readNative()
+	if err != nil {
+		return nil, err
+	}
+	configs, err := s.store.ListConfigs(ctx)
+	if err != nil {
+		return nil, s.storageError(ctx, "level 設定の読み込み", err)
+	}
+	out := make([]map[string]any, 0, len(configs))
+	for _, cfg := range configs {
+		assigned, xp, _, err := s.experienceForRoleUser(ctx, native, cfg.RoleID, userID)
+		if err != nil {
+			return nil, err
+		}
+		if !assigned {
+			continue
+		}
+		hidden, err := s.store.ProfileRoleHidden(ctx, cfg.RoleID, userID)
+		if err != nil {
+			return nil, s.storageError(ctx, "プロフィール表示設定の読み込み", err)
+		}
+		exp, err := cfg.Experience(xp)
+		if err != nil {
+			return nil, s.storageError(ctx, "level の計算", err)
+		}
+		out = append(out, map[string]any{
+			"roleId": cfg.RoleID, "experience": xp, "level": exp, "hidden": hidden,
 		})
 	}
 	return map[string]any{"userId": userID, "roles": out}, nil
