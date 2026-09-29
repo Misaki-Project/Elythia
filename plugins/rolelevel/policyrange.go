@@ -3,6 +3,7 @@ package rolelevel
 import (
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // RangeType names one level-based policy rule shape.
@@ -40,11 +41,12 @@ type PolicyRange struct {
 // expensive part of a save.
 const MaxPolicyRanges = 256
 
-// validateRanges rejects a range list that does not tile the reachable progression
-// exactly, then applies the per-key rules.
+// validateRanges validates independently ranged policy keys.
 //
-// **継ぎ目だけを見て合計長は最後の End から判定する。** 半開区間なので
-// `ranges[i].Start == ranges[i-1].End` が重複も欠落も無いことの証明になる。
+// Different policy keys may overlap: one level can change driveCapacityMb and
+// antennaLimit at the same time. Ranges for the same key must not overlap.
+// Missing stages mean "keep the native policy"; explicit base ranges are also
+// accepted as no-op compatibility entries.
 func validateRanges(ranges []PolicyRange, levelUps int64, cat *Catalog) error {
 	if len(ranges) == 0 {
 		return invalid(CodeInvalidRanges, "policyRanges",
@@ -54,22 +56,34 @@ func validateRanges(ranges []PolicyRange, levelUps int64, cat *Catalog) error {
 		return invalid(CodeInvalidRanges, "policyRanges",
 			"%d 個以下で指定してください (%d)", MaxPolicyRanges, len(ranges))
 	}
-	next := int64(1)
+	wantEnd := levelUps + 2
+	byKey := make(map[string][]PolicyRange)
 	for i, r := range ranges {
-		if r.Start != next {
+		if r.Start < 1 {
 			return invalid(CodeInvalidRanges, "policyRanges",
-				"policyRanges[%d].start は %d であるべきですが %d です (重複または欠落があります)",
-				i, next, r.Start)
+				"policyRanges[%d].start は 1 以上である必要があります (%d)", i, r.Start)
 		}
 		if r.End <= r.Start {
 			return invalid(CodeInvalidRanges, "policyRanges",
 				"policyRanges[%d]: end (%d) は start (%d) より大きい必要があります", i, r.End, r.Start)
 		}
-		next = r.End
+		if r.End > wantEnd {
+			return invalid(CodeInvalidRanges, "policyRanges",
+				"policyRanges[%d].end は到達可能範囲の終端 %d 以下である必要があります (%d)", i, wantEnd, r.End)
+		}
+		if r.Type != RangeBase {
+			byKey[r.Key] = append(byKey[r.Key], r)
+		}
 	}
-	if want := levelUps + 1; next-1 != want {
-		return invalid(CodeInvalidRanges, "policyRanges",
-			"policyRanges の合計長 (%d) は到達可能 level 数 (%d) と一致する必要があります", next-1, want)
+	for key, keyed := range byKey {
+		sort.Slice(keyed, func(i, j int) bool { return keyed[i].Start < keyed[j].Start })
+		for i := 1; i < len(keyed); i++ {
+			if keyed[i].Start < keyed[i-1].End {
+				return invalid(CodeInvalidRanges, "policyRanges",
+					"policy %q の範囲 [%d,%d) と [%d,%d) が重複しています",
+					key, keyed[i-1].Start, keyed[i-1].End, keyed[i].Start, keyed[i].End)
+			}
+		}
 	}
 	return validateRangeRules(ranges, cat)
 }
@@ -131,13 +145,24 @@ func reField(err error, field string) error {
 	return err
 }
 
-// rangeForStage returns the range covering stage. The list is validated to tile
-// the progression without gaps, so at most one range matches.
-func rangeForStage(ranges []PolicyRange, stage int64) (PolicyRange, bool) {
+// rangesForStage returns every policy-key range covering stage. At most one
+// non-base range per key can match because validation rejects same-key overlap.
+func rangesForStage(ranges []PolicyRange, stage int64) []PolicyRange {
+	out := make([]PolicyRange, 0)
 	for _, r := range ranges {
-		if stage >= r.Start && stage < r.End {
-			return r, true
+		if r.Type != RangeBase && stage >= r.Start && stage < r.End {
+			out = append(out, r)
 		}
+	}
+	return out
+}
+
+// rangeForStage remains the single-range helper used by focused tests and old
+// callers. New policy resolution uses rangesForStage.
+func rangeForStage(ranges []PolicyRange, stage int64) (PolicyRange, bool) {
+	matched := rangesForStage(ranges, stage)
+	if len(matched) > 0 {
+		return matched[0], true
 	}
 	return PolicyRange{}, false
 }

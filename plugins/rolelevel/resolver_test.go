@@ -54,6 +54,39 @@ func TestResolveReplacementsDBAndHostValidation(t *testing.T) {
 	}
 }
 
+func TestResolveReplacementsReturnsOverlappingDifferentPolicyKeys(t *testing.T) {
+	db := testDBRequired(t)
+	h := newHarness(t, db, nil)
+	h.Routes(Plugin)
+	svc, err := newService(h.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		RoleID: "multi-policy", BaseLevel: 1, UpdatedBy: "legacy-import",
+		ExperienceCurve: []Curve{{Type: CurveConst, LevelUps: 2, Base: 10}},
+		PolicyRanges: []PolicyRange{
+			{Type: RangeConst, Key: "pinLimit", Start: 1, End: 4, Value: 10},
+			{Type: RangeConst, Key: "antennaLimit", Start: 1, End: 4, Value: 20},
+		},
+	}
+	if err := cfg.Validate(defaultCatalog); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.store.UpsertConfig(context.Background(), cfg, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.resolveReplacements(context.Background(), plugin.EffectivePolicyRequest{
+		ActiveAssignments: []plugin.ActiveRoleAssignment{{RoleID: cfg.RoleID, AssignmentID: "assignment"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Key != "pinLimit" || got[1].Key != "antennaLimit" {
+		t.Fatalf("contributions = %#v", got)
+	}
+}
+
 func TestResolveReplacementsRejectsMalformedPersistedConfig(t *testing.T) {
 	db := testDBRequired(t)
 	h := newHarness(t, db, nil)
@@ -65,7 +98,7 @@ func TestResolveReplacementsRejectsMalformedPersistedConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.RoleID = "bad"
 	cfg.UpdatedBy = "test"
-	cfg.PolicyRanges = []PolicyRange{{Type: RangeConst, Key: "canDeleteAccount", Start: 1, End: 99, Value: true}}
+	cfg.PolicyRanges = []PolicyRange{{Type: RangeConst, Key: "canDeleteAccount", Start: 1, End: 102, Value: true}}
 	if _, err := svc.store.UpsertConfig(context.Background(), cfg, 0); err != nil {
 		t.Fatal(err)
 	}

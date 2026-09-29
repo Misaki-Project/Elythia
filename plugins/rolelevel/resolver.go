@@ -47,23 +47,21 @@ func (s *service) resolveReplacements(ctx context.Context, req plugin.EffectiveP
 		if err != nil {
 			return nil, statusError(err)
 		}
-		r, ok := rangeForStage(cfg.PolicyRanges, level.ProgressionStage)
-		if !ok {
-			continue
+		for _, r := range rangesForStage(cfg.PolicyRanges, level.ProgressionStage) {
+			value, err := rangeValue(r, level.ProgressionStage)
+			if err != nil {
+				return nil, statusError(err)
+			}
+			if value == nil || r.Key == "" {
+				continue
+			}
+			dedupe := r.Key + "\x00" + a.RoleID
+			if _, exists := seen[dedupe]; exists {
+				continue
+			}
+			seen[dedupe] = struct{}{}
+			out = append(out, plugin.EffectivePolicyContribution{Key: r.Key, Value: value, Priority: 0, Order: 0, ReplaceRoleID: a.RoleID})
 		}
-		value, err := rangeValue(r, level.ProgressionStage)
-		if err != nil {
-			return nil, statusError(err)
-		}
-		if value == nil || r.Key == "" {
-			continue
-		}
-		dedupe := r.Key + "\x00" + a.RoleID
-		if _, exists := seen[dedupe]; exists {
-			continue
-		}
-		seen[dedupe] = struct{}{}
-		out = append(out, plugin.EffectivePolicyContribution{Key: r.Key, Value: value, Priority: 0, Order: 0, ReplaceRoleID: a.RoleID})
 	}
 	return out, nil
 }

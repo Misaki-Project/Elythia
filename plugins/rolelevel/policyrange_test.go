@@ -35,20 +35,14 @@ func baseRanges(n int64) []PolicyRange {
 	return out
 }
 
-// **range は半開区間で、stage 1 から levelUps+1 までを
-// [1, levelUps+2) として重複も欠落も無く敷き詰める。**
-// 旧実装の inclusive boundary は level 境界で必ず重複していた。
-func TestValidateRangesRequiresAnExactTiling(t *testing.T) {
+func TestValidateRangesRejectsInvalidBoundsAndSameKeyOverlap(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		ranges []PolicyRange
 	}{
 		{"空", nil},
-		{"先頭が 2 から始まる", []PolicyRange{{Type: RangeBase, Start: 2, End: 6}}},
-		{"1 を飛ばす", []PolicyRange{{Type: RangeBase, Start: 1, End: 2}, {Type: RangeBase, Start: 3, End: 6}}},
-		{"重複", []PolicyRange{{Type: RangeBase, Start: 1, End: 3}, {Type: RangeBase, Start: 2, End: 6}}},
-		{"途中が欠ける", []PolicyRange{{Type: RangeBase, Start: 1, End: 2}, {Type: RangeBase, Start: 4, End: 6}}},
-		{"合計が足りない", []PolicyRange{{Type: RangeBase, Start: 1, End: 5}}},
+		{"start が 0", []PolicyRange{{Type: RangeBase, Start: 0, End: 2}}},
+		{"同じ key が重複", []PolicyRange{{Type: RangeConst, Key: "pinLimit", Start: 1, End: 3, Value: 1}, {Type: RangeConst, Key: "pinLimit", Start: 2, End: 6, Value: 2}}},
 		{"合計が多い", []PolicyRange{{Type: RangeBase, Start: 1, End: 7}}},
 		{"空の range がある", []PolicyRange{{Type: RangeBase, Start: 1, End: 1}, {Type: RangeBase, Start: 1, End: 6}}},
 		{"end < start", []PolicyRange{{Type: RangeBase, Start: 6, End: 1}}},
@@ -67,6 +61,16 @@ func TestValidateRangesRequiresAnExactTiling(t *testing.T) {
 				t.Fatalf("code = %+v, want %s (%v)", err, CodeInvalidRanges, err)
 			}
 		})
+	}
+}
+
+func TestValidateRangesAllowsGapsAndDifferentKeyOverlap(t *testing.T) {
+	ranges := []PolicyRange{
+		{Type: RangeConst, Key: "pinLimit", Start: 2, End: 4, Value: 3},
+		{Type: RangeConst, Key: "antennaLimit", Start: 2, End: 5, Value: 4},
+	}
+	if err := rangeCfg(ranges...).Validate(defaultCatalog); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -426,25 +430,17 @@ func TestRangeValueBaseIsNil(t *testing.T) {
 // **重複があるときの一意性はここでは見ていない。** それは validateRanges が
 // CodeInvalidRanges で落とすので (TestValidateRangesRequiresAnExactTiling の「重複」)、
 // このテストは「到達可能 stage はすべて1つで、外には range がない」だけを固定する。
-func TestRangeForStageCoversReachableStagesOnly(t *testing.T) {
+func TestRangesForStageReturnsEveryChangedPolicy(t *testing.T) {
 	ranges := []PolicyRange{
 		{Type: RangeConst, Start: 1, End: 3, Key: "canPublicNote", Value: false},
-		{Type: RangeBase, Start: 3, End: 4},
-		{Type: RangeConst, Start: 4, End: 6, Key: "canPublicNote", Value: true},
+		{Type: RangeConst, Start: 2, End: 4, Key: "pinLimit", Value: 10},
+		{Type: RangeBase, Start: 1, End: 6},
 	}
-	for stage, want := range map[int64]int{1: 0, 2: 0, 3: 1, 4: 2, 5: 2} {
-		got, ok := rangeForStage(ranges, stage)
-		if !ok {
-			t.Fatalf("stage %d を受ける range がありません", stage)
-		}
-		if got != ranges[want] {
-			t.Fatalf("stage %d = %+v, want ranges[%d] = %+v", stage, got, want, ranges[want])
-		}
+	got := rangesForStage(ranges, 2)
+	if len(got) != 2 || got[0].Key != "canPublicNote" || got[1].Key != "pinLimit" {
+		t.Fatalf("stage 2 = %+v", got)
 	}
-	if _, ok := rangeForStage(ranges, 6); ok {
-		t.Fatal("stage 6 を受ける range がある")
-	}
-	if _, ok := rangeForStage(ranges, 0); ok {
-		t.Fatal("stage 0 を受ける range がある")
+	if got := rangesForStage(ranges, 5); len(got) != 0 {
+		t.Fatalf("stage 5 = %+v, want native policy only", got)
 	}
 }

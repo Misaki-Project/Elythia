@@ -167,6 +167,157 @@ var migrations = []plugin.Migration{
 		CREATE INDEX role_level_profile_visibility_user_idx
 			ON role_level_profile_visibility (user_id);
 	`},
+	{Version: 6, SQL: `
+		-- CherryPick stored level roles in native role / role_assignment columns.
+		-- Import them once when those compatibility columns exist. Clean mk-go
+		-- databases do not have the columns, so the dynamic block is a no-op there.
+		-- ON CONFLICT never overwrites plugin-owned data, making a restart safe.
+		CREATE TABLE role_level_legacy_import (
+			role_id     text PRIMARY KEY,
+			source      jsonb NOT NULL,
+			imported_at timestamptz NOT NULL DEFAULT now()
+		);
+
+		DO $migration$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'role' AND column_name = 'levelPolicies'
+			) AND EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'role_assignment' AND column_name = 'experience'
+			) THEN
+				-- Keep the complete source, including policy keys no longer present in
+				-- mk-go. Unsupported keys cannot affect effective policy resolution,
+				-- but operators must not lose the data during conversion.
+				EXECUTE $archive$
+					INSERT INTO role_level_legacy_import (role_id, source)
+					SELECT r.id, jsonb_build_object(
+						'levelPolicies', r."levelPolicies",
+						'policies', r.policies,
+						'canHideProfileByUser', r."canHideProfileByUser"
+					)
+					FROM public.role r
+					WHERE r.target::text = 'manualLevel'
+					ON CONFLICT (role_id) DO NOTHING
+				$archive$;
+
+				EXECUTE $import$
+					WITH legacy AS (
+						SELECT r.id, r."levelPolicies" AS levels, r.policies,
+							COALESCE((r."levelPolicies"->>'baseLevel')::bigint, 0) AS base_level,
+							COALESCE((
+								SELECT sum(COALESCE((curve->>'level')::bigint, 0))
+								FROM jsonb_array_elements(COALESCE(r."levelPolicies"->'experiencePolicies', '[]'::jsonb)) curve
+							), 0) AS level_ups
+						FROM public.role r
+						WHERE r.target::text = 'manualLevel'
+					), configs AS (
+						SELECT l.*,
+							COALESCE((
+								SELECT jsonb_agg(jsonb_build_object(
+									'type', curve->>'type',
+									'levelUps', COALESCE((curve->>'level')::bigint, 0),
+									'base', COALESCE((curve->>'base')::numeric, 0),
+									'additional', COALESCE((curve->>'additional')::numeric, 0),
+									'exponential', COALESCE((curve->>'exponential')::numeric, 1)
+								) ORDER BY ord)
+								FROM jsonb_array_elements(COALESCE(l.levels->'experiencePolicies', '[]'::jsonb)) WITH ORDINALITY curves(curve, ord)
+							), '[]'::jsonb) AS experience_curve,
+							COALESCE((
+								SELECT jsonb_agg(
+									CASE item->>'type'
+									WHEN 'const' THEN jsonb_build_object(
+										'type', 'const', 'key', policy_key,
+										'start', CASE WHEN ord = 1 THEN 1 ELSE previous_levels + 2 END,
+										'end', CASE WHEN ord = item_count THEN l.level_ups + 2 ELSE LEAST(l.level_ups + 2, previous_levels + item_levels + 2) END,
+										'value', item->'base')
+									WHEN 'multiplier' THEN jsonb_build_object(
+										'type', 'multiplier', 'key', policy_key,
+										'start', CASE WHEN ord = 1 THEN 1 ELSE previous_levels + 2 END,
+										'end', CASE WHEN ord = item_count THEN l.level_ups + 2 ELSE LEAST(l.level_ups + 2, previous_levels + item_levels + 2) END,
+										'base', COALESCE((item->>'base')::numeric, 0) + COALESCE((item->>'additional')::numeric, 0) * (l.base_level + CASE WHEN ord = 1 THEN 0 ELSE 1 END),
+										'additional', COALESCE((item->>'additional')::numeric, 0))
+									END
+									ORDER BY policy_key, ord)
+								FROM (
+									SELECT p.key AS policy_key, e.item, e.ord,
+										COALESCE((e.item->>'level')::bigint, 0) AS item_levels,
+										COALESCE(sum(COALESCE((e.item->>'level')::bigint, 0)) OVER (
+											PARTITION BY p.key ORDER BY e.ord ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+										), 0) AS previous_levels,
+										count(*) OVER (PARTITION BY p.key) AS item_count
+									FROM jsonb_each(COALESCE(l.policies, '{}'::jsonb)) p
+									CROSS JOIN LATERAL jsonb_array_elements(COALESCE(p.value->'policyAsLevel', '[]'::jsonb)) WITH ORDINALITY e(item, ord)
+								) legacy_ranges
+				WHERE item->>'type' IN ('const', 'multiplier')
+								  AND (CASE WHEN ord = 1 THEN 1 ELSE previous_levels + 2 END) < l.level_ups + 2
+								  AND policy_key = ANY (ARRAY[
+									'alwaysMarkNsfw','antennaLimit','avatarDecorationLimit','canCreateChannel',
+									'canDeleteAccount','canHideAds','canImportAntennas','canImportBlocking',
+									'canImportFollowing','canImportMuting','canImportUserLists','canInvite',
+									'canManageAvatarDecorations','canManageCustomEmojis','canPublicNote',
+									'canPurgeAccount','canRequestCustomEmojis','canSearchIpHistory','canSearchNotes',
+									'canSearchUsers','canUpdateBioMedia','canUseChunkedUpload',
+									'canUseEmojiAsAvatarDecoration','canUseTranslator','chatAvailability',
+									'chunkedUploadMaxConcurrentSessions','chunkedUploadMaxPendingMb','clipLimit',
+									'driveCapacityMb','emojiApplicationMaxPending','emojiApplicationMaxPerDay',
+									'emojiApplicationMaxPerMonth','emojiApplicationMaxPerWeek','gtlAvailable',
+									'inviteExpirationTime','inviteLimit','inviteLimitCycle','ltlAvailable',
+									'maxFileSizeMb','mentionLimit','noteDraftLimit','noteEachClipsLimit',
+									'optOutNotificationTypes','pinLimit','rateLimitFactor','scheduledNoteLimit',
+									'uploadableFileTypes','userEachUserListsLimit','userListLimit',
+									'watermarkAvailable','webhookLimit','wordMuteLimit'
+								  ])
+							), '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+								'type', 'base', 'start', 1, 'end', l.level_ups + 2
+							)) AS policy_ranges
+						FROM legacy l
+					)
+					INSERT INTO role_level_config
+						(role_id, base_level, experience_curve, policy_ranges, revision, created_at, updated_at, updated_by)
+					SELECT id, base_level, experience_curve, policy_ranges, 1, now(), now(), 'legacy-import'
+					FROM configs
+					WHERE jsonb_array_length(experience_curve) > 0
+					ON CONFLICT (role_id) DO NOTHING
+				$import$;
+
+				EXECUTE $experience$
+					INSERT INTO role_level_experience
+						(assignment_id, role_id, user_id, experience, created_at, updated_at)
+					SELECT ra.id, ra."roleId", ra."userId",
+						LEAST(GREATEST(COALESCE(ra.experience, 0), 0), 9007199254740991), now(), now()
+					FROM public.role_assignment ra
+					JOIN role_level_config cfg ON cfg.role_id = ra."roleId"
+					ON CONFLICT (assignment_id) DO NOTHING
+				$experience$;
+
+				IF EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = 'public' AND table_name = 'role_assignment' AND column_name = 'isHideProfile'
+				) THEN
+					EXECUTE $visibility$
+						INSERT INTO role_level_profile_visibility (role_id, user_id, hidden, updated_at)
+						SELECT ra."roleId", ra."userId", true, now()
+						FROM public.role_assignment ra
+						JOIN role_level_config cfg ON cfg.role_id = ra."roleId"
+						WHERE COALESCE(ra."isHideProfile", false)
+						ON CONFLICT (role_id, user_id) DO NOTHING
+					$visibility$;
+				END IF;
+
+				-- The plugin owns level semantics after the import. Native assignment
+				-- endpoints only accept manual roles, so convert the legacy enum value
+				-- after every plugin row has been copied successfully.
+				EXECUTE $roles$
+					UPDATE public.role r SET target = 'manual'
+					WHERE r.target::text = 'manualLevel'
+					  AND EXISTS (SELECT 1 FROM role_level_config cfg WHERE cfg.role_id = r.id)
+				$roles$;
+			END IF;
+		END
+		$migration$;
+	`},
 }
 
 // config mirrors the `plugins.role-level` section of the instance config.
@@ -498,14 +649,12 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 			PolicyRanges:    body.PolicyRanges,
 			UpdatedBy:       req.UserID(),
 		}
-		// **末尾の未指定 stage は保存前に埋める。** 共有 validator は ranges が
-		// [1, levelUps+2) をちょうど覆うことを要求するが、request は「指定したい
-		// stage だけ」しか持ってこない (frontend の既定 range にも end が無い)。
-		// 埋めずに検証すると、既定の 1 段を落としただけの保存が 400 になり、未知の
-		// policy key の検証にも到達しない。**RequireConfigAdmin のあと・Validate の
-		// まえ**に置くことで、conditional 弾きと curve / range の stable code の
-		// 優先順位はそのまま保たれる。
-		cfg.PolicyRanges = fillPolicyRangeTail(cfg.PolicyRanges, cfg.TotalLevelUps())
+		// Empty means no level-specific replacement. Keep one explicit base range
+		// for a stable round-trip shape; partial keyed ranges intentionally retain
+		// their gaps because a gap means “use the native policy”.
+		if len(cfg.PolicyRanges) == 0 {
+			cfg.PolicyRanges = []PolicyRange{{Type: RangeBase, Start: 1, End: cfg.TotalLevelUps() + 2}}
+		}
 		if err := cfg.Validate(defaultCatalog); err != nil {
 			return nil, statusError(err)
 		}

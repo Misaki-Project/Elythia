@@ -359,7 +359,7 @@ func TestAdminConfigRequiredDBAuditAndRollback(t *testing.T) {
 			t.Fatalf("audit[%d] null states: before=%s after=%s", i, before, after)
 		}
 		state := func(base, revision int64) map[string]any {
-			return configAuditState(Config{RoleID: "r1", BaseLevel: base, ExperienceCurve: []Curve{{Type: "const", LevelUps: 9, Base: 10}}, PolicyRanges: []PolicyRange{{Type: RangeBase, Start: 1, End: 10}, {Type: RangeBase, Start: 10, End: 11}}, Revision: revision, UpdatedBy: "a1"})
+			return configAuditState(Config{RoleID: "r1", BaseLevel: base, ExperienceCurve: []Curve{{Type: "const", LevelUps: 9, Base: 10}}, PolicyRanges: []PolicyRange{{Type: RangeBase, Start: 1, End: 10}}, Revision: revision, UpdatedBy: "a1"})
 		}
 		if i > 0 {
 			var got any

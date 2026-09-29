@@ -6,7 +6,9 @@ Misakiのmanual roleにlevel・XP・level別policyを追加するbackend-only bu
 
 `mk-plugin.yml`のmanifest nameは`role-level`、plugin versionは`1.0.0`、API versionは1です。`tools/pluginbuild`が`plugins/rolelevel/mk-plugin.yml`と`go.mod`を発見し、backend registration (`cmd/misskey/plugins_generated.go`)に含めます。frontendはありません。
 
-plugin-owned schemaは`plugin_role_level`だけです。Definition内のtransactional migration 1〜4が4 tables (`role_level_config`, `role_level_experience`, `role_level_operation`, `role_level_audit`)を作ります。XPの主キーは`assignment_id`、operationの主キーは`idempotency_key`です。XPはJSON/Go safe integer `0..9007199254740991`、operandは有限な`double precision`です。core tableへのforeign keyは張りません。plugin無効化・削除でschemaやmigration dataを自動DROPしません。
+plugin-owned schemaは`plugin_role_level`だけです。Definition内のtransactional migration 1〜6が設定・XP・operation・audit・プロフィール表示設定・旧データ保管用の6 tablesを作ります。XPの主キーは`assignment_id`、operationの主キーは`idempotency_key`です。XPはJSON/Go safe integer `0..9007199254740991`、operandは有限な`double precision`です。core tableへのforeign keyは張りません。plugin無効化・削除でschemaやmigration dataを自動DROPしません。
+
+migration 6はCherryPickの`manualLevel`列が存在するときだけ、curve、対応中の段階別policy、assignment XP、プロフィール非表示設定をplugin schemaへ冪等に取り込み、native roleを`manual`へ変換します。現行mk-goに存在しない旧policy keyを含む完全な原本は`role_level_legacy_import.source`へ保存し、未知keyをeffective policyとして返すことはしません。
 
 ## Configuration
 
@@ -28,7 +30,7 @@ plugins:
 
 既定は`baseLevel=1`、`const 100 XP × 99 level-ups`、effective level 1〜100です。curveは`const`/`linear`/`exponential`で、実数コストを保持し、整数XPはthresholdを`ceil`で到達します。`progressionStage = effectiveLevel - baseLevel + 1`を半開区間rangeで評価します。range typeは`base`/`const`/`multiplier`です。
 
-`RangeBase`は`nil` contributionを返します。したがってそのstageではnative policyを置換せず、native default/static contributionが残ります。置換が必要なpolicyだけが`ReplaceRoleID`を使い、追加 contributionと取り違えません。
+`RangeBase`は`nil` contributionを返します。したがってそのstageではnative policyを置換せず、native default/static contributionが残ります。rangeはpolicy keyごとに独立しており、異なるkeyは同じstageで重なれます。同じkeyのrangeだけは重複不可で、未指定stageはnative policyのままです。置換が必要なpolicyだけが`ReplaceRoleID`を使い、追加 contributionと取り違えません。
 
 ## API
 

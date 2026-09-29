@@ -38,6 +38,7 @@ func TestMigrationsCreatePluginTables(t *testing.T) {
 		"role_level_config", "role_level_experience",
 		"role_level_operation", "role_level_audit",
 		"role_level_profile_visibility",
+		"role_level_legacy_import",
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM information_schema.tables
@@ -47,6 +48,18 @@ func TestMigrationsCreatePluginTables(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("%s が作られていません", table)
 		}
+	}
+}
+
+func TestLegacyMigrationPolicyAllowlistMatchesCatalog(t *testing.T) {
+	legacySQL := Plugin.Migrations[len(Plugin.Migrations)-1].SQL
+	for _, key := range defaultCatalog.Keys() {
+		if !strings.Contains(legacySQL, "'"+key+"'") {
+			t.Fatalf("legacy migration policy allowlist is missing %q", key)
+		}
+	}
+	if !strings.Contains(legacySQL, "role_level_legacy_import") {
+		t.Fatal("legacy migration does not archive its complete source")
 	}
 }
 
