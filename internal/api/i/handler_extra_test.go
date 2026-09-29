@@ -792,6 +792,136 @@ func TestDeleteAccount_CanDeleteAccountPolicy(t *testing.T) {
 	}
 }
 
+// countingCheckedRoleProvider counts GetUserPoliciesChecked calls so the
+// canDeleteAccount gate and the canPurgeAccount mapping can be proven to share
+// ONE resolution instead of reading the resolver twice.
+type countingCheckedRoleProvider struct {
+	*stubRoleProvider
+	calls int
+}
+
+func (c *countingCheckedRoleProvider) GetUserPoliciesChecked(userID string) (map[string]any, error) {
+	c.calls++
+	return c.stubRoleProvider.GetUserPoliciesChecked(userID)
+}
+
+// canPurgeAccount は job payload の PreserveAccount に写る。**既定は保持側**
+// (missing / 非 bool / false => PreserveAccount=true, user 行を残す)。明示的な
+// bool true だけが物理削除 (現在の挙動) を許す。
+func TestDeleteAccount_CanPurgeAccountMapsToPreserveAccount(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		policies map[string]any
+		wantKeep bool
+	}{
+		{"true", map[string]any{role.PolicyCanPurgeAccount: true}, false},
+		{"false", map[string]any{role.PolicyCanPurgeAccount: false}, true},
+		{"missing", map[string]any{}, true},
+		{"wrong type", map[string]any{role.PolicyCanPurgeAccount: "true"}, true},
+		{"numeric", map[string]any{role.PolicyCanPurgeAccount: float64(1)}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, repo := newExtraHandler(t)
+			// canDeleteAccount だけを通過させ、canPurgeAccount を個別に変える。
+			provider := &stubRoleProvider{policies: map[string]any{
+				role.PolicyCanDeleteAccount: true,
+			}}
+			for k, v := range tt.policies {
+				provider.policies[k] = v
+			}
+			h.SetRoleProvider(provider)
+			enq := &fakeDeleteEnqueuer{}
+			fed := &fakeAccountDeletionFed{}
+			inv := &stubTokenInvalidator{}
+			h.SetDeleteAccountEnqueuer(enq)
+			h.SetAccountDeletionFederationHook(fed)
+			h.SetAuthInvalidator(inv)
+			user := setupUserWithPassword(repo, "u1", "pass")
+
+			rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+
+			// どちらの分岐でも論理削除 + AP Delete(actor) + token invalidate は回る。
+			require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+			assert.True(t, repo.Users["u1"].IsDeleted)
+			assert.True(t, repo.Users["u1"].IsSuspended)
+			assert.Equal(t, []string{"u1"}, fed.deleted)
+			assert.Equal(t, []string{"u1"}, inv.userCalls)
+
+			require.Len(t, enq.payloads, 1)
+			assert.Equal(t, "u1", enq.payloads[0].UserID)
+			// Soft は自己削除の local 判定 (変更なし)。
+			assert.False(t, enq.payloads[0].Soft, "self-delete must stay a local hard-delete candidate")
+			assert.Equal(t, tt.wantKeep, enq.payloads[0].PreserveAccount)
+		})
+	}
+}
+
+// canDeleteAccount と canPurgeAccount は**同じ 1 回の解決結果**から読む。
+// 2 回解決すると、plugin 由来の解決が request 内で非決定的になったときに
+// 「消せる」判定と「消すか残すか」判定が食い違う。
+func TestDeleteAccount_ResolvesPoliciesOnceForBothGates(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	provider := &countingCheckedRoleProvider{stubRoleProvider: &stubRoleProvider{
+		policies: map[string]any{
+			role.PolicyCanDeleteAccount: true,
+			role.PolicyCanPurgeAccount:  true,
+		},
+	}}
+	h.SetRoleProvider(provider)
+	h.SetDeleteAccountEnqueuer(&fakeDeleteEnqueuer{})
+	user := setupUserWithPassword(repo, "u1", "pass")
+
+	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	assert.Equal(t, 1, provider.calls, "policy resolution must happen exactly once per request")
+}
+
+// resolver error は password / 2FA / 論理削除フラグ / AP Delete / token
+// invalidate / enqueue の**どれより前**に 500 として落ちる。
+func TestDeleteAccount_ResolverErrorPrecedesPasswordAndTwoFactor(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	h.SetRoleProvider(&stubRoleProvider{
+		policies:  map[string]any{role.PolicyCanDeleteAccount: true, role.PolicyCanPurgeAccount: true},
+		policyErr: errors.New("resolver failed"),
+	})
+	enq := &fakeDeleteEnqueuer{}
+	fed := &fakeAccountDeletionFed{}
+	inv := &stubTokenInvalidator{}
+	h.SetDeleteAccountEnqueuer(enq)
+	h.SetAccountDeletionFederationHook(fed)
+	h.SetAuthInvalidator(inv)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	// 2FA 有効 + 誤った password + token 無し。全部の gate が 500 より後ろ。
+	enableTwoFactorWithBackupCodes(repo, "u1")
+
+	rec := postExtra(h.DeleteAccount, `{"password":"wrong"}`, user)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INTERNAL_ERROR")
+	assert.False(t, repo.Users["u1"].IsDeleted, "resolver error must not flip the delete flags")
+	assert.False(t, repo.Users["u1"].IsSuspended)
+	assert.Empty(t, enq.payloads, "resolver error must not enqueue a cascade job")
+	assert.Empty(t, fed.deleted, "resolver error must not deliver AP Delete(actor)")
+	assert.Empty(t, inv.userCalls, "resolver error must not invalidate tokens")
+}
+
+// resolver error で弾いた request は 2FA のバックアップコードを消費しない。
+// 同じコードをそのまま再利用できることで「検証すら走っていない」ことを示す。
+func TestDeleteAccount_ResolverErrorDoesNotConsumeTwoFactorToken(t *testing.T) {
+	h, repo, provider := newDeleteAccountHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	enableTwoFactorWithBackupCodes(repo, "u1")
+	provider.policyErr = errors.New("resolver failed")
+
+	denied := postExtra(h.DeleteAccount, `{"password":"pass","token":"backup1"}`, user)
+	require.Equal(t, http.StatusInternalServerError, denied.Code)
+
+	provider.policyErr = nil
+	allowed := postExtra(h.DeleteAccount, `{"password":"pass","token":"backup1"}`, user)
+	assert.Equal(t, http.StatusNoContent, allowed.Code, allowed.Body.String())
+}
+
 // The stub above only proves "a checked error is fatal"; it cannot prove that
 // production *produces* one. Wire the real role.Service with an unreadable
 // instance meta (where the admin's canDeleteAccount=false base override lives)

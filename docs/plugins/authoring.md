@@ -917,6 +917,7 @@ type Router interface
 type Request interface
   Context() context.Context
   Bind(any) error
+  BindStrict(any) error
   Param(string) string
   Query(string) string
   UserID() string

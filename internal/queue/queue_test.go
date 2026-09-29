@@ -828,6 +828,81 @@ func TestDecodeDeleteAccountPayload_MalformedReturnsError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// canPurgeAccount=false の enqueue は `preserveAccount:true` を載せる。Soft と
+// 違い wire 互換が要るので、key が無い旧 body は false に戻る。
+func TestNewDeleteAccountTask_OmitsPreserveAccountWhenFalse(t *testing.T) {
+	task := queue.NewDeleteAccountTask(queue.DeleteAccountPayload{UserID: "u1"})
+	require.Equal(t, `{"userId":"u1","soft":false}`, string(task.Payload()))
+}
+
+func TestNewDeleteAccountTask_PreserveAccountByteOrder(t *testing.T) {
+	task := queue.NewDeleteAccountTask(queue.DeleteAccountPayload{UserID: "u1", Soft: false, PreserveAccount: true})
+	require.Equal(t, `{"userId":"u1","soft":false,"preserveAccount":true}`, string(task.Payload()))
+}
+
+func TestNewDeleteAccountTask_PreserveAccountRoundTrip(t *testing.T) {
+	task := queue.NewDeleteAccountTask(queue.DeleteAccountPayload{UserID: "u1", Soft: false, PreserveAccount: true})
+	require.Equal(t, queue.TaskTypeDeleteAccount, task.Type())
+	got, err := queue.DecodeDeleteAccountPayload(task.Payload())
+	require.NoError(t, err)
+	require.Equal(t, "u1", got.UserID)
+	require.False(t, got.Soft)
+	require.True(t, got.PreserveAccount)
+}
+
+func TestDecodeDeleteAccountPayload_LegacyBytesDecodePreserveAccountFalse(t *testing.T) {
+	for _, body := range []string{
+		`{"userId":"u1","soft":false}`,
+		`{"userId":"u1","soft":true}`,
+		`{"userId":"u1"}`,
+	} {
+		got, err := queue.DecodeDeleteAccountPayload([]byte(body))
+		require.NoError(t, err, body)
+		require.False(t, got.PreserveAccount, body)
+	}
+}
+
+// 新 field を足しても既存 producer の body bytes は変わらない (omitempty)。
+// 変わると Unique(24h) の dedup key も全件ずれる。
+func TestNewDeleteAccountTask_LegacyBytesUnchangedByNewField(t *testing.T) {
+	task := queue.NewDeleteAccountTask(queue.DeleteAccountPayload{UserID: "u-delete"})
+	require.Equal(t, `{"userId":"u-delete","soft":false}`, string(task.Payload()))
+}
+
+// 旧 body (preserveAccount key 無し) と明示 false の body は同じ payload に落ちる。
+// in-flight の旧 job を replay しても hard delete の意味が変わらないことが本体。
+func TestDecodeDeleteAccountPayload_LegacyAbsentEqualsExplicitFalse(t *testing.T) {
+	legacy, err := queue.DecodeDeleteAccountPayload([]byte(`{"userId":"u1","soft":false}`))
+	require.NoError(t, err)
+	explicit, err := queue.DecodeDeleteAccountPayload([]byte(`{"userId":"u1","soft":false,"preserveAccount":false}`))
+	require.NoError(t, err)
+	require.Equal(t, legacy, explicit, "absent and explicit false must decode identically")
+	require.False(t, legacy.PreserveAccount, "missing key stays false so the processor still hard deletes")
+}
+
+// Soft x PreserveAccount の 4 通りの wire bytes と round-trip。omitempty によって
+// バイト列が変わるため、producer が soft=true を出す経路も固定しておく。
+func TestNewDeleteAccountTask_SoftPreserveAccountRoundTripMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload queue.DeleteAccountPayload
+		want    string
+	}{
+		{"soft false preserve false", queue.DeleteAccountPayload{UserID: "u1", Soft: false, PreserveAccount: false}, `{"userId":"u1","soft":false}`},
+		{"soft false preserve true", queue.DeleteAccountPayload{UserID: "u1", Soft: false, PreserveAccount: true}, `{"userId":"u1","soft":false,"preserveAccount":true}`},
+		{"soft true preserve false", queue.DeleteAccountPayload{UserID: "u1", Soft: true, PreserveAccount: false}, `{"userId":"u1","soft":true}`},
+		{"soft true preserve true", queue.DeleteAccountPayload{UserID: "u1", Soft: true, PreserveAccount: true}, `{"userId":"u1","soft":true,"preserveAccount":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := queue.NewDeleteAccountTask(tc.payload)
+			require.Equal(t, tc.want, string(task.Payload()))
+
+			got, err := queue.DecodeDeleteAccountPayload(task.Payload())
+			require.NoError(t, err)
+			require.Equal(t, tc.payload, got)
+		})
+	}
+}
 func TestClient_EnqueueUnfollow(t *testing.T) {
 	testutil.SkipIfNoDocker(t)
 	flushTestRedis(t)

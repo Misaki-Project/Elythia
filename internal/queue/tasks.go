@@ -377,6 +377,16 @@ type DeleteAccountPayload struct {
 	// Soft=false to physically remove the row so the account fully disappears
 	// (#2230). upstream DeleteAccountProcessorService の `job.data.soft` 準拠。
 	Soft bool `json:"soft"`
+	// PreserveAccount, when true, keeps the account row and its identifying
+	// columns instead of dropping the account entirely. Soft とは独立した
+	// フラグで、Soft の意味も既存 producer の挙動も変えない。JSON key absent
+	// = false, so bodies written before this field existed keep decoding to
+	// the old behaviour.
+	//
+	// 注意: dedup key は queue + task type + payload bytes の組み合わせ。
+	// EnqueueDeleteAccount の Unique 24h は payload 単位なので、同じ UserID でも
+	// PreserveAccount の値が違う body は別ジョブになる。
+	PreserveAccount bool `json:"preserveAccount,omitempty"`
 }
 
 // NewDeleteAccountTask serializes a DeleteAccountPayload into a driver.Task.

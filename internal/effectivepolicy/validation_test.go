@@ -161,6 +161,42 @@ func TestCanDeleteAccountPolicyContract(t *testing.T) {
 	))
 }
 
+// **canPurgeAccount の既定は true。** 未設定のインスタンスは今まで通り hard delete の
+// ままで、role で false に振った時だけ user row と profile が残る。
+// 契約: true => PreserveAccount false => 消す / false => PreserveAccount true => 残す。
+func TestCanPurgeAccountPolicyContract(t *testing.T) {
+	defaults := Defaults()
+	v, ok := defaults["canPurgeAccount"]
+	require.True(t, ok, "canPurgeAccount が既定に無い")
+	require.IsType(t, true, v, "canPurgeAccount の既定は bool でなければならない")
+	require.Equal(t, true, v, "既定 true であること。false だと未設定で hard delete でなくなる")
+
+	require.True(t, ValidatePolicyValue("canPurgeAccount", true))
+	require.True(t, ValidatePolicyValue("canPurgeAccount", false))
+	// 文字列や数値は通らない。通ると true/false どちらの意図か読めない値が入る。
+	require.False(t, ValidatePolicyValue("canPurgeAccount", "false"))
+	require.False(t, ValidatePolicyValue("canPurgeAccount", 0))
+
+	resolver := func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+		return []plugin.EffectivePolicyContribution{{Key: "canPurgeAccount", Value: false}}, nil
+	}
+	require.NoError(t, ValidateRegistration(plugin.EffectivePolicyRegistration{
+		Keys:    []string{"canPurgeAccount"},
+		Resolve: resolver,
+	}))
+	require.True(t, ValidateContributions(
+		[]string{"canPurgeAccount"},
+		nil,
+		[]plugin.EffectivePolicyContribution{{Key: "canPurgeAccount", Value: false}},
+	))
+	// 宣言していない key の貢献は通らない (登録の gate を抜けない)。
+	require.False(t, ValidateContributions(
+		[]string{"canDeleteAccount"},
+		nil,
+		[]plugin.EffectivePolicyContribution{{Key: "canPurgeAccount", Value: false}},
+	))
+}
+
 // **置換は (Key, ReplaceRoleID) で一意。** (Key, Order) だけで判定すると、同じ key の
 // 2 つの role を同時に置換する plugin が「重複」で弾かれる。置換の Order は 0 しか
 // 選べないので、role ID を含めないと同時置換ができない。

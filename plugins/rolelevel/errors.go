@@ -41,6 +41,15 @@ const (
 	CodeNativeRoleNotFound      = "ROLE_LEVEL_NATIVE_ROLE_NOT_FOUND"
 	CodeNativeAPIFailed         = "ROLE_LEVEL_NATIVE_API_FAILED"
 	CodeStorageFailed           = "ROLE_LEVEL_STORAGE_FAILED"
+	// CodeOrphanScanExhausted reports an XP-row walk that hit its page cap, so the
+	// plugin cannot tell live rows from orphans for that role.
+	CodeOrphanScanExhausted = "ROLE_LEVEL_ORPHAN_SCAN_EXHAUSTED"
+
+	// CodeIdempotencyConflict reports a retry that reuses an idempotency key for a
+	// different request payload.
+	CodeIdempotencyConflict = "ROLE_LEVEL_IDEMPOTENCY_CONFLICT"
+	// CodeOperationFailed reports a retry of an operation that already reached failed.
+	CodeOperationFailed = "ROLE_LEVEL_OPERATION_FAILED"
 )
 
 // ValidationError is a configuration rejection that already knows which stable

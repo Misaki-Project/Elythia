@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/queue"
+	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -76,8 +78,10 @@ func TestUpdateProxyAccount_NoDescriptionDoesNotUpdateProfile(t *testing.T) {
 
 // stubDeleteAccountEnqueuer captures EnqueueDeleteAccount payloads so
 // tests can assert that AccountsDelete / DeleteAccount schedule cascade.
+// payloads は全呼び出しぶんを残す (Soft / PreserveAccount の枝が複数あるため)。
 type stubDeleteAccountEnqueuer struct {
 	lastUserID string
+	payloads   []queue.DeleteAccountPayload
 	called     int
 	err        error
 }
@@ -85,6 +89,7 @@ type stubDeleteAccountEnqueuer struct {
 func (s *stubDeleteAccountEnqueuer) EnqueueDeleteAccount(payload queue.DeleteAccountPayload) error {
 	s.called++
 	s.lastUserID = payload.UserID
+	s.payloads = append(s.payloads, payload)
 	return s.err
 }
 
@@ -215,6 +220,110 @@ func TestDeleteAccount_EnqueuesCascade(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent,
 		doPost(h.DeleteAccount, `{"userId":"u9"}`, adminUser).Code)
 	assert.Equal(t, "u9", stub.lastUserID)
+}
+
+// canPurgeAccount は **self (i/delete-account) 専用の control** で、admin 経路は
+// policy を一切読まない。だから admin が積む payload は Soft のローカル判定だけが
+// 変わり、**PreserveAccount は常に false** (= 物理削除) のまま。ここで
+// PreserveAccount が設定されるとモデレーターの削除が突然 user 行を残すことになり、
+// admin 経路の挙動が暗黙に変わる。
+func TestAdminDeleteProducers_NeverPreserveAccount(t *testing.T) {
+	remote := "remote.example"
+
+	for _, tt := range []struct {
+		name     string
+		endpoint string
+		userID   string
+		body     string
+		seed     func(*testutil.MockUserRepository)
+		wantSoft bool
+	}{
+		{"accounts delete local", "accounts", "u-local", `{"userId":"u-local"}`, nil, false},
+		{"accounts delete remote", "accounts", "u-remote", `{"userId":"u-remote"}`, func(r *testutil.MockUserRepository) {
+			r.Users["u-remote"] = &model.User{ID: "u-remote", Username: "alice", Host: &remote}
+		}, true},
+		{"accounts delete unknown user", "accounts", "u-ghost", `{"userId":"u-ghost"}`, nil, false},
+		{"admin delete local", "admin", "u-local", `{"userId":"u-local"}`, nil, false},
+		{"admin delete remote", "admin", "u-remote", `{"userId":"u-remote"}`, func(r *testutil.MockUserRepository) {
+			r.Users["u-remote"] = &model.User{ID: "u-remote", Username: "alice", Host: &remote}
+		}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, userRepo, _, _ := newTestHandler(t)
+			if tt.seed != nil {
+				tt.seed(userRepo)
+			}
+			stub := &stubDeleteAccountEnqueuer{}
+			h.SetDeleteAccountEnqueuer(stub)
+
+			var rec *httptest.ResponseRecorder
+			switch tt.endpoint {
+			case "accounts":
+				rec = doPost(h.AccountsDelete, tt.body, adminUser)
+			default:
+				rec = doPost(h.DeleteAccount, tt.body, adminUser)
+			}
+			require.Equal(t, http.StatusNoContent, rec.Code)
+
+			require.Equal(t, 1, stub.called, "cascade job must be enqueued exactly once")
+			require.Len(t, stub.payloads, 1)
+			p := stub.payloads[0]
+			assert.Equal(t, tt.userID, p.UserID)
+			// Soft は「remote user なら tombstone」のローカル判定 (変更なし)。
+			assert.Equal(t, tt.wantSoft, p.Soft)
+			// **確認事項**: admin 経路は canPurgeAccount を読まない。
+			assert.False(t, p.PreserveAccount,
+				"admin delete must never set PreserveAccount (policy-free path)")
+		})
+	}
+}
+
+// userId 空 / 保護アカウント拒否の枝は job 自体を作らない。既存アサーション
+// (called == 0) に加えて payload が空であることも固定する。
+func TestAdminDeleteProducers_SkippedBranchesEnqueueNothing(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		account bool
+		body    string
+	}{
+		{"accounts delete empty userId", true, `{}`},
+		{"admin delete empty userId", false, `{}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _, _, _ := newTestHandler(t)
+			stub := &stubDeleteAccountEnqueuer{}
+			h.SetDeleteAccountEnqueuer(stub)
+			var rec *httptest.ResponseRecorder
+			if tt.account {
+				rec = doPost(h.AccountsDelete, tt.body, adminUser)
+			} else {
+				rec = doPost(h.DeleteAccount, tt.body, adminUser)
+			}
+			require.Equal(t, http.StatusNoContent, rec.Code)
+			assert.Equal(t, 0, stub.called)
+			assert.Empty(t, stub.payloads)
+		})
+	}
+
+	t.Run("root は payload を作らない", func(t *testing.T) {
+		h, userRepo, _, _ := newTestHandler(t)
+		userRepo.Users["root"] = &model.User{ID: "root", IsRoot: true}
+		stub := &stubDeleteAccountEnqueuer{}
+		h.SetDeleteAccountEnqueuer(stub)
+		rec := doPost(h.AccountsDelete, `{"userId":"root"}`, adminUser)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Empty(t, stub.payloads)
+	})
+
+	t.Run("system account は payload を作らない", func(t *testing.T) {
+		h, userRepo, _, _ := newTestHandler(t)
+		userRepo.Users["sys"] = &model.User{ID: "sys", Username: "relay.actor", Host: nil, IsRoot: false}
+		stub := &stubDeleteAccountEnqueuer{}
+		h.SetDeleteAccountEnqueuer(stub)
+		rec := doPost(h.DeleteAccount, `{"userId":"sys"}`, adminUser)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Empty(t, stub.payloads)
+	})
 }
 
 // --- /admin/accounts/find-by-email ---

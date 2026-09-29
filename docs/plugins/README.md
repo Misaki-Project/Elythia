@@ -23,6 +23,8 @@
 
 動く実例は [`plugins/status/`](../../plugins/status/)。外部サービスに依存しないので、組み込んで動かしながら読める。ただし**既定では無効**（`mk-plugin.yml`の`disabled: true`）。読みながら動かすだけなら`make plugin-dev PLUGIN=plugins/status`を使うと`mk-plugin.yml`を触らずに済む。その行を消して再ビルドしてもよいが、消したままpushすると`build` jobの`Check bundled plugins are disabled by default`が落ちる。
 
+`plugins/rolelevel/`も同梱している (#12)。これは**既定で有効** — 実行するサンプルではなく、Misakiのlevel機能そのものだから。停止は設定ファイルの`plugins.role-level.enabled: false`で行う。
+
 ## 仕組みの要点
 
 **ビルド時に組み込む。** 実行時に読み込むのではなく、mk-go 本体と一緒にコンパイルする。

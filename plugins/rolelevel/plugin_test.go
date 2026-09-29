@@ -1,6 +1,9 @@
 package rolelevel
 
 import (
+	"fmt"
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/shiroha-a/mk/plugin"
@@ -53,6 +56,154 @@ func TestMigrationsAreIdempotent(t *testing.T) {
 	h := newHarness(t, db, nil)
 	h.Routes(Plugin)
 	h.Routes(Plugin)
+}
+
+func TestMigrationCreatesRequiredIndexes(t *testing.T) {
+	db := testDB(t)
+	newHarness(t, db, nil).Routes(Plugin)
+
+	for name, want := range map[string]string{
+		"role_level_experience_role_user_idx": `(role_id, user_id)`,
+		"role_level_experience_user_idx":      `(user_id)`,
+		"role_level_experience_role_rank_idx": `(role_id, experience DESC, assignment_id)`,
+		"role_level_operation_status_idx":     `(status, updated_at)`,
+		"role_level_audit_role_created_idx":   `(role_id, created_at DESC)`,
+		"role_level_audit_user_created_idx":   `(user_id, created_at DESC)`,
+	} {
+		var definition string
+		err := db.QueryRow(`SELECT indexdef FROM pg_indexes
+			WHERE schemaname = current_schema() AND indexname = $1`, name).Scan(&definition)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !strings.Contains(definition, want) {
+			t.Fatalf("%s = %q, want %q", name, definition, want)
+		}
+	}
+}
+
+func TestMigrationEnforcesExperienceBounds(t *testing.T) {
+	db := testDB(t)
+	newHarness(t, db, nil).Routes(Plugin)
+
+	for _, experience := range []int64{0, 9007199254740991} {
+		_, err := db.Exec(`INSERT INTO role_level_experience
+			(assignment_id, role_id, user_id, experience) VALUES ($1, 'role', 'user', $2)`,
+			fmt.Sprintf("valid-%d", experience), experience)
+		if err != nil {
+			t.Fatalf("valid experience %d was rejected: %v", experience, err)
+		}
+	}
+	for _, experience := range []int64{-1, 9007199254740992} {
+		_, err := db.Exec(`INSERT INTO role_level_experience
+			(assignment_id, role_id, user_id, experience) VALUES ($1, 'role', 'user', $2)`,
+			fmt.Sprintf("invalid-%d", experience), experience)
+		if err == nil {
+			t.Fatalf("out-of-range experience %d was accepted", experience)
+		}
+	}
+}
+
+func TestMigrationEnforcesDesiredExperienceBounds(t *testing.T) {
+	db := testDB(t)
+	newHarness(t, db, nil).Routes(Plugin)
+
+	for i, desired := range []any{nil, int64(0), int64(9007199254740991)} {
+		_, err := db.Exec(`INSERT INTO role_level_operation
+			(idempotency_key, actor_id, user_id, role_id, mode, operand, desired_exp, status)
+			VALUES ($1, 'actor', 'user', 'role', 'set', 0, $2, 'pending')`,
+			fmt.Sprintf("valid-desired-%d", i), desired)
+		if err != nil {
+			t.Fatalf("valid desired experience %v was rejected: %v", desired, err)
+		}
+	}
+	for i, desired := range []int64{-1, 9007199254740992} {
+		_, err := db.Exec(`INSERT INTO role_level_operation
+			(idempotency_key, actor_id, user_id, role_id, mode, operand, desired_exp, status)
+			VALUES ($1, 'actor', 'user', 'role', 'set', 0, $2, 'pending')`,
+			fmt.Sprintf("invalid-desired-%d", i), desired)
+		if err == nil {
+			t.Fatalf("out-of-range desired experience %d was accepted", desired)
+		}
+	}
+}
+
+func TestMigrationAcceptsEveryFiniteOperand(t *testing.T) {
+	db := testDB(t)
+	newHarness(t, db, nil).Routes(Plugin)
+
+	for i, operand := range []float64{-math.MaxFloat64, -9007199254740991, 9007199254740991, math.MaxFloat64} {
+		_, err := db.Exec(`INSERT INTO role_level_operation
+			(idempotency_key, actor_id, user_id, role_id, mode, operand, status)
+			VALUES ($1, 'actor', 'user', 'role', 'set', $2, 'pending')`,
+			fmt.Sprintf("finite-%d", i), operand)
+		if err != nil {
+			t.Fatalf("finite operand %v was rejected: %v", operand, err)
+		}
+	}
+}
+
+func TestMigrationRejectsNonFiniteOperands(t *testing.T) {
+	db := testDB(t)
+	newHarness(t, db, nil).Routes(Plugin)
+
+	for i, operand := range []float64{math.NaN(), math.Inf(-1), math.Inf(1)} {
+		_, err := db.Exec(`INSERT INTO role_level_operation
+			(idempotency_key, actor_id, user_id, role_id, mode, operand, status)
+			VALUES ($1, 'actor', 'user', 'role', 'set', $2, 'pending')`,
+			fmt.Sprintf("non-finite-%d", i), operand)
+		if err == nil {
+			t.Fatalf("non-finite operand %v was accepted", operand)
+		}
+	}
+}
+
+func TestMigrationRollsBackFailedVersion(t *testing.T) {
+	db := testDB(t)
+	h := newHarness(t, db, nil)
+	h.Routes(Plugin)
+
+	version := probeMigrationVersion()
+	err := h.Context().Storage().Migrate(t.Context(), []plugin.Migration{{Version: version, SQL: `
+		CREATE TABLE role_level_rollback_probe (id bigint);
+		SELECT 1 / 0;
+	`}})
+	if err == nil {
+		t.Fatal("failing migration succeeded")
+	}
+	var exists bool
+	if err := db.QueryRow(`SELECT to_regclass(current_schema() || '.role_level_rollback_probe') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("failed migration left role_level_rollback_probe behind")
+	}
+	// **記録も残さない。** 残ると次回の起動が「適用済み」と読み飛ばし、失敗した
+	// migration が二度と実行されない (成功したように見える) 状態になる。
+	var recorded bool
+	if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, version).Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded {
+		t.Fatalf("failed migration %d was recorded as applied", version)
+	}
+}
+
+// probeMigrationVersion is a version no declared migration uses.
+//
+// **probe の version を固定しない。** 固定値 (2 など) にすると、Plugin が同じ
+// version を宣言した時点で probe が「適用済み」判定になって実行されず、テストが
+// 「failing migration succeeded」で落ち、rollback の検証ではなく番号の重複だけを
+// 報告してしまう。宣言済み migration の次の version なら、あとから何版を足しても
+// 衝突しない。
+func probeMigrationVersion() int {
+	highest := 0
+	for _, m := range Plugin.Migrations {
+		if m.Version > highest {
+			highest = m.Version
+		}
+	}
+	return highest + 1
 }
 
 // config の範囲違反は **起動を止める。** 黙って既定値で動かせない。

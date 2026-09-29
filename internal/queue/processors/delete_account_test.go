@@ -243,3 +243,92 @@ func TestDeleteAccountProcessor_NoUserRepoSkipsHardDelete(t *testing.T) {
 	task := deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "x", Soft: false})
 	require.NoError(t, p.Handle(context.Background(), task))
 }
+
+// canPurgeAccount=false (PreserveAccount=true) でも user 行は残す。
+// MockUserRepository.HardDeleteUser は Users と Profiles の両方を消すので、
+// profile 側の assertion も load-bearing。
+func TestDeleteAccountProcessor_PreserveAccountKeepsUserRow(t *testing.T) {
+	noteRepo := testutil.NewMockNoteRepository()
+	userRepo := testutil.NewMockUserRepository()
+	userRepo.Users["target"] = &model.User{ID: "target"}
+	userRepo.Profiles["target"] = &model.UserProfile{UserID: "target"}
+
+	p := processors.NewDeleteAccountProcessor(noteRepo, testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+	p.SetUserRepo(userRepo)
+
+	task := deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "target", Soft: false, PreserveAccount: true})
+	require.NoError(t, p.Handle(context.Background(), task))
+
+	assert.Contains(t, userRepo.Users, "target", "preserveAccount must keep the user row")
+	assert.Contains(t, userRepo.Profiles, "target", "hard delete is what cascades the profile away")
+}
+
+// Soft/PreserveAccount の 4 通りの組み合わせ truth-table。user 行の生死だけを見る。
+func TestDeleteAccountProcessor_SoftPreserveAccountTruthTable(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		soft     bool
+		preserve bool
+		wantKept bool
+	}{
+		{"local delete", false, false, false},
+		{"local preserve", false, true, true},
+		{"remote delete", true, false, true},
+		{"remote preserve", true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			userRepo := testutil.NewMockUserRepository()
+			userRepo.Users["u"] = &model.User{ID: "u"}
+			p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+			p.SetUserRepo(userRepo)
+
+			task := deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "u", Soft: tc.soft, PreserveAccount: tc.preserve})
+			require.NoError(t, p.Handle(context.Background(), task))
+
+			if tc.wantKept {
+				assert.Contains(t, userRepo.Users, "u")
+			} else {
+				assert.NotContains(t, userRepo.Users, "u")
+			}
+		})
+	}
+}
+
+// preserve でも note / drive / following の cleanup は必ず回る。
+func TestDeleteAccountProcessor_PreserveAccountStillCleansUp(t *testing.T) {
+	noteRepo := testutil.NewMockNoteRepository()
+	driveRepo := testutil.NewMockDriveFileRepository()
+	followingRepo := testutil.NewMockFollowingRepository()
+
+	noteRepo.Notes["n-target"] = &model.Note{ID: "n-target", UserID: "target"}
+	noteRepo.Notes["n-other"] = &model.Note{ID: "n-other", UserID: "other"}
+	uid := "target"
+	other := "other"
+	driveRepo.Files["f-target"] = &model.DriveFile{ID: "f-target", UserID: &uid}
+	driveRepo.Files["f-other"] = &model.DriveFile{ID: "f-other", UserID: &other}
+	followingRepo.Followings["fo-1"] = &model.Following{ID: "fo-1", FollowerID: "target", FolloweeID: "x"}
+	followingRepo.Followings["fo-3"] = &model.Following{ID: "fo-3", FollowerID: "y", FolloweeID: "z"}
+
+	userRepo := testutil.NewMockUserRepository()
+	userRepo.Users["target"] = &model.User{ID: "target"}
+	p := processors.NewDeleteAccountProcessor(noteRepo, driveRepo, followingRepo)
+	p.SetUserRepo(userRepo)
+
+	task := deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "target", Soft: false, PreserveAccount: true})
+	require.NoError(t, p.Handle(context.Background(), task))
+
+	assert.NotContains(t, noteRepo.Notes, "n-target")
+	assert.Contains(t, noteRepo.Notes, "n-other")
+	assert.NotContains(t, driveRepo.Files, "f-target")
+	assert.Contains(t, driveRepo.Files, "f-other")
+	assert.NotContains(t, followingRepo.Followings, "fo-1")
+	assert.Contains(t, followingRepo.Followings, "fo-3")
+	assert.Contains(t, userRepo.Users, "target")
+}
+
+// userRepo 未配線 (PreserveAccount=true) でも panic せず nil を返す。
+func TestDeleteAccountProcessor_NoUserRepoWithPreserveAccountSkipsHardDelete(t *testing.T) {
+	p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+	task := deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "x", Soft: false, PreserveAccount: true})
+	require.NoError(t, p.Handle(context.Background(), task))
+}

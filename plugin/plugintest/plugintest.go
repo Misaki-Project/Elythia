@@ -29,6 +29,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -472,9 +473,6 @@ func (r Request) build() plugin.Request {
 		ctx = context.Background()
 	}
 	body := r.Body
-	if body == "" {
-		body = "{}"
-	}
 	return &fakeRequest{
 		ctx: ctx, userID: r.UserID, body: body, params: r.Params, query: r.Query,
 		moderator: r.Moderator || r.Administrator, administrator: r.Administrator,
@@ -617,6 +615,25 @@ func (r *fakeRequest) Query(k string) string    { return r.query[k] }
 func (r *fakeRequest) Bind(v any) error {
 	dec := json.NewDecoder(strings.NewReader(r.body))
 	if err := dec.Decode(v); err != nil && err != io.EOF {
+		return err
+	}
+	return nil
+}
+
+func (r *fakeRequest) BindStrict(v any) error {
+	dec := json.NewDecoder(strings.NewReader(r.body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		if err == io.EOF {
+			return errors.New("リクエストボディが空です")
+		}
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
 		return err
 	}
 	return nil

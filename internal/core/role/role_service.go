@@ -228,6 +228,13 @@ const (
 	// PolicyCanDeleteAccount gates a user's own i/delete-account request. Unlike
 	// HasRolePolicy consumers, this policy does not grant administrators a bypass.
 	PolicyCanDeleteAccount = "canDeleteAccount"
+
+	// PolicyCanPurgeAccount decides whether a deleted account's row is actually
+	// purged. It is a separate decision from PolicyCanDeleteAccount: true hard
+	// deletes the row (PreserveAccount false), false leaves the row behind
+	// (PreserveAccount true). Like canDeleteAccount, administrators get no
+	// bypass — HasRolePolicy is not the consumer here.
+	PolicyCanPurgeAccount = "canPurgeAccount"
 )
 
 // roleCacheTTL は GetUserRoles キャッシュの有効期限。Misskey TS 同等の

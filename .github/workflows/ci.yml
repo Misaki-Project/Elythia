@@ -146,6 +146,11 @@ jobs:
       # 付きは parser では disabled と読まれるがここでは落ちる。安全側に倒れて
       # いるだけなので実害は無い。「誤検知」と見て緩めると、parser とのズレが
       # 今度は**危険側**に開く。
+      #
+      # **ただし `rolelevel` だけは意図的に既定有効** (#12)。Misaki の bundled image で
+      # level 機能がそのまま入るのはそれが目的なので、`disabled: true` を要求しない。
+      # allowlist に入れるだけで、判定の基準は緩めていない — 判定は
+      # 行ベースの完全一致のまま。
       - name: Check bundled plugins are disabled by default
         run: |
           files=$(git ls-files 'plugins/*/mk-plugin.yml')
@@ -156,8 +161,16 @@ jobs:
             echo "同梱プラグインの mk-plugin.yml が 1 つも見つかりません (列挙が壊れています)"
             exit 1
           fi
+          # **意図的に既定有効で同梱するプラグイン (#12 の role-level)。**
+          # 検査を緩めたのではなく、意図を allowlist に書いただけ。判定は
+          # 行ベースのままなので、allowlist への追加も同じ行一致で行う。
+          enabled_by_default=" rolelevel "
           fail=0
           for f in $files; do
+            name=$(basename "$(dirname "$f")")
+            case "$enabled_by_default" in
+            *" $name "*) echo "ok   $f (意図的に既定有効: $name)"; continue;;
+            esac
             if grep -qE '^disabled:[[:space:]]*true[[:space:]]*$' "$f"; then
               echo "ok   $f"
             else

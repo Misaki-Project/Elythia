@@ -15,7 +15,7 @@
 	uds-init uds-frontend-build uds-build uds-rebuild uds-restart uds-up uds-down uds-down-v uds-logs uds-ps \
 	bench-up bench-run bench-down bench-logs \
 	apicompat apicompat-routes apicompat-render \
-	test-fast shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check wiring-check catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check submodulepin-check \
+	test-fast shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check submodulepin-check \
 	diff-up diff-test diff-down diff-logs \
 	upstream-e2e upstream-e2e-deps upstream-e2e-up upstream-e2e-down upstream-e2e-migrate upstream-e2e-test
 
@@ -40,7 +40,7 @@ check: fmt lint actionlint golangci-lint test ## コミット前に必須 (lint 
 	# プラグインの vet → `make plugin-vet`)、`lint` job の重複 fixture ID 検査、
 	# `test` のカバレッジ閾値は再現しない。
 
-gates: shapecheck errorid-check limitspec-check perm-check wiring-check catalog-check notfound-check nulparam-check compose-check testflags-check migrationdoc-check mdtable-check notiftype-check pluginembed-check dockerignore-check secretfield-check ipshape-check iprecord-check sqlbind-check submodulepin-check gaterun-check ## 静的 parity ゲートを一括実行
+gates: shapecheck errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check migrationdoc-check mdtable-check notiftype-check pluginembed-check dockerignore-check secretfield-check ipshape-check iprecord-check sqlbind-check submodulepin-check gaterun-check ## 静的 parity ゲートを一括実行
 
 version: ## mk-go / 互換 Misskey / submodule のバージョンを表示
 	@printf "mk-go            : %s\n" "$$(sed -n 's/^var MkGoVersion = "\(.*\)"/\1/p' internal/config/config.go)"
@@ -331,12 +331,26 @@ test-fast: ## 全テストを -race 抜きで実行 (反復用。コミット前
 plugin-doc-check: ## authoring.md の Go スニペットがコンパイルできるか検査
 	./tests/plugin-doc/check-snippets.sh
 
+# **意図的に既定有効で同梱するプラグインの名前。** 空なら従来どおり全部
+# `disabled: true` を要求する (検査を緩めたのではなく、意図を明示しただけ)。
+#
+# **CI の `Check bundled plugins are disabled by default` にも同じ一覧を置く。**
+# 2箇所に書くのは、CI step を `make plugin-vet` に置き換えると「列挙が git ではなく
+# ディレクトリを走査する pluginbuild に依存する」壊れ方を持ち込むため (#2701 の
+# コメントと同じ判断)。**片方だけ直すと CI と手元で結果が変わる**ので、必ず両方触る。
+BUNDLED_PLUGINS_ENABLED_BY_DEFAULT = rolelevel
+
 plugin-vet: ## 同梱プラグインの既定無効を検査 + go vet (CI の build job の 2 step 相当)
 	@set -e; \
 	markers=$$(git ls-files 'plugins/*/mk-plugin.yml'); \
 	if [ -z "$$markers" ]; then echo "同梱プラグインの mk-plugin.yml が見つかりません (列挙が壊れています)"; exit 1; fi; \
+	enabled_by_default=" $(BUNDLED_PLUGINS_ENABLED_BY_DEFAULT) "; \
 	fail=0; \
 	for f in $$markers; do \
+		name=$$(basename "$$(dirname "$$f")"); \
+		case "$$enabled_by_default" in \
+		*" $$name "*) echo "ok   $$f (意図的に既定有効: $$name)"; continue;; \
+		esac; \
 		if grep -qE '^disabled:[[:space:]]*true[[:space:]]*$$' "$$f"; then echo "ok   $$f"; \
 		else echo "FAIL $$f — 'disabled: true' の行 (完全一致) がありません。disabled を含む行:"; \
 			grep -n disabled "$$f" || echo "  (無し)"; fail=1; fi; \
@@ -1224,3 +1238,12 @@ notfound-check: ## repository の lookup error を種別を見ずに 4xx にし�
 .PHONY: nulparam-check
 nulparam-check: ## 列に入らない値 (NUL) が SQL の bind parameter に載らないか検査
 	go test ./internal/entitycompat/... -run 'TestCursorGuardsAreChecked|TestScanCursorGuards|TestCursorParamsAreNormalized|TestScanCursorParamBinders|TestRepositoryLookupsRejectUnstorableValues|TestScanRepoLookupGuards|TestLikePatternsRejectUnmatchableInput|TestScanLikePatternGuards' -count=1 -v
+
+.PHONY: rolelevel-catalog-check
+rolelevel-catalog-check: ## role-level plugin の native policy catalog が host の既定値と一致するか検査
+	# plugin module は `internal/` を import できないので、native の policy schema を
+	# `plugins/rolelevel/native_policy_catalog.json` として**二重に持っている**。
+	# ずれると plugin が「拒否すべき key を受け入れる」状態になるので、**host 側の
+	# 既定値と突き合わせる** ゲートを main module 側に置く (`ValidateContributions`
+	# は宣言された key しか見ないので、このずれは host 側からは検出できない)。
+	go test ./internal/entitycompat/... -run 'TestRoleLevelCatalog' -count=1 -v

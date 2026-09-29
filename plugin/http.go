@@ -82,6 +82,9 @@ type Request interface {
 	// Bind decodes the JSON request body into v.
 	Bind(v any) error
 
+	// BindStrict decodes one JSON value, rejecting unknown fields and trailing values.
+	BindStrict(v any) error
+
 	// Param returns a path parameter (e.g. ":id").
 	Param(name string) string
 

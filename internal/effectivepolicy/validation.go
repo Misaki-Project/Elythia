@@ -35,6 +35,11 @@ var defaults = map[string]any{
 	// 開き、絞りたい運営者が role で false にする。管理者 bypass は無い
 	// (role_service.go の PolicyCanDeleteAccount 参照)。
 	"canDeleteAccount": true,
+	// canPurgeAccount gates whether the self-delete producer hard-deletes an account row.
+	// **default true** — false にすると row だけ残す (PreserveAccount) ので、
+	// 絞りたい運営者が role で設定する。admin/federation producer はこの policy を解決しない
+	// (role_service.go の PolicyCanPurgeAccount 参照)。
+	"canPurgeAccount": true,
 	// upstream Misskey #17121のchannel作成権限。default trueで全員を許可し、
 	// adminがrole経由で個別userを絞る。
 	"canCreateChannel":       true,

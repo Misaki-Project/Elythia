@@ -39,12 +39,13 @@ import (
 // bundled image で level 機能がそのまま入るのが目的だから。無効化は runtime の
 // `plugins.role-level.enabled: false` で行う (再ビルド不要)。
 var Plugin = plugin.Definition{
-	Name:       "role-level",
-	Version:    "1.0.0",
-	APIVersion: plugin.APIVersion,
-	Migrations: migrations,
-	Routes:     routes,
-	Jobs:       jobs,
+	Name:              "role-level",
+	Version:           "1.0.0",
+	APIVersion:        plugin.APIVersion,
+	Migrations:        migrations,
+	EffectivePolicies: effectivePolicies,
+	Routes:            routes,
+	Jobs:              jobs,
 }
 
 // migrations は Definition で宣言する。
@@ -124,15 +125,45 @@ var migrations = []plugin.Migration{
 		CREATE INDEX role_level_audit_role_created_idx ON role_level_audit (role_id, created_at DESC);
 		CREATE INDEX role_level_audit_user_created_idx ON role_level_audit (user_id, created_at DESC);
 	`},
+	{Version: 2, SQL: `
+		ALTER TABLE role_level_experience ADD COLUMN orphaned_at timestamptz;
+		CREATE INDEX role_level_experience_orphaned_idx ON role_level_experience (orphaned_at) WHERE orphaned_at IS NOT NULL;
+		CREATE INDEX role_level_experience_role_keyset_idx ON role_level_experience (role_id, assignment_id);
+	`},
+	{Version: 3, SQL: `
+		ALTER TABLE role_level_operation
+			ADD COLUMN assignment_created boolean NOT NULL DEFAULT false;
+		-- Rows written before this flag existed cannot safely be replayed: an
+		-- assignment id proves existence, not who created it. Terminal rows are
+		-- retained; active ambiguous rows are made explicitly non-resumable.
+		UPDATE role_level_operation
+		SET status = 'failed', last_error = 'assignment creation state unavailable', updated_at = now()
+		WHERE status IN ('pending', 'assigning', 'applying');
+	`},
+	{Version: 4, SQL: `
+		-- The original v1 bound excluded otherwise valid finite float64 values.
+		-- Drop by its generated name so this also works when v1 was updated before
+		-- being applied, then retain the constraint name with the finite bounds.
+		ALTER TABLE role_level_operation
+			DROP CONSTRAINT IF EXISTS role_level_operation_operand_check;
+		ALTER TABLE role_level_operation
+			ADD CONSTRAINT role_level_operation_operand_check CHECK (
+				operand > '-Infinity'::double precision
+				AND operand < 'Infinity'::double precision
+			);
+		CREATE INDEX IF NOT EXISTS role_level_experience_role_rank_idx
+			ON role_level_experience (role_id, experience DESC, assignment_id);
+	`},
 }
 
 // config mirrors the `plugins.role-level` section of the instance config.
 type config struct {
-	// ActorID is the local administrator every native API call is made as.
+	// ActorID is the configured actor used for native read/scan calls and for
+	// operations whose persisted actor is not otherwise available.
 	//
 	// **AsSystem に相当するものは無い。** 管理操作は必ず誰かの権限で行われ、
-	// モデレーションログにもこのIDで残る。空でも起動は止めない — read系の経路は
-	// そのまま動き、native API を要する操作だけが ROLE_LEVEL_ACTOR_NOT_CONFIGURED を返す。
+	// モデレーションログにもこのIDで残る。空でも起動は止めない — native API を必要としない
+	// 参照経路はそのまま動き、native API を必要とする操作は ROLE_LEVEL_ACTOR_NOT_CONFIGURED を返す。
 	ActorID string `json:"actorId"`
 	// AssignmentScanPages bounds how many pages of admin/roles/users the plugin
 	// walks to resolve a (role, user) pair to a native assignment id.
@@ -224,9 +255,9 @@ func newService(ctx plugin.Context) (*service, error) {
 	}
 	if cfg.ActorID == "" {
 		// **起動は止めない。** 設定していない運営者のインスタンスが起動不能になる
-		// のは同梱pluginとしては大きすぎる。read系は動き、nativeを要する操作だけが
-		// stable code を返す。
-		ctx.Logger().Warn("actorId が未設定なので XP 変更と自動付与は使えません (level 設定の保存はできます)")
+		// のは同梱pluginとしては大きすぎる。native API を必要としない参照系の経路は
+		// そのまま動き、XP 変更・自動付与・level 設定の保存だけが stable code を返す。
+		ctx.Logger().Warn("actorId が未設定のため、XP 変更・自動付与・level 設定の保存は利用できません（native API を必要としない参照操作は利用できます）")
 	}
 	db := ctx.Storage().DB()
 	return &service{
@@ -239,21 +270,23 @@ func newService(ctx plugin.Context) (*service, error) {
 	}, nil
 }
 
-// native returns the role adapter bound to the configured actor.
+// native returns the role adapter bound to the configured svc.
 func (s *service) native() (*nativeRole, error) {
-	if s.cfg.ActorID == "" {
+	return s.nativeFor(s.cfg.ActorID)
+}
+
+// nativeFor returns the role adapter for one specific svc.
+//
+// **actor ごとに 1 枚作る。** Task 8 の assignment write では、永続化された
+// operation.ActorID のユーザーとして nativeFor(operation.ActorID) を使って呼び出す。
+// native() は read/scan と、永続化された actor を利用できない操作で設定済みの actor を使う。
+func (s *service) nativeFor(actorID string) (*nativeRole, error) {
+	if actorID == "" {
 		return nil, codedErrorf(http.StatusForbidden, CodeActorNotConfigured,
 			"actorId が未設定なのでこの操作はできません (.config の plugins.role-level.actorId を設定してください)")
 	}
-	return &nativeRole{caller: s.api.AsUser(s.cfg.ActorID), pages: s.cfg.AssignmentScanPages}, nil
+	return &nativeRole{caller: s.api.AsUser(actorID), pages: s.cfg.AssignmentScanPages}, nil
 }
-
-// store is the plugin's own PostgreSQL access. Every method is scoped to the
-// plugin schema; native ids are opaque text and there is no foreign key into
-// mk-go's tables.
-//
-// **Task 1 では宣言だけ。** メソッドは Task 5 が同じ形のまま足す。
-type store struct{ db *sql.DB }
 
 // nativeRole reads and writes mk-go's own role state through its REST API.
 //
@@ -270,7 +303,8 @@ type nativeRole struct {
 // which are not handed one.
 //
 // host は EffectivePolicies を Routes / Jobs より前に呼ぶので、値が register されるの
-// は常に routes/jobs より前。reader は1つ (routes / jobs) なので競合しない。
+// は常に routes/jobs より前。同じ process の routes と jobs の両方から読まれるため、
+// test の差し替えも含めて mutex で同期する。
 type invHolder struct {
 	mu sync.Mutex
 	v  plugin.EffectivePolicyInvalidator
@@ -303,18 +337,453 @@ type noopInvalidator struct{}
 func (noopInvalidator) InvalidateUser(context.Context, string) error { return nil }
 func (noopInvalidator) InvalidateRole(context.Context, string) error { return nil }
 
-// routes registers the plugin's HTTP endpoints. The route table is added in
-// Task 10; this task only proves the module starts, the schema is created and the
-// configuration is validated.
-func routes(pctx plugin.Context, router plugin.Router) error {
-	_, err := newService(pctx)
-	return err
+// orphanReporter is what the orphan route needs from the service.
+//
+// **Task 11 の handler だけ差し替えられる形にしている。** Task 10 では
+// `service.OrphanReport` が 501 stub なので、route 自身の検証は差し替え先から受け取る
+// fake で行う。
+type orphanReporter interface {
+	OrphanReport(context.Context) (map[string]any, error)
 }
 
-// jobs registers the background work. The handlers are added in Task 11.
-func jobs(pctx plugin.Context, j plugin.Jobs) error {
-	_, err := newService(pctx)
-	return err
+// orphanHandler serves POST /admin/orphans.
+//
+// **Task 11 の結果をそのまま返す。** 結果を捨て (`_, err := ...; return nil, err`)
+// ると、実装が入っても `{"roles":{…}}` が返らない。
+func orphanHandler(rep orphanReporter) plugin.Handler {
+	return func(req plugin.Request) (any, error) {
+		if err := requireModerator(req); err != nil {
+			return nil, err
+		}
+		if err := bindJSON(req, &struct{}{}); err != nil {
+			return nil, err
+		}
+		return rep.OrphanReport(req.Context())
+	}
+}
+
+// routes registers the plugin's HTTP endpoints.
+//
+// **11 routes, all POST.** path parameter も query string も見ず、すべて body で受ける
+// (Global Constraints「全部 POST で，全部 body で受ける」)。native の
+// `admin/roles/assign` / `admin/roles/unassign` はここでは作らない。割り当ての操作は
+// native API が行う (Task 6 / Task 8 が使う)。
+//
+// These endpoints are implemented here; they no longer return the Task 10 stub.
+// 登録済みなので、frontend は 404 ではなく stable code 付きの「未実装」を受け取る。
+func routes(pctx plugin.Context, router plugin.Router) error {
+	svc, err := newService(pctx)
+	if err != nil {
+		return err
+	}
+
+	router.POST("/admin/roles/list", func(req plugin.Request) (any, error) {
+		if err := requireModerator(req); err != nil {
+			return nil, err
+		}
+		if err := bindJSON(req, &struct{}{}); err != nil {
+			return nil, err
+		}
+		// native を要する集計は native の権限で行う。actorId が未設定なら実行者に
+		// fallback し、それも無ければ 0 件 + 不明 を出す。
+		configs, err := svc.store.ListConfigs(req.Context())
+		if err != nil {
+			return nil, svc.storageError(req.Context(), "level 設定の読み込み", err)
+		}
+		// **正確な member 数が要るのは 1 個の role のときだけ。** list では「全部
+		// 走査できた role」だけ member 数を埋める。取れなかった role は 0 のまま
+		// にして、正確な数は `/admin/roles/show` に集約する。
+		counts := make(map[string]int, len(configs))
+		truncatedCounts := make(map[string]bool, len(configs))
+		for _, cfg := range configs {
+			counts[cfg.RoleID] = 0
+			truncatedCounts[cfg.RoleID] = true
+		}
+		for _, cfg := range configs {
+			count, trunc, err := svc.memberCount(req.Context(), cfg.RoleID)
+			if err != nil {
+				continue
+			}
+			// A truncated native scan yields a lower bound; retain it and flag it.
+			counts[cfg.RoleID] = count
+			truncatedCounts[cfg.RoleID] = trunc
+		}
+		return map[string]any{
+			"roles":                 configs,
+			"memberCounts":          counts,
+			"memberCountsTruncated": truncatedCounts,
+		}, nil
+	})
+
+	router.POST("/admin/roles/show", func(req plugin.Request) (any, error) {
+		if err := requireModerator(req); err != nil {
+			return nil, err
+		}
+		var body struct {
+			RoleID string `json:"roleId"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if err := validateID("roleId", body.RoleID); err != nil {
+			return nil, err
+		}
+		cfg, found, err := svc.loadConfigOrStorageError(req.Context(), svc.store, body.RoleID)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			// **level 設定が無い role は 404。** 既定の level 設定を捏造して 200 で
+			// 返すと、「設定した記憶が無いのに level がある」行列が返る。公開の
+			// member 一覧 (`/roles/users`) も同じ状態で 404 (CodeConfigNotFound) を
+			// 返すので、両 route の答えを揃える (routes.go)。新規作成は
+			// `POST /admin/roles/update` の revision 0 がその役を持つ。
+			return nil, codedErrorf(http.StatusNotFound, CodeConfigNotFound,
+				"その role には level 設定がありません")
+		}
+		count, truncated, err := svc.memberCount(req.Context(), body.RoleID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"role":             cfg,
+			"memberCount":      count,
+			"membersTruncated": truncated,
+		}, nil
+	})
+
+	router.POST("/admin/roles/update", func(req plugin.Request) (any, error) {
+		if err := requireAdmin(req); err != nil {
+			return nil, err
+		}
+		var body struct {
+			RoleID          string        `json:"roleId"`
+			BaseLevel       *int64        `json:"baseLevel"`
+			ExperienceCurve []Curve       `json:"experienceCurve"`
+			PolicyRanges    []PolicyRange `json:"policyRanges"`
+			Revision        *int64        `json:"revision"`
+			Note            string        `json:"note"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if body.BaseLevel == nil || body.Revision == nil {
+			return nil, codedErrorf(http.StatusBadRequest, CodeValidationFailed, "baseLevel と revision が必要です")
+		}
+		if err := validateID("roleId", body.RoleID); err != nil {
+			return nil, err
+		}
+		// **manual role だけ許可する。** conditional には assignment が無いので、
+		// XP を紐づけられる対象が存在せず、あとから policy 置換の先が壊れる。
+		if err := svc.RequireConfigAdmin(req.Context(), body.RoleID); err != nil {
+			return nil, err
+		}
+		cfg := Config{
+			RoleID:          body.RoleID,
+			BaseLevel:       *body.BaseLevel,
+			ExperienceCurve: body.ExperienceCurve,
+			PolicyRanges:    body.PolicyRanges,
+			UpdatedBy:       req.UserID(),
+		}
+		// **末尾の未指定 stage は保存前に埋める。** 共有 validator は ranges が
+		// [1, levelUps+2) をちょうど覆うことを要求するが、request は「指定したい
+		// stage だけ」しか持ってこない (frontend の既定 range にも end が無い)。
+		// 埋めずに検証すると、既定の 1 段を落としただけの保存が 400 になり、未知の
+		// policy key の検証にも到達しない。**RequireConfigAdmin のあと・Validate の
+		// まえ**に置くことで、conditional 弾きと curve / range の stable code の
+		// 優先順位はそのまま保たれる。
+		cfg.PolicyRanges = fillPolicyRangeTail(cfg.PolicyRanges, cfg.TotalLevelUps())
+		if err := cfg.Validate(defaultCatalog); err != nil {
+			return nil, statusError(err)
+		}
+		// Read and write the configuration and its audit row in one transaction.  The
+		// read is deliberately inside the transaction as well: the audit must describe
+		// the row that this revision-checked write actually replaced.
+		tx, err := svc.db.BeginTx(req.Context(), nil)
+		if err != nil {
+			return nil, svc.storageStatusError(req.Context(), "level 設定の保存", err)
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		before, found, err := loadConfigRow(req.Context(), tx, body.RoleID)
+		if err != nil {
+			return nil, svc.storageStatusError(req.Context(), "level 設定の読み込み", err)
+		}
+		saved, err := svc.store.UpsertConfigTx(req.Context(), tx, cfg, *body.Revision)
+		if err != nil {
+			// **revision 衝突は storage error に潰さない。** UpsertConfig が 409 +
+			// CodeConfigConflict を返しているのに 500 にすると、frontend が
+			// 読み直して再保存するかどうかを決められない。
+			return nil, svc.storageStatusError(req.Context(), "level 設定の保存", err)
+		}
+		var auditBefore map[string]any
+		if found {
+			auditBefore = configAuditState(before)
+		}
+		op := "config-create"
+		if found {
+			op = "config-update"
+		}
+		if err := svc.store.InsertAudit(req.Context(), tx, auditEntry{
+			ActorID: req.UserID(), Operation: op, RoleID: body.RoleID, Note: truncate(body.Note, 500),
+			Before: auditBefore, After: configAuditState(saved),
+		}); err != nil {
+			return nil, svc.storageStatusError(req.Context(), "監査の記録", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, svc.storageStatusError(req.Context(), "level 設定の保存", err)
+		}
+		committed = true
+		// **commit のあと cache を捨てる。** curve を変えると保存済みの level と
+		// policy が変わる。dynamic policy は次の解決時に読み直される。
+		svc.invalidateRoleConfig(req.Context(), body.RoleID)
+		return map[string]any{"role": saved}, nil
+	})
+
+	router.POST("/admin/roles/delete", func(req plugin.Request) (any, error) {
+		if err := requireAdmin(req); err != nil {
+			return nil, err
+		}
+		var body struct {
+			RoleID   string `json:"roleId"`
+			Revision *int64 `json:"revision"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if body.Revision == nil {
+			return nil, codedErrorf(http.StatusBadRequest, CodeValidationFailed, "revision が必要です")
+		}
+		if err := validateID("roleId", body.RoleID); err != nil {
+			return nil, err
+		}
+		tx, err := svc.db.BeginTx(req.Context(), nil)
+		if err != nil {
+			return nil, svc.storageStatusError(req.Context(), "level 設定の保存", err)
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		before, found, err := loadConfigRow(req.Context(), tx, body.RoleID)
+		if err != nil {
+			return nil, svc.storageStatusError(req.Context(), "level 設定の読み込み", err)
+		}
+		deleted, err := svc.store.DeleteConfigTx(req.Context(), tx, body.RoleID, *body.Revision)
+		if err != nil {
+			return nil, svc.storageStatusError(req.Context(), "level 設定の保存", err)
+		}
+		if !deleted {
+			return nil, codedErrorf(http.StatusConflict, CodeConfigConflict,
+				"level 設定は他の操作で更新されています。読み直して削除してください")
+		}
+		if !found {
+			return nil, codedErrorf(http.StatusConflict, CodeConfigConflict,
+				"level 設定は他の操作で更新されています。読み直して削除してください")
+		}
+		if err := svc.store.InsertAudit(req.Context(), tx, auditEntry{
+			ActorID: req.UserID(), Operation: "config-delete", RoleID: body.RoleID,
+			Before: configAuditState(before), After: nil,
+		}); err != nil {
+			return nil, svc.storageStatusError(req.Context(), "監査の記録", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, svc.storageStatusError(req.Context(), "level 設定の保存", err)
+		}
+		committed = true
+		svc.invalidateRoleConfig(req.Context(), body.RoleID)
+		// XP is retained as an orphan; Task 11 reconciliation prunes it after retention.
+		return map[string]any{"roleId": body.RoleID, "deleted": true}, nil
+	})
+
+	router.POST("/admin/users/show", func(req plugin.Request) (any, error) {
+		if err := requireModerator(req); err != nil {
+			return nil, err
+		}
+		var body struct {
+			UserID string `json:"userId"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if err := validateID("userId", body.UserID); err != nil {
+			return nil, err
+		}
+		return svc.adminUser(req.Context(), body.UserID)
+	})
+
+	router.POST("/admin/change-exp", func(req plugin.Request) (any, error) {
+		var body struct {
+			IdempotencyKey string   `json:"idempotencyKey"`
+			UserID         string   `json:"userId"`
+			RoleID         string   `json:"roleId"`
+			Mode           string   `json:"mode"`
+			Operand        *float64 `json:"operand"`
+			Note           string   `json:"note"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if body.Operand == nil {
+			return nil, codedErrorf(http.StatusBadRequest, CodeValidationFailed, "operand が必要です")
+		}
+		// **入力検証を先に置く。** 不正なリクエストを認可のあとで弾くと、同じ
+		// 400 が「権限がありません」に化ける。
+		if err := validateIdempotencyKey(body.IdempotencyKey); err != nil {
+			return nil, err
+		}
+		if err := validateID("userId", body.UserID); err != nil {
+			return nil, err
+		}
+		if err := validateID("roleId", body.RoleID); err != nil {
+			return nil, err
+		}
+		// 権限は XP を書く前に済ませる。**不正な操作は監査表に残さない。**
+		if err := svc.AuthorizeXPChange(req, body.RoleID); err != nil {
+			return nil, err
+		}
+		native, err := svc.native()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := native.RequireManual(req.Context(), body.RoleID); err != nil {
+			return nil, err
+		}
+		res, err := svc.ChangeExp(req.Context(), ChangeExpRequest{
+			IdempotencyKey: body.IdempotencyKey,
+			ActorID:        req.UserID(),
+			UserID:         body.UserID,
+			RoleID:         body.RoleID,
+			Mode:           Mode(body.Mode),
+			Operand:        *body.Operand,
+			Note:           body.Note,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"assignmentId": res.AssignmentID,
+			"experience":   res.Experience,
+			"status":       string(res.Status),
+			"resumed":      res.Resumed,
+		}, nil
+	})
+
+	router.POST("/admin/audit", func(req plugin.Request) (any, error) {
+		if err := requireModerator(req); err != nil {
+			return nil, err
+		}
+		var body struct {
+			RoleID string `json:"roleId"`
+			UserID string `json:"userId"`
+			Limit  int    `json:"limit"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if body.RoleID != "" {
+			if err := validateID("roleId", body.RoleID); err != nil {
+				return nil, err
+			}
+		}
+		if body.UserID != "" {
+			if err := validateID("userId", body.UserID); err != nil {
+				return nil, err
+			}
+		}
+		// **スコープは必須。** role も user も無いと、権限のない人が自分自身にも
+		// ない全件の履歴が読める。
+		if body.RoleID == "" && body.UserID == "" {
+			return nil, codedErrorf(http.StatusBadRequest, CodeValidationFailed,
+				"roleId か userId のどちらかを指定してください (監査履歴はスコープ付きでなければ読めません)")
+		}
+		if err := validatePageLimit("limit", body.Limit); err != nil {
+			return nil, err
+		}
+		limit, _ := pageBounds(pageRequest{Limit: body.Limit})
+		return svc.auditTrail(req.Context(), body.RoleID, body.UserID, limit)
+	})
+
+	router.POST("/admin/orphans", orphanHandler(svc))
+
+	router.POST("/admin/reconcile", func(req plugin.Request) (any, error) {
+		if err := requireAdmin(req); err != nil {
+			return nil, err
+		}
+		var body struct {
+			Mode string `json:"mode"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		mode := body.Mode
+		if mode == "" {
+			// **mode 省略は all。** RunReconcile は mode を照合するので、
+			// そのまま渡すと未知の mode として弾かれる。all に翻訳する。
+			mode = reconcileAllMode
+		}
+		// **要求者を trigger として渡す。** 監査行の `actorId` に運営者の id が
+		// 残らないと、手動の削除と cron の削除が区別できなくなる。
+		result, err := svc.RunReconcile(req.Context(), mode, reconcileTrigger{
+			Source:  reconcileSourceRoute,
+			ActorID: req.UserID(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"mode": mode, "result": result}, nil
+	})
+
+	router.POST("/roles/users", func(req plugin.Request) (any, error) {
+		var body struct {
+			RoleID string `json:"roleId"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if err := validateID("roleId", body.RoleID); err != nil {
+			return nil, err
+		}
+		if err := validatePageLimit("limit", body.Limit); err != nil {
+			return nil, err
+		}
+		if err := validatePageOffset("offset", body.Offset); err != nil {
+			return nil, err
+		}
+		limit, offset := pageBounds(pageRequest{Limit: body.Limit, Offset: body.Offset})
+		return svc.roleMembers(req.Context(), body.RoleID, limit, offset)
+	})
+
+	router.POST("/users/show", func(req plugin.Request) (any, error) {
+		var body struct {
+			UserID string `json:"userId"`
+		}
+		if err := bindJSON(req, &body); err != nil {
+			return nil, err
+		}
+		if err := validateID("userId", body.UserID); err != nil {
+			return nil, err
+		}
+		return svc.publicProfile(req.Context(), body.UserID)
+	})
+
+	return nil
+}
+
+func configAuditState(cfg Config) map[string]any {
+	return map[string]any{
+		"roleId": cfg.RoleID, "baseLevel": cfg.BaseLevel,
+		"experienceCurve": cfg.ExperienceCurve, "policyRanges": cfg.PolicyRanges,
+		"revision": cfg.Revision, "updatedBy": cfg.UpdatedBy,
+	}
 }
 
 // roleInfo is the slice of admin/roles/show the plugin needs. The full Role shape
@@ -325,6 +794,8 @@ type roleInfo struct {
 	Target                    string `json:"target"`
 	IsAdministrator           bool   `json:"isAdministrator"`
 	CanEditMembersByModerator bool   `json:"canEditMembersByModerator"`
+	IsPublic                  bool   `json:"isPublic"`
+	IsExplorable              bool   `json:"isExplorable"`
 }
 
 // assignment is one row of admin/roles/users. `id` is the native

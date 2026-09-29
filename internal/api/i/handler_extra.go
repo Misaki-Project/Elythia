@@ -147,6 +147,14 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 	if !valid || !allowed {
 		return apierr.JSONRolePermissionDenied(c)
 	}
+	// canPurgeAccount も同じ 1 回の解決結果から取得する (resolver を 2 回叩かない)。
+	// 明示的な bool true だけが user 行の物理削除を許す。false / 欠落 / 非 bool は
+	// 保持側 (PreserveAccount=true) に倒す。processor は payload の値だけを見、
+	// 再解決しないので、この判断は enqueue 時点で確定させる必要がある。
+	preserveAccount := true
+	if canPurge, isBool := policies[role.PolicyCanPurgeAccount].(bool); isBool && canPurge {
+		preserveAccount = false
+	}
 
 	var req struct {
 		Password string `json:"password"`
@@ -234,8 +242,10 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 		h.accountDeletionFed.OnUserDeleted(u)
 	}
 	if h.deleteAccountEnqueuer != nil {
-		// 自己削除は常に local user なので Soft=false で user 行を物理削除する (#2230)。
-		if err := h.deleteAccountEnqueuer.EnqueueDeleteAccount(queue.DeleteAccountPayload{UserID: u.ID, Soft: false}); err != nil {
+		// 自己削除は常に local user なので、cascade job の Soft は false にする (#2230)。
+		// canPurgeAccount が true のときだけ PreserveAccount=false (物理削除)、
+		// それ以外は PreserveAccount=true で user 行と profile を残す。
+		if err := h.deleteAccountEnqueuer.EnqueueDeleteAccount(queue.DeleteAccountPayload{UserID: u.ID, Soft: false, PreserveAccount: preserveAccount}); err != nil {
 			// enqueue 失敗は user 可視のエラーにしない (フラグは既に立っている)。
 			// 次回手動 retry / 再ログイン不可状態は維持されるため 204 を返す。
 			slog.Warn("i/delete-account: enqueue cascade failed", "userId", u.ID, "err", err)

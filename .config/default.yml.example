@@ -586,3 +586,12 @@ proxyBypassHosts:
 #    peerMaxBody: 524288
 #    apiKey: "..."
 #    endpoint: https://api.example-game.com
+#  role-level:  # enabled by default; set false to disable level policy without rebuilding
+#  # actorId must be set for native-dependent reads, XP changes, and automatic assignment; empty starts DB-only paths
+#    enabled: true
+#    actorId: ""
+#    assignmentScanPages: 50
+#    orphanRetentionDays: 30
+#    reconcileCron: "*/10 * * * *"
+#    orphanCron: "17 3 * * *"
+#    pruneCron: "43 4 * * *"
