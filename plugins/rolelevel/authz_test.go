@@ -109,8 +109,8 @@ func TestAuthorizeXPChange(t *testing.T) {
 		{"moderator + admin role", plugintest.Request{UserID: "m1", Moderator: true}, "admin", CodeRoleNotAssignable, false, 0},
 		{"administrator + shut", plugintest.Request{UserID: "a1", Administrator: true}, "shut", "", false, 0},
 		{"administrator + admin role", plugintest.Request{UserID: "a1", Administrator: true}, "admin", "", false, 0},
-		{"actorless moderator", plugintest.Request{UserID: "m1", Moderator: true}, "open", CodeActorNotConfigured, true, 0},
-		{"actorless administrator", plugintest.Request{UserID: "a1", Administrator: true}, "shut", CodeActorNotConfigured, true, 0},
+		{"actorless moderator", plugintest.Request{UserID: "m1", Moderator: true}, "open", "", true, 0},
+		{"actorless administrator", plugintest.Request{UserID: "a1", Administrator: true}, "shut", "", true, 0},
 		{"moderator missing role", plugintest.Request{UserID: "m1", Moderator: true}, "missing", CodeNativeRoleNotFound, false, 0},
 		{"moderator native 500", plugintest.Request{UserID: "m1", Moderator: true}, "open", CodeNativeAPIFailed, false, http.StatusInternalServerError},
 	} {
@@ -155,7 +155,7 @@ func TestAuthorizeXPChange(t *testing.T) {
 
 // **level 設定の変更は administrator だけ。** moderator が curve を変えて権限を
 // 緩められると、canEditMembersByModerator の意味が壊れる。
-func TestRequireConfigAdminValidatesConfiguredActorRole(t *testing.T) {
+func TestRequireConfigAdminValidatesRequestActorRole(t *testing.T) {
 	api := &stubAPI{roles: map[string]roleInfo{
 		"manual":      {ID: "manual", Target: "manual"},
 		"conditional": {ID: "conditional", Target: "conditional"},
@@ -174,7 +174,7 @@ func TestRequireConfigAdminValidatesConfiguredActorRole(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			api.showErr = tt.show
-			err := svc.RequireConfigAdmin(context.Background(), tt.role)
+			err := svc.RequireConfigAdmin(context.Background(), "admin1", tt.role)
 			api.showErr = 0
 			if tt.code == "" {
 				if err != nil {
@@ -190,8 +190,7 @@ func TestRequireConfigAdminValidatesConfiguredActorRole(t *testing.T) {
 			}
 		})
 	}
-	svc.cfg.ActorID = ""
-	if err := svc.RequireConfigAdmin(context.Background(), "manual"); err == nil {
+	if err := svc.RequireConfigAdmin(context.Background(), "", "manual"); err == nil {
 		t.Fatal("actorId 空文字を受け入れています")
 	} else if _, code := extractCode(err); code != CodeActorNotConfigured {
 		t.Fatalf("code = %q, want %s (%v)", code, CodeActorNotConfigured, err)

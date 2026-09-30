@@ -54,7 +54,7 @@ func (s *service) AuthorizeXPChange(req plugin.Request, roleID string) error {
 		return codedErrorf(http.StatusForbidden, CodeForbidden,
 			"この操作にはモデレーター以上の権限が必要です")
 	}
-	native, err := s.native()
+	native, err := s.nativeFor(req.UserID())
 	if err != nil {
 		return err
 	}
@@ -81,8 +81,8 @@ func (s *service) AuthorizeXPChange(req plugin.Request, roleID string) error {
 // **level は manual role にしか付けない。** conditional role には assignment が無いので、
 // XP を紐づけられる対象が存在しない。target を確認せずに保存すると、あとから
 // policy 置換の先が壊れた状態で保存される。
-func (s *service) RequireConfigAdmin(ctx context.Context, roleID string) error {
-	native, err := s.native()
+func (s *service) RequireConfigAdmin(ctx context.Context, actorID, roleID string) error {
+	native, err := s.nativeFor(actorID)
 	if err != nil {
 		return err
 	}

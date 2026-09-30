@@ -162,8 +162,8 @@ func (s *service) readNative() (*nativeRole, error) {
 // **過少申告に倒す。** 取得できた行だけを数え、native が落ちた
 // ときや上限で切れたときは truncated を立てる。推定値を「全部で何件か」として
 // 出すと、operator が member 制限の判断を誤る。
-func (s *service) memberCount(ctx context.Context, roleID string) (int, bool, error) {
-	native, err := s.native()
+func (s *service) memberCount(ctx context.Context, actorID, roleID string) (int, bool, error) {
+	native, err := s.nativeFor(actorID)
 	if err != nil {
 		// actorId 未配置でも起動は止めないので read 系は動く。native へ聞けない
 		// ときは「不明」を 0 + truncated で返す。
@@ -550,8 +550,8 @@ func (s *service) auditTrail(ctx context.Context, roleID, userID string, limit i
 // **未完了の operation だけ持ち出す。** ResumableOperations は全 operation が
 // 対象なので、この user に絞ってから出す。limit を先にとるので、該当用户在らな
 // ければ空の配列になる (null を出さない)。
-func (s *service) adminUser(ctx context.Context, userID string) (any, error) {
-	native, err := s.native()
+func (s *service) adminUser(ctx context.Context, actorID, userID string) (any, error) {
+	native, err := s.nativeFor(actorID)
 	if err != nil {
 		return nil, err
 	}

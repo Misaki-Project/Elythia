@@ -202,7 +202,8 @@ func TestAdminConfigRoutesRequireAdministrator(t *testing.T) {
 
 // **保存の round trip。**
 func TestAdminConfigRoundTrip(t *testing.T) {
-	h := routeHarness(t, levelRoleAPI())
+	api := levelRoleAPI()
+	h := routeHarness(t, api)
 	res, err := h.Call(t, "POST /admin/roles/update", plugintest.Request{
 		UserID: "a1", Administrator: true,
 		Body: `{"roleId":"r1","baseLevel":1,"experienceCurve":[{"type":"const","levelUps":9,"base":10}],"policyRanges":[{"type":"base","start":1,"end":10}],"revision":0}`,
@@ -236,6 +237,14 @@ func TestAdminConfigRoundTrip(t *testing.T) {
 	decode(t, res, &one)
 	if one.Role.BaseLevel != 1 || one.MemberCount != 2 || one.MembersTruncated {
 		t.Fatalf("= %+v", one)
+	}
+	for _, actor := range api.showActors {
+		if actor != "a1" {
+			t.Fatalf("admin/roles/show actor = %q, want request actor a1", actor)
+		}
+	}
+	if len(api.usersActors) == 0 || api.usersActors[len(api.usersActors)-1] != "a1" {
+		t.Fatalf("admin/roles/users actors = %v, want request actor a1", api.usersActors)
 	}
 }
 

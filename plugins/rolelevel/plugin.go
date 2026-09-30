@@ -548,8 +548,8 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 		if err := bindJSON(req, &struct{}{}); err != nil {
 			return nil, err
 		}
-		// native を要する集計は native の権限で行う。actorId が未設定なら実行者に
-		// fallback し、それも無ければ 0 件 + 不明 を出す。
+		// native を要する管理参照は、認可済みの要求者自身として行う。設定済みの
+		// plugin actor は定期job用であり、管理画面の権限を代行しない。
 		configs, err := svc.store.ListConfigs(req.Context())
 		if err != nil {
 			return nil, svc.storageError(req.Context(), "level 設定の読み込み", err)
@@ -564,7 +564,7 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 			truncatedCounts[cfg.RoleID] = true
 		}
 		for _, cfg := range configs {
-			count, trunc, err := svc.memberCount(req.Context(), cfg.RoleID)
+			count, trunc, err := svc.memberCount(req.Context(), req.UserID(), cfg.RoleID)
 			if err != nil {
 				continue
 			}
@@ -605,7 +605,7 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 			return nil, codedErrorf(http.StatusNotFound, CodeConfigNotFound,
 				"その role には level 設定がありません")
 		}
-		count, truncated, err := svc.memberCount(req.Context(), body.RoleID)
+		count, truncated, err := svc.memberCount(req.Context(), req.UserID(), body.RoleID)
 		if err != nil {
 			return nil, err
 		}
@@ -639,7 +639,7 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 		}
 		// **manual role だけ許可する。** conditional には assignment が無いので、
 		// XP を紐づけられる対象が存在せず、あとから policy 置換の先が壊れる。
-		if err := svc.RequireConfigAdmin(req.Context(), body.RoleID); err != nil {
+		if err := svc.RequireConfigAdmin(req.Context(), req.UserID(), body.RoleID); err != nil {
 			return nil, err
 		}
 		cfg := Config{
@@ -777,7 +777,7 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 		if err := validateID("userId", body.UserID); err != nil {
 			return nil, err
 		}
-		return svc.adminUser(req.Context(), body.UserID)
+		return svc.adminUser(req.Context(), req.UserID(), body.UserID)
 	})
 
 	router.POST("/admin/change-exp", func(req plugin.Request) (any, error) {
@@ -810,7 +810,7 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 		if err := svc.AuthorizeXPChange(req, body.RoleID); err != nil {
 			return nil, err
 		}
-		native, err := svc.native()
+		native, err := svc.nativeFor(req.UserID())
 		if err != nil {
 			return nil, err
 		}

@@ -179,9 +179,11 @@ type stubAPI struct {
 	usersShowErr   error
 	usersShowCalls int
 	// showErr, when non-zero, is the status admin/roles/show fails with.
-	showErr int
+	showErr    int
+	showActors []string
 	// usersErr, when non-zero, is the status admin/roles/users fails with.
-	usersErr int
+	usersErr    int
+	usersActors []string
 }
 
 func (a *stubAPI) Anonymous() plugin.Caller            { return &stubCaller{api: a} }
@@ -201,6 +203,7 @@ func (c *stubCaller) Call(_ context.Context, endpoint string, params any) (json.
 	m, _ := params.(map[string]any)
 	switch endpoint {
 	case "admin/roles/show":
+		c.api.showActors = append(c.api.showActors, c.actorID)
 		if c.api.showErr != 0 {
 			return nil, apiError(endpoint, c.api.showErr, "SHOW_FAILED")
 		}
@@ -243,6 +246,7 @@ func (c *stubCaller) Call(_ context.Context, endpoint string, params any) (json.
 				"canEditMembersByModerator": info.CanEditMembersByModerator},
 		})
 	case "admin/roles/users":
+		c.api.usersActors = append(c.api.usersActors, c.actorID)
 		if c.api.usersErr != 0 {
 			return nil, apiError(endpoint, c.api.usersErr, "NO_SUCH_ROLE")
 		}
