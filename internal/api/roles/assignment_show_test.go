@@ -79,7 +79,7 @@ func TestAssignmentShow_PublicRole(t *testing.T) {
 
 	rec := postAssignment(h, `{"roleId":"role"}`, "viewer")
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.JSONEq(t, `{"assigned":false,"expiresAt":null,"role":{"id":"role","target":"manual","isPublic":true,"canEditMembersByModerator":true}}`, rec.Body.String())
+	assert.JSONEq(t, `{"assigned":false,"assignmentId":null,"expiresAt":null,"role":{"id":"role","target":"manual","isPublic":true,"canEditMembersByModerator":true}}`, rec.Body.String())
 	assert.Equal(t, 1, assignments.findCalls)
 	assert.Equal(t, "viewer", assignments.userID)
 	assert.Equal(t, "role", assignments.roleID)
@@ -96,13 +96,13 @@ func TestAssignmentShow_PrivateActiveAssignment(t *testing.T) {
 	// private role では assigned=false が 400 NO_SUCH_ROLE に化けるので、
 	// 症状 (200 のはずが 400) からは時刻依存だと分かりにくい。
 	expires := time.Now().Add(time.Hour).UTC().Truncate(time.Millisecond)
-	assignments.Assignments["viewer:private"] = &model.RoleAssignment{UserID: "viewer", RoleID: "private", ExpiresAt: &expires}
+	assignments.Assignments["viewer:private"] = &model.RoleAssignment{ID: "assignment1", UserID: "viewer", RoleID: "private", ExpiresAt: &expires}
 
 	rec := postAssignment(h, `{"roleId":"private"}`, "viewer")
 	require.Equal(t, http.StatusOK, rec.Code)
 	// 期待値も同じ値から組み立てる。文字列を別に持つと二重管理になる。
 	want := fmt.Sprintf(
-		`{"assigned":true,"expiresAt":%q,"role":{"id":"private","target":"manual","isPublic":false,"canEditMembersByModerator":false}}`,
+		`{"assigned":true,"assignmentId":"assignment1","expiresAt":%q,"role":{"id":"private","target":"manual","isPublic":false,"canEditMembersByModerator":false}}`,
 		entity.ISOMillis(expires))
 	assert.JSONEq(t, want, rec.Body.String())
 }
@@ -182,7 +182,7 @@ func TestAssignmentShow_ConditionalRoleIsNeverAssigned(t *testing.T) {
 
 	rec := postAssignment(h, `{"roleId":"cond"}`, "viewer")
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.JSONEq(t, `{"assigned":false,"expiresAt":null,"role":{"id":"cond","target":"conditional","isPublic":true,"canEditMembersByModerator":false}}`, rec.Body.String())
+	assert.JSONEq(t, `{"assigned":false,"assignmentId":null,"expiresAt":null,"role":{"id":"cond","target":"conditional","isPublic":true,"canEditMembersByModerator":false}}`, rec.Body.String())
 	// condFormula の評価には全 role の走査が要る。exact lookup の O(1) 性を保つため
 	// 評価しないので、参照するのは FindActive 1 回だけ。
 	assert.Equal(t, 1, assignments.findCalls)

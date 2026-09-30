@@ -88,7 +88,7 @@ func TestRolesAssignmentShow_ExactLookup(t *testing.T) {
 
 	rec := doPost(h.RolesAssignmentShow, `{"roleId":"role","userId":"user"}`, &model.User{ID: "moderator"})
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.JSONEq(t, `{"assigned":false,"expiresAt":null,"role":{"id":"role","target":"manual","isPublic":true,"canEditMembersByModerator":true}}`, rec.Body.String())
+	assert.JSONEq(t, `{"assigned":false,"assignmentId":null,"expiresAt":null,"role":{"id":"role","target":"manual","isPublic":true,"canEditMembersByModerator":true}}`, rec.Body.String())
 	assert.Equal(t, 1, assignments.findCalls)
 	assert.Equal(t, "user", assignments.userID)
 	assert.Equal(t, "role", assignments.roleID)
@@ -105,7 +105,7 @@ func TestRolesAssignmentShow_LockedRoleReadableByModerator(t *testing.T) {
 
 	rec := doPost(h.RolesAssignmentShow, `{"roleId":"role","userId":"user"}`, &model.User{ID: "mod"})
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.JSONEq(t, `{"assigned":false,"expiresAt":null,"role":{"id":"role","target":"manual","isPublic":false,"canEditMembersByModerator":false}}`, rec.Body.String())
+	assert.JSONEq(t, `{"assigned":false,"assignmentId":null,"expiresAt":null,"role":{"id":"role","target":"manual","isPublic":false,"canEditMembersByModerator":false}}`, rec.Body.String())
 }
 
 func TestRolesAssignmentShow_RoleNotFound(t *testing.T) {
@@ -215,7 +215,7 @@ func TestRolesAssignmentShow_ConditionalRoleIsNeverAssigned(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	// self 側と違い private でも moderator には body を返すので、conditional の
 	// 制約だけが効く形になる。
-	assert.JSONEq(t, `{"assigned":false,"expiresAt":null,"role":{"id":"cond","target":"conditional","isPublic":false,"canEditMembersByModerator":false}}`, rec.Body.String())
+	assert.JSONEq(t, `{"assigned":false,"assignmentId":null,"expiresAt":null,"role":{"id":"cond","target":"conditional","isPublic":false,"canEditMembersByModerator":false}}`, rec.Body.String())
 	// condFormula の評価には全 role の走査が要る。評価しないので参照は FindActive 1 回。
 	assert.Equal(t, 1, assignments.findCalls)
 	assert.Zero(t, assignments.listCalls)

@@ -214,15 +214,33 @@ func (c *stubCaller) Call(_ context.Context, endpoint string, params any) (json.
 		roleID, _ := m["roleId"].(string)
 		userID, _ := m["userId"].(string)
 		assigned := false
+		assignmentID := ""
 		for _, a := range c.api.assignments[roleID] {
 			if a.UserID() == userID {
 				assigned = true
+				assignmentID = a.ID
 			}
 		}
 		return json.Marshal(map[string]any{
-			"assigned": assigned, "expiresAt": nil,
+			"assigned": assigned, "assignmentId": assignmentID, "expiresAt": nil,
 			"role": map[string]any{"id": roleID, "target": "manual", "isPublic": true,
 				"canEditMembersByModerator": c.api.roleInfoFor(roleID).CanEditMembersByModerator},
+		})
+	case "roles/assignment-show":
+		roleID, _ := m["roleId"].(string)
+		assigned := false
+		assignmentID := ""
+		for _, a := range c.api.assignments[roleID] {
+			if a.UserID() == c.actorID {
+				assigned = true
+				assignmentID = a.ID
+			}
+		}
+		info := c.api.roleInfoFor(roleID)
+		return json.Marshal(map[string]any{
+			"assigned": assigned, "assignmentId": assignmentID, "expiresAt": nil,
+			"role": map[string]any{"id": roleID, "target": "manual", "isPublic": info.IsPublic,
+				"canEditMembersByModerator": info.CanEditMembersByModerator},
 		})
 	case "admin/roles/users":
 		if c.api.usersErr != 0 {

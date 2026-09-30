@@ -2,6 +2,7 @@ package rolelevel
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"sort"
 	"strconv"
@@ -145,10 +146,11 @@ func fillPolicyRangeTail(ranges []PolicyRange, levelUps int64) []PolicyRange {
 
 // readNative returns the configured native adapter used by the read paths.
 //
-// **公開ルートでも configured actor を使う。** `/roles/users` と `/users/show` は認証を
-// 要求しないが、native の管理 endpoint を匿名で読むことはできない。actor が未設定、
-// または native API を構成できない場合は `s.native()` のエラーを返して **fail closed**
-// する。黙って 0 件を返すのは別物で、それは「0 人」と読まれる。
+// **member 一覧などの管理 read は configured actor を使う。** `/users/show` の
+// プロフィール表示だけは対象ユーザー自身の assignment endpoint を使うため、この
+// adapter を通らない。actor が未設定、または native API を構成できない場合は
+// `s.native()` のエラーを返して **fail closed** する。黙って 0 件を返すのは別物で、
+// それは「0 人」と読まれる。
 func (s *service) readNative() (*nativeRole, error) {
 	return s.native()
 }
@@ -232,6 +234,46 @@ func (s *service) experienceForRoleUser(ctx context.Context, native *nativeRole,
 	}
 }
 
+// profileExperienceForRoleUser resolves a user's own assignment through the
+// self-service endpoint. Public profile and profile settings must not depend on
+// the configured plugin actor being a moderator: the owner is always allowed to
+// inspect their own assignment, including a private role.
+func (s *service) profileExperienceForRoleUser(ctx context.Context, roleID, userID string) (assigned bool, public bool, experience int64, assignmentID string, err error) {
+	raw, err := s.api.AsUser(userID).Call(ctx, "roles/assignment-show", map[string]any{"roleId": roleID})
+	if err != nil {
+		return false, false, 0, "", (&nativeRole{}).apiFailure(ctx, "roles/assignment-show", err)
+	}
+	var res struct {
+		Assigned     *bool   `json:"assigned"`
+		AssignmentID *string `json:"assignmentId"`
+		Role         struct {
+			ID       string `json:"id"`
+			IsPublic bool   `json:"isPublic"`
+		} `json:"role"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil || res.Assigned == nil || res.Role.ID != roleID {
+		return false, false, 0, "", codedErrorf(http.StatusBadGateway, CodeNativeAPIFailed,
+			"roles/assignment-show の応答を読めません")
+	}
+	if !*res.Assigned {
+		return false, res.Role.IsPublic, 0, "", nil
+	}
+	if res.AssignmentID == nil || *res.AssignmentID == "" {
+		return false, false, 0, "", codedErrorf(http.StatusBadGateway, CodeNativeAPIFailed,
+			"roles/assignment-show が assignmentId を返しませんでした")
+	}
+	rows, err := s.store.ExperienceRowsForRoleUser(ctx, roleID, userID)
+	if err != nil {
+		return false, false, 0, "", s.storageError(ctx, "経験値の読み込み", err)
+	}
+	for _, row := range rows {
+		if row.AssignmentID == *res.AssignmentID {
+			return true, res.Role.IsPublic, row.Experience, row.AssignmentID, nil
+		}
+	}
+	return true, res.Role.IsPublic, 0, *res.AssignmentID, nil
+}
+
 // publicProfile returns the level of one user for every level-enabled role the user
 // is actually assigned to and allowed to see.
 //
@@ -261,32 +303,21 @@ func roleMembersAreVisible(ctx context.Context, native *nativeRole, roleID strin
 }
 
 func (s *service) publicProfile(ctx context.Context, userID string) (any, error) {
-	native, err := s.readNative()
-	if err != nil {
-		// actorId が無い / native が読めないときは level を返さない。**XP を空で
-		// 返さず operator に設定不備を知らせる** (Task 1 の警告と同じ方針)。
-		return nil, err
-	}
 	configs, err := s.store.ListConfigs(ctx)
 	if err != nil {
 		return nil, s.storageError(ctx, "level 設定の読み込み", err)
 	}
 	out := make([]map[string]any, 0, len(configs))
 	for _, cfg := range configs {
-		assigned, xp, _, err := s.experienceForRoleUser(ctx, native, cfg.RoleID, userID)
+		assigned, public, xp, _, err := s.profileExperienceForRoleUser(ctx, cfg.RoleID, userID)
 		if err != nil {
 			return nil, err
 		}
 		if !assigned {
 			continue
 		}
-		// **private な role の level / XP は公開しない。** member の
-		// experienceForRoleUser と同じ順で「割り当てている role だけ」を
-		// 判定してから返す。Show が読めなければ fail closed で落とす。
-		public, err := roleIsPublic(ctx, native, cfg.RoleID)
-		if err != nil {
-			return nil, err
-		}
+		// **private な role の level / XP は公開しない。** self-service の
+		// assignment 応答で membership と可視性を同時に確認する。
 		if !public {
 			continue
 		}
@@ -311,17 +342,13 @@ func (s *service) publicProfile(ctx context.Context, userID string) (any, error)
 }
 
 func (s *service) profileSettings(ctx context.Context, userID string) (any, error) {
-	native, err := s.readNative()
-	if err != nil {
-		return nil, err
-	}
 	configs, err := s.store.ListConfigs(ctx)
 	if err != nil {
 		return nil, s.storageError(ctx, "level 設定の読み込み", err)
 	}
 	out := make([]map[string]any, 0, len(configs))
 	for _, cfg := range configs {
-		assigned, xp, _, err := s.experienceForRoleUser(ctx, native, cfg.RoleID, userID)
+		assigned, _, xp, _, err := s.profileExperienceForRoleUser(ctx, cfg.RoleID, userID)
 		if err != nil {
 			return nil, err
 		}

@@ -966,11 +966,7 @@ func routes(pctx plugin.Context, router plugin.Router) error {
 		} else if !found {
 			return nil, codedErrorf(http.StatusNotFound, CodeConfigNotFound, "その role には level 設定がありません")
 		}
-		native, err := svc.readNative()
-		if err != nil {
-			return nil, err
-		}
-		assigned, err := native.Assigned(req.Context(), body.RoleID, req.UserID())
+		assigned, _, _, _, err := svc.profileExperienceForRoleUser(req.Context(), body.RoleID, req.UserID())
 		if err != nil {
 			return nil, err
 		}

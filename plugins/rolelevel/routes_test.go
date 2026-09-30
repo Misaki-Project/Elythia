@@ -42,31 +42,22 @@ func routeHarness(t *testing.T, api plugin.API) plugintest.Handlers {
 	return newHarness(t, testDBRequired(t), api).WithConfig(map[string]any{"actorId": "admin1"}).Routes(Plugin)
 }
 
-// actorlessRouteHarness verifies that public native reads do not silently
-// downgrade to the anonymous caller when the privileged plugin actor is absent.
+// actorlessRouteHarness verifies that privileged native reads do not silently
+// downgrade to the anonymous caller when the configured plugin actor is absent.
 func actorlessRouteHarness(t *testing.T, api plugin.API) plugintest.Handlers {
 	t.Helper()
 	return newHarness(t, testDBRequired(t), api).WithConfig(map[string]any{}).Routes(Plugin)
 }
 
-func TestPublicRoutesRequireConfiguredActor(t *testing.T) {
+func TestPublicMemberRouteRequiresConfiguredActor(t *testing.T) {
 	h := actorlessRouteHarness(t, levelRoleAPI())
-	for _, tc := range []struct {
-		name, route, body string
-	}{
-		{"profile", "POST /users/show", `{"userId":"u1"}`},
-		{"members", "POST /roles/users", `{"roleId":"r1"}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := h.Call(t, tc.route, plugintest.Request{Body: tc.body})
-			if err == nil {
-				t.Fatal("public route used an anonymous native caller")
-			}
-			se, code := extractCode(err)
-			if code != CodeActorNotConfigured || se == nil || se.Status != http.StatusForbidden {
-				t.Fatalf("status/code = %v/%q, want 403/%s (%v)", statusOf(se), code, CodeActorNotConfigured, err)
-			}
-		})
+	_, err := h.Call(t, "POST /roles/users", plugintest.Request{Body: `{"roleId":"r1"}`})
+	if err == nil {
+		t.Fatal("public member route used an anonymous native caller")
+	}
+	se, code := extractCode(err)
+	if code != CodeActorNotConfigured || se == nil || se.Status != http.StatusForbidden {
+		t.Fatalf("status/code = %v/%q, want 403/%s (%v)", statusOf(se), code, CodeActorNotConfigured, err)
 	}
 }
 

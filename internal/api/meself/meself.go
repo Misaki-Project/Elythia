@@ -92,8 +92,13 @@ func PackMe(ctx context.Context, d entity.UserDetailed, u *model.User, profile *
 	if _, ok := resp["policies"]; !ok {
 		resp["policies"] = role.DefaultPolicies()
 	}
+	// roles は各呼び出し元が公開範囲やプロフィール非表示設定を適用済み。
+	// /api/i 用の Enricher が全割当ロールを持っていても、self 昇格によって公開用の
+	// 絞り込みを戻してはいけない。設定画面は users/show ではなく /api/i を使う。
+	visibleRoles := resp["roles"]
 	if e := currentEnricher(); e != nil {
 		e.EnrichSelf(ctx, u, profile, resp)
 	}
+	resp["roles"] = visibleRoles
 	return resp
 }
