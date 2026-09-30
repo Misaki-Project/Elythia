@@ -441,10 +441,10 @@ var apiCompatOnlyRe = regexp.MustCompile(`^- mk-go only \(TS spec 外\): \*\*(\d
 // `| fork frontend の独自変更 | 23 tag (`-mk.0` ～ `-mk.22`) | — | — |`.
 // **範囲は base 込みで書く。** submodule を bump すると `-mk.N` は 0 に戻るので、
 // `-mk.0 ～ -mk.1` のような表記だと base をまたいだ範囲が読めない (#2879)。
-var forkTagSummaryRe = regexp.MustCompile("^\\| fork frontend の独自変更 \\| (\\d+) tag \\(`([0-9.]+-mk\\.\\d+[a-z]*)` ～ `([0-9.]+-mk\\.\\d+[a-z]*)`\\)")
+var forkTagSummaryRe = regexp.MustCompile("^\\| fork frontend の独自変更 \\| (\\d+) tag \\(`([0-9.]+-mk\\.(?:\\d+[a-z]*|[a-z][a-z0-9-]*\\.\\d+))` ～ `([0-9.]+-mk\\.(?:\\d+[a-z]*|[a-z][a-z0-9-]*\\.\\d+))`\\)")
 
 // forkTagRowRe matches a §4-2 table row `| `2026.7.0-mk.12` | ... |`.
-var forkTagRowRe = regexp.MustCompile("^\\| `([0-9.]+)-mk\\.(\\d+[a-z]*)` \\|")
+var forkTagRowRe = regexp.MustCompile("^\\| `([0-9.]+)-mk\\.((?:\\d+[a-z]*|[a-z][a-z0-9-]*\\.\\d+))` \\|")
 
 // TestDivergenceDoc_EndpointCountMatchesAPICompat ties §1-1 to the generated
 // matrix. TestDivergenceDoc_EndpointCountMatchesTable only checks that the
@@ -606,7 +606,26 @@ func compareForkBase(a, b string) int {
 func assertForkTagSequence(t *testing.T, tags []string) {
 	t.Helper()
 	prevNum, prevLetter := -1, ""
+	namedNamespace, namedNum := "", 0
 	for _, tag := range tags {
+		if namespace, rawNum, ok := strings.Cut(tag, "."); ok {
+			num := atoi(t, rawNum)
+			switch {
+			case namedNamespace == "" && num == 1:
+				// 数字系列から名前付き系列への切り替え。
+			case namespace == namedNamespace && num == namedNum+1:
+				// 同じ名前付き系列の次版。
+			default:
+				t.Errorf("docs/divergence.md §4-2 の名前付き tag -mk.%s が順に並んでいない", tag)
+				return
+			}
+			namedNamespace, namedNum = namespace, num
+			continue
+		}
+		if namedNamespace != "" {
+			t.Errorf("docs/divergence.md §4-2 で名前付き tag -mk.%s の後に数字 tag -mk.%s がある", namedNamespace, tag)
+			return
+		}
 		num, letter := splitForkTag(t, tag)
 		switch {
 		case num == prevNum+1 && letter == "":

@@ -134,7 +134,7 @@ func TestMigrations_UpDownUpRoundTrip(t *testing.T) {
 
 	// **戻しきれたかを schema の中身で直接見る。**
 	//
-	// 「2 回目の up が通るか」だけでは弱すぎる — up の 97 本中 96 本は
+	// 「2 回目の up が通るか」だけでは弱すぎる — up の 98 本中 97 本は
 	// `IF NOT EXISTS` / `EXCEPTION WHEN duplicate_object` で守られているので、
 	// **down が取りこぼしても再適用が通ってしまう**。実測 (down を 1 本ずつ空に
 	// する ablation) でも、2 回目の up で検出できたのは非冪等な `ADD CONSTRAINT`

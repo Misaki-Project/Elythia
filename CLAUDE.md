@@ -1053,9 +1053,9 @@ PR では回らないので、失敗は Actions 上で確認して別 PR で対�
   `*.up.sql` しか glob しないので **down を 1 本も実行しない**。加えて up 側も `db.Exec` の
   エラーを握り潰す (`continue`) ので壊れた SQL でも緑になる。本番の `cmd/migrate` と同じ
   golang-migrate + pgx5 driver に流す。
-  **down は書いた時点でしか実行されない。** 97 本あって、後から up 側だけ直して対応が
+  **down は書いた時点でしか実行されない。** 98 本あって、後から up 側だけ直して対応が
   崩れても誰も気付けない。壊れているのは**戻したくなった当日**に分かる。
-  **「2 回目の up が通るか」だけでは弱い。** up の 97 本中 96 本は `IF NOT EXISTS` /
+  **「2 回目の up が通るか」だけでは弱い。** up の 98 本中 97 本は `IF NOT EXISTS` /
   `EXCEPTION WHEN duplicate_object` で守られているので、**down が取りこぼしても再適用が
   通ってしまう**。実測 (down を 1 本ずつ空にする ablation) で 2 回目の up が検出できたのは
   非冪等な `ADD CONSTRAINT` を持つ `000001` だけで、サンプルした他 19 本は緑だった。
