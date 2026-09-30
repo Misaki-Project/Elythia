@@ -460,6 +460,8 @@ type auditResponse struct {
 	AssignmentID     *string   `json:"assignmentId"`
 	BeforeExperience *int64    `json:"beforeExperience"`
 	AfterExperience  *int64    `json:"afterExperience"`
+	Before           any       `json:"before,omitempty"`
+	After            any       `json:"after,omitempty"`
 	Note             *string   `json:"note"`
 	CreatedAt        time.Time `json:"createdAt"`
 }
@@ -468,6 +470,12 @@ func auditResponses(entries []auditEntry) []auditResponse {
 	out := make([]auditResponse, 0, len(entries))
 	for _, entry := range entries {
 		r := auditResponse{ID: strconv.FormatInt(entry.ID, 10), ActorID: entry.ActorID, Operation: entry.Operation, CreatedAt: entry.CreatedAt}
+		if entry.Before != nil {
+			r.Before = entry.Before
+		}
+		if entry.After != nil {
+			r.After = entry.After
+		}
 		if entry.RoleID != "" {
 			v := entry.RoleID
 			r.RoleID = &v

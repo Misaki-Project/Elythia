@@ -38,7 +38,7 @@ mk-go は drop-in 互換 (同じ DB / Redis / frontend を Misskey TS と共有�
 | DB カラム | 22 (+ 未使用の残存列 3) | 3 | 0 |
 | ActivityPub | Ed25519 / RemoteStatsFetcher ほか | reversi 連合 / chat 連合 | — |
 | config キー | 20 前後 | 0 | — |
-| fork frontend の独自変更 | 123 tag (`2026.7.0-mk.0` ～ `2026.9.1-mk.5`) | — | — |
+| fork frontend の独自変更 | 126 tag (`2026.7.0-mk.0` ～ `2026.9.1-mk.8`) | — | — |
 
 **upstream endpoint の未実装はゼロ** (coverage 100.0%、444/444)。DB schema も upstream の全テーブル・全共有カラムを superset で保持しており、逆方向の欠落は無い。
 
@@ -461,7 +461,7 @@ submodule bump の PR で人が見る。
 
 **還元できるものを一時的に置く場合は、その行に必ず明記する。** 純正にも同じ不具合があるものをここへ置くと、この表を「還元不能な差分の一覧」として読む運用 (upstream 追従時に残す / 落とすを判断する材料) が壊れる。純正へ取り込まれた時点で revert する対象なので、行を読んだだけでそれが分かる必要がある。現時点の該当は `2026.7.0-mk.22h` / `2026.7.0-mk.22i` / `2026.7.0-mk.22j` / `2026.9.0-mk.1` / `2026.9.0-mk.2` / `2026.9.0-mk.2a` / `2026.9.0-mk.8e` / `2026.9.0-mk.8f` / `2026.9.0-mk.15` / `2026.9.0-mk.15a` / `2026.9.0-mk.15b` / `2026.9.0-mk.15c` / `2026.9.0-mk.16` / `2026.9.0-mk.16a` / `2026.9.0-mk.16b` の 15 行 (**base を省略しない** — bump で `-mk.N` は 0 に戻るので省略形は曖昧になる)。
 
-**現在の pin は `2026.9.1-mk.5` (`99ac80ce6e`)。** `2026.9.0-mk.*` の行はすべて 2026.9.1 への
+**現在の pin は `2026.9.1-mk.8` (`1c347bce92`)。** `2026.9.0-mk.*` の行はすべて 2026.9.1 への
 載せ替え (`git rebase --onto 2026.9.1 2026.9.0`、custom commit 151 個) で `2026.9.1-mk.0` に
 入っている。**載せ替えの衝突は 0 件** — upstream と fork の両方が触ったファイルは
 `locales/en-US.yml` / `pages/flash/flash.vue` / `utility/get-user-menu.ts` の 3 つだが、
@@ -603,6 +603,9 @@ upstream が `jobState` の型を autogen (`AdminQueueJobsRequest['state'][numbe
 | `2026.9.1-mk.3` | `canPurgeAccount` のロールポリシー編集UIと、role-level pluginの管理・表示UI。後者は管理ロールの専用カテゴリ、経験値曲線と段階別policyの編集、プロフィールと管理ユーザーのlevel表示、経験値変更、探索表示、プロフィール上のlevel role表示切替を追加した。plugin endpointはmisskey-jsのupstream endpoint map外なので専用adapterへ集約する。あわせて旧`manualLevel`をカテゴリ・探索・編集対象として認識し、保存時にnative manual role + plugin設定へ移す導線を持つ。**純正へは還元できない行** (`canPurgeAccount`とrole-level pluginはいずれもmk-go固有)。 |
 | `2026.9.1-mk.4` | role-level専用adapterの認証をbodyの`i`から`Authorization: Bearer`へ変更した。標準`misskeyApi`はbodyへ`i`を追加するが、plugin APIは未知fieldを拒否するstrict JSON契約のため、ログイン時だけ全plugin呼び出しが400になっていた。専用adapterはリクエスト中表示とerror shapeを維持しつつ、契約bodyへ認証情報を混ぜない。**純正へは還元できない行** (role-level pluginはmk-go固有)。 |
 | `2026.9.1-mk.5` | プロフィールのrole-level取得をtop-level awaitから即時watchへ変更した。plugin APIの完了をcomponent mountの前提にせず、プロフィール本体と既存テストを停止させない。ユーザー切替時にも同じwatchで再取得する。**純正へは還元できない行** (role-level pluginはmk-go固有)。 |
+| `2026.9.1-mk.6` | role-level UIのRound 1修正。段階別policyを独立したkey入力一覧から各native policyの配下へ移し、管理ユーザー画面ではXPの固定・加算・乗算を常時見える操作にした。プロフィールのrole tooltipはCherryPick同様の1.5倍level、進捗/MAX表記、ゲージ、MFM概要を持つ専用UIへ変更。設定画面の表示切替はicon +「表示する/非表示にする」tooltipにし、moderation logは同時刻・同actorのplugin監査snapshotも併記する。**純正へは還元できない行** (role-level pluginはmk-go固有)。 |
+| `2026.9.1-mk.7` | 非表示roleをクライアントがplugin応答のIDで後から消す暫定処理を廃止し、native `users/show`が既にfilter済みの`roles`/`badgeRoles`をそのまま描画するようにした。非表示IDを公開plugin応答へ載せず、初期描画からrole所属を露出しない。**純正へは還元できない行** (role-level pluginはmk-go固有)。 |
+| `2026.9.1-mk.8` | 管理ユーザー画面のXP操作に減算を独立して追加した。固定・加算・減算・乗算を常時表示し、減算の正数入力はplugin APIへ負の`add`として送る。**純正へは還元できない行** (role-level pluginはmk-go固有)。 |
 
 `2026.7.0-mk.1` の内訳:
 

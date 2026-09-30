@@ -746,11 +746,16 @@ func TestAdminAuditRoute(t *testing.T) {
 		Entries []struct {
 			Operation string `json:"operation"`
 			UserID    string `json:"userId"`
+			Before    any    `json:"before"`
+			After     any    `json:"after"`
 		} `json:"entries"`
 	}
 	decode(t, res, &got)
 	if len(got.Entries) != 1 || got.Entries[0].Operation != "change-exp" || got.Entries[0].UserID != "u1" {
 		t.Fatalf("= %+v", got.Entries)
+	}
+	if got.Entries[0].Before == nil || got.Entries[0].After == nil {
+		t.Fatalf("audit snapshots are missing: %+v", got.Entries[0])
 	}
 }
 

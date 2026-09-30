@@ -1822,6 +1822,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	usersHandler.SetMetaRepo(metaRepo)
 	usersHandler.SetLocalHost(localHost)
 	usersHandler.SetChartHook(chartHooks)
+	if roleLevelPluginEnabled(plugins, s.config.Plugins) {
+		usersHandler.SetProfileRoleVisibilityReader(roleLevelProfileVisibilityReader{db: s.db})
+	}
 	// users/notes (withChannelNotes) の post-fetch filter でチャンネルミュートを効かせる。
 	usersHandler.SetChannelMutingRepo(channelMutingRepo)
 	// #2106 S3: 匿名 visitor への remote profile 露出を ugcVisibilityForVisitor で gate。
