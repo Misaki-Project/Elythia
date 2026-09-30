@@ -1,0 +1,8 @@
+name: role-level
+apiVersion: 1
+# **既定で有効。** Misaki の bundled image では設定なしで level 機能が入る。
+#
+# 同梱の status / trustlevel が `disabled: true` なのは「サンプル」だからで、
+# こちらは実運用に必要な機能なので外す。判定を緩めるのではなく、build job の
+# `Check bundled plugins are disabled by default` と `make plugin-vet` に
+# **意図的に既定有効のプラグインの allowlist** を入れてある (#12)。

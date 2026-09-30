@@ -165,13 +165,15 @@ disabled: true
 
 ### 同梱プラグインの既定
 
-同梱しているのは`plugins/status/`と`plugins/trustlevel/`の2つ。
+同梱しているのは`plugins/status/`と`plugins/trustlevel/`と`plugins/rolelevel/`の3つ。
 
-**どちらもこの仕組みで既定無効**。動かしたい場合は該当する`mk-plugin.yml`から`disabled: true`の行を消して再ビルドする。
+**statusとtrustlevelはこの仕組みで既定無効**。動かしたい場合は該当する`mk-plugin.yml`から`disabled: true`の行を消して再ビルドする。
 
-既定無効なのは、同梱プラグインが**ビルドに含まれているだけで有効になる**ため。`plugin_wiring.go`はRoutes/Jobsの登録より先に専用schemaを開いてmigrationを適用するので、設定していなくても`plugin_<name>` schemaとテーブルができる。schemaを開けない環境では起動そのものが失敗する。cloneしただけで全運営者のバイナリ・フロント・DBに入る状態にしない。
+**rolelevelだけは既定有効**（#12）。Misakiのbundled imageでlevel機能がそのまま入ることが目的なので、`mk-plugin.yml`には`disabled: true`を書いていない。止めたいときは設定ファイルで`plugins.role-level.enabled: false`にする（前節の「実行時に止める」どおり、**再ビルドは要らない**）。
 
-**この既定は`build` jobの`Check bundled plugins are disabled by default`が見ている**（#2701）。検証のために一時的に外して戻し忘れるのを止めるため。手元で動かすだけなら`make plugin-dev PLUGIN=plugins/<name>`を使うと`mk-plugin.yml`を触らずに済む（ビルド生成物である`server-plugins.generated.ts`はsubmodule側でtrackedなので書き換わる）。
+既定無効なのは、同梱プラグインが**ビルドに含まれているだけで有効になる**ため。`plugin_wiring.go`はRoutes/Jobsの登録より先に専用schemaを開いてmigrationを適用するので、設定していなくても`plugin_<name>` schemaとテーブルができる。schemaを開けない環境では起動そのものが失敗する。cloneしただけで全運営者のバイナリ・フロント・DBに入る状態にしない。**rolelevelも設定が無くても`plugin_role_level` schemaとmigration 1〜4のテーブルはできる**ので、既定有効にしたので起動時に何かが落ちるわけではない。止めても**schemaは自動で消えない**（後述の「消したあとのデータ」）。
+
+**この既定は`build` jobの`Check bundled plugins are disabled by default`と`make plugin-vet`が見ている**（#2701）。検証のために一時的に外して戻し忘れるのを止めるため。**ただしallowlistに載せたプラグインは判定から外れる** — allowlistは`Makefile`の`BUNDLED_PLUGINS_ENABLED_BY_DEFAULT`とCI stepの`enabled_by_default`の2箇所に同じ一覧を書くもので、`rolelevel`がその唯一の例外として載っている。検査を緩めたのではなく「意図的に既定有効」の宣言であって、判定の基準自体は緩めておらず行ベースの完全一致のまま。**片方だけ直すと手元とCIで結果が変わる**ので、必ず両方触る。手元で動かすだけなら`make plugin-dev PLUGIN=plugins/<name>`を使うと`mk-plugin.yml`を触らずに済む（ビルド生成物である`server-plugins.generated.ts`はsubmodule側でtrackedなので書き換わる）。
 
 ## 入っているものを確認する
 

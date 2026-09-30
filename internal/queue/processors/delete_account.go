@@ -108,7 +108,9 @@ func (p *DeleteAccountProcessor) Handle(ctx context.Context, t driver.Task) erro
 	// profile / keypair / 残りの従属行も消えるため、論理削除フラグだけ立った「凍結状態の
 	// tombstone」が残らずアカウントが完全に消える。remote user (Soft=true) は再連合での
 	// 復活を防ぐため行を残す (upstream DeleteAccountProcessorService の soft 分岐と同じ)。
-	if !payload.Soft && p.userRepo != nil {
+	// canPurgeAccount=false の enqueue (PreserveAccount=true) も Soft=true と同じく
+	// user 行を残す。cleanup (note / drive / following) は payload の値に関わらず常に回る。
+	if !payload.Soft && !payload.PreserveAccount && p.userRepo != nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

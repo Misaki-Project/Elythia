@@ -4036,15 +4036,15 @@ func TestAccountsCreate_AppTokenDenied(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "app/OAuth token must be denied even for root")
 }
 
-// upstream admin/show-user (show-user.ts:233-261) が返す key 集合と完全に
-// 一致することを固定する (#2287)。旧実装は PackUserDetailed をベースに
+// upstream admin/show-user (show-user.ts:233-261) の key 集合に、削除済みと
+// 凍結済みを区別するための mk-go 固有 isDeleted だけを加える。旧実装は PackUserDetailed をベースに
 // UserLite / UserDetailed / MeDetailed を丸ごと返しており、upstream に無い
 // id をはじめ 40 以上の余剰 field を含んでいた。
 func TestShowUser_ResponseKeysMatchUpstream(t *testing.T) {
 	want := []string{
 		"alwaysMarkNsfw", "autoAcceptFollowed", "autoSensitive", "carefulBot",
 		"email", "emailVerified", "followedMessage", "injectFeaturedNote",
-		"isHibernated", "isModerator", "isSilenced", "isSuspended",
+		"isDeleted", "isHibernated", "isModerator", "isSilenced", "isSuspended",
 		"lastActiveDate", "moderationNote", "mutedInstances", "mutedWords",
 		"noCrawle", "notificationRecieveConfig", "policies", "preventAiLearning",
 		"receiveAnnouncementEmail", "roleAssigns", "roles", "signins",
@@ -4065,7 +4065,20 @@ func TestShowUser_ResponseKeysMatchUpstream(t *testing.T) {
 	}
 	sort.Strings(gotKeys)
 	sort.Strings(want)
-	assert.Equal(t, want, gotKeys, "upstream に無い field を返してはいけない")
+	assert.Equal(t, want, gotKeys, "許可した isDeleted 以外の余剰 field を返してはいけない")
+}
+
+func TestShowUser_ReturnsDeletedState(t *testing.T) {
+	h, userRepo, _, _ := newTestHandler(t)
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "target", IsDeleted: true, IsSuspended: true}
+
+	rec := doPost(h.ShowUser, `{"userId":"u1"}`, &model.User{ID: "admin1"})
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, true, got["isDeleted"])
+	assert.Equal(t, true, got["isSuspended"])
 }
 
 // #2313: 分割アップロード設定の範囲検証。chunkSize は S3 の最小パートサイズと

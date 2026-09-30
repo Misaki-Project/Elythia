@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -805,6 +806,31 @@ type pluginRequest struct {
 
 func (r *pluginRequest) Context() context.Context { return r.c.Request().Context() }
 func (r *pluginRequest) Bind(v any) error         { return json.NewDecoder(r.c.Request().Body).Decode(v) }
+
+// BindStrict decodes exactly one JSON value from the request body.
+//
+// **空 body は成功にしない。** 「JSON 値を 1 つ要求する」ルートで値が無いのは
+// 失敗であって、既定値を通す取引ではない — 必須項目を落としたリクエストが 200
+// になってしまう。未知のフィールド / 2 つ目の値 / 壊れた JSON と同じくエラー
+// にして、プラグインが 400 に写せるようにする (plugintest も同じ形)。
+func (r *pluginRequest) BindStrict(v any) error {
+	dec := json.NewDecoder(r.c.Request().Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		if err == io.EOF {
+			return errors.New("リクエストボディが空です")
+		}
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
 func (r *pluginRequest) Param(name string) string { return r.c.Param(name) }
 func (r *pluginRequest) Query(name string) string { return r.c.QueryParam(name) }
 

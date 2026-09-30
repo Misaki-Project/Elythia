@@ -3,6 +3,7 @@ package users
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/labstack/echo/v4"
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
+	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/entitycompat/shapetest"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -22,6 +24,53 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
 )
+
+type stubProfileRoleVisibility struct {
+	hidden map[string]struct{}
+	err    error
+}
+
+func (s stubProfileRoleVisibility) HiddenProfileRoleIDs(context.Context, string) (map[string]struct{}, error) {
+	return s.hidden, s.err
+}
+
+func TestApplyProfileRoleVisibilityRemovesRoleAndBadge(t *testing.T) {
+	badges := []any{
+		map[string]any{"name": "Hidden"},
+		map[string]any{"name": "Visible"},
+	}
+	detailed := entity.UserDetailed{
+		UserLite: entity.UserLite{BadgeRoles: &badges},
+		Roles: []any{
+			map[string]any{"id": "hidden", "name": "Hidden"},
+			map[string]any{"id": "visible", "name": "Visible"},
+		},
+	}
+	h := &Handler{profileRoleVisibility: stubProfileRoleVisibility{hidden: map[string]struct{}{"hidden": {}}}}
+
+	h.applyProfileRoleVisibility(context.Background(), "u1", &detailed)
+
+	require.Len(t, detailed.Roles, 1)
+	assert.Equal(t, "visible", detailed.Roles[0].(map[string]any)["id"])
+	require.NotNil(t, detailed.BadgeRoles)
+	require.Len(t, *detailed.BadgeRoles, 1)
+	assert.Equal(t, "Visible", (*detailed.BadgeRoles)[0].(map[string]any)["name"])
+}
+
+func TestApplyProfileRoleVisibilityFailsClosed(t *testing.T) {
+	badges := []any{map[string]any{"name": "Role"}}
+	detailed := entity.UserDetailed{
+		UserLite: entity.UserLite{BadgeRoles: &badges},
+		Roles:    []any{map[string]any{"id": "role", "name": "Role"}},
+	}
+	h := &Handler{profileRoleVisibility: stubProfileRoleVisibility{err: errors.New("storage unavailable")}}
+
+	h.applyProfileRoleVisibility(context.Background(), "u1", &detailed)
+
+	assert.Empty(t, detailed.Roles)
+	require.NotNil(t, detailed.BadgeRoles)
+	assert.Empty(t, *detailed.BadgeRoles)
+}
 
 func newTestHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	t.Helper()
@@ -41,6 +90,35 @@ func newTestHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	h.SetFollowingRepo(fRepo)
 	h.SetFollowRequestRepo(frRepo)
 	return h, userRepo
+}
+
+func TestResolveUserIDByURI_FallsBackToLocalUserIDAfterOriginMove(t *testing.T) {
+	h, users := newTestHandler(t)
+	h.SetUserRepo(users)
+	users.Users["target"] = &model.User{ID: "target", Username: "new_account", Host: nil}
+
+	id, ok := h.resolveLocalMoveTarget("https://old.example/users/target")
+	require.True(t, ok)
+	assert.Equal(t, "target", id)
+}
+
+func TestResolveUserIDByURI_DoesNotTreatRemoteIDPathAsLocal(t *testing.T) {
+	h, users := newTestHandler(t)
+	h.SetUserRepo(users)
+	host := "remote.example"
+	users.Users["target"] = &model.User{ID: "target", Username: "remote", Host: &host}
+
+	_, ok := h.resolveLocalMoveTarget("https://other.example/users/target")
+	assert.False(t, ok)
+}
+
+func TestResolveUserIDByURI_StrictResolverDoesNotUsePathFallback(t *testing.T) {
+	h, users := newTestHandler(t)
+	h.SetUserRepo(users)
+	users.Users["target"] = &model.User{ID: "target", Username: "local", Host: nil}
+
+	_, ok := h.resolveUserIDByURI("https://unrelated.example/users/target")
+	assert.False(t, ok)
 }
 
 func addTestUser(repo *testutil.MockUserRepository) *model.User {

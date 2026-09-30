@@ -2323,8 +2323,9 @@ func (h *Handler) Unpin(c echo.Context) error {
 }
 
 // EnrichSelf implements meself.Enricher. 他 handler が self を MeDetailed へ
-// 昇格させたとき、entity 層では出せない field (未読 / role policies / roles /
-// pinned) をここで埋める。/api/i と同じ source を使うので値も一致する。
+// 昇格させたとき、entity 層では出せない field (未読 / role policies / pinned)
+// をここで埋める。roles は呼び出し元が公開範囲やプロフィール非表示設定を適用済み
+// なので上書きしない。全割当ロールは /api/i の設定画面向け応答だけで返す。
 //
 // includeSecrets 相当 (email / emailVerified / securityKeysList) は入れない。
 // upstream も users/show や hashtags/users では includeSecrets を渡さない。
@@ -2334,11 +2335,10 @@ func (h *Handler) EnrichSelf(ctx context.Context, u *model.User, profile *model.
 	}
 	h.fillUnreadFields(ctx, u, resp)
 	h.fillPinnedFields(ctx, u, profile, resp)
-	isAdmin, isMod, policies, roles := h.rolePayload(u.ID)
+	isAdmin, isMod, policies, _ := h.rolePayload(u.ID)
 	resp["isAdmin"] = isAdmin
 	resp["isModerator"] = isMod
 	resp["policies"] = policies
-	resp["roles"] = roles
 	resp["isSilenced"] = h.isSilenced(u.ID)
 }
 

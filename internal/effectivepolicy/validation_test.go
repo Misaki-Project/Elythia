@@ -34,6 +34,7 @@ func TestValidateContributions(t *testing.T) {
 	tests := []struct {
 		name          string
 		keys          []string
+		roles         []string
 		contributions []plugin.EffectivePolicyContribution
 		valid         bool
 	}{
@@ -62,10 +63,39 @@ func TestValidateContributions(t *testing.T) {
 		{name: "float overflow", keys: []string{"mentionLimit"}, contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: maxIntFloat}}},
 		{name: "wrong number type", keys: []string{"mentionLimit"}, contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: "1"}}},
 		{name: "use default", keys: []string{"canSearchNotes"}, contributions: []plugin.EffectivePolicyContribution{{Key: "canSearchNotes", UseDefault: true, Value: "ignored"}}, valid: true},
+		// --- 置換 ---
+		{name: "valid replacement", keys: []string{"mentionLimit"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"}}, valid: true},
+		{name: "replacement of a role that is not active", keys: []string{"mentionLimit"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r2"}}},
+		{name: "replacement with no active roles at all", keys: []string{"mentionLimit"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"}}},
+		{name: "replacement choosing a priority", keys: []string{"mentionLimit"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: 40, Priority: 1, ReplaceRoleID: "r1"}}},
+		{name: "replacement choosing an order", keys: []string{"mentionLimit"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: 40, Order: 3, ReplaceRoleID: "r1"}}},
+		{name: "replacement of an undeclared key", keys: []string{"canSearchNotes"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "canSearchUsers", Value: 40, ReplaceRoleID: "r1"}}},
+		{name: "replacement of an unknown native key", keys: []string{"unknown"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "unknown", Value: 40, ReplaceRoleID: "r1"}}},
+		{name: "replacement with a wrong value type", keys: []string{"mentionLimit"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{{Key: "mentionLimit", Value: "40", ReplaceRoleID: "r1"}}},
+		// **同じ key でも role が違えば別 tie。** 複数 role を同時に置換する plugin を
+		// 「重複」で弾かない。
+		{name: "two roles replaced for the same key", keys: []string{"mentionLimit"}, roles: []string{"r1", "r2"},
+			contributions: []plugin.EffectivePolicyContribution{
+				{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"},
+				{Key: "mentionLimit", Value: 50, ReplaceRoleID: "r2"},
+			}, valid: true},
+		{name: "same role replaced twice", keys: []string{"mentionLimit"}, roles: []string{"r1"},
+			contributions: []plugin.EffectivePolicyContribution{
+				{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"},
+				{Key: "mentionLimit", Value: 50, ReplaceRoleID: "r1"},
+			}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.valid, ValidateContributions(tc.keys, tc.contributions))
+			assert.Equal(t, tc.valid, ValidateContributions(tc.keys, tc.roles, tc.contributions))
 		})
 	}
 }
@@ -126,6 +156,60 @@ func TestCanDeleteAccountPolicyContract(t *testing.T) {
 	}))
 	require.True(t, ValidateContributions(
 		[]string{"canDeleteAccount"},
+		nil,
 		[]plugin.EffectivePolicyContribution{{Key: "canDeleteAccount", Value: false}},
 	))
+}
+
+// **canPurgeAccount の既定は true。** 未設定のインスタンスは今まで通り hard delete の
+// ままで、role で false に振った時だけ user row と profile が残る。
+// 契約: true => PreserveAccount false => 消す / false => PreserveAccount true => 残す。
+func TestCanPurgeAccountPolicyContract(t *testing.T) {
+	defaults := Defaults()
+	v, ok := defaults["canPurgeAccount"]
+	require.True(t, ok, "canPurgeAccount が既定に無い")
+	require.IsType(t, true, v, "canPurgeAccount の既定は bool でなければならない")
+	require.Equal(t, true, v, "既定 true であること。false だと未設定で hard delete でなくなる")
+
+	require.True(t, ValidatePolicyValue("canPurgeAccount", true))
+	require.True(t, ValidatePolicyValue("canPurgeAccount", false))
+	// 文字列や数値は通らない。通ると true/false どちらの意図か読めない値が入る。
+	require.False(t, ValidatePolicyValue("canPurgeAccount", "false"))
+	require.False(t, ValidatePolicyValue("canPurgeAccount", 0))
+
+	resolver := func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+		return []plugin.EffectivePolicyContribution{{Key: "canPurgeAccount", Value: false}}, nil
+	}
+	require.NoError(t, ValidateRegistration(plugin.EffectivePolicyRegistration{
+		Keys:    []string{"canPurgeAccount"},
+		Resolve: resolver,
+	}))
+	require.True(t, ValidateContributions(
+		[]string{"canPurgeAccount"},
+		nil,
+		[]plugin.EffectivePolicyContribution{{Key: "canPurgeAccount", Value: false}},
+	))
+	// 宣言していない key の貢献は通らない (登録の gate を抜けない)。
+	require.False(t, ValidateContributions(
+		[]string{"canDeleteAccount"},
+		nil,
+		[]plugin.EffectivePolicyContribution{{Key: "canPurgeAccount", Value: false}},
+	))
+}
+
+// **置換は (Key, ReplaceRoleID) で一意。** (Key, Order) だけで判定すると、同じ key の
+// 2 つの role を同時に置換する plugin が「重複」で弾かれる。置換の Order は 0 しか
+// 選べないので、role ID を含めないと同時置換ができない。
+func TestValidateContributionsReplacementTieUsesRoleID(t *testing.T) {
+	two := []plugin.EffectivePolicyContribution{
+		{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"},
+		{Key: "mentionLimit", Value: 50, ReplaceRoleID: "r2"},
+	}
+	assert.True(t, ValidateContributions([]string{"mentionLimit"}, []string{"r1", "r2"}, two))
+
+	same := []plugin.EffectivePolicyContribution{
+		{Key: "mentionLimit", Value: 40, ReplaceRoleID: "r1"},
+		{Key: "mentionLimit", Value: 50, ReplaceRoleID: "r1"},
+	}
+	assert.False(t, ValidateContributions([]string{"mentionLimit"}, []string{"r1"}, same))
 }

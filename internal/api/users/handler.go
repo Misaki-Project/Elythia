@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -107,6 +108,73 @@ type Handler struct {
 	// abuseReport system webhook を発火するために使う (#1542)。未配線なら発火しない。
 	systemWebhookDispatcher SystemWebhookDispatcher
 	recipientRepo           repository.AbuseReportNotificationRecipientRepository
+	profileRoleVisibility   ProfileRoleVisibilityReader
+}
+
+// ProfileRoleVisibilityReader returns role IDs a user chose not to expose on
+// their public profile. It is optional because the role-level plugin can be
+// disabled or absent from a custom build.
+type ProfileRoleVisibilityReader interface {
+	HiddenProfileRoleIDs(ctx context.Context, userID string) (map[string]struct{}, error)
+}
+
+// SetProfileRoleVisibilityReader wires the optional role-level visibility
+// source used by users/show.
+func (h *Handler) SetProfileRoleVisibilityReader(r ProfileRoleVisibilityReader) {
+	h.profileRoleVisibility = r
+}
+
+// applyProfileRoleVisibility removes both detailed role chips and UserLite
+// badge roles before users/show is serialized. A read failure fails closed:
+// leaking a role the owner hid is worse than temporarily showing no roles.
+func (h *Handler) applyProfileRoleVisibility(ctx context.Context, userID string, detailed *entity.UserDetailed) {
+	if h.profileRoleVisibility == nil || detailed == nil {
+		return
+	}
+	hidden, err := h.profileRoleVisibility.HiddenProfileRoleIDs(ctx, userID)
+	if err != nil {
+		detailed.Roles = []any{}
+		empty := []any{}
+		detailed.BadgeRoles = &empty
+		return
+	}
+	if len(hidden) == 0 {
+		return
+	}
+	hiddenNames := make(map[string]struct{}, len(hidden))
+	roles := make([]any, 0, len(detailed.Roles))
+	for _, raw := range detailed.Roles {
+		role, ok := raw.(map[string]any)
+		if !ok {
+			roles = append(roles, raw)
+			continue
+		}
+		roleID, _ := role["id"].(string)
+		if _, hiddenRole := hidden[roleID]; hiddenRole {
+			if name, ok := role["name"].(string); ok {
+				hiddenNames[name] = struct{}{}
+			}
+			continue
+		}
+		roles = append(roles, raw)
+	}
+	detailed.Roles = roles
+	if detailed.BadgeRoles == nil || len(hiddenNames) == 0 {
+		return
+	}
+	badges := make([]any, 0, len(*detailed.BadgeRoles))
+	for _, raw := range *detailed.BadgeRoles {
+		badge, ok := raw.(map[string]any)
+		if ok {
+			if name, ok := badge["name"].(string); ok {
+				if _, hiddenRole := hiddenNames[name]; hiddenRole {
+					continue
+				}
+			}
+		}
+		badges = append(badges, raw)
+	}
+	detailed.BadgeRoles = &badges
 }
 
 // SystemWebhookDispatcher fires a system webhook event to subscribed webhooks,
@@ -272,10 +340,40 @@ func (h *Handler) resolveUserIDByURI(uri string) (string, bool) {
 		return "", false
 	}
 	u, err := h.userRepo.FindByURI(uri)
-	if err != nil || u == nil {
+	if err == nil && u != nil {
+		return u.ID, true
+	}
+	return "", false
+}
+
+// resolveLocalMoveTarget also accepts a restored local actor URI whose origin no
+// longer matches the running instance. It must only be used for a local source
+// account; otherwise a remote actor could point at /users/<local-id> on an
+// unrelated host and make the UI display that local account as its destination.
+func (h *Handler) resolveLocalMoveTarget(uri string) (string, bool) {
+	if id, ok := h.resolveUserIDByURI(uri); ok {
+		return id, true
+	}
+
+	// CherryPick の dump を別 URL で復元すると、local user の movedToUri は旧
+	// origin (`https://old.example/users/<id>`) のまま残る一方、local user 自身は
+	// uri=NULL なので FindByURI では解決できない。末尾が users/<id> で、その id が
+	// 実在する local user を指す場合だけ ID fallback を許可する。host を無視して
+	// remote user まで拾うと別 instance の同名 path を誤結合するため、Host==nil を
+	// 必須にする。
+	parsed, parseErr := url.Parse(uri)
+	if parseErr != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", false
 	}
-	return u.ID, true
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 2 || parts[0] != "users" || parts[1] == "" {
+		return "", false
+	}
+	target, findErr := h.userRepo.FindByID(parts[1])
+	if findErr != nil || target == nil || target.Host != nil {
+		return "", false
+	}
+	return target.ID, true
 }
 
 // SetNoteReactionRepo wires the NoteReactionRepository for users/reactions
@@ -568,6 +666,7 @@ func (h *Handler) Show(c echo.Context) error {
 		ctx := c.Request().Context()
 		for _, b := range visible {
 			detailed := entity.PackUserDetailed(b.User, b.Profile, h.idGen)
+			h.applyProfileRoleVisibility(ctx, b.User.ID, &detailed)
 			resolver.FillUserLite(&detailed.UserLite)
 			h.populateUserEmojis(b.User, &detailed.UserLite)
 			h.applyModerationNote(&detailed, iAmModerator, b.Profile)
@@ -648,6 +747,7 @@ func (h *Handler) Show(c echo.Context) error {
 	}
 
 	detailed := entity.PackUserDetailed(bundle.User, bundle.Profile, h.idGen)
+	h.applyProfileRoleVisibility(c.Request().Context(), bundle.User.ID, &detailed)
 	h.applyModerationNote(&detailed, iAmModerator, bundle.Profile)
 	// moderator が他ユーザーを見るときは twoFactorEnabled/usePasswordLessLogin/
 	// securityKeys を出す (upstream UserEntityService、#1781)。self-view は下の
@@ -657,7 +757,11 @@ func (h *Handler) Show(c echo.Context) error {
 	// movedTo / alsoKnownAs を URI→ローカルID 解決して埋める (#1255)。単一
 	// ユーザー path なので FindByURI は数回で済む。list path (followers 等) は
 	// N+1 を避けるため解決せず null のまま (move banner は profile でのみ表示)。
-	detailed.ResolveMoveTargets(bundle.User, h.resolveUserIDByURI)
+	moveResolver := h.resolveUserIDByURI
+	if bundle.User.Host == nil {
+		moveResolver = h.resolveLocalMoveTarget
+	}
+	detailed.ResolveMoveTargets(bundle.User, moveResolver)
 
 	// remote user の場合は origin instance の /api/users/show から実際の counts
 	// を取得して上書きする (#943)。Misskey TS は自インスタンス観測値のみ集計する

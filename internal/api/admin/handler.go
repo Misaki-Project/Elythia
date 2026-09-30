@@ -1224,7 +1224,9 @@ func badgeRolesForMap(br *[]any) []any {
 // 渡すための内部キー。**wire へ出す前に必ず delete する。**
 const signinsLoadedKey = "__signinsLoaded"
 
-// packAdminUser returns a MeDetailed-equivalent response for admin endpoints.
+// packAdminUser returns the upstream admin response plus mk-go's explicit
+// isDeleted state, which the moderation UI needs to distinguish deletion from
+// an ordinary suspension.
 func (h *Handler) packAdminUser(u *model.User, profile *model.UserProfile, showIPs bool) map[string]any {
 	// upstream admin/show-user (show-user.ts:233-261) が返すのはこの 24 key
 	// だけで、UserLite / UserDetailed / MeDetailed は含まない。旧実装は
@@ -1235,6 +1237,7 @@ func (h *Handler) packAdminUser(u *model.User, profile *model.UserProfile, showI
 	// isSilenced / isSuspended / moderationNote しか読まないので、upstream の
 	// key 集合に絞っても UI は壊れない。
 	resp := map[string]any{
+		"isDeleted":    u.IsDeleted,
 		"isSuspended":  u.IsSuspended,
 		"isHibernated": u.IsHibernated,
 		// roleService 未配線時は false / 既定 policy に倒す (fail-closed)。

@@ -29,6 +29,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -341,8 +342,18 @@ func (h *Harness) EffectivePolicies(def plugin.Definition) plugin.EffectivePolic
 	if resolver != nil {
 		registration.Resolve = func(ctx context.Context, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
 			req.RoleIDs = append([]string(nil), req.RoleIDs...)
+			// **ActiveAssignments も複製して渡す。** 本番 (core/role/plugin_policy.go) が
+			// 複製しているのと同じで、テストが production より緩くないようにする。
+			req.ActiveAssignments = append([]plugin.ActiveRoleAssignment(nil), req.ActiveAssignments...)
+			// **置換してよい role は resolver を呼ぶ前に確定させる。** 上で複製した slice は
+			// 共有されているので resolver が書き換えられる。複製し直してから判定すると
+			// 「active な role を差し替えた」置換が harness を通ってしまうので、
+			// 本番 (core/role/plugin_policy.go) と同じ形で**呼び出し前**の集合を採る。
+			replaceableRoleIDs := plugintestActiveRoleIDs(req.ActiveAssignments)
 			contributions, err := resolver(ctx, req)
-			if err == nil && !effectivepolicy.ValidateContributions(registration.Keys, contributions) {
+			if err == nil && !effectivepolicy.ValidateContributions(
+				registration.Keys, replaceableRoleIDs, contributions,
+			) {
 				h.t.Errorf("plugintest: EffectivePolicies の出力が不正です")
 				return nil, fmt.Errorf("plugintest: effective policy output is invalid")
 			}
@@ -462,9 +473,6 @@ func (r Request) build() plugin.Request {
 		ctx = context.Background()
 	}
 	body := r.Body
-	if body == "" {
-		body = "{}"
-	}
 	return &fakeRequest{
 		ctx: ctx, userID: r.UserID, body: body, params: r.Params, query: r.Query,
 		moderator: r.Moderator || r.Administrator, administrator: r.Administrator,
@@ -610,4 +618,46 @@ func (r *fakeRequest) Bind(v any) error {
 		return err
 	}
 	return nil
+}
+
+func (r *fakeRequest) BindStrict(v any) error {
+	dec := json.NewDecoder(strings.NewReader(r.body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		if err == io.EOF {
+			return errors.New("リクエストボディが空です")
+		}
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+// plugintestActiveRoleIDs は request の assignment が覆う role ID をソート・重複除去
+// して返す。置換が名乗ってよい target を harness 側で判定するために使う
+// （core/role の activeRoleIDsFromAssignments と同じ形）。
+func plugintestActiveRoleIDs(assignments []plugin.ActiveRoleAssignment) []string {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(assignments))
+	seen := make(map[string]struct{}, len(assignments))
+	for _, a := range assignments {
+		if a.RoleID == "" {
+			continue
+		}
+		if _, duplicate := seen[a.RoleID]; duplicate {
+			continue
+		}
+		seen[a.RoleID] = struct{}{}
+		out = append(out, a.RoleID)
+	}
+	sort.Strings(out)
+	return out
 }

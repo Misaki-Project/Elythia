@@ -32,6 +32,8 @@ import (
 // **現在は空。** 分割アップロードの 3 キー (#2313) が導入時から UI に無く、
 // #2898 の gate が検出して #2900 で解消した。空のまま保つのが正しい状態で、
 // 足すときは「UI に出さない」と決めた理由を書くこと。
+// canPurgeAccount は frontend 側のキー一覧と XFolder に追加したので、ここで
+// 除外する必要はない。
 var notInFrontendUI = map[string]string{}
 
 func TestMkGoRolePolicyKeysAreListedInFrontend(t *testing.T) {

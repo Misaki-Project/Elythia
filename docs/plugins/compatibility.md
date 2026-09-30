@@ -28,6 +28,14 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 
 `Definition.EffectivePolicies`と関連型の追加はこのadditive契約に従い、`Validate`もRoutes、Jobs、EffectivePoliciesのいずれかを要求する形へ緩和するだけなので、`APIVersion`は1のまま維持する。
 
+`EffectivePolicyRequest.ActiveAssignments` と `plugin.ActiveRoleAssignment` の追加も同じ扱い。**`RoleIDs` は変更されない**ので、`EffectivePolicyRequest`はhostが組み立ててproviderに渡すものだけだから、`RoleIDs`を読む既存providerの挙動は変わらず、新sliceを無視する実装は害がない。`APIVersion`は1のまま。
+
+`EffectivePolicyContribution.ReplaceRoleID`の追加も同じ扱い。**keyed struct literalで組み立てる限り**、**未設定なら追加contributionのまま**なので既存providerの挙動は変わらず、pluginは「対象ロールのネイティブcontributionを置き換える」という新しい契約にだけオプトインする。置換の`Priority`/`Order`制約はprovider作者の誤りを弾くもので、既存providerの出力形式は変えない。`APIVersion`は1のまま。
+
+`EffectivePolicyRequest`をpluginのtestやヘルパーで組み立てる場合は`plugin.Definition`と同じく**keyed struct literalだけ**を互換対象とする（`RoleIDs: ...`のようにフィールド名を書く）。外部プラグインのpositional / unkeyed literalはサポートしない。
+
+`EffectivePolicyContribution`をpluginのコードやtestで組み立てる場合も`plugin.Definition`と同じく**keyed struct literalだけ**を互換対象とする（`Key: ...`のようにフィールド名を書く）。**exported fieldを増やした型はpositional / unkeyed literalがソースで壊れる** — `ActiveAssignments`の追加で`EffectivePolicyRequest`が、`ReplaceRoleID`の追加で`EffectivePolicyContribution`がこれに当たるので、実行時の挙動がadditiveのままであってもコンパイルは通らない。
+
 `Definition.Peer`（#2819）と`Context.Queue()`、`plugin.Queue` / `EnqueueOption`の追加も同じ扱い。`Definition.Peer`は既存プラグインが`Routes`の中でpeerを登録していても壊さない（`RoleBoth`ならそのまま動く）が、**ロールを分割した構成では応答が届かない**ので、移すこと。登録が無いロールでは起動時にwarnが出る。
 
 `Context`はmk-goが実装してプラグインは受け取るだけなので、メソッドが増えてもプラグインは壊れない（プラグイン側が`Context`を自前で実装している場合はこの限りではないが、それはサポート対象外）。
@@ -100,11 +108,11 @@ go run ./tools/pluginspec -write
 
 ## サンプルプラグイン
 
-`plugins/status/` と `plugins/trustlevel/` を**リポジトリに同梱**してある。
+`plugins/status/`、`plugins/trustlevel/`、`plugins/rolelevel/` を**リポジトリに同梱**してある。
 
 別リポジトリに置くと、`plugin/` を変えたときに壊れても CI で気付けない。同梱していれば公開面を壊した時点で CI が落ちる。**サンプルの一番の価値は「常に動くこと」**。
 
-ただし**素の `make build` では落ちない** — 既定無効なので取り込まれないため。落とすのは次の 3 つ。
+`rolelevel` は既定有効なので backend registration に入り、コンパイル不良は素の `make build` でも検出される。一方、disabled-marker 検査では allowlist により判定対象外になる。変更を検出するのは次の 3 つ。
 
 | job | 見るもの | required |
 |---|---|---|
@@ -114,7 +122,7 @@ go run ./tools/pluginspec -write
 
 required なのは `build` だけ (`docs/ci.md` の required check は `build` / `test` / `lint` の 3 つ)。`plugin-tests` / `frontend-check` だけが落ちる壊れ方はマージをブロックしない。
 
-`plugins/*` は gitignore されているが、`!plugins/status/` と `!plugins/trustlevel/` (#2586) で例外指定してある。**どちらも `mk-plugin.yml` で既定無効**なので、clone して `make build` してもバイナリにもフロントにも入らない。`status` は #2495 から。`trustlevel` は #2586 で `disabled: true` 付きで同梱したあと、#2585 の実測を採るために一度外し、実測が終わって #2701 で戻している。既定無効であることは `build` job の `Check bundled plugins are disabled by default` が見る。
+`plugins/*` は gitignore されているが、`!plugins/status/`、`!plugins/trustlevel/`、`!plugins/rolelevel/` (#12)で例外指定してある。`status` と `trustlevel` は既定無効、`rolelevel` だけは意図的に既定有効である。allowlist は `make plugin-vet` と CI に重複して定義し、どちらも `rolelevel` の判定をスキップする。`status` は #2495 から。`trustlevel` は #2586 で `disabled: true` 付きで同梱したあと、#2585 の実測を採るために一度外し、実測が終わって #2701 で戻している。既定無効であることは `build` job の `Check bundled plugins are disabled by default` が見る。
 
 ## 変更時のチェック
 

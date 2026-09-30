@@ -114,6 +114,23 @@ func TestPackMe_EnricherOverridesDefaults(t *testing.T) {
 	assert.Equal(t, 3, resp["unreadNotificationsCount"])
 }
 
+func TestPackMe_EnricherCannotRestoreFilteredRoles(t *testing.T) {
+	t.Cleanup(func() { SetEnricher(nil) })
+	enricher := &recordingEnricher{inject: map[string]any{
+		"roles": []any{map[string]any{"id": "private"}},
+	}}
+	SetEnricher(enricher)
+
+	me := newUser("u1")
+	detailed := packed(me)
+	detailed.Roles = []any{map[string]any{"id": "public"}}
+	resp, ok := PackMe(context.Background(), detailed, me, nil).(map[string]any)
+	require.True(t, ok)
+
+	require.Len(t, resp["roles"], 1)
+	assert.Equal(t, "public", resp["roles"].([]any)[0].(map[string]any)["id"])
+}
+
 func TestSetEnricher_NilDisablesEnrichment(t *testing.T) {
 	t.Cleanup(func() { SetEnricher(nil) })
 	enricher := &recordingEnricher{}

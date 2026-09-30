@@ -35,6 +35,11 @@ var defaults = map[string]any{
 	// 開き、絞りたい運営者が role で false にする。管理者 bypass は無い
 	// (role_service.go の PolicyCanDeleteAccount 参照)。
 	"canDeleteAccount": true,
+	// canPurgeAccount gates whether the self-delete producer hard-deletes an account row.
+	// **default true** — false にすると row だけ残す (PreserveAccount) ので、
+	// 絞りたい運営者が role で設定する。admin/federation producer はこの policy を解決しない
+	// (role_service.go の PolicyCanPurgeAccount 参照)。
+	"canPurgeAccount": true,
 	// upstream Misskey #17121のchannel作成権限。default trueで全員を許可し、
 	// adminがrole経由で個別userを絞る。
 	"canCreateChannel":       true,
@@ -135,23 +140,38 @@ func ValidateRegistration(reg plugin.EffectivePolicyRegistration) error {
 	return nil
 }
 
-// ValidateContributions reports whether contributions satisfy the host's
-// native policy schema.
-func ValidateContributions(keys []string, contributions []plugin.EffectivePolicyContribution) bool {
+// ValidateContributions reports whether contributions satisfy the host's native
+// policy schema.
+//
+// activeRoles are the role IDs the request carried in
+// [plugin.EffectivePolicyRequest.ActiveAssignments]. A contribution that sets
+// ReplaceRoleID must name one of them — otherwise it would replace a
+// contribution that does not exist in this request — and must leave Priority and
+// Order at 0, because the replaced entry inherits the role's own declared
+// priority. Breaking either rule fails the whole provider, like any other
+// malformed output.
+func ValidateContributions(keys, activeRoles []string, contributions []plugin.EffectivePolicyContribution) bool {
 	type contributionTie struct {
-		key   string
-		order int
+		key string
+		// order only distinguishes additive contributions; a replacement always
+		// carries 0, so replacements are told apart by roleID instead.
+		order  int
+		roleID string
 	}
 	seen := make(map[contributionTie]struct{}, len(contributions))
 	for _, contribution := range contributions {
 		if !declaresKey(keys, contribution.Key) || contribution.Priority < 0 || contribution.Priority > 2 {
 			return false
 		}
+		if contribution.ReplaceRoleID != "" &&
+			(contribution.Priority != 0 || contribution.Order != 0 || !declaresActiveRole(activeRoles, contribution.ReplaceRoleID)) {
+			return false
+		}
 		native, ok := defaults[contribution.Key]
 		if !ok {
 			return false
 		}
-		tie := contributionTie{key: contribution.Key, order: contribution.Order}
+		tie := contributionTie{key: contribution.Key, order: contribution.Order, roleID: contribution.ReplaceRoleID}
 		if _, duplicate := seen[tie]; duplicate {
 			return false
 		}
@@ -161,6 +181,17 @@ func ValidateContributions(keys []string, contributions []plugin.EffectivePolicy
 		}
 	}
 	return true
+}
+
+// declaresActiveRole reports whether roleID is one of the request's active manual
+// roles. Only a role that carries a native contribution can have it replaced.
+func declaresActiveRole(activeRoles []string, roleID string) bool {
+	for _, active := range activeRoles {
+		if active == roleID {
+			return true
+		}
+	}
+	return false
 }
 
 func declaresKey(keys []string, key string) bool {

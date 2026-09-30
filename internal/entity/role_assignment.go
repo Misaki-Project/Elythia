@@ -16,13 +16,16 @@ import (
 // 「そもそも付与が無い」が区別できなくなる。
 func PackRoleAssignmentLookup(assignment *model.RoleAssignment, r *model.Role) map[string]any {
 	assigned := assignment != nil
+	var assignmentID *string
 	var expiresAt *time.Time
 	if assigned {
+		assignmentID = &assignment.ID
 		expiresAt = assignment.ExpiresAt
 	}
 	return map[string]any{
-		"assigned":  assigned,
-		"expiresAt": ISOMillisPtr(expiresAt),
+		"assigned":     assigned,
+		"assignmentId": assignmentID,
+		"expiresAt":    ISOMillisPtr(expiresAt),
 		"role": map[string]any{
 			"id":                        r.ID,
 			"target":                    r.Target,
