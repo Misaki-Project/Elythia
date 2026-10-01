@@ -17,7 +17,6 @@ import (
 	"github.com/shiroha-a/mk/internal/api/userrelation"
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
-	"github.com/shiroha-a/mk/internal/core/notification"
 	"github.com/shiroha-a/mk/internal/core/user"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -280,13 +279,14 @@ type AbuseReportNotifier interface {
 	PublishAdminEvent(userID, eventType string, body any)
 }
 
-// AbuseReportInAppNotifier creates the in-app notification moderators see in
-// their notification list (#2868)。実装は core/notification.Service。
+// AbuseReportInAppNotifier leaves a new report in the moderators' notification
+// list (#2868)。実装は core/abuse.InAppNotifier。
 //
 // **admin stream (AbuseReportNotifier) では足りない。** あちらはその瞬間に
-// 管理画面を開いている人にしか届かず、後から見返せない。
+// 管理画面を開いている人にしか届かず、後から見返せない。連打で通知欄が
+// 埋まらないよう絞るのも実装側 (#3200)。
 type AbuseReportInAppNotifier interface {
-	Create(ctx context.Context, in notification.CreateInput) (*notification.Notification, error)
+	NotifyNewReport(ctx context.Context, report *model.AbuseUserReport)
 }
 
 // SetAbuseReportFanout wires the moderator lister + admin event notifier so
@@ -1604,7 +1604,7 @@ func (h *Handler) fillPinned(ctx context.Context, viewer *model.User, u *model.U
 					notes = notesfilter.FilterVisible(viewer, notes, h.followingRepo)
 					entities := entity.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 					h.fieldRes.Apply(entities, viewer)
-					notehide.HideEmbeds(viewer, entities)
+					notehide.HidePinnedNotes(viewer, entities, h.followingRepo)
 					packed := make([]any, 0, len(entities))
 					for _, pn := range entities {
 						packed = append(packed, pn)

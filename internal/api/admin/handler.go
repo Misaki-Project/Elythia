@@ -199,6 +199,9 @@ type Handler struct {
 	deliveryHealth DeliveryHealthProvider
 	// inboxHealth は admin/federation/inbox-health の集計元 (#2471)。
 	inboxHealth DeliveryHealthProvider
+	// deliveryBreaker は落ちた配送先へのブレーカー (#3048)。nil なら一覧は空で、
+	// 閉じる操作は何もしない。
+	deliveryBreaker DeliveryBreakerAdmin
 	// ipSearchRepo は admin/ip/* の検索元 (#3104)。**未配線なら 500 を返す** —
 	// 空の結果は「その IP を使ったアカウントは無い」という誤った事実になる。
 	ipSearchRepo repository.UserIPSearchRepository
@@ -214,6 +217,19 @@ type Handler struct {
 	signupApplications SignupApplicationReviewer
 	// selfCheck は admin/self-check の実行元 (#2463)。未配線なら空の結果を返す。
 	selfCheck SelfCheckRunner
+	// remoteCheck は admin/federation/check-host の実行元 (#3055)。
+	// remoteCheckSelfHost は自ホスト (断る)。
+	remoteCheck         RemoteChecker
+	remoteCheckSelfHost string
+	// goneCleaner は消えたインスタンスとのフォロー関係の片付け (#3067)。
+	goneCleaner GoneInstanceCleaner
+	// fedRules は連合のルール (#3090)。
+	fedRules FederationRuleManager
+	// dbHealth は DB の健全性 (#3095)。
+	dbHealth DatabaseHealthReader
+	// clock は時刻の取得 (nil なら time.Now)。テストで経過時間に依存する計算
+	// (関連アカウントのスコアの減衰など) を固定するため。
+	clock func() time.Time
 	// userTokenInvalidator は admin が他 user を suspend / unsuspend /
 	// 論理削除した直後に target user の全 tokenCache entry を即時失効する
 	// ために使う (#965)。i/regenerate-token (#884) や i/update (#960) と
@@ -222,6 +238,10 @@ type Handler struct {
 	// router で必ず wire する (未配線時は 30s cache TTL 待ちで stale 旧 user
 	// が auth 通過する security regression が残る)。
 	userTokenInvalidator UserTokenInvalidator
+	// userStreamRevoker は凍結・削除した user の /streaming 接続を閉じる。
+	// WebSocket は接続時に 1 度しか認証しないので、tokenCache を落としても
+	// 既存の接続は通知・DM を受け取り続ける。
+	userStreamRevoker UserStreamRevoker
 	// signinRepo は admin/show-user の `signins` field を実データで埋める
 	// ために使う (#1198)。未配線時は `[]` fallback で shape compat を保つ。
 	signinRepo repository.SigninRepository
@@ -301,6 +321,34 @@ type UserTokenInvalidator interface {
 // (未配線時は最大 30 秒 stale window が残る)。
 func (h *Handler) SetUserTokenInvalidator(inv UserTokenInvalidator) {
 	h.userTokenInvalidator = inv
+}
+
+// UserStreamRevoker closes every live /streaming connection of a user.
+// Implemented by stream.StreamRevokePublisher (pubsub fan-out so connections
+// held by other processes close too).
+type UserStreamRevoker interface {
+	RevokeUserStreams(userID string)
+}
+
+// SetUserStreamRevoker wires the revoker used by admin/suspend-user and the
+// account deletion endpoints.
+func (h *Handler) SetUserStreamRevoker(r UserStreamRevoker) {
+	h.userStreamRevoker = r
+}
+
+// HasUserStreamRevoker reports whether the stream revoker is wired.
+//
+// 未配線だと、凍結・削除した利用者の WebSocket が**再接続するまで通知・DM・
+// フォロワー限定投稿を受け取り続ける** (HasUserTokenInvalidator とは独立)。
+func (h *Handler) HasUserStreamRevoker() bool { return h.userStreamRevoker != nil }
+
+// revokeUserStreams closes the target user's streaming connections. 凍結解除
+// では呼ばない (凍結中の利用者の token では /streaming へ接続できない — upgrade が 403 — ので閉じる対象が無い)。
+func (h *Handler) revokeUserStreams(userID string) {
+	if h.userStreamRevoker == nil || userID == "" {
+		return
+	}
+	h.userStreamRevoker.RevokeUserStreams(userID)
 }
 
 // invalidateUserTokenCache は target user の全 token cache entry を即時
@@ -1465,6 +1513,8 @@ func (h *Handler) SuspendUser(c echo.Context) error {
 	// 凍結直後の auth bypass 防止 (#965)。target の全 token cache entry を
 	// 即時削除し、middleware 通過後の P2 gate (#964) に依存せず確実に弾く。
 	h.invalidateUserTokenCache(req.UserID)
+	// 既に張られている WebSocket も閉じる (mk-go 独自、docs/divergence.md)。
+	h.revokeUserStreams(req.UserID)
 	// upstream UserSuspendService.suspend: local user なら全 sharedInbox へ
 	// Delete(actor) を配信する (#1759)。best-effort (queue 経由)。
 	if h.userModerationFed != nil {
@@ -1579,6 +1629,7 @@ func (h *Handler) AdminMeta(c echo.Context) error {
 		"disableRegistration":       m.DisableRegistration,
 		"emailRequiredForSignup":    m.EmailRequiredForSignup,
 		"approvalRequiredForSignup": m.ApprovalRequiredForSignup,
+		"registrationClosed":        m.RegistrationClosed,
 		"signupApplicationForm":     m.SignupApplicationForm,
 		// Cache
 		"cacheRemoteFiles":          m.CacheRemoteFiles,
@@ -1755,6 +1806,9 @@ func (h *Handler) UpdateMeta(c echo.Context) error {
 	// 手段まで塞いでしまう)。
 	currentMeta, _ := h.metaRepo.Fetch()
 	normalizeSignupConditions(fields, currentMeta)
+	// **承認制の整合より後に置く。** 「受け付けない」は他の受け付け方より優先するので、
+	// 承認制を入れる更新が開けた登録を、ここで閉じ直す (#3186)。
+	normalizeRegistrationClosed(fields, currentMeta)
 	// 申請フォームの定義を検証する (#2570)。**上限を置かないと管理者が自分で
 	// 壊せる** — 項目を無制限に足せば申請ページが使い物にならなくなる。
 	if err := validateSignupApplicationForm(fields); err != nil {
@@ -1895,6 +1949,41 @@ func (h *Handler) maybeAutoGenerateVAPID(fields map[string]any) error {
 	fields["swPublicKey"] = newPub
 	fields["swPrivateKey"] = newPriv
 	return nil
+}
+
+// normalizeRegistrationClosed makes "not accepting registrations" win over the
+// other registration modes (mk-go, #3186).
+//
+// **有効な間は disableRegistration を立てる。** 外から見た値 (nodeinfo の
+// `openRegistrations` / `/api/meta` の `features.registration`) を本家と同じにするため
+// と、TS へ戻したときに招待制へ落とすため (新しい列は無視される)。利用者の指定より
+// 優先する — 閉じたまま登録が開いた値を残すと、TS へ戻したときに開く。
+//
+// **承認制は外さない。** 閉じている間も申請者が状態を照会できるように (照会は承認制の
+// 入口で、閉じている間も開けてある) と、解除したときに元の受け付け方へ戻れるように。
+// 承認制と disableRegistration が同時に立つのは #2565 が避けている組み合わせだが、
+// 閉じている間は「どの入口も開かない」がまさに意図した状態なので構わない。
+//
+// **解除する更新では、承認制が残っていれば登録を開け直す** (#2565 の整合)。閉じる
+// 更新で立てた disableRegistration が残ると、承認制の入口が `approvalOpen` で塞がった
+// ままになる。disableRegistration の明示より優先する — normalizeSignupConditions の
+// 「開ける側は上書きする」と同じ扱いで、尊重すると入口が 1 つも無い状態が作れる。
+// 承認制が無ければ何もしない — disableRegistration が立ったままなので招待制で再開する
+// (開く側へは倒さない)。
+//
+// meta が引けない (current == nil) ときは、この更新で送られた値だけで判定する。
+func normalizeRegistrationClosed(fields map[string]any, current *model.Meta) {
+	wasClosed := current != nil && current.RegistrationClosed
+	if metaBoolAfterUpdate(fields, "registrationClosed", wasClosed) {
+		fields["disableRegistration"] = true
+		return
+	}
+	if !wasClosed {
+		return
+	}
+	if metaBoolAfterUpdate(fields, "approvalRequiredForSignup", current.ApprovalRequiredForSignup) {
+		fields["disableRegistration"] = false
+	}
 }
 
 // metaBoolAfterUpdate returns the effective bool value of key after the
@@ -4533,7 +4622,7 @@ func (h *Handler) ShowModerationLogs(c echo.Context) error {
 // コードが持つ。メールは独立した任意設定。
 
 // signupGateBoolFields are the registration gates that must arrive as booleans.
-var signupGateBoolFields = []string{"approvalRequiredForSignup", "disableRegistration"}
+var signupGateBoolFields = []string{"approvalRequiredForSignup", "disableRegistration", "registrationClosed"}
 
 // normalizeSignupGateBools drops JSON null and rejects other non-bool values
 // for the registration gates.
@@ -4553,7 +4642,7 @@ var signupGateBoolFields = []string{"approvalRequiredForSignup", "disableRegistr
 // クライアントを 400 にすると互換が壊れる。落とさないと NOT NULL 制約違反で
 // 500 になる (この分岐を入れる前の mk-go の挙動)。
 //
-// **対象はこの 2 つに絞る** — 他の bool 列は型を間違えても正規化の判断を
+// **対象は登録のゲートに絞る** (#3186 で `registrationClosed` が加わり 3 つ) — 他の bool 列は型を間違えても正規化の判断を
 // すり抜けさせる働きが無く、update-meta の全 bool 列を一括で弾くと既存クライアント
 // への影響範囲が読めない。
 func normalizeSignupGateBools(fields map[string]any) error {
@@ -4677,3 +4766,11 @@ func validateSignupApplicationForm(fields map[string]any) error {
 // session が auth cache の TTL のあいだ生き残る。router 側のコメントも
 // これを security regression と呼んでいる (#2682)。
 func (h *Handler) HasUserTokenInvalidator() bool { return h.userTokenInvalidator != nil }
+
+// now returns the current time, or the fixed one set in tests (SetClockForTest)。
+func (h *Handler) now() time.Time {
+	if h.clock != nil {
+		return h.clock()
+	}
+	return time.Now()
+}

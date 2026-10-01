@@ -16,7 +16,6 @@ import (
 	corechat "github.com/shiroha-a/mk/internal/core/chat"
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	corenote "github.com/shiroha-a/mk/internal/core/note"
-	"github.com/shiroha-a/mk/internal/core/notification"
 	corereaction "github.com/shiroha-a/mk/internal/core/reaction"
 	corereversi "github.com/shiroha-a/mk/internal/core/reversi"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -64,6 +63,8 @@ type RelayActorChecker interface {
 
 // Processor dispatches inbound activities to the right handler.
 type Processor struct {
+	// rules は連合のルール (#3090)。nil なら評価しない。
+	rules            RuleEvaluator
 	resolver         *Resolver
 	followingService *corefollowing.Service
 	reactionService  *corereaction.Service
@@ -74,19 +75,24 @@ type Processor struct {
 	// Block/Flag/Move/Add/Remove federation hooks.
 	// SetBlockingService等で注入。nilの場合は対応activityがErrUnsupportedActivityを返す。
 	blockingService *coreblocking.Service
+	// quoteRequests は FEP-044f の QuoteRequest に答える (#3234)。未配線なら
+	// ErrUnsupportedActivity。
+	quoteRequests *QuoteRequestHandler
+	// quoteAnswers は、こちらが送った QuoteRequest への Accept / Reject を受ける
+	// (#3234 段階 3)。未配線なら従来どおり (Follow 以外の Accept は無視)。
+	quoteAnswers    QuoteAnswerHandler
 	abuseReportRepo repository.AbuseReportRepository
 	abuseIDGen      id.Generator
-	// abuseModeratorLister / abuseInAppNotifier はリモートからの通報 (AP Flag)
-	// をモデレーターの通知欄に出す (#2868)。local の report-abuse と同じ扱いに
-	// するためで、片方でも nil なら通知しない。
+	// abuseInAppNotifier はリモートからの通報 (AP Flag) をモデレーターの通知欄に
+	// 出す (#2868)。local の report-abuse と同じ実装 (core/abuse.InAppNotifier)
+	// を通すので、連打の絞り方 (#3200) も同じになる。nil なら通知しない。
 	//
 	// **admin stream と system webhook はこの経路では飛んでいない** (local 側の
 	// #1549 / #1542 が users handler にしかない既存の穴)。ここで in-app だけを
 	// 足すのは、通報の出どころで通知の有無が変わる非対称を作らないため。
-	abuseModeratorLister AbuseModeratorLister
-	abuseInAppNotifier   AbuseInAppNotifier
-	pinningRepo          repository.UserNotePiningRepository
-	pinningIDGen         id.Generator
+	abuseInAppNotifier AbuseInAppNotifier
+	pinningRepo        repository.UserNotePiningRepository
+	pinningIDGen       id.Generator
 
 	// Reversi federation hooks (Phase 9.7). All four are set via
 	// SetReversi; if nil, reversi inbox types are treated as unsupported.
@@ -170,6 +176,43 @@ type InboundFollowAcceptor interface {
 // for inbound Follow activities targeting local users.
 func (p *Processor) SetInboundFollowAcceptor(a InboundFollowAcceptor) {
 	p.inboundFollowAcceptor = a
+}
+
+// SetQuoteRequestHandler wires FEP-044f QuoteRequest handling (#3234).
+func (p *Processor) SetQuoteRequestHandler(h *QuoteRequestHandler) {
+	p.quoteRequests = h
+}
+
+// QuoteAnswerHandler receives the answers to QuoteRequests sent by local notes.
+type QuoteAnswerHandler interface {
+	HandleAnswer(actorURI, requestURI string, accepted bool, result string) error
+	HandleRevocation(actorURI, approvalURI string) (bool, error)
+}
+
+// SetQuoteAnswerHandler wires the handler of Accept / Reject for our
+// QuoteRequests (FEP-044f、#3234)。
+func (p *Processor) SetQuoteAnswerHandler(h QuoteAnswerHandler) {
+	p.quoteAnswers = h
+}
+
+// handleQuoteRequest answers a FEP-044f QuoteRequest for a local note (#3234).
+func (p *Processor) handleQuoteRequest(act genericActivity) error {
+	if p.quoteRequests == nil {
+		return ErrUnsupportedActivity
+	}
+	// activity の id は actor と同じホストのものだけ受ける (Mastodon と同じ)。
+	// 違うと、Accept の object に他人の activity の id を返すことになる。
+	if act.ID == "" || !sameHost(act.ID, act.Actor) {
+		return nil
+	}
+	quoter, err := p.resolver.ResolveActor(act.Actor)
+	if err != nil {
+		if isPermanentSkipError(err) {
+			return nil
+		}
+		return err
+	}
+	return p.quoteRequests.Handle(quoter, act.raw)
 }
 
 // SetLocalBaseURL configures the local instance's base URL. This is used to
@@ -279,6 +322,9 @@ type AntennaHook interface {
 // 上部の "Hook mutation contract"。
 type NotificationHook interface {
 	OnNoteCreated(note *model.Note, author *model.User, replyTarget, renoteTarget *model.Note)
+	// OnNoteDeleted removes the renote notification a withdrawn boost left
+	// (#3201)。Undo(Announce) は DeleteService を通らないので、ここから呼ぶ。
+	OnNoteDeleted(note *model.Note)
 }
 
 // NoteChartHook is invoked after a freshly persisted inbound Create / Announce
@@ -466,6 +512,11 @@ const maxCollectionDepth = 1
 // dispatchActivity routes a parsed activity to its handler. depth tracks
 // Collection/OrderedCollection unrolling so handleCollection can bound recursion.
 func (p *Processor) dispatchActivity(act genericActivity, depth int, signer *model.User) error {
+	// 連合のルール (#3090) で拒否するものは、ここで ack して捨てる (禁止語と
+	// 同じく retry させない)。
+	if p.activityRejectedByRules(act, signer) {
+		return nil
+	}
 	switch strings.ToLower(act.Type) {
 	case "follow":
 		return p.handleFollow(act)
@@ -521,6 +572,8 @@ func (p *Processor) dispatchActivity(act genericActivity, depth int, signer *mod
 		return p.handleChatMessage(act)
 	case "collection", "orderedcollection":
 		return p.handleCollection(act, depth, signer)
+	case "quoterequest", "https://w3id.org/fep/044f#quoterequest":
+		return p.handleQuoteRequest(act)
 	}
 	return ErrUnsupportedActivity
 }
@@ -712,56 +765,16 @@ func (p *Processor) SetAbuseReportRepo(repo repository.AbuseReportRepository, id
 	p.abuseIDGen = idGen
 }
 
-// AbuseModeratorLister lists moderator/administrator users (#2868)。
-// 実装は core/role.Service。
-type AbuseModeratorLister interface {
-	GetModerators() ([]*model.User, error)
-}
-
-// AbuseInAppNotifier creates the in-app notification moderators see for a new
-// report (#2868)。実装は core/notification.Service。
+// AbuseInAppNotifier leaves a new report in the moderators' notification list
+// (#2868)。実装は core/abuse.InAppNotifier (連打の絞りもそちら、#3200)。
 type AbuseInAppNotifier interface {
-	Create(ctx context.Context, in notification.CreateInput) (*notification.Notification, error)
+	NotifyNewReport(ctx context.Context, report *model.AbuseUserReport)
 }
 
 // SetAbuseReportNotification wires the in-app notification for reports that
-// arrive over ActivityPub (#2868)。片方でも nil なら通知しない。
-func (p *Processor) SetAbuseReportNotification(lister AbuseModeratorLister, notifier AbuseInAppNotifier) {
-	p.abuseModeratorLister = lister
+// arrive over ActivityPub (#2868)。nil なら通知しない。
+func (p *Processor) SetAbuseReportNotification(notifier AbuseInAppNotifier) {
 	p.abuseInAppNotifier = notifier
-}
-
-// notifyModeratorsOfRemoteAbuseReport mirrors the local report-abuse fanout for
-// reports received over ActivityPub (#2868)。best-effort。
-func (p *Processor) notifyModeratorsOfRemoteAbuseReport(report *model.AbuseUserReport) {
-	if p.abuseModeratorLister == nil || p.abuseInAppNotifier == nil {
-		return
-	}
-	mods, err := p.abuseModeratorLister.GetModerators()
-	if err != nil {
-		slog.Warn("remote abuse report: list moderators failed", "err", err)
-		return
-	}
-	for _, m := range mods {
-		// notifier は通報者 (リモートユーザー)。通報者自身がローカルの
-		// モデレーターになることは無いので self-notification は起きないが、
-		// 起きても正しい挙動なので同じく警告に出さない。
-		_, nerr := p.abuseInAppNotifier.Create(context.Background(), notification.CreateInput{
-			NotifieeID: m.ID,
-			NotifierID: report.ReporterID,
-			Type:       notification.TypeAbuseReport,
-			// **comment は入れない (#2868)。** 通報コメントは定型フォームの全文が
-			// 入るので通知欄に出しても読めず、出さない以上 Redis に通報本文の
-			// 複製を残す理由が無い (権限を失った元モデレーターに読まれる面も減る)。
-			Extra: map[string]any{
-				"reportId":     report.ID,
-				"targetUserId": report.TargetUserID,
-			},
-		})
-		if nerr != nil && !errors.Is(nerr, notification.ErrSelfNotification) {
-			slog.Warn("remote abuse report: in-app notification failed", "moderator", m.ID, "err", nerr)
-		}
-	}
 }
 
 // SetPinningRepo wires the note pinning repository for Add/Remove activities.
@@ -1280,6 +1293,12 @@ func (p *Processor) handleUndoAnnounce(act genericActivity, inner genericActivit
 		if err := p.noteRepo.Delete(n); err != nil {
 			return err
 		}
+		// 取り消されたブーストの通知を消す (#3201)。**この経路は DeleteService を
+		// 通らない** (noteRepo.Delete を直接呼ぶ) ので、DeleteService 側の hook
+		// だけではリモートからのリノート取り消しが丸ごと漏れる。
+		if p.notificationHook != nil {
+			p.notificationHook.OnNoteDeleted(n)
+		}
 		// handleAnnounce の increment と同条件でのみ減算する。条件がずれると
 		// 加算しなかった boost の undo で count が負に振れる (#2283)。
 		//
@@ -1316,7 +1335,7 @@ func (p *Processor) handleUndoAnnounce(act genericActivity, inner genericActivit
 //     `ErrLookupUnavailable` で種別を残し、`inbox.go` がそれだけ retry に倒す。
 //     **落とす側は 1 箇所ではない** — HTTP 署名 (`verifyPayload`)、転送 activity の
 //     認可 (`authorizeActor` → LD-Signature の creator 解決と鍵引き)、Headers 無しの
-//     legacy 経路 (`ldVerifier.VerifyIfPresent`) の 3 つが同じ sentinel を見る。
+//     legacy 経路 (`ldVerifier.VerifyAndCompact`) の 3 つが同じ sentinel を見る。
 //
 // この規則で数えれば対象は導ける (件数を別に持たない)。
 //
@@ -1339,6 +1358,13 @@ func (p *Processor) handleUndoAnnounce(act genericActivity, inner genericActivit
 // 自身であれば relay の Accept とみなし、RelayStatusMarker.MarkAccepted を
 // 呼び出す (所有権検証は upstream に無い mk-go 側の硬化)。
 func (p *Processor) handleAccept(act genericActivity) error {
+	// こちらが送った QuoteRequest への承認 (FEP-044f、#3234)。object が id だけの
+	// 文字列でも来るので、下の Follow 用の解釈より先に見る。
+	if p.quoteAnswers != nil {
+		if reqURI := quoteAnswerRequestURI(act.Object, p.localBaseURL); reqURI != "" {
+			return p.quoteAnswers.HandleAnswer(act.Actor, reqURI, true, quoteAnswerResult(act.raw))
+		}
+	}
 	var inner genericActivity
 	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
 	// `inner.actor` が embedded object のケースに**到達できない** (#2662)。
@@ -2224,6 +2250,16 @@ func (p *Processor) handleDelete(act genericActivity) error {
 	if err != nil {
 		return err
 	}
+	// こちらの引用が受けていた承認の取り消し (FEP-044f、#3234 段階 4)。承認の型か、
+	// 型の分からない id のときだけ照合する。型の付いたノート (Tombstone / Note) と、
+	// actor 自身の Delete (アカウント削除。object が actor の id) では引かない
+	// (Mastodon も actor の削除を先に見る)。
+	if p.quoteAnswers != nil && targetURI != act.Actor && mayBeQuoteAuthorization(act.Object) {
+		handled, err := p.quoteAnswers.HandleRevocation(act.Actor, targetURI)
+		if handled || err != nil {
+			return err
+		}
+	}
 	// upstream Misskey #17294 (= 2026.5.0 fix / triage #1001): object が Actor
 	// (self-delete または object.type が Actor 系) で、その actor がローカルに
 	// 存在しないなら無視する。これをやらないと ResolveActor が remote fetch を
@@ -2450,6 +2486,11 @@ func isBearcapURI(raw json.RawMessage) bool {
 // actor がその relay 自身なら relay 関連として RelayStatusMarker.MarkRejected
 // を呼ぶ。
 func (p *Processor) handleReject(act genericActivity) error {
+	if p.quoteAnswers != nil {
+		if reqURI := quoteAnswerRequestURI(act.Object, p.localBaseURL); reqURI != "" {
+			return p.quoteAnswers.HandleAnswer(act.Actor, reqURI, false, "")
+		}
+	}
 	var inner genericActivity
 	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
 	// `inner.actor` が embedded object のケースに**到達できない** (#2662)。
@@ -2661,7 +2702,9 @@ func (p *Processor) handleFlag(act genericActivity) error {
 		slog.Warn("failed to create abuse report from flag activity", "err", err)
 		return err
 	}
-	p.notifyModeratorsOfRemoteAbuseReport(report)
+	if p.abuseInAppNotifier != nil {
+		p.abuseInAppNotifier.NotifyNewReport(context.Background(), report)
+	}
 	return nil
 }
 
@@ -3094,4 +3137,20 @@ func (p *Processor) handleChatMessage(act genericActivity) error {
 		return ErrUnsupportedActivity
 	}
 	return err
+}
+
+// mayBeQuoteAuthorization reports whether a Delete's object may be a FEP-044f
+// approval: a bare id, or an object typed QuoteAuthorization.
+func mayBeQuoteAuthorization(object json.RawMessage) bool {
+	var id string
+	if json.Unmarshal(object, &id) == nil {
+		return true
+	}
+	var obj struct {
+		Type json.RawMessage `json:"type"`
+	}
+	if json.Unmarshal(object, &obj) != nil {
+		return false
+	}
+	return apTypeIs(obj.Type, "QuoteAuthorization")
 }

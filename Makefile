@@ -6,6 +6,7 @@
 	federation-misskey-build federation-misskey-up federation-misskey-test \
 	federation-misskey-e2e \
 	federation-misskey-down federation-misskey-logs \
+	federation-mastodon-e2e federation-mastodon-down \
 	dropin-up dropin-down dropin-test dropin-logs \
 	dropin-mk-up dropin-mk-test dropin-mk-down dropin-mk-logs dropin-swap-test dropin-fedibird-test \
 	dropin-mkgo-born-test \
@@ -267,7 +268,7 @@ endif
 # **`$(shell ...)` は使わない。** make の parse 時に必ず走るので、target と
 # 無関係な `make help` でも git を呼ぶことになるうえ、`gaterun-check` が
 # 「この Makefile に `$(shell …)` が無いので `make -pn` に副作用が無い」という
-# 前提で回っている (CLAUDE.md 2026-09-06)。recipe 内の `$$(...)` なら展開は
+# 前提で回っている (docs/gates.md の 2026-09-06 の経緯、gaterun-check)。recipe 内の `$$(...)` なら展開は
 # 実行時だけで、`make -n` では表示されるだけになる。
 #
 # git が無い / リポジトリ外でビルドした場合は空のまま。読む側が「不明」として
@@ -299,7 +300,18 @@ build: plugins ## バイナリを ./built/misskey に生成
 run: build ## build して起動
 	$(BUILD_DIR)/$(BINARY) -config .config/default.yml
 
-dev: ## go run で直接起動
+# **ビルド済みフロントが無いときだけ MK_DEV=1 を立てる。** mk-go は dev モード
+# (`dev: true` / MK_DEV=1) でしか `/vite/*` を dev server へ流さない —
+# 本番でビルド出力が欠けたときに、認証なしで localhost:5173 へ reverse proxy
+# されていたため。以前の `make dev` は「無ければ proxy」の暗黙の挙動に頼って
+# いたので、同じ条件をここで明示する。ビルド済みなら従来どおりそれを配る。
+# 呼び出し側が MK_DEV を export していればそちらを優先する。
+# (recipe の中に置くと make -n / 実行時にこのコメントが echo されるので外に置く)
+dev: ## go run で直接起動 (ビルド済みフロントが無ければ Vite dev server を使う)
+	@if [ -z "$${MK_DEV+x}" ] && [ ! -d "$${MISSKEY_FRONTEND_DIR:-third_party/misskey/built/_frontend_vite_}" ]; then \
+		echo "make dev: ビルド済みフロントが無いので MK_DEV=1 で起動します (Vite dev server を localhost:5173 で立てること)"; \
+		export MK_DEV=1; \
+	fi; \
 	go run ./cmd/misskey -config .config/default.yml
 
 clean: ## ビルド成果物を削除
@@ -534,6 +546,15 @@ federation-misskey-down: ## 連合テストスタックを撤去
 federation-misskey-logs: ## 連合テストスタックのログを表示
 	docker compose -f $(FEDERATION_MISSKEY_COMPOSE) logs -f
 
+# 本物の Mastodon を相手にした実連合 e2e (#3234)。引用の承認 (FEP-044f) を見る。
+FEDERATION_MASTODON_COMPOSE=docker-compose.federation.mastodon.yml
+
+federation-mastodon-e2e: ## Mastodon との連合テストを起動から撤去まで通しで実行
+	./tests/federation/run-mastodon-test.sh
+
+federation-mastodon-down: ## Mastodon との連合テストスタックを撤去
+	docker compose -f $(FEDERATION_MASTODON_COMPOSE) --profile test down -v
+
 # Drop-in e2e (#365) ― Misskey TS 2 インスタンス (A, B) を立ち上げて
 # 連合基盤を検証する。Phase 13-1 では TS ↔ TS の smoke test のみ。
 # Phase 13-2 以降で mk 差し替え overlay を追加する予定。
@@ -632,8 +653,10 @@ dropin-frontend-swap-test: ## TS-A → mk-A 切替まで含む frontend e2e
 # ライセンス境界のため、本家コードはすべて third_party/misskey/ の git submodule
 # 参照で扱う。mk-go のリポジトリには 1 行もコピーしない。
 #
-# CLAUDE.md の規約で「パッケージはホストに直接入れずコンテナ経由で動かす」と
-# 決まっているため、pnpm はすべて docker run で実行する。
+# `e2e-frontend-build` は pnpm を docker run で実行する。ビルドに使う Node の版と
+# distro を、upstream がコンテナでビルドするときの組み合わせにそろえるため
+# (下の #2921 の段落)。Makefile の pnpm がすべてそうなっているわけではない —
+# `upstream-e2e-deps` はホストの pnpm を使う。
 #
 # frontend e2e は Playwright に一本化した (#2437)。Cypress ラッパーは本家が
 # Cypress を廃止して参照先が消滅したため削除済み。spec は tests/playwright/。
@@ -1121,7 +1144,7 @@ perm-check: ## router middleware の権限が upstream より緩くないか検�
 
 .PHONY: wiring-check
 wiring-check: ## router で配線が必要なものが外れていないか検査
-	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestInviteModeratorCheckerIsWired|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestAbuseReportInAppNotifierIsWired|TestNotificationModeratorCheckerIsWired|TestRemoteAbuseReportNotificationIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestRemoteStatsGateUsesFailClosedPredicate' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestInviteModeratorCheckerIsWired|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestAbuseReportInAppNotifierIsWired|TestNotificationModeratorCheckerIsWired|TestRemoteAbuseReportNotificationIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestPasswordChecksAreFailureLimited|TestPasswordFailureGuardIsWired|TestRemoteStatsGateUsesFailClosedPredicate|TestStreamRevokeIsWired' -count=1 -v
 
 .PHONY: notiftype-check
 notiftype-check: ## 通知タイプの一覧が 1 箇所から導出されているか検査
@@ -1130,7 +1153,7 @@ notiftype-check: ## 通知タイプの一覧が 1 箇所から導出されてい
 
 .PHONY: migrationdoc-check
 migrationdoc-check: ## migration の本数を述べた doc が実態と合っているか検査
-	go test ./internal/entitycompat/... -run 'TestMigrationCountsInDocsMatchReality|TestNoopDownMigrationListMatchesReality|TestDestructiveMigrationTableRowsAreUnique' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestMigrationCountsInDocsMatchReality|TestMigrationCountClaimsDoNotPointIntoHistory|TestClaimPointsIntoHistory|TestNoopDownMigrationListMatchesReality|TestDestructiveMigrationTableRowsAreUnique' -count=1 -v
 
 .PHONY: mdtable-check
 mdtable-check: ## md の表の各行がヘッダと同じ列数か検査 (溢れたセルは描画時に捨てられる)

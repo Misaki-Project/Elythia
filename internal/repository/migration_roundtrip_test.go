@@ -74,6 +74,42 @@ func runMigrate(fn func() error) error {
 	return nil
 }
 
+func TestMigrations_Fork98UpgradeAppliesRegistrationClosed(t *testing.T) {
+	db, err := testutil.OpenTestDBSchema("fork98upgrade")
+	require.NoError(t, err)
+	var schema string
+	require.NoError(t, db.Raw("SELECT current_schema()").Scan(&schema).Error)
+	require.Equal(t, "internal_repository_fork98upgrade", schema)
+	require.NoError(t, db.Exec(`DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`).Error)
+	require.NoError(t, db.Exec(`CREATE SCHEMA "`+schema+`"`).Error)
+	m, err := migrate.New("file://../../migration", migrateURL(schema))
+	require.NoError(t, err)
+	defer func() {
+		serr, derr := m.Close()
+		require.NoError(t, serr)
+		require.NoError(t, derr)
+	}()
+	// forkの98は既に適用済み。上流98のDDLを同じ番号で置き換えても実行されない。
+	require.NoError(t, m.Migrate(98))
+	var columns int64
+	columnCount := func() int64 {
+		require.NoError(t, db.Raw(`SELECT count(*) FROM information_schema.columns
+			WHERE table_schema=current_schema() AND table_name='meta' AND column_name='registrationClosed'`).Scan(&columns).Error)
+		return columns
+	}
+	require.Zero(t, columnCount())
+	require.NoError(t, runMigrate(m.Up))
+	version, dirty, err := m.Version()
+	require.NoError(t, err)
+	require.Equal(t, uint(106), version)
+	require.False(t, dirty)
+	require.EqualValues(t, 1, columnCount(), "上流の登録受付設定が98からの更新で欠落している")
+	var closed bool
+	require.NoError(t, db.Exec(`INSERT INTO meta (id) VALUES ('fork98')`).Error)
+	require.NoError(t, db.Raw(`SELECT "registrationClosed" FROM meta WHERE id='fork98'`).Scan(&closed).Error)
+	require.False(t, closed)
+}
+
 // **down が実際に戻せることを検査する。**
 //
 // `make migrate-down` は運用手順に載っていて、CLAUDE.md も「down スクリプトは必ず

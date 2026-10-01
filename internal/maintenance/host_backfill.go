@@ -14,8 +14,8 @@ import (
 // HostColumn identifies one remote-host column to normalize.
 //
 // KeysetColumn is what the batch paginates on. It is usually the primary key;
-// `instance_signature_capability` has no separate id so it paginates on the
-// host column itself (see HostColumns).
+// `instance_signature_capability` and `instance_gone_suspension` have no
+// separate id so they paginate on the host column itself (see HostColumns).
 type HostColumn struct {
 	Table        string
 	KeysetColumn string
@@ -48,6 +48,7 @@ var HostColumns = []HostColumn{
 	{Table: "user", KeysetColumn: "id", Column: "host"},
 	{Table: "instance", KeysetColumn: "id", Column: "host"},
 	{Table: "instance_signature_capability", KeysetColumn: "host", Column: "host"},
+	{Table: "instance_gone_suspension", KeysetColumn: "host", Column: "host"},
 	{Table: "emoji", KeysetColumn: "id", Column: "host"},
 	{Table: "following", KeysetColumn: "id", Column: "followerHost"},
 	{Table: "following", KeysetColumn: "id", Column: "followeeHost"},
@@ -81,6 +82,9 @@ var metaHostColumns = []HostColumn{
 	{Table: "meta", KeysetColumn: "id", Column: "mediaSilencedHosts"},
 	{Table: "meta", KeysetColumn: "id", Column: "federationHosts"},
 	{Table: "meta", KeysetColumn: "id", Column: "smtpHost"},
+	// 連合のルール (#3090) の条件。meta の *Hosts と同じく後方一致のパターンで、
+	// 保存時に正規化している。
+	{Table: "federation_rule", KeysetColumn: "id", Column: "hosts"},
 }
 
 // HostBackfillResult reports the outcome of one keyset batch.
@@ -102,11 +106,17 @@ type HostConflict struct {
 }
 
 // BackfillHostColumnBatch normalizes one keyset batch of a remote-host column
-// with idna.ToASCII(lowercase) (UTS#46).
+// to the form hostFromURI now produces (UTS#46 mapping + punycode, lowercase).
+//
+// **mapping 無しで punycode 化した旧形式も畳み直す** (`idnhost.RepairLegacyPuny`)。
+// 以前の `Puny` は UTS#46 の文字対応付けをしなかったので、`https://ｅｖｉｌ.example/`
+// の actor が `xn--qi7ciaj2b.example` として保存されていた。接続先は
+// `evil.example` なので、この行は blockedHosts の `evil.example` に当たらない。
+// 正当な IDN の行 (`xn--eckve.example`) は同じ値に戻るので触らない。
 //
 // **`hostFromURI` が保存する形と完全には一致しない。** あちらは既定ポート
 // (`https://h:443` の `:443`) も剥がすようになったが、この backfill は
-// `idnhost.Puny` しか掛けないのでポートを落とさない。過去に `h:443` の形で
+// host の正規化しか掛けないのでポートを落とさない。過去に `h:443` の形で
 // 保存された行は、これを流しても `h` にはならない。
 //
 // 既存行は `url.Parse` の生の host で保存されており、`Mixed.Example` のような
@@ -163,7 +173,7 @@ func BackfillHostColumnBatch(db *gorm.DB, col HostColumn, fromKey string, batchS
 	for _, r := range rows {
 		res.Scanned++
 		res.LastKey = r.Key
-		normalized := idnhost.Puny(r.Host)
+		normalized := idnhost.RepairLegacyPuny(r.Host)
 		if normalized == r.Host {
 			continue
 		}

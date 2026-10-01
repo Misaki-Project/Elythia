@@ -23,6 +23,7 @@ import (
 	"github.com/shiroha-a/mk/internal/activitypub"
 	"github.com/shiroha-a/mk/internal/activitypub/mfm"
 	coredrive "github.com/shiroha-a/mk/internal/core/drive"
+	"github.com/shiroha-a/mk/internal/core/fedrule"
 	corenote "github.com/shiroha-a/mk/internal/core/note"
 	"github.com/shiroha-a/mk/internal/misc/colfit"
 	"github.com/shiroha-a/mk/internal/misc/hashtag"
@@ -380,6 +381,8 @@ type PublickeyExtraStore interface {
 // する。エントリは actorTTL を超えると miss として扱い、次回 ResolveActor 時
 // にリフレッシュされる。
 type Resolver struct {
+	// rules は連合のルール (#3090)。nil なら評価しない。
+	rules    RuleEvaluator
 	userRepo repository.UserRepository
 	noteRepo repository.NoteRepository
 	urls     *activitypub.URLBuilder
@@ -417,11 +420,6 @@ type Resolver struct {
 	pollVoter     PollVoter                      // optional: AP vote (Note.name) の投票記録
 	emojiRepo     repository.EmojiRepository     // optional: リモート絵文字の永続化
 	driveFileRepo repository.DriveFileRepository // optional: リモート添付の link 化
-	// imageProbeClient は image attachment の dimension probe (#461) で
-	// 使う outbound HTTP client。SSRF-safe transport (router.go で
-	// safehttp.NewSSRFSafeTransport を適用したもの) を渡す前提で、
-	// 未設定なら probe 自体をスキップする (安全側に倒す: SSRF リスクを
-	// 起こすくらいなら properties 空のまま運用)。
 	// ephemeralSink はリレー経由でしか観測しない投稿の置き場 (#2332)。
 	// 設定が有効かつ配線されているときだけ、DB ではなくこちらへ書く。
 	ephemeralSink EphemeralSink
@@ -430,8 +428,12 @@ type Resolver struct {
 	// ephemeralTimeline は DB 行が ephemeral を上書きしたときに FTT から旧 ID
 	// を除くためのもの。残すと hydrate で ephemeral 側が拾われ二重表示になる。
 	ephemeralTimeline EphemeralTimelineRemover
-	imageProbeClient  *http.Client
-	// probeBudget は 1 document 分の dimension probe に許す合計時間。0 なら
+	// attachmentProbeClient は添付の先頭取得 (#461 / #3243) で使う outbound
+	// HTTP client。SSRF-safe transport (router.go で safehttp の transport を
+	// 適用したもの) を渡す前提で、未設定なら取得自体をスキップする (安全側に
+	// 倒す: SSRF リスクを起こすくらいなら申告と推測だけで登録する)。
+	attachmentProbeClient *http.Client
+	// probeBudget は 1 document 分の先頭取得に許す合計時間。0 なら
 	// attachmentProbeBudget を使う (テストだけが縮める)。
 	probeBudget time.Duration
 	// hostBlocker は federation 設定 (none / specified / blockedHosts) を
@@ -441,6 +443,9 @@ type Resolver struct {
 	// (全 host 許可) にフォールバック。
 	hostBlocker HostBlockChecker
 
+	// mediaSilencedChecker は meta.mediaSilencedHosts の判定 (#3218)。未配線なら
+	// 添付をセンシティブにしない。
+	mediaSilencedChecker MediaSilencedHostChecker
 	// silencedChecker は remote note ingest 時に meta.silencedHosts 該当 host の
 	// public note を home に降格する判定に使う (#2106 N14)。未配線時は降格しない。
 	silencedChecker SilencedHostChecker
@@ -650,14 +655,14 @@ func (r *Resolver) SetEmojiRepo(repo repository.EmojiRepository) {
 	r.emojiRepo = repo
 }
 
-// SetImageProbeClient attaches an SSRF-safe *http.Client used by the
-// attachment dimension probe (#461). The supplied client must wrap a
-// transport with safehttp.NewSSRFSafeTransport(...) — otherwise a
-// malicious remote can point a Document URL at internal addresses
-// (cloud metadata, localhost services). nil 渡しは無効化と同義で、
-// その場合 dimension probe はスキップされ properties は空のまま。
-func (r *Resolver) SetImageProbeClient(client *http.Client) {
-	r.imageProbeClient = client
+// SetAttachmentProbeClient attaches an SSRF-safe *http.Client used to read
+// the leading bytes of remote attachments (type, filename and image
+// dimensions; #461 / #3243). The supplied client must wrap a transport with
+// safehttp.NewSSRFSafeTransport(...) — otherwise a malicious remote can point
+// a Document URL at internal addresses (cloud metadata, localhost services).
+// nil 渡しは無効化と同義で、その場合は AP の申告と URL からの推測だけで登録する。
+func (r *Resolver) SetAttachmentProbeClient(client *http.Client) {
+	r.attachmentProbeClient = client
 }
 
 // SetDriveFileRepo attaches a DriveFileRepository for ingesting AP
@@ -679,6 +684,65 @@ func (r *Resolver) SetHostBlockChecker(c HostBlockChecker) {
 // *instance.Service implements it (IsSilenced).
 type SilencedHostChecker interface {
 	IsSilenced(host string) bool
+}
+
+// MediaSilencedHostChecker reports whether a host is in meta.mediaSilencedHosts.
+type MediaSilencedHostChecker interface {
+	IsMediaSilenced(host string) bool
+}
+
+// SetMediaSilencedHostChecker attaches the meta.mediaSilencedHosts checker
+// used to mark remote attachments sensitive (#3218).
+func (r *Resolver) SetMediaSilencedHostChecker(c MediaSilencedHostChecker) {
+	r.mediaSilencedChecker = c
+}
+
+// isMediaSilencedHost reports whether host is in meta.mediaSilencedHosts
+// (未配線 / host 無しは false)。
+func (r *Resolver) isMediaSilencedHost(host *string) bool {
+	return host != nil && *host != "" && r.mediaSilencedChecker != nil && r.mediaSilencedChecker.IsMediaSilenced(*host)
+}
+
+// noteEmojisFor returns the custom emojis a note may use.
+//
+// upstream の NoteCreateService は、投稿者のホストがメディアサイレンス対象なら
+// 投稿の emojis を空にする (#3220。`NoteCreateService.ts:607`)。絵文字の行は
+// その前に ApNoteService.extractEmojis が作るので、`upsertEmojis` は呼んだまま
+// 投稿に載せる名前だけを落とす。**空は nil ではなく空配列** (note.emojis は
+// NOT NULL で、Updates の map 経由だと nil が NULL になる)。
+func (r *Resolver) noteEmojisFor(emojis model.StringArray, host *string) model.StringArray {
+	if r.isMediaSilencedHost(host) {
+		return model.StringArray{}
+	}
+	return emojis
+}
+
+// markMediaSilencedFiles marks the attachments of a note by a media-silenced
+// host sensitive.
+//
+// upstream は `DriveService.addFile` で、リンクだけのリモートファイルにも
+// `isMediaSilencedHost` を当てて `isSensitive = true` にする (#3218)。mk-go の
+// 添付は `upsertAttachments` が drive を通さずに作るので、ここで同じことをする。
+// `maybeSensitive` は upstream でも検出の結果なので触らない。
+//
+// 書き換えるのは投稿者自身の行と、**持ち主のホストもメディアサイレンス対象の行**
+// (本来センシティブであるべき行なので、書き換えを悪用される経路にならない)。
+// upstream は投稿者ごとに行を作る (`addFile` の dedup は md5 + userId) ので必ず
+// 投稿者の行に当たるが、mk-go は URL で再利用するので他人の行を指しうる。他人の
+// 行は書き換えない (#3090 と同じ理由。URL を指すだけで他人のファイルを書き換え
+// られる)。**書き換えられない添付が残ったら false を返す** — 呼び出し側は投稿ごと
+// 空の CW で畳む (そのままだと他人の URL を指すだけでメディアサイレンスを
+// すり抜けられる)。再利用する投稿者自身の行にも当てるのは upstream に無い
+// 挙動で、設定する前に取り込んだ画像を同じ人が添付し直すとそのまま表示される
+// のを防ぐ。
+func (r *Resolver) markMediaSilencedFiles(ids model.StringArray, authorID string, host *string) bool {
+	if !r.isMediaSilencedHost(host) {
+		return true
+	}
+	ownerSilenced := func(f *model.DriveFile) bool {
+		return f.UserHost != nil && *f.UserHost != "" && r.mediaSilencedChecker.IsMediaSilenced(*f.UserHost)
+	}
+	return r.markAuthorFiles(ids, authorID, ownerSilenced, map[string]any{"isSensitive": true})
 }
 
 // SetSilencedHostChecker attaches the meta.silencedHosts checker used to demote
@@ -3002,6 +3066,26 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 			"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "actor", actor.ID)
 		return nil, false, nil
 	}
+	// 連合のルール (#3090)。禁止語と同じく**行を作る前**に評価する。ここより後ろは
+	// 返信先・引用先の取得や添付の登録で行を書くので、拒否するものはここで落とす。
+	// 取り込みの全経路 (inbox の Create、Announce 先・返信先・引用先の取得、
+	// リレー) がこの関数を通るので、ブースト経由で入ってくる投稿にも効く。
+	var ruleDecision fedrule.Decision
+	if r.rules != nil && r.rules.HasNoteRules() {
+		hasAttachment := len(extractAttachments(apNote.Attachment, apNote.Sensitive.Bool())) > 0
+		in := noteRuleFacts(actor, note.Text, note.CW, &apNote, hasAttachment)
+		in.Actor = r.rules.ActorFacts(actor)
+		ruleDecision = r.rules.EvaluateNote(in)
+		if ruleDecision.Reject {
+			slog.Info("federation: dropping inbound note rejected by a federation rule",
+				"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "actor", actor.ID)
+			return nil, false, nil
+		}
+		// silence と同じ形でタイムラインから外す (public → home)。
+		if ruleDecision.Unlist && note.Visibility == model.NoteVisibilityPublic {
+			note.Visibility = model.NoteVisibilityHome
+		}
+	}
 	// 返信先がローカルに存在すれば紐付ける。リモート返信先の解決は後続 phase で
 	// 対応するため、現状では nil のままにする。
 	var replyTarget *model.Note
@@ -3151,7 +3235,7 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	}
 	// AP Note Tag配列からカスタム絵文字を抽出してDBにupsert
 	if actor.Host != nil {
-		note.Emojis = r.upsertEmojis(extractEmojiTags(apNote.Tag), *actor.Host)
+		note.Emojis = r.noteEmojisFor(r.upsertEmojis(extractEmojiTags(apNote.Tag), *actor.Host), actor.Host)
 	}
 	// hashtag は AP `tag` 配列の Hashtag entry と本文 / CW の両方から拾い、
 	// hashtag.ExtractNoteTags で case-insensitive dedup + 件数 cap + 長さ判定を
@@ -3169,9 +3253,26 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	if tags := hashtag.ExtractNoteTags(hashtagSources...); len(tags) > 0 {
 		note.Tags = model.StringArray(tags)
 	}
+	// ルールの CW は tag を抜いた**後**に付ける。前に付けると、管理者の書いた
+	// 文言の hashtag がその投稿の tag として集計される。
+	if cw := ruleCW(ruleDecision, note.CW); cw != nil {
+		note.CW = cw
+	}
 	// AP `attachment` 配列を drive_file 行に upsert (#378)。link 形式のみで
 	// 実 fetch はせず、frontend が drive_file.url 経由で remote 取得する。
-	note.FileIDs = r.upsertAttachments(extractAttachments(apNote.Attachment, apNote.Sensitive.Bool()), &actor.ID, actor.Host)
+	note.FileIDs = r.upsertAttachments(applyRulesToAttachments(ruleDecision,
+		extractAttachments(apNote.Attachment, apNote.Sensitive.Bool())), &actor.ID, actor.Host)
+	// ルールを先に当てる (後に回すと、メディアサイレンスで isSensitive だけ立った
+	// 行を「済み」として飛ばし、ルールの maybeSensitive が付かない)。
+	folded := ruleDecision.Sensitive && !r.markFilesSensitive(note.FileIDs, actor.ID)
+	if !r.markMediaSilencedFiles(note.FileIDs, actor.ID, actor.Host) {
+		folded = true
+	}
+	if folded {
+		if cw := foldCW(note.CW); cw != nil {
+			note.CW = cw
+		}
+	}
 	if len(note.FileIDs) > 0 {
 		// AttachedFileTypes は MIME type の配列 (TS との互換性)。
 		note.AttachedFileTypes = r.collectAttachedFileTypes(note.FileIDs)
@@ -3448,7 +3549,8 @@ func (r *Resolver) UpdateRemoteQuestion(object json.RawMessage, actorURI string)
 //     (`upsertAttachments` が**新規に作る** `drive_file` の `isSensitive` /
 //     `maybeSensitive` に書く。既知 URL の添付は URI で dedup して `continue`
 //     する (関数から抜けるのではなく次の添付へ進む) ので、**保存済みの添付の
-//     NSFW は Update では変わらない**)
+//     NSFW は送信者の sensitive では変わらない**。例外は連合のルール (#3090) の
+//     「センシティブにする」で、投稿者自身の保存済みの行にも立てる)
 //   - **書き込みは note の列だけではない。** 同じ呼び出しで `drive_file` /
 //     `emoji` / hashtag の行が作られ、**`emoji` と hashtag は既存行も書き換わる**
 //     — `upsertEmojis` は同名 + 同 host の行の `originalUrl` / `publicUrl` /
@@ -3555,14 +3657,49 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 	if newText != "" {
 		effectiveText = &newText
 	}
-	effectiveCW := existing.CW
-	if newCW != nil {
-		effectiveCW = newCW
-	}
+	// **CW は受け取った Update を正とする** (#3090)。Update は投稿全体を送り直す
+	// ものなので、summary が無ければ CW は外れている。以前は「変えない」として
+	// 保存済みの値を使っていたが、保存済みの CW には連合のルールが付けた文言も
+	// 入るので、それが送信者の CW として tag に拾われ、パターンや禁止語の判定にも
+	// 混ざって以後の編集が全部弾かれた (#3090 の敵対的レビューで実測)。ルールの
+	// CW は、当たれば下で付け直す。
+	effectiveCW := newCW
 	if r.containsProhibitedWords(effectiveText, effectiveCW, nil) {
 		slog.Info("federation: dropping inbound note update containing prohibited words",
 			"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "noteId", existing.ID)
 		return existing, nil
+	}
+	// 連合のルール (#3090) も編集に掛ける。掛けないと「条件に当たらない投稿を
+	// 作ってから Update で差し替える」で素通りできる。判定は更新後の値で行う。
+	var ruleDecision fedrule.Decision
+	if r.rules != nil && r.rules.HasNoteRules() {
+		author, aerr := r.noteAuthorForRules(existing.UserID)
+		if aerr != nil {
+			// 投稿者を引けないと bot / 新規の条件を判定できない。取り込みを
+			// やり直させる (黙って素通しにしない)。
+			return nil, fmt.Errorf("update remote note: rule author: %w", aerr)
+		}
+		hasAttachment := len(extractAttachments(apNote.Attachment, apNote.Sensitive.Bool())) > 0
+		in := noteRuleFacts(author, effectiveText, effectiveCW, &apNote, hasAttachment)
+		if in.Host == "" && existing.UserHost != nil {
+			in.Host = strings.ToLower(*existing.UserHost)
+		}
+		in.Actor = r.rules.ActorFacts(author)
+		in.Update = true
+		// 「初めて見てから N 時間以内」は投稿した時刻で測る (fedrule.NoteInput.At)。
+		if t, err := r.idGen.ParseTime(existing.ID); err == nil {
+			in.At = t
+		}
+		ruleDecision = r.rules.EvaluateNote(in)
+		if ruleDecision.Reject {
+			slog.Info("federation: dropping inbound note update rejected by a federation rule",
+				"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "noteId", existing.ID)
+			return existing, nil
+		}
+		if ruleDecision.Unlist && existing.Visibility == model.NoteVisibilityPublic {
+			fields["visibility"] = model.NoteVisibilityHome
+			existing.Visibility = model.NoteVisibilityHome
+		}
 	}
 	if newText != "" {
 		fields["text"] = &newText
@@ -3593,7 +3730,7 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 		fields["mentions"] = mentions
 		existing.Mentions = mentions
 	}
-	if newCW != nil {
+	if !pointerStringsEqual(existing.CW, newCW) {
 		fields["cw"] = newCW
 		existing.CW = newCW
 	}
@@ -3606,7 +3743,7 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 	// AP Note Tag配列からカスタム絵文字を抽出してDBにupsert
 	// 既存値と比較して変化があった場合のみfieldsに含める
 	if existing.UserHost != nil {
-		emojis := r.upsertEmojis(extractEmojiTags(apNote.Tag), *existing.UserHost)
+		emojis := r.noteEmojisFor(r.upsertEmojis(extractEmojiTags(apNote.Tag), *existing.UserHost), existing.UserHost)
 		if !slices.Equal([]string(existing.Emojis), []string(emojis)) {
 			fields["emojis"] = emojis
 			existing.Emojis = emojis
@@ -3641,11 +3778,28 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 		fields["tags"] = noteTags
 		existing.Tags = noteTags
 	}
+	// ルールの CW は tag を抜いた後に付ける (取り込み側と同じ理由)。
+	if cw := ruleCW(ruleDecision, existing.CW); cw != nil {
+		fields["cw"] = cw
+		existing.CW = cw
+	}
 	// AP `attachment` 配列の差分を反映する (#378)。driveFileRepo 未設定時は
 	// upsertAttachments が空 slice を返すので何もしない (= 既存 fileIDs を
 	// 誤って空に上書きしない、Devin #400 #1)。
 	if r.driveFileRepo != nil {
-		fileIDs := r.upsertAttachments(extractAttachments(apNote.Attachment, apNote.Sensitive.Bool()), &existing.UserID, existing.UserHost)
+		fileIDs := r.upsertAttachments(applyRulesToAttachments(ruleDecision,
+			extractAttachments(apNote.Attachment, apNote.Sensitive.Bool())), &existing.UserID, existing.UserHost)
+		// ルールを先に当てる (取り込み側と同じ理由)。
+		folded := ruleDecision.Sensitive && !r.markFilesSensitive(fileIDs, existing.UserID)
+		if !r.markMediaSilencedFiles(fileIDs, existing.UserID, existing.UserHost) {
+			folded = true
+		}
+		if folded {
+			if cw := foldCW(existing.CW); cw != nil {
+				fields["cw"] = cw
+				existing.CW = cw
+			}
+		}
 		if !slices.Equal([]string(existing.FileIDs), []string(fileIDs)) {
 			fields["fileIds"] = model.StringArray(fileIDs)
 			existing.FileIDs = model.StringArray(fileIDs)
@@ -4197,11 +4351,10 @@ func hostFromURI(uri string) (string, error) {
 }
 
 // punyHost normalizes a host for comparison the way upstream
-// UtilityService.toPuny does (idna.ToASCII(lowercase), UTS#46)。Unicode IDN と
+// UtilityService.toPuny does (UTS#46 mapping + punycode, lowercase)。Unicode IDN と
 // punycode の mixed-form (例: `パイ.example` vs `xn--eckve.example`) を同一視
-// するため host 一致比較の両辺に適用する (#1850)。idna が失敗する不正入力のみ
-// 小文字化で返す (Go default の lenient UTS#46 profile では port 付き host も
-// 成功し ASCII tail はそのまま残るため、fallback は実質ほぼ発生しない)。これは
+// するため host 一致比較の両辺に適用する (#1850)。規則は `idnhost.Puny` が持つ
+// (Go の HTTP client が実際に dial する名前 = `idna.Lookup` と同じ形)。これは
 // 保存側 (`hostFromURI`) も #2706 で同じ正規化を掛けるようになったので、両者は
 // 同じ値を作る。punyHost が今も要るのは、**外から渡ってくる acct や actor の host**
 // を保存形と同じ正規形へ揃えるため (読み取り側の両当たりは #2996 で撤去した)。
@@ -4210,8 +4363,8 @@ func hostFromURI(uri string) (string, error) {
 // 保存する (`punyHostPort` が剥がす) が、`punyHost` はポートを見ない。ポートを
 // 含む host を突き合わせるときは `punyHostPort` / `NormalizeGateHost` を使う。
 //
-// なお Go の idna は ideographic/fullwidth dot (U+3002 等) を `.` に畳まない
-// (Node の domainToASCII と異なるが、別 authority を同一視しない安全側)。
+// 全角英字・句点類 (U+3002 等)・soft hyphen も畳む。畳まないと接続先は同じなのに
+// 表記だけ違う host が blockedHosts を素通りする (`idnhost.Puny` の doc)。
 func punyHost(host string) string { return idnhost.Puny(host) }
 
 // finalURLFetcher は redirect 後の最終 URL も返せる fetcher。本番 APFetcher が
@@ -4232,6 +4385,39 @@ func (r *Resolver) fetchObjectWithFinalURL(uri string) ([]byte, string, error) {
 	}
 	body, err := r.fetcher.FetchObject(uri)
 	return body, "", err
+}
+
+// FetchNoteForVerification fetches a remote Note without ingesting it and
+// returns it with the same host checks as ResolveNote (#3234).
+//
+// **取り込まない。** QuoteRequest の instrument を確かめるためだけに読む。ここで
+// 取り込むと、後から届く Create が「既にある」(created=false) になり、引用の
+// 通知と chart のフックが飛ばされる (#2686 と同じ形)。
+func (r *Resolver) FetchNoteForVerification(uri string) (*activitypub.Note, error) {
+	// ResolveNote の fetch 経路 (resolveNoteOnce) と同じ検査を当てる: 連合の
+	// 許可、AS の @context、取得した id と応答したホスト、要求したホストの一致。
+	if !r.hostAllowedForURI(uri) {
+		return nil, ErrHostNotAllowed
+	}
+	body, finalURL, err := r.fetchObjectWithFinalURL(uri)
+	if err != nil {
+		return nil, err
+	}
+	var note activitypub.Note
+	if err := json.Unmarshal(body, &note); err != nil {
+		return nil, fmt.Errorf("fetch note for verification: %w", ErrInvalidNote)
+	}
+	if !hasActivityStreamsContext(note.Context) {
+		return nil, ErrInvalidNote
+	}
+	note.ID = trimWHATWGURL(note.ID)
+	if err := assertResponseHostMatches(finalURL, note.ID); err != nil {
+		return nil, err
+	}
+	if err := assertRequestHostMatches(uri, note.ID); err != nil {
+		return nil, err
+	}
+	return &note, nil
 }
 
 // hasActivityStreamsContext reports whether a fetched AP object's `@context`
@@ -4445,9 +4631,9 @@ func NormalizeGateHost(rawURL string) string {
 //
 // **upstream に上限は無い** (`ApNoteService` は `toArray(note.attachment)` を
 // そのまま回す) が、mk-go では 1 件につき `drive_file` の SELECT + INSERT と、
-// `mediaType` が `image/*` で width/height が欠けていれば**外向き GET** が
-// 直列に走る。上限が無いと、署名付き POST 1 通 (inbox の body 上限 64 KiB に
-// 添付 900 件が収まる) で inbox worker を数十分占有できる。
+// 未取り込みの添付なら先頭取得の**外向き GET** (#3243) が直列に走る。上限が
+// 無いと、署名付き POST 1 通 (inbox の body 上限 64 KiB に添付 900 件が
+// 収まる) で inbox worker を数十分占有できる。
 //
 // 値はローカルの受け入れ上限に揃える — `notes/create` の paramDef は
 // `fileIds: maxItems 16` (upstream も同値、`validateCreateInput` 参照)。
@@ -4738,8 +4924,8 @@ func isForeignKeyViolation(err error) bool {
 }
 
 // upsertAttachments persists each AP Document as a drive_file row (link
-// 形式、isLink=true、実 fetch なし) and returns the resulting drive_file IDs
-// in original order. URI による dedup を行うので、同じ remote attachment が
+// 形式、isLink=true、実体は保存せず先頭だけ取得する #3243) and returns the
+// resulting drive_file IDs in original order. URI による dedup を行うので、同じ remote attachment が
 // 複数の note に紐付いても drive_file は 1 行のみ。
 //
 // driveFileRepo が未設定なら空 (model.StringArray{}) を返す (旧挙動)。userID は
@@ -4751,14 +4937,19 @@ func isForeignKeyViolation(err error) bool {
 // `validateFileName` の不合格は `untitled`)。
 //
 // **upstream は実体を download して名前を決める** (Content-Disposition があれば
-// それを優先する) が、mk-go は実体を保存しない (docs/divergence.md 5.5) ので
-// URL の basename だけを使う。**拡張子の補完もしない** — upstream が付けるのは
+// それを優先する)。mk-go は実体を保存しない (docs/divergence.md 5.5) が、先頭を
+// 取得して Content-Disposition を見る (probeAttachment、#3243)。これは
+// Content-Disposition から名前が取れなかったときの fallback — 取得の失敗、
+// ヘッダ無し、名前の不合格 (制御文字・bidi 制御文字を含む)、エラーページと
+// 判断して取得結果を捨てた場合。**拡張子の補完はしない** — upstream が付けるのは
 // 実体を sniff した型であって、相手の申告した mediaType ではないため。
 //
-// 結果が upstream とずれるのは 4 つ。(1) Content-Disposition で filename を返す
-// 配信元。**Misskey 同士ではここでずれる** — upstream は自分が配信するファイルに
-// `Content-Disposition: inline; filename=...` を付ける (object storage / 自 host
-// 配信のどちらも) ので、upstream 側は原ファイル名を採る。(2) 拡張子の補完。
+// 結果が upstream とずれるのは 4 つ。(1) この fallback に落ちたとき。取得に
+// 失敗した添付では Content-Disposition の名前を使えない (**Misskey 同士では
+// ここでずれる** — upstream は自分が配信するファイルに
+// `Content-Disposition: inline; filename=...` を付けるので、upstream 側は原ファイル
+// 名を採る)。名前が不合格のとき upstream は `untitled` にする。Latin-1 の名前は
+// upstream だけが decode する (詳細は docs/divergence.md)。(2) 拡張子の補完。
 // (3) Go の `net/url` は WHATWG URL の正規化をしないので `/a/%2e%2e` (upstream は
 // 畳んで `untitled`) と `/a\b.png` (upstream は `\` を区切り扱いにして `b.png`) が
 // ずれる。(4) upstream は `name === comment` のとき comment を落とすが mk-go は
@@ -4795,8 +4986,8 @@ func (r *Resolver) upsertAttachments(docs []activitypub.Document, userID, host *
 		return model.StringArray{}
 	}
 	ids := make(model.StringArray, 0, len(docs))
-	// dimension probe の予算は**この呼び出し全体**で 1 つ。添付ごとの
-	// `imageFetchTimeout` は 1 本の GET しか縛らないので、直列に積まれると
+	// 先頭取得 (probe) の予算は**この呼び出し全体**で 1 つ。添付ごとの
+	// `attachmentFetchTimeout` は 1 本の GET しか縛らないので、直列に積まれると
 	// 件数分だけ待たされる (attachmentProbeBudget の説明を参照)。
 	//
 	// **ジョブの ctx は届かない。** IngestNote / upsertAttachments は ctx を
@@ -4831,15 +5022,25 @@ func (r *Resolver) upsertAttachments(docs []activitypub.Document, userID, host *
 			continue
 		}
 		now := r.clock()
-		// `drive_file.type` は varchar(128)。**切ると別の MIME type になる**ので、
-		// 収まらなければ既定値に倒す (#2723)。
-		mediaType := doc.MediaType
-		if mediaType == "" || !fitsColumn(mediaType, driveFileTypeMaxRunes) {
-			mediaType = "application/octet-stream"
+		// 先頭を 1 回だけ取得して、形式・名前・画像の寸法をまとめて読む (#3243)。
+		// AP の申告だけで決めると、`mediaType` を持たない実装 (画像なのに
+		// octet-stream になる) や、URL にファイル名を持たない実装 (名前が UUID や
+		// API のパスになる) で壊れる。取得できなければ申告と推測に倒す。
+		var probed attachmentProbe
+		if r.attachmentProbeClient != nil {
+			probed, _ = probeAttachment(probeCtx, r.attachmentProbeClient, doc.URL)
 		}
+		// メディアを名乗るのに文書が返ったら、200 のエラーページを読んだと
+		// みなして取得結果ごと捨てる (形式だけでなく名前もエラーページのもの)。
+		if claimsMedia(doc.MediaType, doc.Type) && isDocumentMIME(probed.MIME) {
+			probed = attachmentProbe{}
+		}
+		// `drive_file.type` は varchar(128)。**切ると別の MIME type になる**ので、
+		// 収まらない申告は採らない (#2723)。
+		mediaType := resolveAttachmentMIME(probed.MIME, doc.MediaType, doc.Type, doc.URL)
 		// AP の `name` は**代替テキスト**なので `comment` (varchar(512)) に入れる。
-		// `name` (varchar(256)) は URL から作る — upstream の `uploadFromUrl` と
-		// 同じ置き場にする (#2723)。
+		// `name` (varchar(256)) は Content-Disposition か URL から作る — upstream の
+		// `uploadFromUrl` と同じ置き場・同じ順にする (#2723)。
 		//
 		// **comment は列の上限で切る。** 説明が長い添付は入らず 22001 で落ち、
 		// **その添付が丸ごと保存されない** (#2717)。rune 単位で切る — byte で
@@ -4847,7 +5048,10 @@ func (r *Resolver) upsertAttachments(docs []activitypub.Document, userID, host *
 		// **NUL も落とす。** 長さだけ直しても、制御文字が混じると 22021 で
 		// 同じく添付が丸ごと落ちる (#2721 review MEDIUM-1)。
 		safeName := sanitizeRemoteText(doc.Name)
-		name := attachmentFileName(doc.URL)
+		name := probed.FileName
+		if name == "" {
+			name = attachmentFileName(doc.URL)
+		}
 		var comment *string
 		if safeName != "" {
 			cn := truncateRunes(safeName, driveFileCommentMaxRunes)
@@ -4871,9 +5075,9 @@ func (r *Resolver) upsertAttachments(docs []activitypub.Document, userID, host *
 			StoredInternal: false,
 		}
 		// AP Document に乗ってきた metadata を可能な限り永続化する
-		// (#460 thumbnail / #461 properties)。link-format なので実体
-		// 画像解析はしないが、remote 側が宣言している width/height/
-		// icon/blurhash を信頼してそのまま保存する。
+		// (#460 thumbnail / #461 properties)。link-format なので実体は
+		// 保存しない。width/height は宣言を優先し、欠けていれば先頭取得で
+		// 読んだ画像ヘッダの値で埋める。icon/blurhash は宣言をそのまま使う。
 		// thumbnail / blurhash は**表示の補助でしかない**ので、列
 		// (varchar(512) / varchar(128)) に入らなければ値ごと捨てて添付は残す。
 		if doc.Icon != nil && doc.Icon.URL != "" {
@@ -4884,19 +5088,14 @@ func (r *Resolver) upsertAttachments(docs []activitypub.Document, userID, host *
 		width := doc.Width
 		height := doc.Height
 		// 上流 Misskey TS の renderDocument は width/height を AP に
-		// 載せないため、image MIME の場合は best-effort で URL を
-		// fetch して画像ヘッダから dimensions を復元する。失敗時は
-		// 0/0 のまま属性 JSON を空にしておき、表示側のフォールバック
-		// に任せる。タイムアウト 3s で inbox 全体は止めない。
-		if (width == 0 || height == 0) && strings.HasPrefix(mediaType, "image/") && r.imageProbeClient != nil {
-			if w, h, ok := probeImageDimensions(probeCtx, r.imageProbeClient, doc.URL); ok {
-				if width == 0 {
-					width = w
-				}
-				if height == 0 {
-					height = h
-				}
-			}
+		// 載せないため、先頭取得で読めた画像ヘッダの寸法で埋める。取得
+		// できなければ 0/0 のまま属性 JSON を空にしておき、表示側の
+		// フォールバックに任せる。
+		if width == 0 {
+			width = probed.Width
+		}
+		if height == 0 {
+			height = probed.Height
 		}
 		if width > 0 || height > 0 {
 			// upstream Misskey は properties JSON を `{width, height}` で

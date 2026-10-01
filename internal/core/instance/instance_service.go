@@ -6,15 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
 	"gorm.io/gorm"
 
 	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/misc/idnhost"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
 )
@@ -24,13 +22,6 @@ import (
 // (autoSuspendedForNotResponding)。upstream DeliverProcessorService の
 // `1000 * 60 * 60 * 24 * 7` (1 週間) と一致する (#1811)。
 const autoSuspendNotRespondingThreshold = 7 * 24 * time.Hour
-
-// hostMatchCaser folds host names case-insensitively in a Unicode-aware
-// manner. Misskey TS uses String.prototype.toLowerCase() which works on
-// arbitrary Unicode (e.g. \`Ä\` → \`ä\`); strings.ToLower in Go only handles
-// ASCII, so raw IDN representations would diverge between TS and mk-go
-// without this caser. cases.Caser instances are safe for concurrent use.
-var hostMatchCaser = cases.Lower(language.Und)
 
 // Errors returned by Service.
 var (
@@ -49,10 +40,12 @@ type MetadataFetcher interface {
 // for any code that needs to know whether a host is blocked / silenced /
 // suspended, and for refreshing the cached metadata after a fetch.
 type Service struct {
-	repo            repository.InstanceRepository
-	metaRepo        repository.MetaRepository
-	idGen           id.Generator
-	clock           func() time.Time
+	repo     repository.InstanceRepository
+	metaRepo repository.MetaRepository
+	idGen    id.Generator
+	clock    func() time.Time
+	// goneRecorder は goneSuspended になった時刻の記録先 (#3067)。nil なら記録しない。
+	goneRecorder    GoneRecorder
 	metadataFetcher MetadataFetcher
 
 	// mu は suspendCache / requestReceivedCache / lastMetaWarn を保護する。
@@ -374,9 +367,33 @@ func (s *Service) MarkGoneSuspended(host string) error {
 		inst.SuspensionState == model.SuspensionStateManuallySuspended {
 		return nil
 	}
-	return s.repo.UpdateFields(host, map[string]any{
+	if err := s.repo.UpdateFields(host, map[string]any{
 		"suspensionState": string(model.SuspensionStateGoneSuspended),
-	})
+	}); err != nil {
+		return err
+	}
+	// 判定のキャッシュを捨てる。残すと cacheTTL の間、消えた相手へ配送が続く
+	// (管理画面からの停止と同じ扱い)。
+	s.InvalidateSuspendCache(host)
+	// 停止した時刻を残す (#3067)。消えたインスタンスとのフォロー関係を片付ける
+	// 候補を「いつから消えているか」で並べるため。記録に失敗しても停止そのものは
+	// 成立しているので、止めずにログだけ残す (経過日数が不明と表示されるだけ)。
+	if s.goneRecorder != nil {
+		if err := s.goneRecorder.RecordGone(host, s.clock()); err != nil {
+			slog.Warn("instance: record gone suspension failed", "host", host, "err", err)
+		}
+	}
+	return nil
+}
+
+// GoneRecorder stores when an instance became goneSuspended (#3067).
+type GoneRecorder interface {
+	RecordGone(host string, at time.Time) error
+}
+
+// SetGoneRecorder wires where MarkGoneSuspended records the time.
+func (s *Service) SetGoneRecorder(r GoneRecorder) {
+	s.goneRecorder = r
 }
 
 // IsBlocked reports whether the host matches an entry in meta.blockedHosts.
@@ -420,7 +437,8 @@ func (s *Service) ProhibitedWords() []string {
 
 // IsMediaSilenced reports whether the host matches an entry in
 // meta.mediaSilencedHosts. Used by reaction gating to reject custom emoji
-// reactions from media-silenced remote hosts (#1538).
+// reactions from media-silenced remote hosts (#1538) and to mark remote
+// attachments sensitive (#3218).
 func (s *Service) IsMediaSilenced(host string) bool {
 	if host == "" {
 		return false
@@ -442,6 +460,10 @@ type FederationHostSets struct {
 	// SuspendedSoftware は meta.deliverSuspendedSoftware をパースしたもの。
 	// federation/instances 等の softwareSuspended 表示判定に使う (#1732)。
 	SuspendedSoftware []model.SuspendedSoftwareEntry
+	// Federation / FederationHosts は連合モード (`all` / `none` / `specified`) と
+	// `specified` のときの許可リスト。疎通の診断 (#3055) が IsAllowed と同じ判定に使う。
+	Federation      string
+	FederationHosts []string
 }
 
 // FederationHostLists returns the blocked / silenced / media-silenced host
@@ -469,6 +491,8 @@ func (s *Service) FederationHostLists() (FederationHostSets, error) {
 		Silenced:          meta.SilencedHosts,
 		MediaSilenced:     meta.MediaSilencedHosts,
 		SuspendedSoftware: suspended,
+		Federation:        meta.Federation,
+		FederationHosts:   meta.FederationHosts,
 	}, nil
 }
 
@@ -513,7 +537,7 @@ func (s *Service) IsAllowed(host string) bool {
 	case "none":
 		return false
 	case "specified":
-		if !HostMatchesAny(meta.FederationHosts, host) {
+		if !HostMatchesAllowList(meta.FederationHosts, host) {
 			return false
 		}
 	}
@@ -553,7 +577,7 @@ func (s *Service) ShouldSkipDelivery(host string) bool {
 		case "none":
 			return true
 		case "specified":
-			if !HostMatchesAny(meta.FederationHosts, host) {
+			if !HostMatchesAllowList(meta.FederationHosts, host) {
 				return true
 			}
 		}
@@ -595,7 +619,7 @@ func (s *Service) CanFetchOptionalRemoteData(host string) bool {
 	case "none":
 		return false
 	case "specified":
-		if !HostMatchesAny(meta.FederationHosts, host) {
+		if !HostMatchesAllowList(meta.FederationHosts, host) {
 			return false
 		}
 	}
@@ -647,12 +671,20 @@ func (s *Service) evictExpiredLocked(now time.Time) {
 // 呼ぶことで、TTL を待たずに配送可否へ即時反映する (#1407 review)。Service.Suspend
 // 経由だけでなく、admin/federation/update-instance のように instanceRepo を直接
 // 更新する handler からも呼べるよう公開している。
+//
+// 同じホスト名の別ポート (`host:8443`) の判定も `host` の行を見ているので、
+// あわせて捨てる (lookupSuspended の doc)。
 func (s *Service) InvalidateSuspendCache(host string) {
 	if host == "" {
 		return
 	}
 	s.mu.Lock()
 	delete(s.suspendCache, host)
+	for h := range s.suspendCache {
+		if idnhost.BareHost(h) == host {
+			delete(s.suspendCache, h)
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -667,12 +699,28 @@ func (s *Service) SuspendCacheLen() int {
 // lookupSuspended resolves the suspend decision for host directly from the
 // repository. A missing row or lookup error is fail-open (not skipped), matching
 // the previous inline behaviour.
+//
+// **モデレーターが止めたインスタンスは、同じホスト名の別ポートにも効かせる。**
+// instance 行は host 完全一致で引くので、`evil.example` を停止しても actor を
+// `https://evil.example:8443/` で公開し直すだけで別の行 (`evil.example:8443`)
+// になり、配送が再開する。blockedHosts と同じ理屈で、ポートは相手が自由に選べる
+// 値で、同じホスト名の別ポートは同じ運営者の管理下にある。**自動停止
+// (応答なし / gone) は広げない** — そちらは「その authority のサーバーが応答
+// しない」という観測で、同じホストの別ポートで動く別プロセスには当てはまらない。
 func (s *Service) lookupSuspended(host string) bool {
-	inst, err := s.repo.FindByHost(host)
+	if inst, err := s.repo.FindByHost(host); err == nil &&
+		inst.SuspensionState != "" && inst.SuspensionState != model.SuspensionStateNone {
+		return true
+	}
+	bare := idnhost.BareHost(host)
+	if bare == "" || bare == host {
+		return false
+	}
+	inst, err := s.repo.FindByHost(bare)
 	if err != nil {
 		return false
 	}
-	return inst.SuspensionState != "" && inst.SuspensionState != model.SuspensionStateNone
+	return inst.SuspensionState == model.SuspensionStateManuallySuspended
 }
 
 // warnMetaFetchFailed logs a meta-fetch failure at most once per metaWarnEvery
@@ -694,33 +742,33 @@ func (s *Service) warnMetaFetchFailed(host string, err error) {
 }
 
 // HostMatchesAny reports whether host (case-insensitive, Unicode-aware)
-// matches any of the given patterns under Misskey TS's suffix-match rule.
-// A pattern matches if host equals it, or host ends with `.<pattern>`
-// (i.e. host is a subdomain).
+// matches any of the given patterns under Misskey TS's suffix-match rule, for
+// lists that restrict a host (blockedHosts / silencedHosts /
+// mediaSilencedHosts). A pattern matches if host equals it, or host ends with
+// `.<pattern>` (i.e. host is a subdomain).
 //
-// 比較ロジックは TS の \`UtilityService.isBlockedHost\` (および
-// \`isFederationAllowedHost\`) と等価:
+// mediaSilencedHosts だけは upstream の `isMediaSilencedHost` が完全一致なので、
+// mk-go の後方一致はサブドメインにも効く分だけ広い (docs/divergence.md §3-3)。
 //
-//	patterns.some(x => `.${host.toLowerCase()}`.endsWith(`.${x.toLowerCase()}`))
+// Host is also compared with its port and trailing dot removed, so a remote
+// that publishes its actor on a non-default port (`evil.example:8443`) still
+// falls under an `evil.example` entry. See idnhost.MatchesBlockList.
 //
-// host が空文字なら常に false。空 pattern は意図的に skip する (\`host == ""\`
-// ガードが既に効くので "." 単独が任意 host に誤マッチすることは無いが、
-// admin が誤って空エントリを混入させた場合に "全 host を allow / block" に
-// 化けない defensive guard を残す)。
+// host が空文字なら常に false。空 pattern は skip する (admin が誤って空エントリを
+// 混入させた場合に "全 host を block" に化けない defensive guard)。
+//
+// **許可リスト (federationHosts) には使わない。** ポートを落として照合するのは
+// 拒否側だけで、許可側に使うと許可が広がる。HostMatchesAllowList を使うこと。
 func HostMatchesAny(patterns []string, host string) bool {
-	if host == "" {
-		return false
-	}
-	needle := "." + hostMatchCaser.String(host)
-	for _, p := range patterns {
-		if p == "" {
-			continue
-		}
-		if strings.HasSuffix(needle, "."+hostMatchCaser.String(p)) {
-			return true
-		}
-	}
-	return false
+	return idnhost.MatchesBlockList(patterns, host)
+}
+
+// HostMatchesAllowList reports whether host is admitted by a federationHosts
+// style allow list. Same suffix rule as HostMatchesAny, but the port is
+// significant: `good.example` admits only the default-port authority, as in
+// upstream `UtilityService.isFederationAllowedHost`.
+func HostMatchesAllowList(patterns []string, host string) bool {
+	return idnhost.MatchesAllowList(patterns, host)
 }
 
 // Suspend updates the suspensionState column for the host. 引数の state には
