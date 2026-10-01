@@ -105,7 +105,14 @@ func (s *Service) Check() error {
 		return err
 	}
 	// 既に招待制なら何もしない (upstream process() の早期 return)。
-	if meta.DisableRegistration {
+	//
+	// **承認制 (#2557) と「受け付けない」(#3186) のときも何もしない (mk-go 独自)。**
+	// この処理の目的は「審査する人がいない間に、誰でも登録できる状態を残さない」こと。
+	// 承認制は承認するモデレーターがいなければ誰も入れないので、閉じる理由が無い。
+	// しかも disableRegistration だけを立てると承認制の入口 (approvalOpen) まで塞がり、
+	// 承認制と招待制が重なった「どこからも登録できない」状態になる (#2565 が避けている
+	// 組み合わせ)。「受け付けない」は既に全部閉じている。
+	if meta.DisableRegistration || meta.ApprovalRequiredForSignup || meta.RegistrationClosed {
 		return nil
 	}
 
@@ -170,7 +177,7 @@ func (s *Service) Check() error {
 	remainingDays := int(remaining / (24 * time.Hour)) // floor (非負)
 	remainingHours := int(remaining / time.Hour)       // floor (非負)
 	if remainingDays <= warningRemainingDays && remainingHours%warningIntervalHours == 0 {
-		s.notifyInactiveModeratorsWarning(allMods, remainingDays, remainingHours)
+		s.notifyInactiveModeratorsWarning(allMods, remaining, remainingDays, remainingHours)
 	}
 	return nil
 }
@@ -193,7 +200,7 @@ func (s *Service) instanceLangs() []string {
 
 // notifyInactiveModeratorsWarning emails moderators and dispatches the warning
 // SystemWebhook (upstream notifyInactiveModeratorsWarning).
-func (s *Service) notifyInactiveModeratorsWarning(mods []*model.User, remainingDays, remainingHours int) {
+func (s *Service) notifyInactiveModeratorsWarning(mods []*model.User, remaining time.Duration, remainingDays, remainingHours int) {
 	profileByUser := s.profilesByUserID(mods)
 	metaLangs := s.instanceLangs()
 	if s.sendEmail != nil {
@@ -208,7 +215,10 @@ func (s *Service) notifyInactiveModeratorsWarning(mods []*model.User, remainingD
 	}
 	if s.webhook != nil {
 		s.webhook.DispatchSystem("inactiveModeratorsWarning", map[string]any{
+			// 本家の ModeratorInactivityRemainingTime と同じ 3 つ。time は残りの
+			// ミリ秒 (本家は Date の getTime の差) (#3261)。
 			"remainingTime": map[string]any{
+				"time":    remaining.Milliseconds(),
 				"asDays":  remainingDays,
 				"asHours": remainingHours,
 			},

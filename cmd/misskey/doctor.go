@@ -9,6 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/shiroha-a/mk/internal/config"
+	"github.com/shiroha-a/mk/internal/core/dbhealth"
 	"github.com/shiroha-a/mk/internal/core/selfcheck"
 	"github.com/shiroha-a/mk/internal/redislog"
 	"gorm.io/driver/postgres"
@@ -50,6 +51,7 @@ func runDoctor(configPath string) int {
 		deps.DBErr = dbErr
 	} else {
 		deps.DB = db
+		deps.DBHealth = dbhealth.NewService(db, cfg.DBReplications && len(cfg.DBSlaves) > 0).Report
 		defer closeDoctorDB(db)
 	}
 	if rdb := openDoctorRedis(cfg); rdb != nil {
@@ -78,9 +80,9 @@ func countMigrations() int {
 // openDoctorDB dials PostgreSQL with the same settings the server uses.
 // 失敗しても検査は続ける (理由が DBErr 経由で DB の検査結果に載る)。
 func openDoctorDB(cfg *config.Config) (*gorm.DB, error) {
-	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		cfg.DB.Host, cfg.DB.Port, cfg.DB.User, cfg.DB.Pass, cfg.DB.DB)
-	return gorm.Open(postgres.Open(dsn), &gorm.Config{
+	// 本体と同じ config.DSN() を使う。以前は sslmode=disable を直書きしており、
+	// db.extra.ssl を設定した環境では doctor だけが平文で繋いでいた。
+	return gorm.Open(postgres.Open(cfg.DSN()), &gorm.Config{
 		// doctor の出力に gorm のログを混ぜない。読むのは検査結果の表だけ。
 		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
 	})

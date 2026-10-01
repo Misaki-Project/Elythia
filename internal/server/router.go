@@ -77,12 +77,14 @@ import (
 	coreantenna "github.com/shiroha-a/mk/internal/core/antenna"
 	"github.com/shiroha-a/mk/internal/core/avatardecoration"
 	coreblocking "github.com/shiroha-a/mk/internal/core/blocking"
+	corebubbleversus "github.com/shiroha-a/mk/internal/core/bubbleversus"
 	corecaptcha "github.com/shiroha-a/mk/internal/core/captcha"
 	corechannel "github.com/shiroha-a/mk/internal/core/channel"
 	"github.com/shiroha-a/mk/internal/core/chart"
 	"github.com/shiroha-a/mk/internal/core/chart/charthook"
 	corechat "github.com/shiroha-a/mk/internal/core/chat"
 	coreclip "github.com/shiroha-a/mk/internal/core/clip"
+	"github.com/shiroha-a/mk/internal/core/dbhealth"
 	"github.com/shiroha-a/mk/internal/core/deliveryhealth"
 	coredrive "github.com/shiroha-a/mk/internal/core/drive"
 	"github.com/shiroha-a/mk/internal/core/driveusage"
@@ -93,8 +95,10 @@ import (
 	"github.com/shiroha-a/mk/internal/core/event"
 	corefeatured "github.com/shiroha-a/mk/internal/core/featured"
 	corefederation "github.com/shiroha-a/mk/internal/core/federation"
+	"github.com/shiroha-a/mk/internal/core/fedrule"
 	coreflash "github.com/shiroha-a/mk/internal/core/flash"
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
+	"github.com/shiroha-a/mk/internal/core/gonecleanup"
 	corehashtag "github.com/shiroha-a/mk/internal/core/hashtag"
 	coreinstance "github.com/shiroha-a/mk/internal/core/instance"
 	"github.com/shiroha-a/mk/internal/core/iplog"
@@ -107,6 +111,7 @@ import (
 	corenote "github.com/shiroha-a/mk/internal/core/note"
 	corenotification "github.com/shiroha-a/mk/internal/core/notification"
 	corepage "github.com/shiroha-a/mk/internal/core/page"
+	"github.com/shiroha-a/mk/internal/core/passwordguard"
 	corepoll "github.com/shiroha-a/mk/internal/core/poll"
 	"github.com/shiroha-a/mk/internal/core/procstats"
 	corereaction "github.com/shiroha-a/mk/internal/core/reaction"
@@ -508,6 +513,13 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		if st.AssigneeID != nil {
 			out.AssigneeID = *st.AssigneeID
 		}
+		// 未対応の件数 (#3200)。取れなければ件数だけ出さない — 通知そのものは
+		// 状態が引けているので落とさない。
+		if n, err := abuseReportRepoForNotif.CountUnresolved(); err == nil {
+			out.UnresolvedCount = &n
+		} else {
+			slog.Warn("notification: unresolved abuse report count failed", "err", err)
+		}
 		return out, true
 	}
 	followingService.SetNotificationHook(notificationHook)
@@ -712,6 +724,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		UserListRepo:     userListRepo,
 		Drive:            driveService,
 		Notifier:         notificationService,
+		IDGen:            idGen,
 		// custom-emojis export: 全 local emoji を ListLocal で列挙し、各画像を
 		// SSRF-safe client で download して zip 化する (#1217)。画像取得は最大
 		// 60s/個、cap 8 MiB。
@@ -828,12 +841,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	federationResolver.SetPollVoter(pollService)
 	federationResolver.SetEmojiRepo(emojiRepo)
 	federationResolver.SetDriveFileRepo(driveFileRepo)
-	// AP attachment dimension probe (#461) 用 outbound HTTP client。
+	// AP attachment の先頭取得 (#461 / #3243) 用 outbound HTTP client。
 	// SSRF-safe transport で内部 IP / cloud metadata エンドポイントへの
-	// アクセスを拒否する。timeout は単発 image fetch なので apHTTPClient
+	// アクセスを拒否する。timeout は先頭だけの単発 fetch なので apHTTPClient
 	// (30s) より短めの 10s にする。
-	imageProbeClient := s.outboundClient(10 * time.Second)
-	federationResolver.SetImageProbeClient(imageProbeClient)
+	attachmentProbeClient := s.outboundClient(10 * time.Second)
+	federationResolver.SetAttachmentProbeClient(attachmentProbeClient)
 	federationProcessor := corefederation.NewProcessor(federationResolver, followingService, reactionService, noteDeleteService, userRepo, noteRepo)
 	federationProcessor.SetLocalBaseURL(s.config.URL)
 
@@ -850,6 +863,10 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Instance management (Phase 3 Step H)
 	instanceService := coreinstance.NewService(instanceRepo, metaRepo, idGen)
+	// goneSuspended になった時刻を残す (#3067)。消えたインスタンスとのフォロー関係を
+	// 片付ける候補を「いつから消えているか」で並べる。
+	goneInstanceRepo := repository.NewGoneInstanceRepository(s.db)
+	instanceService.SetGoneRecorder(goneInstanceRepo)
 	federationResolver.SetInstanceTracker(instanceService)
 	// #1538: reactionAcceptance gate — role-gated emoji + media-silenced host。
 	// instanceService 生成後 (= 本ブロック) で配線する (reactionService は line ~281
@@ -864,7 +881,21 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// resolver の入口 (fetchActor / resolveNoteOnce / IngestNoteWithCreated) に
 	// 適用する。deliver_service / inboxProcessor と同じ instanceService を共有。
 	federationResolver.SetHostBlockChecker(instanceService)
-	federationResolver.SetSilencedHostChecker(instanceService) // #2106 N14: silenced host の public note を home 降格
+	federationResolver.SetSilencedHostChecker(instanceService)      // #2106 N14: silenced host の public note を home 降格
+	federationResolver.SetMediaSilencedHostChecker(instanceService) // #3218: media silenced host の添付をセンシティブに
+	// 連合のルール (#3090)。ホスト単位の設定 (上の hostBlocker / silenced) に
+	// 追加の層として重ねる。activity のルールは inbox の署名検証の後
+	// (dispatchActivity の入口)、投稿のルールは取り込みの全経路で評価する。
+	fedRuleRepo := repository.NewFederationRuleRepository(s.db)
+	fedRuleHits := fedrule.NewHitStore(s.redis.Default)
+	fedRuleService := fedrule.NewService(fedRuleRepo, fedRuleHits, idGen.ParseTime)
+	federationResolver.SetRuleEvaluator(fedRuleService)
+	federationProcessor.SetRuleEvaluator(fedRuleService)
+	{
+		hitsCtx, stopHits := context.WithCancel(context.Background())
+		fedRuleHits.Start(hitsCtx)
+		s.registerShutdownHook(func(context.Context) { stopHits() })
+	}
 	// 新規 instance row 発見時に nodeinfo を取得して metadata を更新する。
 	// admin/federation/refresh-remote-instance-metadata でも同じ fetcher を
 	// 再利用して on-demand で再取得する (#351 フォロー)。
@@ -943,6 +974,32 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// inbound Follow に対する Accept 返送は processor から直接呼ぶ (original
 	// Follow の id を保持したまま相手に返すため、service 層を経由しない)。
 	federationProcessor.SetInboundFollowAcceptor(followingDeliveryHook)
+	// FEP-044f: リモートからの QuoteRequest に答え、承認の実体を配る (#3234)。
+	quoteAuthorizationRepo := repository.NewNoteQuoteAuthorizationRepository(s.db)
+	quoteRequestHandler := corefederation.NewQuoteRequestHandler(corefederation.QuoteRequestDeps{
+		Notes:     noteRepo,
+		Users:     userRepo,
+		Blocks:    blockingService,
+		Follows:   followingService,
+		Approvals: quoteAuthorizationRepo,
+		FetchNote: federationResolver.FetchNoteForVerification,
+		Respond:   corefederation.NewQuoteRequestDeliveryHook(deliverService, apRenderer),
+		URLs:      apURLs,
+		IDGen:     idGen,
+	})
+	federationProcessor.SetQuoteRequestHandler(quoteRequestHandler)
+	// こちらの引用の承認を取りに行き (ローカル同士は自分で発行)、承認を
+	// quoteAuthorization として配る (#3234 段階 3)。
+	quoteOutbox := corefederation.NewQuoteOutbox(quoteRequestHandler,
+		repository.NewNoteQuoteRequestRepository(s.db), quoteAuthorizationRepo, noteDeliveryHook)
+	noteDeliveryHook.SetQuoteOutbox(quoteOutbox)
+	federationProcessor.SetQuoteAnswerHandler(quoteOutbox)
+	apRenderer.SetQuoteApprovalResolver(quoteOutbox.ApprovalURI)
+	// 保留のまま残った QuoteRequest を毎分確かめて送り直す (#3238)。
+	s.queueServer.Handle(queue.TaskTypeResendQuoteRequests, processors.NewResendQuoteRequestsProcessor(quoteOutbox).Handle)
+	// ブロックした相手の引用に出していた承認を取り消す (#3234 段階 4)。
+	blockingService.SetQuoteRevoker(corefederation.NewQuoteRevoker(quoteAuthorizationRepo, userRepo, noteRepo,
+		corefederation.NewQuoteRequestDeliveryHook(deliverService, apRenderer), noteDeliveryHook, apURLs))
 	reactionService.SetFederationHook(corefederation.NewReactionDeliveryHook(deliverService, apRenderer, apURLs, idGen, userRepo))
 	// local user が remote user を (un)block した際に Block / Undo(Block) を
 	// 相手 inbox へ配信する (#1560)。
@@ -1086,6 +1143,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// IP 照会の監査記録にも保持期間を掛ける (#3106)。**この行が無いと記録が永久に
 	// 残り、`moderation_log` に IP を書くのと変わらなくなる。**
 	cleanGenericProcessor.SetIPLookupLogPruner(repository.NewIPLookupLogRepository(s.db))
+	// 対戦の記録は終局から 30 日で消す (#3232)。
+	cleanGenericProcessor.SetBubbleVersusRecordPruner(repository.NewBubbleVersusRepository(s.db))
 	s.queueServer.Handle(queue.TaskTypeClean, cleanGenericProcessor.Handle)
 
 	// 分割アップロードセッションの GC (#2313): scheduler の cron (*/15) が
@@ -1217,7 +1276,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	inboxHealth := deliveryhealth.NewService(
 		deliveryhealth.NewStoreForDirection(s.redis.Default, deliveryhealth.DirectionInbound),
 		deliveryhealth.DefaultMaxHosts, 0)
+	// 落ちた配送先へのブレーカーと 429 の間隔 (#3048)。状態は Redis に置くので、
+	// queue ノードが複数あっても判断を共有する。管理画面 (Web ノード) からも
+	// 同じ状態を読み、手で閉じる。
+	deliveryBreaker := deliveryhealth.NewBreaker(s.redis.Default)
 	if s.role.RunsQueue() {
+		if deliveryBreaker != nil {
+			deliverProcessor.SetDeliveryBreaker(deliveryBreaker)
+		}
 		deliverProcessor.SetDeliveryTelemetry(deliveryHealth)
 		deliveryHealth.Start(context.Background())
 		s.registerShutdownHook(func(ctx context.Context) { deliveryHealth.Stop(ctx) })
@@ -1920,6 +1986,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	iHandler.SetUserRepo(userRepo)
 	iHandler.SetRoleProvider(roleService)
 	iHandler.SetTOTPReplayGuard(totpReplayGuard)
+	// 現在のパスワードを照合する i/* の照合失敗をアカウント単位で数える。
+	// route ごとの limiter に置くと、token を持つだけの第三者が被害者の
+	// i/regenerate-token を使い切れる (passwordguard の package doc)。
+	passwordFailureGuard := passwordguard.NewRedisGuard(s.redis.Default)
+	iHandler.SetPasswordFailureGuard(passwordFailureGuard)
 	// upstream UserAuthService と同じテスト用バイパス。testMode 以外では無効。
 	coretwofactor.SetTestMode(s.config.TestMode)
 	iHandler.SetRegistryRepo(registryRepo)
@@ -2152,6 +2223,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	notificationsHandler.SetTestNotifier(notificationHook)
 	notificationsHandler.SetRoleLookup(roleNotifLookup)
 	notificationsHandler.SetAbuseReportLookup(abuseNotifStates)
+	notificationsHandler.SetAbuseReportUnresolvedCounter(abuseReportRepoForNotif.CountUnresolved)
 	notificationsHandler.SetEmojiApplicationLookup(emojiApplicationNotifLookup)
 	notificationsHandler.SetSignupApplicationLookup(signupApplicationNotifLookup)
 	// 通知に埋め込む note の files / channel / myReaction を埋める (#2735)。
@@ -2408,6 +2480,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// Create / Announce の activity id (renderer が広告する <note URI>/activity)
 	// の dereference 先 (#2507)。upstream と同じくローカルノート専用。
 	s.echo.GET("/notes/:id/activity", apHandler.NoteActivity)
+	// FEP-044f の承認の実体 (#3234)。
+	apHandler.SetQuoteAuthorizationStore(quoteAuthorizationRepo)
+	s.echo.GET("/notes/:id/quote-authorizations/:authId", apHandler.QuoteAuthorization)
 	// ユーザーフィード (#2345)。upstream ClientServerService と同じく
 	// /@:user.rss / .atom / .json を返す。
 	feedHost := s.config.URL
@@ -2765,6 +2840,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		metaHandler.InvalidateResponseCache()
 		reloadCaptcha()
 	})
+	// 連合のルール (#3090) は受信の経路でスナップショットを持つので、管理画面で
+	// 変えたら他のプロセスにも読み直させる (繋がないと最大 5 分古いルールで
+	// 評価し続ける)。
+	internalPubSub.Subscribe(context.Background(), "federationRulesUpdated", func([]byte) {
+		fedRuleService.Invalidate()
+	})
 
 	// #3037: ロール / ポリシーの cross-worker cache invalidation。更新した
 	// worker は internal:rolesUpdated を publish し、各 worker は受信して自
@@ -2833,6 +2914,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	pollService.SetEventPublisher(noteEventPub)
 	reactionService.SetNoteStreamHook(&reactionNoteStreamAdapter{pub: noteEventPub})
 	noteDeleteService.SetNoteStreamHook(&noteDeleteStreamAdapter{pub: noteEventPub})
+	// 取り消したリノート / 削除した引用の通知を消す (#3201)。**配線しないと build も
+	// テストも通ったまま** 未読件数に中身の無い通知が数えられ続ける。
+	noteDeleteService.SetNotificationHook(notificationHook)
 
 	// 2. Channel registry: Misskey 互換のチャンネル名で各 factory を登録する
 	streamRegistry := stream.NewRegistry()
@@ -2902,7 +2986,25 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		streamManager.SubscribeRelationReload()
 		// broadcast stream (emojiAdded/Updated/Deleted 等) を全 connection へ forward (#2046)。
 		streamManager.SubscribeBroadcast()
+		// 資格情報の失効 (token 再生成 / access token 失効 / 凍結 / 削除) を受けて、
+		// その資格情報で張られた接続を閉じる。publish は失効を処理したプロセスが
+		// 行うので、接続を持つ全プロセスが購読する (mk-go 独自、docs/divergence.md)。
+		streamManager.SubscribeStreamRevoke()
 	}
+	// 失効 event に相乗りして、各プロセスが自分の tokenCache から対象利用者の
+	// entry を落とす。tokenCache はプロセス内の map なので、Web ノードが複数
+	// あると失効を処理したノード以外に旧 token の entry が残り、閉じた接続が
+	// そのノードへ再接続すると無期限に残る。
+	streamManager.OnStreamRevoke(s.auth.InvalidateTokensForUser)
+	// 2 回目の閉じ処理は tokenCache の TTL が切れた後に行う (DB を引いた直後に
+	// 無効化 event を追い越して積まれた entry も、そこで確実に切れている)。
+	streamManager.SetRevokeRecheckDelay(middleware.AuthCacheTTL + 5*time.Second)
+	// WebSocket は接続時に 1 度しか認証しないので、tokenCache を落とすだけでは
+	// 既存の接続が閉じない。失効を扱う handler へ revoke publisher を配る。
+	// 自プロセスの Manager も渡す — publish が失敗しても、ここに居る接続は閉じる。
+	streamRevokePublisher := stream.NewStreamRevokePublisher(streamPubSub, streamManager)
+	iHandler.SetStreamRevoker(streamRevokePublisher)
+	oauthHandler.SetStreamRevoker(streamRevokePublisher)
 	iHandler.SetHardMutePublisher(&hardMutePublisherAdapter{pubsub: streamPubSub})
 	// relation 変更 (#2400) の publisher を各 mutation 側へ配線する。7 系統すべてを
 	// 繋がないと「一部の操作だけ反映されない」形の抜けになるので、まとめて置く。
@@ -2959,12 +3061,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	mainStreamPublisher := stream.NewMainStreamPublisher(streamPubSub)
 	// broadcast stream publisher (emoji / global announcement 等を全 connection へ、#2046/#2056)。
 	broadcastPublisher := stream.NewBroadcastPublisher(streamPubSub)
-	// #1549: report-abuse が各 moderator の adminStream:<id> へ newAbuseUserReport
-	// を配信できるよう admin publisher + moderator lister を usersHandler に配線。
-	usersHandler.SetAbuseReportFanout(roleService, stream.NewAdminStreamPublisher(streamPubSub))
-	// 通報を通知欄にも残す (#2868)。**admin stream だけでは足りない** — あちらは
-	// その瞬間に管理画面を開いている人にしか届かず、後から見返せない。
-	usersHandler.SetAbuseReportInAppNotifier(notificationService)
+	// 通報の通知 (通知欄 #2868 / admin stream #1549 / abuseReport system webhook
+	// #1542)。**local と連合 (Flag) で同じ notifier を共有する** — 入口ごとに
+	// 配線していたので Flag の経路だけ admin stream と webhook が抜けていた
+	// (#3256)。連打の絞り (#3200) も通報の出どころで変わらない。webhook は
+	// recipientRepo (無効にした通知先の除外に使う) が揃う後段で SetWebhook する。
+	abuseInAppNotifier := coreabuse.NewInAppNotifier(roleService, notificationService, repository.NewAbuseReportRepository(s.db))
+	abuseCreatedNotifier := coreabuse.NewCreatedNotifier(abuseInAppNotifier, roleService, stream.NewAdminStreamPublisher(streamPubSub))
+	usersHandler.SetAbuseReportCreatedNotifier(abuseCreatedNotifier)
 
 	// server / queue stats publishers (#344)。起動時から tick を回して
 	// `serverStats` / `queueStats` トピックへ定期 publish する。
@@ -3038,6 +3142,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	streamRegistry.Register("reversiGame", channels.NewReversiGameFactory(reversiService).New)
 	streamRegistry.RegisterCredentialed("reversi", channels.NewReversi)
 
+	// バブルゲームの対戦 (#3230)。対局の状態は Redis にだけ置き、記録 (両者の
+	// 報告と勝敗) は DB に書く (#3232)。
+	bubbleVersusRecordRepo := repository.NewBubbleVersusRepository(s.db)
+	bubbleVersusService := corebubbleversus.NewService(s.redis.Default, stream.NewBubbleVersusPublisher(streamPubSub), blockingService, idGen)
+	bubbleVersusService.SetRecordStore(bubbleVersusRecordRepo)
+	streamRegistry.RegisterCredentialed("bubbleVersus", channels.NewBubbleVersus)
+	streamRegistry.RegisterCredentialed("bubbleVersusMatch", channels.NewBubbleVersusMatchFactory(bubbleVersusService).New)
+
 	// 6. Chat WebSocket channels (Phase 9.8): chatRoom と chatUser を登録する
 	chatPublisher := stream.NewChatPublisher(streamPubSub)
 	chatService := corechat.NewService(chatRepo, idGen)
@@ -3073,9 +3185,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	federationProcessor.SetReversi(reversiService, reversiRepo, idGen, reversiFedCache)
 	federationProcessor.SetBlockingService(blockingService)
 	federationProcessor.SetAbuseReportRepo(repository.NewAbuseReportRepository(s.db), idGen)
-	// リモートからの通報 (AP Flag) もモデレーターの通知欄に出す (#2868)。
+	// リモートからの通報 (AP Flag) もローカルと同じ通知を出す (#2868 / #3256)。
 	// **配線しないと通報の出どころで通知の有無が変わる。**
-	federationProcessor.SetAbuseReportNotification(roleService, notificationService)
+	federationProcessor.SetAbuseReportCreatedNotifier(abuseCreatedNotifier)
 	federationProcessor.SetPinningRepo(piningRepo, idGen)
 	federationProcessor.SetRelayMarker(relaySvc)
 	federationProcessor.SetRelayActorChecker(relaySvc)
@@ -3253,9 +3365,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	abuseReportRepo := repository.NewAbuseReportRepository(s.db)
 	modLogRepo := repository.NewModerationLogRepository(s.db)
 	recipientRepo := repository.NewAbuseReportNotificationRecipientRepository(s.db)
-	// users/report-abuse 時に abuseReport system webhook を発火する (#1542)。
-	// recipientRepo がここで揃うため本箇所で配線する。
-	usersHandler.SetAbuseReportWebhook(webhookService, recipientRepo)
+	// 通報の abuseReport system webhook (#1542)。local と Flag の両方に効く
+	// (#3256)。recipientRepo がここで揃うため本箇所で配線する。
+	abuseCreatedNotifier.SetWebhook(webhookService, recipientRepo, coreabuse.UserLookups{Instances: instanceRepo, Emojis: emojiRepo}, idGen)
+	// 通報のメール (#3265)。SMTP の設定は送るたびに meta から読み直すので、
+	// 未設定でも配線しておいてよい (そのときは送らない)。
+	abuseCreatedNotifier.SetMail(miscsmtp.SubjectBodySenderFromMeta(metaRepo, s.config.ProxySMTP), recipientRepo, userRepo, metaRepo)
 	adminHandler := apiadmin.NewHandler(signupService, roleService, metaRepo, userRepo, idGen)
 	// モデレーターの suspend / unsuspend を local 由来として刻む (#2973)。
 	adminHandler.SetSuspensionOriginRepo(suspensionOriginRepo)
@@ -3273,8 +3388,13 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// AuthMiddleware が duck-typed で UserTokenInvalidator interface を
 	// 満たしている。
 	adminHandler.SetUserTokenInvalidator(s.auth)
+	// 凍結・削除した利用者の WebSocket を閉じる (tokenCache の失効とは独立)。
+	adminHandler.SetUserStreamRevoker(streamRevokePublisher)
 	adminHandler.SetInstanceRepo(instanceRepo)
 	adminHandler.SetDeliveryHealthProvider(deliveryHealth)
+	if deliveryBreaker != nil {
+		adminHandler.SetDeliveryBreaker(deliveryBreaker)
+	}
 	adminHandler.SetInboxHealthProvider(inboxHealth)
 	// IP からアカウントを引く口 (#3104)。**この行を落とすと admin/ip/accounts が
 	// 500 を返す** — 空の結果は「その IP を使ったアカウントは無い」という誤った
@@ -3350,10 +3470,32 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 連合セルフ診断 (#2463)。migration 本数は起動時に数えず 0 を渡す
 	// (server 側は既に migrate 済みで動いている前提。適用漏れの検出は
 	// `misskey -doctor` の担当で、あちらは同梱ファイルを数えられる)。
+	// DB の健全性 (#3095)。統計はプライマリから読み、1 分キャッシュする。
+	dbHealth := dbhealth.NewService(s.db, s.config.DBReplications && len(s.config.DBSlaves) > 0)
+	adminHandler.SetDatabaseHealth(dbHealth)
 	adminHandler.SetSelfCheckRunner(&selfCheckAdapter{
 		checker: selfcheck.NewChecker(s.config.URL),
-		deps:    selfcheck.LocalDeps{DB: s.db, Redis: s.redis.Default},
+		deps:    selfcheck.LocalDeps{DB: s.db, Redis: s.redis.Default, DBHealth: dbHealth.Report},
 	})
+	// 連合先との疎通の診断 (#3055)。**通信は SSRF-safe な outboundClient だけ**で、
+	// 上の self-check の client (ガード無し) とは繋がない。自ホストは断る。
+	adminHandler.SetRemoteChecker(s.newRemoteCheckAdapter(remoteCheckSources{
+		fetcher:   apFetcher,
+		instances: instanceService,
+		users:     repository.NewRemoteUserSampler(s.db),
+		sigCaps:   sigCapRepo,
+		degraded:  deliverProcessor.Ed25519Degraded,
+		delivery:  deliveryHealth,
+		breaker:   deliveryBreaker,
+	}), corefederation.NormalizeGateHost(s.config.URL))
+	// 消えたインスタンスとのフォロー関係の片付け (#3067)。自動では消さず、管理者が
+	// 候補を見て実行する。
+	adminHandler.SetGoneInstanceCleaner(gonecleanup.NewService(goneInstanceRepo, instanceService, followingService))
+	adminHandler.SetFederationRuleManager(fedrule.NewManager(fedRuleRepo, fedRuleService, fedRuleHits, idGen, func() {
+		if err := internalPubSub.Publish(context.Background(), "federationRulesUpdated", struct{}{}); err != nil {
+			slog.Warn("fedrule: publish federationRulesUpdated failed", "err", err)
+		}
+	}))
 	// admin/federation/update-instance の suspend / unsuspend を deliver hot path
 	// の suspend 判定 cache へ TTL を待たず即時反映する (#1407 review)。
 	adminHandler.SetInstanceSuspendCacheInvalidator(instanceService)
@@ -3524,6 +3666,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		middleware.RequireScope("read:admin:user-ips"))
 	api.POST("/admin/get-index-stats", adminHandler.GetIndexStats, middleware.RequireAdmin(roleService), middleware.RequireScope("read:admin:index-stats"))
 	api.POST("/admin/get-table-stats", adminHandler.GetTableStats, middleware.RequireAdmin(roleService), middleware.RequireScope("read:admin:table-stats"))
+	// DB の健全性 (#3095、mk-go 独自)。get-table-stats と同じ権限。
+	api.POST("/admin/database-health", adminHandler.DatabaseHealth, middleware.RequireAdmin(roleService), middleware.RequireScope("read:admin:table-stats"))
 	api.POST("/admin/server-info", adminHandler.ServerInfo, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:server-info"))
 	// mk-go 独自 (#2395)。upstream に対応する endpoint は無いので scope も
 	// server-info のものを流用する (admin UI 以外の consumer を想定しない)。
@@ -3605,6 +3749,25 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// mk-go 独自 (#2471)。送信側と同じ scope を再利用する。
 	api.POST("/admin/federation/inbox-health", adminHandler.FederationInboxHealth, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:server-info"))
 	api.POST("/admin/federation/delivery-health", adminHandler.FederationDeliveryHealth, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:server-info"))
+	// mk-go 独自 (#3055)。指定したホストとの疎通を 1 回だけ検査する。相手へ GET を
+	// 送るだけで状態を変えないので、観測系と同じ scope。
+	api.POST("/admin/federation/check-host", adminHandler.FederationCheckHost, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:server-info"))
+	// mk-go 独自 (#3067)。消えたインスタンスと、残っているフォロー関係の件数。
+	api.POST("/admin/federation/gone-instances", adminHandler.FederationGoneInstances, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:server-info"))
+	// mk-go 独自 (#3067)。消えたインスタンスとのフォロー関係を片付ける。取り返しが
+	// つかない書き込みなので、既存の admin/federation/* の書き込み系と同じ scope。
+	api.POST("/admin/federation/clean-gone-instance", adminHandler.FederationCleanGoneInstance, middleware.RequireModerator(roleService), middleware.RequireScope("write:admin:federation"))
+	// 連合のルール (#3090、mk-go 独自)。meta.blockedHosts と同じく受信を丸ごと
+	// 止められる設定なので、変更は管理者に限る (blockedHosts は update-meta で
+	// 管理者のみ)。一覧と当たった記録はモデレーターにも見せる。
+	api.POST("/admin/federation/rules/list", adminHandler.FederationRules, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:meta"))
+	api.POST("/admin/federation/rules/hits", adminHandler.FederationRuleHits, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:meta"))
+	api.POST("/admin/federation/rules/create", adminHandler.FederationRuleCreate, middleware.RequireAdmin(roleService), middleware.RequireScope("write:admin:meta"))
+	api.POST("/admin/federation/rules/update", adminHandler.FederationRuleUpdate, middleware.RequireAdmin(roleService), middleware.RequireScope("write:admin:meta"))
+	api.POST("/admin/federation/rules/delete", adminHandler.FederationRuleDelete, middleware.RequireAdmin(roleService), middleware.RequireScope("write:admin:meta"))
+	// mk-go 独自 (#3048)。落ちた配送先へのブレーカーを手で閉じる。配送の挙動を
+	// 変える書き込みなので、既存の admin/federation/* の書き込み系と同じ scope。
+	api.POST("/admin/federation/close-delivery-breaker", adminHandler.FederationCloseDeliveryBreaker, middleware.RequireModerator(roleService), middleware.RequireScope("write:admin:federation"))
 	api.POST("/admin/invite/create", adminHandler.InviteCreate, middleware.RequireModerator(roleService), middleware.RequireScope("write:admin:invite-codes"))
 	api.POST("/admin/invite/list", adminHandler.InviteList, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:invite-codes"))
 	// 承認制の登録の審査 (#2555)。mk-go 独自。scope は invite-codes を再利用する
@@ -3729,6 +3892,20 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// fetch-rss と同様、#1774)。
 	api.POST("/bubble-game/ranking", bubbleGameHandler.Ranking)
 	api.GET("/bubble-game/ranking", bubbleGameHandler.Ranking)
+	// bubble-game/versus/* — 1:1 の対戦 (mk-go 独自、#3230)
+	bubbleVersusHandler := apibubblegame.NewVersusHandler(bubbleVersusService, userRepo)
+	api.POST("/bubble-game/versus/invite", bubbleVersusHandler.Invite, middleware.RequireAuth(), middleware.RequireScope("write:account"))
+	api.POST("/bubble-game/versus/invitations", bubbleVersusHandler.Invitations, middleware.RequireAuth(), middleware.RequireScope("read:account"))
+	api.POST("/bubble-game/versus/show", bubbleVersusHandler.Show, middleware.RequireAuth(), middleware.RequireScope("read:account"))
+	api.POST("/bubble-game/versus/accept", bubbleVersusHandler.Accept, middleware.RequireAuth(), middleware.RequireScope("write:account"))
+	api.POST("/bubble-game/versus/decline", bubbleVersusHandler.Decline, middleware.RequireAuth(), middleware.RequireScope("write:account"))
+	api.POST("/bubble-game/versus/cancel", bubbleVersusHandler.Cancel, middleware.RequireAuth(), middleware.RequireScope("write:account"))
+	api.POST("/bubble-game/versus/report", bubbleVersusHandler.Report, middleware.RequireAuth(), middleware.RequireScope("write:account"))
+	// 対戦の記録 (#3232)。見せる範囲は handler の canView が決める。
+	bubbleVersusHandler.SetRecords(bubbleVersusRecordRepo, blockingService)
+	api.POST("/bubble-game/versus/history", bubbleVersusHandler.History, middleware.RequireAuth(), middleware.RequireScope("read:account"))
+	api.POST("/bubble-game/versus/record", bubbleVersusHandler.ShowRecord, middleware.RequireAuth(), middleware.RequireScope("read:account"))
+	api.POST("/bubble-game/versus/set-public", bubbleVersusHandler.SetPublic, middleware.RequireAuth(), middleware.RequireScope("write:account"))
 
 	// chat/* — Misskey v2026 チャット機能 (実データ)
 	chatHandler := apichat.NewHandler(chatRepo, idGen)
@@ -3975,25 +4152,16 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.Any("/*", apiCatchall)
 
 	// フロントエンドアセット配信
-	// ビルド済みアセットがあれば静的配信、なければVite dev serverプロキシ
+	// dev モードなら Vite dev server へプロキシ、そうでなければビルド済みアセットを
+	// 静的配信する (無ければ 404。dev server へは流さない)。
 	//
 	// dev モードではビルド成果物の有無を**見ない** (#2477)。見てしまうと、
 	// 以前のビルドが残っているだけで dev server に繋がらず HMR に入れない。
-	frontendDir := frontendutil.FrontendDir()
-	if _, err := os.Stat(frontendDir); err == nil && !isDev(s.config) {
-		s.echo.Static("/vite", frontendDir)
-	} else {
-		s.echo.Any("/vite/*", newViteProxy(viteDevServerURL))
-	}
+	registerFrontendAssets(s.echo, s.config, "/vite", frontendutil.FrontendDir(), viteDevServerURL)
 
 	// embed 専用バンドル配信 (#2389)。通常の SPA とは別 build なので別ディレクトリ・
 	// 別 prefix になる (upstream ClientServerService の `/embed_vite/` と同じ)。
-	frontendEmbedDir := frontendutil.FrontendEmbedDir()
-	if _, err := os.Stat(frontendEmbedDir); err == nil && !isDev(s.config) {
-		s.echo.Static("/embed_vite", frontendEmbedDir)
-	} else {
-		s.echo.Any("/embed_vite/*", newViteProxy(viteEmbedDevServerURL))
-	}
+	registerFrontendAssets(s.echo, s.config, "/embed_vite", frontendutil.FrontendEmbedDir(), viteEmbedDevServerURL)
 
 	// フロントエンド配布アセット (locales, fonts等) + リポジトリアセット (ai.png等)
 	// Echo は同一パスに Static を 2 回登録すると上書きされるため、
@@ -4176,6 +4344,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"i/revoke-token が成功と同じ 204 を返したまま token を消さない (恒久)"},
 		{"oauth.authInvalidator", oauthHandler.HasAuthInvalidator(),
 			"authorization code 再利用を検出して失効させた token が TTL のあいだ通る"},
+		{"i.streamRevoker", iHandler.HasStreamRevoker(),
+			"regenerate-token / revoke-token / delete-account の後も、失効した token で張られた WebSocket が通知・DM を受け取り続ける"},
+		{"admin.userStreamRevoker", adminHandler.HasUserStreamRevoker(),
+			"凍結・削除した利用者の WebSocket が通知・DM・フォロワー限定投稿を受け取り続ける"},
+		{"oauth.streamRevoker", oauthHandler.HasStreamRevoker(),
+			"authorization code 再利用で失効させた token の WebSocket が開いたまま残る"},
 		{"signup.applicationSettlement", signupService.HasApplicationSettlement(),
 			"承認済み申請の行ロックが飛び、1 承認から複数アカウントを作る窓が開く"},
 		{"signup.formTokens", signupHandler.HasFormTokens(),

@@ -119,7 +119,8 @@ func (s *Service) DispatchUser(userID, eventType string, body any) {
 
 // DispatchUserTest enqueues a single test delivery for i/webhooks/test (#1546).
 // 通常の DispatchUser と違い (1) 指定 webhookID 1 件だけに送り (= テスト対象を
-// 限定)、(2) overrideURL/Secret が非空なら保存済 webhook でなくそちらへ送る。
+// 限定)、(2) overrideURL が非空なら保存済 webhook でなく overrideURL /
+// overrideSecret へ送り、(3) 再試行しない (本家の attempts: 1、#3278)。
 // イベント購読 (h.On) は無視する (テストは任意の type を送れる)。
 func (s *Service) DispatchUserTest(webhookID, userID, eventType string, body any, overrideURL, overrideSecret string) {
 	if s == nil || s.enqueuer == nil {
@@ -141,6 +142,8 @@ func (s *Service) DispatchUserTest(webhookID, userID, eventType string, body any
 		Body:           raw,
 		OverrideURL:    overrideURL,
 		OverrideSecret: overrideSecret,
+		// 本家はテスト送信を attempts: 1 で積む (#3278)。
+		SingleAttempt: true,
 	}); err != nil {
 		slog.Warn("webhook: enqueue test webhook failed",
 			"hookId", webhookID, "event", eventType, "err", err)
@@ -149,8 +152,9 @@ func (s *Service) DispatchUserTest(webhookID, userID, eventType string, body any
 
 // DispatchSystemTest enqueues a single system webhook test delivery for
 // admin/system-webhook/test (#1542)。DispatchUserTest の system 版で、UserID は
-// 持たず、overrideURL/Secret が非空ならそちらへ送る。real delivery (processor) を
-// 経由するため header / envelope は本配送と完全に一致する。
+// 持たず、overrideURL が非空なら overrideURL / overrideSecret へ送る。real
+// delivery (processor) を経由するため header / envelope は本配送と完全に一致する。
+// 本家と同じく再試行しない (attempts: 1、#3262)。
 func (s *Service) DispatchSystemTest(webhookID, eventType string, body any, overrideURL, overrideSecret string) {
 	if s == nil || s.enqueuer == nil {
 		return
@@ -169,6 +173,7 @@ func (s *Service) DispatchSystemTest(webhookID, eventType string, body any, over
 		Body:           raw,
 		OverrideURL:    overrideURL,
 		OverrideSecret: overrideSecret,
+		SingleAttempt:  true,
 	}); err != nil {
 		slog.Warn("webhook: enqueue system test webhook failed",
 			"hookId", webhookID, "event", eventType, "err", err)

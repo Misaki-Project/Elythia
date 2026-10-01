@@ -1834,13 +1834,14 @@ func (m *MockNoteRepository) ListFeaturedByUser(userID, viewerID, untilID string
 	return pool, nil
 }
 
-func (m *MockNoteRepository) FindRenoteByUser(userID, renoteID string) (*model.Note, error) {
+func (m *MockNoteRepository) ListRenotesByUser(userID, renoteID string) ([]*model.Note, error) {
+	notes := make([]*model.Note, 0)
 	for _, n := range m.Notes {
-		if n.UserID == userID && n.RenoteID != nil && *n.RenoteID == renoteID && n.Text == nil {
-			return n, nil
+		if n.UserID == userID && n.RenoteID != nil && *n.RenoteID == renoteID {
+			notes = append(notes, n)
 		}
 	}
-	return nil, ErrNotFound
+	return notes, nil
 }
 
 // ListMentions accepts the `following` flag for signature parity but does not
@@ -3136,6 +3137,10 @@ func (m *MockMetaRepository) Update(fields map[string]any) error {
 		case "approvalRequiredForSignup":
 			if b, ok := v.(bool); ok {
 				m.Meta.ApprovalRequiredForSignup = b
+			}
+		case "registrationClosed":
+			if b, ok := v.(bool); ok {
+				m.Meta.RegistrationClosed = b
 			}
 		case "signupApplicationForm":
 			if j, ok := v.(datatypes.JSON); ok {
@@ -7183,10 +7188,44 @@ func (m *MockAbuseReportRepository) FindStatesByIDs(ids []string) (map[string]mo
 	return out, nil
 }
 
+// CountUnresolved counts the reports that are not resolved yet (#3200).
+func (m *MockAbuseReportRepository) CountUnresolved() (int64, error) {
+	var n int64
+	for _, r := range m.Reports {
+		if !r.Resolved {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// HasOlderUnresolvedByPair mirrors the production query (#3200).
+func (m *MockAbuseReportRepository) HasOlderUnresolvedByPair(reporterID, targetUserID, beforeID string) (bool, error) {
+	for _, r := range m.Reports {
+		if !r.Resolved && r.ReporterID == reporterID && r.TargetUserID == targetUserID && r.ID < beforeID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// HasOlderUnresolvedFromHost mirrors the production query (#3200).
+func (m *MockAbuseReportRepository) HasOlderUnresolvedFromHost(host, beforeID string) (bool, error) {
+	for _, r := range m.Reports {
+		if !r.Resolved && r.ReporterHost != nil && *r.ReporterHost == host && r.ID < beforeID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *MockAbuseReportRepository) UpdateFields(id string, fields map[string]any) error {
 	r, ok := m.Reports[id]
 	if !ok {
-		return ErrNotFound
+		// 本物 (GORM の Updates) は該当行が無くてもエラーを返さないので合わせる。
+		// ErrNotFound を返すと、存在の確認を UpdateFields 任せにした handler の
+		// テストが、本番では 204 になるのに 404 で通ってしまう (#3259)。
+		return nil
 	}
 	if v, ok := fields["resolved"]; ok {
 		r.Resolved = v.(bool)

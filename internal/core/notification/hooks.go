@@ -445,6 +445,35 @@ func (h *Hook) OnReactionCreated(notifieeID, notifierID, noteID, reaction string
 	})
 }
 
+// OnReactionRemoved removes the reaction notification notifierID left on the
+// note author's stream when the reaction is withdrawn or replaced (#3201).
+//
+// 取り消したリアクションは「無いもの」なので通知も残さない。付け替えのときは
+// 呼び出し側が直後に新しいリアクションの通知を作る。best-effort。
+func (h *Hook) OnReactionRemoved(notifieeID, notifierID, noteID string) {
+	if h.svc == nil {
+		return
+	}
+	if err := h.svc.DeleteByNote(context.Background(), notifieeID, notifierID, noteID, TypeReaction); err != nil {
+		slog.Warn("notification: remove reaction notification failed", "notifiee", notifieeID, "note", noteID, "err", err)
+	}
+}
+
+// OnNoteDeleted removes the renote / quote notification a deleted note left on
+// its renote target's author (#3201).
+//
+// 通知の NoteID はリノート自身なので、一覧からは read 時に落ちる (#1953)。
+// それでも stream に残ると未読件数に数えられ、開いても何も無い状態になる。
+// 自分のノートのリノートは通知を作っていないので何もしない。best-effort。
+func (h *Hook) OnNoteDeleted(note *model.Note) {
+	if h.svc == nil || note == nil || note.RenoteUserID == nil || *note.RenoteUserID == note.UserID {
+		return
+	}
+	if err := h.svc.DeleteByNote(context.Background(), *note.RenoteUserID, note.UserID, note.ID, TypeRenote, TypeQuote); err != nil {
+		slog.Warn("notification: remove renote notification failed", "notifiee", *note.RenoteUserID, "note", note.ID, "err", err)
+	}
+}
+
 // OnPollVote records a poll vote notification on the note author's stream.
 func (h *Hook) OnPollVote(notifieeID, notifierID, noteID string, choice int) {
 	c := choice
@@ -615,7 +644,7 @@ func (h *Hook) passesReceiveConfig(notifieeID string, in CreateInput) bool {
 	case "followingOrFollower":
 		return h.followingExists(notifieeID, in.NotifierID) || h.followingExists(in.NotifierID, notifieeID)
 	case "list":
-		return h.listContains(entry.UserListID, in.NotifierID)
+		return h.listContains(notifieeID, entry.UserListID, in.NotifierID)
 	}
 	return true
 }
@@ -633,11 +662,23 @@ func (h *Hook) followingExists(followerID, followeeID string) bool {
 	return ex
 }
 
-// listContains reports whether userID is a member of listID. dep 未配線 / 空
-// listID / query error は許可側 (true) に倒す。
-func (h *Hook) listContains(listID, userID string) bool {
+// listContains reports whether userID is a member of listID, which must be
+// owned by ownerID (the notifiee). dep 未配線 / 空 listID / query error は許可側
+// (true) に倒す。list が無い、または ownerID のものでなければ false。
+func (h *Hook) listContains(ownerID, listID, userID string) bool {
 	if h.userListRepo == nil || listID == "" {
 		return true
+	}
+	// userListId は i/update で保存するときに所有者を検証していない (upstream も
+	// 同じ)。他人の list を指定されたまま照合すると、通知が届くかどうかでその
+	// list のメンバー構成を 1 人ずつ確かめられるので、照合側で所有者を見る
+	// (アンテナの照合と同じ多層防御)。
+	list, err := h.userListRepo.FindByID(listID)
+	if err != nil {
+		return !repository.IsNotFound(err)
+	}
+	if list == nil || list.UserID != ownerID {
+		return false
 	}
 	members, err := h.userListRepo.ListMembers(listID)
 	if err != nil {

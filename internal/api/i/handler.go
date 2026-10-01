@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,6 +20,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/notehide"
 	"github.com/shiroha-a/mk/internal/core/avatardecoration"
 	"github.com/shiroha-a/mk/internal/core/notification"
+	"github.com/shiroha-a/mk/internal/core/passwordguard"
 	"github.com/shiroha-a/mk/internal/core/role"
 	"github.com/shiroha-a/mk/internal/core/twofactor"
 	"github.com/shiroha-a/mk/internal/core/user"
@@ -136,6 +138,10 @@ type Handler struct {
 	// (30 秒) 待ちで stale 旧 token が auth 通過する security regression が
 	// 残るので production では必ず wire する。
 	authInvalidator TokenInvalidator
+	// streamRevoker は資格情報を失効させたときに、その資格情報で張られた
+	// /streaming の接続を閉じる。tokenCache を落としても WebSocket は接続時に
+	// 1 度しか認証しないので、失効後も通知・DM を受け取り続ける。
+	streamRevoker StreamRevoker
 	// totpReplayGuard は i/2fa/done / 2fa-gated 操作で同一 TOTP コードの
 	// 二度使いを refuse する (RFC 6238 §5.2 / mk-go 独自 hardening、upstream
 	// Misskey TS は持たない)。nil なら無保護 (= unit test / dev fallback)。
@@ -157,6 +163,9 @@ type Handler struct {
 	// antennaCounter は i/import-antennas の TOO_MANY_ANTENNAS 判定で現 antenna
 	// 件数を数えるのに使う (#1667)。未配線時は limit check を skip する。
 	antennaCounter AntennaCounter
+	// passwordGuard は現在のパスワードの照合失敗をアカウント単位で数える。
+	// nil なら数えない (router は必ず配線する。TestPasswordFailureGuardIsWired)。
+	passwordGuard passwordguard.Guard
 }
 
 // TokenInvalidator は i/regenerate-token / i/change-password 等の sensitive
@@ -384,6 +393,28 @@ func splitAcct(acct string) (string, *string) {
 type MainStreamPublisher interface {
 	PublishMainEvent(userID, eventType string, body any)
 }
+
+// StreamRevoker closes live /streaming connections whose credential was just
+// invalidated. Implemented by stream.StreamRevokePublisher (pubsub fan-out so
+// connections held by other processes close too).
+type StreamRevoker interface {
+	RevokeUserStreams(userID string)
+	RevokeNativeTokenStreams(userID, token string)
+	RevokeAccessTokenStreams(userID, tokenID string)
+}
+
+// SetStreamRevoker wires the revoker used by i/regenerate-token,
+// i/revoke-token and i/delete-account.
+func (h *Handler) SetStreamRevoker(r StreamRevoker) {
+	h.streamRevoker = r
+}
+
+// HasStreamRevoker reports whether the stream revoker is wired.
+//
+// 未配線だと、失効させた token で張られていた WebSocket が**再接続するまで
+// 通知・DM・フォロワー限定投稿を受け取り続ける**。HTTP 側の失効
+// (HasAuthInvalidator) とは独立に効く。
+func (h *Handler) HasStreamRevoker() bool { return h.streamRevoker != nil }
 
 // SetAuthInvalidator attaches a token invalidator so RegenerateToken and
 // other sensitive endpoints can drop the old token from the auth cache
@@ -1187,12 +1218,26 @@ func (h *Handler) rolePayload(userID string) (isAdmin bool, isMod bool, policies
 		isMod = h.roleProvider.IsModerator(userID)
 		policies = h.roleProvider.GetUserPolicies(userID)
 		if rs, err := h.roleProvider.GetUserRoles(userID); err == nil {
+			// 公開ロールだけを表示順に並べる (#3240)。本家 UserEntityService も
+			// 本人かどうかに関係なく isPublic で絞る。絞らないと、運用上の分類や
+			// モデレーション目的の非公開ロールの名前が、割り当てられた本人に見える。
+			// 権限 (isAdmin / isModerator / policies) は非公開ロールも含めて上で
+			// 計算済みなので変わらない。
+			// iconUrl は entity (packPublicRoles、meUpdated の経路) と同じく media
+			// proxy を通す。通さないと $i.roles[].iconUrl が経路ごとに変わる。
+			visible := make([]*model.Role, 0, len(rs))
 			for _, r := range rs {
+				if r.IsPublic {
+					visible = append(visible, r)
+				}
+			}
+			sort.SliceStable(visible, func(i, j int) bool { return visible[i].DisplayOrder > visible[j].DisplayOrder })
+			for _, r := range visible {
 				roles = append(roles, map[string]any{
 					"id":              r.ID,
 					"name":            r.Name,
 					"color":           r.Color,
-					"iconUrl":         r.IconURL,
+					"iconUrl":         entity.ProxyMediaURLPtr(r.IconURL),
 					"description":     r.Description,
 					"isModerator":     r.IsModerator,
 					"isAdministrator": r.IsAdministrator,

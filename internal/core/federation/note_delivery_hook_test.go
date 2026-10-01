@@ -3,6 +3,7 @@ package federation_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -589,4 +590,220 @@ func TestNoteDeliveryHook_RelayBroadcasterNil_IsSafe(t *testing.T) {
 	note := makeNote(author.ID, model.NoteVisibilityPublic)
 	// SetRelayBroadcaster を呼ばなくても panic しない
 	hook.OnNoteCreated(note, author)
+}
+
+type stubQuoteApprovals struct {
+	enq    *stubEnqueuer
+	calls  []string
+	err    error
+	issued bool
+}
+
+func (s *stubQuoteApprovals) Prepare(n *model.Note, _ *model.User) error {
+	s.calls = append(s.calls, fmt.Sprintf("prepare %s after %d deliveries", n.ID, len(s.enq.calls)))
+	if s.err == nil {
+		s.issued = true
+	}
+	return s.err
+}
+
+func (s *stubQuoteApprovals) RequestApproval(n *model.Note, _ *model.User) error {
+	s.calls = append(s.calls, fmt.Sprintf("request %s after %d deliveries", n.ID, len(s.enq.calls)))
+	return s.err
+}
+
+// 引用の承認 (#3234 段階 3): ローカル同士の承認は Create を描画する前に発行し
+// (最初の Create から quoteAuthorization が付く。後から Update は送らない)、
+// リモートへの QuoteRequest は Create の後に送る。失敗しても配送は止めない。
+func TestNoteDeliveryHook_QuoteApprovalOrder(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		enq := &stubEnqueuer{}
+		userRepo := testutil.NewMockUserRepository()
+		followingRepo := testutil.NewMockFollowingRepository()
+		keypairRepo := testutil.NewMockUserKeypairRepository()
+		urls := activitypub.NewURLBuilder("https://example.com")
+		renderer := activitypub.NewRenderer(urls)
+		q := &stubQuoteApprovals{enq: enq}
+		// renderer は Prepare が発行した承認を読む (発行前に描画すると付かない)。
+		renderer.SetQuoteApprovalResolver(func(*model.Note) (string, error) {
+			if q.issued {
+				return "https://example.com/notes/target/quote-authorizations/a1", nil
+			}
+			return "", nil
+		})
+		idGen, _ := id.NewGenerator("aidx")
+		hook := federation.NewNoteDeliveryHook(federation.NewDeliverService(enq, userRepo, followingRepo, keypairRepo, urls), renderer, urls, idGen, userRepo, testutil.NewMockNoteRepository())
+		author := makeLocalAuthor(t, userRepo, keypairRepo)
+		followingRepo.RemoteInboxes[author.ID] = []string{"https://r.example/inbox"}
+		if fail {
+			q.err = assert.AnError
+		}
+		hook.SetQuoteOutbox(q)
+		text, target := "look", "target"
+		note := makeNote(author.ID, model.NoteVisibilityPublic)
+		note.Text, note.RenoteID = &text, &target
+		hook.OnNoteCreated(note, author)
+		assert.Equal(t, []string{
+			"prepare " + note.ID + " after 0 deliveries",
+			"request " + note.ID + " after 1 deliveries",
+		}, q.calls)
+		require.Len(t, enq.calls, 1, "the Create is delivered either way")
+		var create map[string]any
+		require.NoError(t, json.Unmarshal(enq.calls[0].Body, &create))
+		obj := create["object"].(map[string]any)
+		if fail {
+			assert.NotContains(t, obj, "quoteAuthorization")
+		} else {
+			assert.Equal(t, "https://example.com/notes/target/quote-authorizations/a1", obj["quoteAuthorization"])
+		}
+	}
+}
+
+func TestNoteDeliveryHook_SendQuoteRequest(t *testing.T) {
+	hook, enq, userRepo, _, keypairRepo, _ := newNoteDeliveryHook(t)
+	author := makeLocalAuthor(t, userRepo, keypairRepo)
+	host, inbox := "remote.example", "https://remote.example/users/bob/inbox"
+	bob := &model.User{ID: "bob", Username: "bob", Host: &host, Inbox: &inbox}
+	text, target := "look", "bobnote"
+	note := makeNote(author.ID, model.NoteVisibilityPublic)
+	note.Text, note.RenoteID = &text, &target
+
+	require.NoError(t, hook.SendQuoteRequest(note, "https://remote.example/notes/1", bob))
+	require.Len(t, enq.calls, 1)
+	assert.Equal(t, inbox, enq.calls[0].Inbox)
+	// 配送の queue では再試行しない (#3238。再試行は状態を確かめる定期処理だけ)。
+	assert.True(t, enq.opts[0].MaxRetrySet)
+	assert.Equal(t, 0, enq.opts[0].MaxRetry)
+	// 後へ回されて遅れて届かないよう、期限を付ける (5 分)。
+	assert.NotZero(t, enq.calls[0].NotAfter)
+	assert.WithinDuration(t, time.Now().Add(5*time.Minute), time.UnixMilli(enq.calls[0].NotAfter), 10*time.Second)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(enq.calls[0].Body, &got))
+	assert.Equal(t, "QuoteRequest", got["type"])
+	assert.Equal(t, "https://remote.example/notes/1", got["object"])
+
+	// ローカルの相手には送らない。送れなければ error。
+	enq.calls = nil
+	require.NoError(t, hook.SendQuoteRequest(note, "https://remote.example/notes/1", &model.User{ID: "dave"}))
+	assert.Empty(t, enq.calls)
+	enq.err = assert.AnError
+	assert.Error(t, hook.SendQuoteRequest(note, "https://remote.example/notes/1", bob))
+}
+
+func TestNoteDeliveryHook_SendNoteUpdate(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newNoteDeliveryHook(t)
+	author := makeLocalAuthor(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes[author.ID] = []string{"https://r.example/inbox"}
+	host, inbox := "remote.example", "https://remote.example/users/bob/inbox"
+	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &host, Inbox: &inbox}
+	noteRepo.Notes["bobnote"] = &model.Note{ID: "bobnote", UserID: "bob"}
+	text, target := "look", "bobnote"
+	relay := &fakeRelayBroadcaster{}
+	hook.SetRelayBroadcaster(relay)
+
+	for _, vis := range []model.NoteVisibility{model.NoteVisibilityPublic, model.NoteVisibilityHome, model.NoteVisibilityFollowers} {
+		enq.calls, relay.calls = nil, nil
+		note := makeNote(author.ID, vis)
+		note.Text, note.RenoteID = &text, &target
+		require.NoError(t, hook.SendNoteUpdate(note, author))
+		// フォロワーと、引用される作者 (Create と同じ宛先) へ届く。
+		var inboxes []string
+		for _, c := range enq.calls {
+			inboxes = append(inboxes, c.Inbox)
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(c.Body, &got))
+			assert.Equal(t, "Update", got["type"])
+		}
+		assert.ElementsMatch(t, []string{"https://r.example/inbox", inbox}, inboxes, vis)
+		// relay 経由で Create を受け取ったサーバーにも届ける (公開のときだけ)。
+		if vis == model.NoteVisibilityPublic {
+			require.Len(t, relay.calls, 1, vis)
+			assert.IsType(t, &activitypub.Update{}, relay.calls[0].Activity)
+		} else {
+			assert.Empty(t, relay.calls, vis)
+		}
+	}
+
+	// ダイレクトの引用は承認を取りに行かないので、配り直しもしない
+	// (引用される作者へも送らない)。
+	// ローカル限定の投稿は連合しない。
+	enq.calls = nil
+	lonly := makeNote(author.ID, model.NoteVisibilityPublic)
+	lonly.Text, lonly.RenoteID, lonly.LocalOnly = &text, &target, true
+	require.NoError(t, hook.SendNoteUpdate(lonly, author))
+	assert.Empty(t, enq.calls)
+
+	enq.calls = nil
+	dm := makeNote(author.ID, model.NoteVisibilitySpecified)
+	dm.Text, dm.RenoteID = &text, &target
+	require.NoError(t, hook.SendNoteUpdate(dm, author))
+	assert.Empty(t, enq.calls, "direct notes never ask for approval")
+
+	enq.err = assert.AnError
+	assert.Error(t, hook.SendNoteUpdate(makeNote(author.ID, model.NoteVisibilityPublic), author))
+}
+
+// 承認を引けなければ Update を作らずに error を返す (再試行させる)。
+func TestNoteDeliveryHook_SendNoteUpdate_ApprovalLookupFails(t *testing.T) {
+	enq := &stubEnqueuer{}
+	userRepo := testutil.NewMockUserRepository()
+	followingRepo := testutil.NewMockFollowingRepository()
+	keypairRepo := testutil.NewMockUserKeypairRepository()
+	urls := activitypub.NewURLBuilder("https://example.com")
+	renderer := activitypub.NewRenderer(urls)
+	renderer.SetQuoteApprovalResolver(func(*model.Note) (string, error) { return "", assert.AnError })
+	idGen, _ := id.NewGenerator("aidx")
+	hook := federation.NewNoteDeliveryHook(federation.NewDeliverService(enq, userRepo, followingRepo, keypairRepo, urls), renderer, urls, idGen, userRepo, testutil.NewMockNoteRepository())
+	author := makeLocalAuthor(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes[author.ID] = []string{"https://r.example/inbox"}
+	text, target := "look", "bobnote"
+	note := makeNote(author.ID, model.NoteVisibilityPublic)
+	note.Text, note.RenoteID = &text, &target
+
+	assert.ErrorIs(t, hook.SendNoteUpdate(note, author), assert.AnError)
+	assert.Empty(t, enq.calls)
+}
+
+// 承認の取り消し (#3234 段階 4): Delete は作者のフォロワーと、リモートの相手の inbox へ。
+func TestQuoteRequestDeliveryHook_SendApprovalDelete(t *testing.T) {
+	_, enq, userRepo, followingRepo, keypairRepo, _ := newNoteDeliveryHook(t)
+	author := makeLocalAuthor(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes[author.ID] = []string{"https://r.example/inbox"}
+	urls := activitypub.NewURLBuilder("https://example.com")
+	hook := federation.NewQuoteRequestDeliveryHook(federation.NewDeliverService(enq, userRepo, followingRepo, keypairRepo, urls), activitypub.NewRenderer(urls))
+	host, inbox := "remote.example", "https://remote.example/users/bob/inbox"
+	bob := &model.User{ID: "bob", Username: "bob", Host: &host, Inbox: &inbox}
+	a := &model.NoteQuoteAuthorization{ID: "a1", NoteID: "n1", QuoterID: "bob", QuotingURI: "https://remote.example/notes/q"}
+
+	require.NoError(t, hook.SendApprovalDelete(author, bob, a))
+	var inboxes []string
+	for _, c := range enq.calls {
+		inboxes = append(inboxes, c.Inbox)
+		var got map[string]any
+		require.NoError(t, json.Unmarshal(c.Body, &got))
+		assert.Equal(t, "Delete", got["type"])
+		assert.Equal(t, "https://example.com/notes/n1/quote-authorizations/a1", got["object"].(map[string]any)["id"])
+	}
+	assert.ElementsMatch(t, []string{"https://r.example/inbox", inbox}, inboxes)
+
+	// 相手がローカルなら、フォロワーだけ (引用する投稿の Update は別に配る)。
+	enq.calls = nil
+	require.NoError(t, hook.SendApprovalDelete(author, &model.User{ID: "dave"}, a))
+	require.Len(t, enq.calls, 1)
+	assert.Equal(t, "https://r.example/inbox", enq.calls[0].Inbox)
+
+	// 相手と同じ inbox を持つフォロワーには二度送らない。
+	enq.calls = nil
+	followingRepo.RemoteInboxes[author.ID] = []string{"https://r.example/inbox", inbox}
+	require.NoError(t, hook.SendApprovalDelete(author, bob, a))
+	inboxes = nil
+	for _, c := range enq.calls {
+		inboxes = append(inboxes, c.Inbox)
+	}
+	assert.ElementsMatch(t, []string{"https://r.example/inbox", inbox}, inboxes)
+	// 相手へは先に送る (フォロワーへの送信が落ちても相手には届く)。
+	assert.Equal(t, inbox, enq.calls[0].Inbox)
+
+	enq.err = assert.AnError
+	assert.Error(t, hook.SendApprovalDelete(author, bob, a))
 }

@@ -1,0 +1,24 @@
+name: Misaki image with Genshin
+
+# 手動実行のみ。公開後も本番のcomposeや稼働containerは変更しない。
+on:
+  workflow_dispatch:
+
+# 既存Docker workflowと同じ範囲。既存GITHUB_TOKENのみ使用する。
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # ローカル参照は呼び出し元の不変commitから解決される。
+    uses: ./.github/workflows/build-with-plugins.yml
+    with:
+      mk_repository: ${{ github.repository }}
+      mk_ref: ${{ github.sha }}
+      plugins: |
+        genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 151e135548d405fd39faddd38eeacf1dfaf51048
+      image: ghcr.io/misaki-project/mk-genshin
+      # 再実行でも既存tagを上書きしない。
+      tags: sync-20261001-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      push: true

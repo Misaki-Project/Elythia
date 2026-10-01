@@ -2,95 +2,92 @@ package users_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/shiroha-a/mk/internal/core/notification"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/testutil"
 )
 
-// stubInAppNotifier records the notifications report-abuse creates.
-type stubInAppNotifier struct {
-	created []notification.CreateInput
-	err     error
+// stubCreatedNotifier records what report-abuse hands to the notifier.
+type stubCreatedNotifier struct {
+	reports   []*model.AbuseUserReport
+	reporters []*model.User
+	targets   []*model.User
 }
 
-func (s *stubInAppNotifier) Create(_ context.Context, in notification.CreateInput) (*notification.Notification, error) {
-	s.created = append(s.created, in)
-	if s.err != nil {
-		return nil, s.err
-	}
-	return &notification.Notification{ID: "n1", Type: in.Type}, nil
+func (s *stubCreatedNotifier) NotifyCreated(_ context.Context, report *model.AbuseUserReport, reporter, target *model.User) {
+	s.reports = append(s.reports, report)
+	s.reporters = append(s.reporters, reporter)
+	s.targets = append(s.targets, target)
 }
 
-// #2868: 通報はモデレーターの通知欄にも残る。
-//
-// **admin stream (#1549) では足りない。** あちらはその瞬間に管理画面を開いて
-// いる人にしか届かない。
-func TestReportAbuse_CreatesInAppNotification(t *testing.T) {
-	h, _, _ := newExtraHandler(t)
-	notifier := &stubInAppNotifier{}
-	h.SetAbuseReportFanout(stubModeratorLister{mods: []*model.User{{ID: "mod1"}, {ID: "mod2"}}}, &stubAbuseNotifier{})
-	h.SetAbuseReportInAppNotifier(notifier)
+// 通報の通知 (通知欄 #2868 / admin stream #1549 / abuseReport system webhook
+// #1542) は core/abuse.CreatedNotifier の責務で、handler は保存した通報と
+// 通報者・対象を渡す。連合経由の Flag も同じものを呼ぶ (#3256)。
+func TestReportAbuse_HandsReportToCreatedNotifier(t *testing.T) {
+	h, userRepo, _ := newExtraHandler(t)
+	h.SetUserRepo(userRepo)
+	userRepo.Users["u2"] = &model.User{ID: "u2", Username: "target"}
+	notifier := &stubCreatedNotifier{}
+	h.SetAbuseReportCreatedNotifier(notifier)
 
-	rec := postExtra(h.ReportAbuse, `{"userId":"u2","comment":"spam"}`, &model.User{ID: "u1"})
+	me := &model.User{ID: "u1"}
+	rec := postExtra(h.ReportAbuse, `{"userId":"u2","comment":"spam"}`, me)
 	require.Equal(t, http.StatusNoContent, rec.Code)
-	require.Len(t, notifier.created, 2, "moderator ごとに 1 件作る")
+	require.Len(t, notifier.reports, 1, "通報 1 件につき 1 回渡す")
 
-	for _, in := range notifier.created {
-		assert.Equal(t, notification.TypeAbuseReport, in.Type)
-		assert.Equal(t, "u1", in.NotifierID, "notifier は通報者")
-		assert.Equal(t, "u2", in.Extra["targetUserId"])
-		assert.NotEmpty(t, in.Extra["reportId"], "管理画面の該当通報へ飛ぶために要る")
-		// **通報コメントは入れない (#2868)。** 定型フォームの全文が入るので
-		// 通知欄に出しても読めず、出さない以上 Redis に本文の複製を残す理由が
-		// 無い (権限を失った元モデレーターに読まれる面も減る)。
-		assert.NotContains(t, in.Extra, "comment", "通報コメントを通知に持たせない")
-	}
-	assert.ElementsMatch(t, []string{"mod1", "mod2"},
-		[]string{notifier.created[0].NotifieeID, notifier.created[1].NotifieeID})
+	r := notifier.reports[0]
+	assert.NotEmpty(t, r.ID, "保存済みの通報を渡す")
+	assert.Equal(t, "u1", r.ReporterID)
+	assert.Equal(t, "u2", r.TargetUserID)
+	assert.Equal(t, "spam", r.Comment)
+	// webhook の本文の reporter / targetUser に使う。欠けると null になる。
+	assert.Same(t, me, notifier.reporters[0])
+	require.NotNil(t, notifier.targets[0])
+	assert.Equal(t, "u2", notifier.targets[0].ID)
 }
 
-// admin stream 未配線でも in-app 通知だけは作る。
-//
-// 早期 return の条件を `lister == nil || notifier == nil` のままにすると、
-// 片方だけ配線した構成で無言で no-op になる。
-func TestReportAbuse_InAppNotificationWithoutAdminStream(t *testing.T) {
-	h, _, _ := newExtraHandler(t)
-	notifier := &stubInAppNotifier{}
-	h.SetAbuseReportFanout(stubModeratorLister{mods: []*model.User{{ID: "mod1"}}}, nil)
-	h.SetAbuseReportInAppNotifier(notifier)
-
-	rec := postExtra(h.ReportAbuse, `{"userId":"u2","comment":"spam"}`, &model.User{ID: "u1"})
-	require.Equal(t, http.StatusNoContent, rec.Code)
-	require.Len(t, notifier.created, 1)
-}
-
-// 通知の作成に失敗しても通報自体は成功する (report は永続化済み)。
-func TestReportAbuse_InAppNotificationFailureIsBestEffort(t *testing.T) {
-	h, _, _ := newExtraHandler(t)
-	notifier := &stubInAppNotifier{err: assertAnError{}}
-	h.SetAbuseReportFanout(stubModeratorLister{mods: []*model.User{{ID: "mod1"}}}, &stubAbuseNotifier{})
-	h.SetAbuseReportInAppNotifier(notifier)
-
+// 未配線でも通報自体は成功する。
+func TestReportAbuse_NoCreatedNotifierStillSucceeds(t *testing.T) {
+	h, userRepo, _ := newExtraHandler(t)
+	h.SetUserRepo(userRepo)
+	userRepo.Users["u2"] = &model.User{ID: "u2", Username: "target"}
 	rec := postExtra(h.ReportAbuse, `{"userId":"u2","comment":"spam"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 }
 
-// 未配線なら通知を作らない (旧挙動)。
-func TestReportAbuse_NoInAppNotifierIsNoop(t *testing.T) {
-	h, _, _ := newExtraHandler(t)
-	adminNotifier := &stubAbuseNotifier{}
-	h.SetAbuseReportFanout(stubModeratorLister{mods: []*model.User{{ID: "mod1"}}}, adminNotifier)
-
-	rec := postExtra(h.ReportAbuse, `{"userId":"u2","comment":"spam"}`, &model.User{ID: "u1"})
-	require.Equal(t, http.StatusNoContent, rec.Code)
-	require.Len(t, adminNotifier.calls, 1, "admin stream 側は従来どおり動く")
+// failingAbuseRepo fails every Create.
+type failingAbuseRepo struct {
+	*testutil.MockAbuseReportRepository
 }
 
-type assertAnError struct{}
+func (failingAbuseRepo) Create(*model.AbuseUserReport) error { return errors.New("db down") }
 
-func (assertAnError) Error() string { return "boom" }
+// 通報を保存できなかったら通知しない (通知が指す通報が無い)。
+func TestReportAbuse_UnsavedReportIsNotNotified(t *testing.T) {
+	h, userRepo, _ := newExtraHandler(t)
+	h.SetUserRepo(userRepo)
+	userRepo.Users["u2"] = &model.User{ID: "u2", Username: "target"}
+	h.SetAbuseRepo(failingAbuseRepo{testutil.NewMockAbuseReportRepository()})
+	notifier := &stubCreatedNotifier{}
+	h.SetAbuseReportCreatedNotifier(notifier)
+
+	rec := postExtra(h.ReportAbuse, `{"userId":"u2","comment":"spam"}`, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Empty(t, notifier.reports)
+}
+
+// 弾いた通報 (自分を通報) も通知しない。
+func TestReportAbuse_RejectedReportIsNotNotified(t *testing.T) {
+	h, _, _ := newExtraHandler(t)
+	notifier := &stubCreatedNotifier{}
+	h.SetAbuseReportCreatedNotifier(notifier)
+	rec := postExtra(h.ReportAbuse, `{"userId":"u1","comment":"spam"}`, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "自分を通報")
+	assert.Empty(t, notifier.reports)
+}

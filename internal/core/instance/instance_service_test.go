@@ -407,8 +407,12 @@ func TestService_FederationHostLists(t *testing.T) {
 	metaRepo.Meta.BlockedHosts = model.StringArray{"bad.example"}
 	metaRepo.Meta.SilencedHosts = model.StringArray{"quiet.example"}
 	metaRepo.Meta.MediaSilencedHosts = model.StringArray{"media.example"}
+	metaRepo.Meta.Federation = "specified"
+	metaRepo.Meta.FederationHosts = model.StringArray{"friend.example"}
 	hosts, err := svc.FederationHostLists()
 	require.NoError(t, err)
+	assert.Equal(t, "specified", hosts.Federation)
+	assert.Equal(t, []string{"friend.example"}, []string(hosts.FederationHosts))
 	assert.Equal(t, []string{"bad.example"}, []string(hosts.Blocked))
 	assert.Equal(t, []string{"quiet.example"}, []string(hosts.Silenced))
 	assert.Equal(t, []string{"media.example"}, []string(hosts.MediaSilenced))
@@ -542,6 +546,86 @@ func TestService_HostMatching(t *testing.T) {
 			svc, _, metaRepo := newService(t)
 			metaRepo.Meta.SilencedHosts = model.StringArray{tc.pattern}
 			assert.Equal(t, tc.want, svc.IsSilenced(tc.host))
+		})
+	}
+}
+
+// 非既定ポートで actor を公開しただけで blockedHosts / silencedHosts /
+// mediaSilencedHosts を回避できてはいけない。`hostFromURI` は非既定ポートを
+// `user.host` に残すので、拒否側の判定はポートを落とした形でも照合する。
+func TestService_DenyListsIgnorePort(t *testing.T) {
+	const host = "evil.example:8443"
+
+	t.Run("IsBlocked", func(t *testing.T) {
+		svc, _, metaRepo := newService(t)
+		metaRepo.Meta.BlockedHosts = model.StringArray{"evil.example"}
+		assert.True(t, svc.IsBlocked(host))
+		assert.True(t, svc.IsBlocked("sub.evil.example:8443"), "サブドメイン一致もポート付きで保たれる")
+		assert.False(t, svc.IsBlocked("notevil.example:8443"))
+	})
+	t.Run("IsAllowed_all", func(t *testing.T) {
+		svc, _, metaRepo := newService(t)
+		metaRepo.Meta.BlockedHosts = model.StringArray{"evil.example"}
+		assert.False(t, svc.IsAllowed(host))
+	})
+	t.Run("IsSilenced", func(t *testing.T) {
+		svc, _, metaRepo := newService(t)
+		metaRepo.Meta.SilencedHosts = model.StringArray{"evil.example"}
+		assert.True(t, svc.IsSilenced(host))
+	})
+	t.Run("IsMediaSilenced", func(t *testing.T) {
+		svc, _, metaRepo := newService(t)
+		metaRepo.Meta.MediaSilencedHosts = model.StringArray{"evil.example"}
+		assert.True(t, svc.IsMediaSilenced(host))
+	})
+	t.Run("ShouldSkipDelivery", func(t *testing.T) {
+		svc, _, metaRepo := newService(t)
+		metaRepo.Meta.BlockedHosts = model.StringArray{"evil.example"}
+		assert.True(t, svc.ShouldSkipDelivery(host))
+	})
+	t.Run("CanFetchOptionalRemoteData", func(t *testing.T) {
+		svc, _, metaRepo := newService(t)
+		metaRepo.Meta.BlockedHosts = model.StringArray{"evil.example"}
+		assert.False(t, svc.CanFetchOptionalRemoteData(host))
+	})
+	// 許可リストにポート付きで載せていても、拒否リストはポートを落として
+	// 照合するので拒否が勝つ (拒否側を緩めない)。
+	t.Run("blocked wins over port-specific allow entry", func(t *testing.T) {
+		svc, _, metaRepo := newService(t)
+		metaRepo.Meta.Federation = "specified"
+		metaRepo.Meta.FederationHosts = model.StringArray{host}
+		metaRepo.Meta.BlockedHosts = model.StringArray{"evil.example"}
+		assert.False(t, svc.IsAllowed(host))
+		assert.True(t, svc.ShouldSkipDelivery(host))
+		assert.False(t, svc.CanFetchOptionalRemoteData(host))
+	})
+}
+
+// federation: specified の許可リストはポートを落とさない (upstream
+// isFederationAllowedHost と同じ)。落とすと同じホスト名の別ポートまで許可が
+// 広がる。
+func TestService_AllowListPortIsSignificant(t *testing.T) {
+	cases := []struct {
+		name    string
+		allowed string
+		host    string
+		want    bool
+	}{
+		{name: "bare entry does not admit non-default port", allowed: "good.example", host: "good.example:8443", want: false},
+		{name: "bare entry admits default port", allowed: "good.example", host: "good.example", want: true},
+		{name: "bare entry admits subdomain", allowed: "good.example", host: "sub.good.example", want: true},
+		{name: "port-specific entry admits that port", allowed: "good.example:8443", host: "good.example:8443", want: true},
+		{name: "port-specific entry does not admit another port", allowed: "good.example:8443", host: "good.example:9443", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, metaRepo := newService(t)
+			metaRepo.Meta.Federation = "specified"
+			metaRepo.Meta.FederationHosts = model.StringArray{tc.allowed}
+			assert.Equal(t, tc.want, svc.IsAllowed(tc.host), "IsAllowed")
+			assert.Equal(t, !tc.want, svc.ShouldSkipDelivery(tc.host), "ShouldSkipDelivery")
+			assert.Equal(t, tc.want, svc.CanFetchOptionalRemoteData(tc.host), "CanFetchOptionalRemoteData")
+			assert.Equal(t, tc.want, instance.HostMatchesAllowList([]string{tc.allowed}, tc.host), "HostMatchesAllowList")
 		})
 	}
 }
@@ -692,4 +776,51 @@ func TestService_ProhibitedWords(t *testing.T) {
 	// 空を返す (一時的な DB error で inbound を止めない)。
 	metaRepo.Meta = nil
 	assert.Nil(t, svc.ProhibitedWords())
+}
+
+type recordedGone struct {
+	host string
+	at   time.Time
+}
+
+type fakeGoneRecorder struct {
+	got []recordedGone
+	err error
+}
+
+func (f *fakeGoneRecorder) RecordGone(host string, at time.Time) error {
+	f.got = append(f.got, recordedGone{host, at})
+	return f.err
+}
+
+// goneSuspended になった時刻を記録する (#3067)。既に gone / 手動停止なら記録しない
+// (状態が変わっていないので、最初に消えた時刻を上書きしない)。
+func TestService_MarkGoneSuspended_RecordsTime(t *testing.T) {
+	svc, repo, _ := newService(t)
+	now := time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC)
+	svc.SetClock(func() time.Time { return now })
+	rec := &fakeGoneRecorder{}
+	svc.SetGoneRecorder(rec)
+
+	repo.Instances["alpha.example"] = &model.Instance{ID: "i1", Host: "alpha.example"}
+	require.NoError(t, svc.MarkGoneSuspended("alpha.example"))
+	require.NoError(t, svc.MarkGoneSuspended("alpha.example"))
+	repo.Instances["beta.example"] = &model.Instance{ID: "i2", Host: "beta.example", SuspensionState: model.SuspensionStateManuallySuspended}
+	require.NoError(t, svc.MarkGoneSuspended("beta.example"))
+	assert.Equal(t, []recordedGone{{"alpha.example", now}}, rec.got)
+
+	// 記録に失敗しても停止そのものは成立させる。
+	rec.err = errors.New("db down")
+	repo.Instances["gamma.example"] = &model.Instance{ID: "i3", Host: "gamma.example"}
+	require.NoError(t, svc.MarkGoneSuspended("gamma.example"))
+	assert.Equal(t, model.SuspensionStateGoneSuspended, repo.Instances["gamma.example"].SuspensionState)
+}
+
+// goneSuspended にしたら、判定のキャッシュを待たずに配送を止める。
+func TestService_MarkGoneSuspended_InvalidatesSuspendCache(t *testing.T) {
+	svc, repo, _ := newService(t)
+	repo.Instances["alpha.example"] = &model.Instance{ID: "i1", Host: "alpha.example"}
+	require.False(t, svc.ShouldSkipDelivery("alpha.example"), "caches the not-suspended decision")
+	require.NoError(t, svc.MarkGoneSuspended("alpha.example"))
+	assert.True(t, svc.ShouldSkipDelivery("alpha.example"))
 }

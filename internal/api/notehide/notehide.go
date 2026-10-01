@@ -16,6 +16,9 @@
 //     owned by RequireVisible / FilterVisible / SQL push-down / the notes-show
 //     ID-known doctrine (#799 / #1488); re-applying it here would re-blank notes
 //     those gates deliberately served (#1568).
+//   - Top-level notes packed from IDs the viewer saved earlier (i/favorites):
+//     HideStoredNotes applies the FULL decision to them as well, because no
+//     other gate re-checks visibility on that path.
 //
 // Streaming has its own per-connection gate in internal/stream/channels.
 package notehide
@@ -47,6 +50,26 @@ func SetFollowingRepo(r repository.FollowingRepository) {
 // no query.
 func HideEmbeds(viewer *model.User, packed []entity.NoteEntity) {
 	hideEmbedsAt(viewer, packed, followingRepo, time.Now().UnixMilli())
+}
+
+// HidePinnedNotes preserves public/home top-level notes in the profile's pinned
+// section despite author lockdown preferences. Call only after FilterVisible:
+// intrinsic access checks and all embedded-note gates remain in force.
+// Other response paths must keep using HideEmbeds or HideStoredNotes.
+func HidePinnedNotes(viewer *model.User, packed []entity.NoteEntity, repo repository.FollowingRepository) {
+	hideBatchAt(viewer, packed, repo, time.Now().UnixMilli(), true, true)
+}
+
+// HideStoredNotes is HideEmbeds plus the FULL hideNote decision on the
+// top-level notes (intrinsic followers/specified included), mirroring upstream
+// NoteEntityService.pack(note, me) without skipHide.
+//
+// Use it for endpoints that pack notes from IDs the viewer saved earlier
+// (i/favorites) and therefore have no visibility gate of their own: the
+// viewer may have lost access since (unfollowed the author, or the author
+// removed them), and upstream blanks such notes instead of returning them.
+func HideStoredNotes(viewer *model.User, packed []entity.NoteEntity) {
+	hideAt(viewer, packed, followingRepo, time.Now().UnixMilli(), true)
 }
 
 // HideNotificationNotes applies the per-viewer hideNote gate to the embedded
@@ -90,14 +113,37 @@ func hideNotificationNotesAt(viewer *model.User, packed []map[string]any, repo r
 }
 
 func hideEmbedsAt(viewer *model.User, packed []entity.NoteEntity, repo repository.FollowingRepository, nowMs int64) {
+	hideAt(viewer, packed, repo, nowMs, false)
+}
+
+// hideAt is the shared body of HideEmbeds / HideStoredNotes. fullTopLevel
+// selects the full decision (HideEmbedDecision) for top-level notes instead of
+// the author-preference subset.
+func hideAt(viewer *model.User, packed []entity.NoteEntity, repo repository.FollowingRepository, nowMs int64, fullTopLevel bool) {
+	hideBatchAt(viewer, packed, repo, nowMs, fullTopLevel, false)
+}
+
+func hideBatchAt(viewer *model.User, packed []entity.NoteEntity, repo repository.FollowingRepository, nowMs int64, fullTopLevel, pinnedTopLevel bool) {
 	if len(packed) == 0 {
 		return
 	}
-	follows := buildFollowSet(viewer, packed, repo)
+	follows := buildFollowSet(viewer, packed, repo, fullTopLevel)
 	for i := range packed {
-		// 著者設定ゲートを top-level に適用 (intrinsic followers/specified は別ゲート
-		// 任せ)。HideNoteEntity が要素を mutate できるよう slice element の pointer。
-		hideTopLevelIfNeeded(viewer, &packed[i], follows, nowMs)
+		// HideNoteEntity が要素を mutate できるよう slice element の pointer を渡す。
+		// 固定欄の公開ノート本体だけをロックダウン例外にする。元から
+		// followers/specified のノートや引用・返信先へ例外を伝播させない。
+		publicPin := pinnedTopLevel && (packed[i].Visibility == string(model.NoteVisibilityPublic) || packed[i].Visibility == string(model.NoteVisibilityHome))
+		if !publicPin {
+			if fullTopLevel {
+				// 保存済み ID から引いた note は可視性ゲートを通っていないので、
+				// intrinsic followers/specified も含めて判定する。
+				hideStoredTopLevelIfNeeded(viewer, &packed[i], follows, nowMs)
+			} else {
+				// 著者設定ゲートを top-level に適用 (intrinsic followers/specified は別ゲート
+				// 任せ)。
+				hideTopLevelIfNeeded(viewer, &packed[i], follows, nowMs)
+			}
+		}
 		hideEmbedIfNeeded(viewer, packed[i].Renote, follows, nowMs)
 		hideEmbedIfNeeded(viewer, packed[i].Reply, follows, nowMs)
 		// pure renote → quote の引用先 (renote.renote) と、renote 先の返信先
@@ -109,7 +155,9 @@ func hideEmbedsAt(viewer *model.User, packed []entity.NoteEntity, repo repositor
 		}
 		// #2106 L5: treatVisibility downgrade を packed entity の visibility field にも反映する
 		// (hide 判定が元の visibility を読み終えた後に書き換える、viewer 非依存)。
-		downgradeVisibilityIfNeeded(&packed[i], nowMs)
+		if !publicPin {
+			downgradeVisibilityIfNeeded(&packed[i], nowMs)
+		}
 		downgradeVisibilityIfNeeded(packed[i].Renote, nowMs)
 		downgradeVisibilityIfNeeded(packed[i].Reply, nowMs)
 		if packed[i].Renote != nil {
@@ -152,18 +200,31 @@ func hideTopLevelIfNeeded(viewer *model.User, n *entity.NoteEntity, follows func
 	}
 }
 
+// hideStoredTopLevelIfNeeded blanks a top-level note with the full decision
+// (HideEmbedDecision), using the reply-target author a top-level note carries.
+func hideStoredTopLevelIfNeeded(viewer *model.User, n *entity.NoteEntity, follows func(string) bool, nowMs int64) {
+	if corenote.HideEmbedDecision(viewer, topLevelFactsFromEntity(n), follows, nowMs) {
+		entity.HideNoteEntity(n)
+	}
+}
+
 // buildFollowSet resolves, in ONE query, which embed authors `viewer` follows.
 // It collects the distinct authors of embeds that may require a follow check
 // (followers, plus public/home that could downgrade via the author's
 // makeNotesFollowersOnlyBefore), then issues a single FilterFollowingsFromAnchor.
-func buildFollowSet(viewer *model.User, packed []entity.NoteEntity, repo repository.FollowingRepository) func(string) bool {
+func buildFollowSet(viewer *model.User, packed []entity.NoteEntity, repo repository.FollowingRepository, fullTopLevel bool) func(string) bool {
 	never := func(string) bool { return false }
 	if viewer == nil || repo == nil {
 		return never
 	}
 	seen := make(map[string]struct{})
 	for i := range packed {
-		collectTopLevelAuthor(&packed[i], viewer.ID, seen)
+		if fullTopLevel {
+			// 全判定では top-level の followers も follow 判定が要る (embed と同じ収集)。
+			collectEmbedAuthor(&packed[i], viewer.ID, seen)
+		} else {
+			collectTopLevelAuthor(&packed[i], viewer.ID, seen)
+		}
 		collectEmbedAuthor(packed[i].Renote, viewer.ID, seen)
 		collectEmbedAuthor(packed[i].Reply, viewer.ID, seen)
 		// depth-2 embed (renote.renote / renote.reply) の著者も follow 判定対象に含める。

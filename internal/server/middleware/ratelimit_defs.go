@@ -24,6 +24,9 @@ var DefaultEndpointLimits = map[string]*EndpointLimit{
 
 	// ── Bubble Game ────────────────────────────────────
 	"bubble-game/register": {Duration: time.Hour, Max: 120, MinInterval: 30 * time.Second},
+	// 対戦 (mk-go 独自、#3230)。招待は相手に通知が飛ぶので絞る。
+	"bubble-game/versus/invite": {Duration: time.Hour, Max: 60, MinInterval: time.Second},
+	"bubble-game/versus/report": {Duration: time.Hour, Max: 120},
 
 	// ── Channels ───────────────────────────────────────
 	"channels/create": {Duration: time.Hour, Max: 10},
@@ -84,13 +87,25 @@ var DefaultEndpointLimits = map[string]*EndpointLimit{
 	"gallery/posts/update": {Duration: time.Hour, Max: 300},
 
 	// ── I (account) ────────────────────────────────────
-	"i/change-password":       {Duration: time.Hour, Max: 10, MinInterval: time.Second},
 	"i/move":                  {Duration: 24 * time.Hour, Max: 5},
 	"i/notifications":         {Duration: 30 * time.Second, Max: 30},
 	"i/notifications-grouped": {Duration: 30 * time.Second, Max: 30},
 	"i/update":                {Duration: time.Hour, Max: 20},
 	"i/update-email":          {Duration: time.Hour, Max: 3},
 	"i/webhooks/test":         {Duration: 15 * time.Minute, Max: 60},
+
+	// ── I (パスワードを照合する endpoint) ──────────────
+	//
+	// **`i/change-password` / `i/delete-account` / `i/regenerate-token` /
+	// `i/2fa/*` はここに置かない。**
+	// limiter は route の RequireAuth / RequireSecure より前に走り、成否に
+	// 関係なく user bucket を消費するので、被害者の token を持つだけの第三者
+	// (scope 不問) が枠を使い切れる — token 漏洩時の唯一の対処である
+	// `i/regenerate-token` を攻撃者が止められる。パスワードの総当たりは
+	// handler 側の `passwordguard` が照合失敗だけを (アカウント, 接続元の範囲) とアカウント全体の 2 段で数えて
+	// 止める (`TestPasswordChecksAreFailureLimited` が固定)。
+	// `i/change-password` には以前 mk-go 独自の route 上限 (1h 10) があったが、
+	// 同じ理由で第三者に使い切られるので外した (upstream にも limit は無い)。
 
 	// ── Muting ─────────────────────────────────────────
 	"mute/create":        {Duration: time.Hour, Max: 20},
@@ -181,6 +196,12 @@ var DefaultEndpointLimits = map[string]*EndpointLimit{
 	// 対応」なので、ここだけ無制限だと mk-go 側に上限を置いた意味が無い。
 	// upstream にこの制限は無いので意図的な divergence (docs/divergence.md §7)。
 	"admin/get-user-ips": {Duration: time.Hour, Max: 120, UserBucketOnly: true},
+	// 連合先との疎通の診断 (#3055)。1 回で相手へ最大 8 本程度のリクエストを飛ばすので、
+	// mk-go を任意の外部ホストへの踏み台にさせない上限を置く。宛先は SSRF-safe
+	// transport が絞るので、ここで見るのは回数だけ。切り分けで続けて叩くので、
+	// 短い窓ではなく時間あたりで抑える。user bucket だけで数えるのは IP 照会と
+	// 同じ理由 (同じ出口 IP から未認証で叩き続けてモデレーターを締め出させない)。
+	"admin/federation/check-host": {Duration: time.Hour, Max: 30, UserBucketOnly: true},
 	// 初回セットアップの窓 (rootUserId 未設定 + 未認証) だけは credential 無しで
 	// 通るので、setupPassword の試行回数に上限を置く。**signin の 10 ではなく 30
 	// にしてある** — この endpoint は administrator が正規にアカウントを作る経路

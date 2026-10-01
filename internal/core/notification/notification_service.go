@@ -4,6 +4,7 @@ package notification
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -324,7 +325,164 @@ func (s *Service) passesRolePolicy(notifieeID string, typ Type) bool {
 var (
 	// ErrSelfNotification is returned when attempting to create a notification where notifier == notifiee.
 	ErrSelfNotification = errors.New("cannot notify oneself")
+	// ErrCoalesced is returned by CreateCoalesced when the notification was
+	// folded into one the recipient already has.
+	ErrCoalesced = errors.New("coalesced into an existing notification")
 )
+
+// coalesceLockTTL bounds how long CreateCoalesced holds the per-recipient
+// lock. 走査と XDEL / XADD だけなので通常は数 ms で外れる。落ちた process が
+// 握ったままにならないための上限。
+const coalesceLockTTL = 10 * time.Second
+
+// releaseCoalesceLock deletes the lock only while it still holds our token.
+// TTL が切れて別の呼び出しが取り直した後に、そちらのロックを消さないため。
+var releaseCoalesceLock = redis.NewScript(`
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+`)
+
+// Coalesce configures CreateCoalesced.
+type Coalesce struct {
+	// Window is the minimum interval between two notifications of the type
+	// for one recipient while an earlier one is still alive.
+	Window time.Duration
+	// Quiet keeps an existing alive notification instead of replacing it,
+	// even after Window has passed. A recipient without one still gets a new
+	// notification.
+	Quiet bool
+	// Alive reports whether an existing notification still stands for
+	// something. nil treats every existing entry as alive.
+	Alive func(*Notification) bool
+}
+
+// CreateCoalesced keeps at most one notification of the given type in the
+// recipient's list. It returns ErrCoalesced when it kept the existing one.
+//
+//   - 生きている同種の通知が無ければ必ず作る
+//   - 有れば、Window 内か Quiet なら作らない
+//   - それ以外は既存のものを消して作り直す (新しいものが一覧の先頭に来る)
+//
+// **既読位置を判定に使わない (#3200)。** frontend は通知欄を表示している間、
+// 通知が届くたびに `readNotification` を送って既読にする。「未読があれば
+// 作らない」形は、通知欄を開いているモデレーターにだけ一切効かない
+// (敵対的レビューで指摘された)。一覧に残る件数を 1 件に保つので、送る側の数に
+// 関係なく他の通知が押し出されない。作り直し (= realtime のポップアップ) は
+// Window に 1 回まで。
+//
+// **check と create を受信者ごとに直列化する。** 無いと並行したリクエストが
+// 全部「既存なし」を見て全部作る = 並列に投げるだけで素通りできる。
+// ロックが取れなければ作らない — 握っている側が作るか、既存を残す。
+//
+// Alive が偽の通知 (read 時に drop されるもの) は数えない。根拠にすると、
+// 通知欄に何も見えないまま後続が隠れる。
+func (s *Service) CreateCoalesced(ctx context.Context, in CreateInput, opt Coalesce) (*Notification, error) {
+	if in.NotifieeID == "" {
+		return nil, errors.New("notifieeId is required")
+	}
+	// 作らないことが分かっている呼び出しでロックを取らない。取ると、同時に来た
+	// 別の通報がロック待ちで見送られ、しかもこちらは何も作らないので誰にも
+	// 届かない。
+	if in.NotifierID != "" && in.NotifierID == in.NotifieeID {
+		return nil, ErrSelfNotification
+	}
+	if !s.passesRolePolicy(in.NotifieeID, in.Type) {
+		return nil, nil
+	}
+
+	suffix := string(in.Type) + ":" + in.NotifieeID
+	lockKey := s.keyPrefix + "notificationCoalesceLock:" + suffix
+	windowKey := s.keyPrefix + "notificationCoalesceWindow:" + suffix
+	token := rand.Text()
+	ok, err := s.client.SetNX(ctx, lockKey, token, coalesceLockTTL).Result()
+	if err != nil {
+		return nil, fmt.Errorf("notification coalesce lock: %w", err)
+	}
+	if !ok {
+		return nil, ErrCoalesced
+	}
+	defer releaseCoalesceLock.Run(context.WithoutCancel(ctx), s.client, []string{lockKey}, token)
+
+	existing, err := s.entriesOfType(ctx, in.NotifieeID, in.Type)
+	if err != nil {
+		return nil, err
+	}
+	var alive []string
+	for _, e := range existing {
+		if opt.Alive == nil || opt.Alive(e.n) {
+			alive = append(alive, e.streamID)
+		}
+	}
+	if len(alive) > 0 {
+		if opt.Quiet {
+			return nil, ErrCoalesced
+		}
+		inWindow, err := s.client.Exists(ctx, windowKey).Result()
+		if err != nil {
+			return nil, fmt.Errorf("notification coalesce window: %w", err)
+		}
+		if inWindow > 0 {
+			return nil, ErrCoalesced
+		}
+	}
+	n, err := s.createWithPush(ctx, in, nil)
+	if err != nil || n == nil {
+		// **既存は消さずに残す。** 先に消すと、作成が失敗したとき (XADD の失敗 /
+		// 早期判定の後に opt-out へ変わった) に何も残らない。
+		return n, err
+	}
+	// 作れてから既存を消す。生きていないものも一緒に消す — 残しても read 時に
+	// drop されるだけで、次の判定のたびに走査の対象になる。
+	if len(existing) > 0 {
+		ids := make([]string, len(existing))
+		for i, e := range existing {
+			ids[i] = e.streamID
+		}
+		if err := s.client.XDel(ctx, s.streamKey(in.NotifieeID), ids...).Err(); err != nil {
+			// 新しい通知は作れている。古いものが残るだけなので返さない。
+			slog.Warn("notification: coalesce xdel failed", "notifiee", in.NotifieeID, "err", err)
+		}
+	}
+	if opt.Window > 0 {
+		if err := s.client.Set(ctx, windowKey, "1", opt.Window).Err(); err != nil {
+			// 作成は済んでいる。窓が張れないと次が早く来るだけなので返さない。
+			slog.Warn("notification: coalesce window set failed", "notifiee", in.NotifieeID, "err", err)
+		}
+	}
+	return n, nil
+}
+
+type streamEntry struct {
+	streamID string
+	n        *Notification
+}
+
+// entriesOfType returns every notification of the given type in the
+// recipient's stream, read or not.
+func (s *Service) entriesOfType(ctx context.Context, userID string, typ Type) ([]streamEntry, error) {
+	res, err := s.client.XRange(ctx, s.streamKey(userID), "-", "+").Result()
+	if err != nil {
+		return nil, err
+	}
+	var out []streamEntry
+	for _, msg := range res {
+		raw, ok := msg.Values["data"].(string)
+		if !ok {
+			continue
+		}
+		var n Notification
+		if err := json.Unmarshal([]byte(raw), &n); err != nil {
+			continue
+		}
+		if n.Type == typ {
+			out = append(out, streamEntry{streamID: msg.ID, n: &n})
+		}
+	}
+	return out, nil
+}
 
 // Create writes a notification entry to the user's notification stream.
 // notifier == notifiee の場合は何もしない (Misskey本家の挙動を踏襲)。
@@ -552,8 +710,15 @@ func (s *Service) DeleteByTypeAndNotifier(ctx context.Context, notifieeID string
 	if notifieeID == "" || notifierID == "" {
 		return nil
 	}
-	// 全 stream entry を走査 (MaxPerUser=300 cap なので上限は常識的)。
-	res, err := s.client.XRange(ctx, s.streamKey(notifieeID), "-", "+").Result()
+	return s.deleteWhere(ctx, notifieeID, func(n *Notification) bool {
+		return n.Type == typ && n.NotifierID == notifierID
+	})
+}
+
+// deleteWhere removes every notification in userID's stream for which match
+// returns true. 全 stream entry を走査する (MaxPerUser=300 cap なので上限は常識的)。
+func (s *Service) deleteWhere(ctx context.Context, userID string, match func(*Notification) bool) error {
+	res, err := s.client.XRange(ctx, s.streamKey(userID), "-", "+").Result()
 	if err != nil {
 		return err
 	}
@@ -567,17 +732,36 @@ func (s *Service) DeleteByTypeAndNotifier(ctx context.Context, notifieeID string
 		if err := json.Unmarshal([]byte(raw), &n); err != nil {
 			continue
 		}
-		if n.Type == typ && n.NotifierID == notifierID {
+		if match(&n) {
 			toDelete = append(toDelete, msg.ID)
 		}
 	}
 	if len(toDelete) == 0 {
 		return nil
 	}
-	if err := s.client.XDel(ctx, s.streamKey(notifieeID), toDelete...).Err(); err != nil {
-		return err
+	return s.client.XDel(ctx, s.streamKey(userID), toDelete...).Err()
+}
+
+// DeleteByNote removes the notifications of the given types that notifierID
+// caused on noteID from notifieeID's stream.
+//
+// **取り消した操作の通知を残さない (#3201)。** リアクションの通知が指すのは
+// リアクションされた元ノートなので、取り消しても read 時に落ちる理由が無く
+// 一覧に残り続ける。リノートの通知はリノート自身を指すので一覧からは read 時に
+// 落ちる (#1953) が、stream には残って未読件数に数えられ、MaxPerUser の枠も
+// 使い続ける。upstream はどちらも消さない。
+func (s *Service) DeleteByNote(ctx context.Context, notifieeID, notifierID, noteID string, types ...Type) error {
+	if notifieeID == "" || notifierID == "" || noteID == "" || len(types) == 0 {
+		return nil
 	}
-	return nil
+	wanted := make(map[Type]struct{}, len(types))
+	for _, t := range types {
+		wanted[t] = struct{}{}
+	}
+	return s.deleteWhere(ctx, notifieeID, func(n *Notification) bool {
+		_, ok := wanted[n.Type]
+		return ok && n.NotifierID == notifierID && n.NoteID == noteID
+	})
 }
 
 // scheduleUnreadPublish delivers an `unreadNotification` event to the user's
@@ -602,6 +786,15 @@ func (s *Service) scheduleUnreadPublish(notifieeID, streamID string, packed any,
 			// badge を burn せず、冗長な push も送らない (#2106 L35)。
 			slog.Debug("notification: unreadNotification/push suppressed (already read)",
 				"userId", notifieeID, "streamId", streamID, "latestRead", latestRead)
+			return
+		}
+		// 待機中に通知そのものが消された (リアクション / リノートの取り消し #3201、
+		// 通報の通知の置き換え #3200 など) → 送らない。送ると一覧に無い通知の
+		// Web Push が届き、バッジだけが +1 される。確かめられなかったときは
+		// 送る側に倒す (取りこぼすより、消えた通知を 1 回送るほうがまし)。
+		if entries, err := s.client.XRange(context.Background(), s.streamKey(notifieeID), streamID, streamID).Result(); err == nil && len(entries) == 0 {
+			slog.Debug("notification: unreadNotification/push suppressed (deleted)",
+				"userId", notifieeID, "streamId", streamID)
 			return
 		}
 		if s.mainStreamPublisher != nil {

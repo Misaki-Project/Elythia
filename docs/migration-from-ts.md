@@ -73,7 +73,7 @@ id: aidx             # Misskey-TS側のID生成方式と一致させること
 
 mk-goの追加テーブルを作り、共有テーブルを upstream の形に揃える。**Misskey-TSが書いたデータは原則として保持される** (例外は `000081` / `000084` / `000085` / `000094` / `000098`、後述)。`000082` も行を DELETE するが、対象は upstream Misskey に無い `transfer-ownership` が作った行だけで TS 由来のものは含まない。`000098` は CherryPick 由来のリモートアバターデコレーションだけを削除する。
 
-共有テーブルにも触るものが 16 件あるので、内容と復路への影響を[破壊的なマイグレーション](#破壊的なマイグレーション)にまとめてある。**先に読むこと。**
+共有テーブルにも触るものが 17 件あるので、内容と復路への影響を[破壊的なマイグレーション](#破壊的なマイグレーション)にまとめてある。**先に読むこと。**
 
 ```bash
 # ローカルビルドの場合
@@ -87,7 +87,7 @@ docker compose exec app /app/migrate -config .config/default.yml -direction up
 
 ### 破壊的なマイグレーション
 
-「追加のみ」ではない。共有テーブルに触るものが 16 件ある。**うち 11 件は mk-go 側だけが作るもの (列 / FK / index / seed / 重複行 / 譲渡が残した membership) の除去、その初期化、または upstream 追随で、Misskey-TS が書いた列の値には影響しない。残る 5 件 (`000081` / `000084` / `000085` / `000094` / `000098`) は TS が書いた値にも当たる (`000098` は TS fork の CherryPick 由来)。**
+「追加のみ」ではない。共有テーブルに触るものが 17 件ある。**うち 12 件は mk-go 側だけが作るもの (列 / FK / index / seed / 重複行 / 譲渡が残した membership) の除去、その初期化、または upstream 追随で、Misskey-TS が書いた列の値には影響しない。残る 5 件 (`000081` / `000084` / `000085` / `000094` / `000098`) は TS が書いた値にも当たる (`000098` は TS fork の CherryPick 由来)。**
 
 | migration | 内容 | 位置づけ |
 |---|---|---|
@@ -107,6 +107,7 @@ docker compose exec app /app/migrate -config .config/default.yml -direction up
 | `000094` | `user_ip.ip` を正規化 (`UPDATE`) + 正規化で衝突した行を統合して DELETE | **TS が書いた値にも当たる。** IPv4-mapped IPv6 (`::ffff:a.b.c.d`) を対応する IPv4 へ畳み、IPv6 の大文字・ゼロ圧縮も正規形にする。畳んだ結果 `(userId, ip)` が衝突する行は 1 行へ統合し (初回 = 最古 / 最終 = 最新 / 回数 = 合算)、元の行は DELETE する。**down では戻らない** — 統合前の行数も個別の観測時刻も残っていない。`inet` が読めない値 (port 付き / zone 付き / IP でない文字列) と CIDR は触らない。あわせて mk-go 独自列 `lastSeenAt` / `observationCount` を 足すが、こちらは追加のみ (#3103) |
 | `000095` | `IDX_user_ip_ip_lastSeenAt` を DROP して `("ip","lastSeenAt" DESC,"userId")` の複合 index を作る | **落とすのは mk-go の `000094` が作った index だけ** — upstream の `user_ip` は `userId` と `UNIQUE (userId, ip)` しか持たないので、TS 由来の index には触らない (`000068` / `000083` と同じ方針)。張り替えるのは、関連候補の抽出 (#3105) が 1 つの IP から取る件数を上限で打ち切るため、`userId` まで index に乗っていないと**同じ最終観測が固まっているときに上限が保証されない**から。down は対称 (旧を作り直して新を落とす) で、行は触らない |
 | `000098` | CherryPick の `avatar_decoration."host" IS NOT NULL` の行をすべて DELETE | **CherryPick が連合先から取り込んだリモート由来のデコレーションだけが対象。** `host IS NULL` のローカル行は保持する。upstream / fresh mk-go のテーブルには `host` 列が無いため、その場合は何もしない。down は no-op で、削除した行は復元できない |
+| `000107` | `abuse_report_notification_recipient` の FK を張り替え (`SET NULL` の mk-go 名 2 本を DROP し、本家と同じ名前の `CASCADE` 3 本を足す) | **upstream 追随** (#3264)。本家 `1713656541000-abuse-report-notification.js` と同じ 3 本 (`userId` -> `user` / `user_profile`、`systemWebhookId` -> `system_webhook`) にする。**TS 製 DB には元から本家の 3 本があるので何もしない** (名前で有無を見て足す)。行は消さない — 直す前に `SET NULL` で宛先が NULL になった通知先は残る。**外部キーを張る前に、本家では作れない形の値を NULL にする** — `user_profile` の無い利用者を指す `userId` (残すと検証で失敗して migration が止まる) と、method に合わない側の参照 (webhook 方式の行の `userId`、email 方式の行の `systemWebhookId`。残すと CASCADE で無関係な削除に巻き込まれて通知先ごと消える)。どれも TS が書く値には当たらず、down でも戻らない |
 
 #### `000081` について
 
@@ -185,7 +186,7 @@ admin 画面 (全般 → 情報) で上書きする。
 
 **個別の migration を見て「これは安全」と判断しないこと。** 判断材料になりそうなものが 2 つあるが、どちらも当てにならない。
 
-- **`-- data loss:` の宣言。** あるのは 17 本だけで、**宣言が無いまま `DROP TABLE` / `DROP COLUMN` / `DELETE` する down が 51 本ある**。運用も一貫していない — `000076` は `meta` の設定列 1 本を落とすだけで宣言しているが、同じく `meta` の設定列を落とす `000070` は「data loss も無い」と書いている
+- **`-- data loss:` の宣言。** 現行 migration は 107 本（fork の legacy `000098_drop_remote_avatar_decorations` は無変更、upstream の `000098_registration_closed` は `000106_registration_closed`、通知先FKのmigrationは `000107` へ移設）。`-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある。運用も一貫していない — `000076` は `meta` の設定列 1 本を落とすだけで宣言しているが、同じく `meta` の設定列を落とす `000070` は「data loss も無い」と書いている
 - **up が冪等かどうか。** `000029` の up は大半が `IF NOT EXISTS` 付きだが、**down は無条件に DROP する**。落ちるのは `user_security_key` / `user_ip` / `user_memo` / `promo_note` / `promo_read` といった **upstream 所有のテーブル**と、`meta` / `user_profile` の 63 列、そして **TypeORM の `migrations` テーブル**。`000067` がわざわざ守っているものを、より悪い形で壊す。宣言は無い。同じ形 (up は冪等、down は無条件 DROP、対象は upstream) は `000030` / `000031` / `000032` / `000038` にもある
 
 方向が違うので別に挙げておくもの:
@@ -269,7 +270,7 @@ Misskey-TSに戻す場合の手順:
 
 データベースは双方向に互換性があり、mk-goが追加したテーブルはMisskey-TSからは無視される。
 
-ただし [破壊的なマイグレーション](#破壊的なマイグレーション) の 16 件は戻らない。うち 11 件は mk-go が自分で作ったものの除去・初期化か upstream 追随なので**戻す必要が無い**。`000056` / `000081` / `000082` / `000098` が消した行と `000053` / `000067` / `000084` / `000085` が上書きした値は、down が `SELECT 1;` の no-op なので復元できない。**`000094` は down を持つが、それでも戻らない** — 消すのは自分で足した列と index だけで、正規化した `ip` の値と統合で消えた行は復元できない (統合前の行数も個別の観測時刻も残っていない)。**`000084` / `000085` が書き換えるのは `meta."repositoryUrl"` と `meta."feedbackUrl"` なので、TS へ戻すときは admin 画面で設定し直すこと** (mk-go のリポジトリと issues を案内したままになる)。この経路を CI で検証しているのは `make dropin-swap-test` (TS → mk-go → TS) で、`make dropin-mkgo-born-test` は逆に mk-go 生まれの DB を TS に引き渡せるかを見ている。
+ただし [破壊的なマイグレーション](#破壊的なマイグレーション) の 17 件は戻らない。うち 12 件は mk-go が自分で作ったものの除去・初期化か upstream 追随なので**戻す必要が無い**。`000056` / `000081` / `000082` / `000098` が消した行と `000053` / `000067` / `000084` / `000085` が上書きした値は、down が `SELECT 1;` の no-op なので復元できない。**`000094` は down を持つが、それでも戻らない** — 消すのは自分で足した列と index だけで、正規化した `ip` の値と統合で消えた行は復元できない (統合前の行数も個別の観測時刻も残っていない)。**`000107` が空にした通知先の参照もdownでは復元できない。** `000107` のFKを巻き戻してからTS版へ戻すと、本家の3本のFKは再作成されないため、このmigrationを巻き戻さずにTS版へ戻す。**`000084` / `000085` が書き換えるのは `meta."repositoryUrl"` と `meta."feedbackUrl"` なので、TS へ戻すときは admin 画面で設定し直すこと** (mk-go のリポジトリと issues を案内したままになる)。この経路を CI で検証しているのは `make dropin-swap-test` (TS → mk-go → TS) で、`make dropin-mkgo-born-test` は逆に mk-go 生まれの DB を TS に引き渡せるかを見ている。
 
 ## drop-in 互換性の現状 (2026-05-09 時点)
 

@@ -145,6 +145,28 @@ func TestAdmin_DBFailureIsNot4xx(t *testing.T) {
 			"DB 障害が 4xx に化けている (#2792)")
 	})
 
+	// resolve-abuse-user-report も abuse report を引く。以前は引かずに
+	// UpdateFields の失敗を 404 にしていた (#3259)。
+	t.Run("admin/resolve-abuse-user-report", func(t *testing.T) {
+		rh, _, _, _ := newTestHandler(t)
+		rh.SetAbuseRepo(&failingAbuseRepo{err: dbErr})
+
+		rec := doPost(rh.ResolveAbuseReport, `{"reportId":"r1"}`, adminUser)
+		assert.Equal(t, http.StatusInternalServerError, rec.Code,
+			"DB 障害が 4xx に化けている (#2792)")
+	})
+
+	// system-webhook/delete は webhook を引く。以前は lookup の失敗を握りつぶして
+	// 204 を返していた (#3262)。
+	t.Run("admin/system-webhook/delete", func(t *testing.T) {
+		sh, _, _, _ := newTestHandler(t)
+		sh.SetSystemWebhookRepo(&failingSystemWebhookRepo{err: dbErr})
+
+		rec := doPost(sh.SystemWebhookDelete, `{"id":"w1"}`, adminUser)
+		assert.Equal(t, http.StatusInternalServerError, rec.Code,
+			"DB 障害が 4xx / 204 に化けている (#2792)")
+	})
+
 	// promo/create は user ではなく note を引く。**別の repo なので上の
 	// failingUserRepo では守れない** (実際、guard を外す変異が生き残った)。
 	t.Run("admin/promo/create", func(t *testing.T) {
@@ -170,3 +192,14 @@ type failingAbuseRepo struct {
 }
 
 func (r *failingAbuseRepo) FindByID(string) (*model.AbuseUserReport, error) { return nil, r.err }
+
+// failingSystemWebhookRepo makes every system webhook lookup look like a
+// database failure.
+type failingSystemWebhookRepo struct {
+	repository.SystemWebhookRepository
+	err error
+}
+
+func (r *failingSystemWebhookRepo) FindByID(string) (*model.SystemWebhook, error) {
+	return nil, r.err
+}

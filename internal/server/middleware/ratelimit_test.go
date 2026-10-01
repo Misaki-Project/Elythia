@@ -579,7 +579,6 @@ func TestDefaultEndpointLimits_KnownEndpoints(t *testing.T) {
 		{"signin", 10},
 		{"signin-flow", 10},
 		{"signin-with-passkey", 200},
-		{"i/change-password", 10},
 		{"request-reset-password", 3},
 		{"reset-password", 30},
 	}
@@ -667,6 +666,16 @@ var adminUserForLimit = &model.User{ID: "01hzzzzzzzzzzzzzzzzzzzzzzz"}
 // 実際、初版は 3 行を削除しても全テストと `make gates` が緑だった (敵対的
 // レビュー 1 周目で実測)。limiter は未登録のキーを**素通しする**ので、
 // 気付ける経路が他に無い。
+// 疎通の診断 (#3055) は相手ホストへリクエストを飛ばす口なので上限を置く。route を
+// rename すると上限が黙って外れるので path から引いて固定する。
+func TestDefaultEndpointLimits_RemoteCheck(t *testing.T) {
+	limit, ok := DefaultEndpointLimits["admin/federation/check-host"]
+	require.True(t, ok, "admin/federation/check-host に上限が無い")
+	assert.Equal(t, time.Hour, limit.Duration)
+	assert.Equal(t, 30, limit.Max)
+	assert.True(t, limit.UserBucketOnly)
+}
+
 func TestDefaultEndpointLimits_IPLookups(t *testing.T) {
 	paths := []string{
 		"/api/admin/ip/accounts",
@@ -724,7 +733,6 @@ func TestDefaultEndpointLimits_MinIntervalEndpoints(t *testing.T) {
 		{"notes/unrenote", time.Second},
 		{"notes/reactions/delete", 3 * time.Second},
 		{"bubble-game/register", 30 * time.Second},
-		{"i/change-password", time.Second},
 		{"signin", time.Second},
 		{"signin-flow", time.Second},
 		{"signin-with-passkey", 250 * time.Millisecond},

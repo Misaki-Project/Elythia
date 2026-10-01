@@ -2171,29 +2171,50 @@ func TestNoteRepository_ListByUserList_RenoteFilters(t *testing.T) {
 	assert.False(t, ids["ulr_pure"], "ファイル無し renote も除外")
 }
 
-func TestNoteRepository_FindRenoteByUser(t *testing.T) {
+func TestNoteRepository_ListRenotesByUser(t *testing.T) {
 	repo := NewNoteRepository(testDB)
 	user := insertTestUser(t, "unrn_u", "unrnuser")
 	defer cleanupUser(t, user.ID)
+	otherUser := insertTestUser(t, "unrn_other_u", "unrnother")
+	defer cleanupUser(t, otherUser.ID)
 
 	orig := &model.Note{ID: "unrn_orig", UserID: user.ID, Visibility: "public"}
 	require.NoError(t, testDB.Create(orig).Error)
 	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, orig.ID)
+	otherOrig := &model.Note{ID: "unrn_other_orig", UserID: user.ID, Visibility: "public"}
+	require.NoError(t, testDB.Create(otherOrig).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, otherOrig.ID)
 
 	renoteID := orig.ID
 	rn := &model.Note{ID: "unrn_rn", UserID: user.ID, RenoteID: &renoteID, Visibility: "public"}
 	require.NoError(t, testDB.Create(rn).Error)
 	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, rn.ID)
+	quoteText := "quote"
+	quote := &model.Note{ID: "unrn_quote", UserID: user.ID, RenoteID: &renoteID, Text: &quoteText, Visibility: "public"}
+	require.NoError(t, testDB.Create(quote).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, quote.ID)
+	otherUsersRenote := &model.Note{ID: "unrn_other_user_rn", UserID: otherUser.ID, RenoteID: &renoteID, Visibility: "public"}
+	require.NoError(t, testDB.Create(otherUsersRenote).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, otherUsersRenote.ID)
+	otherRenoteID := otherOrig.ID
+	otherTargetsRenote := &model.Note{ID: "unrn_other_target_rn", UserID: user.ID, RenoteID: &otherRenoteID, Visibility: "public"}
+	require.NoError(t, testDB.Create(otherTargetsRenote).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, otherTargetsRenote.ID)
 
-	found, err := repo.FindRenoteByUser(user.ID, orig.ID)
+	found, err := repo.ListRenotesByUser(user.ID, orig.ID)
 	require.NoError(t, err)
-	assert.Equal(t, rn.ID, found.ID)
+	require.Len(t, found, 2)
+	assert.Equal(t, quote.ID, found[0].ID)
+	assert.Equal(t, rn.ID, found[1].ID)
+	assert.NotContains(t, []string{found[0].ID, found[1].ID}, otherUsersRenote.ID)
+	assert.NotContains(t, []string{found[0].ID, found[1].ID}, otherTargetsRenote.ID)
 }
 
-func TestNoteRepository_FindRenoteByUser_NotFound(t *testing.T) {
+func TestNoteRepository_ListRenotesByUser_NotFound(t *testing.T) {
 	repo := NewNoteRepository(testDB)
-	_, err := repo.FindRenoteByUser("ghost", "ghost")
-	assert.Error(t, err)
+	found, err := repo.ListRenotesByUser("ghost", "ghost")
+	require.NoError(t, err)
+	assert.Empty(t, found)
 }
 
 func TestNoteRepository_ListMentions(t *testing.T) {

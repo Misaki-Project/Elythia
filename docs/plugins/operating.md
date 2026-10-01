@@ -63,9 +63,10 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: shiroha-a/mk/.github/workflows/build-with-plugins.yml@main
+    # reusable workflow もタグかコミット SHA で固定する (@main にしない。下記)
+    uses: shiroha-a/mk/.github/workflows/build-with-plugins.yml@<タグ または コミット SHA>
     with:
-      mk_ref: develop
+      mk_ref: <同じタグ または コミット SHA>
       plugins: |
         weather    https://github.com/foo/mk-plugin-weather  v1.2.0
         nowplaying https://github.com/bar/mk-plugin-np       0123456789abcdef0123456789abcdef01234567
@@ -76,16 +77,29 @@ jobs:
 出来上がったイメージは**自分の GHCR** に入るので、本番は `docker pull` するだけになる。
 
 - **`permissions` は呼び出す側で宣言する。** publish するなら `packages: write` が要る。reusable workflow 側では宣言していない — あちらで書くと呼び出し元の権限以下にしか設定できず、権限を持たない呼び出し（fork からの PR など）は `push: false` でも run ごと拒否されるため
-- **`mk_ref` にこの機能を含む版を指す。** リリース `1.3.0` には `tools/pluginresolve` が無いので、指定するとビルドが「no required module provides package」で落ちる。対応する最初のリリースが出るまでは `develop` か、その先のコミット SHA を指すこと
+- **`mk_ref` にこの機能を含む版を指す。** リリース `1.3.0` には `tools/pluginresolve` が無いので、指定するとビルドが「no required module provides package」で落ちる。`1.4.0` 以降のタグか、その先のコミット SHA を指すこと
 - **ref は必須だが、それだけでは内容は固定されない。** タグ・ブランチ・コミット SHA のいずれも書けるので、`main` と書けば実質的に既定ブランチを追うことになる。省略を許さないのは「どの版を取るかを毎回書かせる」ためで、**内容まで固定したいならコミット SHA か、動かさない運用のタグを指すこと**。ブランチを指した場合、この文書の冒頭にある「特定のバージョンを名指しで含める」という前提は成立しない（作者のアカウントが侵害されれば、次のビルドで任意のコードが入る）
 - **フロントエンドを持つプラグインは自動で判定される。** 1つでもあれば SPA を自前でビルドして同梱し、無ければ公式のアセットイメージを使ってフロントエンドのビルドを丸ごと省く。判定は `mk-plugin.yml` で無効化されているものを除いた実際の組み込み対象に対して行われる
 - **指定したプラグインが組み込まれなかったらビルドが落ちる。** `mk-plugin.yml` が `disabled: true` のプラグインは生成ツールが黙って読み飛ばすため、突き合わせないと「指定したのに1つも入っていないイメージ」が成功扱いで publish される
-- **private なプラグインは `plugin_token` を渡す。** `https://github.com/` の URL 書き換えで差し込むので、プラグインの指定行に token を書く必要はない（書いた場合はビルドが弾く。指定行は秘密として扱われないので、ログに平文で残るため）
+- **private なプラグインは `plugin_token` を渡す。** `https://github.com/` の URL 書き換えで差し込むので、プラグインの指定行に token を書く必要はない（書いた場合はビルドが弾く。指定行は秘密として扱われないので、ログに平文で残るため）。書き換えはプラグインを clone する step の中だけで有効で、抜けるとき (失敗時も) に消すので、後続の `pnpm install` や go のビルドからは token を読めない。**token に持たせる権限はプラグインのリポジトリの読み取りだけにする**
 - `push: false` を渡すとビルドだけ行い、publish しない。`image` は `ghcr.io/...` のみ受け付ける（ログイン先が ghcr.io に固定されているため）
 
 `mk_repository` を渡せば mk-go 自体を fork したものにも向けられる。
 
-**`@main` の部分も可動であることに注意。** 上の例は reusable workflow をブランチで参照しているので、mk-go 側の更新がそのまま次回のビルドに入る。固定したい場合はタグかコミット SHA を指す。なお、この workflow はビルド結果のキャッシュを**呼び出し元の** Actions キャッシュに書き出す。プラグインのソースを含むので、公開リポジトリで fork からの PR を許している場合は取り扱いに注意すること。
+**`uses:` の `@` の後ろも固定する。** `@main` のようにブランチで参照すると、mk-go の `main` に入った変更がそのまま次回のビルドで**呼び出し側の権限のまま**動く。reusable workflow は呼び出し元が渡した `packages: write` (自分の GHCR へ publish できる) と `plugin_token` (private なプラグインを読める) を受け取るので、`main` が壊れたり侵害されたりすれば、それらがそのまま晒される。`mk_ref` を固定しても workflow 自体は別に解決されるので防げない。タグか、より確実にはコミット SHA を指し、上げるときは差分を読んでから上げること。なお、この workflow はビルド結果のキャッシュを**呼び出し元の** Actions キャッシュに書き出す。プラグインのソースを含むので、公開リポジトリで fork からの PR を許している場合は取り扱いに注意すること。
+
+## Misaki版の原神入り更新イメージ
+
+Misaki forkでは `.github/workflows/misaki-genshin-image.yml` を手動実行すると、実行対象のmkコミット・そのsubmodule・原神の固定コミットからfrontendとbackendを同時にビルドします。原神ソースは別リポジトリ `Misaki-Project/mk-plugin-genshin` から取得し、mk本体へ直接コミットしません。
+
+```bash
+# <mkの不変コミット> は検証・マージ済みの版を指定する。
+gh workflow run misaki-genshin-image.yml --repo Misaki-Project/mk --ref <mkの不変コミット>
+```
+
+公開先は `ghcr.io/misaki-project/mk-genshin` です。タグにはコミット・実行ID・再実行回数を含め、既存タグを上書きしません。実行結果のimageとdigestを確認し、更新時はdigestで固定してください。既存の認証情報だけを使い、新しいsecretの登録は不要です。
+
+**このworkflowはイメージを準備するだけで、本番へ適用しません。** 導入前にDB・設定・filesをバックアップし、本体と原神のmigrationを確認してください。原神Migration 8/9の適用前へ戻す場合は、イメージだけでなく適用前DBの復元が必要です。復元ではバックアップ後の書き込みが失われるため、切り戻し時はサービスを停止します。
 
 ## 設定
 
