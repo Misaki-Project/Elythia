@@ -364,12 +364,12 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 `MK_` プレフィックスの環境変数でオーバーライド可（例 `MK_DB_HOST`）。詳細は [configuration.md](configuration.md)。
 
-マイグレーション（`migration/`、golang-migrate、現在 106 本）:
-> 注: fork の `000098_drop_remote_avatar_decorations` は無変更で残し、upstream の `000098_registration_closed` は `000106_registration_closed` として統合している。upstream の過去実測 105 本は履歴上の値。
+マイグレーション（`migration/`、golang-migrate、現在 107 本）:
+> 注: fork の `000098_drop_remote_avatar_decorations` は無変更で残し、upstream の `000098_registration_closed` は `000106_registration_closed`、`000106_abuse_report_notification_recipient_fk_cascade` は `000107_abuse_report_notification_recipient_fk_cascade` として統合している。upstream の過去実測本数は履歴上の値。
 
-- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 16 件あり、うち 11 件は mk-go が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
+- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 17 件あり、うち 12 件は mk-go が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
 - drop-in テストで発見した補完列は専用マイグレーションで追加。
-- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただし既存の down はこの規約を満たしていない** — 現行 106 本のうち `-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある（[migration-from-ts.md](migration-from-ts.md#mk-go-内での切り戻し)）。
+- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただし既存の down はこの規約を満たしていない** — 現行 107 本のうち `-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある（[migration-from-ts.md](migration-from-ts.md#mk-go-内での切り戻し)）。
 
 ```bash
 make migrate-up      # 最新まで

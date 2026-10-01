@@ -2555,8 +2555,21 @@ func (s *stubSystemWebhookDispatcher) DispatchSystemTest(webhookID, eventType st
 func TestResolveAbuseReport_FiresResolvedWebhook(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	abuseRepo := testutil.NewMockAbuseReportRepository()
-	abuseRepo.Reports["r1"] = &model.AbuseUserReport{ID: "r1", ReporterID: "rep1", TargetUserID: "tgt1"}
+	reporterHost := "remote.example"
+	assigneeID := "mod1"
+	abuseRepo.Reports["r1"] = &model.AbuseUserReport{
+		ID: "r1", ReporterID: "rep1", TargetUserID: "tgt1", ReporterHost: &reporterHost,
+		Reporter:   &model.User{ID: "rep1", Username: "rep", Host: &reporterHost, FollowersCount: 3, Emojis: []string{"blob"}},
+		AssigneeID: &assigneeID, Assignee: &model.User{ID: assigneeID, Username: "mod"},
+	}
 	h.SetAbuseRepo(abuseRepo)
+	instanceRepo := testutil.NewMockInstanceRepository()
+	instanceName := "Remote"
+	instanceRepo.Instances[reporterHost] = &model.Instance{Host: reporterHost, Name: &instanceName}
+	h.SetInstanceRepo(instanceRepo)
+	emojiRepo := testutil.NewMockEmojiRepository()
+	emojiRepo.Emojis["e1"] = &model.Emoji{ID: "e1", Name: "blob", Host: &reporterHost, PublicURL: "https://remote.example/blob.png"}
+	h.SetEmojiRepo(emojiRepo)
 
 	recipientRepo := testutil.NewMockAbuseReportNotificationRecipientRepository()
 	inactiveID := "wh_inactive"
@@ -2591,6 +2604,20 @@ func TestResolveAbuseReport_FiresResolvedWebhook(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &body))
 	assert.Equal(t, "r1", body["id"])
 	assert.Equal(t, true, body["resolved"])
+	// 管理画面の API の形ではなく、本家の Webhook の形で送る (#3260)。
+	assert.Equal(t, "remote.example", body["reporterHost"])
+	assert.Contains(t, body, "targetUserHost")
+	reporter, ok := body["reporter"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "rep", reporter["username"])
+	assert.NotContains(t, reporter, "followersCount", "利用者は UserLite で載せる")
+	instance, ok := reporter["instance"].(map[string]any)
+	require.True(t, ok, "リモートの通報者に instance を付ける")
+	assert.Equal(t, "Remote", instance["name"])
+	assert.Equal(t, map[string]any{"blob": "https://remote.example/blob.png"}, reporter["emojis"], "絵文字の URL を解決する")
+	assignee, ok := body["assignee"].(map[string]any)
+	require.True(t, ok, "担当者も載せる")
+	assert.Equal(t, "mod", assignee["username"])
 }
 
 // dispatcher 未配線時は webhook を発火しないが resolve 自体は成功する (#1723)。
@@ -2673,13 +2700,92 @@ func TestResolveAbuseReport_InvalidResolvedAsReturns400(t *testing.T) {
 	assert.False(t, abuseRepo.Reports["r1"].Resolved)
 }
 
+// 存在しない ID は 404。モックの UpdateFields は本物と同じく該当行が無くても
+// エラーを返さないので、存在の確認を UpdateFields に任せると 204 になる (#3259)。
 func TestResolveAbuseReport_NotFound(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	abuseRepo := testutil.NewMockAbuseReportRepository()
 	h.SetAbuseRepo(abuseRepo)
+	disp := &stubSystemWebhookDispatcher{}
+	h.SetSystemWebhookDispatcher(disp)
+	logs := attachModLog(t, h)
 
-	rec := doPost(h.ResolveAbuseReport, `{"reportId":"ghost"}`, nil)
+	rec := doPost(h.ResolveAbuseReport, `{"reportId":"ghost"}`, adminUser)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Contains(t, rec.Body.String(), "NO_SUCH_ABUSE_REPORT")
+	assert.Empty(t, disp.calls, "存在しない通報で abuseReportResolved を出さない")
+	time.Sleep(50 * time.Millisecond)
+	assert.Empty(t, logs.Snapshot(), "存在しない通報でモデレーションログを残さない")
+}
+
+// 本家 AbuseReportService.resolve と同じく resolveAbuseReport を残し、
+// report には更新前の行を載せる (#3259)。
+func TestResolveAbuseReport_WritesModerationLog(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	abuseRepo := testutil.NewMockAbuseReportRepository()
+	abuseRepo.Reports["r1"] = &model.AbuseUserReport{ID: "r1", ReporterID: "rep1", TargetUserID: "tgt1"}
+	h.SetAbuseRepo(abuseRepo)
+	logs := attachModLog(t, h)
+
+	rec := doPost(h.ResolveAbuseReport, `{"reportId":"r1","resolvedAs":"reject"}`, adminUser)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Eventually(t, func() bool { return len(logs.Snapshot()) == 1 }, 500*time.Millisecond, 5*time.Millisecond)
+	log := logs.Snapshot()[0]
+	assert.Equal(t, "resolveAbuseReport", log.Type)
+	assert.Equal(t, adminUser.ID, log.UserID)
+	var info map[string]any
+	require.NoError(t, json.Unmarshal(log.Info, &info))
+	assert.Equal(t, "r1", info["reportId"])
+	assert.Equal(t, "reject", info["resolvedAs"])
+	report, ok := info["report"].(map[string]any)
+	require.True(t, ok, "report must be the report row: %v", info["report"])
+	assert.Equal(t, "tgt1", report["targetUserId"])
+	assert.Equal(t, false, report["resolved"], "report は更新前の行")
+}
+
+// resolvedAs の空文字と省略は、ログでも null になる (列と同じ値を残す)。
+func TestResolveAbuseReport_ModerationLogResolvedAsNull(t *testing.T) {
+	for _, body := range []string{`{"reportId":"r1","resolvedAs":""}`, `{"reportId":"r1"}`} {
+		t.Run(body, func(t *testing.T) {
+			h, _, _, _ := newTestHandler(t)
+			abuseRepo := testutil.NewMockAbuseReportRepository()
+			abuseRepo.Reports["r1"] = &model.AbuseUserReport{ID: "r1"}
+			h.SetAbuseRepo(abuseRepo)
+			logs := attachModLog(t, h)
+
+			rec := doPost(h.ResolveAbuseReport, body, adminUser)
+			require.Equal(t, http.StatusNoContent, rec.Code)
+			require.Eventually(t, func() bool { return len(logs.Snapshot()) == 1 }, 500*time.Millisecond, 5*time.Millisecond)
+			var info map[string]any
+			require.NoError(t, json.Unmarshal(logs.Snapshot()[0].Info, &info))
+			v, ok := info["resolvedAs"]
+			require.True(t, ok, "resolvedAs のキーは残す")
+			assert.Nil(t, v)
+		})
+	}
+}
+
+// 引いた後の更新の失敗は DB の障害なので 500 にする (#2792)。
+func TestResolveAbuseReport_UpdateFailureIs500(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	inner := testutil.NewMockAbuseReportRepository()
+	inner.Reports["r1"] = &model.AbuseUserReport{ID: "r1"}
+	h.SetAbuseRepo(&failingAbuseUpdateRepo{MockAbuseReportRepository: inner})
+	disp := &stubSystemWebhookDispatcher{}
+	h.SetSystemWebhookDispatcher(disp)
+
+	rec := doPost(h.ResolveAbuseReport, `{"reportId":"r1"}`, adminUser)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Empty(t, disp.calls)
+}
+
+// failingAbuseUpdateRepo finds reports but fails every update.
+type failingAbuseUpdateRepo struct {
+	*testutil.MockAbuseReportRepository
+}
+
+func (r *failingAbuseUpdateRepo) UpdateFields(string, map[string]any) error {
+	return errors.New("db down")
 }
 
 func TestShowModerationLogs_WithRepo(t *testing.T) {

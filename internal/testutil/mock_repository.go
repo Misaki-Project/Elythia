@@ -1834,13 +1834,14 @@ func (m *MockNoteRepository) ListFeaturedByUser(userID, viewerID, untilID string
 	return pool, nil
 }
 
-func (m *MockNoteRepository) FindRenoteByUser(userID, renoteID string) (*model.Note, error) {
+func (m *MockNoteRepository) ListRenotesByUser(userID, renoteID string) ([]*model.Note, error) {
+	notes := make([]*model.Note, 0)
 	for _, n := range m.Notes {
-		if n.UserID == userID && n.RenoteID != nil && *n.RenoteID == renoteID && n.Text == nil {
-			return n, nil
+		if n.UserID == userID && n.RenoteID != nil && *n.RenoteID == renoteID {
+			notes = append(notes, n)
 		}
 	}
-	return nil, ErrNotFound
+	return notes, nil
 }
 
 // ListMentions accepts the `following` flag for signature parity but does not
@@ -7221,7 +7222,10 @@ func (m *MockAbuseReportRepository) HasOlderUnresolvedFromHost(host, beforeID st
 func (m *MockAbuseReportRepository) UpdateFields(id string, fields map[string]any) error {
 	r, ok := m.Reports[id]
 	if !ok {
-		return ErrNotFound
+		// 本物 (GORM の Updates) は該当行が無くてもエラーを返さないので合わせる。
+		// ErrNotFound を返すと、存在の確認を UpdateFields 任せにした handler の
+		// テストが、本番では 204 になるのに 404 で通ってしまう (#3259)。
+		return nil
 	}
 	if v, ok := fields["resolved"]; ok {
 		r.Resolved = v.(bool)

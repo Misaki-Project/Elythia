@@ -88,6 +88,19 @@ jobs:
 
 **`uses:` の `@` の後ろも固定する。** `@main` のようにブランチで参照すると、mk-go の `main` に入った変更がそのまま次回のビルドで**呼び出し側の権限のまま**動く。reusable workflow は呼び出し元が渡した `packages: write` (自分の GHCR へ publish できる) と `plugin_token` (private なプラグインを読める) を受け取るので、`main` が壊れたり侵害されたりすれば、それらがそのまま晒される。`mk_ref` を固定しても workflow 自体は別に解決されるので防げない。タグか、より確実にはコミット SHA を指し、上げるときは差分を読んでから上げること。なお、この workflow はビルド結果のキャッシュを**呼び出し元の** Actions キャッシュに書き出す。プラグインのソースを含むので、公開リポジトリで fork からの PR を許している場合は取り扱いに注意すること。
 
+## Misaki版の原神入り更新イメージ
+
+Misaki forkでは `.github/workflows/misaki-genshin-image.yml` を手動実行すると、実行対象のmkコミット・そのsubmodule・原神の固定コミットからfrontendとbackendを同時にビルドします。原神ソースは別リポジトリ `Misaki-Project/mk-plugin-genshin` から取得し、mk本体へ直接コミットしません。
+
+```bash
+# <mkの不変コミット> は検証・マージ済みの版を指定する。
+gh workflow run misaki-genshin-image.yml --repo Misaki-Project/mk --ref <mkの不変コミット>
+```
+
+公開先は `ghcr.io/misaki-project/mk-genshin` です。タグにはコミット・実行ID・再実行回数を含め、既存タグを上書きしません。実行結果のimageとdigestを確認し、更新時はdigestで固定してください。既存の認証情報だけを使い、新しいsecretの登録は不要です。
+
+**このworkflowはイメージを準備するだけで、本番へ適用しません。** 導入前にDB・設定・filesをバックアップし、本体と原神のmigrationを確認してください。原神Migration 8/9の適用前へ戻す場合は、イメージだけでなく適用前DBの復元が必要です。復元ではバックアップ後の書き込みが失われるため、切り戻し時はサービスを停止します。
+
 ## 設定
 
 `.config/default.yml` の `plugins:` セクションに、プラグイン名をキーとして書く。

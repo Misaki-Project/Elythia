@@ -29,9 +29,8 @@
 # 固定しても workflow 自体は `uses:` の ref で解決されるので防げない)。
 # docs/plugins/operating.md も同じ書き方にしてある。
 #
-# **frontend を持つプラグインは扱えない。** この image の SPA は assets イメージ
-# から COPY するので .vue を反映する経路が無い。指定するとビルドが明示的に
-# 失敗する (pluginbuild が submodule 未取得を検出して落ちる)。
+# frontend を持つプラグインがあれば、取得済みsubmoduleからSPAを自前でビルドし、
+# ASSETS_SOURCE=localで同梱する。無ければ固定されたassetsイメージを使用する。
 name: Build with plugins
 
 on:
