@@ -95,7 +95,7 @@ jobs:
           # 1 往復で済む (実測 0.5 秒 / 121 tag)。
           git ls-remote --tags "$url" | sed 's/.*refs\/tags\///; s/\^{}$//' | sort -u > /tmp/fork-tags.txt
           # shellcheck disable=SC2016  # sed の後方参照なのでシェルに展開させない
-          sed -n 's/^| `\([0-9][0-9.]*-mk\.[0-9][0-9]*[a-z]*\)` |.*/\1/p' docs/divergence.md | sort -u > /tmp/doc-tags.txt
+          sed -n 's/^| `\([0-9][0-9.]*-mk\.\(misaki\.\)\{0,1\}[0-9][0-9]*[a-z]*\)` |.*/\1/p' docs/divergence.md | sort -u > /tmp/doc-tags.txt
           doccount=$(wc -l < /tmp/doc-tags.txt)
 
           # **件数は冒頭サマリの宣言値と一致すること。** 「1 件以上」のような下限だと
@@ -113,11 +113,20 @@ jobs:
             exit 1
           fi
           missing=$(comm -23 /tmp/doc-tags.txt /tmp/fork-tags.txt)
+          # 上流同期で追加された履歴タグは元のfrontend repoで確認する。
+          # Misaki固有タグと現在のpinは必ず上記のfork側で検証する。
+          if [ -n "$missing" ]; then
+            git ls-remote --tags https://github.com/shiroha-a/misskey-ts.git | sed 's/.*refs\/tags\///; s/\^{}$//' | sort -u > /tmp/upstream-tags.txt
+            printf '%s\n' "$missing" | grep -v -- '-mk\.misaki\.' > /tmp/legacy-missing-tags.txt || true
+            unresolved=$(comm -23 /tmp/legacy-missing-tags.txt /tmp/upstream-tags.txt)
+            misaki_missing=$(printf '%s\n' "$missing" | grep -- '-mk\.misaki\.' || true)
+            missing=$(printf '%s\n%s\n' "$unresolved" "$misaki_missing" | sed '/^$/d')
+          fi
           if [ -n "$missing" ]; then
             echo "::error::docs/divergence.md §4-2 の tag が $url にありません: $(echo "$missing" | tr '\n' ' ')"
             exit 1
           fi
-          echo "§4-2 tags ok: $doccount 件すべて fork に存在"
+          echo "§4-2 tags ok: $doccount 件すべて fork または上流履歴に存在"
 
       # 同梱サンプルは **既定無効** (#2495)。clone しただけの運営者のバイナリ・
       # フロント・DB に勝手に入らないようにするため。有効なままだと、設定して

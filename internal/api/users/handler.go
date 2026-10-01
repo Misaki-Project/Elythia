@@ -100,8 +100,8 @@ type Handler struct {
 	driveFileRepo repository.DriveFileRepository
 	// featuredRanking は users/featured-notes の per-user engagement ランキング
 	// (#1687)。nil 時 (= 未配線 / test) は SQL count-DESC fallback を使う。
-	featuredRanking FeaturedRankingReader
-	profileRoleVisibility   ProfileRoleVisibilityReader
+	featuredRanking       FeaturedRankingReader
+	profileRoleVisibility ProfileRoleVisibilityReader
 }
 
 // ProfileRoleVisibilityReader returns role IDs a user chose not to expose on

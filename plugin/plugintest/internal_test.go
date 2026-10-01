@@ -38,3 +38,33 @@ func TestJobSet_Lookup(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nope")
 }
+
+func TestFakeRequest_BindStrict(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		err  string
+	}{
+		{"valid", `{"value":"ok"}`, ""},
+		{"whitespace", "{\"value\":\"ok\"} \n\t", ""},
+		{"empty", "", "リクエストボディが空です"},
+		{"unknown field", `{"unexpected":true}`, "unknown field"},
+		{"malformed", `{"value":`, "unexpected EOF"},
+		{"wrong type", `{"value":1}`, "cannot unmarshal"},
+		{"trailing value", `{"value":"ok"} {}`, "trailing JSON value"},
+		{"trailing malformed", `{"value":"ok"} !`, "invalid character"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got struct {
+				Value string `json:"value"`
+			}
+			err := (&fakeRequest{body: tt.body}).BindStrict(&got)
+			if tt.err != "" {
+				require.ErrorContains(t, err, tt.err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "ok", got.Value)
+		})
+	}
+}
