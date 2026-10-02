@@ -203,6 +203,7 @@ func (s *service) ChangeExp(ctx context.Context, req ChangeExpRequest) (ChangeEx
 		RoleID:         req.RoleID,
 		Mode:           string(req.Mode),
 		Operand:        req.Operand,
+		Note:           req.Note,
 		Status:         string(StatusPending),
 	})
 	if err != nil {
@@ -229,16 +230,15 @@ func (s *service) ChangeExp(ctx context.Context, req ChangeExpRequest) (ChangeEx
 			return ChangeExpResult{}, err
 		}
 	}
-	return s.resume(ctx, op, req.Note, created)
+	return s.resume(ctx, op, created)
 }
 
 // ensureSameOperation rejects a retry that reuses an idempotency key for a different
 // request payload.
 //
 // **ActorID と Note は比較しない。** retry と reconciliation は永続化された
-// operation.ActorID で native を呼ぶので、要求者だけが違う再送は正常系。Note は
-// operation テーブルに列が無く監査専用で、再開の判断にも要らない
-// (再開する呼び出し側が毎回渡す)。
+// operation.ActorIDでnativeを呼び、operation.Noteで監査を記録する。
+// 再送の要求者やnoteが違っても、最初に保存した値を置き換えない。
 func ensureSameOperation(op operation, req ChangeExpRequest) error {
 	if op.UserID != req.UserID || op.RoleID != req.RoleID || op.Mode != string(req.Mode) ||
 		op.Operand != req.Operand {
@@ -331,9 +331,8 @@ func operationUnlockDecision(queryErr error, unlocked bool) (discard bool, reaso
 // It is the single implementation behind the first attempt, a client retry and the
 // reconciliation job, so the three can never drift apart.
 //
-// note is the operator's note for the audit row. **operation テーブルに note 列が無い**
-// のは、note が監査専用で操作の再開には要らないため。job からの再開は "" を渡す。
-func (s *service) resume(ctx context.Context, op operation, note string, created bool) (ChangeExpResult, error) {
+// 監査のnoteはlock内で読み直したoperationの値を使う。retry/jobから差し替えない。
+func (s *service) resume(ctx context.Context, op operation, created bool) (ChangeExpResult, error) {
 	conn, err := s.acquireOperationLock(ctx, op.IdempotencyKey)
 	if err != nil {
 		return ChangeExpResult{}, err
@@ -494,7 +493,7 @@ func (s *service) resume(ctx context.Context, op operation, note string, created
 	}
 	if err := s.store.InsertAudit(ctx, tx, auditEntry{
 		ActorID: op.ActorID, Operation: "change-exp", RoleID: op.RoleID, UserID: op.UserID,
-		AssignmentID: assignmentID, Note: truncate(note, 500),
+		AssignmentID: assignmentID, Note: op.Note,
 		Before: map[string]any{"experience": current},
 		After:  map[string]any{"experience": desired},
 	}); err != nil {

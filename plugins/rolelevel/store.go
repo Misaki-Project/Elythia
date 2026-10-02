@@ -48,6 +48,8 @@ type operation struct {
 	// Operand is a finite decimal. multiplier の raw factor (1.5 = ×1.5) を保持する
 	// 必要があるので整数にはしない (DB 列も double precision)。
 	Operand float64
+	// Note is the first request's audit note, preserved across retries and jobs.
+	Note string
 	// DesiredExp is the integer XP the operation settled on, filled on completion.
 	DesiredExp        *int64
 	AssignmentID      string
@@ -708,10 +710,10 @@ func (s *store) RecentAudit(ctx context.Context, roleID, userID string, limit in
 func (s *store) InsertOperation(ctx context.Context, op operation) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO role_level_operation
-			(idempotency_key, actor_id, user_id, role_id, mode, operand, status, assignment_created)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(idempotency_key, actor_id, user_id, role_id, mode, operand, status, assignment_created, note)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (idempotency_key) DO NOTHING
-	`, op.IdempotencyKey, op.ActorID, op.UserID, op.RoleID, op.Mode, op.Operand, op.Status, op.AssignmentCreated)
+	`, op.IdempotencyKey, op.ActorID, op.UserID, op.RoleID, op.Mode, op.Operand, op.Status, op.AssignmentCreated, truncate(op.Note, 500))
 	if err != nil {
 		return false, err
 	}
@@ -738,7 +740,7 @@ func (s *store) LoadOperation(ctx context.Context, key string) (operation, bool,
 func (s *store) loadOperation(ctx context.Context, q queryer, key string) (operation, bool, error) {
 	op, err := scanOperation(q.QueryRowContext(ctx, `
 		SELECT idempotency_key, actor_id, user_id, role_id, mode, operand, desired_exp,
-		       assignment_id, assignment_created, status, last_error, created_at, updated_at
+		       assignment_id, assignment_created, status, last_error, created_at, updated_at, note
 		FROM role_level_operation WHERE idempotency_key = $1
 	`, key))
 	if err != nil {
@@ -755,7 +757,7 @@ func (s *store) loadOperation(ctx context.Context, q queryer, key string) (opera
 func (s *store) LoadOperationForUpdate(ctx context.Context, tx *sql.Tx, key string) (operation, bool, error) {
 	op, err := scanOperation(tx.QueryRowContext(ctx, `
 		SELECT idempotency_key, actor_id, user_id, role_id, mode, operand, desired_exp,
-		       assignment_id, assignment_created, status, last_error, created_at, updated_at
+		       assignment_id, assignment_created, status, last_error, created_at, updated_at, note
 		FROM role_level_operation WHERE idempotency_key = $1 FOR UPDATE
 	`, key))
 	if err != nil {
@@ -776,7 +778,7 @@ func scanOperation(sc rowScanner) (operation, error) {
 	)
 	if err := sc.Scan(&op.IdempotencyKey, &op.ActorID, &op.UserID, &op.RoleID, &op.Mode,
 		&op.Operand, &op.DesiredExp, &assignmentID, &op.AssignmentCreated, &op.Status, &op.LastError,
-		&op.CreatedAt, &op.UpdatedAt); err != nil {
+		&op.CreatedAt, &op.UpdatedAt, &op.Note); err != nil {
 		return operation{}, err
 	}
 	if assignmentID.Valid {
@@ -825,7 +827,7 @@ func (s *store) ResumableOperations(ctx context.Context, limit int) ([]operation
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT idempotency_key, actor_id, user_id, role_id, mode, operand, desired_exp,
-		       assignment_id, assignment_created, status, last_error, created_at, updated_at
+		       assignment_id, assignment_created, status, last_error, created_at, updated_at, note
 		FROM role_level_operation
 		WHERE status IN ('pending', 'assigning', 'applying')
 		ORDER BY updated_at ASC
@@ -857,7 +859,7 @@ func (s *store) ResumableOperationsForUser(ctx context.Context, userID string, l
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT idempotency_key, actor_id, user_id, role_id, mode, operand, desired_exp,
-		       assignment_id, assignment_created, status, last_error, created_at, updated_at
+		       assignment_id, assignment_created, status, last_error, created_at, updated_at, note
 		FROM role_level_operation
 		WHERE status IN ('pending', 'assigning', 'applying') AND user_id = $1
 		ORDER BY updated_at ASC

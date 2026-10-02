@@ -730,11 +730,22 @@ func TestRoleMembersRequireNativeExplorableVisibility(t *testing.T) {
 
 func TestAdminAuditRoute(t *testing.T) {
 	h := routeHarness(t, levelRoleAPI())
-	if _, err := h.Call(t, "POST /admin/change-exp", plugintest.Request{
+	request := plugintest.Request{
 		UserID: "a1", Administrator: true,
 		Body: `{"idempotencyKey":"k1","userId":"u1","roleId":"r1","mode":"add","operand":50,"note":"first"}`,
-	}); err != nil {
-		t.Fatal(err)
+	}
+	for range 2 {
+		res, err := h.Call(t, "POST /admin/change-exp", request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var xp struct {
+			Experience int64 `json:"experience"`
+		}
+		decode(t, res, &xp)
+		if xp.Experience != 50 {
+			t.Fatalf("再送でXPが変わりました: %+v", xp)
+		}
 	}
 	res, err := h.Call(t, "POST /admin/audit", plugintest.Request{
 		UserID: "m1", Moderator: true, Body: `{"userId":"u1","limit":10}`,
@@ -745,6 +756,8 @@ func TestAdminAuditRoute(t *testing.T) {
 	var got struct {
 		Entries []struct {
 			Operation string `json:"operation"`
+			Note      string `json:"note"`
+			ActorID   string `json:"actorId"`
 			UserID    string `json:"userId"`
 			Before    any    `json:"before"`
 			After     any    `json:"after"`
@@ -753,6 +766,9 @@ func TestAdminAuditRoute(t *testing.T) {
 	decode(t, res, &got)
 	if len(got.Entries) != 1 || got.Entries[0].Operation != "change-exp" || got.Entries[0].UserID != "u1" {
 		t.Fatalf("= %+v", got.Entries)
+	}
+	if got.Entries[0].Note != "first" || got.Entries[0].ActorID != "a1" {
+		t.Fatalf("監査ログのnote/実行者が失われました: %+v", got.Entries[0])
 	}
 	if got.Entries[0].Before == nil || got.Entries[0].After == nil {
 		t.Fatalf("audit snapshots are missing: %+v", got.Entries[0])

@@ -259,6 +259,9 @@ func TestChangeExpOnExistingAssignment(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("audit = %d 件, want 1", len(entries))
 	}
+	if entries[0].Note != "test" || entries[0].ActorID != "admin1" || entries[0].Operation != "change-exp" {
+		t.Fatalf("audit のnote/実行者/操作が一致しません: %+v", entries[0])
+	}
 	if entries[0].Before["experience"].(float64) != 250 || entries[0].After["experience"].(float64) != 300 {
 		t.Fatalf("audit = %+v", entries[0])
 	}
