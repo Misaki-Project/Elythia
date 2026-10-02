@@ -214,7 +214,8 @@ func (c Curve) completedLevelUps(budget float64) (int64, error) {
 type Experience struct {
 	CurrentLevel    int64 `json:"currentLevel"`
 	CurrentLevelExp int64 `json:"currentLevelExp"`
-	// NextLevelExp is null at the maximum level or when there is no curve.
+	// NextLevelExp is the remaining XP until the next level, not its full cost.
+	// It is null at the maximum level or when there is no curve.
 	NextLevelExp     *int64 `json:"nextLevelExp"`
 	TotalExp         int64  `json:"totalExp"`
 	MinLevel         int64  `json:"minLevel"`

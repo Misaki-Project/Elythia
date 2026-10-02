@@ -318,6 +318,10 @@ var migrations = []plugin.Migration{
 		END
 		$migration$;
 	`},
+	// 旧操作の未保存noteは復元できないため空のまま保持する。
+	{Version: 7, SQL: `
+		ALTER TABLE role_level_operation ADD COLUMN note text NOT NULL DEFAULT '';
+	`},
 }
 
 // config mirrors the `plugins.role-level` section of the instance config.

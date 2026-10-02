@@ -136,7 +136,7 @@ func (s *service) ResumePendingOperations(ctx context.Context) error {
 			}
 			return ctx.Err()
 		}
-		if _, err := s.resume(ctx, op, "reconciliation による再開", false); err != nil {
+		if _, err := s.resume(ctx, op, false); err != nil {
 			s.log.Warn("role-level: 保留中の XP 操作を再開できませんでした",
 				"idempotencyKey", op.IdempotencyKey, "status", op.Status, "err", err)
 			if firstErr == nil {

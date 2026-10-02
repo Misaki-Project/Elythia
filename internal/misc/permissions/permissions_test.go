@@ -11,6 +11,7 @@ func TestIsKnown(t *testing.T) {
 	assert.True(t, IsKnown("write:notes"))
 	assert.True(t, IsKnown("read:chat"))
 	assert.True(t, IsKnown("write:admin:emoji"))
+	assert.True(t, IsKnown(WriteRoleLevelExperience))
 	assert.False(t, IsKnown("bogus"))
 	assert.False(t, IsKnown("read:*"))
 	assert.False(t, IsKnown(""))

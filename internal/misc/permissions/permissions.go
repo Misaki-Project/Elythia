@@ -6,8 +6,11 @@
 // retained verbatim for parity.
 package permissions
 
-// All is the ordered list of known permission kinds, matching upstream
-// misskey-js `permissions` exactly.
+// WriteRoleLevelExperience authorizes only Misaki's role-level XP mutation route.
+const WriteRoleLevelExperience = "write:admin:role-level-experience"
+
+// All is the ordered list of known permission kinds, matching the bundled
+// fork frontend's misskey-js permissions, including Misaki's XP-only scope.
 var All = []string{
 	"read:account",
 	"write:account",
@@ -66,6 +69,7 @@ var All = []string{
 	"write:admin:meta",
 	"write:admin:user-note",
 	"write:admin:roles",
+	"write:admin:role-level-experience",
 	"read:admin:roles",
 	"write:admin:relays",
 	"read:admin:relays",

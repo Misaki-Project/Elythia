@@ -53,6 +53,39 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+// 提示された旧データの残りXPとレベル境界を固定する。表示の分母はcurrent+next。
+func TestExperienceReportedLegacyCurve(t *testing.T) {
+	cfg := Config{
+		BaseLevel: 0,
+		ExperienceCurve: []Curve{
+			{Type: CurveLinear, LevelUps: 100, Base: 5000, Additional: 50, Exponential: 1},
+			{Type: CurveExponential, LevelUps: 1900, Additional: 10000, Exponential: 1.005},
+		},
+	}
+	for _, tt := range []struct {
+		total, level, current, remaining int64
+	}{
+		{364800, 57, 0, 7850},
+		{372639, 57, 7839, 11},
+		{372649, 57, 7849, 1},
+		{372650, 58, 0, 7900},
+		{747500, 100, 0, 10000},
+		{757499, 100, 9999, 1},
+		{757500, 101, 0, 10050},
+	} {
+		exp, err := cfg.Experience(tt.total)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exp.CurrentLevel != tt.level || exp.CurrentLevelExp != tt.current ||
+			exp.NextLevelExp == nil || *exp.NextLevelExp != tt.remaining ||
+			exp.TotalExp != tt.total || exp.MinLevel != 0 || exp.MaxLevel != 2000 ||
+			exp.ProgressionStage != tt.level+1 {
+			t.Fatalf("total %d = %+v, want level %d / current %d / remaining %d", tt.total, exp, tt.level, tt.current, tt.remaining)
+		}
+	}
+}
+
 // **baseLevel は負数・0・正数を許可する。** stage は常に 1 始まり。
 func TestNegativeAndZeroBaseLevel(t *testing.T) {
 	for _, tt := range []struct {

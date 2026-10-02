@@ -52,7 +52,15 @@ func TestMigrationsCreatePluginTables(t *testing.T) {
 }
 
 func TestLegacyMigrationPolicyAllowlistMatchesCatalog(t *testing.T) {
-	legacySQL := Plugin.Migrations[len(Plugin.Migrations)-1].SQL
+	var legacySQL string
+	for _, migration := range Plugin.Migrations {
+		if migration.Version == 6 {
+			legacySQL = migration.SQL
+		}
+	}
+	if legacySQL == "" {
+		t.Fatal("legacy migration 6が見つかりません")
+	}
 	for _, key := range defaultCatalog.Keys() {
 		if !strings.Contains(legacySQL, "'"+key+"'") {
 			t.Fatalf("legacy migration policy allowlist is missing %q", key)

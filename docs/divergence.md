@@ -44,7 +44,7 @@ mk-go は drop-in 互換 (同じ DB / Redis / frontend を Misskey TS と共有�
 | DB カラム | 23 (+ 未使用の残存列 3) | 3 | 0 |
 | ActivityPub | Ed25519 / RemoteStatsFetcher ほか | reversi 連合 / chat 連合 | — |
 | config キー | 20 前後 | 0 | — |
-| fork frontend の独自変更 | 140 tag (`2026.7.0-mk.0` ～ `2026.9.1-mk.misaki.3`) | — | — |
+| fork frontend の独自変更 | 141 tag (`2026.7.0-mk.0` ～ `2026.9.1-mk.misaki.4`) | — | — |
 
 > 注: frontend merge は旧 `950bcacd06` と upstream `31e7eb73` の自動 merge 成功を経たもので、現在の pin は `9e29160624`。API 件数は生成 API の確定値。
 
@@ -586,7 +586,7 @@ submodule bump の PR で人が見る。
 
 **還元できるものを一時的に置く場合は、その行に必ず明記する。** 純正にも同じ不具合があるものをここへ置くと、この表を「還元不能な差分の一覧」として読む運用 (upstream 追従時に残す / 落とすを判断する材料) が壊れる。純正へ取り込まれた時点で revert する対象なので、行を読んだだけでそれが分かる必要がある。現時点の該当は `2026.7.0-mk.22h` / `2026.7.0-mk.22i` / `2026.7.0-mk.22j` / `2026.9.0-mk.1` / `2026.9.0-mk.2` / `2026.9.0-mk.2a` / `2026.9.0-mk.8e` / `2026.9.0-mk.8f` / `2026.9.0-mk.15` / `2026.9.0-mk.15a` / `2026.9.0-mk.15b` / `2026.9.0-mk.15c` / `2026.9.0-mk.16` / `2026.9.0-mk.16a` / `2026.9.0-mk.16b` / `2026.9.1-mk.5` の 16 行 (**base を省略しない** — bump で `-mk.N` は 0 に戻るので省略形は曖昧になる)。
 
-**現在の pin は `2026.9.1-mk.misaki.3` (`414b78f9ad`)。** 旧 `9e29160624` / `950bcacd06` は履歴上の pin である。`2026.9.0-mk.*` の行はすべて 2026.9.1 への
+**現在の pin は `2026.9.1-mk.misaki.4` (`0d8e656dfb`)。** 旧 `414b78f9ad` / `9e29160624` / `950bcacd06` は履歴上の pin である。`2026.9.0-mk.*` の行はすべて 2026.9.1 への
 載せ替え (`git rebase --onto 2026.9.1 2026.9.0`、custom commit 151 個) で `2026.9.1-mk.0` に
 入っている。**載せ替えの衝突は 0 件** — upstream と fork の両方が触ったファイルは
 `locales/en-US.yml` / `pages/flash/flash.vue` / `utility/get-user-menu.ts` の 3 つだが、
@@ -746,6 +746,7 @@ upstream が `jobState` の型を autogen (`AdminQueueJobsRequest['state'][numbe
 | `2026.9.1-mk.misaki.1` | Misaki forkの既存変更を含む版。`canDeleteAccount`・`canPurgeAccount`のロールポリシーUI、role-levelの管理・表示・XP操作・段階別ポリシーUIを保持する。専用adapterはBearer認証を使い、プロフィール取得はmountを妨げないwatch方式。非表示roleはnative APIで除外する。Folderの件数は未mountの「変更なし」範囲も含めて計算する。上流の同名数字tagとは異なる履歴なので、下の補足表で区別する。 |
 | `2026.9.1-mk.misaki.2` | 上流frontend `31e7eb73` を旧fork `950bcacd06`へ統合。既存の削除ポリシー・role-level UIを保持し、上流の登録受付設定・連合管理・バブルゲームの変更へ追従する。 |
 | `2026.9.1-mk.misaki.3` | Misaki-developへ通常マージし、サーバープラグイン向け標準UI公開API・ユーザー取得・「見つける」の明示参加を追加。原神固有ソースとテストは別リポジトリで管理。既存bubble-gameのカバレッジ付きunitタイムアウトは、ユーザーが今回のマージに限り例外承認した。 |
+| `2026.9.1-mk.misaki.4` | role-levelの経験値表示を「獲得済み / 必要XP全体」へ修正し、XP変更専用のAPIキー権限を追加。APIの残りXPと保存済みXPは変更しない。関連37テスト・型・lint・ビルド・API reportは成功。CIの既存bubble-game4件timeout（757/761成功）は、ユーザーがこのマージに限り新たに例外承認し、FAILとして記録した。 |
 
 **Misaki forkの旧数字tagの補足**: 上流とforkが別の変更へ同じ数字tagを付けていたため、上の標準表は上流系列、下はMisaki fork系列として区別する。過去のtagを付け替えたり削除したりはしない。詳細な当時の説明は、[同期前の文書](https://github.com/Misaki-Project/mk/blob/fbf8f293/docs/divergence.md)に残る。標準表の行数には、この補足表を含めない。
 
