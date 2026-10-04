@@ -299,7 +299,7 @@ func TestAdminDeleteProducers_SkippedBranchesEnqueueNothing(t *testing.T) {
 			} else {
 				rec = doPost(h.DeleteAccount, tt.body, adminUser)
 			}
-			require.Equal(t, http.StatusNoContent, rec.Code)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
 			assert.Equal(t, 0, stub.called)
 			assert.Empty(t, stub.payloads)
 		})

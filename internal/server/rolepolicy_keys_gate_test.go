@@ -115,8 +115,14 @@ func TestCanDeleteAccountIsWiredInSettings(t *testing.T) {
 		t.Skipf("submodule が無い: %v", err)
 	}
 	src := htmlComment.ReplaceAll(raw, nil)
-	require.Contains(t, string(src), `import { isAccountDeletionAllowed } from '@/utility/account-delete-policy.js';`)
-	require.Regexp(t, regexp.MustCompile(`<SearchMarker\s+v-if="isAccountDeletionAllowed\(\$i\.policies\)"\s+:keywords="\['account', 'close', 'delete'\]">`), string(src))
+	require.Contains(t, string(src), `import { shouldShowAccountDeletionSection } from '@/utility/account-delete-policy.js';`)
+	require.Regexp(t, regexp.MustCompile(`<SearchMarker\s+:keywords="\['account', 'close', 'delete'\]">\s*<MkFolder\s+v-if="shouldShowAccountDeletionSection\(\$i\.policies,\s*\$i\.isDeleted\)">`), string(src))
+	helperPath := filepath.Join(filepath.Dir(path), "..", "..", "utility", "account-delete-policy.ts")
+	helper, err := os.ReadFile(helperPath)
+	require.NoError(t, err)
+	require.Contains(t, string(helper), "isAccountDeletionAllowed(policies)")
+	require.Contains(t, string(helper), "return isDeleted || isAccountDeletionAllowed(policies);")
+	require.Contains(t, string(helper), "return (policies as Record<string, unknown>).canDeleteAccount === true;")
 }
 
 // htmlComment matches a `<!-- ... -->` block in a Vue template.
