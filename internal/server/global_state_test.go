@@ -55,6 +55,7 @@ func restoreProcessGlobals(t *testing.T) {
 		entity.SetInstanceIconURLLookup(nil)
 		entity.SetSilencedLookup(nil)
 		notehide.SetFollowingRepo(nil)
+		notehide.SetUGCVisibilityLookup(nil)
 		coretwofactor.SetTestMode(false)
 		meself.SetEnricher(nil)
 		// **latch も戻す。** `RequireSetup` は「利用者を観測した」を覚えるので、
@@ -133,6 +134,7 @@ func TestProcessGlobalsAreRestored(t *testing.T) {
 		"entity.SetMediaURLContext":        "router.go",
 		"entity.SetSilencedLookup":         "router.go",
 		"notehide.SetFollowingRepo":        "router.go",
+		"notehide.SetUGCVisibilityLookup":  "router.go",
 		"coretwofactor.SetTestMode":        "router.go",
 		"meself.SetEnricher":               "router.go",
 		"meta.SetLocalUserCounter":         "router.go",
@@ -220,7 +222,8 @@ func readNonCommentSource(t *testing.T, name string) string {
 	// **block comment も落とす。** `/* entity.SetSilencedLookup(...) */` は
 	// 行コメント判定だけだと生き残り、「コメントアウトして残すのは消すのと
 	// 同じ」が成立しなくなる。
-	src := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(string(b), "")
+	// Windows由来のCRLFでも、同じソースに対する監査結果を保つ。
+	src := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(strings.ReplaceAll(string(b), "\r\n", "\n"), "")
 	var kept []string
 	for _, line := range strings.Split(src, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "//") {

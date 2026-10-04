@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/shiroha-a/mk/internal/model"
@@ -237,6 +238,75 @@ func TestDeleteAccountProcessor_SoftKeepsUser(t *testing.T) {
 	assert.Contains(t, userRepo.Users, "remote", "soft delete must keep the user row as tombstone")
 }
 
+func TestDeleteAccountProcessor_SoftPreserveAccountTruthTable(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		soft        bool
+		preserve    bool
+		wantUser    bool
+		wantProfile bool
+	}{
+		{"local purge", false, false, false, false},
+		{"local preserve", false, true, true, true},
+		{"remote purge flag", true, false, true, true},
+		{"remote preserve", true, true, true, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			userRepo := testutil.NewMockUserRepository()
+			userRepo.Users["u"] = &model.User{ID: "u"}
+			userRepo.Profiles["u"] = &model.UserProfile{UserID: "u"}
+			p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+			p.SetUserRepo(userRepo)
+
+			require.NoError(t, p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{
+				UserID: "u", Soft: tt.soft, PreserveAccount: tt.preserve,
+			})))
+
+			_, userExists := userRepo.Users["u"]
+			_, profileExists := userRepo.Profiles["u"]
+			assert.Equal(t, tt.wantUser, userExists)
+			assert.Equal(t, tt.wantProfile, profileExists)
+		})
+	}
+}
+
+func TestDeleteAccountProcessor_PreserveStillRunsAllCleanup(t *testing.T) {
+	noteRepo := testutil.NewMockNoteRepository()
+	driveRepo := testutil.NewMockDriveFileRepository()
+	followingRepo := testutil.NewMockFollowingRepository()
+	pageRepo := &recordingPageRepo{MockPageRepository: testutil.NewMockPageRepository()}
+	userRepo := testutil.NewMockUserRepository()
+	uid := "target"
+	noteRepo.Notes["n-target"] = &model.Note{ID: "n-target", UserID: uid}
+	driveRepo.Files["f-target"] = &model.DriveFile{ID: "f-target", UserID: &uid}
+	followingRepo.Followings["fo-target"] = &model.Following{ID: "fo-target", FollowerID: uid, FolloweeID: "other"}
+	pageRepo.Pages["pg-target"] = &model.Page{ID: "pg-target", UserID: uid}
+	name := "Retained Name"
+	description := "Retained profile description"
+	email := "retained@example.com"
+	userRepo.Users[uid] = &model.User{ID: uid, Username: "retained", UsernameLower: "retained", Name: &name}
+	userRepo.Profiles[uid] = &model.UserProfile{UserID: uid, Description: &description, Email: &email}
+	p := processors.NewDeleteAccountProcessor(noteRepo, driveRepo, followingRepo)
+	p.SetPageRepo(pageRepo)
+	p.SetUserRepo(userRepo)
+
+	require.NoError(t, p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{
+		UserID: uid, PreserveAccount: true,
+	})))
+
+	assert.NotContains(t, noteRepo.Notes, "n-target")
+	assert.NotContains(t, driveRepo.Files, "f-target")
+	assert.NotContains(t, followingRepo.Followings, "fo-target")
+	assert.NotContains(t, pageRepo.Pages, "pg-target")
+	assert.Equal(t, []string{"pg-target"}, pageRepo.deleted, "#3293 page repository cleanup must still run")
+	require.Contains(t, userRepo.Users, uid)
+	require.Contains(t, userRepo.Profiles, uid)
+	assert.Equal(t, "retained", userRepo.Users[uid].Username, "preserve is retention, not anonymization")
+	assert.Equal(t, &name, userRepo.Users[uid].Name, "preserve must leave identifying user fields unchanged")
+	assert.Equal(t, &description, userRepo.Profiles[uid].Description, "preserve must leave profile fields unchanged")
+	assert.Equal(t, &email, userRepo.Profiles[uid].Email, "preserve must leave identifying profile fields unchanged")
+}
+
 // #2230: userRepo 未配線なら hard delete を skip する (従来の soft 挙動)。
 func TestDeleteAccountProcessor_NoUserRepoSkipsHardDelete(t *testing.T) {
 	p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
@@ -264,7 +334,7 @@ func TestDeleteAccountProcessor_PreserveAccountKeepsUserRow(t *testing.T) {
 }
 
 // Soft/PreserveAccount の 4 通りの組み合わせ truth-table。user 行の生死だけを見る。
-func TestDeleteAccountProcessor_SoftPreserveAccountTruthTable(t *testing.T) {
+func TestDeleteAccountProcessor_SoftPreserveAccountUserRowTruthTable(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		soft     bool
@@ -326,9 +396,250 @@ func TestDeleteAccountProcessor_PreserveAccountStillCleansUp(t *testing.T) {
 	assert.Contains(t, userRepo.Users, "target")
 }
 
-// userRepo 未配線 (PreserveAccount=true) でも panic せず nil を返す。
-func TestDeleteAccountProcessor_NoUserRepoWithPreserveAccountSkipsHardDelete(t *testing.T) {
+// A local preserved account requires credential revocation before cleanup.
+func TestDeleteAccountProcessor_NoUserRepoWithPreserveAccountFailsClosed(t *testing.T) {
 	p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
 	task := deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "x", Soft: false, PreserveAccount: true})
-	require.NoError(t, p.Handle(context.Background(), task))
+	require.Error(t, p.Handle(context.Background(), task))
+}
+
+type credentialUserRepo struct {
+	*testutil.MockUserRepository
+	calls int
+	err   error
+}
+
+func (r *credentialUserRepo) RevokeDeletedLocalCredentials(uid string) error {
+	r.calls++
+	if r.err != nil {
+		return r.err
+	}
+	return r.MockUserRepository.RevokeDeletedLocalCredentials(uid)
+}
+
+func TestDeleteAccountProcessor_Credentials(t *testing.T) {
+	for _, soft := range []bool{false, true} {
+		for _, preserve := range []bool{false, true} {
+			r := &credentialUserRepo{MockUserRepository: testutil.NewMockUserRepository()}
+			secret := "secret"
+			r.Users["u"] = &model.User{ID: "u", IsDeleted: true, Token: &secret}
+			r.Profiles["u"] = &model.UserProfile{UserID: "u", Password: &secret}
+			p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+			p.SetUserRepo(r)
+			require.NoError(t, p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "u", Soft: soft, PreserveAccount: preserve})))
+			if !soft && preserve {
+				assert.Equal(t, 1, r.calls)
+				assert.Nil(t, r.Users["u"].Token)
+				assert.Nil(t, r.Profiles["u"].Password)
+			} else {
+				assert.Zero(t, r.calls)
+			}
+		}
+	}
+}
+
+func TestDeleteAccountProcessor_CredentialFailureRetriesBeforeCleanup(t *testing.T) {
+	notes := testutil.NewMockNoteRepository()
+	notes.Notes["n"] = &model.Note{ID: "n", UserID: "u"}
+	p := processors.NewDeleteAccountProcessor(notes, testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+	task := deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "u", PreserveAccount: true})
+	require.Error(t, p.Handle(context.Background(), task))
+	r := &credentialUserRepo{MockUserRepository: testutil.NewMockUserRepository(), err: errors.New("cleanup failure")}
+	p.SetUserRepo(r)
+	err := p.Handle(context.Background(), task)
+	require.ErrorIs(t, err, r.err)
+	assert.False(t, errors.Is(err, driver.ErrSkipRetry))
+	assert.Contains(t, notes.Notes, "n")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, p.Handle(ctx, task), context.Canceled)
+	assert.Equal(t, 1, r.calls)
+}
+
+// recordingPageRepo records which pages were deleted through Delete, so the
+// test can tell them from pages that would only vanish by the user-row
+// CASCADE (which does not decrement pageCount).
+type recordingPageRepo struct {
+	*testutil.MockPageRepository
+	deleted []string
+}
+
+func (r *recordingPageRepo) Delete(p *model.Page) error {
+	r.deleted = append(r.deleted, p.ID)
+	return r.MockPageRepository.Delete(p)
+}
+
+// The user's pages are deleted one by one through PageRepository.Delete so
+// the notes they reference get their pageCount decremented (#3293), across
+// more than one listing batch; other users' pages stay.
+func TestDeleteAccountProcessor_DeletesPagesThroughRepository(t *testing.T) {
+	pages := &recordingPageRepo{MockPageRepository: testutil.NewMockPageRepository()}
+	for i := 0; i < 150; i++ {
+		id := fmt.Sprintf("pg-%03d", i)
+		pages.Pages[id] = &model.Page{ID: id, UserID: "target"}
+	}
+	pages.Pages["pg-other"] = &model.Page{ID: "pg-other", UserID: "other"}
+
+	p := processors.NewDeleteAccountProcessor(nil, nil, nil)
+	p.SetPageRepo(pages)
+	require.True(t, p.HasPageRepo())
+	require.NoError(t, p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "target"})))
+
+	assert.Len(t, pages.deleted, 150)
+	assert.Len(t, pages.Pages, 1)
+	assert.Contains(t, pages.Pages, "pg-other")
+}
+
+type failingPageRepo struct {
+	*testutil.MockPageRepository
+}
+
+func (f *failingPageRepo) Delete(_ *model.Page) error { return errors.New("page boom") }
+
+// A page deletion error is returned so the job is retried.
+func TestDeleteAccountProcessor_PageErrorPropagates(t *testing.T) {
+	pages := &failingPageRepo{testutil.NewMockPageRepository()}
+	pages.Pages["pg-1"] = &model.Page{ID: "pg-1", UserID: "target"}
+	p := processors.NewDeleteAccountProcessor(nil, nil, nil)
+	p.SetPageRepo(pages)
+	require.Error(t, p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "target"})))
+	assert.False(t, processors.NewDeleteAccountProcessor(nil, nil, nil).HasPageRepo())
+}
+
+// recordingPushCache records the user IDs whose push subscription cache was
+// invalidated, along with the state of the context it received.
+type recordingPushCache struct {
+	invalidated []string
+	ctxErrs     []error
+	deadlines   []bool
+}
+
+func (c *recordingPushCache) Invalidate(ctx context.Context, userID string) {
+	c.invalidated = append(c.invalidated, userID)
+	c.ctxErrs = append(c.ctxErrs, ctx.Err())
+	_, ok := ctx.Deadline()
+	c.deadlines = append(c.deadlines, ok)
+}
+
+// cancelingUserRepo cancels the job context right after the rows are deleted,
+// simulating a job timeout or shutdown that lands between the deletion and the
+// cache invalidation.
+type cancelingUserRepo struct {
+	*testutil.MockUserRepository
+	cancel context.CancelFunc
+}
+
+func (r *cancelingUserRepo) RevokeDeletedLocalCredentials(uid string) error {
+	defer r.cancel()
+	return r.MockUserRepository.RevokeDeletedLocalCredentials(uid)
+}
+
+func (r *cancelingUserRepo) HardDeleteUser(uid string) error {
+	defer r.cancel()
+	return r.MockUserRepository.HardDeleteUser(uid)
+}
+
+// 行を消した直後に job の ctx が cancel されても、Invalidate には cancel されて
+// いない (ただし上限付きの) ctx が渡ること。cancel 済みの ctx だと Redis の Del が
+// 失敗し、キャッシュが最大 1 時間残る。
+func TestDeleteAccountProcessor_InvalidateSurvivesJobCancel(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		preserve bool
+	}{
+		{"local purge", false},
+		{"local preserve", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			userRepo := &cancelingUserRepo{MockUserRepository: testutil.NewMockUserRepository(), cancel: cancel}
+			userRepo.Users["u"] = &model.User{ID: "u", IsDeleted: true}
+			userRepo.Profiles["u"] = &model.UserProfile{UserID: "u"}
+			cache := &recordingPushCache{}
+			p := processors.NewDeleteAccountProcessor(nil, nil, nil)
+			p.SetUserRepo(userRepo)
+			p.SetPushSubscriptionCache(cache)
+
+			// preserve は後続の cleanup が cancel を見て error を返すが、
+			// 資格情報の削除とキャッシュの破棄はその前に済んでいる。
+			_ = p.Handle(ctx, deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "u", PreserveAccount: tt.preserve}))
+			require.Error(t, ctx.Err(), "the job context must be canceled by the repository")
+			require.Equal(t, []string{"u"}, cache.invalidated)
+			assert.NoError(t, cache.ctxErrs[0], "Invalidate must receive a live context")
+			assert.True(t, cache.deadlines[0], "Invalidate must receive a bounded context")
+		})
+	}
+}
+
+// sw_subscription 行を消す経路 (保持時の資格情報削除と、user 行の CASCADE) では
+// 購読キャッシュを捨てる。remote は sw_subscription を持たず、行も消さない。
+func TestDeleteAccountProcessor_InvalidatesPushSubscriptionCache(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		soft     bool
+		preserve bool
+		want     []string
+	}{
+		{"local purge", false, false, []string{"u"}},
+		{"local preserve", false, true, []string{"u"}},
+		{"remote purge flag", true, false, nil},
+		{"remote preserve", true, true, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			userRepo := testutil.NewMockUserRepository()
+			userRepo.Users["u"] = &model.User{ID: "u", IsDeleted: true}
+			userRepo.Profiles["u"] = &model.UserProfile{UserID: "u"}
+			cache := &recordingPushCache{}
+			p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+			p.SetUserRepo(userRepo)
+			p.SetPushSubscriptionCache(cache)
+
+			require.NoError(t, p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{
+				UserID: "u", Soft: tt.soft, PreserveAccount: tt.preserve,
+			})))
+			assert.Equal(t, tt.want, cache.invalidated)
+		})
+	}
+}
+
+// 資格情報の削除に失敗したときは行が残っているので、キャッシュを捨てずに再試行へ回す。
+func TestDeleteAccountProcessor_RevokeFailureKeepsPushSubscriptionCache(t *testing.T) {
+	r := &credentialUserRepo{MockUserRepository: testutil.NewMockUserRepository(), err: errors.New("revoke failure")}
+	cache := &recordingPushCache{}
+	p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+	p.SetUserRepo(r)
+	p.SetPushSubscriptionCache(cache)
+
+	err := p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "u", PreserveAccount: true}))
+	require.ErrorIs(t, err, r.err)
+	assert.Empty(t, cache.invalidated)
+}
+
+// failingHardDeleteUserRepo fails HardDeleteUser so the job is retried.
+type failingHardDeleteUserRepo struct {
+	*testutil.MockUserRepository
+	err error
+}
+
+func (r *failingHardDeleteUserRepo) HardDeleteUser(string) error { return r.err }
+
+// 物理削除に失敗したときも、キャッシュを捨てずに再試行へ回す。
+func TestDeleteAccountProcessor_HardDeleteFailureKeepsPushSubscriptionCache(t *testing.T) {
+	r := &failingHardDeleteUserRepo{MockUserRepository: testutil.NewMockUserRepository(), err: errors.New("hard delete failure")}
+	cache := &recordingPushCache{}
+	p := processors.NewDeleteAccountProcessor(testutil.NewMockNoteRepository(), testutil.NewMockDriveFileRepository(), testutil.NewMockFollowingRepository())
+	p.SetUserRepo(r)
+	p.SetPushSubscriptionCache(cache)
+
+	err := p.Handle(context.Background(), deleteAccountTask(t, queue.DeleteAccountPayload{UserID: "u"}))
+	require.ErrorIs(t, err, r.err)
+	assert.Empty(t, cache.invalidated)
+}
+
+func TestDeleteAccountProcessor_HasPushSubscriptionCache(t *testing.T) {
+	p := processors.NewDeleteAccountProcessor(nil, nil, nil)
+	assert.False(t, p.HasPushSubscriptionCache())
+	p.SetPushSubscriptionCache(&recordingPushCache{})
+	assert.True(t, p.HasPushSubscriptionCache())
 }

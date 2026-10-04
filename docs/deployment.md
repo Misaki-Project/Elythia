@@ -153,7 +153,7 @@ make image-build       # ghcr.io/shiroha-a/mk:bundled をローカルにビル�
 `bundled` / `latest` は develop の最新を指す **可変タグ**。本番ではバージョンを固定する。
 
 ```bash
-MK_IMAGE=ghcr.io/shiroha-a/mk:1.4.0-bundled docker compose up -d
+MK_IMAGE=ghcr.io/shiroha-a/mk:1.5.0-bundled docker compose up -d
 ```
 
 リリースタグを push すると `<version>` と `<version>-bundled` が publish される
@@ -186,7 +186,7 @@ gh workflow run docker.yml -f tag=1.1.0
 TS版Misskeyのイメージからアセットをコピーすることも可能:
 
 ```dockerfile
-FROM misskey/misskey:2026.9.1 AS misskey-assets
+FROM misskey/misskey:2026.10.0 AS misskey-assets
 FROM ghcr.io/shiroha-a/mk:latest
 COPY --from=misskey-assets /misskey/built /frontend
 COPY --from=misskey-assets /misskey/packages/frontend/assets /client-assets
@@ -307,6 +307,8 @@ make migrate-up
 | `user.followersCount` / `followingCount` | `following` の実件数 |
 | `user.notesCount` | `note` の実件数 |
 | `note.repliesCount` / `renoteCount` | `note.replyId` / `renoteId` の実件数 |
+| `note.clippedCount` | `clip_note` の実件数 (列は smallint なので 32767 で頭打ち) |
+| `note.pageCount` | ページの content が参照する件数 (同上) |
 | 孤児行 | 存在しない user を参照する `note` / `drive_file` / `following` |
 
 これらのカウンタは増減で維持されており、増減はベストエフォート (戻り値を捨てる呼び出しが
@@ -317,11 +319,16 @@ make migrate-up
 **報告に留める。** カウンタは元データから導けるので `-fix` で直せるが、**削除した行は
 復元できない**。影響を確認した上で手動で対応する。
 
-### 検査しないもの
+### 途中から維持し始めたカウンタ
 
-`clippedCount` / `pageCount` は**意図的に対象外**。mk-go はクリップ件数の非正規化カウンタを
-維持せず `clip_note` を直接数える設計なので、常に 0 が正しい値になる
-([divergence.md](divergence.md) 参照)。実件数と突き合わせると全件がずれとして報告される。
+`note.clippedCount` は #1768 から、`note.pageCount` は #3293 から維持している。それより前に
+クリップした行はカウンタが 0 のまま残っているので、`-fix` で実件数に直せる。**リモートノートの
+掃除の保護条件に使われる** (0 だと期限を過ぎたときに消える)。`pageCount` は migration `000108` が
+増やす向きに埋めるので、`-fix` で直るのは参照が無いのに値が残っている行 (下げる向き) だけ。
+
+**クリップを消すと平常時にもずれが出る。** クリップの削除 (利用者の削除による削除を含む) では、
+本家と同じくカウンタを減らさないので、保存値が実件数より大きく残る。`-fix` で下げてよいが、
+下げるとクリップが消えたリモートノートは掃除の対象に戻る (本家では残り続ける)。
 
 ## 設定の実効値を確認する
 
@@ -378,13 +385,13 @@ worker 数は既定値がキューごとに違い、`stuck 検出` は**キュ�
 
 ```
   ok    config.url   https://example.com
-  ok    database     接続 ok / migration version 107
+  ok    database     接続 ok / migration version 109
   ok    database-health dead tuple と VACUUM に問題なし (121 テーブル)
   ok    root user    meta.rootUserId 設定済み
   ok    redis        接続 ok
   FAIL  webfinger    status 403 (連合が無効)
         インスタンス設定の `federation` が `none` になっている。連合するなら管理画面で有効にする
-  ok    nodeinfo     mk-go 1.4.0
+  ok    nodeinfo     mk-go 1.5.0
   warn  actor        assertionMethod (Ed25519) が無い
         RSA だけでも連合できる。Ed25519 を公開すると対応実装との署名検証が軽くなる
   ok    tls          証明書の残り 68 日
@@ -630,7 +637,7 @@ upstream以外の設定はTCP構成と同じ。
 
 既存のMisskey (TypeScript版)からの移行手順は[TS版からの移行ガイド](migration-from-ts.md)を参照。
 
-mk-goはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの差し替えだけで移行可能。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 17 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
+mk-goはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの差し替えだけで移行可能。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 18 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
 
 ## アップデート
 
@@ -643,8 +650,10 @@ mk-goはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの
 **1.3.0 より後へ上げるときは、先に `backfill-remote-host` を流す (#2996)。** リモート
 host の読み取り側にあった、非正規化のまま保存された行むけの互換経路を撤去した。流して
 いない環境で上げると**非正規化の行が DB から引けなくなる** (`users/show` が呼ばれる
-たびに WebFinger を叩く、AP の acct 解決が 404 になる、リモート宛メンションの通知が
-飛ばない)。**保存側を正規化したのが 1.3.0 なので、それより古い版から上げる場合ほど
+たび、その acct へメンションした投稿 (`notes/create`) のたびに WebFinger を叩く、
+AP の acct 解決が 404 になる)。メンションは WebFinger で既存の行に解決し直すので
+配送はされるが、取得が締め切り (20 秒) や到達不能で落ちると、その投稿ではメンションが
+外れて配送されない (#3330)。**保存側を正規化したのが 1.3.0 なので、それより古い版から上げる場合ほど
 対象行は多い。** 確認方法と手順は[後始末バッチ](#後始末バッチ)の
 `backfill-remote-host`。
 
@@ -715,6 +724,99 @@ SQL migration として書けない一回限りの正規化は、独立したバ
 
 **稼働中の本体プロセスに影響しない使い捨てコンテナ**で流す。entrypoint を差し替えるのは
 `docker-compose.yml` の `migrate` サービスと同じ手法。
+
+### `backfill-instance-counts` — instance の `notesCount` / `usersCount` を数え直す (#3330)
+
+`instance.notesCount` / `usersCount` (`federation/instances` の `notesCount` / `usersCount`、
+`+notes` / `+users` の並び順) は、#3330 まで mk-go が動かしていなかった。それより前に
+mk-go が作った instance 行は **`notesCount` が 0、`usersCount` が行を作ったときの 1 のまま**
+残っている。#3330 からリモートの投稿・利用者の取り込みで増減を積むようになったが、
+積むのは差分なので過去の分は埋まらない。このバッチで実件数へ数え直す。
+
+**数え方は本家の instance chart の total と同じ** (`chart/charts/instance.ts` の
+`tickMajor`)。
+
+| 列 | 数えるもの |
+|---|---|
+| `notesCount` | `note."userHost"` がその host の行。renote も含む |
+| `usersCount` | `user.host` がその host の行。削除済み (`isDeleted`)・凍結中も含む |
+
+本家の集計列は累積値で、投稿の作成 (`NoteCreateService`、renote を含む全経路) で足し、
+`NoteDeleteService` で引き、利用者は `ApPersonService.createPerson` で足すだけで引かない。
+リモートのアカウント削除 (`DeleteAccountProcessorService`) は投稿も利用者の行も直接
+消すので、**どちらの列も引かない**。長く動いた本家の値は実件数より大きくなりうるが、
+その履歴は DB に残らないので復元できない。そのため本家自身が chart に使う
+「いまの実件数」を正とする。**`meta.enableStatsForFederatedInstances` に関係なく
+数え直す** (本家は設定が false の間は積まない)。
+
+instance 行の無い host は数えない (行を作らない)。値が既に正しい行は書かない
+(`IS DISTINCT FROM` で外れる) ので、何度流しても同じ結果になる。
+
+```bash
+# まず差分を見る (書き込まない)
+docker compose run --rm --no-deps --entrypoint /app/backfill-instance-counts app \
+  -config /app/.config/default.yml -dry-run
+
+# 実行
+docker compose run --rm --no-deps --entrypoint /app/backfill-instance-counts app \
+  -config /app/.config/default.yml -batch 100 -sleep-ms 200
+```
+
+**`--no-deps` を付ける** (理由は `backfill-emoji-system-file` と同じ)。UDS 構成では
+サービス名が `mkgo` になる (`docker compose -f compose.uds.yaml run --rm --no-deps
+--entrypoint /app/backfill-instance-counts mkgo ...`)。**バイナリが入るのはこのバッチを
+含む版のイメージから**なので、先にイメージを作り直す。バイナリ直接実行なら
+`go run ./cmd/backfill-instance-counts -config .config/default.yml -dry-run`。
+
+**無指定で書き込み、`-dry-run` で抑止する**側の作法 (`backfill-avatar-public-url` と同じ)。
+
+出力は差分のある行ごとに `instance <host> notesCount <旧> -> <新> usersCount <旧> -> <新>`、
+最後に `done [...]: scanned=<走査した instance 行> changed=<差分のあった行>
+notesCountDelta=<新 - 旧の合計> usersCountDelta=<同>`。本実行の `changed` は書いた行数。
+中断したら `-from <最後に出た cursor>` で続きから流せる (失敗したバッチは 1 本の
+UPDATE なので、まるごと書かれていない)。
+
+**TS から引き継いだ DB では、値が下がる行 (差分がマイナス) が出るのが正常。** TS 版が
+積んだ累積値は、リモートのアカウント削除で投稿と利用者の行が消えても引かれないので、
+実件数より大きく残っている。このバッチはそれを実件数へ下げる。
+
+**#3330 を含む版に上げてから流す。** それより前の版で流すと、値は直っても以後の
+増減を積まないので、また実件数から離れていく。
+
+**負荷とロック。** instance 行を id 順に `-batch` 件ずつ区切り、1 バッチを
+**数える SELECT と書く UPDATE の 2 文**で処理する。件数は host ごとに
+`note."userHost"` / `user.host` の index の該当範囲だけを読む (note の全件走査には
+ならない。ローカルの投稿は読まない。どちらの index も本家の初期 migration が作り、
+mk-go の `000001` も作るので、TS から引き継いだ DB でも mk-go 生まれの DB でもある)。
+数える文は行ロックを取らない。書く文は数えた値を `VALUES` で受け取るだけで集計を
+含まず、値が変わる行だけを書くので、instance 行のロックを持つのはその短い UPDATE の
+間だけになる (その間、同じ行を更新する処理 — 受信時の `latestRequestReceivedAt` の
+更新や集計列の書き込み — は待たされる)。**1 本の `UPDATE ... FROM (集計)` にしない**
+こと: `MATERIALIZED` の CTE でも planner が Nested Loop を選ぶと「1 行数えて書く →
+次を数える」が交互に進み、先に書いた行のロックを残りの集計の間ずっと握る。
+読む量の目安は「リモートの投稿の総数 + リモートの利用者の総数」の index 範囲で、
+1 バッチの数える時間はその中で最も投稿の多い host に引っ張られる
+(手元の計測: 合成した note 500 万行・instance 5000 行で、投稿 100 万件の host を含む
+100 件分の集計が 64ms、index がキャッシュに載り visibility map が埋まった状態。本番では
+ディスク読みと heap の確認でこれより遅くなる)。`-sleep-ms` で間を空けられる。
+
+**稼働中に流すと、少しずれうる。** 本体はリモートの投稿・利用者の増減を 30 秒の窓で
+合算してから書く (`instance.CounterBuffer`)。バッチは集計した時点の件数を書くので、
+
+- **集計より前に取り込まれ、まだ窓の中にある分は二重に数えられる** (集計に入り、窓の
+  書き込みでもう一度足される)
+- **集計の後・書き込みの前に窓が書いた分は失われる** (バッチの値で上書きされる。
+  書く時点で値が既に一致していればその行は書かない)
+
+どちらも 1 host あたり「窓 1 つ分 + 1 バッチの時間」のあいだの増減が上限で、
+集計列は best-effort の統計なので許容している。気になるなら空いている時間帯に
+流すか、終わってから `-dry-run` をもう一度当てて差分を見る (もう一度流しても同じ
+大きさのずれが起こりうるので、0 にならないことはある)。
+
+**mk-go の再起動と重ねない。** 起動時の `RecomputeFollowCounts` も instance の複数行を
+1 本の UPDATE で書くので、バッチの書き込みと重なると行を取る順が食い違い、まれに
+deadlock で片方が失敗する (バッチ側は id の順に渡しているが、行を取る順は planner
+次第)。バッチが落ちたら `-from` で流し直せばよい。
 
 ### `backfill-avatar-public-url` — アイコン / バナーの URL を公開用へ寄せ直す
 
@@ -846,7 +948,8 @@ compose の `run` はサービスの volume をそのまま引き継ぐ。別の
 冪等。途中で失敗しても、作れた複製の分だけ進んだ状態から再実行して安全。
 
 **既定は dry-run で、書き込みには `-apply` が要る。** 姉妹バッチ
-(`backfill-remote-host` / `backfill-note-tags` / `backfill-avatar-public-url`) は
+(`backfill-remote-host` / `backfill-note-tags` / `backfill-avatar-public-url` /
+`backfill-instance-counts`) は
 **逆** (無指定で書き込み、`-dry-run` で抑止) なので、手が覚えているほうで打たないこと。`-dry-run` と `-apply`
 を両方渡すと落ちる。
 
@@ -983,7 +1086,7 @@ acct 解決も #2996 で両当たりを撤去したので引けない。
 > | `/@:acct` の AP JSON | `ShowByUsernameDB` が DB だけを見るので **404**。リモートからの acct 解決はここで失敗する |
 > | `/@:acct` の HTML | 404 にはならない。素の SPA shell を 200 で返し (upstream も同じ)、OGP の meta だけが落ちる |
 > | `/avatar/@:acct` | `/static-assets/user-unknown.png` へ 302。**`Cache-Control: public, max-age=86400` を先に書く**ので、backfill を流しても最大 1 日はブラウザ側で unknown のまま出る |
-> | リモート宛メンション | 宛先を引けないので AP の `Mention` タグが付かない。**フォロワーには通常の配送で届くがメンション通知は飛ばず**、フォロワーでない相手には届かない |
+> | リモート宛メンション (`notes/create`) | DB で引けないので、`users/show` と同じく**投稿のたびに WebFinger で問い合わせ直す** (#3330)。相手が応答すれば既存の行に解決し、`Mention` タグも直接の配送も付く (行は増えない)。応答が無い・取得の締め切り (20 秒) に間に合わない場合は宛先を引けず、AP の `Mention` タグが付かない。そのときは**フォロワーには通常の配送で届くがメンション通知は飛ばず**、フォロワーでない相手には届かない |
 >
 > 連合ゲート (blocked / silenced host) と instance-mute は元から完全一致なので、
 > そちらは #2706 の時点から取りこぼしている。
@@ -1083,11 +1186,27 @@ IP とアカウントの対応を引く機能は、**照会そのものを別の
 `admin/get-user-ips` と `admin/show-user` の `signins` も記録する** — どちらも
 返すのは同じ「利用者 ↔ IP の対応」なので、外すと監査を迂回して同じものを引ける。
 
-**`admin/show-user` は記録が増えやすい。** 管理画面の利用者ページは開くたびに
-この口を叩き、凍結・サイレンス・ロール変更・メモ保存などの操作のあとにも引き直す。
-`canSearchIpHistory` を持つ相手が利用者ページを 1 回開いて 1 操作すると、それだけで
-記録が 2 行増える (ログイン履歴が 0 件の利用者でも `resultCount: 0` の行が残る)。
-下の「記録の一覧は最新 10,100 件までしか遡れない」と合わせて考えること。
+`admin/show-user` は additive な `withSignins` を受け付ける。明示的に `false` を渡すと
+signin repository を読まず `signins: []` を返し、照会していないため監査も残さない。
+省略時と `true` は既存 client のため従来どおり `signins` を返し、IP を開示した場合だけ
+`kind: signins` の記録を残す。
+
+**`withSignins` を省略する client では、`admin/show-user` の記録が増えやすい。** 同梱 frontend も
+`2026.10.0-mk.0` まではこの形で、管理画面の利用者ページを開くたびにこの口を叩き、凍結・
+ロールの付与と解除・メモ保存・アバターやバナーの解除などの操作のあとにも引き直していた。
+`canSearchIpHistory` を持つモデレーターが利用者ページを 1 回開いて、引き直しを伴う操作を
+1 回すると、それだけで `kind: signins` の記録が 2 行増える (ログイン履歴が 0 件の利用者でも
+`resultCount: 0` の行が残る)。管理者は開くたび・引き直すたびに `admin/get-user-ips` も
+呼んでいたので、`kind: userIps` の 2 行が加わって 4 行になる。下の「記録の一覧は最新
+10,100 件までしか遡れない」と合わせて考えること。
+
+**同梱 frontend は `2026.10.0-mk.1` から、利用者ページを開いただけでは記録しない** (#3276)。
+接続先が mk-go のとき (`meta` に `mkGoVersion` があるとき) は、開いたときも操作のあとの引き直しでも
+`withSignins: false` を渡す。管理者が IP の折りたたまれた欄を開いたときに初めて
+`admin/get-user-ips` を呼び、その照会が `kind: userIps` で 1 行残る (DB 障害で空を返したときは
+記録されない。管理者でないモデレーターには欄に案内だけが出て、照会は起きない)。同じページで
+欄を閉じて開き直しても取得済みの結果を使うので、記録は増えない。ページを開き直せば、欄を
+開いた時点でまた 1 行増える。
 
 **監査の一覧 (`admin/ip/lookup-log`) を読んだことは記録しない。** 監査ログの閲覧を
 監査し続けると際限が無いので切ってあるが、**この応答にも照会に使った IP が並ぶ**
@@ -1108,7 +1227,7 @@ upstream からの意図的な逸脱。**ただし揃っているのは policy �
 | 権限 | モデレーター + `canSearchIpHistory` (既定 false) + scope `read:admin:user-ips` | **管理者** + scope | **モデレーター + `canSearchIpHistory`** + scope `read:admin:show-user` (policy が無ければ `ip` と `headers` は空) |
 | 監査 | 残る | 残る | **返したときだけ残る** |
 | レート制限 | 1 時間 120 回 | 1 時間 120 回 | **無し** |
-| `Cache-Control` | `no-store` | `no-store` | 返したときだけ `no-store` |
+| `Cache-Control` | `no-store` | `no-store` | policy がある応答は `withSignins: false` でも `no-store` (既存の管理情報の保護を維持) |
 | 件数 | 1 ページ 100 件 | 最新 30 件 | **全件** |
 | `meta.enableIpLogging` が無効 | 新しい観測が止まる | 同左 | **関係なく記録され続ける** |
 | 保持期間 | 90 日で刈る | 同左 | **刈らない (無期限)** |
@@ -1232,3 +1351,9 @@ policy さえあればログイン IP が読める。**
 - 起動時に並走する race による微小なズレ
 
 drift は起動時の `RecomputeFollowCounts` で完全に再計算されるため、admin dashboard の federation pie chart に違和感が出たら **mk-go プロセスを再起動** すれば即時整合する。再起動以外で recompute を強制する API はまだ無い (将来 admin endpoint 化を検討)。
+
+列の意味は本家と同じで、どちらも**その host の側から見た**数 (#3330)。`followingCount` はその host の利用者がローカルの利用者をフォローしている数 (federation/instances の `publishing`)、`followersCount` はローカルの利用者がその host の利用者をフォローしている数 (`subscribing`)。#3330 より前の mk-go は incremental 更新・起動時の再計算ともに**逆向きに数えていた**ので、それまでに mk-go を起動したことのある DB では 2 列の値が入れ替わっている (TS 版が正しく積んだ値も、mk-go の起動時の再計算で入れ替わる)。#3330 を含む版に上げて**一度起動すれば、再計算で正しい向きに戻る**。一方、instance chart (`__chart__instance` の `following` / `followers`) の過去の行は作り直さないので、更新前の期間は 2 系列が入れ替わったまま残る。
+
+`meta.enableStatsForFederatedInstances` を false にすると、本家と同じく Follow / Unfollow はこの 2 列も instance chart の following / followers も動かさない (リモートの投稿・利用者の取り込みで動く `notesCount` / `usersCount` と、instance chart の notes / users も同じく止まる)。ただし**起動時の `RecomputeFollowCounts` はこの設定に関係なく走る** (本家には起動時の再計算そのものが無い。docs/divergence.md の 5 節)。chart と集計列の判定は、どちらも次のイベントから効く (meta はキャッシュ越しに読むので、キャッシュの TTL ぶん遅れうる。#3330 より前は chart 側だけ起動時の値に固定されていて、再起動が要った)。
+
+再計算は**移行済みのアカウントが絡むフォロー行を数えない**。本家の値と一致するのは、移行済みのリモートアカウントをローカルの利用者がフォローしている分の `followersCount` だけで、移行したアカウント側のフォローやローカルのアカウントの移行、proxy アカウントの行は本家では数えたまま残る。そのため移行が絡む instance では、mk-go の値が本家より小さくなりうる (詳細は docs/divergence.md の 5 節、#3330)。

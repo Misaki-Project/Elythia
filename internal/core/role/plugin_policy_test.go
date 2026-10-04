@@ -836,6 +836,41 @@ func TestEffectivePolicy_MetaBaseAndRoleInputFailuresBothReported(t *testing.T) 
 	})
 }
 
+func TestEffectivePolicy_CheckedForKeysIgnoresUnrelatedProviderFailures(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	var unrelatedCalls atomic.Int32
+	registerProvider(t, svc, "unrelated", []string{"canSearchNotes"}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+		unrelatedCalls.Add(1)
+		return nil, errors.New("unrelated provider failed")
+	})
+	var accountCalls atomic.Int32
+	registerProvider(t, svc, "account", []string{role.PolicyCanDeleteAccount, role.PolicyCanPurgeAccount}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+		accountCalls.Add(1)
+		return []plugin.EffectivePolicyContribution{
+			{Key: role.PolicyCanDeleteAccount, Value: true},
+			{Key: role.PolicyCanPurgeAccount, Value: false},
+		}, nil
+	})
+
+	policies, err := svc.GetUserPoliciesCheckedForKeys("u1", role.PolicyCanDeleteAccount, role.PolicyCanPurgeAccount)
+	require.NoError(t, err)
+	assert.Equal(t, true, policies[role.PolicyCanDeleteAccount])
+	assert.Equal(t, false, policies[role.PolicyCanPurgeAccount])
+	assert.Zero(t, unrelatedCalls.Load())
+	assert.Equal(t, int32(1), accountCalls.Load())
+}
+
+func TestEffectivePolicy_CheckedForKeysReportsRelevantProviderFailure(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	registerProvider(t, svc, "account", []string{role.PolicyCanDeleteAccount}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+		return nil, errors.New("account provider failed")
+	})
+
+	policies, err := svc.GetUserPoliciesCheckedForKeys("u1", role.PolicyCanDeleteAccount, role.PolicyCanPurgeAccount)
+	require.ErrorIs(t, err, role.ErrEffectivePolicyProvider)
+	assert.Equal(t, true, policies[role.PolicyCanDeleteAccount], "failed provider restores the native value")
+}
+
 func TestEffectivePolicy_ProviderPanicCheckedRestoresDeclaredKeys(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
 	registerProvider(t, svc, "p", []string{"canSearchUsers", "driveCapacityMb"}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {

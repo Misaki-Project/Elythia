@@ -211,14 +211,15 @@ func TestProcess_FollowAlreadyFollowing(t *testing.T) {
 }
 
 func TestProcess_FollowUnknownFollowee(t *testing.T) {
-	p, _, _, _ := newProcessor(t, aliceActor)
+	p, _, followingRepo, _ := newProcessor(t, aliceActor)
 	body := []byte(`{
 		"type": "Follow",
 		"actor": "https://remote.example/users/alice",
 		"object": "https://example.com/users/ghost"
 	}`)
-	err := p.Process(body)
-	assert.Error(t, err)
+	// 本家 follow() は 'skip: followee not found' で ack する (#3330)。
+	require.NoError(t, p.Process(body))
+	assert.Empty(t, followingRepo.Followings)
 }
 
 func TestProcess_FollowResolveError(t *testing.T) {
@@ -386,8 +387,8 @@ func TestProcess_UndoUnknownFollowee(t *testing.T) {
 		"actor": "https://remote.example/users/alice",
 		"object": {"type":"Follow","actor":"x","object":"https://example.com/users/ghost"}
 	}`)
-	err := p.Process(undo)
-	assert.Error(t, err)
+	// 本家 undoFollow() は 'skip: followee not found' で ack する (#3330)。
+	require.NoError(t, p.Process(undo))
 }
 
 func TestProcess_UndoMissingObject(t *testing.T) {
@@ -494,7 +495,7 @@ func TestProcess_UndoNestedObjectInvalid(t *testing.T) {
 // 自体は読まない。効いているのは型エラーを握ることだけ。)
 func TestProcess_UndoFollow_InnerActorEmbeddedObject(t *testing.T) {
 	p, repo, followingRepo, _ := newProcessor(t, aliceActor)
-	// **local user は本番と同じく uri NULL。** `resolveTargetUser` の
+	// **local user は本番と同じく uri NULL。** `userFromAPID` の
 	// local-ID 分岐を通すために base URL を配線する。
 	p.SetLocalBaseURL("https://example.com")
 	// remote follower alice が local followee bob をフォロー済み。
@@ -607,7 +608,8 @@ func newProcessorWithBlocking(t *testing.T) (*federation.Processor, *testutil.Mo
 	idGen, _ := id.NewGenerator("aidx")
 	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
 	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	blockingSvc := coreblocking.NewService(repo, blockingRepo, followingRepo, idGen)
+	blockingSvc := coreblocking.NewService(repo, blockingRepo, idGen)
+	blockingSvc.SetUnfollower(followingSvc)
 	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
 	processor.SetBlockingService(blockingSvc)
 	return processor, repo, blockingRepo
@@ -616,7 +618,7 @@ func newProcessorWithBlocking(t *testing.T) (*federation.Processor, *testutil.Mo
 func TestProcess_BlockHappyPath(t *testing.T) {
 	p, repo, blockingRepo := newProcessorWithBlocking(t)
 	// 実本番のローカルユーザー row は user.uri が NULL なので、この条件で
-	// test する (handleBlock が resolveTargetUser で ID 解決することを検証)。
+	// test する (handleBlock が userFromAPID で ID 解決することを検証)。
 	p.SetLocalBaseURL("https://example.com")
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
 
@@ -778,7 +780,7 @@ func TestProcess_FlagObjectFormURIs(t *testing.T) {
 	p.SetAbuseReportRepo(abuseRepo, idGenFlag)
 
 	// **local user は本番と同じく uri NULL。** handleFlag は
-	// `ExtractLocalUserID` → `FindByID` で解決する (#1560 で「任意 host の
+	// `flagTargetUserID` → `FindManyByIDs` で解決する (#1560 で「任意 host の
 	// URI を受ける」旧実装を潰した硬化)。偽の uri を持たせると `FindByURI`
 	// に差し戻す変異が素通りする。
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
@@ -1437,35 +1439,39 @@ func TestProcess_AcceptFollowerLookupFailurePropagates(t *testing.T) {
 // Reject も同じ (#3115)。**Accept と Reject は同じ決定の裏表**なので、片方だけ
 // 直すと「承認は拾えるが拒否は落ちる」という非対称が残る。
 //
-// **Accept と経路が違う。** あちらは `resolver.ExtractLocalUserID` (URL builder 由来)
-// で分岐するが、Reject は `resolveTargetUser` = `Processor.localBaseURL` で分岐する。
-// `SetLocalBaseURL` を呼ばないと**常に `FindByURI` 側**へ落ちるので、`FindErr`
-// だけを立てたテストは分岐に到達せず緑のまま通る (実測)。両方を試す。
+// follower は Accept と同じく userFromAPID で引く (#3330)。ローカルの URI は
+// `FindByID`、リモートの URI は `FindByURI` に分かれるので両方を試す。
+// `FindByURIErr` をまとめて立てると actor (alice) の解決が先に落ち、follower の
+// lookup に到達しないまま緑になるので、リモート側は follower の URI だけを落とす。
 func TestProcess_RejectFollowerLookupFailurePropagates(t *testing.T) {
 	cases := []struct {
-		name         string
-		localBaseURL string
-		arm          func(*testutil.MockUserRepository, error)
+		name        string
+		followerURI string
+		arm         func(*testutil.MockUserRepository, error)
 	}{
 		{
-			name:         "localBaseURL あり (FindByID)",
-			localBaseURL: "https://example.com",
-			arm:          func(r *testutil.MockUserRepository, e error) { r.FindErr = e },
+			name:        "ローカルの follower (FindByID)",
+			followerURI: "https://example.com/users/ghost",
+			arm:         func(r *testutil.MockUserRepository, e error) { r.FindErr = e },
 		},
 		{
-			name: "localBaseURL なし (FindByURI)",
-			arm:  func(r *testutil.MockUserRepository, e error) { r.FindByURIErr = e },
+			name:        "リモートの follower (FindByURI)",
+			followerURI: "https://other.example/users/ghost",
+			arm: func(r *testutil.MockUserRepository, e error) {
+				r.FindByURIHook = func(uri string) error {
+					if uri == "https://other.example/users/ghost" {
+						return e
+					}
+					return nil
+				}
+			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			p, repo, _, _ := newProcessor(t, aliceActor)
-			if tc.localBaseURL != "" {
-				p.SetLocalBaseURL(tc.localBaseURL)
-			}
-			// **actor の解決を先に済ませておく。** `FindByURIErr` を立てると
-			// `ResolveActor` も落ちてしまい、その手前で return されて
-			// follower の lookup に到達しない。
+			// **actor の解決を先に済ませておく。** 未取り込みの actor は fetch に
+			// 回り、follower の lookup の手前で別の失敗をしうる。
 			dummyURI := "https://example.com/users/dummy"
 			repo.Users["dummy"] = &model.User{ID: "dummy", Username: "dummy", URI: &dummyURI}
 			require.NoError(t, p.Process([]byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/dummy"}`)))
@@ -1476,7 +1482,7 @@ func TestProcess_RejectFollowerLookupFailurePropagates(t *testing.T) {
 				"actor": "https://remote.example/users/alice",
 				"object": {
 					"type": "Follow",
-					"actor": "https://example.com/users/ghost",
+					"actor": "` + tc.followerURI + `",
 					"object": "https://remote.example/users/alice"
 				}
 			}`)
@@ -1590,7 +1596,7 @@ func TestProcess_LookupFailuresPropagate(t *testing.T) {
 	t.Run("Undo(Accept) の follower が引けない", func(t *testing.T) {
 		p, repo, _, _ := newProcessor(t, aliceActor)
 		const actor = "https://remote.example/users/alice"
-		// **follower はローカル利用者**なので `ExtractLocalUserID` → `FindByID`
+		// **follower はローカル利用者**なので `userFromAPID` → `FindByID`
 		// を通る (`FindByURI` ではない)。凍結判定は `FindByURI` なので干渉しない。
 		repo.FindErr = boom
 		body := []byte(`{"type":"Undo","actor":"` + actor + `","object":{"type":"Accept","actor":"` + actor + `",` +
@@ -1825,11 +1831,28 @@ func relayAcceptBody(kind, actor, activityID string) []byte {
 	}`)
 }
 
+// seedRelayActor registers an already-fetched remote actor so the relay
+// ownership check resolves it from the user repository without fetching.
+func seedRelayActor(repo *testutil.MockUserRepository, uri, inbox, sharedInbox string) {
+	host := "relay.example"
+	now := time.Now()
+	u := &model.User{ID: "relayactor_" + uri, Username: "relay", UsernameLower: "relay",
+		Host: &host, URI: &uri, LastFetchedAt: &now}
+	if inbox != "" {
+		u.Inbox = &inbox
+	}
+	if sharedInbox != "" {
+		u.SharedInbox = &sharedInbox
+	}
+	repo.Users[u.ID] = u
+}
+
 func TestProcess_AcceptFollowRelay_MarksAccepted(t *testing.T) {
-	p, _, _, _ := newProcessor(t, aliceActor)
+	p, repo, _, _ := newProcessor(t, aliceActor)
 	p.SetLocalBaseURL("https://example.com")
 	marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
 	p.SetRelayMarker(marker)
+	seedRelayActor(repo, "https://relay.example/actor", "https://relay.example/inbox", "")
 
 	// 送信元は relay 自身 (inbox と同じ host)。
 	body := relayAcceptBody("Accept", "https://relay.example/actor",
@@ -1840,10 +1863,11 @@ func TestProcess_AcceptFollowRelay_MarksAccepted(t *testing.T) {
 }
 
 func TestProcess_RejectFollowRelay_MarksRejected(t *testing.T) {
-	p, _, _, _ := newProcessor(t, aliceActor)
+	p, repo, _, _ := newProcessor(t, aliceActor)
 	p.SetLocalBaseURL("https://example.com")
 	marker := newFakeRelayMarker("rel456", "https://relay.example/inbox")
 	p.SetRelayMarker(marker)
+	seedRelayActor(repo, "https://relay.example/actor", "https://relay.example/inbox", "")
 
 	body := relayAcceptBody("Reject", "https://relay.example/actor",
 		"https://example.com/activities/follow-relay/rel456")
@@ -1855,10 +1879,11 @@ func TestProcess_RejectFollowRelay_MarksRejected(t *testing.T) {
 // TestProcess_FollowRelay_HostNormalizedMatch は host 比較が punycode / 大小文字を
 // 揃えてから行われることを固定する (素の文字列比較へ退行すると落ちる)。
 func TestProcess_FollowRelay_HostNormalizedMatch(t *testing.T) {
-	p, _, _, _ := newProcessor(t, aliceActor)
+	p, repo, _, _ := newProcessor(t, aliceActor)
 	p.SetLocalBaseURL("https://example.com")
 	marker := newFakeRelayMarker("rel1", "https://xn--eckve.example/inbox")
 	p.SetRelayMarker(marker)
+	seedRelayActor(repo, "https://パイ.Example/actor", "https://xn--eckve.example/inbox", "")
 
 	body := relayAcceptBody("Accept", "https://パイ.Example/actor",
 		"https://example.com/activities/follow-relay/rel1")
@@ -1887,6 +1912,44 @@ func TestProcess_AcceptFollowRelay_ForeignActorDropped(t *testing.T) {
 			// 行の lookup 自体は行われている (= 検証を通って落ちた)。
 			assert.Equal(t, []string{"rel123"}, marker.lookups)
 		})
+	}
+}
+
+// 本家 2026.10.0 updateRequestingRelayStatus: 同じ host でも、inbox /
+// sharedInbox が relay の inbox と完全一致しない actor は relay を動かせない
+// (マルチテナントな relay サーバーで隣の actor が status を倒す経路)。
+// sharedInbox が一致すれば relay 自身として扱う。
+func TestProcess_FollowRelay_ExactInboxMatch(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		inbox, sharedInbox string
+		want               bool
+	}{
+		{"same host, other inbox", "https://relay.example/users/other/inbox", "", false},
+		{"same host, other inbox and shared inbox", "https://relay.example/users/other/inbox", "https://relay.example/other-shared", false},
+		{"trailing slash differs", "https://relay.example/inbox/", "", false},
+		{"no inbox at all", "", "", false},
+		{"shared inbox matches", "https://relay.example/users/relay/inbox", "https://relay.example/inbox", true},
+	} {
+		for _, kind := range []string{"Accept", "Reject"} {
+			t.Run(tc.name+"/"+kind, func(t *testing.T) {
+				p, repo, _, _ := newProcessor(t, aliceActor)
+				p.SetLocalBaseURL("https://example.com")
+				marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
+				p.SetRelayMarker(marker)
+				seedRelayActor(repo, "https://relay.example/users/other", tc.inbox, tc.sharedInbox)
+
+				body := relayAcceptBody(kind, "https://relay.example/users/other",
+					"https://example.com/activities/follow-relay/rel123")
+				require.NoError(t, p.Process(body))
+				changed := len(marker.accepted) + len(marker.rejected)
+				if tc.want {
+					assert.Equal(t, 1, changed)
+				} else {
+					assert.Zero(t, changed, "actor whose inbox is not the relay inbox changed the relay")
+				}
+			})
+		}
 	}
 }
 
@@ -2980,4 +3043,24 @@ func TestProcess_CreateDoesNotRenotifyOnRedelivery(t *testing.T) {
 	assert.Never(t, func() bool {
 		return len(hook.snapshot()) > 1
 	}, 200*time.Millisecond, 20*time.Millisecond)
+}
+
+// TestProcess_FollowRelay_UnresolvableActorIsRetried checks that an Accept /
+// Reject whose signer cannot be resolved returns an error so the inbox job is
+// retried, instead of being acked and dropped (a relay does not resend it).
+func TestProcess_FollowRelay_UnresolvableActorIsRetried(t *testing.T) {
+	for _, kind := range []string{"Accept", "Reject"} {
+		t.Run(kind, func(t *testing.T) {
+			p, _, _, _ := newProcessor(t, aliceActor)
+			p.SetLocalBaseURL("https://example.com")
+			marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
+			p.SetRelayMarker(marker)
+
+			body := relayAcceptBody(kind, "https://relay.example/actor",
+				"https://example.com/activities/follow-relay/rel123")
+			require.Error(t, p.Process(body))
+			assert.Empty(t, marker.accepted)
+			assert.Empty(t, marker.rejected)
+		})
+	}
 }

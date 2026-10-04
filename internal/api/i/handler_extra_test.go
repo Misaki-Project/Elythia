@@ -51,7 +51,10 @@ func newExtraHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 func newDeleteAccountHandler(t *testing.T) (*Handler, *testutil.MockUserRepository, *stubRoleProvider) {
 	t.Helper()
 	h, repo := newExtraHandler(t)
-	provider := &stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}}
+	provider := &stubRoleProvider{policies: map[string]any{
+		role.PolicyCanDeleteAccount: true,
+		role.PolicyCanPurgeAccount:  true,
+	}}
 	h.SetRoleProvider(provider)
 	return h, repo, provider
 }
@@ -536,7 +539,10 @@ func TestDeleteAccount_UpdateError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
 	h := NewHandler(svc, idGen)
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}})
+	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{
+		role.PolicyCanDeleteAccount: true,
+		role.PolicyCanPurgeAccount:  true,
+	}})
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, failRepo.Users["u1"])
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -841,6 +847,11 @@ func (c *countingCheckedRoleProvider) GetUserPoliciesChecked(userID string) (map
 	return c.stubRoleProvider.GetUserPoliciesChecked(userID)
 }
 
+func (c *countingCheckedRoleProvider) GetUserPoliciesCheckedForKeys(userID string, keys ...string) (map[string]any, error) {
+	c.calls++
+	return c.stubRoleProvider.GetUserPoliciesCheckedForKeys(userID, keys...)
+}
+
 // canPurgeAccount は job payload の PreserveAccount に写る。**既定は保持側**
 // (missing / 非 bool / false => PreserveAccount=true, user 行を残す)。明示的な
 // bool true だけが物理削除 (現在の挙動) を許す。
@@ -911,6 +922,7 @@ func TestDeleteAccount_ResolvesPoliciesOnceForBothGates(t *testing.T) {
 
 	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
 	assert.Equal(t, 1, provider.calls, "policy resolution must happen exactly once per request")
+	assert.Equal(t, []string{role.PolicyCanDeleteAccount, role.PolicyCanPurgeAccount}, provider.checkedPolicyKeys)
 }
 
 // resolver error は password / 2FA / 論理削除フラグ / AP Delete / token

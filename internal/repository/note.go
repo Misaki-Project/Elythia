@@ -114,6 +114,11 @@ type NoteRepository interface {
 	// ListByChannelIDVisible を別メソッドに切り出さず本 signature に viewerID を
 	// 取り込む形に統合した (#1439 / #1441 と同じパターン)。
 	ListByChannelID(channelID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error)
+	// ListLocalByChannelID is ListByChannelID restricted to notes whose
+	// author is local (`note.userHost IS NULL`), applied before LIMIT. Used
+	// for anonymous visitors under ugcVisibilityForVisitor = local (upstream
+	// generateUgcVisibilityQueryForVisitor).
+	ListLocalByChannelID(channelID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error)
 	FindManyByIDsWithUser(ids []string) ([]*model.Note, error)
 	// ExistingNoteIDsOnPrimary returns the subset of ids that exist, reading
 	// from the primary DB even when read replicas are configured.
@@ -242,6 +247,16 @@ type NoteRepository interface {
 	CountLocalComments() (int64, error)
 }
 
+// NotePrimaryReader exposes the small set of note reads whose authorization
+// decision must observe the primary immediately after pin, visibility or
+// author-preference changes. Ordinary timeline/list reads remain replica-safe.
+// Production wiring validates this capability once at startup.
+type NotePrimaryReader interface {
+	FindByIDWithUserOnPrimary(id string) (*model.Note, error)
+	FindByIDWithRelationsOnPrimary(id string) (*model.Note, error)
+	FindManyByIDsWithUserOnPrimary(ids []string) ([]*model.Note, error)
+}
+
 type noteRepository struct {
 	db *gorm.DB
 }
@@ -308,12 +323,34 @@ func (r *noteRepository) FindByIDWithUser(id string) (*model.Note, error) {
 	return &note, nil
 }
 
+func (r *noteRepository) FindByIDWithUserOnPrimary(id string) (*model.Note, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
+	var note model.Note
+	if err := r.db.Clauses(dbresolver.Write).Preload("User").First(&note, "id = ?", id).Error; err != nil {
+		return nil, err
+	}
+	return &note, nil
+}
+
 func (r *noteRepository) FindByIDWithRelations(id string) (*model.Note, error) {
 	if !storable(id) {
 		return nil, ErrNotFound
 	}
 	var note model.Note
 	if err := preloadNoteRelations(r.db).First(&note, "id = ?", id).Error; err != nil {
+		return nil, err
+	}
+	return &note, nil
+}
+
+func (r *noteRepository) FindByIDWithRelationsOnPrimary(id string) (*model.Note, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
+	var note model.Note
+	if err := preloadNoteRelations(r.db.Clauses(dbresolver.Write)).First(&note, "id = ?", id).Error; err != nil {
 		return nil, err
 	}
 	return &note, nil
@@ -374,12 +411,22 @@ func (r *noteRepository) CountLocalComments() (int64, error) {
 	return count, err
 }
 
-// IncrementCount adjusts a counter column on the note row by delta.
+// IncrementCount adjusts a counter column on the note row by delta. A
+// negative delta never takes the counter below 0.
 // 集計列の更新はGORMのUpdateColumnでSQL式を直接適用する。
+//
+// 減らすときは 0 で止める (#3291)。カウンタを維持する前に作られた行は実件数より
+// 小さいまま残っており (例: #1768 より前にクリップした行の clippedCount は 0)、
+// そこから減らすと負になる。負の clippedCount は API にそのまま出るうえ、
+// リモートノートの掃除の条件 (`clippedCount = 0`) に一致しなくなる。
 func (r *noteRepository) IncrementCount(noteID, column string, delta int) error {
+	expr := gorm.Expr("\""+column+"\" + ?", delta)
+	if delta < 0 {
+		expr = gorm.Expr("GREATEST(\""+column+"\" + ?, 0)", delta)
+	}
 	return r.db.Model(&model.Note{}).
 		Where("id = ?", noteID).
-		UpdateColumn(column, gorm.Expr("\""+column+"\" + ?", delta)).Error
+		UpdateColumn(column, expr).Error
 }
 
 // IncrementReaction increments (or decrements when delta<0) the value of a
@@ -516,8 +563,22 @@ func (r *noteRepository) ListByUserIDFiltered(userID, viewerID, untilID, sinceID
 // underfilled-page / N+1 follower-check problems of post-fetch filtering
 // (#1440).
 func (r *noteRepository) ListByChannelID(channelID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error) {
+	return r.listByChannelID(channelID, viewerID, untilID, sinceID, limit, false)
+}
+
+// ListLocalByChannelID is ListByChannelID limited to local authors.
+func (r *noteRepository) ListLocalByChannelID(channelID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error) {
+	return r.listByChannelID(channelID, viewerID, untilID, sinceID, limit, true)
+}
+
+func (r *noteRepository) listByChannelID(channelID, viewerID, untilID, sinceID string, limit int, localOnly bool) ([]*model.Note, error) {
 	var notes []*model.Note
 	q := preloadNoteRelations(r.db).Where("\"channelId\" = ?", channelID)
+	// チャンネルには remote 利用者の返信も入る (返信先のチャンネルを引き継ぐ) ので、
+	// LIMIT の後で落とすとページが過少充填される。LIMIT 前に絞る。
+	if localOnly {
+		q = q.Where("\"userHost\" IS NULL")
+	}
 	// core/note.CanSeeNote と同じ可視性条件を LIMIT 前に SQL で絞る。
 	// post-fetch filter だとページが過少充填されるのと followers 判定が
 	// note ごとの N+1 になるため LIMIT 前に push down する (#1440)。
@@ -692,6 +753,12 @@ func (r *noteRepository) SearchByFilter(f model.NoteSearchFilter) ([]*model.Note
 			q = q.Where("\"userHost\" = ?", f.Host)
 		}
 	}
+	// 未ログインの閲覧者には、サーバーの ugcVisibilityForVisitor=local に従って
+	// ローカルの投稿者のノートだけを返す (upstream generateUgcVisibilityQueryForVisitor)。
+	// Host 指定とは独立に AND する。
+	if f.LocalUsersOnly {
+		q = q.Where(`"note"."userHost" IS NULL`)
+	}
 	if f.UntilID != "" {
 		q = q.Where("id < ?", f.UntilID)
 	}
@@ -742,6 +809,11 @@ func (r *noteRepository) ExistingNoteIDsOnPrimary(ids []string) ([]string, error
 // Notes that are not found are simply omitted from the result.
 func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, error) {
 	ids = storableIDs(ids)
+	return r.findManyByIDsWithUser(ids, false)
+}
+
+func (r *noteRepository) findManyByIDsWithUser(ids []string, primary bool) ([]*model.Note, error) {
+	ids = storableIDs(ids)
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -757,8 +829,14 @@ func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, err
 	// frontend が引用先を「削除されたノート」として描画する (packer の
 	// maxNoteEmbedDepth=2 / detail gate と一致)。reply embed は detail:false で
 	// 子を持たないため、reply target の子は辿らない。
+	db := func() *gorm.DB {
+		if primary {
+			return r.db.Clauses(dbresolver.Write)
+		}
+		return r.db
+	}
 	var notes []*model.Note
-	if err := r.db.Where("id IN ?", ids).Find(&notes).Error; err != nil {
+	if err := db().Where("id IN ?", ids).Find(&notes).Error; err != nil {
 		return nil, err
 	}
 	if len(notes) == 0 {
@@ -778,7 +856,7 @@ func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, err
 	subByID := make(map[string]*model.Note, len(subIDSet))
 	if len(subIDSet) > 0 {
 		var subs []*model.Note
-		if err := r.db.Where("id IN ?", mapKeys(subIDSet)).Find(&subs).Error; err != nil {
+		if err := db().Where("id IN ?", mapKeys(subIDSet)).Find(&subs).Error; err != nil {
 			return nil, err
 		}
 		for _, s := range subs {
@@ -819,7 +897,7 @@ func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, err
 	}
 	if len(lvl2IDSet) > 0 {
 		var lvl2 []*model.Note
-		if err := r.db.Where("id IN ?", mapKeys(lvl2IDSet)).Find(&lvl2).Error; err != nil {
+		if err := db().Where("id IN ?", mapKeys(lvl2IDSet)).Find(&lvl2).Error; err != nil {
 			return nil, err
 		}
 		for _, s := range lvl2 {
@@ -856,7 +934,7 @@ func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, err
 	}
 	if len(userIDSet) > 0 {
 		var users []*model.User
-		if err := r.db.Where("id IN ?", mapKeys(userIDSet)).Find(&users).Error; err != nil {
+		if err := db().Where("id IN ?", mapKeys(userIDSet)).Find(&users).Error; err != nil {
 			return nil, err
 		}
 		userByID := make(map[string]*model.User, len(users))
@@ -875,7 +953,7 @@ func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, err
 		noteIDs = append(noteIDs, n.ID)
 	}
 	var polls []*model.Poll
-	if err := r.db.Where(`"noteId" IN ?`, noteIDs).Find(&polls).Error; err != nil {
+	if err := db().Where(`"noteId" IN ?`, noteIDs).Find(&polls).Error; err != nil {
 		return nil, err
 	}
 	if len(polls) > 0 {
@@ -902,6 +980,11 @@ func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, err
 		}
 	}
 	return ordered, nil
+}
+
+func (r *noteRepository) FindManyByIDsWithUserOnPrimary(ids []string) ([]*model.Note, error) {
+	ids = storableIDs(ids)
+	return r.findManyByIDsWithUser(ids, true)
 }
 
 // mapKeys returns the keys of a string-set as a slice (順序不定)。
@@ -1127,6 +1210,12 @@ func (r *noteRepository) SearchByTag(tagGroups [][]string, viewerID string, limi
 	if filter.WithFiles {
 		q = q.Where(`"fileIds" != '{}'`)
 	}
+	// 未ログインの閲覧者向けの ugcVisibilityForVisitor=local (upstream
+	// search-by-tag.ts の generateUgcVisibilityQueryForVisitor)。LIMIT の前に
+	// 絞らないと、ページがリモートのノートで埋まって件数が欠ける。
+	if filter.LocalUsersOnly {
+		q = q.Where(`"note"."userHost" IS NULL`)
+	}
 	q = q.Order(paginationOrder(sinceID, untilID, "id")).Limit(limit)
 	if sinceID != "" {
 		q = q.Where("id > ?", sinceID)
@@ -1168,6 +1257,11 @@ func (r *noteRepository) IncrementUserNotesCount(userID string, delta int) error
 
 // applyTimelineFilter adds common filter conditions to a GORM query builder.
 func applyTimelineFilter(q *gorm.DB, f model.TimelineDBFilter) *gorm.DB {
+	if f.LocalUsersOnly {
+		// 未ログインの閲覧者向けの ugcVisibilityForVisitor=local。ノート自身の
+		// 投稿者だけを見る (返信先・リノート先は upstream も残す)。
+		q = q.Where(`"note"."userHost" IS NULL`)
+	}
 	if f.WithFiles {
 		q = q.Where(`"fileIds" != '{}'`)
 	}
@@ -1502,10 +1596,13 @@ const noteRemovableExpr = `
 // 本人の操作と無関係に消える。
 //
 // `clip_note` を直接見るのは mk-go 固有の追加。upstream は非正規化カウンタの
-// `clippedCount = 0` で判定するが、mk-go はカウンタを維持せず clip_note を数える
-// 設計 (#2243) なので `clippedCount` は常に 0 で、upstream の条件をそのまま
-// 移植してもクリップを保護できない。`clippedCount` / `pageCount` の比較自体は
-// TS から切り戻したインスタンス (= カウンタが実際に入っている行) のために残す。
+// `clippedCount = 0` だけで判定する。mk-go も #1768 以降は clips/add-note と
+// remove-note で `clippedCount` を増減しているが、それより前に mk-go で
+// クリップした行はカウンタが 0 のまま残っているので、カウンタだけを見ると
+// そうしたクリップを保護できない。`clippedCount` / `pageCount` の比較は
+// カウンタが入っている行 (TS 由来や #1768 以降の行) のために併せて見る。
+// `pageCount` は #3293 からページの作成・更新・削除で増減している。それより前に
+// 作ったページが参照する行は migration 000107 で埋めた。
 func (r *noteRepository) DeleteExpiredRemoteNotes(expiryDays, batchSize int) (int64, error) {
 	deleted, _, _, err := r.DeleteExpiredRemoteNotesAfter(expiryDays, batchSize, "")
 	return deleted, err

@@ -1,10 +1,12 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
 	corenote "github.com/shiroha-a/mk/internal/core/note"
+	"github.com/shiroha-a/mk/internal/core/userpack"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -188,9 +190,25 @@ func (h *ReactionCreateHook) OnReactionCreated(note *model.Note, reactor *model.
 	h.svc.DispatchUser(note.UserID, EventReaction, body)
 }
 
+// ProfileLookup / RelationApplier / ModeratorChecker / UserLookups are the
+// lookups of the shared user packer (internal/core/userpack), kept here as
+// aliases for existing wiring.
+type (
+	ProfileLookup    = userpack.ProfileLookup
+	RelationApplier  = userpack.RelationApplier
+	ModeratorChecker = userpack.ModeratorChecker
+	UserLookups      = userpack.Lookups
+)
+
 // FollowingHook implements the following WebhookHook interface.
+//
+// 本家 UserFollowingService は follow / unfollow を
+// `pack(followee, follower, {schema: 'UserDetailedNotMe'})` (閲覧者はフォローした側)、
+// followed を `pack(follower, followee)` (既定の UserLite) で送る (#3269)。
+// main stream の同じイベントも同じ packer で組む (#3330)。
 type FollowingHook struct {
-	svc *Service
+	svc    *Service
+	packer *userpack.Packer
 }
 
 // NewFollowingHook constructs a FollowingHook.
@@ -198,20 +216,61 @@ func NewFollowingHook(svc *Service) *FollowingHook {
 	return &FollowingHook{svc: svc}
 }
 
+// SetUserLookups wires the lookups used to pack the `user` of follow /
+// followed / unfollow bodies, and idGen to derive createdAt.
+func (h *FollowingHook) SetUserLookups(l UserLookups, idGen id.Generator) {
+	h.packer = userpack.New(l, idGen)
+}
+
+// SetUserPacker wires a packer shared with the main stream publisher, so the
+// webhook and the stream carry the same shape.
+func (h *FollowingHook) SetUserPacker(p *userpack.Packer) {
+	h.packer = p
+}
+
 // OnFollow fires the `follow` event on the follower's webhooks.
 func (h *FollowingHook) OnFollow(follower, followee *model.User) {
-	if h == nil || h.svc == nil || follower == nil || followee == nil {
-		return
-	}
-	h.svc.DispatchUser(follower.ID, EventFollow, map[string]any{"user": packUser(followee)})
+	h.OnFollowPacked(follower, followee, h.ownPacker(follower, followee))
 }
 
 // OnUnfollow fires the `unfollow` event on the follower's webhooks.
 func (h *FollowingHook) OnUnfollow(follower, followee *model.User) {
-	if h == nil || h.svc == nil || follower == nil || followee == nil {
+	h.OnUnfollowPacked(follower, followee, h.ownPacker(follower, followee))
+}
+
+// OnFollowPacked fires the `follow` event with followee built by packed, which
+// the following service shares with the main stream (packed once).
+func (h *FollowingHook) OnFollowPacked(follower, followee *model.User, packed func() (entity.UserDetailed, bool)) {
+	h.dispatchDetailed(EventFollow, follower, followee, packed)
+}
+
+// OnUnfollowPacked fires the `unfollow` event with followee built by packed.
+func (h *FollowingHook) OnUnfollowPacked(follower, followee *model.User, packed func() (entity.UserDetailed, bool)) {
+	h.dispatchDetailed(EventUnfollow, follower, followee, packed)
+}
+
+func (h *FollowingHook) dispatchDetailed(event string, follower, followee *model.User, packed func() (entity.UserDetailed, bool)) {
+	if h == nil || h.svc == nil || follower == nil || followee == nil || packed == nil {
 		return
 	}
-	h.svc.DispatchUser(follower.ID, EventUnfollow, map[string]any{"user": packUser(followee)})
+	h.svc.DispatchUserLazy(follower.ID, event, func() (any, bool) {
+		d, ok := packed()
+		if !ok {
+			return nil, false
+		}
+		return map[string]any{"user": toMap(d)}, true
+	})
+}
+
+// ownPacker builds followee as UserDetailedNotMe seen by follower with the
+// hook's own packer, for callers that do not share a packed value.
+func (h *FollowingHook) ownPacker(follower, followee *model.User) func() (entity.UserDetailed, bool) {
+	if h == nil || follower == nil || followee == nil {
+		return nil
+	}
+	return func() (entity.UserDetailed, bool) {
+		return h.userPacker().DetailedNotMe(context.Background(), followee, follower)
+	}
 }
 
 // OnFollowed fires the `followed` event on the followee's webhooks.
@@ -219,7 +278,24 @@ func (h *FollowingHook) OnFollowed(follower, followee *model.User) {
 	if h == nil || h.svc == nil || follower == nil || followee == nil {
 		return
 	}
-	h.svc.DispatchUser(followee.ID, EventFollowed, map[string]any{"user": packUser(follower)})
+	h.svc.DispatchUserLazy(followee.ID, EventFollowed, func() (any, bool) {
+		return map[string]any{"user": toMap(h.userPacker().Lite(follower))}, true
+	})
+}
+
+// HasUserPacker reports whether the user packer was wired.
+//
+// 未配線だと follow / unfollow の Webhook は profile を確かめられないので送られず、
+// followed は instance と絵文字を解決しない形になる。起動時検査に使う。
+func (h *FollowingHook) HasUserPacker() bool { return h.packer != nil }
+
+// userPacker returns the wired packer, or one without lookups when unwired
+// (which drops the detailed bodies, see userpack.Packer.DetailedNotMe).
+func (h *FollowingHook) userPacker() *userpack.Packer {
+	if h.packer == nil {
+		return userpack.New(userpack.Lookups{}, nil)
+	}
+	return h.packer
 }
 
 // SignupHook implements the signup WebhookHook interface, firing the
@@ -254,8 +330,13 @@ func noteEntityToMap(packed entity.NoteEntity) map[string]any {
 // packUser turns a model.User into a generic map matching entity.UserLite.
 // 呼び出し元で u != nil は保証済み。
 func packUser(u *model.User) map[string]any {
-	packed := entity.PackUserLite(u)
-	raw, _ := json.Marshal(packed)
+	return toMap(entity.PackUserLite(u))
+}
+
+// toMap converts a packed entity into the generic map the webhook envelope
+// carries. json.Marshal/Unmarshal は正常値に対して失敗しない。
+func toMap(v any) map[string]any {
+	raw, _ := json.Marshal(v)
 	out := map[string]any{}
 	_ = json.Unmarshal(raw, &out)
 	return out

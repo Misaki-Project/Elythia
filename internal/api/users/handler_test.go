@@ -294,6 +294,69 @@ func TestShow_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+func TestShow_DeletedUserIsNotFound(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	user := addTestUser(userRepo)
+	user.IsDeleted = true
+
+	rec := postStub(h.Show, `{"userId":"user1"}`, nil)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+
+	rec = postStub(h.Show, `{"userIds":["user1"]}`, nil)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `[]`, rec.Body.String())
+}
+
+func TestShow_DeletedLocalUserIsVisibleToModerator(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	user := addTestUser(userRepo)
+	user.IsDeleted = true
+	user.IsSuspended = true
+	h.SetModeratorChecker(visibilityModStub{modID: "u_mod"})
+	moderator := &model.User{ID: "u_mod"}
+
+	rec := postStub(h.Show, `{"userId":"user1"}`, moderator)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var single map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &single))
+	assert.Equal(t, "user1", single["id"])
+
+	rec = postStub(h.Show, `{"userIds":["user1"]}`, moderator)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var bulk []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &bulk))
+	require.Len(t, bulk, 1)
+	assert.Equal(t, "user1", bulk[0]["id"])
+}
+
+func TestShow_DeletedRemoteUserKeepsUpstreamVisibility(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	host := "remote.example"
+	userRepo.Users["remote1"] = &model.User{
+		ID:                "remote1",
+		Username:          "alice",
+		UsernameLower:     "alice",
+		Host:              &host,
+		IsDeleted:         true,
+		AvatarDecorations: datatypes.JSON([]byte("[]")),
+	}
+	h.SetModeratorChecker(visibilityModStub{modID: "u_mod"})
+	viewer := &model.User{ID: "u_plain"}
+
+	rec := postStub(h.Show, `{"userId":"remote1"}`, viewer)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var single map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &single))
+	assert.Equal(t, "remote1", single["id"])
+
+	rec = postStub(h.Show, `{"userIds":["remote1"]}`, viewer)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	var bulk []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &bulk))
+	require.Len(t, bulk, 1)
+	assert.Equal(t, "remote1", bulk[0]["id"])
+}
+
 // stubRemoteResolver is a test double for coreuser.RemoteUserResolver.
 type stubRemoteResolver struct {
 	user *model.User
@@ -1241,6 +1304,11 @@ func TestFollowers_PopulatesIsFollowedFromViewer(t *testing.T) {
 	require.NoError(t, err)
 	_, err = fSvc.Follow("alice", "bob", corefollowing.FollowOptions{})
 	require.NoError(t, err)
+	// 本番と同じく関係の repo をすべて配線する (未配線の関係は、一覧共通の
+	// packer が項目ごと出さない)。
+	h.SetBlockingRepo(testutil.NewMockBlockingRepository())
+	h.SetMutingRepo(testutil.NewMockMutingRepository())
+	h.SetRenoteMutingRepo(testutil.NewMockRenoteMutingRepository())
 
 	rec := postStub(h.Followers, `{"userId":"user1"}`, repo.Users["bob"])
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -1254,7 +1322,7 @@ func TestFollowers_PopulatesIsFollowedFromViewer(t *testing.T) {
 	assert.Equal(t, false, follower["isFollowing"])
 	// #1249: isFollowing が present のため misskey_dart は WithRelations variant を
 	// 選び、isBlocking/isBlocked/isMuted/isRenoteMuted も非null bool として cast
-	// する。EnsureRelationFlags で false 埋めされ全て present であること。
+	// する。関係が無ければ false で、全て present であること。
 	for _, key := range []string{"isBlocking", "isBlocked", "isMuted", "isRenoteMuted", "hasPendingFollowRequestFromYou", "hasPendingFollowRequestToYou"} {
 		v, present := follower[key]
 		assert.True(t, present, "%s must be present (WithRelations variant)", key)
@@ -1329,6 +1397,8 @@ func TestFollowers_AppliesRemoteStatsOverride(t *testing.T) {
 		FollowingCount:    3,  // ローカル観測値
 		AvatarDecorations: datatypes.JSON([]byte("[]")),
 	}
+	// profile 無しの利用者はカウントを伏せる (#3330) ので、実際の行と同じく profile を置く。
+	repo.Profiles["remote-alice"] = &model.UserProfile{UserID: "remote-alice"}
 	// remote-alice が user1 を follow → list に出る。
 	fSvc := h.followingService
 	_, err := fSvc.Follow("remote-alice", "user1", corefollowing.FollowOptions{})
@@ -1371,6 +1441,8 @@ func TestFollowing_AppliesRemoteStatsOverride(t *testing.T) {
 		FollowingCount:    3,
 		AvatarDecorations: datatypes.JSON([]byte("[]")),
 	}
+	// profile 無しの利用者はカウントを伏せる (#3330) ので、実際の行と同じく profile を置く。
+	repo.Profiles["remote-charlie"] = &model.UserProfile{UserID: "remote-charlie"}
 	fSvc := h.followingService
 	// user1 follows charlie → charlie が followee として list される。
 	_, err := fSvc.Follow("user1", "remote-charlie", corefollowing.FollowOptions{})
@@ -1407,6 +1479,8 @@ func TestFollowers_RemoteStatsOverride_FallsBackOnFetchError(t *testing.T) {
 		Host:              &remoteHost,
 		AvatarDecorations: datatypes.JSON([]byte("[]")),
 	}
+	// profile 無しの利用者はカウントを伏せる (#3330) ので、実際の行と同じく profile を置く。
+	repo.Profiles["remote-dora"] = &model.UserProfile{UserID: "remote-dora"}
 	fSvc := h.followingService
 	_, err := fSvc.Follow("remote-dora", "user1", corefollowing.FollowOptions{})
 	require.NoError(t, err)
@@ -2218,6 +2292,79 @@ func TestShow_PinnedNotes_ExcludesNonVisibleFromBody(t *testing.T) {
 	assert.Equal(t, "pn_pub", first["id"])
 }
 
+func TestShow_PinnedNotes_PublicationExceptionMatrix(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	author := addTestUser(userRepo)
+	hidden := 0
+	author.MakeNotesHiddenBefore = &hidden
+
+	piningRepo := testutil.NewMockUserNotePiningRepository()
+	pin := &model.UserNotePining{ID: "pin", UserID: author.ID, NoteID: "note"}
+	require.NoError(t, piningRepo.Create(pin))
+	h.SetPiningRepo(piningRepo)
+
+	nr := h.noteRepo.(*testutil.MockNoteRepository)
+	text := "intentionally published"
+	n := &model.Note{ID: "note", UserID: author.ID, User: author, Text: &text, Visibility: model.NoteVisibilityPublic, Reactions: datatypes.JSON([]byte("{}"))}
+	nr.Notes[n.ID] = n
+
+	request := func(viewer *model.User) map[string]any {
+		rec := postStub(h.Show, `{"userId":"user1"}`, viewer)
+		require.Equal(t, http.StatusOK, rec.Code)
+		var response map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+		return response
+	}
+	firstPinned := func(response map[string]any) map[string]any {
+		notes, ok := response["pinnedNotes"].([]any)
+		require.True(t, ok)
+		require.Len(t, notes, 1)
+		return notes[0].(map[string]any)
+	}
+
+	assert.Equal(t, text, firstPinned(request(nil))["text"], "anonymous public pin bypasses time lockdown")
+
+	author.RequireSigninToViewContents = true
+	assert.Nil(t, firstPinned(request(nil))["text"], "anonymous sign-in requirement is never bypassed")
+	assert.Equal(t, text, firstPinned(request(&model.User{ID: "viewer"}))["text"], "authenticated public pin bypasses author lockdown")
+
+	n.Visibility = model.NoteVisibilityFollowers
+	response := request(&model.User{ID: "viewer"})
+	notes, _ := response["pinnedNotes"].([]any)
+	assert.Empty(t, notes, "login alone must not bypass followers visibility")
+}
+
+func TestShow_PinnedNotes_ForeignAuthorDoesNotGetPublicationException(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	profileOwner := addTestUser(userRepo)
+	hidden := 0
+	foreignAuthor := &model.User{ID: "other", Username: "other", MakeNotesHiddenBefore: &hidden}
+	userRepo.Users[foreignAuthor.ID] = foreignAuthor
+
+	piningRepo := testutil.NewMockUserNotePiningRepository()
+	require.NoError(t, piningRepo.Create(&model.UserNotePining{
+		ID: "legacy-pin", UserID: profileOwner.ID, NoteID: "foreign-note",
+	}))
+	h.SetPiningRepo(piningRepo)
+
+	text := "not published by this profile owner"
+	nr := h.noteRepo.(*testutil.MockNoteRepository)
+	nr.Notes["foreign-note"] = &model.Note{
+		ID: "foreign-note", UserID: foreignAuthor.ID, User: foreignAuthor,
+		Text: &text, Visibility: model.NoteVisibilityPublic, Reactions: datatypes.JSON([]byte("{}")),
+	}
+
+	rec := postStub(h.Show, `{"userId":"user1"}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	notes, ok := response["pinnedNotes"].([]any)
+	require.True(t, ok)
+	require.Len(t, notes, 1)
+	got := notes[0].(map[string]any)
+	assert.Nil(t, got["text"], "a legacy pin row owned by another user must not bypass the note author's lockdown")
+}
+
 func TestShow_PinnedPage_Populated(t *testing.T) {
 	h, userRepo := newTestHandler(t)
 	addTestUser(userRepo)
@@ -2290,8 +2437,14 @@ func TestShow_IsFollowing(t *testing.T) {
 // 実行されるよう emoji 行を仕込む。
 func TestSetters_WireOptionalDeps(t *testing.T) {
 	h, repo := newTestHandler(t)
+	remoteHost := "remote.example"
 	repo.Users["u1"] = &model.User{
 		ID: "u1", Username: "alice", UsernameLower: "alice",
+		Emojis:            []string{"smile"},
+		AvatarDecorations: datatypes.JSON("[]"),
+	}
+	repo.Users["u2"] = &model.User{
+		ID: "u2", Username: "bob", UsernameLower: "bob", Host: &remoteHost,
 		Emojis:            []string{"smile"},
 		AvatarDecorations: datatypes.JSON("[]"),
 	}
@@ -2300,20 +2453,28 @@ func TestSetters_WireOptionalDeps(t *testing.T) {
 	require.NoError(t, emojiRepo.Create(&model.Emoji{
 		ID: "e1", Name: "smile", PublicURL: "https://x/smile.png",
 	}))
+	require.NoError(t, emojiRepo.Create(&model.Emoji{
+		ID: "e2", Name: "smile", Host: &remoteHost, PublicURL: "https://remote.example/smile.png",
+	}))
 	h.SetEmojiRepo(emojiRepo)
 	h.SetInstanceRepo(testutil.NewMockInstanceRepository())
 	h.SetReactionReader(stubBufferedReactions{})
 	h.SetNoteFieldResolver(nil) // Apply は r==nil で no-op (#739)
 
-	rec := postStub(h.Show, `{"userId":"u1"}`, &model.User{ID: "u1"})
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	var resp map[string]any
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-	// populateUserEmojis が emoji を URL に解決して emojis map に出すこと
-	emojis, _ := resp["emojis"].(map[string]any)
-	require.NotNil(t, emojis, "emojis should be populated when emojiRepo is wired")
-	assert.Equal(t, "https://x/smile.png", emojis["smile"])
+	show := func(id string) map[string]any {
+		rec := postStub(h.Show, `{"userId":"`+id+`"}`, &model.User{ID: "u1"})
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		emojis, _ := resp["emojis"].(map[string]any)
+		return emojis
+	}
+	// populateUserEmojis がリモートの利用者の emoji を URL に解決して emojis map に出すこと
+	remote := show("u2")
+	require.NotNil(t, remote, "emojis should be populated when emojiRepo is wired")
+	assert.Equal(t, "https://remote.example/smile.png", remote["smile"])
+	// ローカルの利用者は本家と同じく解決しない (#3270)。
+	assert.Empty(t, show("u1"))
 }
 
 // stubBufferedReactions implements entity.BufferedReactionsReader as a no-op
@@ -2341,6 +2502,7 @@ func TestFollowers_PopulatesBlockMute(t *testing.T) {
 	muteRepo := testutil.NewMockMutingRepository()
 	require.NoError(t, muteRepo.Create(&model.Muting{ID: "mu1", MuterID: "bob", MuteeID: "alice"}))
 	h.SetMutingRepo(muteRepo)
+	h.SetRenoteMutingRepo(testutil.NewMockRenoteMutingRepository())
 
 	rec := postStub(h.Followers, `{"userId":"user1"}`, repo.Users["bob"])
 	require.Equal(t, http.StatusOK, rec.Code)

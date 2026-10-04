@@ -48,10 +48,12 @@ func TestParse_WorkAndMemoryStayBounded(t *testing.T) {
 		// 上限に届いた後の振る舞いを見るテストなので、予算を小さくして早く届かせる。
 		// 本来の予算 (2^21 + 32/byte) のままだと CI の -race + atomic カバレッジで
 		// このテストだけで 150 秒を超えた。-race 下では 1 桁以上遅くなるので、
-		// 時間ではなく仕事量とメモリ量で見る
+		// 時間ではなく仕事量とメモリ量で見る。
+		// 閉じない装飾を読んだ範囲ごと文字にするようになって (#3301)、これらの
+		// 入力は 1 バイトあたり数回の仕事で読み終わるので、上限は入力長より小さくする
 		in := strings.Repeat(u, (16<<10)/len(u))
 		s := newState(in, false)
-		s.budget.limit = 1<<16 + workBudgetPerByte*len(in)
+		s.budget.limit = len(in) / 4
 		mergeText(s.parseNodes(false))
 		require.True(t, s.budget.exhausted(), "the input must reach a cap for %q", u)
 		assert.LessOrEqual(t, s.budget.memUsed, memoByteLimit, "memo storage must stay under the cap for %q", u)
@@ -78,14 +80,18 @@ func TestParse_DeepButBalancedNestingStillParses(t *testing.T) {
 	assert.Equal(t, 10, depth)
 }
 
-func TestParse_UnclosedPrefixKeepsLaterSyntax(t *testing.T) {
-	// 閉じない開きタグが並んでも、その後ろの構文は失われない
+func TestParse_UnclosedPrefixSwallowsLaterSyntax(t *testing.T) {
+	// mfm-js と同じく、閉じない開きタグは末尾までを文字にするので、後ろの構文も
+	// 文字になる (#3301)。開きタグより前の構文は残る
 	in := strings.Repeat("<b>", 50) + "**bold**"
 	nodes := parseWithin(t, in, 5*time.Second)
-	require.NotEmpty(t, nodes)
-	last := nodes[len(nodes)-1]
-	assert.Equal(t, NodeBold, last.Type)
-	assert.Equal(t, strings.Repeat("<b>", 50), nodes[0].textValue())
+	require.Len(t, nodes, 1)
+	assert.Equal(t, in, nodes[0].textValue())
+
+	nodes = parseWithin(t, "**bold**"+strings.Repeat("<b>", 50), 5*time.Second)
+	require.Len(t, nodes, 2)
+	assert.Equal(t, NodeBold, nodes[0].Type)
+	assert.Equal(t, strings.Repeat("<b>", 50), nodes[1].textValue())
 }
 
 func TestParse_TextNodesAreNotShared(t *testing.T) {
@@ -131,21 +137,40 @@ func TestParse_LocalSizedPathologicalInputsStayWithinBudget(t *testing.T) {
 	// テキストになり出力が変わるので、メモ化や区切りの索引が効いていない経路は
 	// ここで落ちる (時間では見ない。-race 下では桁で遅くなる)
 	cases := map[string]string{
-		"unclosed bold":           strings.Repeat("<b>", 1000),
-		"unclosed link label":     strings.Repeat("[<b>", 750),
-		"quote chain bold":        quoteChain(20, "<b>"),
-		"quote chain italic":      quoteChain(20, "<i>"),
-		"quote chain fn":          quoteChain(20, "$[x "),
-		"unclosed plain":          fill("", "<plain>", 3000),
-		"unclosed math block":     fill("", "\\[", 3000),
-		"unclosed fn arg value":   fill("", "$[x.k=v", 3000),
-		"unclosed inline math":    fill("", "<b>\\(", 3000),
-		"unclosed link url":       fill(strings.Repeat("<b>", 20), "[a](", 3000),
+		"unclosed bold":         strings.Repeat("<b>", 1000),
+		"unclosed link label":   strings.Repeat("[<b>", 750),
+		"quote chain bold":      quoteChain(20, "<b>"),
+		"quote chain italic":    quoteChain(20, "<i>"),
+		"quote chain fn":        quoteChain(20, "$[x "),
+		"unclosed plain":        fill("", "<plain>", 3000),
+		"unclosed math block":   fill("", "\\[", 3000),
+		"unclosed fn arg value": fill("", "$[x.k=v", 3000),
+		"unclosed inline math":  fill("", "<b>\\(", 3000),
+		"unclosed link url":     fill(strings.Repeat("<b>", 20), "[a](", 3000),
+		"link urls":             fill(strings.Repeat("<b>", 20), "[a](https://x", 3000),
+		// 多数の `[` が同じ長い飛び先に届く形。飛び先を位置ごとに覚えないと、同じ
+		// URL を `[` の数だけ読み直す (#3300)。
+		"labels sharing a url":    strings.Repeat("[", 1000) + "a](https://" + strings.Repeat("x", 1978),
+		"unclosed url parens":     fill("", "https://a(", 3000),
+		"unclosed url brackets":   fill("<b>", "https://a[(", 3000),
+		"unclosed url alt":        fill("", "[a](<https://x\n", 3000),
+		"unclosed hashtag parens": fill("", "#a(", 3000),
+		"unclosed hashtag groups": fill(strings.Repeat("<b>", 20), "#a(「[（", 3000),
 		"short quotes":            fill(strings.Repeat("<b>", 7), ":```js\n\n> ", 3000),
 		"quote lines under limit": fill(strings.Repeat("<b>", 20), "\n> ", 3000),
 		"quote lines with bold":   fill("", "<b>\n> ", 3000),
 		"deep mixed":              fill(strings.Repeat("<b>", 18), "~~$[x.a=b *", 3000),
 		"mixed":                   fill("", "<b>**~~$[x [<small><i>\\[`<plain>\\(", 3000),
+		// center は行の先頭ごとに試す。開きの直後から閉じを探す区間を毎回辿り直すと
+		// 行数の 2 乗になる (#3328)
+		"unclosed center lines": fill("", "<center>a\n", 3000),
+		"unclosed center crlf":  fill("", "\r\n<center>\r\n**", 3000),
+		"center lines at limit": fill("", strings.Repeat(">", 19)+" <center>a\n", 3000),
+		// コードブロックは閉じの ``` の直後が行の終わりでなければならない。開きの行を
+		// 並べると、開きごとに末尾まで閉じを探して行数の 2 乗になる (#3329)
+		"unclosed code blocks":    fill("", "```a\n", 3000),
+		"unclosed code blocks cr": fill("", "```a\r", 3000),
+		"quoted code blocks":      fill("", "> ```a\r\n", 3000),
 	}
 	for name, in := range cases {
 		for _, simple := range []bool{false, true} {
@@ -158,65 +183,87 @@ func TestParse_LocalSizedPathologicalInputsStayWithinBudget(t *testing.T) {
 }
 
 func TestParse_QuoteChainKeepsNestedQuotes(t *testing.T) {
-	// 入れ子の quote の各段に閉じない <b> がある形。quote の中身の表を深さごとに
-	// 作り直していた実装は 11 段で上限に届き、quote の中身を丸ごとテキストにした
+	// 入れ子の quote の各段に閉じない構文がある形。quote の中身の表を深さごとに
+	// 作り直していた実装は 11 段で上限に届き、quote の中身を丸ごとテキストにした。
+	// 閉じない <b> は mfm-js と同じく末尾までを文字にするので (#3301)、各段に
+	// 残るのは改行で止まる ~~ の形
 	nodes := parseWithin(t, quoteChain(20, "<b>"), 5*time.Second)
+	require.Len(t, nodes, 1)
+	assert.Equal(t, quoteChain(20, "<b>"), nodes[0].textValue())
+
+	nodes = parseWithin(t, quoteChain(20, "~~a"), 5*time.Second)
 	require.Len(t, nodes, 2)
 	quotes := 0
 	for n := nodes[1]; ; n = n.Children[1] {
 		require.Equal(t, NodeQuote, n.Type)
 		quotes++
 		require.NotEmpty(t, n.Children)
+		// 次の段の quote が直前の改行を読むので、改行は残らない (mfm-js と同じ。#3325)
+		assert.Equal(t, "~~a", n.Children[0].textValue())
 		if len(n.Children) < 2 {
-			assert.Equal(t, "<b>", n.Children[0].textValue())
 			break
 		}
-		assert.Equal(t, "<b>\n", n.Children[0].textValue())
 	}
 	assert.Equal(t, 20, quotes)
 }
 
-// memo と区切りの索引を入れる前の実装と同じ出力であることを、キーの各軸が
-// 結果を変える入力で固定する。どれも旧実装の出力と突き合わせて確かめた値。
+// memo の表のキーの各軸 (inLink と深さ) が結果を変える入力で、出力を固定する。
+// どれも mfm-js 0.26.0 の出力と一致し、軸を表のキーから外す変異で出力が変わる
+// ことを確かめた値。閉じない装飾を読み直さなくなったので (#3301)、読み直しは
+// 失敗すると戻る構文 (リンク・center) の中でだけ起きる。どちらも最上位の center が
+// 閉じずに失敗し、その中身 (1 段深い) で読んだ結果が表に残る形
+// (最上位かどうかの軸は TestParse_QuoteMemoSeparatesTopLevelCenter)。
 func TestParse_MemoKeyGolden(t *testing.T) {
-	text := func(s string) *Node { return Text(s) }
+	bolds := func(s string) string { return strings.Repeat("<b>", 18) + s + strings.Repeat("</b>", 18) }
+	boldTree := func(s string) string { return strings.Repeat("bold[", 18) + s + strings.Repeat("]", 18) }
 	cases := []struct {
 		name string
 		in   string
-		want []*Node
+		want string
 	}{
 		{
-			// link のラベルの中では link を試さない。inLink を表の軸から外すと、
-			// ラベルの外で読んだ結果 (link) をラベルの中で使い回して出力が変わる
+			// center の中では 19 段目のリンクの飛び先の括弧が深さの上限に届いて失敗し、
+			// ラベルの位置をラベルの外として読む。最上位では 18 段目のリンクが成功し、
+			// 同じ位置を同じ深さのラベルの中で読む。inLink を表の軸から外すと、
+			// ラベルの外で読んだ結果 (ハッシュタグ) をラベルの中で使い回して出力が変わる
 			name: "inLink axis",
-			in:   "b~~$[x [a](https://e.com)",
-			want: []*Node{
-				text("b~~$"),
-				{Type: NodeLink, Props: map[string]any{"url": "https://e.com", "silent": false}, Children: []*Node{text("x [a")}},
-			},
+			in:   "<center>" + bolds("[#t](https://e.x/((a)))"),
+			want: "text:<center>|" + boldTree("link:https://e.x/((a))[text:#t]"),
 		},
 		{
-			// 深さの上限では入れ子を読まない。深さを表の軸から外すと、浅い位置で
-			// 読んだ結果を上限の深さで使い回して出力が変わる
-			name: "depth axis center",
-			in:   "<center>" + strings.Repeat("<b>", 19) + "<i>x</i></center>",
-			want: []*Node{{Type: NodeCenter, Children: []*Node{
-				text(strings.Repeat("<b>", 19)),
-				withChildren(NodeItalic, []*Node{text("x")}),
-			}}},
-		},
-		{
-			name: "depth axis strike",
-			in:   "<b>" + strings.Repeat("<s>", 20) + "**a**</b>",
-			want: []*Node{{Type: NodeBold, Children: []*Node{
-				text(strings.Repeat("<s>", 20)),
-				withChildren(NodeBold, []*Node{text("a")}),
-			}}},
+			// ハッシュタグの括弧は深さの上限までしか読まない。深さを表の軸から外すと、
+			// 失敗した center の中 (1 段深い) で読んだ結果を使い回して出力が変わる
+			name: "depth axis",
+			in:   "<center>" + bolds("#a((b))"),
+			want: "text:<center>|" + boldTree("hashtag:a((b))"),
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, parseWithin(t, tc.in, 5*time.Second))
+			assert.Equal(t, tc.want, serializeTree(parseWithin(t, tc.in, 5*time.Second)))
 		})
 	}
+}
+
+// `<https://...>` の飛び先は閉じの `>` か空白まで読む。改行では止まらないので、
+// 1 文字ずつ読むと `[a](<https://x` を改行を挟んで並べただけで、どの `](` からも
+// 末尾まで読んで入力長の 2 乗になる (#3300。1MB で 30 秒台)。区切りの位置の索引から
+// 引いていることを確かめる。時間で見ると CI の負荷で揺れるので、索引が作られて
+// 使われたことを見る。
+func TestParse_UnclosedURLAltUsesStopIndex(t *testing.T) {
+	s := newState(strings.Repeat("[a](<https://x\n", 2000), false)
+	mergeText(s.parseNodes(false))
+	assert.Equal(t, int8(1), s.memo.stopsState[stopURLAltEnd], "区切りの索引を作って引いていない")
+	assert.False(t, s.budget.exhausted())
+}
+
+// 区切りの索引を作れないとき (メモの上限に届いた、不正な UTF-8) は 1 文字ずつ
+// 読むが、読んだ分を仕事量に数えて上限で打ち切る。数えないと、上の形で入力長の
+// 2 乗になっても上限に届かない (#3300)。Parse は入口で UTF-8 を正すので、索引を
+// 作れない状態は state を直接作って再現する。
+func TestParse_UnclosedURLAltFallbackCountsWork(t *testing.T) {
+	s := newState(strings.Repeat("[a](<https://x\n", 14000), false)
+	s.memo.stopsState[stopURLAltEnd] = -1 // 索引を作れない状態
+	mergeText(s.parseNodes(false))
+	assert.True(t, s.budget.exhausted(), "1 文字ずつ読んだ分を仕事量に数えていない (used %d of %d)", s.budget.used, s.budget.limit)
 }

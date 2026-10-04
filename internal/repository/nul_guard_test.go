@@ -205,12 +205,12 @@ func TestListFiltersRejectUnstorableHost(t *testing.T) {
 	const unstorable = "a\x00b"
 
 	t.Run("federation/followers", func(t *testing.T) {
-		rows, err := NewFollowingRepository(db).ListFollowersByHostCursor(unstorable, "", "", 10)
+		rows, err := NewFollowingRepository(db).ListFollowersByHostCursor(unstorable, "", "", 10, model.FollowListViewer{})
 		require.NoError(t, err, "host を SELECT に載せてしまっている")
 		assert.Empty(t, rows)
 	})
 	t.Run("federation/following", func(t *testing.T) {
-		rows, err := NewFollowingRepository(db).ListFollowingByHostCursor(unstorable, "", "", 10)
+		rows, err := NewFollowingRepository(db).ListFollowingByHostCursor(unstorable, "", "", 10, model.FollowListViewer{})
 		require.NoError(t, err, "host を SELECT に載せてしまっている")
 		assert.Empty(t, rows)
 	})
@@ -391,6 +391,7 @@ func TestGuardedLookupsRejectUnstorableValues(t *testing.T) {
 		{"NewClipRepository.FindByID", func() error { _, err := NewClipRepository(db).FindByID(bad); return err }},
 		{"NewClipRepository.ListPublicByIDs", func() error { _, err := NewClipRepository(db).ListPublicByIDs([]string{bad}); return err }},
 		{"NewClipNoteRepository.FindByPair", func() error { _, err := NewClipNoteRepository(db).FindByPair(bad, bad); return err }},
+		{"NewClipNoteRepository.DeleteByPair", func() error { _, err := NewClipNoteRepository(db).DeleteByPair(bad, bad); return err }},
 		{"NewDriveFileRepository.FindByID", func() error { _, err := NewDriveFileRepository(db).FindByID(bad); return err }},
 		{"NewDriveFileRepository.FindByIDs", func() error { _, err := NewDriveFileRepository(db).FindByIDs([]string{bad}); return err }},
 		{"NewDriveFileRepository.FindByMD5", func() error { _, err := NewDriveFileRepository(db).FindByMD5(bad, bad); return err }},

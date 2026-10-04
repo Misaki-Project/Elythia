@@ -3,13 +3,15 @@ package note
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
-	"regexp"
+	"net"
+	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/hashtag"
 	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/misc/idnhost"
 	"github.com/shiroha-a/mk/internal/misc/keyword"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
@@ -217,18 +220,12 @@ type SilencingProvider interface {
 	IsSilenced(userID string) bool
 }
 
-// RolePolicyProvider abstracts role-policy lookup for the mentionLimit gate
-// (#2321)。循環依存を避けるため interface で受け取り、実装は core/role.Service。
-type RolePolicyProvider interface {
-	GetUserPolicies(userID string) map[string]any
-}
-
 // CreateService provides note creation logic.
 type CreateService struct {
 	noteRepo repository.NoteRepository
 	// rolePolicyProvider は mentionLimit の gate に使う (#2321)。nil なら
 	// DefaultMentionLimit にフォールバックする。
-	rolePolicyProvider RolePolicyProvider
+	rolePolicyProvider role.PolicyProvider
 	pollRepo           repository.PollRepository
 	followingRepo      repository.FollowingRepository
 	idGen              id.Generator
@@ -256,6 +253,37 @@ type CreateService struct {
 	featuredRanking     FeaturedRanking
 	// randFn は featured ランキング更新の 30% sampling 用。テストで固定する。
 	randFn func() float64
+	// localHost は自インスタンスのホスト (idnhost.Puny 済み)。`@user@<自ホスト>`
+	// をローカルの利用者として解決するのに使う。空なら判定しない。
+	localHost string
+	// remoteUserResolver は DB に無いリモートの利用者へのメンションを
+	// WebFinger で解決する。nil なら DB の照合だけにする。
+	remoteUserResolver RemoteUserResolver
+	// remoteMentionTimeout overrides defaultRemoteMentionFetchTimeout (tests).
+	remoteMentionTimeout time.Duration
+}
+
+// RemoteUserResolver resolves a remote `username@host` that is not in the DB
+// yet by WebFinger + actor fetch, upserting the user row. 循環依存を避けるため
+// interface で受け取る (実装は core/federation.RemoteUserResolver)。
+type RemoteUserResolver interface {
+	ResolveByUsernameHost(username, host string) (*model.User, error)
+}
+
+// RemoteUserResyncer is implemented by a RemoteUserResolver that re-syncs a
+// stored remote user whose data is older than 24 hours, as upstream
+// RemoteUserResolveService.resolveUser does for a user found in the DB.
+type RemoteUserResyncer interface {
+	// NeedsResync reports whether ResyncIfStale would contact the remote server.
+	NeedsResync(u *model.User) bool
+	ResyncIfStale(u *model.User) (*model.User, error)
+}
+
+// SetRemoteUserResolver wires the resolver used to fetch mentioned remote
+// users that are not in the DB, as upstream RemoteUserResolveService.resolveUser
+// does. nil keeps mention resolution DB-only.
+func (s *CreateService) SetRemoteUserResolver(r RemoteUserResolver) {
+	s.remoteUserResolver = r
 }
 
 // FeaturedRanking abstracts the engagement ranking store (#1687). 循環依存回避の
@@ -281,10 +309,20 @@ func (s *CreateService) SetUserRepo(r repository.UserRepository) {
 	s.userRepo = r
 }
 
+// SetLocalHost sets this instance's own host (`config.url` authority) so a
+// mention such as `@alice@<this host>` resolves to the local user, as upstream
+// RemoteUserResolveService.resolveUser does.
+func (s *CreateService) SetLocalHost(host string) {
+	s.localHost = ""
+	if host != "" {
+		s.localHost = idnhost.Puny(host)
+	}
+}
+
 // SetRolePolicyProvider wires role-policy lookup so note creation honours the
 // per-user `mentionLimit` policy (#2321). nil (未配線 / test) のときは
 // DefaultMentionLimit にフォールバックする。
-func (s *CreateService) SetRolePolicyProvider(p RolePolicyProvider) {
+func (s *CreateService) SetRolePolicyProvider(p role.PolicyProvider) {
 	s.rolePolicyProvider = p
 }
 
@@ -440,7 +478,7 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 	// reply/renote 先を取得する。reply 先の channel を継承する re-scoping (#1859) と
 	// channel-force / silencing が effective channel に依存するため、channel 判定より
 	// 前に fetch する。fetch error は後段の validation block で報告するので、報告順
-	// (reply → renote) は変わらない。ReplyID / RenoteID の fetch は独立なので並列に
+	// (renote → reply) は変わらない。ReplyID / RenoteID の fetch は独立なので並列に
 	// 走らせる (#300 2-5)。
 	var (
 		replyTarget, renoteTarget *model.Note
@@ -533,107 +571,18 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		}
 	}
 
-	// プロhibited wordsチェック (meta.prohibitedWordsマッチ)。#2106 N12: poll choices も検査。
-	var prohibitedPollChoices []string
-	if in.Poll != nil {
-		prohibitedPollChoices = in.Poll.Choices
-	}
-	if err := checkProhibitedWords(meta, in.Text, in.CW, prohibitedPollChoices); err != nil {
-		return nil, err
-	}
-
-	// mention の解決はここで 1 回だけ行い、上限チェックと note.Mentions の
-	// 両方で使い回す (host ごとの batch query を二重に投げないため)。
-	var (
-		mentionUserIDs   []string
-		mentionRawCount  int
-		mentionsResolved bool
-	)
-	if in.Text != nil && *in.Text != "" {
-		mentions := ExtractMentionStructs(*in.Text)
-		// 上限の判定には NoExtractMentions でも text 中の mention を数える
-		// (AP 経路で tag 由来の mention に置き換える場合でも本文の量は効く)。
-		mentionRawCount = len(mentions)
-		if len(mentions) > 0 && !in.NoExtractMentions && s.userRepo != nil {
-			mentionUserIDs = s.resolveMentionUserIDs(mentions)
-			mentionsResolved = true
-		}
-	}
-
-	// mentionLimitチェック (role policiesの制限)
-	if err := s.checkMentionLimit(in, visibility, replyTarget, mentionUserIDs, mentionRawCount); err != nil {
-		return nil, err
-	}
-
-	// pollのexpiresAtが既に過去なら弾く
-	if in.Poll != nil && in.Poll.ExpiresAt != nil && in.Poll.ExpiresAt.Before(time.Now()) {
-		return nil, ErrCannotCreateAlreadyExpiredPoll
-	}
+	// 検証の順は本家に揃える (#3330): NoteCreateService.fetchAndCreate のファイル →
+	// 引用 (renote) → 返信 → 投票の期限 → チャンネル、続いて create の禁止語 →
+	// メンション数。複数の誤りを含む投稿で返すエラーが本家と同じになる。以前は
+	// 禁止語とメンション数を先に見ていたので、DB で解決したメンションだけで上限を
+	// 超える投稿は、返信先が無い・ファイルが無いなどの誤りより先に
+	// CONTAINS_TOO_MANY_MENTIONS になっていた。
 
 	// fileIdsのうち存在しないIDがあれば弾く
 	if err := s.checkFileIDs(in.User.ID, in.FileIDs); err != nil {
 		return nil, err
 	}
 
-	// user 指定 channel の存在チェック (空文字正規化済 specifiedChannelID)。reply
-	// 継承で得た channel は元 note が属する実在 channel なので検証不要 (#1859)。
-	// channelHook 未設定なら channel 機能無効として扱いエラーは返さない。
-	// 注: reply 先 channel が削除済の極端ケースでは upstream (findOneBy→null で
-	// channel=null) と異なり dangling な channelId を残す。mk-go に channel 削除
-	// 経路が無く到達しない上、OnNotePosted も no-op で無害なため許容する。
-	if specifiedChannelID != nil && s.channelHook != nil {
-		if err := s.channelHook.EnsureChannelExists(*specifiedChannelID); err != nil {
-			// **DB 障害を not-found に丸めない** (#2792)。丸めると障害が
-			// NO_SUCH_CHANNEL (400) に化け、監視でも 5xx が立たない。
-			if errors.Is(err, ErrChannelNotFound) {
-				return nil, ErrChannelNotFound
-			}
-			return nil, fmt.Errorf("ensure channel exists: %w", err)
-		}
-	}
-
-	// reply/renote 先の取得 (FindByIDWithUser) は visibility 決定のため上方へ移動済。
-	// ここでは取得済みの replyTarget / renoteTarget を validation に使う。報告順は
-	// reply → renote。
-	if in.ReplyID != nil {
-		if replyFetchErr != nil {
-			// **DB 障害を not-found に丸めない** (#2799)。lookup が上の
-			// goroutine に hoist されているので gate の射程外 — ここは
-			// テストが唯一の回帰検知になる。
-			if !repository.IsNotFound(replyFetchErr) {
-				return nil, replyFetchErr
-			}
-			return nil, ErrReplyTargetNotFound
-		}
-		t := replyTarget
-		// 可視性チェックを先に行う。FindByIDWithUserは無条件に行を返すため、
-		// 不可視noteに対して別error (pure renote 等) を返すと「対象noteが
-		// 何であるか」を攻撃者が推測できる情報漏洩になる。Devin review #270。
-		if !CanSeeNote(in.User, t, s.followingRepo) {
-			return nil, ErrCannotReplyToInvisibleNote
-		}
-		// pure renote (renoteIdあり、text/files/poll/cwなし) への返信は許可しない
-		if IsPureRenote(t) {
-			return nil, ErrCannotReplyToAPureRenote
-		}
-		// specified可視性noteへの返信時は visibility も specified でなければ拒否
-		if t.Visibility == model.NoteVisibilitySpecified && visibility != model.NoteVisibilitySpecified {
-			return nil, ErrCannotReplyToSpecifiedVisibility
-		}
-		// reply対象のユーザーに block されていたら拒否
-		if t.UserID != in.User.ID {
-			if err := s.checkBlocked(t.UserID, in.User.ID); err != nil {
-				return nil, err
-			}
-		}
-		// 返信対象の可視性に応じて段階クランプする (upstream 2026.7.0 #17747)。
-		visibility = ClampVisibilityForReply(t.Visibility, visibility)
-		// local-only な対象への reply は local-only にする (channel 外のみ、
-		// upstream:541-543)。
-		if t.LocalOnly && effectiveChannelID == nil {
-			localOnly = true
-		}
-	}
 	if in.RenoteID != nil {
 		if renoteFetchErr != nil {
 			// **DB 障害を not-found に丸めない** (#2799、reply 側と同じ)。
@@ -703,10 +652,130 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		}
 	}
 
+	// reply/renote 先の取得 (FindByIDWithUser) は visibility 決定のため上方へ移動済。
+	// ここでは取得済みの replyTarget / renoteTarget を validation に使う。報告順は
+	// 本家 fetchAndCreate と同じ renote → reply。
+	if in.ReplyID != nil {
+		if replyFetchErr != nil {
+			// **DB 障害を not-found に丸めない** (#2799)。lookup が上の
+			// goroutine に hoist されているので gate の射程外 — ここは
+			// テストが唯一の回帰検知になる。
+			if !repository.IsNotFound(replyFetchErr) {
+				return nil, replyFetchErr
+			}
+			return nil, ErrReplyTargetNotFound
+		}
+		t := replyTarget
+		// 可視性チェックを先に行う。FindByIDWithUserは無条件に行を返すため、
+		// 不可視noteに対して別error (pure renote 等) を返すと「対象noteが
+		// 何であるか」を攻撃者が推測できる情報漏洩になる。Devin review #270。
+		if !CanSeeNote(in.User, t, s.followingRepo) {
+			return nil, ErrCannotReplyToInvisibleNote
+		}
+		// pure renote (renoteIdあり、text/files/poll/cwなし) への返信は許可しない
+		if IsPureRenote(t) {
+			return nil, ErrCannotReplyToAPureRenote
+		}
+		// specified可視性noteへの返信時は visibility も specified でなければ拒否
+		if t.Visibility == model.NoteVisibilitySpecified && visibility != model.NoteVisibilitySpecified {
+			return nil, ErrCannotReplyToSpecifiedVisibility
+		}
+		// reply対象のユーザーに block されていたら拒否
+		if t.UserID != in.User.ID {
+			if err := s.checkBlocked(t.UserID, in.User.ID); err != nil {
+				return nil, err
+			}
+		}
+		// 返信対象の可視性に応じて段階クランプする (upstream 2026.7.0 #17747)。
+		visibility = ClampVisibilityForReply(t.Visibility, visibility)
+		// local-only な対象への reply は local-only にする (channel 外のみ、
+		// upstream:541-543)。
+		if t.LocalOnly && effectiveChannelID == nil {
+			localOnly = true
+		}
+	}
+
+	// pollのexpiresAtが既に過去なら弾く
+	if in.Poll != nil && in.Poll.ExpiresAt != nil && in.Poll.ExpiresAt.Before(time.Now()) {
+		return nil, ErrCannotCreateAlreadyExpiredPoll
+	}
+
+	// user 指定 channel の存在チェック (空文字正規化済 specifiedChannelID)。reply
+	// 継承で得た channel は元 note が属する実在 channel なので検証不要 (#1859)。
+	// channelHook 未設定なら channel 機能無効として扱いエラーは返さない。
+	// 注: reply 先 channel が削除済の極端ケースでは upstream (findOneBy→null で
+	// channel=null) と異なり dangling な channelId を残す。mk-go に channel 削除
+	// 経路が無く到達しない上、OnNotePosted も no-op で無害なため許容する。
+	if specifiedChannelID != nil && s.channelHook != nil {
+		if err := s.channelHook.EnsureChannelExists(*specifiedChannelID); err != nil {
+			// **DB 障害を not-found に丸めない** (#2792)。丸めると障害が
+			// NO_SUCH_CHANNEL (400) に化け、監視でも 5xx が立たない。
+			if errors.Is(err, ErrChannelNotFound) {
+				return nil, ErrChannelNotFound
+			}
+			return nil, fmt.Errorf("ensure channel exists: %w", err)
+		}
+	}
+
+	// プロhibited wordsチェック (meta.prohibitedWordsマッチ)。#2106 N12: poll choices も検査。
+	var prohibitedPollChoices []string
+	if in.Poll != nil {
+		prohibitedPollChoices = in.Poll.Choices
+	}
+	if err := checkProhibitedWords(meta, in.Text, in.CW, prohibitedPollChoices); err != nil {
+		return nil, err
+	}
+
+	// mention の解決はここで 1 回だけ行い、上限チェックと note.Mentions の
+	// 両方で使い回す (host ごとの batch query を二重に投げないため)。
+	// 本家 (NoteCreateService.create) は本文・CW・投票の選択肢を合わせた構文木から
+	// メンションを取る。noExtractMentions のときは apMentions に [] が渡り、
+	// 本文のメンションは上限の数にも入らない。
+	//
+	// DB に無いリモートの利用者は WebFinger で取りに行く (下の fetchRemoteMentions)。
+	// ここでは DB の分だけで上限を判定する。取りに行っても数は増えるだけなので、
+	// ここで超えていれば外向きのリクエストを出さずに弾ける。
+	var mentionRes *mentionResolution
+	if !in.NoExtractMentions && s.userRepo != nil {
+		if mentions := extractNoteMentions(in.Text, in.CW, in.Poll); len(mentions) > 0 {
+			mentionRes = s.lookupMentionsInDB(mentions, in.User.Host)
+		}
+	}
+	mentionUserIDs := mentionRes.userIDs()
+
+	// mentionLimitチェック (role policiesの制限)
+	if err := s.checkMentionLimit(in, visibility, replyTarget, mentionUserIDs); err != nil {
+		return nil, err
+	}
+
+	// DB に無いリモートの利用者へのメンションを WebFinger + actor の取得で解決する
+	// (本家 RemoteUserResolveService.resolveUser)。外向きのリクエストを出すので、
+	// 返信先・引用先・ファイル・チャンネルの検証を全部通った後に行う (本家も
+	// notes/create のエンドポイントで検証してから NoteCreateService.create に入る)。
+	//
+	// **取りに行く件数は上限の残りまでにする。** 取りに行く acct を全部「解決できる」
+	// と見なして数え、上限を超えるなら取らずに弾く。本家は全件を取りに行ってから
+	// 数えるので、結果が変わるのは「上限の残りを超える数の未知の acct を並べ、
+	// そのうち十分な数が解決できなかった」ときだけ (本家は通し、mk-go は弾く)。
+	// 解決できる acct だけなら本家も同じく弾く。これが無いと、応答しないホストへの
+	// メンションを数百並べるだけで、投稿のハンドラを分単位で止められる。
+	// 取った後は件数が上の見積もり以下にしかならないので、判定し直しは要らない。
+	//
+	// 保存から 24 時間を過ぎた利用者の再同期 (本家 resolveUser) も同じ枠で行う。
+	// こちらは既に上の数に入っているので、件数の見積もりは増やさない。
+	if mentionRes.hasRemoteWork() && s.remoteUserResolver != nil {
+		accts, _ := mentionRes.fetchableAccts()
+		if n := mentionTargetCount(in, visibility, replyTarget, mentionUserIDs) + len(accts); n > s.mentionLimitFor(in.User.ID) {
+			return nil, ErrContainsTooManyMentions
+		}
+		s.fetchRemoteMentions(mentionRes)
+		mentionUserIDs = mentionRes.userIDs()
+	}
+
 	now := time.Now()
 	noteID := s.idGen.Generate(now)
 
-	// hashtag 抽出: text/cw から #tag を拾い note.tags 列に格納する。
+	// hashtag 抽出: text/cw/投票の選択肢から #tag を拾い note.tags 列に格納する。
 	// hashtags/trend の動的集計や hashtag 検索が機能するためには
 	// note.tags が常に正しく埋められている必要がある (#655)。
 	var tags []string
@@ -717,6 +786,12 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		}
 		if in.CW != nil {
 			hashtagParts = append(hashtagParts, *in.CW)
+		}
+		// 本家は本文・CW・投票の選択肢を合わせた構文木からハッシュタグを取る
+		// (NoteCreateService.create の combinedTokens)。選択肢を見ないと、
+		// 選択肢にだけ書いたタグがハッシュタグの検索やトレンドに載らない (#3330)。
+		if in.Poll != nil {
+			hashtagParts = append(hashtagParts, in.Poll.Choices...)
 		}
 		// upstream NoteCreateService は note.tags を normalizeForSearch (NFKC +
 		// lowercase) で正規化し、>128 char を drop、32 件 cap してから格納する。
@@ -789,17 +864,16 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		}
 	}
 
-	// メンションの抽出。ユーザー名+ホストをユーザーIDに解決する。
-	// ローカル (host="") は host IS NULL で、リモート (host!="") は
-	// host 列の等価比較で lookup する。未知のユーザーは単にスキップする
-	// (remote webfinger 解決は pre-lookup されている前提)。
+	// メンションの抽出。ユーザー名+ホストをユーザーIDに解決する (解決は上で
+	// 済ませてある。規則は resolveMentionUserIDs)。DB に無いユーザーは単に
+	// スキップする。
 	// userRepo が未設定のときは後方互換のため username 文字列をそのまま格納する。
-	if in.Text != nil && !in.NoExtractMentions {
+	if !in.NoExtractMentions {
 		if s.userRepo != nil {
-			if mentionsResolved && len(mentionUserIDs) > 0 {
+			if len(mentionUserIDs) > 0 {
 				note.Mentions = mentionUserIDs
 			}
-		} else {
+		} else if in.Text != nil {
 			note.Mentions = ExtractMentions(*in.Text)
 		}
 	}
@@ -817,6 +891,20 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 			for _, id := range note.VisibleUserIDs {
 				note.Mentions = appendUniqueID(note.Mentions, id)
 			}
+		}
+	}
+
+	// 本家 insertNote と同じく、mentions のうちリモートの利用者を
+	// mentionedRemoteUsers 列に書く。連合で配る content のメンションの href は
+	// この列の url / uri から作る (#3329)。WebFinger で取ってきた利用者も入るよう、
+	// mentions が確定した後で書く。
+	if s.userRepo != nil && len(note.Mentions) > 0 {
+		if allMentionsLocal(note.Mentions, mentionRes.localUserIDs(), replyTarget) {
+			// ローカル同士の返信やメンションで、ノートの作成ごとに利用者の
+			// クエリを 1 回増やさない。結果は引いた場合と同じ `[]`
+			note.MentionedRemoteUsers = "[]"
+		} else {
+			note.MentionedRemoteUsers = s.mentionedRemoteUsersJSON(note.Mentions)
 		}
 	}
 
@@ -1071,12 +1159,6 @@ func (s *CreateService) isThreadMuted(userID string, threadNote *model.Note) boo
 	return err == nil && muted
 }
 
-// mentionRegex matches @username and @username@host occurrences anywhere in
-// text. Misskey本家のクライアント実装(misskey-js)と同じく、ユーザー名は
-// 英数とアンダースコアおよびハイフンからなり、長さは制限しない。
-// ホスト部はドメイン形式 (英数・ハイフン・ドット) を許容する。
-var mentionRegex = regexp.MustCompile(`@([A-Za-z0-9_-]+)(?:@([A-Za-z0-9.\-]+))?`)
-
 // Mention represents a single user mention extracted from note text.
 type Mention struct {
 	Username string
@@ -1096,52 +1178,53 @@ func appendUniqueID(ids []string, id string) []string {
 // Misskeyのnote.mentions列はユーザーIDの配列だが、本サービスではユーザー解決を
 // 別レイヤで行う前提で、ここではユーザー名形式のままで返す。重複は除去する。
 func ExtractMentions(text string) []string {
-	matches := mentionRegex.FindAllStringSubmatch(text, -1)
-	if len(matches) == 0 {
+	mentions := ExtractMentionStructs(text)
+	if len(mentions) == 0 {
 		return nil
 	}
-	seen := make(map[string]struct{}, len(matches))
-	var out []string
-	for _, m := range matches {
-		username := m[1]
-		host := ""
-		if len(m) >= 3 {
-			host = m[2]
+	out := make([]string, 0, len(mentions))
+	for _, m := range mentions {
+		key := m.Username
+		if m.Host != "" {
+			key = m.Username + "@" + m.Host
 		}
-		key := username
-		if host != "" {
-			key = username + "@" + host
-		}
-		if _, dup := seen[key]; dup {
-			continue
-		}
-		seen[key] = struct{}{}
 		out = append(out, key)
 	}
 	return out
 }
 
-// ExtractMentionStructs returns the mentions as structured Mention values.
-// 主にNotificationServiceなどリモート/ローカル区別を要する呼び出し向け。
+// ExtractMentionStructs returns the mentions in text as structured Mention
+// values, ordered by first appearance and dedup'd by exact username and host.
+// Mirrors upstream extractMentions(mfm.parse(text)): only mention nodes of the
+// MFM tree count, so an "@" inside code, a link label, a URL or an e-mail
+// address is not a mention.
+//
+// 本家は正規表現ではなく、MFMのパーサが作ったmentionノードだけを使う
+// (misc/extract-mentions.ts)。正規表現で拾うと、メールアドレスやコードの中の
+// @がメンションになり、末尾の"."をhostに含めて宛先を落とす(#3304)。
 func ExtractMentionStructs(text string) []Mention {
-	matches := mentionRegex.FindAllStringSubmatch(text, -1)
-	if len(matches) == 0 {
+	if text == "" {
 		return nil
 	}
-	seen := make(map[string]struct{}, len(matches))
+	seen := make(map[Mention]struct{})
 	var out []Mention
-	for _, m := range matches {
-		username := m[1]
-		host := ""
-		if len(m) >= 3 {
-			host = m[2]
+	var walk func(n *mfm.Node)
+	walk = func(n *mfm.Node) {
+		if n.Type == mfm.NodeMention {
+			username, _ := n.Props["username"].(string)
+			host, _ := n.Props["host"].(string)
+			m := Mention{Username: username, Host: host}
+			if _, dup := seen[m]; !dup {
+				seen[m] = struct{}{}
+				out = append(out, m)
+			}
 		}
-		key := username + "@" + host
-		if _, dup := seen[key]; dup {
-			continue
+		for _, c := range n.Children {
+			walk(c)
 		}
-		seen[key] = struct{}{}
-		out = append(out, Mention{Username: username, Host: host})
+	}
+	for _, n := range mfm.Parse(text) {
+		walk(n)
 	}
 	return out
 }
@@ -1262,22 +1345,151 @@ func checkProhibitedWords(meta *model.Meta, text, cw *string, pollChoices []stri
 	return nil
 }
 
-// resolveMentionUserIDs maps `@username[@host]` mentions to local user IDs,
-// dropping the ones that do not resolve to a known user.
+// Mention resolution mirrors upstream NoteCreateService.extractMentionedUsers:
+// a mention without a host belongs to the author's host (`m.host ??
+// user.host`), a mention of this instance's own host is a local user, an
+// unknown remote user is resolved via WebFinger (RemoteUserResolveService.
+// resolveUser), and the resolved users are dedup'd by ID. lookupMentionsInDB
+// does the DB part and fetchRemoteMentions the WebFinger part.
+
+// mentionResolution holds the per-mention result of mention resolution.
+type mentionResolution struct {
+	mentions []Mention
+	// hosts[i] is the lookup host of mentions[i] ("" = local).
+	hosts []string
+	// ids[i] is the resolved user ID of mentions[i] ("" = unresolved).
+	ids []string
+	// fetchable lists the indices of remote mentions the DB lookup answered
+	// with "no such user", i.e. the ones to resolve via WebFinger.
+	fetchable []int
+	// stale maps the indices of remote mentions the DB answered with a user
+	// whose data is due for a re-sync to that user.
+	stale map[int]*model.User
+}
+
+// userIDs returns the resolved user IDs in mention order, dedup'd by ID.
+func (r *mentionResolution) userIDs() []string {
+	if r == nil {
+		return nil
+	}
+	out := make([]string, 0, len(r.ids))
+	for _, id := range r.ids {
+		// 本家は解決した利用者を ID で重複除去する。大文字小文字だけ違う
+		// `@Alice @alice` は別の mention ノードだが同じ利用者になる。
+		out = appendUniqueID(out, id)
+	}
+	return out
+}
+
+// localUserIDs returns the IDs of the mentions resolved as local users.
+func (r *mentionResolution) localUserIDs() map[string]bool {
+	if r == nil {
+		return nil
+	}
+	local := make(map[string]bool)
+	for i, id := range r.ids {
+		if id != "" && r.hosts[i] == "" {
+			local[id] = true
+		}
+	}
+	return local
+}
+
+// allMentionsLocal reports whether every ID in mentions is already known to be
+// a local user: a mention resolved under this host, or the author of the
+// replied note when that note is local. Recipients of a specified note are
+// not known here, so they make it false.
+func allMentionsLocal(mentions []string, localMentionIDs map[string]bool, replyTarget *model.Note) bool {
+	for _, id := range mentions {
+		if localMentionIDs[id] {
+			continue
+		}
+		if replyTarget != nil && replyTarget.UserID == id && replyTarget.UserHost == nil {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// mentionedRemoteUsersJSON returns the `mentionedRemoteUsers` column for the
+// note's mentions: the remote users among them, in the same order, as upstream
+// NoteCreateService.insertNote writes it (uri, url from the user's profile,
+// username, host).
+//
+// 本家は利用者を引けないとノートの作成ごと失敗する。mk-go は作成を止めず、
+// 引けなかった分は列に入れない (メンションの href が自サーバーの /@acct になる
+// だけで、宛先や通知は mentions 列で決まる)。プロフィールを引けないときは url を
+// 省き、本家と同じく uri へのリンクにする。
+func (s *CreateService) mentionedRemoteUsersJSON(mentions []string) string {
+	users, err := s.userRepo.FindManyByIDs(mentions)
+	if err != nil {
+		slog.Warn("note: looking up mentioned users failed; mentionedRemoteUsers left empty", "err", err)
+		return "[]"
+	}
+	byID := make(map[string]*model.User, len(users))
+	var remoteIDs []string
+	for _, u := range users {
+		if u.Host != nil {
+			byID[u.ID] = u
+			remoteIDs = append(remoteIDs, u.ID)
+		}
+	}
+	urlByID := make(map[string]*string, len(remoteIDs))
+	if len(remoteIDs) > 0 {
+		profiles, err := s.userRepo.FindProfilesByUserIDs(remoteIDs)
+		if err != nil {
+			slog.Warn("note: looking up mentioned users' profiles failed; urls omitted", "err", err)
+		}
+		for _, p := range profiles {
+			urlByID[p.UserID] = p.URL
+		}
+	}
+	out := make([]mfm.MentionedRemoteUser, 0, len(remoteIDs))
+	for _, id := range mentions {
+		u, ok := byID[id]
+		if !ok {
+			continue
+		}
+		// 同じ利用者は mentions に 1 度しか入らないが、念のため 2 度目は書かない
+		delete(byID, id)
+		var uri string
+		if u.URI != nil {
+			uri = *u.URI
+		}
+		out = append(out, mfm.MentionedRemoteUser{URI: uri, URL: urlByID[id], Username: u.Username, Host: u.Host})
+	}
+	// JSON.stringify と同じく `<` `>` `&` をエスケープしない (url の query に
+	// `&` が入る)。要素は文字列とそのポインタだけなので、Encode は失敗しない
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(out)
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// lookupMentionsInDB resolves mentions against the user table only.
 //
 // host ごとに 1 query にまとめる (#300 1-5)。元実装は mention 数 N に対して
 // N 回 FindByUsernameLower を直列に叩いていたが、host 単位で IN(?) にして
 // ラウンドトリップを host 種類数まで削減する。
-func (s *CreateService) resolveMentionUserIDs(mentions []Mention) []string {
+func (s *CreateService) lookupMentionsInDB(mentions []Mention, authorHost *string) *mentionResolution {
 	if s.userRepo == nil || len(mentions) == 0 {
 		return nil
 	}
-	byHost := make(map[string][]string)
-	for _, m := range mentions {
-		byHost[m.Host] = append(byHost[m.Host], m.Username)
+	r := &mentionResolution{
+		mentions: mentions,
+		hosts:    make([]string, len(mentions)),
+		ids:      make([]string, len(mentions)),
 	}
-	// resolved[host][usernameLower] = userID
-	resolved := make(map[string]map[string]string, len(byHost))
+	byHost := make(map[string][]string)
+	for i, m := range mentions {
+		h := s.mentionLookupHost(m.Host, authorHost)
+		r.hosts[i] = h
+		byHost[h] = append(byHost[h], m.Username)
+	}
+	// resolved[host][usernameLower] = user
+	resolved := make(map[string]map[string]*model.User, len(byHost))
 	for host, names := range byHost {
 		var hostPtr *string
 		if host != "" {
@@ -1287,48 +1499,363 @@ func (s *CreateService) resolveMentionUserIDs(mentions []Mention) []string {
 		users, err := s.userRepo.FindManyByUsernamesAndHost(names, hostPtr)
 		if err != nil {
 			// 1 host の lookup 失敗は当該 host の mention を諦めて後続を
-			// 続行する (元実装も err 時 skip だった)。
+			// 続行する (元実装も err 時 skip だった)。WebFinger にも回さない。
+			// DB の障害を外向きのリクエストに化けさせないため (#2792 と同じ理由)。
 			continue
 		}
-		m := make(map[string]string, len(users))
+		m := make(map[string]*model.User, len(users))
 		for _, u := range users {
-			m[u.UsernameLower] = u.ID
+			m[u.UsernameLower] = u
 		}
 		resolved[host] = m
 	}
-	ids := make([]string, 0, len(mentions))
-	for _, mn := range mentions {
-		if hostMap, ok := resolved[mn.Host]; ok {
-			if id, ok := hostMap[strings.ToLower(mn.Username)]; ok {
-				ids = append(ids, id)
+	resyncer, _ := s.remoteUserResolver.(RemoteUserResyncer)
+	for i, mn := range mentions {
+		hostMap, ok := resolved[r.hosts[i]]
+		if !ok {
+			continue
+		}
+		if u, ok := hostMap[strings.ToLower(mn.Username)]; ok {
+			r.ids[i] = u.ID
+			// 本家 resolveUser は DB にあった利用者も、保存から 24 時間を過ぎて
+			// いれば WebFinger から取り直す (下の fetchRemoteMentions で行う)。
+			if r.hosts[i] != "" && resyncer != nil && resyncer.NeedsResync(u) {
+				if r.stale == nil {
+					r.stale = make(map[int]*model.User)
+				}
+				r.stale[i] = u
+			}
+			continue
+		}
+		// ローカルの利用者は取りに行く先が無い (本家も findOneBy の結果だけ)。
+		if r.hosts[i] != "" {
+			r.fetchable = append(r.fetchable, i)
+		}
+	}
+	return r
+}
+
+// remoteMentionFetchConcurrency bounds the WebFinger + actor fetches run in
+// parallel for one note.
+//
+// 本家は Promise.all で全件を同時に投げる。mk-go は goroutine を無制限に
+// 立てないよう並列数だけ絞る (結果の集合と順序は変わらない)。
+const remoteMentionFetchConcurrency = 4
+
+// defaultRemoteMentionFetchTimeout is the overall deadline of the remote
+// mention fetches of one note.
+//
+// 本家には全体の締め切りが無い。mk-go は投稿のハンドラ (と予約投稿の job。
+// lock の TTL は 5 分) を外部のサーバーの応答待ちで止めないよう、全体を 20 秒で
+// 打ち切る。1 件の WebFinger の client timeout (10 秒) を 2 巡できる長さ。
+// 締め切りに間に合わなかった分は、取得に失敗したものとして扱う (本家の
+// `.catch(() => null)` と同じ結末)。
+const defaultRemoteMentionFetchTimeout = 20 * time.Second
+
+// remoteMentionFetchTimeout returns the overall fetch deadline (overridable in
+// tests).
+func (s *CreateService) remoteMentionFetchTimeout() time.Duration {
+	if s.remoteMentionTimeout > 0 {
+		return s.remoteMentionTimeout
+	}
+	return defaultRemoteMentionFetchTimeout
+}
+
+// remoteMentionAcct is one `username@host` to resolve via WebFinger.
+type remoteMentionAcct struct{ usernameLower, host string }
+
+// fetchableAccts groups r.fetchable by acct (case-insensitive username), in
+// mention order.
+func (r *mentionResolution) fetchableAccts() ([]remoteMentionAcct, map[remoteMentionAcct][]int) {
+	byAcct := make(map[remoteMentionAcct][]int)
+	var order []remoteMentionAcct
+	if r == nil {
+		return nil, byAcct
+	}
+	for _, i := range r.fetchable {
+		a := remoteMentionAcct{strings.ToLower(r.mentions[i].Username), r.hosts[i]}
+		if _, ok := byAcct[a]; !ok {
+			order = append(order, a)
+		}
+		byAcct[a] = append(byAcct[a], i)
+	}
+	return order, byAcct
+}
+
+// isUnreachableHostError reports whether err from a remote resolve means the
+// host itself could not be reached (DNS / connect / TLS failure or timeout),
+// as opposed to "this account does not exist".
+func isUnreachableHostError(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// staleAccts groups r.stale by acct, in mention order, with the stored user of
+// each acct.
+func (r *mentionResolution) staleAccts() ([]remoteMentionAcct, map[remoteMentionAcct][]int, map[remoteMentionAcct]*model.User) {
+	byAcct := make(map[remoteMentionAcct][]int)
+	users := make(map[remoteMentionAcct]*model.User)
+	var order []remoteMentionAcct
+	if r == nil {
+		return nil, byAcct, users
+	}
+	for i := range r.mentions {
+		u, ok := r.stale[i]
+		if !ok {
+			continue
+		}
+		a := remoteMentionAcct{strings.ToLower(r.mentions[i].Username), r.hosts[i]}
+		if _, ok := byAcct[a]; !ok {
+			order = append(order, a)
+			users[a] = u
+		}
+		byAcct[a] = append(byAcct[a], i)
+	}
+	return order, byAcct, users
+}
+
+// hasRemoteWork reports whether fetchRemoteMentions has anything to do.
+func (r *mentionResolution) hasRemoteWork() bool {
+	return r != nil && (len(r.fetchable) > 0 || len(r.stale) > 0)
+}
+
+// remoteMentionJob is one acct for fetchRemoteMentions: an unknown acct to
+// resolve (stored == nil) or a stored user to re-sync.
+type remoteMentionJob struct {
+	acct    remoteMentionAcct
+	stored  *model.User
+	indices []int
+}
+
+// fetchRemoteMentions resolves the fetchable mentions of r through the
+// RemoteUserResolver and re-syncs the stale ones, filling r.ids in place. A
+// failed fetch leaves the mention unresolved, like upstream's
+// `resolveUser(...).catch(() => null)`; so does a failed re-sync, since
+// upstream's resolveUser throws for it too.
+//
+// The fetches run at most remoteMentionFetchConcurrency at a time, share one
+// overall deadline, and skip the rest of a host once that host turned out to be
+// unreachable. The caller caps the number of accts (see Create).
+func (s *CreateService) fetchRemoteMentions(r *mentionResolution) {
+	if !r.hasRemoteWork() || s.remoteUserResolver == nil {
+		return
+	}
+	// 同じ利用者を大文字小文字違いで並べても、取りに行くのは 1 回にする。
+	order, byAcct := r.fetchableAccts()
+	staleOrder, staleByAcct, staleUsers := r.staleAccts()
+	r.fetchable = nil
+	r.stale = nil
+	jobs := make([]remoteMentionJob, 0, len(order)+len(staleOrder))
+	for _, a := range order {
+		jobs = append(jobs, remoteMentionJob{acct: a, indices: byAcct[a]})
+	}
+	resyncer, _ := s.remoteUserResolver.(RemoteUserResyncer)
+	if resyncer != nil {
+		for _, a := range staleOrder {
+			jobs = append(jobs, remoteMentionJob{acct: a, stored: staleUsers[a], indices: staleByAcct[a]})
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.remoteMentionFetchTimeout())
+	defer cancel()
+
+	type result struct {
+		k      int
+		id     string
+		failed bool
+	}
+	// 締め切りの後に返ってきた goroutine が詰まらないよう、全件分の容量を取る。
+	results := make(chan result, len(jobs))
+	sem := make(chan struct{}, remoteMentionFetchConcurrency)
+	var deadMu sync.Mutex
+	deadHosts := make(map[string]struct{})
+	isDead := func(host string) bool {
+		deadMu.Lock()
+		defer deadMu.Unlock()
+		_, ok := deadHosts[host]
+		return ok
+	}
+
+	pending := 0
+launch:
+	for k, job := range jobs {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break launch
+		}
+		// 到達できなかったホストの残りは取りに行かない。応答しないホストへの
+		// メンションを並べても、待つのは並列数ぶんの 1 巡だけになる。
+		if isDead(job.acct.host) || ctx.Err() != nil {
+			<-sem
+			if ctx.Err() != nil {
+				break launch
+			}
+			continue
+		}
+		pending++
+		go func(k int, job remoteMentionJob) {
+			res := result{k: k}
+			// defer は逆順に走る: 結果を送る → sem を返す。到達不能の印は sem を
+			// 返す前に付くので、次に起動される goroutine は必ずそれを見る。
+			defer func() { <-sem }()
+			defer func() { results <- res }()
+			defer func() {
+				// 外部の応答を扱う経路なので、panic で投稿ごと落とさない。
+				if rec := recover(); rec != nil {
+					slog.Error("note create: remote mention resolve panicked", "host", job.acct.host, "panic", rec)
+				}
+			}()
+			var (
+				u   *model.User
+				err error
+			)
+			if job.stored != nil {
+				u, err = resyncer.ResyncIfStale(job.stored)
+			} else {
+				u, err = s.remoteUserResolver.ResolveByUsernameHost(job.acct.usernameLower, job.acct.host)
+			}
+			if err != nil {
+				res.failed = true
+				if isUnreachableHostError(err) {
+					deadMu.Lock()
+					deadHosts[job.acct.host] = struct{}{}
+					deadMu.Unlock()
+				}
+				return
+			}
+			if u != nil {
+				res.id = u.ID
+			} else {
+				res.failed = true
+			}
+		}(k, job)
+	}
+
+	got := make([]result, len(jobs))
+collect:
+	for pending > 0 {
+		select {
+		case res := <-results:
+			pending--
+			got[res.k] = res
+		case <-ctx.Done():
+			// 取得中のものは待たない。resolver の HTTP client は自前の timeout で
+			// 終わり、結果は上の容量付きの channel に捨てられる。
+			slog.Info("note create: remote mention resolve deadline exceeded", "pending", pending)
+			break collect
+		}
+	}
+	for k, job := range jobs {
+		res := got[k]
+		switch {
+		case res.id != "":
+			for _, i := range job.indices {
+				r.ids[i] = res.id
+			}
+		case job.stored != nil && res.failed:
+			// 再同期に失敗した利用者へのメンションは本家と同じく落とす
+			// (resolveUser が投げ、extractMentionedUsers の catch で null になる)。
+			// 締め切りや到達不能のホストで試さなかった分は、失敗を確かめていない
+			// ので DB の利用者のまま残す。
+			for _, i := range job.indices {
+				r.ids[i] = ""
 			}
 		}
 	}
-	return ids
+}
+
+// mentionLookupHost returns the host to look a mention up under: "" for a
+// local user (no host, or this instance's own host), otherwise the mention's
+// host (or the author's host when the mention has none) normalized by
+// idnhost.Puny, i.e. lower-cased and in punycode.
+func (s *CreateService) mentionLookupHost(host string, authorHost *string) string {
+	if host == "" && authorHost != nil {
+		host = *authorHost
+	}
+	if host == "" {
+		return ""
+	}
+	// 正規形 (小文字 + punycode) で返す。本家も resolveUser の先頭で toPuny を
+	// 掛けてから引く。生の綴りのままだと `@a@Remote.example @a@remote.example` が
+	// 別の acct として数えられ (上限で弾かれる)、同じ相手へ 2 回 WebFinger を投げ、
+	// 到達不能の印も綴りごとに分かれる (#3330)。
+	host = idnhost.Puny(host)
+	if s.localHost != "" && host == s.localHost {
+		return ""
+	}
+	return host
+}
+
+// extractNoteMentions returns the mentions of the note's text, CW and poll
+// choices in this order, like upstream which parses the three and concatenates
+// the trees before extractMentions.
+func extractNoteMentions(text, cw *string, poll *PollInput) []Mention {
+	var out []Mention
+	seen := make(map[Mention]struct{})
+	add := func(src string) {
+		for _, m := range ExtractMentionStructs(src) {
+			if _, dup := seen[m]; dup {
+				continue
+			}
+			seen[m] = struct{}{}
+			out = append(out, m)
+		}
+	}
+	if text != nil {
+		add(*text)
+	}
+	if cw != nil {
+		add(*cw)
+	}
+	if poll != nil {
+		for _, c := range poll.Choices {
+			add(c)
+		}
+	}
+	return out
 }
 
 // checkMentionLimit counts the note's mention targets and compares them against
 // the author's `mentionLimit` role policy (#2321).
 //
-// upstream NoteCreateService は text 中の mention に加えて、返信先の投稿者と
-// ダイレクト投稿の宛先 (visibleUsers) も同じ `mentionedUsers` 集合に入れて
-// 数える。text に mention が 1 つも無いダイレクト投稿でも上限に当たるのは
-// このため。宛先と text mention が同じ相手なら 1 件として数える。
+// Mirrors upstream NoteCreateService.create: the count is the number of
+// distinct users in `mentionedUsers`, which holds the resolved mentions, the
+// author of the reply target (unless it is the author) and, for a specified
+// note, the recipients. A mention that does not resolve to a user is not
+// counted. The local API passes no apMentionRawCount, so the max with it is a
+// no-op here (the AP path takes it in Resolver.IngestNote).
 //
-// 解決できなかった mention は upstream では数に入らないが、mk-go は存在しない
-// ユーザーへの mention を大量に含む note を弾くため文字列のまま数える (意図的
-// な差分。upstream 自身も AP 経路では raw 数との max を取る方針 #17576)。
-func (s *CreateService) checkMentionLimit(in CreateInput, visibility model.NoteVisibility, replyTarget *model.Note, mentionUserIDs []string, mentionRawCount int) error {
+// 以前は解決できなかった mention も文字列のまま数えていたが (#3330)、本家は
+// 数えない。解決できない mention は通知も配送も Mention tag も作らないので、
+// 数えないことで弾けなくなる害は無い。
+func (s *CreateService) checkMentionLimit(in CreateInput, visibility model.NoteVisibility, replyTarget *model.Note, mentionUserIDs []string) error {
+	n := mentionTargetCount(in, visibility, replyTarget, mentionUserIDs)
+	// upstream の条件は `mentionCount > 0 && mentionCount > mentionLimit` で、
+	// limit 側にガードは無い。mk-go は `limit > 0` を条件にしていたため、
+	// ロールで mentionLimit=0 (メンション全面禁止) を設定しても判定ごと
+	// スキップされ、いくらでもメンションできてしまっていた。
+	if n > 0 && n > s.mentionLimitFor(in.User.ID) {
+		return ErrContainsTooManyMentions
+	}
+	return nil
+}
+
+// mentionTargetCount returns the number of distinct users in upstream's
+// `mentionedUsers`: the resolved mentions, the reply target's author (unless it
+// is the author) and, for a specified note, the recipients.
+func mentionTargetCount(in CreateInput, visibility model.NoteVisibility, replyTarget *model.Note, mentionUserIDs []string) int {
 	targets := make(map[string]struct{})
 	for _, id := range mentionUserIDs {
 		targets[id] = struct{}{}
 	}
-	// 未解決の mention はどれが該当するか特定できないので、件数分だけ
-	// 一意なキーを足して数に入れる。
-	for i := len(mentionUserIDs); i < mentionRawCount; i++ {
-		targets["\x00unresolved:"+strconv.Itoa(i)] = struct{}{}
-	}
-	if replyTarget != nil {
+	// 本家は自分の投稿への返信では返信先の作者を足さない
+	// (`user.id !== data.reply.userId`)。
+	if replyTarget != nil && replyTarget.UserID != in.User.ID {
 		targets[replyTarget.UserID] = struct{}{}
 	}
 	if visibility == model.NoteVisibilitySpecified {
@@ -1336,14 +1863,7 @@ func (s *CreateService) checkMentionLimit(in CreateInput, visibility model.NoteV
 			targets[id] = struct{}{}
 		}
 	}
-	// upstream の条件は `mentionCount > 0 && mentionCount > mentionLimit` で、
-	// limit 側にガードは無い。mk-go は `limit > 0` を条件にしていたため、
-	// ロールで mentionLimit=0 (メンション全面禁止) を設定しても判定ごと
-	// スキップされ、いくらでもメンションできてしまっていた。
-	if len(targets) > 0 && len(targets) > s.mentionLimitFor(in.User.ID) {
-		return ErrContainsTooManyMentions
-	}
-	return nil
+	return len(targets)
 }
 
 // mentionLimitFor resolves the effective mentionLimit for userID, falling back
@@ -1351,10 +1871,20 @@ func (s *CreateService) checkMentionLimit(in CreateInput, visibility model.NoteV
 // of an unexpected type. fail-soft にするのは、policy が引けないことを理由に
 // 投稿そのものを止めるのは過剰なため (上限は既定値で効き続ける)。
 func (s *CreateService) mentionLimitFor(userID string) int {
-	if s.rolePolicyProvider == nil || userID == "" {
+	return MentionLimitFor(s.rolePolicyProvider, userID)
+}
+
+// MentionLimitFor resolves userID's effective `mentionLimit` role policy from
+// p, falling back to DefaultMentionLimit when p is nil or the policy is absent
+// or of an unexpected type. It applies to remote users as well: upstream
+// NoteCreateService.create reads `roleService.getUserPolicies(user.id)` for
+// every author, so the base policies and the roles assigned to (or
+// conditionally matching) a remote user govern its inbound notes too.
+func MentionLimitFor(p role.PolicyProvider, userID string) int {
+	if p == nil || userID == "" {
 		return DefaultMentionLimit
 	}
-	policies := s.rolePolicyProvider.GetUserPolicies(userID)
+	policies := p.GetUserPolicies(userID)
 	if policies == nil {
 		return DefaultMentionLimit
 	}
@@ -1370,10 +1900,9 @@ func (s *CreateService) mentionLimitFor(userID string) int {
 // 直接 role.DefaultPolicies() を import すると循環依存になるため、同期を保つ
 // 意図で本家TSの現行既定値 (20) を const として直書きしている。
 //
-// local の note 作成では role policy の値が優先され、本定数は provider 未配線 /
-// policy 不在時のフォールバックとして使う (#2321)。連合の inbound 経路
-// (Resolver.IngestNote) はリモートユーザーがローカルの role を持たないため、
-// 引き続き本定数のみで判定する。
+// ローカルの note 作成でも連合の inbound 経路 (Resolver.IngestNote) でも role
+// policy の値が優先され (#2321 / #3330)、本定数は provider 未配線 / policy 不在時の
+// フォールバックとして使う。
 const DefaultMentionLimit = 20
 
 // checkFileIDs verifies all provided fileIds exist and belong to the user.

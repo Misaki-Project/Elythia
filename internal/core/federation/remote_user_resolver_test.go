@@ -2,6 +2,8 @@ package federation_test
 
 import (
 	"errors"
+	"net/url"
+	"strings"
 	"testing"
 
 	corefederation "github.com/shiroha-a/mk/internal/core/federation"
@@ -32,6 +34,25 @@ type fakeActorResolver struct {
 func (f *fakeActorResolver) ResolveActor(uri string) (*model.User, error) {
 	f.uri = uri
 	return f.user, f.err
+}
+
+func (f *fakeActorResolver) RefreshActor(uri string) (*model.User, error) {
+	f.uri = uri
+	return f.user, f.err
+}
+
+// LocalUserIDFromURI mirrors Resolver.LocalUserIDFromURI for the fixed local
+// host "local.example".
+func (f *fakeActorResolver) LocalUserIDFromURI(uri string) (string, bool) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Host != "local.example" {
+		return "", false
+	}
+	parts := strings.Split(u.Path, "/")
+	if len(parts) < 3 || parts[1] != "users" {
+		return "", true
+	}
+	return parts[2], true
 }
 
 func TestRemoteUserResolver_ResolveByUsernameHost_Success(t *testing.T) {
@@ -117,4 +138,44 @@ func TestRemoteUserResolver_ResolveByUsernameHost_LocalHostWithoutUserRepo(t *te
 	_, err := r.ResolveByUsernameHost("alice", "local.example")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "userRepo")
+}
+
+type stubRemoteUserHostBlocker struct {
+	blocked    map[string]bool
+	notAllowed map[string]bool
+}
+
+func (s stubRemoteUserHostBlocker) IsBlocked(host string) bool { return s.blocked[host] }
+func (s stubRemoteUserHostBlocker) IsAllowed(host string) bool { return !s.notAllowed[host] }
+
+// A host the instance does not federate with is skipped before the WebFinger
+// request (#3330); other hosts still go through.
+func TestRemoteUserResolver_ResolveByUsernameHost_SkipsBlockedHost(t *testing.T) {
+	host := "ok.example"
+	for _, tc := range []struct {
+		name, host string
+		wantSkip   bool
+	}{
+		{"blocked", "blocked.example", true},
+		{"not allowed", "outside.example", true},
+		{"allowed", "ok.example", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wf := &fakeWebFinger{uri: "https://ok.example/users/alice"}
+			ar := &fakeActorResolver{user: &model.User{ID: "uR", Host: &host}}
+			r := corefederation.NewRemoteUserResolver(wf, ar, testutil.NewMockUserRepository(), "local.example")
+			r.SetHostBlockChecker(stubRemoteUserHostBlocker{
+				blocked:    map[string]bool{"blocked.example": true},
+				notAllowed: map[string]bool{"outside.example": true},
+			})
+			_, err := r.ResolveByUsernameHost("alice", tc.host)
+			if tc.wantSkip {
+				require.ErrorIs(t, err, corefederation.ErrRemoteUserHostNotAllowed)
+				assert.Empty(t, wf.call.host, "WebFinger を投げない")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.host, wf.call.host)
+		})
+	}
 }

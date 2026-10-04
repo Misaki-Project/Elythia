@@ -662,6 +662,8 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	// encoding/json (fastJSONSerializer の doc 参照: goccy は #542 の panic で
 	// revert、高速 encoder 化は #1142 で見送り)。
 	e.JSONSerializer = fastJSONSerializer{}
+	// body の無い API 呼び出しを本家と同じく INVALID_PARAM にする (apiBinder 参照)。
+	e.Binder = &apiBinder{}
 
 	// trustProxyからIPExtractorを構成。詳細は buildIPExtractor のコメント。
 	// **常に設定する。** 未設定のまま残すと Echo の RealIP は XFF の最左を
@@ -743,6 +745,12 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 			"accepted", []string{middleware.COOPOff, middleware.COOPSameOriginAllowPopups, middleware.COOPSameOrigin})
 	}
 	e.Use(middleware.COOP(cfg.CrossOriginOpenerPolicy))
+
+	// 本家の requireFile endpoint (drive/files/create) は、token を読む前に
+	// multipart の file を取り出し、取れなければ本文の無い 400 を返す
+	// (ApiCallService.ts の handleMultipartRequest)。無効な token の 401 より
+	// 先に答えるため、auth.Authenticate より前に置く (#3330)。
+	e.Use(middleware.RequireMultipartFile(multipartUploadRoutes...))
 
 	// WWW-Authenticate は auth.Authenticate より外側に置く。auth は無効 token に
 	// 対して自分で 401 を書くので、内側 (api グループ) に置くと middleware まで

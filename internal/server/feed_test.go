@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/shiroha-a/mk/internal/core/ugcvisibility"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/stretchr/testify/assert"
@@ -51,7 +52,7 @@ func newFeedTestHandler(notes []*model.Note) *feedHandler {
 			return &model.UserProfile{FollowingVisibility: "public", FollowersVisibility: "public"}
 		},
 		avatarURL: func(*model.User) string { return "https://example.test/avatar.png" },
-		toHTML:    func(text string) string { return "<p>" + text + "</p>" },
+		toHTML:    func(text, _ string) string { return "<p>" + text + "</p>" },
 	}
 }
 
@@ -126,6 +127,35 @@ func TestFeed_JSON(t *testing.T) {
 	item := items[0].(map[string]any)
 	assert.Equal(t, "https://example.test/notes/n1", item["url"])
 	assert.Equal(t, "<p>hello</p>", item["content_html"])
+}
+
+// TestFeed_PassesMentionedRemoteUsers checks that the note's
+// mentionedRemoteUsers column reaches toHTML, as upstream FeedService passes
+// it to MfmService.toHtml.
+func TestFeed_PassesMentionedRemoteUsers(t *testing.T) {
+	notes := sampleFeedNotes()
+	notes[0].MentionedRemoteUsers = `[{"uri":"https://remote.example/users/1","username":"bob","host":"remote.example"}]`
+	h := newFeedTestHandler(notes)
+	var got string
+	h.toHTML = func(_, mentionedRemoteUsers string) string {
+		got = mentionedRemoteUsers
+		return ""
+	}
+	rec := doFeedReq(t, h.JSON, "alice")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, notes[0].MentionedRemoteUsers, got)
+}
+
+// TestFeedNoteHTML checks that the feed's HTML links a remote mention to the
+// url in the mentionedRemoteUsers column and an unknown one to this server.
+func TestFeedNoteHTML(t *testing.T) {
+	toHTML := feedNoteHTML("example.test")
+	got := toHTML("@bob@remote.example @carol@other.example",
+		`[{"uri":"https://remote.example/users/1","url":"https://remote.example/@bob","username":"bob","host":"remote.example"}]`)
+	assert.Equal(t,
+		`<a href="https://remote.example/@bob" class="u-url mention">@bob@remote.example</a> `+
+			`<a href="https://example.test/@carol@other.example" class="u-url mention">@carol@other.example</a>`,
+		got)
 }
 
 // 存在しないユーザーは 404。upstream も同じ。
@@ -253,4 +283,49 @@ func TestFeed_NormalUserStillServed(t *testing.T) {
 		assert.Equal(t, http.StatusOK, rec.Code)
 		assert.Contains(t, rec.Body.String(), "hello")
 	}
+}
+
+// upstream getFeed と同じく、ugcVisibilityForVisitor が 'none' のときは feed を
+// 返さない。'local' / 'all' ではローカル利用者の feed をそのまま返す。
+// TryServe (実際のルーティング経路) で 3 形式すべてを見る。
+func TestFeed_UGCVisibilityForVisitor(t *testing.T) {
+	e := echo.New()
+	for _, tc := range []struct {
+		policy string
+		want   int
+	}{
+		{ugcvisibility.None, http.StatusNotFound},
+		{ugcvisibility.Local, http.StatusOK},
+		{ugcvisibility.All, http.StatusOK},
+	} {
+		for _, acct := range []string{"alice.rss", "alice.atom", "alice.json"} {
+			h := newFeedTestHandler(sampleFeedNotes())
+			policy := tc.policy
+			h.ugcVisibility = func() string { return policy }
+			rec := httptest.NewRecorder()
+			c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
+			handled, err := h.TryServe(c, acct)
+			require.True(t, handled, "%s/%s", tc.policy, acct)
+			code := rec.Code
+			var he *echo.HTTPError
+			if asHTTPError(err, &he) {
+				code = he.Code
+			} else {
+				require.NoError(t, err, "%s/%s", tc.policy, acct)
+			}
+			assert.Equal(t, tc.want, code, "%s/%s", tc.policy, acct)
+			if tc.want == http.StatusNotFound {
+				assert.NotContains(t, rec.Body.String(), "hello", "%s/%s", tc.policy, acct)
+			} else {
+				assert.Contains(t, rec.Body.String(), "hello", "%s/%s", tc.policy, acct)
+			}
+		}
+	}
+}
+
+// HasUGCVisibility backs the feed.ugcVisibility startup wiring check: an
+// unwired lookup silently falls back to `local`, so `none` would not 404.
+func TestFeedHandler_HasUGCVisibility(t *testing.T) {
+	assert.False(t, (&feedHandler{}).HasUGCVisibility(), "unwired lookup must be reported")
+	assert.True(t, (&feedHandler{ugcVisibility: func() string { return "none" }}).HasUGCVisibility())
 }

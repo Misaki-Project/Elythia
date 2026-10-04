@@ -256,6 +256,7 @@ func TestAssertUserColumns_RejectsOversizedIdentity(t *testing.T) {
 		{"inbox", 512, func(u *model.User, v *string) { u.Inbox = v }},
 		{"sharedInbox", 512, func(u *model.User, v *string) { u.SharedInbox = v }},
 		{"featured", 512, func(u *model.User, v *string) { u.Featured = v }},
+		{"followersUri", 512, func(u *model.User, v *string) { u.FollowersURI = v }},
 		{"movedToUri", 512, func(u *model.User, v *string) { u.MovedToURI = v }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -281,4 +282,21 @@ func TestAssertUserColumns_RejectsOversizedIdentity(t *testing.T) {
 	nul := base()
 	nul.AlsoKnownAs = ptr("https://a/\x00")
 	assert.Error(t, assertUserColumns(nul), "alsoKnownAs の NUL を通している")
+}
+
+// The mock's IncrementCount stops at 0 like the real repository (#3291), so
+// tests that remove a clip from a note whose counter is 0 see the same value.
+func TestMockNoteRepository_IncrementCountFloorsAtZero(t *testing.T) {
+	m := NewMockNoteRepository()
+	m.Notes["n1"] = &model.Note{ID: "n1"}
+	for _, col := range []string{"clippedCount", "renoteCount", "repliesCount"} {
+		require.NoError(t, m.IncrementCount("n1", col, -1))
+	}
+	assert.EqualValues(t, 0, m.Notes["n1"].ClippedCount)
+	assert.EqualValues(t, 0, m.Notes["n1"].RenoteCount)
+	assert.EqualValues(t, 0, m.Notes["n1"].RepliesCount)
+
+	require.NoError(t, m.IncrementCount("n1", "clippedCount", 2))
+	require.NoError(t, m.IncrementCount("n1", "clippedCount", -1))
+	assert.EqualValues(t, 1, m.Notes["n1"].ClippedCount)
 }

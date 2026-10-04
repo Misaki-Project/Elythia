@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/shiroha-a/mk/internal/activitypub/mfm"
+	corenote "github.com/shiroha-a/mk/internal/core/note"
+	"github.com/shiroha-a/mk/internal/core/ugcvisibility"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
 )
@@ -238,9 +241,17 @@ type feedHandler struct {
 	// parseTime は note.id から投稿日時を得る。upstream も
 	// idService.parse(note.id).date を使っており、note 行に createdAt は無い。
 	parseTime func(id string) (time.Time, error)
-	profiles  func(userID string) *model.UserProfile
-	avatarURL func(u *model.User) string
-	toHTML    func(text string) string
+	// ugcVisibility は meta.ugcVisibilityForVisitor の live lookup。nil なら
+	// metaUGCVisibility の既定 ('local') として扱う。
+	ugcVisibility func() string
+	profiles      func(userID string) *model.UserProfile
+	avatarURL     func(u *model.User) string
+	// toHTML は note の本文と mentionedRemoteUsers 列から HTML を作る。本家
+	// FeedService も toHtml に列を渡すので、リモートのメンションはその利用者の
+	// url へのリンクになる。
+	toHTML func(text, mentionedRemoteUsers string) string
+	// now は時間窓の判定に使う現在時刻。nil なら time.Now (テストで固定する)。
+	now func() time.Time
 }
 
 // serve builds the feed for the requested user and hands it to render.
@@ -275,6 +286,12 @@ func (h *feedHandler) serve(c echo.Context, username string, render func(*feedDa
 	if u.IsSuspended || u.RequireSigninToViewContents {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
+	// upstream getFeed は ugcVisibilityForVisitor が 'none' なら feed を返さない
+	// (404)。'local' で remote 利用者を外す条件は、この feed がローカル利用者
+	// だけを引く (feedUserResolver) ので常に満たされない。
+	if ugcvisibility.HidesAll(h.ugcVisibilityNow()) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
 
 	data := h.build(u)
 	out, err := render(data)
@@ -282,6 +299,19 @@ func (h *feedHandler) serve(c echo.Context, username string, render func(*feedDa
 		return echo.NewHTTPError(http.StatusInternalServerError)
 	}
 	return c.Blob(http.StatusOK, contentType, out)
+}
+
+// HasUGCVisibility reports whether the meta.ugcVisibilityForVisitor lookup
+// was wired. 未配線だと ugcVisibilityNow が既定の `local` に倒れ、`none` に
+// しても feed が 404 にならないので、起動時検査で拾う。
+func (h *feedHandler) HasUGCVisibility() bool { return h.ugcVisibility != nil }
+
+// ugcVisibilityNow resolves the current meta.ugcVisibilityForVisitor.
+func (h *feedHandler) ugcVisibilityNow() string {
+	if h.ugcVisibility == nil {
+		return defaultUGCVisibilityForVisitor
+	}
+	return h.ugcVisibility()
 }
 
 func (h *feedHandler) build(u *model.User) *feedData {
@@ -307,21 +337,41 @@ func (h *feedHandler) build(u *model.User) *feedData {
 	if err != nil {
 		notes = nil
 	}
+	nowMs := time.Now().UnixMilli()
+	if h.now != nil {
+		nowMs = h.now().UnixMilli()
+	}
 	for _, n := range notes {
 		e := feedEntry{
 			Title: "New note by " + name,
 			Link:  h.baseURL + "/notes/" + n.ID,
 		}
+		// 作成時刻が分からないときは epoch 0 扱いにし、期間設定のゲートを
+		// 「隠す」側に倒す (notehide.parseCreatedAtMs と同じ方針)。
+		var createdAtMs int64
 		if h.parseTime != nil {
 			if t, err := h.parseTime(n.ID); err == nil {
 				e.Date = t
+				createdAtMs = t.UnixMilli()
 			}
+		}
+		// upstream 2026.10.0 FeedService は 20 件取った後で
+		// makeNotesHiddenBefore / makeNotesFollowersOnlyBefore に当たる note を
+		// 落とす。フィードは常に匿名なので、followers へ降格した note も
+		// 出してはいけない。
+		//
+		// LIMIT の後で落としても 1 ページは欠けない。どちらの設定も「ある時刻
+		// より古い note」を隠すもので、一覧は id (= 作成時刻) の新しい順なので、
+		// 隠れる note は必ず末尾に固まり、21 件目以降に見せてよい note は無い。
+		if corenote.ShouldHideNoteByTime(u.MakeNotesHiddenBefore, createdAtMs, nowMs) ||
+			corenote.ShouldHideNoteByTime(u.MakeNotesFollowersOnlyBefore, createdAtMs, nowMs) {
+			continue
 		}
 		if n.CW != nil {
 			e.Summary = *n.CW
 		}
 		if n.Text != nil && *n.Text != "" && h.toHTML != nil {
-			e.Content = h.toHTML(*n.Text)
+			e.Content = h.toHTML(*n.Text, n.MentionedRemoteUsers)
 		}
 		data.Entries = append(data.Entries, e)
 	}
@@ -397,4 +447,13 @@ type feedUserResolver struct {
 
 func (r feedUserResolver) FindLocalByUsername(username string) (*model.User, error) {
 	return r.repo.FindByUsernameLower(strings.ToLower(username), nil)
+}
+
+// feedNoteHTML returns the feedHandler.toHTML that renders a note's text with
+// its mentionedRemoteUsers column, like upstream FeedService passes
+// JSON.parse(note.mentionedRemoteUsers) to MfmService.toHtml.
+func feedNoteHTML(host string) func(text, mentionedRemoteUsers string) string {
+	return func(text, mentionedRemoteUsers string) string {
+		return mfm.ToHTMLWithMentions(mfm.Parse(text), host, mfm.ParseMentionedRemoteUsers(mentionedRemoteUsers))
+	}
 }

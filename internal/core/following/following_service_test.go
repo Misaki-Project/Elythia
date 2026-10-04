@@ -704,26 +704,27 @@ func TestCancelRequest_InvokesUnfollowHook(t *testing.T) {
 	assert.Equal(t, []string{"alice->bob"}, fed.unfollowed)
 }
 
-func TestCancelRequest_PublishesUnfollowEvent(t *testing.T) {
-	// frontend MkFollowButton は main channel の unfollow event を受けて
-	// ボタンを「フォロー」表示にリセットする。CancelRequest でも publish する
-	// ことでリロードなしの UI 更新を実現する。
+func TestCancelRequest_PublishesOnlyMeUpdated(t *testing.T) {
+	// 本家 cancelFollowRequest は followee に meUpdated を流すだけで、follower に
+	// unfollow も Webhook も出さない (フォローボタンは API の応答で戻す)。
 	svc, userRepo, _, _ := newSvc(t)
 	addUser(t, userRepo, "alice", false)
 	addUser(t, userRepo, "bob", true)
 	pub := &stubMainStreamPublisher{}
 	svc.SetMainStreamPublisher(pub)
+	me := &recordingMeUpdated{}
+	svc.SetMeUpdatedPublisher(me)
+	wh := &recordingWebhookHook{}
+	svc.SetWebhookHook(wh)
 	_, err := svc.Follow("alice", "bob", following.FollowOptions{})
 	require.NoError(t, err)
-	// Follow() 内の receiveFollowRequest は followee (bob) 宛。cancel 分を
-	// 観察するためリセット。
 	pub.calls = nil
+	me.users = nil
 
 	require.NoError(t, svc.CancelRequest("alice", "bob"))
-	require.Len(t, pub.calls, 1)
-	assert.Equal(t, "alice", pub.calls[0].userID)
-	assert.Equal(t, "unfollow", pub.calls[0].eventType)
-	assertFollowStreamBody(t, pub.calls[0].body, "bob", false, false)
+	assert.Empty(t, pub.calls, "follower に unfollow を流さない")
+	assert.Equal(t, []string{"bob"}, me.users, "followee に meUpdated を流す")
+	assert.Zero(t, wh.unfollows, "Webhook の unfollow を出さない")
 }
 
 // selectiveFindFailRepo makes FindByPair fail for a single pair so error
@@ -756,7 +757,7 @@ func (r *followerLookupFailRepo) FindByID(id string) (*model.User, error) {
 
 func TestCancelFollowRequestsBetween_NoRequestsIsNoop(t *testing.T) {
 	svc, _, _, _ := newSvc(t)
-	require.NoError(t, svc.CancelFollowRequestsBetween("alice", "bob"))
+	require.NoError(t, svc.CancelFollowRequestsBetween("alice", "bob", false))
 }
 
 func TestCancelFollowRequestsBetween_LocalFollowerUsesCancelPath(t *testing.T) {
@@ -770,7 +771,7 @@ func TestCancelFollowRequestsBetween_LocalFollowerUsesCancelPath(t *testing.T) {
 	fed := &stubFederationHook{}
 	svc.SetFederationHook(fed)
 
-	require.NoError(t, svc.CancelFollowRequestsBetween("bob", "alice"))
+	require.NoError(t, svc.CancelFollowRequestsBetween("bob", "alice", false))
 	assert.Empty(t, frRepo.Requests)
 	assert.Empty(t, hook.rejects, "local follower の取り消しは Reject 通知の掃除を伴わない")
 	assert.Equal(t, []string{"alice->bob"}, fed.unfollowed, "CancelRequest 経路は unfollow hook を呼ぶ")
@@ -786,7 +787,7 @@ func TestCancelFollowRequestsBetween_RemoteFollowerUsesRejectPath(t *testing.T) 
 	hook := &recordingHook{}
 	svc.SetNotificationHook(hook)
 
-	require.NoError(t, svc.CancelFollowRequestsBetween("bob", "remote1"))
+	require.NoError(t, svc.CancelFollowRequestsBetween("bob", "remote1", false))
 	assert.Empty(t, frRepo.Requests)
 	assert.Equal(t, []string{"remote1->bob"}, hook.rejects, "remote follower の取り消しは followee 側の通知を掃除する")
 }
@@ -798,7 +799,7 @@ func TestCancelFollowRequestsBetween_BothDirections(t *testing.T) {
 	require.NoError(t, frRepo.Create(&model.FollowRequest{ID: "r1", FollowerID: "alice", FolloweeID: "bob"}))
 	require.NoError(t, frRepo.Create(&model.FollowRequest{ID: "r2", FollowerID: "bob", FolloweeID: "alice"}))
 
-	require.NoError(t, svc.CancelFollowRequestsBetween("alice", "bob"))
+	require.NoError(t, svc.CancelFollowRequestsBetween("alice", "bob", false))
 	assert.Empty(t, frRepo.Requests, "双方向の申請が消える")
 }
 
@@ -813,7 +814,7 @@ func TestCancelFollowRequestsBetween_ContinuesAfterError(t *testing.T) {
 	require.NoError(t, frRepo.Create(&model.FollowRequest{ID: "r2", FollowerID: "bob", FolloweeID: "alice"}))
 	svc := newSvcWith(userRepo, testutil.NewMockFollowingRepository(), frRepo)
 
-	err := svc.CancelFollowRequestsBetween("alice", "bob")
+	err := svc.CancelFollowRequestsBetween("alice", "bob", false)
 	assert.ErrorIs(t, err, errStub, "失敗した direction の error を返す")
 	assert.Empty(t, frRepo.Requests, "1 方向が失敗してももう片方は処理する")
 }
@@ -828,7 +829,7 @@ func TestCancelFollowRequestsBetween_FollowerLookupFailureStillDeletes(t *testin
 	require.NoError(t, frRepo.Create(&model.FollowRequest{ID: "r1", FollowerID: "alice", FolloweeID: "bob"}))
 	svc := newSvcWith(userRepo, testutil.NewMockFollowingRepository(), frRepo)
 
-	require.NoError(t, svc.CancelFollowRequestsBetween("bob", "alice"))
+	require.NoError(t, svc.CancelFollowRequestsBetween("bob", "alice", false))
 	assert.Empty(t, frRepo.Requests, "lookup 失敗でも申請行は消える")
 }
 
@@ -844,7 +845,7 @@ func TestCancelFollowRequestsBetween_CancelRequestErrorPropagates(t *testing.T) 
 	require.NoError(t, frRepo.Create(&model.FollowRequest{ID: "r1", FollowerID: "alice", FolloweeID: "bob"}))
 	svc := newSvcWith(userRepo, testutil.NewMockFollowingRepository(), frRepo)
 
-	err := svc.CancelFollowRequestsBetween("alice", "bob")
+	err := svc.CancelFollowRequestsBetween("alice", "bob", false)
 	assert.ErrorIs(t, err, errStub, "削除失敗は握り潰さない")
 }
 
@@ -861,7 +862,7 @@ func TestCancelFollowRequestsBetween_RejectRequestErrorPropagates(t *testing.T) 
 	require.NoError(t, frRepo.Create(&model.FollowRequest{ID: "r1", FollowerID: "remote1", FolloweeID: "bob"}))
 	svc := newSvcWith(userRepo, testutil.NewMockFollowingRepository(), frRepo)
 
-	err := svc.CancelFollowRequestsBetween("bob", "remote1")
+	err := svc.CancelFollowRequestsBetween("bob", "remote1", false)
 	assert.ErrorIs(t, err, errStub, "削除失敗は握り潰さない")
 }
 
@@ -1366,8 +1367,9 @@ func TestService_FederationHook_OnAccept_UserLookupFailure(t *testing.T) {
 
 // --- Instance counter incremental hook (#596) ---
 
-// remote follower → local followee: instance(remote).followersCount += 1
-func TestFollow_RemoteFollower_BumpsInstanceFollowers(t *testing.T) {
+// remote follower → local followee: instance(remote).followingCount += 1
+// (本家 insertFollowingDoc の isRemoteUser(follower) 分岐、#3330)。
+func TestFollow_RemoteFollower_BumpsInstanceFollowing(t *testing.T) {
 	svc, userRepo, _, _ := newSvc(t)
 	instanceRepo := testutil.NewMockInstanceRepository()
 	host := "remote.example"
@@ -1381,12 +1383,13 @@ func TestFollow_RemoteFollower_BumpsInstanceFollowers(t *testing.T) {
 	_, err := svc.Follow("remote_user", "alice_local", following.FollowOptions{})
 	require.NoError(t, err)
 
-	assert.Equal(t, 1, instanceRepo.Instances[host].FollowersCount)
-	assert.Equal(t, 0, instanceRepo.Instances[host].FollowingCount)
+	assert.Equal(t, 0, instanceRepo.Instances[host].FollowersCount)
+	assert.Equal(t, 1, instanceRepo.Instances[host].FollowingCount)
 }
 
-// local follower → remote followee: instance(remote).followingCount += 1
-func TestFollow_LocalFollowsRemote_BumpsInstanceFollowing(t *testing.T) {
+// local follower → remote followee: instance(remote).followersCount += 1
+// (本家 insertFollowingDoc の isRemoteUser(followee) 分岐、#3330)。
+func TestFollow_LocalFollowsRemote_BumpsInstanceFollowers(t *testing.T) {
 	svc, userRepo, _, _ := newSvc(t)
 	instanceRepo := testutil.NewMockInstanceRepository()
 	host := "remote.example"
@@ -1400,8 +1403,8 @@ func TestFollow_LocalFollowsRemote_BumpsInstanceFollowing(t *testing.T) {
 	_, err := svc.Follow("alice_local", "remote_user", following.FollowOptions{})
 	require.NoError(t, err)
 
-	assert.Equal(t, 0, instanceRepo.Instances[host].FollowersCount)
-	assert.Equal(t, 1, instanceRepo.Instances[host].FollowingCount)
+	assert.Equal(t, 1, instanceRepo.Instances[host].FollowersCount)
+	assert.Equal(t, 0, instanceRepo.Instances[host].FollowingCount)
 }
 
 // Unfollow で counter -1
@@ -1418,10 +1421,18 @@ func TestUnfollow_DecrementsInstanceCounters(t *testing.T) {
 
 	_, err := svc.Follow("remote_user", "alice_local", following.FollowOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, 6, instanceRepo.Instances[host].FollowersCount)
+	assert.Equal(t, 4, instanceRepo.Instances[host].FollowingCount)
 
 	require.NoError(t, svc.Unfollow("remote_user", "alice_local"))
+	assert.Equal(t, 3, instanceRepo.Instances[host].FollowingCount)
+	assert.Equal(t, 5, instanceRepo.Instances[host].FollowersCount, "remote → local は followersCount を触らない")
+
+	_, err = svc.Follow("alice_local", "remote_user", following.FollowOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 6, instanceRepo.Instances[host].FollowersCount)
+	require.NoError(t, svc.Unfollow("alice_local", "remote_user"))
 	assert.Equal(t, 5, instanceRepo.Instances[host].FollowersCount)
+	assert.Equal(t, 3, instanceRepo.Instances[host].FollowingCount, "local → remote は followingCount を触らない")
 }
 
 // Local→local follow ではどの instance counter も動かない (host=nil)
@@ -1454,8 +1465,81 @@ func TestAcceptRequest_BumpsInstanceCounters(t *testing.T) {
 	}
 
 	require.NoError(t, svc.AcceptRequest("alice_local", "remote_user"))
-	// follower=remote → followersCount on remote host += 1
-	assert.Equal(t, 1, instanceRepo.Instances[host].FollowersCount)
+	// follower=remote → followingCount on remote host += 1
+	assert.Equal(t, 1, instanceRepo.Instances[host].FollowingCount)
+	assert.Equal(t, 0, instanceRepo.Instances[host].FollowersCount)
+}
+
+// TestFollow_InstanceStatsGateOff_LeavesCounters pins the upstream
+// meta.enableStatsForFederatedInstances gate: when it is false, follow and
+// unfollow in either direction do not touch the instance counters.
+func TestFollow_InstanceStatsGateOff_LeavesCounters(t *testing.T) {
+	svc, userRepo, _, _ := newSvc(t)
+	instanceRepo := testutil.NewMockInstanceRepository()
+	host := "remote.example"
+	instanceRepo.Instances[host] = &model.Instance{Host: host, FollowersCount: 5, FollowingCount: 3}
+	svc.SetInstanceRepo(instanceRepo)
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{EnableStatsForFederatedInstances: false}
+	svc.SetInstanceStatsGate(following.MetaInstanceStatsGate(metaRepo))
+
+	addUser(t, userRepo, "alice_local", false)
+	remote := addUser(t, userRepo, "remote_user", false)
+	remote.Host = &host
+
+	_, err := svc.Follow("remote_user", "alice_local", following.FollowOptions{})
+	require.NoError(t, err)
+	_, err = svc.Follow("alice_local", "remote_user", following.FollowOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 5, instanceRepo.Instances[host].FollowersCount)
+	assert.Equal(t, 3, instanceRepo.Instances[host].FollowingCount)
+
+	require.NoError(t, svc.Unfollow("remote_user", "alice_local"))
+	assert.Equal(t, 3, instanceRepo.Instances[host].FollowingCount)
+
+	// 運営者が有効に戻したら次の操作から集計する (meta を毎回読む)。
+	metaRepo.Meta.EnableStatsForFederatedInstances = true
+	require.NoError(t, svc.Unfollow("alice_local", "remote_user"))
+	assert.Equal(t, 4, instanceRepo.Instances[host].FollowersCount)
+}
+
+// TestFollow_RemoteRemote_DoesNotTouchInstance pins that only follows with a
+// local side are counted, matching upstream's if / else if branches.
+func TestFollow_RemoteRemote_DoesNotTouchInstance(t *testing.T) {
+	svc, userRepo, _, _ := newSvc(t)
+	instanceRepo := testutil.NewMockInstanceRepository()
+	h1, h2 := "one.example", "two.example"
+	instanceRepo.Instances[h1] = &model.Instance{Host: h1}
+	instanceRepo.Instances[h2] = &model.Instance{Host: h2}
+	svc.SetInstanceRepo(instanceRepo)
+
+	a := addUser(t, userRepo, "remote_a", false)
+	a.Host = &h1
+	b := addUser(t, userRepo, "remote_b", false)
+	b.Host = &h2
+
+	_, err := svc.Follow("remote_a", "remote_b", following.FollowOptions{})
+	require.NoError(t, err)
+	for _, h := range []string{h1, h2} {
+		assert.Zero(t, instanceRepo.Instances[h].FollowersCount, h)
+		assert.Zero(t, instanceRepo.Instances[h].FollowingCount, h)
+	}
+}
+
+// TestMetaInstanceStatsGate covers the gate's fallbacks: a missing repository
+// or an unreadable meta reports enabled (the upstream default).
+func TestMetaInstanceStatsGate(t *testing.T) {
+	assert.True(t, following.MetaInstanceStatsGate(nil)())
+
+	metaRepo := testutil.NewMockMetaRepository()
+	assert.True(t, following.MetaInstanceStatsGate(metaRepo)(), "no meta row")
+	metaRepo.Meta = &model.Meta{EnableStatsForFederatedInstances: true}
+	assert.True(t, following.MetaInstanceStatsGate(metaRepo)())
+	metaRepo.Meta.EnableStatsForFederatedInstances = false
+	assert.False(t, following.MetaInstanceStatsGate(metaRepo)())
+
+	metaRepo.FetchErr = errors.New("db down")
+	assert.True(t, following.MetaInstanceStatsGate(metaRepo)())
 }
 
 // SetInstanceRepo 未配線でも従来 path は動く (regression 防止)
@@ -1468,10 +1552,10 @@ func TestFollow_NoInstanceRepoStillWorks(t *testing.T) {
 	assert.Len(t, fRepo.Followings, 1)
 }
 
-// #2106 N11: UnfollowSilent は Undo(Follow) を逆配送しない (federationHook 不発火) が、
+// #2106 N11: RemoteReject は Undo(Follow) を逆配送しない (federationHook 不発火) が、
 // main stream の unfollow event は upstream remoteReject 同様に publish する。
-func TestUnfollowSilent_DoesNotFederateButPublishes(t *testing.T) {
-	svc, userRepo, _, _ := newSvc(t)
+func TestRemoteReject_DoesNotFederateButPublishes(t *testing.T) {
+	svc, userRepo, fRepo, _ := newSvc(t)
 	addUser(t, userRepo, "alice", false)
 	addUser(t, userRepo, "bob", false)
 	_, err := svc.Follow("alice", "bob", following.FollowOptions{})
@@ -1483,8 +1567,9 @@ func TestUnfollowSilent_DoesNotFederateButPublishes(t *testing.T) {
 	pub := &stubMainStreamPublisher{}
 	svc.SetMainStreamPublisher(pub)
 
-	require.NoError(t, svc.UnfollowSilent("alice", "bob"))
-	assert.Empty(t, fed.unfollowed, "UnfollowSilent は Undo(Follow) を逆配送しない")
+	require.NoError(t, svc.RemoteReject("alice", "bob"))
+	assert.Empty(t, fed.unfollowed, "RemoteReject は Undo(Follow) を逆配送しない")
+	assert.Empty(t, fRepo.Followings)
 	require.Len(t, pub.calls, 1, "main stream の unfollow event は publish する")
 	assert.Equal(t, "unfollow", pub.calls[0].eventType)
 }
@@ -1578,16 +1663,20 @@ func TestFollow_CarefulBot_NonBotFollowerFollowsDirectly(t *testing.T) {
 //
 // アカウント移行時に PostMoveProcess が「unfollow せずカウントだけ落とす」調整を
 // 先に済ませているので、ここで無条件に減らすと二重に減る。
+//
+// チャートも同じ分岐の中でだけ更新する (本家は移行済みの側を "TODO: adjust
+// charts" のまま触らない)。
 func TestUnfollow_SkipsCountAdjustmentWhenMoved(t *testing.T) {
 	cases := []struct {
 		name         string
 		movedUser    string // movedToUri を立てるユーザー ("" ならどちらも未移行)
 		wantFollow   int    // unfollow 後の alice.FollowingCount
 		wantFollower int    // unfollow 後の bob.FollowersCount
+		wantCharts   int    // chartHook.OnUnfollow の呼び出し回数
 	}{
-		{"未移行なら通常どおり減らす", "", 0, 0},
-		{"follower が移行済みなら触らない", "alice", 1, 1},
-		{"followee が移行済みなら触らない", "bob", 1, 1},
+		{"未移行なら通常どおり減らす", "", 0, 0, 1},
+		{"follower が移行済みなら触らない", "alice", 1, 1, 0},
+		{"followee が移行済みなら触らない", "bob", 1, 1, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1598,6 +1687,8 @@ func TestUnfollow_SkipsCountAdjustmentWhenMoved(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 1, userRepo.Users["alice"].FollowingCount)
 			require.Equal(t, 1, userRepo.Users["bob"].FollowersCount)
+			chart := &recordingChartHook{}
+			svc.SetChartHook(chart)
 
 			if tc.movedUser != "" {
 				moved := "https://elsewhere.example/users/x"
@@ -1610,6 +1701,7 @@ func TestUnfollow_SkipsCountAdjustmentWhenMoved(t *testing.T) {
 			assert.Empty(t, fRepo.Followings, "the following row is always removed")
 			assert.Equal(t, tc.wantFollow, userRepo.Users["alice"].FollowingCount)
 			assert.Equal(t, tc.wantFollower, userRepo.Users["bob"].FollowersCount)
+			assert.Len(t, chart.unfollows, tc.wantCharts)
 		})
 	}
 }
@@ -1655,4 +1747,61 @@ func TestUnfollowQuiet_NoDeliveryNoNotification(t *testing.T) {
 	assert.Equal(t, 0, userRepo.Users["alice"].FollowingCount)
 	assert.Equal(t, 0, userRepo.Users["bob"].FollowersCount)
 	assert.ErrorIs(t, svc.UnfollowQuiet("alice", "bob"), following.ErrNotFollowing)
+}
+
+// 移行済みアカウントが絡むフォローでは、行は作るがカウント・instance の集計列・
+// chart を動かさない (#3330)。本家 insertFollowingDoc の
+// `if (!followeeUser.movedToUri && !followerUser.movedToUri)` と同じガードで、
+// Follow も AcceptRequest (承認) も insertFollowingDoc を通る。unfollow 側の
+// ガード (TestUnfollow_SkipsCountAdjustmentWhenMoved) と対になる。
+func TestFollow_SkipsCountsWhenMoved(t *testing.T) {
+	host := "remote.example"
+	const movedURI = "https://elsewhere.example/users/x"
+	cases := []struct {
+		name      string
+		movedUser string // movedToUri を立てるユーザー ("" ならどちらも未移行)
+		movedTo   string // 立てる movedToUri の値 (空文字は未移行とみなす)
+		accept    bool   // true なら承認制アカウントへの申請を承認する経路
+		want      int    // remote.FollowingCount / alice.FollowersCount / instance.FollowingCount
+	}{
+		{name: "follow: neither moved", want: 1},
+		{name: "follow: empty movedToUri is not moved", movedUser: "alice", movedTo: "", want: 1},
+		{name: "follow: follower moved", movedUser: "remote", movedTo: movedURI, want: 0},
+		{name: "follow: followee moved", movedUser: "alice", movedTo: movedURI, want: 0},
+		{name: "accept: neither moved", accept: true, want: 1},
+		{name: "accept: follower moved", movedUser: "remote", movedTo: movedURI, accept: true, want: 0},
+		{name: "accept: followee moved", movedUser: "alice", movedTo: movedURI, accept: true, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, userRepo, fRepo, _ := newSvc(t)
+			instanceRepo := testutil.NewMockInstanceRepository()
+			instanceRepo.Instances[host] = &model.Instance{Host: host}
+			svc.SetInstanceRepo(instanceRepo)
+			chart := &recordingChartHook{}
+			svc.SetChartHook(chart)
+
+			addUser(t, userRepo, "alice", tc.accept)
+			remote := addUser(t, userRepo, "remote", false)
+			remote.Host = &host
+			if tc.movedUser != "" {
+				moved := tc.movedTo
+				userRepo.Users[tc.movedUser].MovedToURI = &moved
+			}
+
+			res, err := svc.Follow("remote", "alice", following.FollowOptions{})
+			require.NoError(t, err)
+			if tc.accept {
+				require.NotNil(t, res.Request)
+				require.NoError(t, svc.AcceptRequest("alice", "remote"))
+			}
+
+			// 行はガードに関係なく作る。
+			assert.Len(t, fRepo.Followings, 1, "the following row is always created")
+			assert.Equal(t, tc.want, userRepo.Users["remote"].FollowingCount)
+			assert.Equal(t, tc.want, userRepo.Users["alice"].FollowersCount)
+			assert.Equal(t, tc.want, instanceRepo.Instances[host].FollowingCount)
+			assert.Len(t, chart.follows, tc.want)
+		})
+	}
 }

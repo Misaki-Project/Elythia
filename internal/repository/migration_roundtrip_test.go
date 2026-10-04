@@ -101,7 +101,7 @@ func TestMigrations_Fork98UpgradeAppliesRegistrationClosed(t *testing.T) {
 	require.NoError(t, runMigrate(m.Up))
 	version, dirty, err := m.Version()
 	require.NoError(t, err)
-	require.Equal(t, uint(107), version)
+	require.Equal(t, maxMigrationVersion(t), version)
 	require.False(t, dirty)
 	require.EqualValues(t, 1, columnCount(), "上流の登録受付設定が98からの更新で欠落している")
 	var closed bool

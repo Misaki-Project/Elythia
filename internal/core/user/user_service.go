@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shiroha-a/mk/internal/activitypub/mfm"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/hashtag"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -68,6 +69,13 @@ type RemoteUserResolver interface {
 	ResolveByUsernameHost(username, host string) (*model.User, error)
 }
 
+// RemoteUserResyncer is implemented by a RemoteUserResolver that can re-sync a
+// stored remote user whose data is stale (upstream RemoteUserResolveService.
+// resolveUser re-syncs a user found in the DB after 24 hours).
+type RemoteUserResyncer interface {
+	ResyncIfStale(u *model.User) (*model.User, error)
+}
+
 // Service provides user-related business logic.
 type Service struct {
 	userRepo            repository.UserRepository
@@ -83,7 +91,7 @@ type Service struct {
 	// rolePolicyProvider は PinNote の上限を role policy `pinLimit` で
 	// override するのに使う (#1029)。nil 時は MaxPinnedNotes 定数 fallback
 	// (= 旧挙動互換)。実装は core/role.Service。
-	rolePolicyProvider RolePolicyProvider
+	rolePolicyProvider role.PolicyProvider
 	// selfHostname は SearchByUsernameAndHost で「host==self-hostname → local
 	// 限定」を判定するために保持する (upstream UserSearchService と互換、
 	// #1064)。空文字なら remap を skip して "." 一致のみ local 限定にする。
@@ -103,17 +111,10 @@ type UsertagHook interface {
 	UpdateUsertags(userID string, isLocal bool, oldTags, newTags []string)
 }
 
-// RolePolicyProvider abstracts role-policy lookup used to override default
-// limits with admin-authored values. 実装は core/role.Service の
-// GetUserPolicies (#1029)。
-type RolePolicyProvider interface {
-	GetUserPolicies(userID string) map[string]any
-}
-
-// SetRolePolicyProvider wires a RolePolicyProvider so the user service can
+// SetRolePolicyProvider wires a role policy source so the user service can
 // honour role-policy overrides for limits like pinLimit (#1029). nil 時は
 // MaxPinnedNotes 定数 fallback の旧挙動を維持する。
-func (s *Service) SetRolePolicyProvider(p RolePolicyProvider) {
+func (s *Service) SetRolePolicyProvider(p role.PolicyProvider) {
 	s.rolePolicyProvider = p
 }
 
@@ -263,6 +264,21 @@ func (s *Service) ShowManyByIDs(ids []string) ([]*UserWithProfile, error) {
 // resolver 未設定の場合は ErrUserNotFound を返し (後方互換)、設定済みで解決
 // に失敗した場合は ErrFailedToResolveRemoteUser を返す。
 func (s *Service) ShowByUsername(username string, host *string) (*UserWithProfile, error) {
+	return s.showByUsername(username, host, false)
+}
+
+// ResolveByUsername is ShowByUsername for users/show, which upstream answers
+// with RemoteUserResolveService.resolveUser whenever a host is given: besides
+// fetching an unknown remote user, a stored remote user whose lastFetchedAt is
+// older than 24 hours is re-synced (WebFinger + actor fetch) before it is
+// returned, and a failed re-sync is ErrFailedToResolveRemoteUser.
+//
+// users/followers / users/following は本家が DB だけを引くので、こちらを使わない。
+func (s *Service) ResolveByUsername(username string, host *string) (*UserWithProfile, error) {
+	return s.showByUsername(username, host, true)
+}
+
+func (s *Service) showByUsername(username string, host *string, resync bool) (*UserWithProfile, error) {
 	// **正規化は repository に任せる。** `FindByUsernameLower` が引く直前に
 	// `idnhost.Puny` を掛けるので (#2704)、ここで掛けると二度手間になるだけ。
 	//
@@ -274,6 +290,17 @@ func (s *Service) ShowByUsername(username string, host *string) (*UserWithProfil
 	// (経路ごとの症状は docs/deployment.md)。
 	u, err := s.userRepo.FindByUsernameLower(username, host)
 	if err == nil {
+		// 本家 users/show は host 付きなら毎回 resolveUser を通り、保存から 24 時間を
+		// 過ぎたリモートの利用者は WebFinger から取り直す (待ってから返す)。
+		if resync && host != nil && *host != "" {
+			if rs, ok := s.remoteResolver.(RemoteUserResyncer); ok {
+				synced, rerr := rs.ResyncIfStale(u)
+				if rerr != nil || synced == nil {
+					return nil, ErrFailedToResolveRemoteUser
+				}
+				u = synced
+			}
+		}
 		profile, _ := s.userRepo.FindProfileByUserID(u.ID)
 		return &UserWithProfile{User: u, Profile: profile}, nil
 	}
@@ -306,6 +333,7 @@ func (s *Service) ShowByUsername(username string, host *string) (*UserWithProfil
 // 未知の acct は 404 を返す。ShowByUsername の remote fallback をここで使うと、
 // 認証不要の GET 1 回ごとに WebFinger + actor fetch の outbound HTTP とリモート
 // user 行の作成を外部から強制できてしまう (upstream に無い増幅面)。
+// users/followers / users/following も本家が DB だけを引くのでこちらを使う (#3330)。
 func (s *Service) ShowByUsernameDB(username string, host *string) (*UserWithProfile, error) {
 	u, err := s.userRepo.FindByUsernameLower(username, host)
 	if err != nil {
@@ -656,6 +684,7 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 		// Room と同じく []byte ではなく string で渡して bytea 化を防ぐ。
 		userFields["avatarDecorations"] = string(*in.AvatarDecorations)
 	}
+	var newFields []FieldItem
 	if in.Fields != nil {
 		// upstream Misskey TS 互換 (#956): name / value をそれぞれ trim して
 		// 両方非空の entry のみ残す。空 slice 渡しはクリア (= []) として
@@ -675,6 +704,7 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 			return nil, err
 		}
 		profileFields["fields"] = string(raw)
+		newFields = normalized
 	}
 	if in.AlsoKnownAs != nil {
 		// 引越し元エイリアス (#1546)。upstream update.ts は要素 0 個なら null を
@@ -734,6 +764,12 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 		}
 	}
 
+	emojis, err := s.profileEmojis(userID, existing, in, newFields)
+	if err != nil {
+		return nil, err
+	}
+	userFields["emojis"] = model.StringArray(emojis)
+
 	if err := s.userRepo.UpdateUser(userID, userFields); err != nil {
 		return nil, err
 	}
@@ -755,6 +791,62 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 	// ため)。body は packed UserDetailed full object。
 	s.publishMeUpdated(bundle)
 	return bundle, nil
+}
+
+// profileEmojis returns the custom emoji names used in the user's name,
+// description, profile fields and followed message after the update, like
+// upstream i/update: the name and fields are read with parseSimple, the
+// description and followed message with the full parser, each source is
+// dedup'd on its own and the results are concatenated.
+//
+// 送らなかった項目は保存済みの値を使う (本家と同じく、どの項目を更新しても
+// 毎回まとめて書き直す)。Person の `tag` の絵文字はこの列から描画するので、
+// 書かないと連合先で名前やプロフィールの `:emoji:` が文字のまま出る (#3270)。
+func (s *Service) profileEmojis(userID string, existing *model.User, in UpdateInput, newFields []FieldItem) ([]string, error) {
+	profile, err := s.userRepo.FindProfileByUserID(userID)
+	if err != nil {
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
+		profile = nil
+	}
+
+	name := existing.Name
+	if in.Name != nil {
+		name = *in.Name
+	}
+	var description, followedMessage *string
+	if profile != nil {
+		description, followedMessage = profile.Description, profile.FollowedMessage
+	}
+	if in.Description != nil {
+		description = *in.Description
+	}
+	if in.FollowedMessage != nil {
+		followedMessage = *in.FollowedMessage
+	}
+	fields := newFields
+	if in.Fields == nil && profile != nil && len(profile.Fields) > 0 {
+		// 読めない保存値は補足情報が無いものとして扱う (本家は jsonb の配列を前提に
+		// している)。
+		_ = json.Unmarshal(profile.Fields, &fields)
+	}
+
+	emojis := []string{}
+	if name != nil {
+		emojis = append(emojis, mfm.ExtractCustomEmojis(mfm.ParseSimple(*name))...)
+	}
+	if description != nil {
+		emojis = append(emojis, mfm.ExtractCustomEmojis(mfm.Parse(*description))...)
+	}
+	for _, f := range fields {
+		emojis = append(emojis, mfm.ExtractCustomEmojis(mfm.ParseSimple(f.Name))...)
+		emojis = append(emojis, mfm.ExtractCustomEmojis(mfm.ParseSimple(f.Value))...)
+	}
+	if followedMessage != nil {
+		emojis = append(emojis, mfm.ExtractCustomEmojis(mfm.Parse(*followedMessage))...)
+	}
+	return emojis, nil
 }
 
 // applyMediaUpdate writes prefix+"Id" / prefix+"Url" / prefix+"Blurhash"

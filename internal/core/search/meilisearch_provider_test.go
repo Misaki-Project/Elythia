@@ -1,6 +1,7 @@
 package search
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -251,7 +252,7 @@ func TestMeilisearchProvider_SearchNoteHappyPath(t *testing.T) {
 	assert.Equal(t, []string{"createdAt:desc"}, idx.lastSearchReq.Sort)
 	assert.Contains(t, idx.lastSearchReq.Filter, "userId = 'u1'")
 	assert.Contains(t, idx.lastSearchReq.Filter, "channelId = 'ch1'")
-	assert.Contains(t, idx.lastSearchReq.Filter, "userHost IS NULL")
+	assert.Contains(t, idx.lastSearchReq.Filter, meiliLocalUserClause)
 }
 
 func TestMeilisearchProvider_SearchNoteEmptyQueryRejected(t *testing.T) {
@@ -369,8 +370,55 @@ func TestMeilisearchProvider_TimestampOfBadID(t *testing.T) {
 	assert.Equal(t, int64(0), got)
 }
 
-func TestQuoteValueEscapesSingleQuotes(t *testing.T) {
-	assert.Equal(t, "'a''b'", quoteValue("a'b"))
-	assert.Equal(t, "'plain'", quoteValue("plain"))
+func TestQuoteValueEscapesLikeUpstream(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain", in: "plain", want: `'plain'`},
+		{name: "single quote", in: "a'b", want: `'a\'b'`},
+		{name: "backslash", in: `a\b`, want: `'a\\b'`},
+		{name: "backslash before quote", in: `a\'b`, want: `'a\\\'b'`},
+		{name: "trailing backslash", in: `a\`, want: `'a\\'`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, quoteValue(tc.in))
+		})
+	}
 	assert.True(t, strings.HasPrefix(quoteValue("x"), "'"))
+}
+
+func TestMeilisearchProvider_BuildFilterEscapesValues(t *testing.T) {
+	p, _, _, _ := newProviderWithFake(t, IndexScopeLocal)
+	got := p.buildFilter(SearchOpts{
+		UserID:    "u'1",
+		ChannelID: `c\`,
+		Host:      `h\'x`,
+	}, Pagination{})
+	assert.Equal(t, `(userId = 'u\'1') AND (channelId = 'c\\') AND (userHost = 'h\\\'x')`, got)
+}
+
+// LocalUsersOnly adds the local-author clause (upstream searchNoteByMeilisearch
+// for visitors under ugcVisibilityForVisitor=local), and leaves the filter
+// alone when unset.
+//
+// 句は `IS NULL` だけでは足りない。属性の無い文書 (omitempty で索引した既存の
+// ローカルの文書) に一致しないので、未ログインの検索が常に空になる。
+func TestMeilisearchProvider_BuildFilterLocalUsersOnly(t *testing.T) {
+	p, _, _, _ := newProviderWithFake(t, IndexScopeGlobal)
+	assert.Equal(t, "(userHost NOT EXISTS OR userHost IS NULL)", p.buildFilter(SearchOpts{LocalUsersOnly: true}, Pagination{}))
+	assert.Equal(t, "(userHost NOT EXISTS OR userHost IS NULL)", p.buildFilter(SearchOpts{Host: "."}, Pagination{}))
+	assert.Equal(t, "", p.buildFilter(SearchOpts{}, Pagination{}))
+	assert.Equal(t, `(userHost = 'remote.example') AND (userHost NOT EXISTS OR userHost IS NULL)`,
+		p.buildFilter(SearchOpts{Host: "remote.example", LocalUsersOnly: true}, Pagination{}))
+}
+
+// Local authors are indexed with an explicit null userHost, like upstream,
+// so that `userHost IS NULL` filters written against upstream indexes match.
+func TestNoteDocument_LocalUserHostIsNull(t *testing.T) {
+	b, err := json.Marshal(NoteDocument{ID: "n1"})
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"userHost":null`)
 }

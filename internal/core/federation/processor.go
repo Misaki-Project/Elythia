@@ -38,15 +38,16 @@ var (
 // for the inbox processor to toggle relay status on Accept / Reject
 // activities whose id matches `{baseURL}/activities/follow-relay/{id}`.
 type RelayStatusMarker interface {
+	// MarkAccepted / MarkRejected only change a relay that is still
+	// "requesting"; answers for an already settled relay are ignored.
 	MarkAccepted(ctx context.Context, id string) error
 	MarkRejected(ctx context.Context, id string) error
 	// FindByID returns the relay row identified by id, or an error when no
 	// such row exists.
 	//
 	// status を書き換える前に「送信元 actor がその relay 自身か」を確かめる
-	// ために要る。行が持っている identity は inbox URI だけなので、
-	// 突き合わせはその host と act.actor の host で行う
-	// (relayActorOwnsRelay)。
+	// ために要る。行が持っている identity は inbox URI だけなので、actor の
+	// inbox / sharedInbox との完全一致 (relayActorInboxMatches) で突き合わせる。
 	FindByID(ctx context.Context, id string) (*model.Relay, error)
 }
 
@@ -132,15 +133,15 @@ type Processor struct {
 	// 配線されていなければ no-op。
 	notificationHook NotificationHook
 
-	// Note chart hook for inbound Create / Announce (#1156). ローカル作成は
+	// Note chart hook for inbound Announce (#1156). inbound Create を含め resolver
+	// が作る note は Resolver.fireNoteCreated が数える (#3330)。ローカル作成は
 	// note_create_service.go から chartHook.OnNoteCreated を発火させているが、
-	// federation 経由のリモートノートは handleCreate / handleAnnounce で直接
-	// note を作るため、本フィールド経由で同じ chart hook を発火させないと
+	// handleAnnounce は renote 行を resolver を通さず直接作るため、本フィールド
+	// 経由で同じ chart hook を発火させないと
 	// PerUserNotesChart 等の inc 列が +1 されない (= プロフィールの
 	// アクティビティタブの heatmap がリモートユーザーだけ空になる)。
 	// noteChartHook は idempotent ではないので、dedup hit (= 既存ノートを返した
-	// ケース) では発火させない (IngestNoteWithCreated の created==false 時は
-	// skip)。resolver の ChartHook (= OnRemoteUserCreated) とは責務が異なるので
+	// ケース) では発火させない。resolver の ChartHook (= OnRemoteUserCreated) とは責務が異なるので
 	// 別 interface として分離する。
 	noteChartHook NoteChartHook
 
@@ -231,6 +232,10 @@ func (p *Processor) HasLocalBaseURL() bool { return p.localBaseURL != "" }
 // 対策として localBaseURL 配下の URI ("{baseURL}/users/{id}") を検出し、
 // ID パートを抜き出して FindByID で lookup する。リモートユーザーは従来通り
 // FindByURI で解決する。
+//
+// 使うのは本家に対応の無い reversi の招待と chat room の招待の宛先だけ。
+// Follow / Block とその Undo は本家が getUserFromApId で引くので
+// userFromAPID を使う (#3330)。
 func (p *Processor) resolveTargetUser(uri string) (*model.User, error) {
 	if p.localBaseURL != "" {
 		prefix := p.localBaseURL + "/users/"
@@ -245,6 +250,40 @@ func (p *Processor) resolveTargetUser(uri string) (*model.User, error) {
 		}
 	}
 	return p.userRepo.FindByURI(uri)
+}
+
+// userFromAPID looks up the user an AP id names the way upstream
+// ApDbResolverService.getUserFromApId does: a URI on this instance's host
+// names the user whose ID is the segment after `/users/` (parseLocalURI, so
+// `?` and `#` are not part of it), any other URI names the user with that
+// uri. A deleted user is not found. It returns a repository not-found error
+// when there is no such user.
+//
+// 本家は local / remote のどちらも `isDeleted: false` で引く。以前の Accept /
+// Undo(Accept) / Reject は削除済みの利用者も引き、削除済みの利用者を follower
+// としてフォローの承認・解除を進めていた (#3330)。
+// ローカルの host で `/users/` 以外を指すものは、本家と同じく誰にも当てない
+// (本家は `parsed.type !== 'users'` で null)。
+func (p *Processor) userFromAPID(uri string) (*model.User, error) {
+	var (
+		u   *model.User
+		err error
+	)
+	if id, local := p.resolver.LocalUserIDFromURI(uri); local {
+		if id == "" {
+			return nil, repository.ErrNotFound
+		}
+		u, err = p.userRepo.FindByID(id)
+	} else {
+		u, err = p.userRepo.FindByURI(uri)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if u == nil || u.IsDeleted {
+		return nil, repository.ErrNotFound
+	}
+	return u, nil
 }
 
 // ChatMessageReceiver handles inbound Misskey:ChatMessage activities.
@@ -325,8 +364,8 @@ type NotificationHook interface {
 	OnNoteDeleted(note *model.Note)
 }
 
-// NoteChartHook is invoked after a freshly persisted inbound Create / Announce
-// so that PerUserNotesChart 等の counters が +1 される (#1156)。ローカル作成では
+// NoteChartHook is invoked after a freshly persisted note (the resolver's new
+// notes and the processor's Announce renote rows) so that PerUserNotesChart 等の counters が +1 される (#1156)。ローカル作成では
 // note_create_service.go の ChartHook が同じ役目を担う。
 //
 // dedup ヒット (同 URI の重複配送) では発火させないこと: chart hook は
@@ -844,9 +883,10 @@ func (p *Processor) SetNotificationHook(h NotificationHook) {
 	p.notificationHook = h
 }
 
-// SetNoteChartHook wires a NoteChartHook so that inbound Create / Announce
-// activities update PerUserNotesChart 等のリモートユーザー向け chart 集計
-// (#1156)。Without it, リモートユーザーのプロフィールの「アクティビティ」
+// SetNoteChartHook wires a NoteChartHook so that the renote rows an inbound
+// Announce creates update PerUserNotesChart 等のリモートユーザー向け chart 集計
+// (#1156)。Notes the resolver creates (inbound Create included) are counted
+// through Resolver.SetNoteChartHook instead (#3330); wire both.Without it, リモートユーザーのプロフィールの「アクティビティ」
 // タブが空になる (delete だけ note_delete_service 経由で -1 されるため
 // heatmap がマイナスにしか動かない drop-in regression が再発する)。
 //
@@ -892,16 +932,13 @@ func matchFollowRelayID(uri, localBaseURL string) string {
 // relayActorOwnsRelay reports whether actorURI belongs to the same host as the
 // relay's registered inbox.
 //
-// relay 行は inbox URI しか identity を持たないので host で突き合わせる。
 // host は hostFromURI で punycode + 小文字に正規化してから比較するため、
 // `https://Relay.Example/actor` と `https://relay.example/inbox` は一致する。
 // port は host の一部として扱う (別 authority を同一視しない安全側)。
 //
-// 既知の限界: relay と同じ host に別 actor を立てられる相手 (マルチテナントな
-// relay サーバー) は依然としてその relay の status を動かせる。行が inbox URI
-// しか持たない以上ここが上限で、actor の advertise する inbox と管理者が
-// 登録した inbox が完全一致する保証は無い (末尾スラッシュ等で正当な relay を
-// 落とすほうが害が大きい)。
+// これは前段の安価な絞り込みで、本判定は relayActorInboxMatches (本家と同じ
+// inbox / sharedInbox の完全一致)。host だけだと、relay と同じ host に別 actor
+// を立てられる相手 (マルチテナントな relay サーバー) が status を動かせる。
 func relayActorOwnsRelay(actorURI string, rel *model.Relay) bool {
 	if rel == nil || rel.Inbox == "" || actorURI == "" {
 		return false
@@ -917,24 +954,57 @@ func relayActorOwnsRelay(actorURI string, rel *model.Relay) bool {
 	return actorHost == inboxHost
 }
 
+// relayActorInboxMatches reports whether the actor's inbox or sharedInbox is
+// exactly the inbox registered for the relay.
+//
+// 本家 2026.10.0 RelayService.updateRequestingRelayStatus の
+// `actor.inbox === relay.inbox || actor.sharedInbox === relay.inbox` と同じ
+// 完全一致にする。actor の inbox / sharedInbox は取り込み時に actor の host へ
+// 縛られている (resolver の validateActor 相当) ので、他 host の actor が relay
+// の inbox を名乗ることはできない。末尾スラッシュなどの表記揺れで一致しない
+// relay は本家でも requesting のまま止まるので、互換の範囲では緩めない。
+func relayActorInboxMatches(actor *model.User, rel *model.Relay) bool {
+	if actor == nil || rel == nil || rel.Inbox == "" {
+		return false
+	}
+	if actor.Inbox != nil && *actor.Inbox == rel.Inbox {
+		return true
+	}
+	return actor.SharedInbox != nil && *actor.SharedInbox == rel.Inbox
+}
+
 // relayStatusChangeAllowed reports whether the actor that signed an inbound
 // Accept / Reject may flip the status of the relay row referenced by relayID.
 //
 // kind はログ用の activity 種別 ("Accept" / "Reject")。検証に落ちたケースは
-// 呼び出し側で状態を変えずに drop する (ack して retry しない)。
-func (p *Processor) relayStatusChangeAllowed(actorURI, relayID, kind string) bool {
+// 呼び出し側で状態を変えずに drop する (ack して retry しない)。actor を引けない
+// ときだけは error を返し、呼び出し側はそれを返して再試行させる。
+func (p *Processor) relayStatusChangeAllowed(actorURI, relayID, kind string) (bool, error) {
 	rel, err := p.relayMarker.FindByID(context.Background(), relayID)
 	if err != nil || rel == nil {
 		slog.Info("federation: dropping relay "+kind+" for unknown relay",
 			"actor", actorURI, "relayId", relayID, "err", err)
-		return false
+		return false, nil
 	}
 	if !relayActorOwnsRelay(actorURI, rel) {
 		slog.Warn("federation: dropping forged relay "+kind+" (actor is not the relay)",
 			"actor", actorURI, "relayId", relayID, "relayInbox", rel.Inbox)
-		return false
+		return false, nil
 	}
-	return true
+	// 署名検証で actor は取り込み済みなので、通常は DB から引けて fetch しない。
+	// 引けないときは捨てずにエラーを返して再試行させる。通常の Follow の
+	// Accept / Reject と同じ扱いで、relay は Accept を送り直さないので、捨てると
+	// requesting のまま止まる。
+	actor, err := p.resolver.ResolveActor(actorURI)
+	if err != nil {
+		return false, fmt.Errorf("relay %s: resolve actor: %w", kind, err)
+	}
+	if !relayActorInboxMatches(actor, rel) {
+		slog.Warn("federation: dropping relay "+kind+" (actor inbox does not match relay inbox)",
+			"actor", actorURI, "relayId", relayID, "relayInbox", rel.Inbox)
+		return false, nil
+	}
+	return true, nil
 }
 
 // SetReversi wires the reversi federation dependencies. When any of the
@@ -968,9 +1038,17 @@ func (p *Processor) handleFollow(act genericActivity) error {
 	if err != nil {
 		return err
 	}
-	followee, err := p.resolveTargetUser(followeeURI)
+	// 本家 follow() は getUserFromApId で引く (自ホストかは host で判定し、
+	// `/users/{id}` の id だけを読む。削除済みの利用者は引かない)。
+	// 見つからなければ本家は 'skip: followee not found' で ack する。以前は
+	// error を返して inbox の retry を使い切っていた (#3330)。DB 障害は retry
+	// させるために伝播する (#3115 と同じ扱い)。
+	followee, err := p.userFromAPID(followeeURI)
 	if err != nil {
-		return errors.New("unknown followee")
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("follow: lookup followee: %w", err)
 	}
 	// upstream follow() は followee が remote の場合 'skip: フォローしようと
 	// しているユーザーはローカルユーザーではありません' で明示的に拒否する
@@ -1125,12 +1203,7 @@ func (p *Processor) handleUndoAccept(act genericActivity, inner genericActivity)
 	if err != nil || followerURI == "" {
 		return nil
 	}
-	var follower *model.User
-	if localID := p.resolver.ExtractLocalUserID(followerURI); localID != "" {
-		follower, err = p.userRepo.FindByID(localID)
-	} else {
-		follower, err = p.userRepo.FindByURI(followerURI)
-	}
+	follower, err := p.userFromAPID(followerURI)
 	if err != nil {
 		// **#3115 が Accept / Reject で確立した原則の裏返し** (#3116)。ack すると
 		// job が retry されず、**accept を撤回された相手をフォローし続ける**。
@@ -1162,9 +1235,13 @@ func (p *Processor) handleUndoFollow(act genericActivity, inner genericActivity)
 	if err != nil {
 		return err
 	}
-	followee, err := p.resolveTargetUser(followeeURI)
+	// 本家 undoFollow() も getUserFromApId で引き、見つからなければ skip (#3330)。
+	followee, err := p.userFromAPID(followeeURI)
 	if err != nil {
-		return errors.New("unknown followee")
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("undo follow: lookup followee: %w", err)
 	}
 	// #2106 L30: upstream undoFollow は followee が remote (host != null) なら skip する
 	// (handleFollow の gate と対称)。remote→remote の Undo を DB 走査 / counter 経路に
@@ -1355,7 +1432,9 @@ func (p *Processor) handleUndoAnnounce(act genericActivity, inner genericActivit
 // followerからのフォローリクエストを承認した場合に、フォロー関係を確立する。
 // inner.id が自ホストの follow-relay URI で、かつ送信元 actor がその relay
 // 自身であれば relay の Accept とみなし、RelayStatusMarker.MarkAccepted を
-// 呼び出す (所有権検証は upstream に無い mk-go 側の硬化)。
+// 呼び出す。actor の inbox / sharedInbox と relay の inbox の完全一致は本家
+// 2026.10.0 と同じで、id が自ホストの URI であることと actor の host の照合は
+// mk-go 側の追加。status が requesting の relay だけが動く (MarkAccepted 側)。
 func (p *Processor) handleAccept(act genericActivity) error {
 	// こちらが送った QuoteRequest への承認 (FEP-044f、#3234)。object が id だけの
 	// 文字列でも来るので、下の Follow 用の解釈より先に見る。
@@ -1385,7 +1464,11 @@ func (p *Processor) handleAccept(act genericActivity) error {
 		// 送信元がその relay 自身でなければ状態を変えずに drop する。
 		// 通さないと、署名が通る任意のリモート actor が未承認 / 拒否済みの
 		// relay を accepted に倒せ、全公開ノートがその inbox へ流れ出す。
-		if !p.relayStatusChangeAllowed(act.Actor, relayID, "Accept") {
+		allowed, err := p.relayStatusChangeAllowed(act.Actor, relayID, "Accept")
+		if err != nil {
+			return err
+		}
+		if !allowed {
 			return nil
 		}
 		return p.relayMarker.MarkAccepted(context.Background(), relayID)
@@ -1400,14 +1483,7 @@ func (p *Processor) handleAccept(act genericActivity) error {
 	if err != nil {
 		return nil
 	}
-	// ローカルユーザーはURIカラムがNULLなのでFindByURIでは見つからない。
-	// ローカルURI（/users/{id}）からIDを抽出してFindByIDで検索する。
-	var follower *model.User
-	if localID := p.resolver.ExtractLocalUserID(followerURI); localID != "" {
-		follower, err = p.userRepo.FindByID(localID)
-	} else {
-		follower, err = p.userRepo.FindByURI(followerURI)
-	}
+	follower, err := p.userFromAPID(followerURI)
 	if err != nil {
 		// **not-found だけ ack する** (#3115)。その利用者が居ないことは retry
 		// しても変わらないので、7 回 retry (試行は計 8 回、
@@ -1686,8 +1762,9 @@ func (p *Processor) handleCreate(act genericActivity, signer *model.User) error 
 		// ので queue retry に乗せず ack して drop する。upstream は同種 error を
 		// IdentifiableError('9f466dab-...') で switch する patch だが、mk-go は
 		// sentinel error の errors.Is で同等の non-retry 化を行う。
+		// 上限は投稿者の role policy で決まる (#3330) ので、既定値を記録しない。
 		slog.Info("federation: dropping inbound note exceeding mentionLimit",
-			"actor", act.Actor, "limit", corenote.DefaultMentionLimit)
+			"actor", act.Actor)
 		return nil
 	}
 	if errors.Is(err, ErrHostNotAllowed) {
@@ -1769,12 +1846,9 @@ func (p *Processor) handleCreate(act genericActivity, signer *model.User) error 
 				p.notificationHook.OnNoteCreated(hydrated, actor, hydrated.Reply, hydrated.Renote)
 			})
 		}
-		// chart hook は dedup hit では発火させない (#1156)。同 URI の
-		// Create activity が重複配送されたとき (= リトライ / S2S 二重投げ)
-		// に PerUserNotesChart の inc 列が +2 されないようにする。
-		if p.noteChartHook != nil && created {
-			safeGoFedHook(func() { p.noteChartHook.OnNoteCreated(hydrated) })
-		}
+		// chart hook は resolver が新しく作ったときに呼ぶ (Resolver.fireNoteCreated、
+		// #3330)。ここでも呼ぶと二重に数える。dedup hit で呼ばないのは
+		// resolver 側も同じ (#1156)。
 	}
 	return nil
 }
@@ -2086,7 +2160,7 @@ func (p *Processor) handleAnnounce(act genericActivity, signer *model.User) erro
 	// followers=to[followers] shape を正しく判定する)。実装が送らない exotic shape
 	// (cc のみ Public 等) での upstream parseAudience との差、および specified renote の
 	// visibleUsers / 通知の扱いは #1864 で別途対応する。
-	renoteVisibility := deriveVisibility(decodeAudience(act.To), decodeAudience(act.CC))
+	renoteVisibility := deriveVisibility(announcer, decodeAudience(act.To), decodeAudience(act.CC))
 	// upstream NoteCreateService は renote の visibility を対象 note 以下に clamp する
 	// (home note は public で renote できず home に落ちる)。target は上の gate で
 	// public/home に限定済みなので、home target に対する public boost を home に
@@ -2509,7 +2583,11 @@ func (p *Processor) handleReject(act genericActivity) error {
 	if relayID := matchFollowRelayID(inner.ID, p.localBaseURL); relayID != "" && p.relayMarker != nil {
 		// Accept 側と同じ理由で送信元を検証する。こちらを通すと稼働中の
 		// relay 配送を任意の actor が無言で止められる。
-		if !p.relayStatusChangeAllowed(act.Actor, relayID, "Reject") {
+		allowed, err := p.relayStatusChangeAllowed(act.Actor, relayID, "Reject")
+		if err != nil {
+			return err
+		}
+		if !allowed {
 			return nil
 		}
 		return p.relayMarker.MarkRejected(context.Background(), relayID)
@@ -2522,11 +2600,11 @@ func (p *Processor) handleReject(act genericActivity) error {
 	if err != nil {
 		return err
 	}
-	// ローカルユーザーは user.uri が NULL なので resolveTargetUser で ID
-	// 解決する。これをやらないと FindByURI が fail して reject が silent drop
-	// されてしまい、ローカル側の FollowRequest が消えずに永遠に pending の
+	// ローカルユーザーは user.uri が NULL なので、URI から ID を読んで引く
+	// (userFromAPID)。これをやらないと FindByURI が fail して reject が silent
+	// drop されてしまい、ローカル側の FollowRequest が消えずに永遠に pending の
 	// ままになる。
-	follower, err := p.resolveTargetUser(followerURI)
+	follower, err := p.userFromAPID(followerURI)
 	if err != nil {
 		// **Accept と同じ扱い** (#3115)。not-found は retry しても変わらないので
 		// ack するが、**DB 障害を ack すると job が成功扱いになって retry されず**、
@@ -2537,19 +2615,18 @@ func (p *Processor) handleReject(act genericActivity) error {
 		}
 		return err
 	}
+	// Reject されるのはこちらが送った Follow なので、follower はローカルの利用者の
+	// はず。本家 rejectFollow と同じく、ローカルでなければ何もしない
+	// (`skip: follower is not a local user`)。
+	if !follower.IsLocal() {
+		return nil
+	}
 	// 既存のフォローがあれば解除する。pending な follow request も同様。
-	// #2106 N11: upstream remoteReject は AP 配送を伴わない内部削除なので、federating な
-	// Unfollow ではなく UnfollowSilent を使い、rejecter へ余計な Undo(Follow) を逆配送
-	// しない (Following 行が残るエッジケースでの連合ノイズ / 相手の重複処理を防ぐ)。
-	if err := p.followingService.UnfollowSilent(follower.ID, followee.ID); err != nil &&
-		!errors.Is(err, corefollowing.ErrNotFollowing) {
-		return err
-	}
-	if err := p.followingService.CancelRequest(follower.ID, followee.ID); err != nil &&
-		!errors.Is(err, corefollowing.ErrRequestNotFound) {
-		return err
-	}
-	return nil
+	// #2106 N11: upstream remoteReject は AP 配送を伴わない内部削除なので、rejecter へ
+	// 余計な Undo(Follow) を逆配送しない (Following 行が残るエッジケースでの連合ノイズ /
+	// 相手の重複処理を防ぐ)。申請だけが残っていた場合も同じで、unfollow の通知
+	// (main stream と Webhook) は本家と同じく 1 回だけ出す (#3330)。
+	return p.followingService.RemoteReject(follower.ID, followee.ID)
 }
 
 // handleBlock processes an inbound Block activity. リモートユーザーがローカル
@@ -2566,11 +2643,14 @@ func (p *Processor) handleBlock(act genericActivity) error {
 	if err != nil {
 		return err
 	}
-	// ローカルユーザーは user.uri が NULL なので FindByURI では解決できない。
-	// resolveTargetUser が localBaseURL prefix パターンから ID を抽出する。
-	blockee, err := p.resolveTargetUser(blockeeURI)
+	// 本家 block() は getUserFromApId で引き、見つからなければ skip (#3330)。
+	// ローカルユーザーは user.uri が NULL なので、URI から ID を読んで引く。
+	blockee, err := p.userFromAPID(blockeeURI)
 	if err != nil {
-		return errors.New("unknown blockee")
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("block: lookup blockee: %w", err)
 	}
 	// ローカルユーザーのみ対象
 	if blockee.Host != nil {
@@ -2598,10 +2678,13 @@ func (p *Processor) handleUndoBlock(act genericActivity, inner genericActivity) 
 	if err != nil {
 		return err
 	}
-	// Block と同様、ローカルユーザー解決は resolveTargetUser で行う。
-	blockee, err := p.resolveTargetUser(blockeeURI)
+	// 本家 undoBlock() も getUserFromApId で引き、見つからなければ skip (#3330)。
+	blockee, err := p.userFromAPID(blockeeURI)
 	if err != nil {
-		return errors.New("unknown blockee")
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("undo block: lookup blockee: %w", err)
 	}
 	// #2106 L30: upstream undoBlock は blockee が remote (host != null) なら skip する
 	// (handleBlock の gate と対称)。
@@ -2644,22 +2727,16 @@ func (p *Processor) handleFlag(act genericActivity) error {
 	}
 	// upstream flag() は object URI を config.url + '/users/' prefix の LOCAL
 	// user URI に絞ってから user id に map し users[0] を報告対象にする
-	// (#1560、ApInboxService.ts:560-577)。mk-go も ExtractLocalUserID で
-	// `{baseURL}/users/{id}` 形式のローカル URI だけを対象にする。旧実装は
+	// (#1560、ApInboxService.ts:560-577)。mk-go も flagTargetUserID で
+	// `{baseURL}/users/...` 形式のローカル URI だけを対象にし、本家と同じく最後の
+	// 段を ID として引く (`/users/{id}/followers` は誰にも当たらない、#3330)。旧実装は
 	// 任意 host の user/note URI を受け、note 作者 (リモート可) まで fallback
 	// して別 instance のユーザーを誤って報告し得た。
-	var targetUserID string
-	for _, uri := range uris {
-		localID := p.resolver.ExtractLocalUserID(uri)
-		if localID == "" {
-			continue
-		}
-		if u, err := p.userRepo.FindByID(localID); err == nil && u != nil {
-			targetUserID = u.ID
-			break
-		}
+	target, err := p.flagTargetUser(uris)
+	if err != nil {
+		return err
 	}
-	if targetUserID == "" {
+	if target == nil {
 		// ローカル user を 1 件も解決できない Flag は ack して drop する
 		// (リモート対象や不正 URI。retry しても解決しないため error にしない)。
 		slog.Info("federation: skipping Flag with no resolvable local target", "actor", act.Actor)
@@ -2686,19 +2763,15 @@ func (p *Processor) handleFlag(act genericActivity) error {
 	// 通報の趣旨は残る。
 	comment := remoteText(content.Content+"\n"+string(urisJSON), abuseReportCommentMaxRunes)
 	report := &model.AbuseUserReport{
-		ID:             p.abuseIDGen.Generate(nowFn()),
-		TargetUserID:   targetUserID,
-		ReporterID:     reporter.ID,
-		Comment:        comment,
-		TargetUserHost: nil,
+		ID:           p.abuseIDGen.Generate(nowFn()),
+		TargetUserID: target.ID,
+		ReporterID:   reporter.ID,
+		Comment:      comment,
+		// 対象の行は flagTargetUser で引いたものをそのまま使う。以前は ID から
+		// 引き直し、その失敗を握り潰して TargetUserHost を nil (= ローカル扱い)
+		// のまま保存しえた (#3330)。
+		TargetUserHost: target.Host,
 		ReporterHost:   reporter.Host,
-	}
-	// ターゲットユーザーのホスト情報を取得
-	target, err := p.userRepo.FindByID(targetUserID)
-	if err == nil {
-		report.TargetUserHost = target.Host
-	} else {
-		target = nil
 	}
 	if err := p.abuseReportRepo.Create(report); err != nil {
 		slog.Warn("failed to create abuse report from flag activity", "err", err)
@@ -2710,6 +2783,50 @@ func (p *Processor) handleFlag(act genericActivity) error {
 		p.abuseCreated.NotifyCreated(context.Background(), report, reporter, target)
 	}
 	return nil
+}
+
+// flagTargetUser picks the user an inbound Flag reports among its object
+// URIs, the way upstream ApInboxService.flag does: among the existing users
+// named by the `{url}/users/...` URIs (flagTargetUserID), the one with the
+// smallest ID. It returns nil when none of them exists.
+//
+// **本家は `findBy({ id: In(userIds) })` の users[0] で、ORDER BY を持たない。**
+// 返る順は PostgreSQL の plan 次第で、利用者の表が大きく ID が少数なら主キーの
+// Index Scan (ID の昇順) になり、表が小さいか ID が多いと Seq Scan / Bitmap Heap
+// Scan (物理的な並び) になる。mk-go は普段の plan と同じ ID の昇順に固定する
+// (URI の並び順の先頭ではない、#3330)。本家と同じく host と isDeleted では
+// 絞らない。
+//
+// 引けなかったことを「誰も居ない」に潰さない (#3121)。潰すと job が ack されて
+// retry されず、通報が届かない。
+func (p *Processor) flagTargetUser(uris []string) (*model.User, error) {
+	var ids []string
+	seen := make(map[string]struct{}, len(uris))
+	for _, uri := range uris {
+		id := p.resolver.flagTargetUserID(uri)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	users, err := p.userRepo.FindManyByIDs(ids)
+	if err != nil {
+		return nil, fmt.Errorf("flag: lookup target users: %w", err)
+	}
+	var target *model.User
+	for _, u := range users {
+		if u != nil && (target == nil || u.ID < target.ID) {
+			target = u
+		}
+	}
+	return target, nil
 }
 
 // handleMove processes an inbound Move activity. アカウント移行通知を受けて
@@ -3025,7 +3142,10 @@ func (p *Processor) handleChatCreate(sender *model.User, noteURI, content, mfmSo
 	}
 	recipient, err := p.userRepo.FindByURI(to)
 	if err != nil {
-		if localID := p.resolver.ExtractLocalUserID(to); localID != "" {
+		// chat は cherrypick 由来で本家に対応が無いので、ExtractLocalUserID
+		// (本家 fetchPerson の最後の段) ではなく従来どおり `users` の次の段で読む
+		// (#3330)。
+		if localID := p.resolver.localUserIDFromAPID(to); localID != "" {
 			recipient, err = p.userRepo.FindByID(localID)
 		}
 		if err != nil {
@@ -3105,10 +3225,11 @@ func (p *Processor) handleChatMessage(act genericActivity) error {
 		return fmt.Errorf("chat message: resolve sender: %w", err)
 	}
 	// ローカルユーザーはDB上URI==nilのためFindByURIでは解決できない。
-	// handleAcceptと同じパターンでExtractLocalUserID→FindByIDにフォールバック。
+	// handleAcceptと同じパターンでlocalUserIDFromAPID→FindByIDにフォールバック
+	// (chat は本家に対応が無いので、従来どおり `users` の次の段で読む、#3330)。
 	recipient, err := p.userRepo.FindByURI(raw.To)
 	if err != nil {
-		if localID := p.resolver.ExtractLocalUserID(raw.To); localID != "" {
+		if localID := p.resolver.localUserIDFromAPID(raw.To); localID != "" {
 			recipient, err = p.userRepo.FindByID(localID)
 		}
 		if err != nil {

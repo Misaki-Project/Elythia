@@ -364,12 +364,12 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 `MK_` プレフィックスの環境変数でオーバーライド可（例 `MK_DB_HOST`）。詳細は [configuration.md](configuration.md)。
 
-マイグレーション（`migration/`、golang-migrate、現在 107 本）:
-> 注: fork の `000098_drop_remote_avatar_decorations` は無変更で残し、upstream の `000098_registration_closed` は `000106_registration_closed`、`000106_abuse_report_notification_recipient_fk_cascade` は `000107_abuse_report_notification_recipient_fk_cascade` として統合している。upstream の過去実測本数は履歴上の値。
+マイグレーション（`migration/`、golang-migrate、現在 109 本）:
+> 注: fork の `000098_drop_remote_avatar_decorations` は無変更で残し、upstream の `000098_registration_closed` は `000106_registration_closed`、`000106_abuse_report_notification_recipient_fk_cascade` は `000107_abuse_report_notification_recipient_fk_cascade` として統合している。`000107_note_page_count_backfill`は`000108_note_page_count_backfill`へ、Release 1.5.0の`000108_user_uri_index`は`000109_user_uri_index`へ割り当てた。upstream の過去実測本数は履歴上の値。
 
-- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 17 件あり、うち 12 件は mk-go が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
+- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 18 件あり、うち 13 件は mk-go が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
 - drop-in テストで発見した補完列は専用マイグレーションで追加。
-- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただし既存の down はこの規約を満たしていない** — 現行 107 本のうち `-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある（[migration-from-ts.md](migration-from-ts.md#mk-go-内での切り戻し)）。
+- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただし既存の down はこの規約を満たしていない** — 現行 109 本のうち `-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある（[migration-from-ts.md](migration-from-ts.md#mk-go-内での切り戻し)）。
 
 ```bash
 make migrate-up      # 最新まで
@@ -435,7 +435,8 @@ CLAUDE.md の Section 1 / 2 にあった表とツリーを、#3248 でここへ�
 │   ├── backfill-note-tags/ # note.tags を NFKC 正規化し直す一回限りのバッチ
 │   ├── backfill-remote-host/ # 保存済みリモート host を punycode 正規化し直すバッチ
 │   ├── backfill-emoji-system-file/ # 承認済み自作絵文字の画像を system 所有へ複製し直すバッチ
-│   └── backfill-avatar-public-url/ # アイコン / バナーの URL を公開用へ寄せ直すバッチ
+│   ├── backfill-avatar-public-url/ # アイコン / バナーの URL を公開用へ寄せ直すバッチ
+│   └── backfill-instance-counts/ # instance の notesCount / usersCount を数え直すバッチ
 ├── internal/               # 全26ディレクトリ (`git ls-tree -d HEAD internal/ | wc -l`)
 │   ├── config/             # 設定ローダー（Misskey YAML互換）
 │   ├── db/                 # GORM の PostgreSQL 接続配線

@@ -542,12 +542,13 @@ func TestMe_AvatarAndBannerIDs(t *testing.T) {
 
 // stubRoleProvider implements i.RoleProvider for testing.
 type stubRoleProvider struct {
-	admin     bool
-	moderator bool
-	silenced  bool
-	roles     []*model.Role
-	policies  map[string]any
-	policyErr error
+	admin             bool
+	moderator         bool
+	silenced          bool
+	roles             []*model.Role
+	policies          map[string]any
+	policyErr         error
+	checkedPolicyKeys []string
 }
 
 func (s *stubRoleProvider) IsAdministrator(_ string) bool { return s.admin }
@@ -569,6 +570,11 @@ func (s *stubRoleProvider) GetUserPolicies(_ string) map[string]any {
 // i/delete-account must not let administrators through).
 func (s *stubRoleProvider) GetUserPoliciesChecked(userID string) (map[string]any, error) {
 	return s.GetUserPolicies(userID), s.policyErr
+}
+
+func (s *stubRoleProvider) GetUserPoliciesCheckedForKeys(userID string, keys ...string) (map[string]any, error) {
+	s.checkedPolicyKeys = append([]string(nil), keys...)
+	return s.GetUserPoliciesChecked(userID)
 }
 
 // HasRolePolicy mirrors core/role.Service: admin / moderator は常に true、

@@ -60,13 +60,7 @@ type Handler struct {
 	repo               repository.WebhookRepository
 	idGen              id.Generator
 	dispatcher         TestDispatcher
-	rolePolicyProvider RolePolicyProvider
-}
-
-// RolePolicyProvider abstracts role-policy lookup for `webhookLimit`
-// enforcement (#1029)。実装は core/role.Service。
-type RolePolicyProvider interface {
-	GetUserPolicies(userID string) map[string]any
+	rolePolicyProvider role.PolicyProvider
 }
 
 // NewHandler creates a new webhooks handler.
@@ -80,9 +74,9 @@ func (h *Handler) SetDispatcher(d TestDispatcher) {
 	h.dispatcher = d
 }
 
-// SetRolePolicyProvider wires a RolePolicyProvider so Create enforces the
+// SetRolePolicyProvider wires a role policy source so Create enforces the
 // `webhookLimit` role policy (#1029).
-func (h *Handler) SetRolePolicyProvider(p RolePolicyProvider) {
+func (h *Handler) SetRolePolicyProvider(p role.PolicyProvider) {
 	h.rolePolicyProvider = p
 }
 
@@ -118,15 +112,15 @@ func (h *Handler) Create(c echo.Context) error {
 		On     []string `json:"on"`
 	}
 	if err := c.Bind(&req); err != nil || req.Name == "" || req.URL == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "name and url are required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 	// upstream i/webhooks/create.ts は required:['name','url','on']。on 欠落 (nil) は
 	// ajv 同様 400 で弾く (空配列 [] は present 扱いで許容、#2027)。
 	if req.On == nil {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "on is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 	if !validateOnArray(req.On) {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "on must contain only webhookEventTypes values.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	// webhookLimit role policy gate (#1029)。policy 経由で取得した上限と
@@ -180,7 +174,7 @@ func (h *Handler) Show(c echo.Context) error {
 		WebhookID string `json:"webhookId"`
 	}
 	if err := c.Bind(&req); err != nil || req.WebhookID == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "webhookId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	w, err := h.repo.FindByIDAndUserID(req.WebhookID, user.ID)
@@ -207,10 +201,10 @@ func (h *Handler) Update(c echo.Context) error {
 		Active    *bool                     `json:"active"`
 	}
 	if err := c.Bind(&req); err != nil || req.WebhookID == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "webhookId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 	if !validateOnArray(req.On) {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "on must contain only webhookEventTypes values.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	w, err := h.repo.FindByIDAndUserID(req.WebhookID, user.ID)
@@ -261,7 +255,7 @@ func (h *Handler) Delete(c echo.Context) error {
 		WebhookID string `json:"webhookId"`
 	}
 	if err := c.Bind(&req); err != nil || req.WebhookID == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "webhookId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	if _, err := h.repo.FindByIDAndUserID(req.WebhookID, user.ID); err != nil {
@@ -299,10 +293,10 @@ func (h *Handler) Test(c echo.Context) error {
 		} `json:"override"`
 	}
 	if err := c.Bind(&req); err != nil || req.WebhookID == "" || req.Type == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "webhookId and type are required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 	if !isValidWebhookEventType(req.Type) {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "type must be one of: mention, unfollow, follow, followed, note, reply, renote, reaction.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	webhook, err := h.repo.FindByIDAndUserID(req.WebhookID, user.ID)
@@ -329,48 +323,13 @@ func (h *Handler) Test(c echo.Context) error {
 				overrideSecret = *req.Override.Secret
 			}
 		}
-		// upstream WebhookTestService は type ごとに dummy note/user payload を
-		// 生成して送る (#1546)。テスト対象 webhook 1 件だけに、override 指定時は
+		// upstream WebhookTestService は type ごとに pack した形の dummy note/user
+		// payload を生成して送る (#1546、#3330)。テスト対象 webhook 1 件だけに、override 指定時は
 		// その url/secret へ送る。
-		h.dispatcher.DispatchUserTest(webhook.ID, user.ID, req.Type, dummyWebhookBody(req.Type), overrideURL, overrideSecret)
+		h.dispatcher.DispatchUserTest(webhook.ID, user.ID, req.Type, dummyWebhookBody(req.Type, time.Now()), overrideURL, overrideSecret)
 	}
 
 	return c.NoContent(http.StatusNoContent)
-}
-
-// dummyWebhookBody builds a representative test payload per event type, matching
-// the body shape the real hooks emit (note events → {note}, reaction →
-// {note, userId, reaction}, follow events → {user}), so the webhook receiver can
-// validate its integration against production-like data (#1546).
-func dummyWebhookBody(eventType string) map[string]any {
-	dummyUser := map[string]any{
-		"id":        "dummy-user-1",
-		"name":      "Dummy User",
-		"username":  "dummy",
-		"host":      nil,
-		"avatarUrl": nil,
-		"createdAt": "2020-01-01T00:00:00.000Z",
-	}
-	dummyNote := map[string]any{
-		"id":         "dummy-note-1",
-		"createdAt":  "2020-01-01T00:00:00.000Z",
-		"userId":     "dummy-user-1",
-		"user":       dummyUser,
-		"text":       "This is a dummy note for testing purposes.",
-		"cw":         nil,
-		"visibility": "public",
-		"fileIds":    []string{},
-		"replyId":    nil,
-		"renoteId":   nil,
-	}
-	switch eventType {
-	case "follow", "followed", "unfollow":
-		return map[string]any{"user": dummyUser}
-	case "reaction":
-		return map[string]any{"note": dummyNote, "userId": "dummy-user-1", "reaction": "👍"}
-	default: // note / reply / renote / mention
-		return map[string]any{"note": dummyNote}
-	}
 }
 
 // HasRolePolicyProvider reports whether the role policy provider was wired.

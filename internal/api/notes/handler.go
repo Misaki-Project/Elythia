@@ -16,9 +16,11 @@ import (
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
 	"github.com/shiroha-a/mk/internal/core/poll"
 	"github.com/shiroha-a/mk/internal/core/reaction"
+	"github.com/shiroha-a/mk/internal/core/role"
 	"github.com/shiroha-a/mk/internal/core/search"
 	"github.com/shiroha-a/mk/internal/core/timeline"
 	"github.com/shiroha-a/mk/internal/core/translate"
+	"github.com/shiroha-a/mk/internal/core/ugcvisibility"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -31,6 +33,7 @@ import (
 // Handler handles note-related API endpoints.
 type Handler struct {
 	noteRepo        repository.NoteRepository
+	piningRepo      repository.UserNotePiningRepository
 	createService   *note.CreateService
 	deleteService   *note.DeleteService
 	queryService    *note.QueryService
@@ -100,7 +103,7 @@ type Handler struct {
 	// ltlAvailable / gtlAvailable policy を gate するために使う (#1026)。
 	// 匿名 viewer (userID="") に対しても base policies を返す upstream 互換
 	// semantics で、middleware ではなく handler 内で gate する。
-	policyProvider TimelinePolicyProvider
+	policyProvider role.PolicyProvider
 	// scheduledNoteEnqueuer は drafts/create で `isActuallyScheduled=true`
 	// の draft を delayed queue に enqueue するための narrow interface (#1040)。
 	// nil 時は enqueue を skip する (= test fixture / queue 未配線パス互換)。
@@ -115,6 +118,12 @@ type Handler struct {
 	// (upstream featured.ts の globalNotesRankingCache)。channel ranking は cache
 	// しない (channel ごとなので)。
 	featuredGlobalCache featuredGlobalRankingCache
+}
+
+// SetPiningRepo wires the repository used to verify that a notes/show target
+// is still pinned at request time.
+func (h *Handler) SetPiningRepo(r repository.UserNotePiningRepository) {
+	h.piningRepo = r
 }
 
 // FeaturedRankingReader reads the engagement ranking for notes/featured (#1687).
@@ -158,18 +167,11 @@ func (h *Handler) SetScheduledNoteEnqueuer(e ScheduledNoteEnqueuer) {
 	h.scheduledNoteEnqueuer = e
 }
 
-// TimelinePolicyProvider abstracts the role-policy lookup used by timeline
-// gating. core/role.Service が実装する。匿名 viewer (userID="") に対しては
-// base policies (DefaultPolicies + meta.policies) を返す upstream 互換挙動
-// を要求する (#1026)。
-type TimelinePolicyProvider interface {
-	GetUserPolicies(userID string) map[string]any
-}
-
-// SetPolicyProvider wires a TimelinePolicyProvider so timeline endpoints
-// gate access by ltlAvailable / gtlAvailable role policy (#1026). nil 時は
-// gate を skip する (= test 経路 / 旧挙動互換)。
-func (h *Handler) SetPolicyProvider(p TimelinePolicyProvider) {
+// SetPolicyProvider wires a role policy source so timeline endpoints gate
+// access by ltlAvailable / gtlAvailable (#1026). nil 時は gate を skip する
+// (= test 経路 / 旧挙動互換)。匿名 viewer (userID="") には base policies を
+// 返す upstream 互換 semantics を要求する。
+func (h *Handler) SetPolicyProvider(p role.PolicyProvider) {
 	h.policyProvider = p
 }
 
@@ -235,6 +237,36 @@ func (h *Handler) ugcVisibilityNow() string {
 		return h.ugcVisibilityFn()
 	}
 	return h.ugcVisibility
+}
+
+// visitorHidesAll reports whether viewer is an anonymous visitor who must get
+// no content at all under meta.ugcVisibilityForVisitor=none. Mirrors
+// upstream's `me == null && ugcVisibilityForVisitor === 'none'` checks and the
+// `1=0` that generateVisibilityQuery adds for visitors.
+func (h *Handler) visitorHidesAll(viewer *model.User) bool {
+	return viewer == nil && ugcvisibility.HidesAll(h.ugcVisibilityNow())
+}
+
+// filterVisitorUGC drops notes an anonymous visitor must not see under
+// meta.ugcVisibilityForVisitor (`none` → all, `local` → notes whose own author
+// is remote). Signed-in viewers get notes unchanged. Mirrors upstream
+// QueryService.generateUgcVisibilityQueryForVisitor for paths that are
+// filtered after fetching.
+func (h *Handler) filterVisitorUGC(viewer *model.User, notes []*model.Note) []*model.Note {
+	if viewer != nil {
+		return notes
+	}
+	policy := h.ugcVisibilityNow()
+	if !ugcvisibility.HidesAll(policy) && policy != ugcvisibility.Local {
+		return notes
+	}
+	out := make([]*model.Note, 0, len(notes))
+	for _, n := range notes {
+		if !ugcvisibility.HidesNote(policy, n.UserHost) {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // SetDriveFileRepo attaches a DriveFileRepository for file resolution.
@@ -610,7 +642,11 @@ func (h *Handler) Show(c echo.Context) error {
 	packed := entity.PackNoteWithInstance(c.Request().Context(), n, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	s := []entity.NoteEntity{packed}
 	h.fieldResolver().Apply(s, viewer)
-	notehide.HideEmbeds(viewer, s)
+	if h.isCurrentlyPinned(n) {
+		notehide.HidePinnedNotes(viewer, s)
+	} else {
+		notehide.HideEmbeds(viewer, s)
+	}
 	// #2106 H1: ID-known doctrine (#799) で note は 200 で返すが、follower/specified を
 	// 見られない viewer (非フォロワー/匿名/非対象) には upstream NoteEntityService.hideNote
 	// 同様に本文 (text/cw/files/poll/visibleUserIds) を blank する。これを欠くと ID を
@@ -620,6 +656,14 @@ func (h *Handler) Show(c echo.Context) error {
 		entity.HideNoteEntity(&s[0])
 	}
 	return c.JSON(http.StatusOK, s[0])
+}
+
+func (h *Handler) isCurrentlyPinned(n *model.Note) bool {
+	if h.piningRepo == nil || n == nil {
+		return false
+	}
+	p, err := h.piningRepo.FindByPair(n.UserID, n.ID)
+	return err == nil && p != nil
 }
 
 // lookupForShow fetches the note for the /api/notes/show endpoint.
@@ -637,7 +681,7 @@ func (h *Handler) lookupForShow(noteID string) (*model.Note, error) {
 	if h.queryService == nil {
 		return nil, note.ErrNoteNotFound
 	}
-	return h.queryService.ShowForAPI(noteID)
+	return h.queryService.ShowForAPIOnPrimary(noteID)
 }
 
 // DeleteRequest is the request body for notes/delete.
@@ -739,6 +783,13 @@ func (h *Handler) serveList(c echo.Context, noSuchNoteID string, fn func(*model.
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", noSuchNoteID))
 		}
 		return apierr.JSONInternalError(c)
+	}
+	// upstream children/replies/renotes の generateVisibilityQuery は、未ログインの
+	// 閲覧者に ugcVisibilityForVisitor=none で `1=0` を足す。対象ノートの存在確認
+	// (NO_SUCH_NOTE) は従来どおり先に済ませる (upstream renotes も getNote が先)。
+	// `local` は upstream もここでは絞らない。
+	if h.visitorHidesAll(viewer) {
+		return c.JSON(http.StatusOK, []any{})
 	}
 	// upstream children/replies/renotes は generateBaseNoteFilteringQuery で
 	// 被block / mute / instance-mute を除外する (#1554)。QueryService は
@@ -882,16 +933,30 @@ func (h *Handler) Search(c echo.Context) error {
 		}
 	}
 
+	// 未ログインの閲覧者には ugcVisibilityForVisitor を掛ける (upstream
+	// SearchService: SQL 経路は generateVisibilityQuery / generateUgcVisibilityQueryForVisitor、
+	// Meilisearch 経路は `none` で [] と `local` で userHost IS NULL)。`none` は
+	// provider を呼ばずに返す。空クエリは従来どおり provider 側の INVALID_PARAM に任せる。
+	localUsersOnly := false
+	if viewer == nil && req.Query != "" {
+		policy := h.ugcVisibilityNow()
+		if ugcvisibility.HidesAll(policy) {
+			return c.JSON(http.StatusOK, []any{})
+		}
+		localUsersOnly = policy == ugcvisibility.Local
+	}
+
 	notes, err := h.searchService.SearchNote(
 		viewer,
 		req.Query,
 		search.SearchOpts{
-			UserID:       req.UserID,
-			ChannelID:    req.ChannelID,
-			Host:         req.Host,
-			Offset:       req.Offset,
-			RangeStartAt: req.RangeStartAt,
-			RangeEndAt:   req.RangeEndAt,
+			UserID:         req.UserID,
+			ChannelID:      req.ChannelID,
+			Host:           req.Host,
+			Offset:         req.Offset,
+			RangeStartAt:   req.RangeStartAt,
+			RangeEndAt:     req.RangeEndAt,
+			LocalUsersOnly: localUsersOnly,
 		},
 		search.Pagination{
 			UntilID: untilID,
@@ -965,6 +1030,11 @@ func (h *Handler) Conversation(c echo.Context) error {
 	}
 
 	viewer := middleware.GetUser(c)
+	// upstream conversation.ts は ugcVisibilityForVisitor=none の未ログインの
+	// 閲覧者に、ノートを引く前に [] を返す。`local` は upstream も絞らない。
+	if h.visitorHidesAll(viewer) {
+		return c.JSON(http.StatusOK, []any{})
+	}
 	notes, err := h.queryService.Conversation(viewer, req.NoteID, limit, req.Offset)
 	if err != nil {
 		// **DB 障害を not-found に丸めない** (#2799)。`Conversation` は #2799 で
@@ -1034,11 +1104,15 @@ func (h *Handler) BulkShow(c echo.Context) error {
 			return c.JSON(http.StatusOK, []any{})
 		}
 		notes = h.queryService.FilterVisible(viewer, notes)
+		// mk-go 独自の noteIds 経路にも、一覧側と同じ ugcVisibilityForVisitor の
+		// 方針を掛ける (upstream には該当する経路が無い)。
+		notes = h.filterVisitorUGC(viewer, notes)
 		return c.JSON(http.StatusOK, h.packMany(c.Request().Context(), notes, viewer))
 	}
 
 	// noteIds 不在時は upstream notes.ts の public note 一覧。public note のみなので追加の
-	// visibility filter は不要 (upstream も requireCredential:false で filter 無し)。
+	// visibility filter は不要 (upstream も requireCredential:false)。未ログインの閲覧者
+	// 向けの ugcVisibilityForVisitor は下で掛ける。
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -1047,8 +1121,21 @@ func (h *Handler) BulkShow(c echo.Context) error {
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
+	// upstream notes.ts は未ログインの閲覧者に generateUgcVisibilityQueryForVisitor
+	// を掛ける。`local` の条件 (`userHost IS NULL`) は local パラメータと同じなので
+	// それを立てて SQL で絞る。
+	local := req.Local
+	if viewer == nil {
+		policy := h.ugcVisibilityNow()
+		if ugcvisibility.HidesAll(policy) {
+			return c.JSON(http.StatusOK, []any{})
+		}
+		if policy == ugcvisibility.Local {
+			local = true
+		}
+	}
 	notes, err := h.noteRepo.ListPublicNotes(model.PublicNotesFilter{
-		Local:     req.Local,
+		Local:     local,
 		Reply:     req.Reply,
 		Renote:    req.Renote,
 		WithFiles: req.WithFiles,
