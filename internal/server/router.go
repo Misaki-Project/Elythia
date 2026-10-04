@@ -1171,6 +1171,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	deleteAccountProcessor := processors.NewDeleteAccountProcessor(noteRepo, driveFileRepo, followingRepo)
 	// #2230: local user の物理削除に userRepo を配線。未配線だと soft 削除止まりで行が残る。
 	deleteAccountProcessor.SetUserRepo(userRepo)
+	// #3293: ページを 1 件ずつ消して、参照するノートの pageCount を減らす。
+	deleteAccountProcessor.SetPageRepo(pageRepo)
 	s.queueServer.Handle(queue.TaskTypeDeleteAccount, deleteAccountProcessor.Handle)
 
 	// Per-pair Unfollow job (#587): admin/federation/remove-all-following
@@ -1794,6 +1796,10 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	notesHandler.SetClipRepos(clipRepo, clipNoteRepo, clipFavoriteRepo) // #1554: notes/clips
 
 	notehide.SetFollowingRepo(followingRepo)
+	// 匿名 viewer へ pack する note を ugcVisibilityForVisitor='none' で hide する
+	// (upstream NoteEntityService.shouldHideNote)。管理画面の変更を再起動なしで
+	// 反映するよう、起動時の値ではなく都度引く。
+	notehide.SetUGCVisibilityLookup(func() string { return metaUGCVisibility(metaRepo) })
 	// LocalTimeline / GlobalTimeline / HybridTimeline で ltlAvailable /
 	// gtlAvailable role policy を gate するために配線 (#1026)。匿名 viewer に
 	// 対しては GetUserPolicies("") が base policies を返すので、admin が
@@ -1887,6 +1893,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// inline closure から移設)。
 	usersHandler.SetMetaRepo(metaRepo)
 	usersHandler.SetLocalHost(localHost)
+	usersHandler.SetServerURL(s.config.URL)
 	usersHandler.SetChartHook(chartHooks)
 	if roleLevelPluginEnabled(plugins, s.config.Plugins) {
 		usersHandler.SetProfileRoleVisibilityReader(roleLevelProfileVisibilityReader{db: s.db})
@@ -2490,11 +2497,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		feedHost = pu.Host
 	}
 	feedH := &feedHandler{
-		baseURL:   s.config.URL,
-		host:      feedHost,
-		users:     feedUserResolver{repo: userRepo},
-		notes:     noteRepo,
-		parseTime: idGen.ParseTime,
+		baseURL:       s.config.URL,
+		host:          feedHost,
+		users:         feedUserResolver{repo: userRepo},
+		notes:         noteRepo,
+		parseTime:     idGen.ParseTime,
+		ugcVisibility: func() string { return metaUGCVisibility(metaRepo) },
 		profiles: func(userID string) *model.UserProfile {
 			p, err := userRepo.FindProfileByUserID(userID)
 			if err != nil {
@@ -2693,6 +2701,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// channels/timeline の mute / block filter (#2345 の timelines 調査)。
 	channelsHandler.SetMuteBlockRepos(mutingRepo, blockingRepo, noteRepo)
 	channelsHandler.SetDriveFileRepo(driveFileRepo)
+	// channels/timeline の匿名 visitor への ugcVisibilityForVisitor gate。
+	// notes 側と同じ理由で無条件に配線し、毎回読む (#2708)。
+	channelsHandler.SetUGCVisibilityLookup(func() string { return metaUGCVisibility(metaRepo) })
 	// channels/create の canCreateChannel gate は #1020 で middleware に
 	// 昇格 (handler 内 RolePolicyChecker → middleware.RequireRolePolicy)。
 	api.POST("/channels/create", channelsHandler.Create,
@@ -2749,6 +2760,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	clipsHandler.SetQueryService(noteQueryService)           // #1456: AddNote の visibility gate
 	clipsHandler.SetMuteBlockRepos(mutingRepo, blockingRepo) // #1562: Notes の muted/blocked-user filter
 	clipsHandler.SetMetaRepo(metaRepo)                       // #1562: Notes の blocked-host filter
+	// clips/notes の匿名 visitor への ugcVisibilityForVisitor gate (notes 側と同じく無条件・毎回読む)。
+	clipsHandler.SetUGCVisibilityLookup(func() string { return metaUGCVisibility(metaRepo) })
 	api.POST("/clips/create", clipsHandler.Create, middleware.RequireAuth(), middleware.RequireNotMoved(), middleware.RequireScope("write:account"))
 	api.POST("/clips/show", clipsHandler.Show, middleware.RequireScope("read:account"))
 	api.POST("/clips/update", clipsHandler.Update, middleware.RequireAuth(), middleware.RequireNotMoved(), middleware.RequireScope("write:account"))
@@ -2974,6 +2987,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// policy provider を配線する (#1942)。REST timeline と同じく WS でも policy で
 	// 無効化された timeline を subscribe させない (policy bypass 解消)。
 	streamManager.SetPolicyProvider(roleService)
+	// 匿名接続への meta.ugcVisibilityForVisitor (upstream
+	// NoteStreamingHidingService / Connection の noteUpdated)。REST と同じ
+	// metaUGCVisibility を毎回引く (cachedMeta なので event ごとの DB 往復は無い)。
+	// 起動時に焼き込むと、管理画面で締めても再起動まで streaming に効かない。
+	streamManager.SetUGCVisibilityLookup(func() string { return metaUGCVisibility(metaRepo) })
 	// 以下 3 つの subscriber は **WebSocket 接続を持つ role でだけ**起動する
 	// (#2459)。queue role には connection が無いので、購読しても受け取った
 	// event を捨てるだけで Redis pubsub の帯域を食う。
@@ -3841,7 +3859,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.POST("/ap/show", apHandler.APIShow, middleware.RequireAuth(), middleware.RequireScope("read:account"))
 
 	// sw/* — Service Worker push notifications (実データ)
-	swHandler := apisw.NewHandler(swSubRepo, metaRepo, idGen)
+	swHandler := apisw.NewHandler(swSubRepo, metaRepo, idGen, webPushCache)
 	api.POST("/sw/register", swHandler.Register, middleware.RequireAuth(), middleware.RequireSecure())
 	api.POST("/sw/show-registration", swHandler.ShowRegistration, middleware.RequireAuth(), middleware.RequireSecure())
 	api.POST("/sw/update-registration", swHandler.UpdateRegistration, middleware.RequireAuth(), middleware.RequireSecure())
@@ -4009,7 +4027,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.POST("/retention", chartsHandler.Retention)
 
 	// get-avatar-decorations — アバターデコレーション全件取得
-	avatarDecorationsHandler := avatardecorations.NewHandler(s.db, roleService.ExistingRoleIDSet)
+	avatarDecorationsHandler := avatardecorations.NewHandler(s.db, roleService.ExistingRoleIDSet, roleService.PublicRoleIDSet)
 	api.POST("/get-avatar-decorations", avatarDecorationsHandler.Get)
 
 	// email-address/available — メールアドレスの利用可否チェック (public)
@@ -4393,6 +4411,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"配信ごとのミュート / ブロック filter が無効になる (fail-open)"},
 		{"stream.policyProvider", streamManager.HasPolicyProvider(),
 			"streaming の ltlAvailable / gtlAvailable gate が無効になる (fail-open)"},
+		{"stream.ugcVisibilityLookup", streamManager.HasUGCVisibilityLookup(),
+			"未ログインの streaming 接続に ugcVisibilityForVisitor が効かず、全 note と noteUpdated が流れる (fail-open)"},
 		{"inboxProcessor.hostBlockChecker", inboxProcessor.HasHostBlockChecker(),
 			"ブロック済み host / 許可外 host からの activity を受け入れる"},
 		{"inbox.hostBlockChecker", inboxHandler.HasHostBlockChecker(),
@@ -4478,6 +4498,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"匿名 visitor への note 露出を ugcVisibilityForVisitor で gate できない"},
 		{"users.ugcVisibility", usersHandler.HasUGCVisibility(),
 			"匿名 visitor への remote profile 露出を ugcVisibilityForVisitor で gate できない"},
+		{"channels.ugcVisibility", channelsHandler.HasUGCVisibility(),
+			"匿名 visitor への channels/timeline の露出を ugcVisibilityForVisitor で gate できない"},
+		{"clips.ugcVisibility", clipsHandler.HasUGCVisibility(),
+			"匿名 visitor への clips/notes の露出を ugcVisibilityForVisitor で gate できない"},
+		{"deleteAccount.pageRepo", deleteAccountProcessor.HasPageRepo(),
+			"アカウント削除でページが user 行の CASCADE で消え、参照していたノートの pageCount が減らない (リモートのノートが掃除で消えなくなる)"},
+		{"feed.ugcVisibility", feedH.HasUGCVisibility(),
+			"ugcVisibilityForVisitor が none でも Web の feed (.rss / .atom / .json) を返す"},
 
 		// ここから #2709 review。上と収載基準が同じなのに落ちていた分
 		// (無条件配線で、nil が空集合として素通しされる = 緩い側へ倒れる)。

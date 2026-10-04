@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"github.com/shiroha-a/mk/internal/activitypub"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/api/meself"
 	"github.com/shiroha-a/mk/internal/api/notehide"
@@ -17,6 +18,8 @@ import (
 	"github.com/shiroha-a/mk/internal/api/userrelation"
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
+	"github.com/shiroha-a/mk/internal/core/role"
+	"github.com/shiroha-a/mk/internal/core/ugcvisibility"
 	"github.com/shiroha-a/mk/internal/core/user"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -44,7 +47,7 @@ type Handler struct {
 	followingRepo      repository.FollowingRepository
 	memoRepo           repository.UserMemoRepository
 	blockingRepo       repository.BlockingRepository
-	rolePolicyProvider RolePolicyProvider
+	rolePolicyProvider role.PolicyProvider
 	proxyFollow        ProxyFollowEnqueuer
 	abuseCreated       AbuseReportCreatedNotifier
 	mutingRepo         repository.MutingRepository
@@ -76,6 +79,7 @@ type Handler struct {
 	// closure から移設)。
 	metaRepo  repository.MetaRepository
 	localHost string
+	serverURL string
 	// userRepo は users/notes / users/search-by-username-and-host 経由で
 	// 表示する note list の hardMutedWords filter (#787) に使う。
 	userRepo repository.UserRepository
@@ -246,6 +250,13 @@ func (h *Handler) ugcVisibilityNow() string {
 	return h.ugcVisibility
 }
 
+// visitorHidesAllNotes reports whether ugcVisibilityForVisitor = none hides
+// every note from viewer. Mirrors upstream generateVisibilityQuery's
+// `me == null && ugcVisibilityForVisitor === 'none'` → `1=0`.
+func (h *Handler) visitorHidesAllNotes(viewer *model.User) bool {
+	return viewer == nil && ugcvisibility.HidesAll(h.ugcVisibilityNow())
+}
+
 // AbuseReportCreatedNotifier tells moderators about a newly created report
 // (in-app notification / admin stream / abuseReport system webhook)。実装は
 // core/abuse.CreatedNotifier で、連合経由の Flag も同じものを呼ぶ (#3256)。
@@ -288,12 +299,27 @@ func (h *Handler) SetUserRepo(r repository.UserRepository) {
 	h.userRepo = r
 }
 
+// SetServerURL records the canonical instance URL used to recognize local
+// ActivityPub actor URIs.
+func (h *Handler) SetServerURL(u string) {
+	h.serverURL = u
+}
+
 // resolveUserIDByURI resolves an ActivityPub actor URI to a local user ID via
-// a local DB lookup only (no remote fetch). Used by UserDetailed.ResolveMoveTargets
-// to fill movedTo / alsoKnownAs. Returns ("", false) when unwired or unknown.
+// a local DB lookup only (no remote fetch). Canonical local actor URIs are
+// looked up by ID because local users have a NULL URI column; other URIs use
+// FindByURI. Used by UserDetailed.ResolveMoveTargets to fill movedTo /
+// alsoKnownAs. Returns ("", false) when unwired or unknown.
 func (h *Handler) resolveUserIDByURI(uri string) (string, bool) {
 	if h.userRepo == nil {
 		return "", false
+	}
+	if id := activitypub.NewURLBuilder(h.serverURL).LocalUserIDFromURI(uri); id != "" {
+		u, err := h.userRepo.FindByID(id)
+		if err != nil || u == nil {
+			return "", false
+		}
+		return u.ID, true
 	}
 	u, err := h.userRepo.FindByURI(uri)
 	if err == nil && u != nil {
@@ -400,17 +426,10 @@ func (h *Handler) SetBlockingRepo(r repository.BlockingRepository) {
 	h.blockingRepo = r
 }
 
-// RolePolicyProvider abstracts role-policy lookup for `userListLimit` /
-// `userEachUserListsLimit` enforcement in create-from-public (#1550)。実装は
-// core/role.Service。
-type RolePolicyProvider interface {
-	GetUserPolicies(userID string) map[string]any
-}
-
-// SetRolePolicyProvider wires a RolePolicyProvider so create-from-public enforces
+// SetRolePolicyProvider wires a role policy source so create-from-public enforces
 // the userListLimit / userEachUserListsLimit role policies (#1550)。nil 時は
 // limit gate を skip する (= test / 旧挙動)。
-func (h *Handler) SetRolePolicyProvider(p RolePolicyProvider) {
+func (h *Handler) SetRolePolicyProvider(p role.PolicyProvider) {
 	h.rolePolicyProvider = p
 }
 
@@ -482,8 +501,11 @@ func (h *Handler) emojiLookup() entity.EmojiLookup {
 // populateUserEmojis resolves custom emoji names in user.Emojis to URLs and
 // sets lite.Emojis. PackNotes経由でなくUserLite/UserDetailedを直接返す
 // パス (users/show等) で使用する。
+//
+// ローカルの利用者は本家と同じく解決しない (entity.EmojiResolver.PopulateUserEmojis
+// 参照、#3270)。
 func (h *Handler) populateUserEmojis(u *model.User, lite *entity.UserLite) {
-	if h.emojiRepo == nil || u == nil || lite == nil || len(u.Emojis) == 0 {
+	if h.emojiRepo == nil || u == nil || lite == nil || len(u.Emojis) == 0 || u.Host == nil {
 		return
 	}
 	emojis, err := h.emojiRepo.FindManyByNamesAndHost(u.Emojis, u.Host)
@@ -603,8 +625,15 @@ func (h *Handler) Show(c echo.Context) error {
 		// suspended user を除外する。moderator は素通し。
 		visible := make([]*user.UserWithProfile, 0, len(bundles))
 		users := make([]*model.User, 0, len(bundles))
+		// upstream show.ts は匿名 visitor かつ ugcVisibilityForVisitor='local' のとき
+		// where 句に `host: IsNull()` を足し、remote user をエラーにせず黙って省く。
+		// 'none' はこの経路では見ていない (単体指定と同じく upstream に合わせる)。
+		hideRemote := viewer == nil && h.ugcVisibilityNow() == ugcvisibility.Local
 		for _, b := range bundles {
 			if !iAmModerator && b.User.IsSuspended {
+				continue
+			}
+			if hideRemote && b.User.Host != nil {
 				continue
 			}
 			visible = append(visible, b)
@@ -914,7 +943,8 @@ func (h *Handler) Notes(c echo.Context) error {
 
 	// #2106 L9: upstream notes.ts は user 存在確認をせず単に note を query するため、存在しない
 	// userId では [] を返す (noSuchUser は meta の vestigial error)。404 でなく空配列に揃える。
-	if _, err := h.userService.ShowByID(req.UserID); err != nil {
+	target, err := h.userService.ShowByID(req.UserID)
+	if err != nil {
 		return c.JSON(http.StatusOK, []any{})
 	}
 
@@ -958,6 +988,15 @@ func (h *Handler) Notes(c echo.Context) error {
 	// viewer が target にブロックされている場合は空配列を返す (upstream
 	// notes.ts:96-101 の userIdsWhoBlockingMe.has(ps.userId) 早期 return、#1547)。
 	if h.isBlockedByTarget(viewer, req.UserID) {
+		return c.JSON(http.StatusOK, []entity.NoteEntity{})
+	}
+	// upstream users/notes.ts は匿名 visitor に generateUgcVisibilityQueryForVisitor
+	// (`none` → 1=0、`local` → note.userHost IS NULL) を掛ける。この一覧の行は全て
+	// target 本人の投稿で、note.userHost は投稿者の host を写した列なので、条件は
+	// target.Host だけで決まる。行単位で落とす代わりに入口で空を返すので、
+	// ページの過少充填も起きない。remote のノートを renote した local 利用者の
+	// 行は note.userHost が nil なので、upstream と同じく残る。
+	if viewer == nil && ugcvisibility.HidesNote(h.ugcVisibilityNow(), target.User.Host) {
 		return c.JSON(http.StatusOK, []entity.NoteEntity{})
 	}
 	// visibility は repository 側で LIMIT 前に push down する (#1418 review)。

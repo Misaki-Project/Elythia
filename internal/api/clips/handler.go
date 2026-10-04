@@ -14,6 +14,7 @@ import (
 	coreclip "github.com/shiroha-a/mk/internal/core/clip"
 	corenote "github.com/shiroha-a/mk/internal/core/note"
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
+	"github.com/shiroha-a/mk/internal/core/ugcvisibility"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -51,6 +52,29 @@ type Handler struct {
 	noteRepo repository.NoteRepository
 	// materializer はリレー由来で DB に無いノートを昇格させる (#2332)。
 	materializer NoteMaterializer
+	// ugcVisibilityFn は meta.ugcVisibilityForVisitor の live lookup。
+	// clips/notes の匿名 visitor への gate に使う。
+	ugcVisibilityFn func() string
+}
+
+// SetUGCVisibilityLookup wires a live lookup of meta.ugcVisibilityForVisitor.
+//
+// **毎回読む。** 起動時に焼き込むと、運営者が管理画面で締めても
+// プロセスを再起動するまで反映されない。
+func (h *Handler) SetUGCVisibilityLookup(fn func() string) {
+	h.ugcVisibilityFn = fn
+}
+
+// HasUGCVisibility reports whether the visitor content visibility lookup was
+// wired. 未配線だと clips/notes の匿名 visitor への gate が素通しになる。
+// 起動時検査に使う。
+func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibilityFn != nil }
+
+// visitorHidesAllNotes reports whether ugcVisibilityForVisitor = none hides
+// every note from viewer. Mirrors upstream generateVisibilityQuery's
+// `me == null && ugcVisibilityForVisitor === 'none'` → `1=0`.
+func (h *Handler) visitorHidesAllNotes(viewer *model.User) bool {
+	return viewer == nil && h.ugcVisibilityFn != nil && ugcvisibility.HidesAll(h.ugcVisibilityFn())
 }
 
 // SetNoteRepo wires a NoteRepository used by the clips/notes renote-nested
@@ -416,8 +440,8 @@ func (h *Handler) RemoveNote(c echo.Context) error {
 		case errors.Is(err, coreclip.ErrClipNotFound):
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_CLIP", "No such clip.", "b80525c6-97f7-49d7-a42d-ebccd49cfd52"))
 		case errors.Is(err, coreclip.ErrNoteNotFound):
-			// upstream remove-note.ts は note 不在のみ NO_SUCH_NOTE を返す (#1768)。
-			// clip に含まれない note の削除は service 側で silent success になる。
+			// upstream 2026.10.0 の remove-note は、note が無い場合も clip に
+			// 入っていない場合も NO_SUCH_NOTE を返す (4682d44cae)。
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "aff017de-190e-434b-893e-33a9ff5049d8"))
 		}
 		return apierr.JSONInternalError(c)
@@ -477,6 +501,12 @@ func (h *Handler) Notes(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_CLIP", "No such clip.", "1d7645e6-2b6d-4635-b0fe-fe22b0e72e00"))
 		}
 		return apierr.JSONInternalError(c)
+	}
+	// upstream clips/notes.ts の generateVisibilityQuery は匿名 visitor かつ
+	// ugcVisibilityForVisitor='none' のとき 1=0 になる。NO_SUCH_CLIP は query
+	// より前に投げるので、clip の検査を通した後で空を返す。
+	if h.visitorHidesAllNotes(user) {
+		return c.JSON(http.StatusOK, []any{})
 	}
 	// visibility は clip service の ListByClipVisible で push down 済み (#1418
 	// review)。muted-user / blocked-user / blocked-host / hardMutedWords を

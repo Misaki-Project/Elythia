@@ -33,7 +33,7 @@ func TestCriticalWiringCountMatchesTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read wiring_check.go: %v", err)
 	}
-	m := regexp.MustCompile(`(?m)^const criticalWiringCount = (\d+)$`).FindSubmatch(constSrc)
+	m := regexp.MustCompile(`(?m)^const criticalWiringCount = (\d+)\r?$`).FindSubmatch(constSrc)
 	if m == nil {
 		t.Fatal("criticalWiringCount の宣言が見つからない。書き方を変えたならこの gate も直すこと")
 	}

@@ -73,7 +73,7 @@ id: aidx             # Misskey-TS側のID生成方式と一致させること
 
 mk-goの追加テーブルを作り、共有テーブルを upstream の形に揃える。**Misskey-TSが書いたデータは原則として保持される** (例外は `000081` / `000084` / `000085` / `000094` / `000098`、後述)。`000082` も行を DELETE するが、対象は upstream Misskey に無い `transfer-ownership` が作った行だけで TS 由来のものは含まない。`000098` は CherryPick 由来のリモートアバターデコレーションだけを削除する。
 
-共有テーブルにも触るものが 17 件あるので、内容と復路への影響を[破壊的なマイグレーション](#破壊的なマイグレーション)にまとめてある。**先に読むこと。**
+共有テーブルにも触るものが 18 件あるので、内容と復路への影響を[破壊的なマイグレーション](#破壊的なマイグレーション)にまとめてある。**先に読むこと。**
 
 ```bash
 # ローカルビルドの場合
@@ -87,7 +87,7 @@ docker compose exec app /app/migrate -config .config/default.yml -direction up
 
 ### 破壊的なマイグレーション
 
-「追加のみ」ではない。共有テーブルに触るものが 17 件ある。**うち 12 件は mk-go 側だけが作るもの (列 / FK / index / seed / 重複行 / 譲渡が残した membership) の除去、その初期化、または upstream 追随で、Misskey-TS が書いた列の値には影響しない。残る 5 件 (`000081` / `000084` / `000085` / `000094` / `000098`) は TS が書いた値にも当たる (`000098` は TS fork の CherryPick 由来)。**
+「追加のみ」ではない。共有テーブルに触るものが 18 件ある。**うち 13 件は mk-go 側だけが作るもの (列 / FK / index / seed / 重複行 / 譲渡が残した membership) の除去、その初期化、または upstream 追随で、Misskey-TS が書いた列の値には影響しない。残る 5 件 (`000081` / `000084` / `000085` / `000094` / `000098`) は TS が書いた値にも当たる (`000098` は TS fork の CherryPick 由来)。**
 
 | migration | 内容 | 位置づけ |
 |---|---|---|
@@ -108,6 +108,7 @@ docker compose exec app /app/migrate -config .config/default.yml -direction up
 | `000095` | `IDX_user_ip_ip_lastSeenAt` を DROP して `("ip","lastSeenAt" DESC,"userId")` の複合 index を作る | **落とすのは mk-go の `000094` が作った index だけ** — upstream の `user_ip` は `userId` と `UNIQUE (userId, ip)` しか持たないので、TS 由来の index には触らない (`000068` / `000083` と同じ方針)。張り替えるのは、関連候補の抽出 (#3105) が 1 つの IP から取る件数を上限で打ち切るため、`userId` まで index に乗っていないと**同じ最終観測が固まっているときに上限が保証されない**から。down は対称 (旧を作り直して新を落とす) で、行は触らない |
 | `000098` | CherryPick の `avatar_decoration."host" IS NOT NULL` の行をすべて DELETE | **CherryPick が連合先から取り込んだリモート由来のデコレーションだけが対象。** `host IS NULL` のローカル行は保持する。upstream / fresh mk-go のテーブルには `host` 列が無いため、その場合は何もしない。down は no-op で、削除した行は復元できない |
 | `000107` | `abuse_report_notification_recipient` の FK を張り替え (`SET NULL` の mk-go 名 2 本を DROP し、本家と同じ名前の `CASCADE` 3 本を足す) | **upstream 追随** (#3264)。本家 `1713656541000-abuse-report-notification.js` と同じ 3 本 (`userId` -> `user` / `user_profile`、`systemWebhookId` -> `system_webhook`) にする。**TS 製 DB には元から本家の 3 本があるので何もしない** (名前で有無を見て足す)。行は消さない — 直す前に `SET NULL` で宛先が NULL になった通知先は残る。**外部キーを張る前に、本家では作れない形の値を NULL にする** — `user_profile` の無い利用者を指す `userId` (残すと検証で失敗して migration が止まる) と、method に合わない側の参照 (webhook 方式の行の `userId`、email 方式の行の `systemWebhookId`。残すと CASCADE で無関係な削除に巻き込まれて通知先ごと消える)。どれも TS が書く値には当たらず、down でも戻らない |
+| `000108` | `note."pageCount"`をページcontentから数え直して補完 (`UPDATE`) | **upstream追従** (#3293)。既存ページが参照するノートを本家と同じ数え方で補完する。参照されているノートだけを触り、TSが維持した値は変わらない。downはno-op。upstreamの番号107を、適用済みMisaki migration107を保持するため108へ割り当てた |
 
 #### `000081` について
 
@@ -176,7 +177,7 @@ admin 画面 (全般 → 情報) で上書きする。
 
 #### down が no-op のもの
 
-`000053` / `000056` / `000067` / `000068` / `000074` / `000081` / `000082` / `000084` / `000085` / `000097` / `000098` の 11 本は down が `SELECT 1;` で、up を巻き戻せない。**データを不可逆に変えるのはこのうち 10 本**で、変えないのは index を落とすだけの `000068` だけ。`000074` は backfill で入れた行とその後の実観測で入った行を区別できないので、消すと連合中に蓄積した観測まで巻き添えになる。`000084` / `000085` は未設定だった `meta.repositoryUrl` / `meta.feedbackUrl` を埋めるが、その後 operator が同じ値を明示設定した行と区別できないため戻せない。`000097` は「2FA を解除済みなのに `usePasswordLessLogin` が立ったまま」という壊れた状態を直すもので、どの行がそうだったかを記録していないので戻せない (落としたフラグは利用者が立て直せるのでデータ損失にはならない)。`000098` はリモート由来のデコレーション行そのものを削除するため復元できない。
+`000053` / `000056` / `000067` / `000068` / `000074` / `000081` / `000082` / `000084` / `000085` / `000097` / `000098` / `000108` の 12 本は down が `SELECT 1;` で、upを巻き戻せない。データを不可逆に変えるのはこのうち11本で、変えないのはindexを落とすだけの`000068`。`000074`は補完した行と実観測を区別できず、`000084` / `000085`も補完値とoperatorの明示設定を区別できない。`000097`は解除済み2FAと矛盾するフラグを直す。`000098`はリモート由来デコレーション行を削除する。`000108`はページ参照数を補完し、掃除の保護を外さないため元の値へ戻さない。
 
 #### mk-go 内での切り戻し
 
@@ -186,7 +187,7 @@ admin 画面 (全般 → 情報) で上書きする。
 
 **個別の migration を見て「これは安全」と判断しないこと。** 判断材料になりそうなものが 2 つあるが、どちらも当てにならない。
 
-- **`-- data loss:` の宣言。** 現行 migration は 107 本（fork の legacy `000098_drop_remote_avatar_decorations` は無変更、upstream の `000098_registration_closed` は `000106_registration_closed`、通知先FKのmigrationは `000107` へ移設）。`-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある。運用も一貫していない — `000076` は `meta` の設定列 1 本を落とすだけで宣言しているが、同じく `meta` の設定列を落とす `000070` は「data loss も無い」と書いている
+- **`-- data loss:` の宣言。** 現行 migration は 108 本（fork の legacy `000098_drop_remote_avatar_decorations` は無変更、upstream の `000098_registration_closed` は `000106_registration_closed`、通知先FKのmigrationは `000107` へ移設。pageCountの補完は `000108`）。`-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある。運用も一貫していない — `000076` は `meta` の設定列 1 本を落とすだけで宣言しているが、同じく `meta` の設定列を落とす `000070` は「data loss も無い」と書いている
 - **up が冪等かどうか。** `000029` の up は大半が `IF NOT EXISTS` 付きだが、**down は無条件に DROP する**。落ちるのは `user_security_key` / `user_ip` / `user_memo` / `promo_note` / `promo_read` といった **upstream 所有のテーブル**と、`meta` / `user_profile` の 63 列、そして **TypeORM の `migrations` テーブル**。`000067` がわざわざ守っているものを、より悪い形で壊す。宣言は無い。同じ形 (up は冪等、down は無条件 DROP、対象は upstream) は `000030` / `000031` / `000032` / `000038` にもある
 
 方向が違うので別に挙げておくもの:
@@ -270,7 +271,9 @@ Misskey-TSに戻す場合の手順:
 
 データベースは双方向に互換性があり、mk-goが追加したテーブルはMisskey-TSからは無視される。
 
-ただし [破壊的なマイグレーション](#破壊的なマイグレーション) の 17 件は戻らない。うち 12 件は mk-go が自分で作ったものの除去・初期化か upstream 追随なので**戻す必要が無い**。`000056` / `000081` / `000082` / `000098` が消した行と `000053` / `000067` / `000084` / `000085` が上書きした値は、down が `SELECT 1;` の no-op なので復元できない。**`000094` は down を持つが、それでも戻らない** — 消すのは自分で足した列と index だけで、正規化した `ip` の値と統合で消えた行は復元できない (統合前の行数も個別の観測時刻も残っていない)。**`000107` が空にした通知先の参照もdownでは復元できない。** `000107` のFKを巻き戻してからTS版へ戻すと、本家の3本のFKは再作成されないため、このmigrationを巻き戻さずにTS版へ戻す。**`000084` / `000085` が書き換えるのは `meta."repositoryUrl"` と `meta."feedbackUrl"` なので、TS へ戻すときは admin 画面で設定し直すこと** (mk-go のリポジトリと issues を案内したままになる)。この経路を CI で検証しているのは `make dropin-swap-test` (TS → mk-go → TS) で、`make dropin-mkgo-born-test` は逆に mk-go 生まれの DB を TS に引き渡せるかを見ている。
+ただし [破壊的なマイグレーション](#破壊的なマイグレーション) の 18 件は戻らない。うち 13 件は mk-go が自分で作ったものの除去・初期化か upstream 追随なので**戻す必要が無い**。`000056` / `000081` / `000082` / `000098` が消した行と `000053` / `000067` / `000084` / `000085` が上書きした値は、down が `SELECT 1;` の no-op なので復元できない。**`000094` は down を持つが、それでも戻らない** — 消すのは自分で足した列と index だけで、正規化した `ip` の値と統合で消えた行は復元できない (統合前の行数も個別の観測時刻も残っていない)。**`000107` が空にした通知先の参照もdownでは復元できない。** `000107` のFKを巻き戻してからTS版へ戻すと、本家の3本のFKは再作成されないため、このmigrationを巻き戻さずにTS版へ戻す。**`000084` / `000085` が書き換えるのは `meta."repositoryUrl"` と `meta."feedbackUrl"` なので、TS へ戻すときは admin 画面で設定し直すこと** (mk-go のリポジトリと issues を案内したままになる)。この経路を CI で検証しているのは `make dropin-swap-test` (TS → mk-go → TS) で、`make dropin-mkgo-born-test` は逆に mk-go 生まれの DB を TS に引き渡せるかを見ている。
+
+今回追加した`000108`の補完も巻き戻せない。共有テーブルの非追加変更は合計18件、うち13件はmk-go固有の除去・初期化またはupstream追従である。
 
 ## drop-in 互換性の現状 (2026-05-09 時点)
 
@@ -291,7 +294,7 @@ Playwright spec (#744) を **298 ファイル / 40 directory** (directory は sp
 - **サーバーマシン統計** — `enableServerMachineStats` 有効時に gopsutil で CPU / メモリ / ディスク / ネットワークを 2 秒間隔で収集する。**コンテナで動かしている場合、既定では host の値が返る** (gopsutil は cgroup の制限値ではなくホストを見る)。コンテナに割り当てたリソースを見たい場合は別途 cgroup を読む必要がある
 - **search backend** — `notes/search` の provider は `fulltextSearch.provider` で切替。既定 `sqlLike` で **Meilisearch 不要のまま動く** (`lower(text) LIKE` による部分一致。**ILIKE ではない** — pg_bigm の GIN index が効かなくなるため)。upstream TS strict-mode (400 UNAVAILABLE) で揃えたい operator は `provider: "none"` を opt-in で選べる (#877)。Meilisearch / pgroonga は optional
 - **promo は作成できても表示されない** — `admin/promo/create` は 204 を返し DB 行も増えるが、**利用者へ提示する経路が upstream にも mk-go にも無い** (#2781)。告知・露出の機能として使えると期待しないこと。詳細は [api-compatibility.md](api-compatibility.md) の「既知の制限」
-- **upstream 2026.9.1 まで追従済** — 2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 と段階的に追従した (**2026.8.0 に stable は無い**)。各 release の差分は [docs/update/](update/) を参照 (`<yyyymm><nn>diff.md`)
+- **upstream 2026.10.0 まで追従済** — 2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 → 2026.10.0 と段階的に追従した (**2026.8.0 に stable は無い**)。各 release の差分は [docs/update/](update/) を参照 (`<yyyymm><nn>diff.md`)
 
 差分の網羅的な一覧は [divergence.md](divergence.md) を参照。
 

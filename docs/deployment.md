@@ -186,7 +186,7 @@ gh workflow run docker.yml -f tag=1.1.0
 TS版Misskeyのイメージからアセットをコピーすることも可能:
 
 ```dockerfile
-FROM misskey/misskey:2026.9.1 AS misskey-assets
+FROM misskey/misskey:2026.10.0 AS misskey-assets
 FROM ghcr.io/shiroha-a/mk:latest
 COPY --from=misskey-assets /misskey/built /frontend
 COPY --from=misskey-assets /misskey/packages/frontend/assets /client-assets
@@ -307,6 +307,8 @@ make migrate-up
 | `user.followersCount` / `followingCount` | `following` の実件数 |
 | `user.notesCount` | `note` の実件数 |
 | `note.repliesCount` / `renoteCount` | `note.replyId` / `renoteId` の実件数 |
+| `note.clippedCount` | `clip_note` の実件数 (列は smallint なので 32767 で頭打ち) |
+| `note.pageCount` | ページの content が参照する件数 (同上) |
 | 孤児行 | 存在しない user を参照する `note` / `drive_file` / `following` |
 
 これらのカウンタは増減で維持されており、増減はベストエフォート (戻り値を捨てる呼び出しが
@@ -317,11 +319,16 @@ make migrate-up
 **報告に留める。** カウンタは元データから導けるので `-fix` で直せるが、**削除した行は
 復元できない**。影響を確認した上で手動で対応する。
 
-### 検査しないもの
+### 途中から維持し始めたカウンタ
 
-`clippedCount` / `pageCount` は**意図的に対象外**。mk-go はクリップ件数の非正規化カウンタを
-維持せず `clip_note` を直接数える設計なので、常に 0 が正しい値になる
-([divergence.md](divergence.md) 参照)。実件数と突き合わせると全件がずれとして報告される。
+`note.clippedCount` は #1768 から、`note.pageCount` は #3293 から維持している。それより前に
+クリップした行はカウンタが 0 のまま残っているので、`-fix` で実件数に直せる。**リモートノートの
+掃除の保護条件に使われる** (0 だと期限を過ぎたときに消える)。`pageCount` は migration `000108` が
+増やす向きに埋めるので、`-fix` で直るのは参照が無いのに値が残っている行 (下げる向き) だけ。
+
+**クリップを消すと平常時にもずれが出る。** クリップの削除 (利用者の削除による削除を含む) では、
+本家と同じくカウンタを減らさないので、保存値が実件数より大きく残る。`-fix` で下げてよいが、
+下げるとクリップが消えたリモートノートは掃除の対象に戻る (本家では残り続ける)。
 
 ## 設定の実効値を確認する
 
@@ -378,7 +385,7 @@ worker 数は既定値がキューごとに違い、`stuck 検出` は**キュ�
 
 ```
   ok    config.url   https://example.com
-  ok    database     接続 ok / migration version 107
+  ok    database     接続 ok / migration version 108
   ok    database-health dead tuple と VACUUM に問題なし (121 テーブル)
   ok    root user    meta.rootUserId 設定済み
   ok    redis        接続 ok
@@ -630,7 +637,7 @@ upstream以外の設定はTCP構成と同じ。
 
 既存のMisskey (TypeScript版)からの移行手順は[TS版からの移行ガイド](migration-from-ts.md)を参照。
 
-mk-goはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの差し替えだけで移行可能。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 17 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
+mk-goはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの差し替えだけで移行可能。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 18 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
 
 ## アップデート
 

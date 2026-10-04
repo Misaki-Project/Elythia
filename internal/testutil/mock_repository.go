@@ -1047,6 +1047,11 @@ func applyUserFields(u *model.User, fields map[string]any) {
 			if a, ok := v.(model.StringArray); ok {
 				u.Tags = a
 			}
+		case "emojis":
+			// core/user.UpdateProfile は model.StringArray で渡す (#3270)。
+			if a, ok := v.(model.StringArray); ok {
+				u.Emojis = a
+			}
 		}
 	}
 }
@@ -1450,13 +1455,22 @@ func (m *MockNoteRepository) IncrementCount(noteID, column string, delta int) er
 	}
 	switch column {
 	case "renoteCount":
-		n.RenoteCount += int16(delta)
+		n.RenoteCount = floorZero(int(n.RenoteCount) + delta)
 	case "repliesCount":
-		n.RepliesCount += int16(delta)
+		n.RepliesCount = floorZero(int(n.RepliesCount) + delta)
 	case "clippedCount":
-		n.ClippedCount += int16(delta)
+		n.ClippedCount = floorZero(int(n.ClippedCount) + delta)
 	}
 	return nil
+}
+
+// floorZero mirrors the real repository's IncrementCount, which never takes a
+// counter below 0.
+func floorZero(v int) int16 {
+	if v < 0 {
+		return 0
+	}
+	return int16(v)
 }
 
 // IncrementReaction adjusts an in-memory reaction count map.
@@ -1593,6 +1607,9 @@ func (m *MockNoteRepository) SearchByFilter(f model.NoteSearchFilter) ([]*model.
 				}
 			}
 		}
+		if f.LocalUsersOnly && n.UserHost != nil {
+			return false
+		}
 		return true
 	}, f.UntilID, f.SinceID, limit), nil
 }
@@ -1640,6 +1657,17 @@ func (m *MockNoteRepository) listFiltered(filter func(*model.Note) bool, untilID
 func (m *MockNoteRepository) ListByChannelID(channelID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error) {
 	return m.listFiltered(func(n *model.Note) bool {
 		if n.ChannelID == nil || *n.ChannelID != channelID {
+			return false
+		}
+		return m.canViewerSeeNote(viewerID, n)
+	}, untilID, sinceID, limit), nil
+}
+
+// ListLocalByChannelID is ListByChannelID limited to local authors
+// (`userHost IS NULL`), mirroring the real repo.
+func (m *MockNoteRepository) ListLocalByChannelID(channelID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error) {
+	return m.listFiltered(func(n *model.Note) bool {
+		if n.ChannelID == nil || *n.ChannelID != channelID || n.UserHost != nil {
 			return false
 		}
 		return m.canViewerSeeNote(viewerID, n)
@@ -1933,6 +1961,9 @@ func (m *MockNoteRepository) SearchByTag(tagGroups [][]string, viewerID string, 
 		if filter.WithFiles && len(n.FileIDs) == 0 {
 			return false
 		}
+		if filter.LocalUsersOnly && n.UserHost != nil {
+			return false
+		}
 		for _, g := range groups {
 			if hasAll(n, g) {
 				return true
@@ -1964,8 +1995,11 @@ func (m *MockNoteRepository) ListLocalTimeline(limit int, sinceID, untilID strin
 	}, untilID, sinceID, limit), nil
 }
 
-func (m *MockNoteRepository) ListGlobalTimeline(limit int, sinceID, untilID string, _ model.TimelineDBFilter) ([]*model.Note, error) {
+func (m *MockNoteRepository) ListGlobalTimeline(limit int, sinceID, untilID string, f model.TimelineDBFilter) ([]*model.Note, error) {
 	return m.listFiltered(func(n *model.Note) bool {
+		if f.LocalUsersOnly && n.UserHost != nil {
+			return false
+		}
 		return string(n.Visibility) == "public" || string(n.Visibility) == "home"
 	}, untilID, sinceID, limit), nil
 }
@@ -4443,6 +4477,18 @@ func (m *MockClipNoteRepository) Delete(cn *model.ClipNote) error {
 	return nil
 }
 
+// DeleteByPair removes the matching entries and returns how many were removed.
+func (m *MockClipNoteRepository) DeleteByPair(clipID, noteID string) (int64, error) {
+	var n int64
+	for id, cn := range m.Entries {
+		if cn.ClipID == clipID && cn.NoteID == noteID {
+			delete(m.Entries, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *MockClipNoteRepository) FindByPair(clipID, noteID string) (*model.ClipNote, error) {
 	for _, cn := range m.Entries {
 		if cn.ClipID == clipID && cn.NoteID == noteID {
@@ -5933,6 +5979,9 @@ type MockFollowingRepository struct {
 	// Birthdays maps followeeID -> "YYYY-MM-DD" string used by
 	// ListFollowingByBirthday. 未登録のユーザーは誕生日なしとして扱う。
 	Birthdays map[string]string
+	// LastHostListViewer is the viewer passed to the last
+	// ListFollowersByHostCursor / ListFollowingByHostCursor call (nil if none).
+	LastHostListViewer *model.FollowListViewer
 }
 
 func NewMockFollowingRepository() *MockFollowingRepository {
@@ -6243,13 +6292,20 @@ func (m *MockFollowingRepository) hostCursorPage(match func(*model.Following) bo
 	return rows
 }
 
-func (m *MockFollowingRepository) ListFollowersByHostCursor(host, sinceID, untilID string, limit int) ([]*model.Following, error) {
+// ListFollowersByHostCursor records viewer in LastHostListViewer and returns
+// the host's rows. The owner visibility filter is not emulated (the mock has
+// no profiles); it is covered by the repository's real-DB tests.
+func (m *MockFollowingRepository) ListFollowersByHostCursor(host, sinceID, untilID string, limit int, viewer model.FollowListViewer) ([]*model.Following, error) {
+	m.LastHostListViewer = &viewer
 	return m.hostCursorPage(func(f *model.Following) bool {
 		return f.FolloweeHost != nil && *f.FolloweeHost == host
 	}, sinceID, untilID, limit), nil
 }
 
-func (m *MockFollowingRepository) ListFollowingByHostCursor(host, sinceID, untilID string, limit int) ([]*model.Following, error) {
+// ListFollowingByHostCursor records viewer in LastHostListViewer and returns
+// the host's rows (see ListFollowersByHostCursor).
+func (m *MockFollowingRepository) ListFollowingByHostCursor(host, sinceID, untilID string, limit int, viewer model.FollowListViewer) ([]*model.Following, error) {
+	m.LastHostListViewer = &viewer
 	return m.hostCursorPage(func(f *model.Following) bool {
 		return f.FollowerHost != nil && *f.FollowerHost == host
 	}, sinceID, untilID, limit), nil
@@ -8277,13 +8333,14 @@ func (m *MockRelayRepository) ListByStatus(status string) ([]*model.Relay, error
 	return out, nil
 }
 
-func (m *MockRelayRepository) UpdateStatus(id, status string) error {
+// UpdateStatusFrom sets the status to `to` only when it is currently `from`.
+func (m *MockRelayRepository) UpdateStatusFrom(id, from, to string) (bool, error) {
 	r, ok := m.Relays[id]
-	if !ok {
-		return ErrNotFound
+	if !ok || r.Status != from {
+		return false, nil
 	}
-	r.Status = status
-	return nil
+	r.Status = to
+	return true, nil
 }
 
 func (m *MockRelayRepository) Delete(id string) error {
