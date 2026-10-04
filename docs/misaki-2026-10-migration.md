@@ -4,9 +4,11 @@
 
 ## 1. 適用前の条件
 
-**Release 1.5.0の統合・検証中です。原神入り最終runtime imageは未公開・未検証です。この段階では本番を切り替えないでください。**
+**Release 1.5.0の統合とCI検証、原神入り最終runtime imageの公開が完了しました。ただし実ブラウザ・本番構成での動作確認と本番適用は未実施です。公開成功だけを理由に本番を切り替えないでください。**
 
-Release 1.5.0統合frontendの全791件と原神テストは成功しています。本体の必須チェック、GitHub CI、最終image、実ブラウザでの独自機能、本番の動作確認は別に扱います。以前の統合版の成功結果を、1.5.0追加差分の検証結果として流用しません。
+Release 1.5.0統合frontendの全791件と原神テスト、および本体のGitHub CI（全4分割のraceテスト・frontend整合・lint・build・plugin-tests・API互換・同梱selftest）は成功しています。利用者の指示に従い、ローカルの全体`make check`は中断し、PASS扱いしていません。最終imageの公開workflowとregistryのdigestは一致し、linux/amd64対応とrole-level・原神のビルドへの組込みを確認しました。実ブラウザと本番の動作確認は別に扱います。
+
+検証証拠: [本体CI](https://github.com/Misaki-Project/mk/actions/runs/37203326984)、[API互換](https://github.com/Misaki-Project/mk/actions/runs/37203326977)、[同梱selftest](https://github.com/Misaki-Project/mk/actions/runs/37203327152)、[最終image公開](https://github.com/Misaki-Project/mk/actions/runs/37203818744)。初回CIの旧仕様テストのFAILとfrontendのbubble-game timeoutは記録を保持し、修正・再実行後の成功と区別しています。
 
 対象は正式タグ`1.5.0`（`4a7eb80ef60f0bf66d4fa7ad83849a9be72d68b2`）、Misskey基準は2026.10.0です。上流タグへ単純に切り替えるとMisaki独自機能と原神連携を失うため、対応するMisaki最終imageを使用してください。
 
@@ -22,10 +24,13 @@ Release 1.5.0統合frontendの全791件と原神テストは成功していま�
 
 | 対象 | 固定参照 |
 |---|---|
+| 本体ビルド元 | `75a50768bbcc2468642f1590c64e87f1ce75f1f3`（PR18の通常マージ） |
 | frontend | `50d4490066fda6600a1dd6d92f49fca925cca19c` / `2026.10.0-mk.misaki.2`。上流基準は`9eae05e71435512c39d3838e4689be6d7437707a` |
 | frontendアセット | `ghcr.io/misaki-project/misskey-ts-assets:2026.10.0-mk.misaki.2@sha256:498063ce50b2923e4211b6359c8f3c24d54fe537007d8cc9f23b5deb0c9a57cc`。workflow出力とregistryの一致を確認済み |
 | 原神プラグイン | `97eefa37bab74827df764bb8f3a482903c890c98` |
-| 本番に指定するimage | **公開・検証後の`ghcr.io/misaki-project/mk-genshin@sha256:…`。未確定** |
+| 最終runtime image | `ghcr.io/misaki-project/mk-genshin@sha256:9b4818e134b129039fae803b580692689fc31470f35ab8ea8afd3be5915c0863` |
+
+公開タグは`rolelevel-20261002-75a50768bbcc2468642f1590c64e87f1ce75f1f3-37203818744-1`です。既存タグや`latest`を更新せず公開しました。配備には上記digestを使用します。frontendアセット公開時の意図しない`latest`更新は、承認後に旧digestへ復元し、再発防止PR8をマージ済みです。過去タグの修正前workflowは再実行しないでください。
 
 frontendアセットimageはデータ専用です。**アプリケーションの起動imageとして使用しないでください。** 原神のfrontendを含める最終ビルドでは、プラグインを取り込んだlocal frontendのビルドが必要です。旧imageへアセットだけ差し替えても、今回の移行にはなりません。
 
@@ -84,10 +89,10 @@ sudo docker stop "$APP"
 
 ### imageの取得
 
-公開・検証後に、運用者が確認したdigestを設定します。以下の未確定値をそのまま実行してはいけません。
+公開済みの固定digestを設定します。`APP_CONFIG`は実際の構成に置き換え、本番を変更する前に上記の適用条件を満たしてください。
 
 ```sh
-NEW_IMAGE='ghcr.io/misaki-project/mk-genshin@sha256:<検証済み最終digest>'
+NEW_IMAGE='ghcr.io/misaki-project/mk-genshin@sha256:9b4818e134b129039fae803b580692689fc31470f35ab8ea8afd3be5915c0863'
 APP_CONFIG='/絶対パス/default.yml'
 sudo docker pull "$NEW_IMAGE"
 sudo docker image inspect "$NEW_IMAGE"
@@ -95,7 +100,7 @@ sudo docker image inspect "$NEW_IMAGE"
 
 既存の更新スクリプトが旧digestを固定している場合は、設定先のimageを変更してから事前確認を実行します。スクリプトをそのまま実行しても、追従版へ更新されるとは限りません。
 
-今回の本体migrationは`000108_note_page_count_backfill`です。適用済みのMisaki migration106・107は変更しません。108はページから参照されるノートの`pageCount`を増やす方向に補完し、downはno-opです。新しい原神プラグインはmigration10を含みます。プラグインのmigrationは対応版の起動時に適用されるため、本体migrationだけ実行して完了とはしません。
+今回の本体migrationは`000108_note_page_count_backfill`と`000109_user_uri_index`です。適用済みのMisaki migration106・107・108は変更しません。108はページから参照されるノートの`pageCount`を増やす方向に補完し、downはno-opです。109は`user.uri`インデックスを追加します。新しい原神プラグインはmigration10を含みます。プラグインのmigrationは対応版の起動時に適用されるため、本体migrationだけ実行して完了とはしません。
 
 旧プロセス停止後、本番と同じnetwork・UID/GID・設定の供給方法で、本体migrationを一度だけ実行します。次は**host network・UID/GID `1001:1001`・設定ファイルのみmountする構成の例**です。実際のinspectと異なる場合は、その構成に合わせてください。環境変数で設定を補っている場合は、同じ供給元も指定する必要があります。
 
@@ -106,7 +111,7 @@ sudo docker run --rm --network host --user 1001:1001 \
   -config /app/.config/default.yml up
 ```
 
-失敗した場合は新アプリを起動しません。ログと、`schema_migrations`のversion/dirtyを確認します。履歴を直接書き換えたり、無条件にforce/downしたりしないでください。旧版からの正しい経路で適用した後の本体versionは108、dirtyはfalseです。
+失敗した場合は新アプリを起動しません。ログと、`schema_migrations`のversion/dirtyを確認します。履歴を直接書き換えたり、無条件にforce/downしたりしないでください。旧版からの正しい経路で適用した後の本体versionは109、dirtyはfalseです。
 
 ## 4. 旧コンテナを残して切り替える
 
