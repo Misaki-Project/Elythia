@@ -293,3 +293,80 @@ func TestJSONRateLimitExceeded(t *testing.T) {
 	assert.Equal(t, "RATE_LIMIT_EXCEEDED", errObj["code"])
 	assert.Equal(t, UUIDRateLimitExceeded, errObj["id"])
 }
+
+// TestJSONInvalidParam_BodyNotObject pins that once the binder marked the
+// body as not being a JSON object, JSONInvalidParam answers with upstream's
+// ajv envelope (#/type "must be object", default message) whatever message
+// the handler asked for, because ajv reports that violation first.
+func TestJSONInvalidParam_BodyNotObject(t *testing.T) {
+	code, body := invoke(t, func(c echo.Context) error {
+		MarkBodyNotObject(c)
+		return JSONInvalidParam(c, "userId is required.")
+	})
+	assert.Equal(t, http.StatusBadRequest, code)
+	errObj := body["error"].(map[string]any)
+	assert.Equal(t, "INVALID_PARAM", errObj["code"])
+	assert.Equal(t, UUIDInvalidParam, errObj["id"])
+	assert.Equal(t, "Invalid param.", errObj["message"])
+	assert.Equal(t, map[string]any{"param": "#/type", "reason": "must be object"}, errObj["info"])
+}
+
+func TestJSONInvalidParam_NoInfoWithoutMark(t *testing.T) {
+	_, body := invoke(t, func(c echo.Context) error { return JSONInvalidParam(c) })
+	_, hasInfo := body["error"].(map[string]any)["info"]
+	assert.False(t, hasInfo)
+}
+
+// TestMarkedInvalidParam pins which envelope JSONInvalidParam and
+// JSONInvalidParamClient send for each binder mark: upstream's cast error
+// (0b5f1631) wins over the #/type error because ApiCallService casts before
+// ajv runs, and an unmarked request keeps the handler's own envelope.
+func TestMarkedInvalidParam(t *testing.T) {
+	castErr := map[string]any{"param": "limit", "reason": "cannot cast to integer"}
+	typeErr := map[string]any{"param": "#/type", "reason": "must be object"}
+	ownErr := map[string]any{"param": "#/properties/span/enum", "reason": "must be equal to one of the allowed values"}
+	tests := []struct {
+		name     string
+		cast     bool
+		notObj   bool
+		client   bool
+		wantID   string
+		wantInfo any
+	}{
+		{name: "cast via JSONInvalidParam", cast: true, wantID: UUIDInvalidParamCast, wantInfo: castErr},
+		{name: "cast via JSONInvalidParamClient", cast: true, client: true, wantID: UUIDInvalidParamCast, wantInfo: castErr},
+		{name: "cast wins over not-object", cast: true, notObj: true, wantID: UUIDInvalidParamCast, wantInfo: castErr},
+		{name: "not-object via JSONInvalidParamClient", notObj: true, client: true, wantID: UUIDInvalidParam, wantInfo: typeErr},
+		{name: "unmarked JSONInvalidParamClient", client: true, wantID: UUIDInvalidParam, wantInfo: ownErr},
+		{name: "unmarked JSONInvalidParam", wantID: UUIDInvalidParam, wantInfo: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, body := invoke(t, func(c echo.Context) error {
+				if tt.notObj {
+					MarkBodyNotObject(c)
+				}
+				if tt.cast {
+					MarkCastFailure(c, "limit", "integer")
+				}
+				if tt.client {
+					return JSONInvalidParamClient(c, "#/properties/span/enum", "must be equal to one of the allowed values")
+				}
+				return JSONInvalidParam(c)
+			})
+			assert.Equal(t, http.StatusBadRequest, code)
+			errObj := body["error"].(map[string]any)
+			assert.Equal(t, "INVALID_PARAM", errObj["code"])
+			assert.Equal(t, "Invalid param.", errObj["message"])
+			assert.Equal(t, KindClient, errObj["kind"])
+			assert.Equal(t, tt.wantID, errObj["id"])
+			assert.Equal(t, tt.wantInfo, errObj["info"])
+		})
+	}
+}
+
+func TestInvalidParamCast(t *testing.T) {
+	errObj := InvalidParamCast("blocked", "boolean")["error"].(map[string]any)
+	assert.Equal(t, "0b5f1631-7c1a-41a6-b399-cce335f34d85", errObj["id"])
+	assert.Equal(t, map[string]any{"param": "blocked", "reason": "cannot cast to boolean"}, errObj["info"])
+}

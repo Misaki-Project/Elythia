@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/shiroha-a/mk/internal/activitypub"
-	corenote "github.com/shiroha-a/mk/internal/core/note"
 	"github.com/shiroha-a/mk/internal/model"
 )
 
@@ -44,10 +43,18 @@ func (r *Resolver) ResolveMentionedUserIDs(hrefs []string) ([]string, error) {
 	return r.resolveMentionedUserIDs(hrefs)
 }
 
-// ResolveTextMentionUserIDs exposes the unexported resolveTextMentionUserIDs for external tests.
-func (r *Resolver) ResolveTextMentionUserIDs(mentions []corenote.Mention) ([]string, error) {
-	return r.resolveTextMentionUserIDs(mentions)
+// SpecifiedAudience exposes the unexported specifiedAudience for external tests.
+var SpecifiedAudience = specifiedAudience
+
+// ExceedsRemoteMentionLimit exposes the unexported exceedsRemoteMentionLimit
+// for external tests, with a fixed limit.
+func ExceedsRemoteMentionLimit(n *model.Note, mentions, tagHrefs []string, limit int) bool {
+	return exceedsRemoteMentionLimit(n, mentions, tagHrefs, func() int { return limit })
 }
+
+// ExceedsRemoteMentionLimitFunc exposes exceedsRemoteMentionLimit with a lazy
+// limit, so tests can observe whether the limit is looked up.
+var ExceedsRemoteMentionLimitFunc = exceedsRemoteMentionLimit
 
 // ProcessRemoteMove exposes the unexported processRemoteMove for external
 // tests (#2414)。refreshActor 経由では届かないゲート (クールダウン / 連鎖上限 /
@@ -71,3 +78,30 @@ func (r *Resolver) MarkKeyFetchFailed(userID string) { r.markKeyFetchFailed(user
 // **同じ値を push 側 (`handleAdd`) と pull 側 (`resolveFeaturedNotes`) が使う**
 // ので、片方だけ変えたらテストが落ちる形にしておく。
 const FeaturedPinLimit = featuredPinLimit
+
+// SetInboundMentionFetchBudget overrides inboundMentionFetchBudget for one test.
+func SetInboundMentionFetchBudget(t interface{ Cleanup(func()) }, d time.Duration) {
+	prev := inboundMentionFetchBudget
+	inboundMentionFetchBudget = d
+	t.Cleanup(func() { inboundMentionFetchBudget = prev })
+}
+
+// HoldMentionFetchSlots takes every unknown-actor fetch slot until release is
+// called, as if other inbox workers were fetching.
+func (r *Resolver) HoldMentionFetchSlots() (release func()) {
+	n := cap(r.mentionFetch.slots)
+	for range n {
+		r.mentionFetch.slots <- struct{}{}
+	}
+	return func() {
+		for range n {
+			<-r.mentionFetch.slots
+		}
+	}
+}
+
+// InboundMentionFetchSlots exposes inboundMentionFetchSlots for external tests.
+const InboundMentionFetchSlots = inboundMentionFetchSlots
+
+// InboundMentionFailureTTL exposes inboundMentionFailureTTL for external tests.
+const InboundMentionFailureTTL = inboundMentionFailureTTL

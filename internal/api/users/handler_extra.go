@@ -14,7 +14,6 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/api/meself"
 	"github.com/shiroha-a/mk/internal/api/notehide"
 	"github.com/shiroha-a/mk/internal/api/pagination"
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
@@ -390,6 +389,10 @@ func (h *Handler) Reactions(c echo.Context) error {
 		noteByID[ne.ID] = ne
 	}
 
+	// 本家 packManyWithNote は利用者を packMany (UserLite) で組むので、instance と
+	// 絵文字もまとめて埋める (#3330)。
+	liteByUser := h.packLitesByID(reactionUsers(rows))
+
 	out := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		entry := map[string]any{
@@ -403,7 +406,7 @@ func (h *Handler) Reactions(c echo.Context) error {
 			entry["createdAt"] = t.UTC().Format("2006-01-02T15:04:05.000Z")
 		}
 		if r.User != nil {
-			entry["user"] = entity.PackUserLite(r.User)
+			entry["user"] = liteByUser[r.User.ID]
 		}
 		if r.Note != nil {
 			if ne, ok := noteByID[r.Note.ID]; ok {
@@ -570,49 +573,17 @@ func (h *Handler) SearchByUsernameAndHost(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
-	resolver := entity.NewInstanceResolver(h.instanceLookup(), users...)
-
 	// detail=false → UserLite。default (true) は UserDetailed (upstream は
 	// detail default true で UserDetailed pack、#1547)。旧実装は常に UserLite。
 	if req.Detail != nil && !*req.Detail {
-		result := make([]entity.UserLite, 0, len(users))
-		for _, u := range users {
-			lite := entity.PackUserLite(u)
-			resolver.FillUserLite(&lite)
-			h.populateUserEmojis(u, &lite)
-			result = append(result, lite)
-		}
-		return c.JSON(http.StatusOK, result)
+		return c.JSON(http.StatusOK, h.packLites(users))
 	}
 
-	viewer := middleware.GetUser(c)
-	viewerID := ""
-	if viewer != nil {
-		viewerID = viewer.ID
-	}
-	iAmModerator := viewer != nil && h.moderatorChecker != nil && h.moderatorChecker.IsModerator(viewer.ID)
-	ids := make([]string, 0, len(users))
-	for _, u := range users {
-		ids = append(ids, u.ID)
-	}
-	profiles := h.userService.GetProfilesByUserIDs(ids)
+	// 本家 search-by-username-and-host は packMany(users, me, {schema:'UserDetailed'})。
+	// モデレーター向けの項目・関係 (#1980)・カウントのゲート・ピン留め・移行先を
+	// DetailedMany でまとめて組み、自分の行は MeDetailed にする (#3330)。
 	ctx := c.Request().Context()
-	result := make([]any, 0, len(users))
-	for _, u := range users {
-		d := entity.PackUserDetailed(u, profiles[u.ID], h.idGen)
-		resolver.FillUserLite(&d.UserLite)
-		h.populateUserEmojis(u, &d.UserLite)
-		// upstream search-by-username-and-host は packMany(users, me, {schema:'UserDetailed'})
-		// で embed user に viewer 視点の relation block を付ける (#1980)。匿名/self で no-op。
-		viewerIsFollowing := h.viewerRelationRepos().Apply(&d, viewerID, u, profiles[u.ID])
-		// upstream pack は count gate (followersVisibility=followers 等) を isFollowing で
-		// 解く。これが無いと followers-only count が非フォロワーに leak する (#1980、users/search と対称)。
-		isMe := viewer != nil && viewer.ID == u.ID
-		entity.GateCountVisibility(&d, isMe, iAmModerator, viewerIsFollowing)
-		// upstream の pack は isDetailed && isMe で MeDetailed を返す。
-		result = append(result, meself.Pack(ctx, d, u, profiles[u.ID], viewer))
-	}
-	return c.JSON(http.StatusOK, result)
+	return c.JSON(http.StatusOK, h.packDetailedAll(ctx, middleware.GetUser(c), users, h.userService.GetProfilesByUserIDs(userIDs(users))))
 }
 
 // UpdateMemo handles POST /api/users/update-memo.

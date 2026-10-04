@@ -3,12 +3,13 @@ package notehide
 import (
 	"testing"
 
+	"github.com/shiroha-a/mk/internal/core/notesfilter"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/stretchr/testify/require"
 )
 
-func TestPinnedPublicNotesBypassOnlyTopLevelLockdown(t *testing.T) {
+func TestPinnedPublicNotesBypassOnlyTopLevelTimeLockdown(t *testing.T) {
 	cutoff := 0
 	signin := true
 	for _, visibility := range []string{"public", "home"} {
@@ -28,9 +29,14 @@ func TestPinnedPublicNotesBypassOnlyTopLevelLockdown(t *testing.T) {
 					return entity.NoteEntity{ID: "pin", UserID: "author", User: user, Visibility: visibility, CreatedAt: "2020-01-01T00:00:00.000Z", Text: heStr("pinned public"), Renote: embed}
 				}
 				pinned := []entity.NoteEntity{makeNote()}
-				hideBatchAt(nil, pinned, nil, heNowMs, true, true)
-				require.False(t, pinned[0].IsHidden)
-				require.Equal(t, "pinned public", *pinned[0].Text)
+				hidePinnedNotesAt(nil, pinned, nil, heNowMs)
+				if pref == "signin" {
+					require.True(t, pinned[0].IsHidden, "current pins still require sign-in")
+					require.Nil(t, pinned[0].Text)
+				} else {
+					require.False(t, pinned[0].IsHidden)
+					require.Equal(t, "pinned public", *pinned[0].Text)
+				}
 				require.Equal(t, visibility, pinned[0].Visibility)
 				require.True(t, pinned[0].Renote.IsHidden, "pin exception must not reach quoted notes")
 				require.Nil(t, pinned[0].Renote.Text)
@@ -57,14 +63,33 @@ func TestPinnedNotesKeepIntrinsicAccessAndNestedEmbeds(t *testing.T) {
 			quote := followersEmbed("quote", "secret-author")
 			quote.Renote = followersEmbed("nested", "secret-author")
 			public := entity.NoteEntity{ID: "public", UserID: "author", Visibility: "public", Text: heStr("public"), Renote: quote, Reply: followersEmbed("reply", "secret-author")}
-			packed := []entity.NoteEntity{follow, direct, public}
-			hideBatchAt(viewer, packed, followsRepo([2]string{"follower", "author"}), heNowMs, true, true)
-			require.Equal(t, viewerID != "follower" && viewerID != "author", packed[0].IsHidden)
-			require.Equal(t, viewerID != "recipient" && viewerID != "author", packed[1].IsHidden)
-			require.False(t, packed[2].IsHidden)
-			require.True(t, packed[2].Renote.IsHidden)
-			require.True(t, packed[2].Renote.Renote.IsHidden)
-			require.True(t, packed[2].Reply.IsHidden)
+			repo := followsRepo([2]string{"follower", "author"})
+			// Like 1.5.0's profile path, apply intrinsic ACLs before the preference
+			// helper. Disallowed followers/DM notes must not reach the packed list.
+			visible := notesfilter.FilterVisible(viewer, []*model.Note{
+				{ID: follow.ID, UserID: "author", Visibility: model.NoteVisibilityFollowers},
+				{ID: direct.ID, UserID: "author", Visibility: model.NoteVisibilitySpecified, VisibleUserIDs: []string{"recipient"}},
+				{ID: public.ID, UserID: "author", Visibility: model.NoteVisibilityPublic},
+			}, repo)
+			byID := map[string]entity.NoteEntity{follow.ID: follow, direct.ID: direct, public.ID: public}
+			packed := make([]entity.NoteEntity, 0, len(visible))
+			for _, note := range visible {
+				packed = append(packed, byID[note.ID])
+			}
+			hidePinnedNotesAt(viewer, packed, repo, heNowMs)
+			got := make(map[string]entity.NoteEntity, len(packed))
+			for _, note := range packed {
+				got[note.ID] = note
+			}
+			_, hasFollow := got[follow.ID]
+			_, hasDirect := got[direct.ID]
+			require.Equal(t, viewerID == "follower" || viewerID == "author", hasFollow)
+			require.Equal(t, viewerID == "recipient" || viewerID == "author", hasDirect)
+			pin := got[public.ID]
+			require.False(t, pin.IsHidden)
+			require.True(t, pin.Renote.IsHidden)
+			require.True(t, pin.Renote.Renote.IsHidden)
+			require.True(t, pin.Reply.IsHidden)
 		})
 	}
 }
@@ -72,7 +97,7 @@ func TestPinnedNotesKeepIntrinsicAccessAndNestedEmbeds(t *testing.T) {
 func TestHidePinnedNotesPublicEntryPoint(t *testing.T) {
 	signin := true
 	packed := []entity.NoteEntity{{ID: "pin", UserID: "author", User: entity.UserLite{ID: "author", RequireSigninToViewContents: &signin}, Visibility: "public", Text: heStr("public pin")}}
-	HidePinnedNotes(nil, packed, nil)
-	require.False(t, packed[0].IsHidden)
-	require.NotNil(t, packed[0].Text)
+	HidePinnedNotes(nil, packed)
+	require.True(t, packed[0].IsHidden)
+	require.Nil(t, packed[0].Text)
 }

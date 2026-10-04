@@ -27,7 +27,7 @@
 # digest のままだと tag だけ新しい古い frontend が焼き込まれる。docker.yml の
 # `build-and-push-bundled` が tag と digest の対応を registry に問い合わせて確かめる。
 # 取り直し方は docs/upstream-catch-up.md。
-ARG MISSKEY_ASSETS_IMAGE=ghcr.io/misaki-project/misskey-ts-assets:2026.10.0-mk.misaki.1@sha256:b56b830a7a884fbb07f181703cd6f252bd4f0e7aa88d4ee8d762f22c31744d75
+ARG MISSKEY_ASSETS_IMAGE=ghcr.io/misaki-project/misskey-ts-assets:2026.10.0-mk.misaki.2@sha256:498063ce50b2923e4211b6359c8f3c24d54fe537007d8cc9f23b5deb0c9a57cc
 
 # アセットの供給元。既定は external (公式のアセットイメージ) で、プラグインの
 # frontend を含めたいときだけ local に切り替える (#2940)。
@@ -78,7 +78,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/migrate ./cmd/migrate && \
     CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-remote-host ./cmd/backfill-remote-host && \
     CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-emoji-system-file ./cmd/backfill-emoji-system-file && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-avatar-public-url ./cmd/backfill-avatar-public-url
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-avatar-public-url ./cmd/backfill-avatar-public-url && \
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-instance-counts ./cmd/backfill-instance-counts
 
 # Stage 2: フロントエンドアセット
 #
@@ -124,6 +125,7 @@ COPY --from=builder /app/built/migrate /app/migrate
 COPY --from=builder /app/built/backfill-remote-host /app/backfill-remote-host
 COPY --from=builder /app/built/backfill-emoji-system-file /app/backfill-emoji-system-file
 COPY --from=builder /app/built/backfill-avatar-public-url /app/backfill-avatar-public-url
+COPY --from=builder /app/built/backfill-instance-counts /app/backfill-instance-counts
 COPY --from=builder /app/migration /app/migration
 COPY .config/docker.yml.example /app/.config/default.yml
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
+	"github.com/shiroha-a/mk/internal/server/middleware"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -180,7 +182,7 @@ func (h *Handler) Signin(c echo.Context) error {
 		McaptchaResponse    string `json:"m-captcha-response"`
 		TestcaptchaResponse string `json:"testcaptcha-response"`
 	}
-	if err := c.Bind(&req); err != nil || req.Username == "" {
+	if err := decodeSigninBody(c, &req); err != nil || req.Username == "" {
 		return c.JSON(http.StatusBadRequest, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
 	}
 
@@ -287,24 +289,50 @@ func (h *Handler) Signin(c echo.Context) error {
 // `next` 値で switch するので、`'captcha' | 'password' | 'totp' | 'passkey'`
 // 以外は受け付けない (#705)。
 func (h *Handler) SigninFlow(c echo.Context) error {
-	var req struct {
-		Username   string          `json:"username"`
-		Password   *string         `json:"password"`
-		Token      *string         `json:"token"`
-		Credential json.RawMessage `json:"credential"`
-		// CAPTCHA tokens — フロントエンドは有効な provider の token だけ送る。
-		HcaptchaResponse    string `json:"hcaptcha-response"`
-		RecaptchaResponse   string `json:"g-recaptcha-response"`
-		TurnstileResponse   string `json:"turnstile-response"`
-		McaptchaResponse    string `json:"m-captcha-response"`
-		TestcaptchaResponse string `json:"testcaptcha-response"`
+	body, err := readSigninObject(c)
+	if err != nil {
+		return err
 	}
-	if err := c.Bind(&req); err != nil || req.Username == "" {
-		return c.JSON(http.StatusBadRequest, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
+	// 本家は `typeof username !== 'string'` と、null でも文字列でもない
+	// token を `reply.code(400); return;` (本文の無い 400) で返す。どちらも
+	// ユーザーを引く前 (`SigninApiService.ts`)。以前の mk-go は body を読めない
+	// ものとして 6cc579cc の 400 にまとめていた (#3330)。
+	username, ok := jsonString(body["username"])
+	if !ok {
+		return c.NoContent(http.StatusBadRequest)
+	}
+	var req struct {
+		Password   *string
+		Token      *string
+		Credential json.RawMessage
+		// CAPTCHA tokens — フロントエンドは有効な provider の token だけ送る。
+		HcaptchaResponse    string
+		RecaptchaResponse   string
+		TurnstileResponse   string
+		McaptchaResponse    string
+		TestcaptchaResponse string
+	}
+	if raw := body["token"]; !jsonNullish(raw) {
+		token, ok := jsonString(raw)
+		if !ok {
+			return c.NoContent(http.StatusBadRequest)
+		}
+		req.Token = &token
+	}
+	req.Credential = body["credential"]
+	req.HcaptchaResponse = captchaToken(body["hcaptcha-response"])
+	req.RecaptchaResponse = captchaToken(body["g-recaptcha-response"])
+	req.TurnstileResponse = captchaToken(body["turnstile-response"])
+	req.McaptchaResponse = captchaToken(body["m-captcha-response"])
+	req.TestcaptchaResponse = captchaToken(body["testcaptcha-response"])
+
+	// 空文字列も文字列なので、本家はそのまま引いて見つからず 404 になる。
+	if username == "" {
+		return c.JSON(http.StatusNotFound, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
 	}
 
 	// ユーザー検索 (小文字で検索)
-	user, err := h.userRepo.FindByUsernameLower(req.Username, nil)
+	user, err := h.userRepo.FindByUsernameLower(username, nil)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
@@ -321,6 +349,15 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 	// TS upstream: 2FA 有効 → "password"、2FA 無効 → "captcha" (captcha 設定の有無に
 	// 関わらず常に 'captcha' を返す。フロントが captcha widget の表示要否を
 	// instance meta で判定する)。
+	// 本家は `password == null` で見るので、null も未提供と同じ。文字列で
+	// なければ本文の無い 400 (ユーザーを引いた後なので 404 / 凍結が先)。
+	if raw := body["password"]; !jsonNullish(raw) {
+		password, ok := jsonString(raw)
+		if !ok {
+			return c.NoContent(http.StatusBadRequest)
+		}
+		req.Password = &password
+	}
 	if req.Password == nil {
 		next := "password"
 		if p, perr := h.userRepo.FindProfileByUserID(user.ID); perr == nil && p != nil {
@@ -365,7 +402,7 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 	// ない。許容すると、正しい password でも 403 (「パスワードが違います」) を
 	// 返し、身に覚えのない失敗ログイン履歴まで残す。
 	tolerateUnavailable := profile.UsePasswordLessLogin && profile.TwoFactorEnabled &&
-		len(req.Credential) > 0 && (req.Token == nil || *req.Token == "")
+		jsonTruthy(req.Credential) && (req.Token == nil || *req.Token == "")
 
 	scheme, passwordOK, handled := h.verifyPasswordTolerant(c, user.ID, storedPassword, *req.Password, tolerateUnavailable)
 	if handled {
@@ -460,17 +497,17 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 	}
 
 	// Step 3 (Key): credential が来ていれば WebAuthn assertion を検証する。
-	if len(req.Credential) > 0 {
+	// 本家は `else if (body.credential)` で、JS の truthy で見る。`null` /
+	// `false` / `0` / `""` は credential が無いものとして次の分岐 (challenge の
+	// 発行) へ進む (#3330)。
+	if jsonTruthy(req.Credential) {
 		if !passwordOK && !profile.UsePasswordLessLogin {
 			return h.fail(c, user, http.StatusForbidden, "932c904e-9460-45b7-9ce6-7ed33be7eb2c")
 		}
 		if !hasKeys || h.webauthnSvc == nil {
 			return h.fail(c, user, http.StatusForbidden, "93b86c4b-72f9-40eb-9815-798928603d1e")
 		}
-		httpReq, werr := wrapWebAuthnRequest(c.Request(), req.Credential)
-		if werr != nil {
-			return c.JSON(http.StatusBadRequest, errBody("ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
-		}
+		httpReq := twofactor.CredentialRequest(c.Request(), req.Credential)
 		// UV (PIN / 生体認証) は FinishLogin が常に要求する (upstream と同じ)。
 		// password が合っていないのにここへ来る usePasswordLessLogin の利用者は
 		// 鍵が唯一の要素になるので、UV が無いと鍵を拾った相手がそれだけで
@@ -770,19 +807,131 @@ func errBody(id string) map[string]any {
 	}
 }
 
-// wrapWebAuthnRequest builds a fresh *http.Request whose body is the
-// browser-supplied attestation/assertion JSON. go-webauthn parses the body
-// directly off the request, so we cannot pass through the original Echo
-// request (its body has already been consumed by Bind()).
-func wrapWebAuthnRequest(orig *http.Request, body json.RawMessage) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(orig.Context(), http.MethodPost, orig.URL.String(), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+// signinDecodeOptions are encoding/json's v1 semantics except that object
+// keys bind to struct fields only on an exact (case-sensitive) match.
+var signinDecodeOptions = jsonv2.JoinOptions(json.DefaultOptionsV1(), jsonv2.MatchCaseInsensitiveNames(false))
+
+// decodeSigninBody decodes a signin body into dst, matching object keys
+// exactly like upstream reads `body['username']` off the parsed JS object.
+// Only an application/json body is read; any other body leaves dst as is,
+// since upstream never gets a usable object from it (Fastify answers
+// form-urlencoded with 415, text/plain becomes a string and multipart leaves
+// the body undefined).
+//
+// 本番では server の JSONSerializer も完全一致で読むが (#3330)、c.Bind は
+// 配線に依存する (echo の既定の serializer は大文字小文字を無視するので、
+// `{"CREDENTIAL": ...}` が credential に入る)。signin は資格情報を受ける経路
+// なので、handler 自身で本家と同じ読み方に固定する。
+func decodeSigninBody(c echo.Context, dst any) error {
+	req := c.Request()
+	if req.Body == nil || !middleware.IsJSONContentType(req.Header.Get(echo.HeaderContentType)) {
+		return nil
 	}
-	req.Header = orig.Header.Clone()
-	req.Header.Set("Content-Type", "application/json")
-	req.Body = io.NopCloser(bytes.NewReader(body))
-	return req, nil
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
+	}
+	return jsonv2.Unmarshal(body, dst, signinDecodeOptions)
+}
+
+// readSigninObject returns the members of a signin body the way upstream
+// reads `body['username']` etc. off Fastify's request.body. A body that is
+// not a JSON object (an array, a string, a number, a boolean, null, a
+// text/plain body or no body) has no members. It returns an error only for
+// a JSON body that is not valid JSON, which JSONBodyParse answers before the
+// handler in production.
+//
+// 本家はこの 2 つ (`signin-flow` / `signin-with-passkey`) の body の型を
+// 検査しない (endpoint-base の外なので ajv も通らない)。キーは JS の object
+// と同じく完全一致で、重複したキーは後の値が勝つ。
+// 本家で null や body 無しは `body['credential']` が TypeError で 500 になる。
+// mk-go はそれを再現せず、member が無いものとして扱う (docs/divergence.md)。
+func readSigninObject(c echo.Context) (map[string]json.RawMessage, error) {
+	req := c.Request()
+	if req.Body == nil || !middleware.IsJSONContentType(req.Header.Get(echo.HeaderContentType)) {
+		return nil, nil
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, echo.NewHTTPError(http.StatusBadRequest).SetInternal(err)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, nil
+	}
+	if !json.Valid(body) {
+		return nil, echo.NewHTTPError(http.StatusBadRequest, "invalid JSON body")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(body, &obj) != nil {
+		return nil, nil
+	}
+	return obj, nil
+}
+
+// jsonNullish reports whether a raw JSON member is absent or null, which is
+// what upstream's `x == null` matches.
+func jsonNullish(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) == 0 || string(raw) == "null"
+}
+
+// jsonString returns a raw JSON member as a string when it is a JSON string,
+// which is what upstream's `typeof x === 'string'` matches.
+func jsonString(raw json.RawMessage) (string, bool) {
+	var s string
+	if jsonNullish(raw) || json.Unmarshal(raw, &s) != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// captchaToken returns a captcha response member the way upstream hands
+// `body['hcaptcha-response']` etc. to CaptchaService: a string as is, an
+// absent or null member as "" (upstream's `response == null` check rejects
+// both as captcha-required), and any other value as its JSON text.
+//
+// 本家は文字列でない値もそのまま provider へ送るので検証に落ちる。JSON の
+// 文字列表現は provider が発行する token とも testcaptcha の
+// `testcaptcha-passed` とも一致しないので、同じく落ちる。以前は型の違反を
+// body を読めないものとして 6cc579cc の 400 にしていた (#3330)。
+func captchaToken(raw json.RawMessage) string {
+	if jsonNullish(raw) {
+		return ""
+	}
+	if s, ok := jsonString(raw); ok {
+		return s
+	}
+	return string(bytes.TrimSpace(raw))
+}
+
+// jsonTruthy reports whether a raw JSON value is truthy in the JavaScript
+// sense. An absent value, null, false, 0 and "" are falsy; everything else,
+// including empty arrays and objects, is truthy.
+func jsonTruthy(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return false
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		// 数値のレンジ外 (`1e999`) などは JS では Infinity で truthy。
+		return true
+	}
+	switch t := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return t
+	case float64:
+		return t != 0
+	case string:
+		return t != ""
+	default:
+		return true
+	}
 }
 
 // encodeCredID returns the storage key (base64url) for a webauthn credential

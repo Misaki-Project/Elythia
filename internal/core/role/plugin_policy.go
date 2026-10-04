@@ -192,7 +192,19 @@ func (s *Service) snapshotPolicyProviders() []policyProvider {
 // bounded per-provider LRU; plugins must explicitly invalidate affected inputs
 // after committed state changes.
 func (s *Service) GetUserPoliciesChecked(userID string) (map[string]any, error) {
-	return s.resolvePolicies(userID)
+	return s.resolvePolicies(userID, nil)
+}
+
+// GetUserPoliciesCheckedForKeys resolves policies using only providers that
+// declare at least one of keys. Native base/role policies are still resolved in
+// full. This lets a narrow authorization decision fail closed for providers
+// that can affect it without coupling the decision to unrelated plugins.
+func (s *Service) GetUserPoliciesCheckedForKeys(userID string, keys ...string) (map[string]any, error) {
+	providerKeys := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		providerKeys[key] = struct{}{}
+	}
+	return s.resolvePolicies(userID, providerKeys)
 }
 
 // resolvePolicies computes effective policies for userID, invoking registered
@@ -204,7 +216,7 @@ func (s *Service) GetUserPoliciesChecked(userID string) (map[string]any, error) 
 // back to the native default silently would answer "allowed" for a base
 // override the admin may have set to deny. Concurrent failures (base and
 // role input) are joined, so neither cause is dropped.
-func (s *Service) resolvePolicies(userID string) (out map[string]any, err error) {
+func (s *Service) resolvePolicies(userID string, providerKeys map[string]struct{}) (out map[string]any, err error) {
 	providers := s.snapshotPolicyProviders()
 	// applyMetaBasePolicies が base を mutate するため共有 cache ではなく clone を使う。
 	base := DefaultPoliciesClone()
@@ -222,6 +234,7 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 		basePolicyErr := fmt.Errorf("role: effective policy base: %w", baseErr)
 		defer func() { err = joinBasePolicyError(basePolicyErr, err) }()
 	}
+	providers = policyProvidersForKeys(providers, providerKeys)
 	if userID == "" && len(providers) == 0 {
 		return s.applyServerCaps(base), nil
 	}
@@ -379,16 +392,25 @@ func (s *Service) resolvePolicies(userID string) (out map[string]any, err error)
 	}
 }
 
-// joinBasePolicyError adds the unreadable-base failure to whatever the rest of
-// the resolution already reported. **base の error で無条件に上書きしない。**
-// 上書きすると、base と role 入力が同時に壊れた instance で role 入力側の原因が
-// 黙って消え「片方だけ直せば戻った」ように見える。`errors.Join` なら
-// `errors.Is` がどちらの原因も辿れるので、呼び出し側の fail closed 判断と
-// 運用者の原因切り分けの両方を失わない。
-//
-// 原因が base だけのときは join せずそのまま返す。合成すると 1 行の error が
-// 改行区切りになり、`errors.Unwrap` も切られて、1 原因の経路の読みやすさを
-// 保つ。
+// policyProvidersForKeys limits checked authorization to relevant providers.
+func policyProvidersForKeys(providers []policyProvider, keys map[string]struct{}) []policyProvider {
+	if keys == nil {
+		return providers
+	}
+	filtered := make([]policyProvider, 0, len(providers))
+	for _, provider := range providers {
+		for _, key := range provider.reg.Keys {
+			if _, ok := keys[key]; ok {
+				filtered = append(filtered, provider)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
+// joinBasePolicyError retains both base and role-input failures. A sole base
+// failure remains a single-cause wrap for errors.Unwrap and readable logging.
 func joinBasePolicyError(baseErr, resolveErr error) error {
 	if resolveErr == nil {
 		return baseErr

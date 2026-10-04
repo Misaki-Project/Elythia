@@ -31,6 +31,7 @@ type fullProcessorEnv struct {
 	noteRepo     *testutil.MockNoteRepository
 	reactionRepo *testutil.MockNoteReactionRepository
 	emojiRepo    *testutil.MockEmojiRepository
+	resolver     *federation.Resolver
 }
 
 func newFullProcessor(t *testing.T, fetcherBody string) *fullProcessorEnv {
@@ -60,7 +61,7 @@ func newFullProcessorFetcher(t *testing.T, fetcher federation.HTTPFetcher) *full
 	reactionSvc := corereaction.NewService(noteRepo, reactionRepo, emojiRepo, followingRepo, idGen)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	p := federation.NewProcessor(resolver, followingSvc, reactionSvc, deleteSvc, userRepo, noteRepo)
-	return &fullProcessorEnv{processor: p, userRepo: userRepo, noteRepo: noteRepo, reactionRepo: reactionRepo, emojiRepo: emojiRepo}
+	return &fullProcessorEnv{processor: p, userRepo: userRepo, noteRepo: noteRepo, reactionRepo: reactionRepo, emojiRepo: emojiRepo, resolver: resolver}
 }
 
 const noteCreateBody = `{
@@ -1295,7 +1296,7 @@ func TestProcess_RejectFollow(t *testing.T) {
 // 直後の `normalizeActor` (#999) も効いている (#2665)。
 func TestProcess_RejectFollow_InnerActorEmbeddedObject(t *testing.T) {
 	p, repo, followingRepo, _ := newProcessor(t, aliceActor)
-	// **local user は本番と同じく uri NULL。** `resolveTargetUser` の
+	// **local user は本番と同じく uri NULL。** `userFromAPID` の
 	// local-ID 分岐を通すために base URL を配線する (偽の uri を持たせて
 	// FindByURI で通すと、本番に無い経路でしかテストしていないことになる)。
 	p.SetLocalBaseURL("https://example.com")

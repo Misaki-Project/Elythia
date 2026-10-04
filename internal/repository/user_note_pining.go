@@ -3,6 +3,7 @@ package repository
 import (
 	"github.com/shiroha-a/mk/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/plugin/dbresolver"
 )
 
 // UserNotePiningRepository provides data access for the `user_note_pining` table.
@@ -18,6 +19,15 @@ type UserNotePiningRepository interface {
 	// しないのは、**リモート側で外されたピンを残さない**ため。upstream
 	// ApPersonService.updateFeatured も同じく全削除してから入れ直す。
 	ReplaceByUser(userID string, pins []*model.UserNotePining) error
+}
+
+// UserNotePiningBatchReader lists the pins of many users in one query.
+//
+// 一覧の応答 (users/followers など) でピン留めを利用者ごとに引くと N+1 になる。
+// 本家 UserEntityService.packMany もピン留めを IN でまとめて引く。
+type UserNotePiningBatchReader interface {
+	// ListByUsers returns the pins of userIDs ordered by id DESC.
+	ListByUsers(userIDs []string) ([]*model.UserNotePining, error)
 }
 
 type userNotePiningRepository struct {
@@ -42,7 +52,9 @@ func (r *userNotePiningRepository) FindByPair(userID, noteID string) (*model.Use
 		return nil, ErrNotFound
 	}
 	var p model.UserNotePining
-	if err := r.db.Where("\"userId\" = ? AND \"noteId\" = ?", userID, noteID).First(&p).Error; err != nil {
+	if err := r.db.Clauses(dbresolver.Write).
+		Where("\"userId\" = ? AND \"noteId\" = ?", userID, noteID).
+		First(&p).Error; err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -50,7 +62,23 @@ func (r *userNotePiningRepository) FindByPair(userID, noteID string) (*model.Use
 
 func (r *userNotePiningRepository) ListByUser(userID string) ([]*model.UserNotePining, error) {
 	var rows []*model.UserNotePining
-	if err := r.db.Where("\"userId\" = ?", userID).
+	if err := r.db.Clauses(dbresolver.Write).
+		Where("\"userId\" = ?", userID).
+		Order("id DESC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *userNotePiningRepository) ListByUsers(userIDs []string) ([]*model.UserNotePining, error) {
+	userIDs = storableIDs(userIDs)
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	var rows []*model.UserNotePining
+	if err := r.db.Clauses(dbresolver.Write).
+		Where("\"userId\" IN ?", userIDs).
 		Order("id DESC").
 		Find(&rows).Error; err != nil {
 		return nil, err

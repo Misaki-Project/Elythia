@@ -15,7 +15,7 @@ import (
 	"gorm.io/datatypes"
 )
 
-func TestShowPinnedNotesPreservePublicDuringLockdown(t *testing.T) {
+func TestShowPinnedNotesKeepSigninAndIntrinsicVisibility(t *testing.T) {
 	for _, viewerID := range []string{"", "outsider", "follower", "recipient"} {
 		t.Run(viewerID, func(t *testing.T) {
 			h, users := newTestHandler(t)
@@ -55,9 +55,14 @@ func TestShowPinnedNotesPreservePublicDuringLockdown(t *testing.T) {
 			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
 			ids := []string{}
 			for _, note := range response.PinnedNotes {
-				require.False(t, note.IsHidden)
-				require.NotNil(t, note.Text)
-				require.Equal(t, "content "+note.ID, *note.Text)
+				if viewerID == "" {
+					require.True(t, note.IsHidden, "1.5.0 pins do not bypass sign-in")
+					require.Nil(t, note.Text)
+				} else {
+					require.False(t, note.IsHidden)
+					require.NotNil(t, note.Text)
+					require.Equal(t, "content "+note.ID, *note.Text)
+				}
 				require.Equal(t, note.ID, note.Visibility)
 				ids = append(ids, note.ID)
 			}

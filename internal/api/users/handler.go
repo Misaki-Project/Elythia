@@ -3,6 +3,7 @@ package users
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/shiroha-a/mk/internal/core/role"
 	"github.com/shiroha-a/mk/internal/core/ugcvisibility"
 	"github.com/shiroha-a/mk/internal/core/user"
+	"github.com/shiroha-a/mk/internal/core/userpack"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -622,14 +624,17 @@ func (h *Handler) Show(c echo.Context) error {
 			return apierr.JSONInternalError(c)
 		}
 		// upstream show.ts:136-141 は非 moderator に isSuspended:false を強制して
-		// suspended user を除外する。moderator は素通し。
+		// suspended user を除外する。物理削除待ちか行保持かを問わず local deleted
+		// user も非 moderator から隠すが、remote user と moderator の既存契約は維持する。
 		visible := make([]*user.UserWithProfile, 0, len(bundles))
-		users := make([]*model.User, 0, len(bundles))
 		// upstream show.ts は匿名 visitor かつ ugcVisibilityForVisitor='local' のとき
 		// where 句に `host: IsNull()` を足し、remote user をエラーにせず黙って省く。
 		// 'none' はこの経路では見ていない (単体指定と同じく upstream に合わせる)。
 		hideRemote := viewer == nil && h.ugcVisibilityNow() == ugcvisibility.Local
 		for _, b := range bundles {
+			if !iAmModerator && b.User.IsDeleted && b.User.IsLocal() {
+				continue
+			}
 			if !iAmModerator && b.User.IsSuspended {
 				continue
 			}
@@ -637,36 +642,22 @@ func (h *Handler) Show(c echo.Context) error {
 				continue
 			}
 			visible = append(visible, b)
-			users = append(users, b.User)
 		}
-		resolver := entity.NewInstanceResolver(h.instanceLookup(), users...)
 		// upstream show.ts:151-153 は userIds バルクモードでも schema 'UserDetailed'
-		// で pack する。旧実装は UserLite を返していた (#1547)。move 解決と remote
-		// stats fetch は list path 同様 N+1 回避のため bulk では行わない。
-		out := make([]any, 0, len(visible))
-		viewerID := ""
-		if viewer != nil {
-			viewerID = viewer.ID
+		// で pack する。旧実装は UserLite を返していた (#1547)。remote stats fetch は
+		// list path 同様 N+1 回避のため bulk では行わない。モデレーター向けの項目・
+		// 関係 (#2106 N2)・カウントのゲート・ピン留め・移行先・instance・絵文字は
+		// 本家 packMany と同じく DetailedMany でまとめて組み、関係は getRelations と
+		// 同じく関係ごとに 1 回の IN で引く (#3330)。自分の行は MeDetailed になる。
+		users := make([]*model.User, len(visible))
+		profiles := make(map[string]*model.UserProfile, len(visible))
+		for i, b := range visible {
+			users[i] = b.User
+			if b.Profile != nil {
+				profiles[b.User.ID] = b.Profile
+			}
 		}
-		ctx := c.Request().Context()
-		for _, b := range visible {
-			detailed := entity.PackUserDetailed(b.User, b.Profile, h.idGen)
-			h.applyProfileRoleVisibility(ctx, b.User.ID, &detailed)
-			resolver.FillUserLite(&detailed.UserLite)
-			h.populateUserEmojis(b.User, &detailed.UserLite)
-			h.applyModerationNote(&detailed, iAmModerator, b.Profile)
-			entity.ApplyModeratorSecurityFields(&detailed, iAmModerator, b.Profile)
-			// #2106 N2: バルク show も他のマルチユーザー path (search / recommendation 等) 同様に
-			// viewer relation (isFollowing/isBlocking/isMuted/hasPendingFollowRequest* 等) を解決する。
-			// upstream show.ts:151 の packMany は getRelations を batch で当てる。最大 100 件なので
-			// per-user Apply で許容範囲。viewerIsFollowing は GateCountVisibility に渡し、follower の
-			// non-public count が誤って 0 化されないようにする。
-			viewerIsFollowing := h.viewerRelationRepos().Apply(&detailed, viewerID, b.User, b.Profile)
-			isMe := viewer != nil && viewer.ID == b.User.ID
-			entity.GateCountVisibility(&detailed, isMe, iAmModerator, viewerIsFollowing)
-			// upstream の pack は isDetailed && isMe で MeDetailed を返す。
-			out = append(out, meself.Pack(ctx, detailed, b.User, b.Profile, viewer))
-		}
+		out := h.packDetailedAll(c.Request().Context(), viewer, users, profiles)
 		return c.JSON(http.StatusOK, out)
 	}
 
@@ -689,7 +680,7 @@ func (h *Handler) Show(c echo.Context) error {
 		}
 		// #2106 L10: upstream show.ts は lookup 前に username を trim する。前後空白を含む
 		// リクエストでも usernameLower 一致するよう揃える。
-		bundle, err = h.userService.ShowByUsername(strings.TrimSpace(*req.Username), req.Host)
+		bundle, err = h.userService.ResolveByUsername(strings.TrimSpace(*req.Username), req.Host)
 	}
 
 	if err != nil {
@@ -706,8 +697,12 @@ func (h *Handler) Show(c echo.Context) error {
 	}
 
 	// upstream show.ts:173-175: 非 moderator viewer に対して suspended user は
-	// 存在しないものとして扱い NO_SUCH_USER(4362f8dc...) を返す。moderator は
-	// 従来どおり閲覧できる。匿名/未配線は iAmModerator=false で fail-closed。
+	// 存在しないものとして扱い NO_SUCH_USER(4362f8dc...) を返す。物理削除待ちか
+	// 行保持かを問わず local deleted user も同様に隠すが、remote user と moderator
+	// の既存契約は維持する。匿名/未配線は iAmModerator=false で fail-closed。
+	if !iAmModerator && bundle.User.IsDeleted && bundle.User.IsLocal() {
+		return apierr.JSONNoSuchUser(c)
+	}
 	if !iAmModerator && bundle.User.IsSuspended {
 		return apierr.JSONNoSuchUser(c)
 	}
@@ -858,54 +853,18 @@ func (h *Handler) Search(c echo.Context) error {
 		return apierr.JSONInternalError(c)
 	}
 
-	iAmModerator := viewer != nil && h.moderatorChecker != nil && h.moderatorChecker.IsModerator(viewer.ID)
-
-	resolver := entity.NewInstanceResolver(h.instanceLookup(), users...)
-
 	// detail は default true。false のとき UserLite を返す (upstream search.ts:56、#1547)。
 	if req.Detail != nil && !*req.Detail {
-		out := make([]entity.UserLite, 0, len(users))
-		for _, u := range users {
-			lite := entity.PackUserLite(u)
-			resolver.FillUserLite(&lite)
-			h.populateUserEmojis(u, &lite)
-			out = append(out, lite)
-		}
-		return c.JSON(http.StatusOK, out)
+		return c.JSON(http.StatusOK, h.packLites(users))
 	}
 
 	// users/search が検索結果 N 件ぶん per-row GetProfile を呼んでいた N+1 を
-	// 1 batch query に置換する (#517)。Profile が見つからない user は
-	// PackUserDetailed が nil profile を許容するのでそのまま渡る。
-	ids := make([]string, 0, len(users))
-	for _, u := range users {
-		ids = append(ids, u.ID)
-	}
-	profiles := h.userService.GetProfilesByUserIDs(ids)
-
-	viewerID := ""
-	if viewer != nil {
-		viewerID = viewer.ID
-	}
+	// 1 batch query に置換する (#517)。本家 search.ts は packMany(users, me,
+	// {schema}) なので、モデレーター向けの項目・関係 (#1980)・カウントのゲート・
+	// ピン留め・移行先を DetailedMany でまとめて組む (#3330)。profile が読めない
+	// 利用者のカウントは本人とモデレーター以外に伏せる。
 	ctx := c.Request().Context()
-	out := make([]any, 0, len(users))
-	for _, u := range users {
-		d := entity.PackUserDetailed(u, profiles[u.ID], h.idGen)
-		resolver.FillUserLite(&d.UserLite)
-		h.populateUserEmojis(u, &d.UserLite)
-		// moderator viewer には moderationNote を出す (#1558、users/show と対称)。
-		h.applyModerationNote(&d, iAmModerator, profiles[u.ID])
-		entity.ApplyModeratorSecurityFields(&d, iAmModerator, profiles[u.ID])
-		// upstream search.ts は packMany(users, me, {schema}) で embed user に viewer
-		// 視点の relation block を付ける (#1980)。Apply は匿名/self で no-op。戻り値の
-		// isFollowing を count visibility gate (#1558) に渡す (以前は hardcode false)。
-		viewerIsFollowing := h.viewerRelationRepos().Apply(&d, viewerID, u, profiles[u.ID])
-		isMe := viewer != nil && viewer.ID == u.ID
-		entity.GateCountVisibility(&d, isMe, iAmModerator, viewerIsFollowing)
-		// upstream の pack は isDetailed && isMe で MeDetailed を返す。
-		out = append(out, meself.Pack(ctx, d, u, profiles[u.ID], viewer))
-	}
-	return c.JSON(http.StatusOK, out)
+	return c.JSON(http.StatusOK, h.packDetailedAll(ctx, viewer, users, h.userService.GetProfilesByUserIDs(userIDs(users))))
 }
 
 // NotesRequest is the request body for users/notes.
@@ -1082,7 +1041,6 @@ func (h *Handler) listRelations(c echo.Context, followers bool) error {
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	// **viewer は username 解決より前に読む。** 下の匿名 gate が要る。
 	viewer := middleware.GetUser(c)
 	// userId 指定が無ければ username(+host) から解決する (upstream followers.ts:60-71、
 	// #1547)。usernameLower + host で findOne。
@@ -1090,24 +1048,18 @@ func (h *Handler) listRelations(c echo.Context, followers bool) error {
 		if req.Username == "" {
 			return apierr.JSONInvalidParam(c)
 		}
-		// **users/show と同じ匿名 gate をここにも掛ける** (handler.go の Show に
-		// ある #2106 S3 の判定)。`users/followers` / `users/following` は
-		// auth middleware が無く**未認証で叩ける**のに、`ShowByUsername` は
-		// ローカル DB が miss すると WebFinger + actor fetch へ落ちる。gate が
-		// 無いと、認証不要の POST 1 回ごとに未知のリモート host への outbound
-		// HTTP とリモート user 行の作成を外部から強制できる (= `ShowByUsernameDB`
-		// の doc コメントが `/@:acct` について書いているのと同じ増幅面)。
-		if req.Host != nil && *req.Host != "" && viewer == nil && h.ugcVisibilityNow() == "local" {
-			return jsonNoSuchUserForRelations(c, followers)
-		}
+		// **DB だけを引く。** 本家 followers.ts / following.ts は usersRepository.findOneBy
+		// だけで、未知の acct を WebFinger で取りに行かない (#3330)。以前は
+		// ShowByUsername を使っていたので、未認証の POST 1 回ごとに未知のリモート
+		// host への外向きリクエストとリモートの利用者の行の作成を起こせた (そのため
+		// 匿名の visitor だけ host 指定を弾く gate を置いていたが、DB だけを引くなら
+		// 外向きの通信は起きないので、本家と同じく gate も置かない)。
 		// #2106 L10: Followers/Following も Show と同じく lookup 前に trim する。
-		bundle, err := h.userService.ShowByUsername(strings.ToLower(strings.TrimSpace(req.Username)), req.Host)
+		bundle, err := h.userService.ShowByUsernameDB(strings.ToLower(strings.TrimSpace(req.Username)), req.Host)
 		if err != nil || bundle == nil {
-			// Show と同じく DB 障害は 500 に倒す (#2792 / #2996)。
-			// `ErrFailedToResolveRemoteUser` は「引けたが解決できない」なので
-			// not-found 側に寄せる (この endpoint に専用の error code は無い)。
-			if err != nil && !errors.Is(err, user.ErrUserNotFound) &&
-				!errors.Is(err, user.ErrFailedToResolveRemoteUser) {
+			// Show と同じく DB 障害は 500 に倒す (#2792 / #2996)。見つからなければ
+			// 本家と同じ NO_SUCH_USER (endpoint ごとの id)。
+			if err != nil && !errors.Is(err, user.ErrUserNotFound) {
 				return apierr.JSONInternalError(c)
 			}
 			return jsonNoSuchUserForRelations(c, followers)
@@ -1222,16 +1174,20 @@ func (h *Handler) gateRelationVisibility(c echo.Context, targetID string, viewer
 	return false, nil
 }
 
-// relationItem represents a single entry in followers/following lists.
+// relationItem is one entry of users/followers and users/following: upstream
+// FollowingEntityService.pack with populateFollower (followers) or
+// populateFollowee (following). Follower / Followee are any because the
+// viewer's own entry is MeDetailed (upstream pack returns MeDetailed when
+// isMe).
 type relationItem struct {
 	ID string `json:"id"`
 	// CreatedAt は misskey_dart の Following.fromJson が非null String として
 	// cast するため必須 (#1243)。following row の ID (aidx) から復元する。
-	CreatedAt  string               `json:"createdAt"`
-	FollowerID string               `json:"followerId"`
-	FolloweeID string               `json:"followeeId"`
-	Follower   *entity.UserDetailed `json:"follower,omitempty"`
-	Followee   *entity.UserDetailed `json:"followee,omitempty"`
+	CreatedAt  string `json:"createdAt"`
+	FolloweeID string `json:"followeeId"`
+	FollowerID string `json:"followerId"`
+	Followee   any    `json:"followee,omitempty"`
+	Follower   any    `json:"follower,omitempty"`
 }
 
 func (h *Handler) collectFollowers(ctx context.Context, req FollowersRequest, viewer *model.User) ([]relationItem, error) {
@@ -1239,7 +1195,7 @@ func (h *Handler) collectFollowers(ctx context.Context, req FollowersRequest, vi
 	if err != nil {
 		return nil, err
 	}
-	return h.packRelationItems(ctx, rows, true, viewer), nil
+	return h.packRelationItems(ctx, rows, true, viewer)
 }
 
 func (h *Handler) collectFollowing(ctx context.Context, req FollowersRequest, viewer *model.User) ([]relationItem, error) {
@@ -1247,242 +1203,124 @@ func (h *Handler) collectFollowing(ctx context.Context, req FollowersRequest, vi
 	if err != nil {
 		return nil, err
 	}
-	return h.packRelationItems(ctx, rows, false, viewer), nil
+	return h.packRelationItems(ctx, rows, false, viewer)
 }
 
-// packRelationItems builds the response slice for users/followers and
-// users/following. followers=true means embed the follower side, false means
-// embed the followee side. ShowManyByIDs (#503) で 1 batch query にまとめ、
-// map で O(1) 解決して旧 ShowByID per-row N+1 を解消する (#300 2-3)。instance は
-// 引き続き batch 1 回で resolve する (#277)。
+// packRelationItems builds the response of users/followers (followers=true,
+// the follower side is populated) and users/following (followers=false, the
+// followee side), the way upstream FollowingEntityService.packMany does: the
+// populated users are packed together through packMany(users, me,
+// {schema: 'UserDetailedNotMe'}) and the viewer's own entry is MeDetailed.
+//
+// 利用者の組み立ては一覧共通の DetailedMany に任せる (#3330)。以前は handler
+// が PackUserDetailed から自前で組んでいたので、notify / withReplies / memo と、
+// モデレーター向けの moderationNote・2FA の項目を欠き、閲覧者自身も MeDetailed
+// にならなかった。関係・ピン留め・移行先・instance・絵文字はまとめて引くので、
+// 行数に比例して問い合わせは増えない。
 //
 // **cursor (sinceId/untilId) はここでは見ない。** collect 側が SQL に渡している。
 // ここで掛ける形に戻すと、LIMIT のあとに捨てることになり 2 ページ目が空になる
 // (#2711)。
 //
-// viewer が non-nil なら follow relation flag (isFollowing / isFollowed) を
-// `FilterFollowing` / `FilterFollowedBy` の 2 batch query で埋める (#1144、
-// frontend MkUserInfo の `followsYou` ラベル + MkFollowButton の初期 state
-// が正しく描画されるのに必要)。viewer が自分自身を含む list 経路でも viewer
-// と list 内 user の id 一致時は relation lookup を skip する (= self-flag
-// は意味なし)。
+// 相手の利用者を読めなければ error を返す (呼び元が 500 にする)。相手の行が
+// 無い following の行は、本家の innerJoinAndSelect と同じく応答から落とす。
+// frontend の follow-list は follower / followee を非 null として描くので、
+// 相手の欠けた要素を返すと一覧ごと描画が落ちる。
 func (h *Handler) packRelationItems(
 	ctx context.Context,
 	rows []*model.Following,
 	followers bool,
 	viewer *model.User,
-) []relationItem {
-	idSet := make(map[string]struct{}, len(rows))
-	for _, f := range rows {
-		var target string
+) ([]relationItem, error) {
+	target := func(f *model.Following) string {
 		if followers {
-			target = f.FollowerID
-		} else {
-			target = f.FolloweeID
+			return f.FollowerID
 		}
-		if target != "" {
-			idSet[target] = struct{}{}
+		return f.FolloweeID
+	}
+	ids := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, f := range rows {
+		uid := target(f)
+		if _, ok := seen[uid]; ok || uid == "" {
+			continue
 		}
+		seen[uid] = struct{}{}
+		ids = append(ids, uid)
 	}
 
-	bundleByID := make(map[string]*user.UserWithProfile, len(idSet))
-	if len(idSet) > 0 {
-		ids := make([]string, 0, len(idSet))
-		for id := range idSet {
-			ids = append(ids, id)
+	var (
+		users    []*model.User
+		profiles map[string]*model.UserProfile
+	)
+	if len(ids) > 0 {
+		bundles, err := h.userService.ShowManyByIDs(ids)
+		if err != nil {
+			return nil, fmt.Errorf("load related users: %w", err)
 		}
-		if bundles, err := h.userService.ShowManyByIDs(ids); err == nil {
-			for _, b := range bundles {
-				bundleByID[b.User.ID] = b
+		users = make([]*model.User, 0, len(bundles))
+		profiles = make(map[string]*model.UserProfile, len(bundles))
+		for _, b := range bundles {
+			if b == nil || b.User == nil {
+				continue
+			}
+			users = append(users, b.User)
+			if b.Profile != nil {
+				profiles[b.User.ID] = b.Profile
 			}
 		}
 	}
+	packed := h.packDetailedMany(ctx, viewer, users, profiles)
+	h.overrideRemoteStats(ctx, viewer, users, packed)
 
-	remoteUsers := make([]*model.User, 0, len(bundleByID))
-	for _, b := range bundleByID {
-		remoteUsers = append(remoteUsers, b.User)
+	byID := make(map[string]any, len(users))
+	for i, u := range users {
+		byID[u.ID] = meself.Pack(ctx, packed[i], u, profiles[u.ID], viewer)
 	}
-	resolver := entity.NewInstanceResolver(h.instanceLookup(), remoteUsers...)
-
-	// viewer 視点の follow relation を 2 batch query で先に解決しておく
-	// (#1144)。viewer が nil (= unauthenticated) なら lookup skip して
-	// 全 user の flag を nil 維持 (upstream も me が nil の経路では
-	// UserDetailedNotMe の relation field を omit する)。
-	followingMap, followedMap := h.batchFollowRelations(viewer, bundleByID)
-	// pending follow request も同じく 2 batch query で解決 (#1144 #2)。
-	// MkFollowButton が `hasPendingFollowRequestFromYou` で表示分岐するため
-	// `isFollowing` だけだと「pending 中なのに Follow ボタン」が出る regression
-	// になる。upstream UserDetailedNotMe schema と整合させる。
-	pendingFromMap, pendingToMap := h.batchPendingRequestRelations(viewer, bundleByID)
-	// #2106 N3: block/mute relation も batch query で実値を解決する (旧 best-effort false を是正)。
-	blockingMap, blockedMap, mutingMap, renoteMutingMap := h.batchBlockMuteRelations(viewer)
-
-	// remote user の notes/followers/following count を origin instance の
-	// /api/users/show から fetch して上書き (#1146)。Show 経路 (handler.go:329)
-	// と同 logic だが、本 list 経路では N 件並列 fetch で N round-trip を回避
-	// する (singleflight が同 key dedup、cache 1h で次 scroll は HTTP 0)。
-	remoteStatsMap := h.batchRemoteStatsOverride(ctx, bundleByID)
-
-	// count visibility gate (#1558) 用。moderator viewer は全 count を見られる。
-	iAmModerator := viewer != nil && h.moderatorChecker != nil && h.moderatorChecker.IsModerator(viewer.ID)
-
 	out := make([]relationItem, 0, len(rows))
 	for _, f := range rows {
 		item := relationItem{ID: f.ID, FollowerID: f.FollowerID, FolloweeID: f.FolloweeID}
 		if t, err := h.idGen.ParseTime(f.ID); err == nil {
 			item.CreatedAt = t.UTC().Format("2006-01-02T15:04:05.000Z")
 		}
-		var target string
-		if followers {
-			target = f.FollowerID
-		} else {
-			target = f.FolloweeID
+		d, ok := byID[target(f)]
+		if !ok {
+			continue
 		}
-		if b, ok := bundleByID[target]; ok {
-			d := entity.PackUserDetailed(b.User, b.Profile, h.idGen)
-			resolver.FillUserLite(&d.UserLite)
-			h.populateUserEmojis(b.User, &d.UserLite)
-			isMe := viewer != nil && viewer.ID == b.User.ID
-			isFollowing := false
-			if viewer != nil && viewer.ID != b.User.ID {
-				isFollowing = followingMap[b.User.ID]
-				isFollowed := followedMap[b.User.ID]
-				d.IsFollowing = &isFollowing
-				d.IsFollowed = &isFollowed
-				pendingFrom := pendingFromMap[b.User.ID]
-				pendingTo := pendingToMap[b.User.ID]
-				d.HasPendingFollowRequestFromYou = &pendingFrom
-				d.HasPendingFollowRequestToYou = &pendingTo
-				// #2106 N3: misskey_dart の UserDetailed union は isFollowing が present だと
-				// UserDetailedNotMeWithRelations を選び isBlocking/isBlocked/isMuted/isRenoteMuted も
-				// 非null bool として cast する (#1249)。旧実装は best-effort false に倒していたが、
-				// upstream getRelations 同様 batch query (viewer の outgoing/incoming を 1 query ずつ)
-				// で実値を埋める。
-				isBlocking := blockingMap[b.User.ID]
-				isBlocked := blockedMap[b.User.ID]
-				isMuted := mutingMap[b.User.ID]
-				isRenoteMuted := renoteMutingMap[b.User.ID]
-				d.IsBlocking = &isBlocking
-				d.IsBlocked = &isBlocked
-				d.IsMuted = &isMuted
-				d.IsRenoteMuted = &isRenoteMuted
-				d.EnsureRelationFlags() // 残った nil field を defensive に false で埋める
-				// follower にだけ followedMessage を見せる (#1558)。
-				if isFollowing && b.Profile != nil {
-					entity.SetFollowedMessageForFollower(&d, b.Profile.FollowedMessage)
-				}
-			}
-			if stats := remoteStatsMap[b.User.ID]; stats != nil {
-				d.NotesCount = stats.NotesCount
-				entity.OverrideRemoteCounts(&d, stats.FollowersCount, stats.FollowingCount)
-			}
-			// count visibility gate は remote stats override の後に適用する (#1558)。
-			entity.GateCountVisibility(&d, isMe, iAmModerator, isFollowing)
-			if followers {
-				item.Follower = &d
-			} else {
-				item.Followee = &d
-			}
+		if followers {
+			item.Follower = d
+		} else {
+			item.Followee = d
 		}
 		out = append(out, item)
 	}
-	return out
+	return out, nil
 }
 
-// batchFollowRelations resolves viewer's follow relations against the
-// candidate user set in 2 batch queries (followingRepo.FilterFollowings
-// FromAnchor / ToAnchor). Returns nil maps if viewer or repo is nil so
-// callers can skip safely.
-func (h *Handler) batchFollowRelations(viewer *model.User, bundleByID map[string]*user.UserWithProfile) (map[string]bool, map[string]bool) {
-	if viewer == nil || h.followingRepo == nil || len(bundleByID) == 0 {
-		return nil, nil
-	}
-	candidates := buildRelationCandidates(viewer, bundleByID)
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-	followingMap := make(map[string]bool, len(candidates))
-	followedMap := make(map[string]bool, len(candidates))
-	if ids, err := h.followingRepo.FilterFollowingsFromAnchor(viewer.ID, candidates); err == nil {
-		for _, id := range ids {
-			followingMap[id] = true
-		}
-	}
-	if ids, err := h.followingRepo.FilterFollowingsToAnchor(viewer.ID, candidates); err == nil {
-		for _, id := range ids {
-			followedMap[id] = true
-		}
-	}
-	return followingMap, followedMap
-}
-
-// batchBlockMuteRelations resolves viewer's block/mute relations across the whole
-// candidate set in a few batch queries, mirroring upstream getRelations (#2106 N3):
-// blocking = viewer blocks candidate, blocked = candidate blocks viewer, muting /
-// renoteMuting = viewer mutes / renote-mutes candidate. viewer の outgoing/incoming を
-// 1 query ずつ取得して set 化するので per-user N+1 を避けられる (候補との照合は呼び元)。
-// viewer nil / repo 未配線時は nil map (= 各 dimension を解決しない、best-effort)。
-func (h *Handler) batchBlockMuteRelations(viewer *model.User) (blocking, blocked, muting, renoteMuting map[string]bool) {
-	if viewer == nil {
-		return nil, nil, nil, nil
-	}
-	toSet := func(ids []string) map[string]bool {
-		m := make(map[string]bool, len(ids))
-		for _, id := range ids {
-			m[id] = true
-		}
-		return m
-	}
-	if h.blockingRepo != nil {
-		if ids, err := h.blockingRepo.ListBlockeeIDs(viewer.ID); err == nil {
-			blocking = toSet(ids)
-		}
-		if ids, err := h.blockingRepo.ListBlockerIDs(viewer.ID); err == nil {
-			blocked = toSet(ids)
-		}
-	}
-	if h.mutingRepo != nil {
-		if ids, err := h.mutingRepo.ListMuteeIDs(viewer.ID); err == nil {
-			muting = toSet(ids)
-		}
-	}
-	if h.renoteMutingRepo != nil {
-		if ids, err := h.renoteMutingRepo.ListMuteeIDs(viewer.ID); err == nil {
-			renoteMuting = toSet(ids)
-		}
-	}
-	return blocking, blocked, muting, renoteMuting
-}
-
-// batchPendingRequestRelations resolves viewer's pending follow_request
-// relations across the candidate user set in 2 batch queries
-// (followRequestRepo.FilterPendingFromAnchor / ToAnchor). Returns nil maps
-// if viewer or repo is nil so callers can skip safely.
+// overrideRemoteStats replaces notesCount / followersCount / followingCount of
+// the remote users of a list with the values their origin server reports
+// (#1146), then re-applies the count visibility gate.
 //
-// `hasPendingFollowRequestFromYou` / `hasPendingFollowRequestToYou` を
-// list 経路で埋めないと frontend MkFollowButton が「pending 中なのに
-// `Follow` ボタン」を表示する drift になる (#1144 #2)。
-func (h *Handler) batchPendingRequestRelations(viewer *model.User, bundleByID map[string]*user.UserWithProfile) (map[string]bool, map[string]bool) {
-	if viewer == nil || h.followRequestRepo == nil || len(bundleByID) == 0 {
-		return nil, nil
+// mk-go 独自 (docs/divergence.md の RemoteStatsFetcher)。DetailedMany が掛けた
+// カウントのゲートは元の値に対するものなので、差し替えた値に掛け直す。
+func (h *Handler) overrideRemoteStats(ctx context.Context, viewer *model.User, users []*model.User, packed []entity.UserDetailed) {
+	stats := h.batchRemoteStatsOverride(ctx, users)
+	if len(stats) == 0 {
+		return
 	}
-	candidates := buildRelationCandidates(viewer, bundleByID)
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-	fromMap := make(map[string]bool, len(candidates))
-	toMap := make(map[string]bool, len(candidates))
-	if ids, err := h.followRequestRepo.FilterPendingFromAnchor(viewer.ID, candidates); err == nil {
-		for _, id := range ids {
-			fromMap[id] = true
+	iAmModerator := viewer != nil && h.moderatorChecker != nil && h.moderatorChecker.IsModerator(viewer.ID)
+	for i, u := range users {
+		s := stats[u.ID]
+		if s == nil {
+			continue
 		}
+		d := &packed[i]
+		d.NotesCount = s.NotesCount
+		entity.OverrideRemoteCounts(d, s.FollowersCount, s.FollowingCount)
+		isMe := viewer != nil && viewer.ID == u.ID
+		isFollowing := d.IsFollowing != nil && *d.IsFollowing
+		entity.GateCountVisibility(d, isMe, iAmModerator, isFollowing)
 	}
-	if ids, err := h.followRequestRepo.FilterPendingToAnchor(viewer.ID, candidates); err == nil {
-		for _, id := range ids {
-			toMap[id] = true
-		}
-	}
-	return fromMap, toMap
 }
 
 // remoteStatsBatchTimeout caps the wall-clock time the list response will
@@ -1495,7 +1333,7 @@ func (h *Handler) batchPendingRequestRelations(viewer *model.User, bundleByID ma
 const remoteStatsBatchTimeout = 5 * time.Second
 
 // batchRemoteStatsOverride fans out RemoteStatsFetcher.Fetch goroutines for
-// every remote user in bundleByID and returns the resulting stats keyed by
+// every remote user in users and returns the resulting stats keyed by
 // user ID. Local users (host == nil) are skipped. fetcher が未配線 / list
 // に remote user 0 件なら nil を返して caller が override loop を skip できる
 // (#1146)。
@@ -1509,19 +1347,19 @@ const remoteStatsBatchTimeout = 5 * time.Second
 // を被せた派生 ctx を全 goroutine に渡し、deadline 超過 / client abort
 // どちらでも fetcher 内部の HTTP client が ctx cancel を受けて即時 return
 // する (= 取りこぼした user は silent fallback で local count 維持)。
-func (h *Handler) batchRemoteStatsOverride(ctx context.Context, bundleByID map[string]*user.UserWithProfile) map[string]*RemoteUserStatsView {
-	if h.remoteStatsFetcher == nil || len(bundleByID) == 0 {
+func (h *Handler) batchRemoteStatsOverride(ctx context.Context, users []*model.User) map[string]*RemoteUserStatsView {
+	if h.remoteStatsFetcher == nil || len(users) == 0 {
 		return nil
 	}
 	type job struct {
 		userID, host, username string
 	}
-	jobs := make([]job, 0, len(bundleByID))
-	for id, b := range bundleByID {
-		if b.User.Host == nil || *b.User.Host == "" {
+	jobs := make([]job, 0, len(users))
+	for _, u := range users {
+		if u.Host == nil || *u.Host == "" {
 			continue
 		}
-		jobs = append(jobs, job{userID: id, host: *b.User.Host, username: b.User.Username})
+		jobs = append(jobs, job{userID: u.ID, host: *u.Host, username: u.Username})
 	}
 	if len(jobs) == 0 {
 		return nil
@@ -1548,78 +1386,24 @@ func (h *Handler) batchRemoteStatsOverride(ctx context.Context, bundleByID map[s
 	return out
 }
 
-// buildRelationCandidates returns the candidate user IDs for viewer-relative
-// batch relation lookups, excluding viewer's own id (= self-flag has no
-// meaning, matches upstream `UserDetailedNotMe` semantics).
-func buildRelationCandidates(viewer *model.User, bundleByID map[string]*user.UserWithProfile) []string {
-	candidates := make([]string, 0, len(bundleByID))
-	for id := range bundleByID {
-		if id == viewer.ID {
-			continue
-		}
-		candidates = append(candidates, id)
-	}
-	return candidates
+// FillDetailedExtras fills the UserDetailed parts that need the users/show
+// dependencies: movedTo / alsoKnownAs (local lookup only) and pinnedNoteIds /
+// pinnedNotes / pinnedPageId / pinnedPage gated by viewer. It satisfies
+// userpack.DetailExtras so the follow stream / webhook bodies and
+// blocking/create・delete carry the same values as users/show.
+func (h *Handler) FillDetailedExtras(ctx context.Context, viewer, u *model.User, profile *model.UserProfile, d *entity.UserDetailed) {
+	h.fillExtras(ctx, viewer, []userpack.DetailTarget{{User: u, Profile: profile, Detailed: d}}, true)
 }
 
 // fillPinned populates PinnedNoteIDs / PinnedNotes / PinnedPageID / PinnedPage
-// on the passed UserDetailed from the user's user_note_pining rows and
-// user_profile.pinnedPageId. Missing repos fall back to default empty/nil.
+// on the passed UserDetailed for users/show (single pack). viewer may be nil.
 //
-// viewer は users/show を叩いている認証ユーザー (匿名なら nil)。pinned note
-// の myReaction を埋めるために fieldRes.Apply に流す (#426)。
-//
-// 設計メモ — PinnedNoteIDs を visibility filter 前の生 ID 配列で返す理由 (#1489):
-//
-//   - pin = author の意図的な self-disclosure 行為。「followers にだけ見せる
-//     note を profile に固定する」と author が選んだ時点で、pinnedNoteIds が
-//     viewer に露出することは upstream Misskey TS でも同 shape (drop-in 互換)。
-//   - notes/show ShowForAPI doctrine の境界線上だが、author 自身が pin を選んで
-//     いる以上、ID-known な viewer に content が返るのは「意図された情報開示」
-//     の範疇とする (#1489 で議論)。
-//   - PinnedNotes 本体 (= 中身の埋め込み) は FilterVisible で絞るため、profile
-//     表示上は viewer から見えない pin はカード化されない。
-//   - pinning は per-user 上限が厳しい (= 数件) ので mass enumeration リスクは
-//     低い。
-//
-// この設計は Option A (現状維持 = upstream-aligned) を採用した結果 (#1489
-// wontfix)。Option B (IDs も filter) は frontend drop-in 互換と「author 意図」
-// に逆行するため不採用。
+// viewer は pinned note の myReaction を埋めるために fieldRes.Apply に流す (#426)。
+// 匿名の閲覧者にもピン留めを返す (本家の単体の pack と同じ)。
 func (h *Handler) fillPinned(ctx context.Context, viewer *model.User, u *model.User, profile *model.UserProfile, detailed *entity.UserDetailed) {
-	if h.piningRepo != nil {
-		if pinings, err := h.piningRepo.ListByUser(u.ID); err == nil && len(pinings) > 0 {
-			ids := make([]string, 0, len(pinings))
-			for _, p := range pinings {
-				ids = append(ids, p.NoteID)
-			}
-			// PinnedNoteIDs は意図的に filter 前の生 IDs (上記設計メモ参照)。
-			detailed.PinnedNoteIDs = ids
-			if h.noteRepo != nil {
-				if notes, err := h.noteRepo.FindManyByIDsWithUser(ids); err == nil {
-					notes = notesfilter.FilterVisible(viewer, notes, h.followingRepo)
-					entities := entity.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
-					h.fieldRes.Apply(entities, viewer)
-					notehide.HidePinnedNotes(viewer, entities, h.followingRepo)
-					packed := make([]any, 0, len(entities))
-					for _, pn := range entities {
-						packed = append(packed, pn)
-					}
-					detailed.PinnedNotes = packed
-				}
-			}
-		}
-	}
-
-	if profile != nil && profile.PinnedPageID != nil && *profile.PinnedPageID != "" {
-		detailed.PinnedPageID = profile.PinnedPageID
-		if h.pageRepo != nil {
-			if p, err := h.pageRepo.FindByID(*profile.PinnedPageID); err == nil && pinnedPageVisibleTo(p, viewer) {
-				// golden Page は user 必須。pinnedPage は profile user 自身の page
-				// なので owner=u を渡して user (UserLite) を埋める (#1266 follow-up)。
-				detailed.PinnedPage = entity.PackPageWithContext(p, entity.PackPageContext{IDGen: h.idGen, Owner: u})
-			}
-		}
-	}
+	targets := []userpack.DetailTarget{{User: u, Profile: profile, Detailed: detailed}}
+	h.fillPinnedNotes(ctx, viewer, targets)
+	h.fillPinnedPages(viewer, targets)
 }
 
 // HasRolePolicyProvider reports whether the role policy provider was wired.

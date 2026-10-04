@@ -12,6 +12,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	corereversi "github.com/shiroha-a/mk/internal/core/reversi"
+	"github.com/shiroha-a/mk/internal/core/userpack"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -44,7 +45,23 @@ type Handler struct {
 	streamPub    ReversiStreamPublisher
 	fedChecker   FederationAvailabilityChecker
 	remoteLookup RemoteUserLookup
+	// lites は reversi/invitations の招待者 (UserLite) の instance と絵文字を
+	// まとめて埋める (本家 packMany(invitations, me)、#3330)。連合対戦では
+	// リモートの招待者が混ざる。
+	lites userpack.LiteFiller
 }
+
+// SetLiteFiller wires the batch resolver of instance / emojis for the
+// inviters of reversi/invitations (#3330).
+func (h *Handler) SetLiteFiller(f userpack.LiteFiller) {
+	h.lites = f
+}
+
+// HasLiteFiller reports whether the lite filler was wired.
+//
+// 未配線だと reversi/invitations のリモートの招待者に instance と絵文字が載らない。
+// 起動時検査に使う。
+func (h *Handler) HasLiteFiller() bool { return h.lites != nil }
 
 // FederationAvailabilityChecker determines whether a remote host advertises
 // a compatible reversiVersion via its nodeinfo.
@@ -252,7 +269,9 @@ func (h *Handler) Games(c echo.Context) error {
 		UntilDate *int64 `json:"untilDate"`
 		My        bool   `json:"my"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return apierr.JSONInvalidParam(c)
+	}
 	if req.Limit <= 0 {
 		req.Limit = 10
 	}
@@ -292,6 +311,7 @@ func (h *Handler) Invitations(c echo.Context) error {
 	user := middleware.GetUser(c)
 	games, _ := h.repo.ListByUser(user.ID, 20)
 	inviters := make([]entity.UserLite, 0)
+	users := make([]*model.User, 0)
 	seen := make(map[string]struct{})
 	for _, g := range games {
 		if g.IsStarted || g.IsEnded {
@@ -310,6 +330,14 @@ func (h *Handler) Invitations(c echo.Context) error {
 		}
 		seen[g.User1.ID] = struct{}{}
 		inviters = append(inviters, entity.PackUserLite(g.User1))
+		users = append(users, g.User1)
+	}
+	if h.lites != nil {
+		ptrs := make([]*entity.UserLite, len(users))
+		for i := range users {
+			ptrs[i] = &inviters[i]
+		}
+		h.lites.FillLites(users, ptrs)
 	}
 	return c.JSON(http.StatusOK, inviters)
 }
@@ -320,7 +348,7 @@ func (h *Handler) ShowGame(c echo.Context) error {
 		GameID string `json:"gameId"`
 	}
 	if err := c.Bind(&req); err != nil || req.GameID == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "gameId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 	game, err := h.repo.FindByID(req.GameID)
 	if err != nil && !repository.IsNotFound(err) {
@@ -361,7 +389,9 @@ func (h *Handler) Match(c echo.Context) error {
 		NoIrregularRules bool `json:"noIrregularRules"`
 		Multiple         bool `json:"multiple"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return apierr.JSONInvalidParam(c)
+	}
 	_ = req.NoIrregularRules // accepted for paramDef parity; inert on specific-match
 
 	// acct 形式 (@user / @user@host) を local user id に解決する
@@ -553,7 +583,9 @@ func (h *Handler) CancelMatch(c echo.Context) error {
 	var req struct {
 		UserID string `json:"userId"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return apierr.JSONInvalidParam(c)
+	}
 	ctx := c.Request().Context()
 	// userId 未指定 = ランダムマッチの取り消し。待機列から自分を外す (#2407)。
 	// upstream matchAnyUserCancel に対応する。ここで外さないと、取り消した
@@ -608,7 +640,7 @@ func (h *Handler) Surrender(c echo.Context) error {
 		GameID string `json:"gameId"`
 	}
 	if err := c.Bind(&req); err != nil || req.GameID == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "gameId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	// federation Leave を送るために winner (= 相手) を先に引いておく。
@@ -691,7 +723,7 @@ func (h *Handler) Verify(c echo.Context) error {
 	// crc32 は upstream verify.ts:38-41 で required (gameId と同列)。欠落を
 	// 黙って desynced=false にすると client 側の desync が一生検出されない。
 	if err := c.Bind(&req); err != nil || req.GameID == "" || req.CRC32 == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "gameId and crc32 are required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 	game, err := h.repo.FindByID(req.GameID)
 	if err != nil && !repository.IsNotFound(err) {

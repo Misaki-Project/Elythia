@@ -17,7 +17,8 @@ func (h *Handler) AccountsDelete(c echo.Context) error {
 		UserID string `json:"userId"`
 	}
 	if err := c.Bind(&req); err != nil || req.UserID == "" {
-		return c.NoContent(http.StatusNoContent)
+		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
+		return apierr.JSONInvalidParam(c)
 	}
 	// root / system アカウントの削除は連合を壊すため拒否する (#parity review F1)。
 	// **判定できないときは 500 に倒す** — 分からないまま不可逆な削除を通さない。
@@ -79,7 +80,9 @@ func (h *Handler) AccountsFindByEmail(c echo.Context) error {
 	// includeSecrets 限定 field が漏れる (#1847、#1822 と同 class)。UserDetailed に
 	// 揃えて過剰露出を防ぐ (ShowUsers と同方針)。生 model.User の内部 field
 	// (inbox/sharedInbox/usernameLower) も UserDetailed では出ない。
-	return c.JSON(http.StatusOK, h.packModeratorVisibleUser(user, profile))
+	// 閲覧者は null なので、カウントのゲート・ピン留め・移行先も匿名の閲覧者として
+	// 扱う (呼んだ管理者には非公開のカウントを見せない、#3330)。
+	return c.JSON(http.StatusOK, h.packUserAnonymous(c.Request().Context(), user, profile))
 }
 
 // DeleteAccount handles POST /api/admin/delete-account. AccountsDelete と
@@ -90,7 +93,8 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 		UserID string `json:"userId"`
 	}
 	if err := c.Bind(&req); err != nil || req.UserID == "" {
-		return c.NoContent(http.StatusNoContent)
+		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
+		return apierr.JSONInvalidParam(c)
 	}
 	// root / system アカウントの削除は連合を壊すため拒否する (#parity review F1)。
 	// **判定できないときは 500 に倒す** — 分からないまま不可逆な削除を通さない。

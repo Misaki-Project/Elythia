@@ -2237,7 +2237,7 @@ func TestIsAdministrator_EmptyRootUserIDFallsBackToIsRoot(t *testing.T) {
 // 締め出される。
 func TestIsAdministrator_MetaUnavailableFallsBackToIsRoot(t *testing.T) {
 	svc, _, _, metaRepo := newTestService(t)
-	metaRepo.Meta = nil // Fetch がエラーになる
+	metaRepo.FetchErr = errors.New("meta unavailable")
 	userRepo := testutil.NewMockUserRepository()
 	require.NoError(t, userRepo.Create(&model.User{ID: "alice", Username: "alice", IsRoot: true}))
 	svc.SetUserRepo(userRepo)

@@ -20,7 +20,8 @@ func (h *Handler) UnsetUserAvatar(c echo.Context) error {
 		UserID string `json:"userId"`
 	}
 	if err := c.Bind(&req); err != nil || req.UserID == "" {
-		return c.NoContent(http.StatusNoContent)
+		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
+		return apierr.JSONInvalidParam(c)
 	}
 	user, err := h.userRepo.FindByID(req.UserID)
 	if err != nil || user == nil || user.AvatarID == nil {
@@ -46,7 +47,8 @@ func (h *Handler) UnsetUserBanner(c echo.Context) error {
 		UserID string `json:"userId"`
 	}
 	if err := c.Bind(&req); err != nil || req.UserID == "" {
-		return c.NoContent(http.StatusNoContent)
+		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
+		return apierr.JSONInvalidParam(c)
 	}
 	user, err := h.userRepo.FindByID(req.UserID)
 	if err != nil || user == nil || user.BannerID == nil {
@@ -69,7 +71,8 @@ func (h *Handler) UpdateUserNote(c echo.Context) error {
 		Text   string `json:"text"`
 	}
 	if err := c.Bind(&req); err != nil || req.UserID == "" {
-		return c.NoContent(http.StatusNoContent)
+		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
+		return apierr.JSONInvalidParam(c)
 	}
 	// before を log の info に含めるため UpdateProfile の前に取得する。
 	// 取得失敗時は before 不明扱い (空文字) で log を書く方が監査価値が高い。
@@ -131,6 +134,7 @@ func (h *Handler) UpdateAbuseUserReport(c echo.Context) error {
 	// 更新前の値を控える (UpdateFields 後に before を参照すると、in-memory repo
 	// 実装では同一ポインタが書き換わって比較が壊れる)。
 	beforeNote := before.ModerationNote
+	logRow := abuseReportLogRow(before)
 	if err := h.abuseRepo.UpdateFields(req.ReportID, map[string]any{"moderationNote": note}); err != nil {
 		// 行があることは引いて確かめ済みなので、ここで失敗するのは DB の障害 (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
@@ -139,7 +143,7 @@ func (h *Handler) UpdateAbuseUserReport(c echo.Context) error {
 	if beforeNote != note {
 		h.logModeration(c, moderationlog.LogUpdateAbuseReportNote, map[string]any{
 			"reportId": req.ReportID,
-			"report":   before,
+			"report":   logRow,
 			"before":   beforeNote,
 			"after":    note,
 		})

@@ -1,14 +1,14 @@
-# Misaki 2026.10.0追従版への移行
+# Misaki Release 1.5.0・2026.10.0追従版への移行
 
 この手順は、Misakiのrole-level・XP・原神連携を保持して2026.10.0追従版へ更新する運用者向けの手順です。手順の記載は、本番適用やworkflow実行の承認を意味しません。
 
 ## 1. 適用前の条件
 
-**原神入りの2026.10.0最終runtime imageは未公開・未検証です。追加回帰ではデグレーションを検出していませんが、この段階では本番を切り替えないでください。**
+**Release 1.5.0の統合・検証中です。原神入り最終runtime imageは未公開・未検証です。この段階では本番を切り替えないでください。**
 
-ローカルの必須チェック、frontend全769件・原神18件、原神DBのrace/vet/build、role-levelと原神を組み込んだ本体ビルドは成功しています。GitHub CI、最終image、実ブラウザでの独自機能、本番の動作確認は別に扱います。テスト成功だけで本番適用済みとはしません。
+Release 1.5.0統合frontendの全791件と原神テストは成功しています。本体の必須チェック、GitHub CI、最終image、実ブラウザでの独自機能、本番の動作確認は別に扱います。以前の統合版の成功結果を、1.5.0追加差分の検証結果として流用しません。
 
-正式タグ`1.4.0`（`6c8f83f8dd380c04155fed78c895fc26524f4e38`）は、この追従版の履歴に含まれています。正式版のMisskey基準は2026.9.1ですが、Misakiでは準備した2026.10.0の統合を保持します。上流タグへ単純に切り替えるとMisaki独自機能と原神連携を失うため、対応するMisaki最終imageを使用してください。
+対象は正式タグ`1.5.0`（`4a7eb80ef60f0bf66d4fa7ad83849a9be72d68b2`）、Misskey基準は2026.10.0です。上流タグへ単純に切り替えるとMisaki独自機能と原神連携を失うため、対応するMisaki最終imageを使用してください。
 
 適用前に、次をすべて確認します。
 
@@ -22,8 +22,8 @@
 
 | 対象 | 固定参照 |
 |---|---|
-| frontend | `777a0901c3c473cce1c5d44eb1a451f28f437927` / `2026.10.0-mk.misaki.1` |
-| frontendアセット | `ghcr.io/misaki-project/misskey-ts-assets:2026.10.0-mk.misaki.1@sha256:b56b830a7a884fbb07f181703cd6f252bd4f0e7aa88d4ee8d762f22c31744d75` |
+| frontend | `50d4490066fda6600a1dd6d92f49fca925cca19c` / `2026.10.0-mk.misaki.2`。上流基準は`9eae05e71435512c39d3838e4689be6d7437707a` |
+| frontendアセット | `ghcr.io/misaki-project/misskey-ts-assets:2026.10.0-mk.misaki.2@sha256:498063ce50b2923e4211b6359c8f3c24d54fe537007d8cc9f23b5deb0c9a57cc`。workflow出力とregistryの一致を確認済み |
 | 原神プラグイン | `97eefa37bab74827df764bb8f3a482903c890c98` |
 | 本番に指定するimage | **公開・検証後の`ghcr.io/misaki-project/mk-genshin@sha256:…`。未確定** |
 
@@ -70,7 +70,19 @@ sudo docker stop "$APP"
 - ソースから構築する場合はGo1.27.1と対応するfrontendのNode/pnpmを用い、`make plugins`でworkspaceを再生成します。既存の未コミット変更を上書きしない別checkoutで構築します。frontendの更新後は本体の再起動も必要です。
 - nginxの参照設定を利用している場合は、アクセスログ・`/metrics`・Originの変更を確認します。IP履歴の表示権限変更や、旧いmaintenanceジョブの失敗記録の扱いもリリース本文に従って確認します。
 
-### imageとmigration
+### Release 1.5.0の追加確認
+
+[正式リリースの注意点](https://github.com/shiroha-a/mk/releases/tag/1.5.0)を確認します。
+
+- 複数プロセス構成では、**queue workerを先に更新**します。旧workerは`PreserveAccount`を無視し、保持すべきアカウント行まで削除する可能性があります。単独コンテナでも、別の旧workerが残っていないことを確認します。
+- `db.extra.ssl: true`はDB証明書を検証するようになります。私設CAを使う場合は`sslrootcert`の設定と証明書の読取りを確認します。起動失敗を避けるためだけに、無断で証明書検証を無効化しません。
+- `trustProxy`は明示した範囲だけを信頼します。前段proxyのアドレスが含まれることを確認します。`true`・数値・解釈できない値は起動エラーになるため、[設定手順](configuration.md)に従って修正します。
+- 独自クライアントは、JSONキーの大文字小文字・objectのbody・POSTのbodyを確認します。POSTのURLの`?i=`は認証に使用されません。role-levelのBearer認証と専用scopeを維持します。
+- 固定ノートは1.5.0準拠です。現在固定中のpublic/homeに対する作者の時間制限の例外は`notes/show`にも適用されますが、匿名のログイン要求・visitor制限・followers/DM・引用/返信の認可は迂回しません。
+- 更新後に`backfill-instance-counts`を実行します。本体の再起動と重ねず、まずdry-runで対象件数を確認し、[配備手順](deployment.md#後始末バッチ)に従って実行します。更新後の`backfill-remote-host`も再実行が必要です。更新前のバッチ実行とは別の作業として記録します。
+- Misakiでは上流migration108の`user.uri`インデックスを**109**へ割り当てます。既存106・107・108は変更しません。`CONCURRENTLY`によるインデックス作成は大きなDBで時間がかかるため、途中で通常起動へ進まず完了を確認します。
+
+### imageの取得
 
 公開・検証後に、運用者が確認したdigestを設定します。以下の未確定値をそのまま実行してはいけません。
 

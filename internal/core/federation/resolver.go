@@ -251,14 +251,22 @@ func (r *Resolver) ephemeralNoteByURI(uri string) *model.Note {
 // ephemeral 側の ID と DB 行の ID は別物 (先に ephemeral として採番したものは
 // materialize 時にのみ引き継がれる) なので、FTT に残った旧 ID も除かないと
 // hydrate で ephemeral 側が拾われ続ける。
-func (r *Resolver) dropSupersededEphemeral(uri, visibility string, author *model.User) {
+//
+// It reports whether an ephemeral entry for uri existed.
+//
+// 戻り値は「ephemeral に同じ投稿があったか」(#3330)。ephemeral に入れた時点で
+// note の chart と instance の notesCount は数えてあるので、呼び出し側はこれが
+// true なら作成として数え直さない (materialize の EnsureNote が数えないのと
+// 同じ)。DropNote が失敗しても true を返す — 数えたのは ephemeral に入れた
+// ときで、消せたかどうかとは関係ない。
+func (r *Resolver) dropSupersededEphemeral(uri, visibility string, author *model.User) bool {
 	if r.ephemeralSink == nil || uri == "" {
-		return
+		return false
 	}
 	ctx := context.Background()
 	oldID, err := r.ephemeralSink.NoteIDByURI(ctx, uri)
 	if err != nil || oldID == "" {
-		return
+		return false
 	}
 	if derr := r.ephemeralSink.DropNote(ctx, oldID, uri); derr != nil {
 		slog.Warn("federation: failed to drop superseded ephemeral note", "uri", uri, "err", derr)
@@ -266,6 +274,7 @@ func (r *Resolver) dropSupersededEphemeral(uri, visibility string, author *model
 	if r.ephemeralTimeline != nil && author != nil {
 		r.ephemeralTimeline.RemoveNoteID(oldID, author, visibility, author.Host)
 	}
+	return true
 }
 
 // resolveNoteAuthor resolves a note's author, keeping relay-only authors out
@@ -399,11 +408,15 @@ type Resolver struct {
 	keyFetchFailures map[string]time.Time
 	clock            func() time.Time // テストで差し替える時計
 	actorTTL         time.Duration    // アクター情報の最大寿命
+	// mentionFetch は受信ノートの未知の actor の取得の同時実行数と失敗の記憶
+	// (inbox の worker 全体で共有する)。
+	mentionFetch *mentionFetchGuard
 	// moveProcessor はリモートアカウント移行の検知時に呼ぶ引き継ぎ処理
 	// (#2414)。実体は core/move.Service。nil なら移行を検知しても何もしない。
 	moveProcessor      RemoteMoveProcessor
 	instanceTracker    InstanceTracker             // optional: ホスト発見を通知
 	chartHook          ChartHook                   // optional: 新規 remote user の集計
+	noteChartHook      NoteChartHook               // optional: 新しく取り込んだ note の集計 (#3330)
 	hashtagHook        HashtagHook                 // optional: per-tag mentionedUsersCount 集計 (#680)
 	publickeyRepo      PublickeyStore              // optional: 公開鍵の永続化 (RSA)
 	publickeyExtraRepo PublickeyExtraStore         // optional: 追加公開鍵 (Ed25519 / Multikey) の永続化
@@ -449,6 +462,9 @@ type Resolver struct {
 	// silencedChecker は remote note ingest 時に meta.silencedHosts 該当 host の
 	// public note を home に降格する判定に使う (#2106 N14)。未配線時は降格しない。
 	silencedChecker SilencedHostChecker
+	// rolePolicyProvider は受信した note の mentionLimit を投稿者の role policy
+	// から引くのに使う (#3330)。nil なら corenote.DefaultMentionLimit。
+	rolePolicyProvider RolePolicyProvider
 
 	// prohibitedWordsProvider は meta.prohibitedWords の読み取り元。nil なら
 	// hostBlocker から optional interface で拾う (prohibitedWords() を参照)。
@@ -489,6 +505,8 @@ func NewResolver(
 		keys:     map[string]publicKeyEntry{},
 		clock:    time.Now,
 		actorTTL: DefaultActorTTL,
+
+		mentionFetch: newMentionFetchGuard(inboundMentionFetchSlots),
 	}
 }
 
@@ -518,6 +536,28 @@ func (r *Resolver) SetInstanceTracker(t InstanceTracker) {
 // been freshly created. nil 渡しは無効化と同義。
 func (r *Resolver) SetChartHook(h ChartHook) {
 	r.chartHook = h
+}
+
+// SetNoteChartHook attaches a NoteChartHook invoked for every note this
+// resolver newly creates (inbound Create, and notes fetched while resolving
+// replies, quotes, Announce targets or featured collections). nil disables it.
+func (r *Resolver) SetNoteChartHook(h NoteChartHook) {
+	r.noteChartHook = h
+}
+
+// fireNoteCreated runs the note chart hook for a freshly created note.
+//
+// 本家は ApNoteService.createNote → NoteCreateService.create を通る全経路で
+// notes chart と instance の notesCount を数える。以前の mk-go は inbox の
+// Create を処理する processor だけが hook を呼んでいたので、返信元・引用・
+// Announce の対象などを解決のついでに取り込んだ投稿は数えず、その削除
+// (DeleteService) では引いていた (#3330)。作成の数え方をここ 1 か所に寄せ、
+// 削除と経路を揃える。dedup hit (created=false) では呼ばない。
+func (r *Resolver) fireNoteCreated(note *model.Note) {
+	if r.noteChartHook == nil || note == nil {
+		return
+	}
+	safeGoFedHook(func() { r.noteChartHook.OnNoteCreated(note) })
 }
 
 // SetHashtagHook attaches a HashtagHook invoked after a remote note has
@@ -1023,7 +1063,8 @@ func (r *Resolver) resolveActorOnceWithID(uri string, allowCrossHost bool, preas
 	switch {
 	case ferr == nil:
 		if r.shouldRefreshActor(existing) {
-			r.refreshActor(existing, uri, skipFeatured, chain)
+			// 失敗しても既存値を返す (best-effort)。
+			_ = r.refreshActor(existing, uri, skipFeatured, chain)
 		} else {
 			r.keysMu.RLock()
 			_, cached := r.keys[existing.ID]
@@ -1154,6 +1195,11 @@ func (r *Resolver) resolveActorOnceWithID(uri string, allowCrossHost bool, preas
 	// bannerUrl を守っている `remoteMediaURL` と同じ扱いに揃える (#2723)。
 	if shared := remoteURIValue(actor.ID, "user.sharedInbox", remoteSharedInbox(actor)); shared != "" {
 		user.SharedInbox = &shared
+	}
+	// 受信したノートの可視性の判定 (deriveVisibility) が followersUri と完全一致で
+	// 比べるので保存する (本家 ApPersonService.createPerson の followersUri、#3330)。
+	if followers := remoteURIValue(actor.ID, "user.followersUri", actor.Followers.String()); followers != "" {
+		user.FollowersURI = &followers
 	}
 	if featured := remoteURIValue(actor.ID, "user.featured", actor.Featured.String()); featured != "" {
 		user.Featured = &featured
@@ -1584,10 +1630,31 @@ func extractRemoteDescription(actor *activitypub.Person) *string {
 // bypassing the TTL cache. Move activityなどプロフィール更新が確実に必要な場合に使う。
 func (r *Resolver) ForceResolveActor(uri string) (*model.User, error) {
 	if existing, err := r.userRepo.FindByURI(uri); err == nil {
-		r.refreshActor(existing, uri, false, nil)
+		_ = r.refreshActor(existing, uri, false, nil)
 		return existing, nil
 	}
 	return r.ResolveActor(uri)
+}
+
+// RefreshActor re-fetches the stored remote actor at uri and updates its row,
+// like upstream ApPersonService.updatePerson. Unlike ForceResolveActor it does
+// not create a missing row and it reports a failed fetch.
+//
+// 本家 RemoteUserResolveService.resolveUser の再同期は updatePerson の失敗を
+// そのまま投げる (users/show は FAILED_TO_RESOLVE_REMOTE_USER になる) ので、
+// 取得の失敗を握らずに返す。
+func (r *Resolver) RefreshActor(uri string) (*model.User, error) {
+	if r.isSelfHostURI(uri) {
+		return nil, ErrLocalActor
+	}
+	existing, err := r.userRepo.FindByURI(uri)
+	if err != nil {
+		return nil, fmt.Errorf("refresh actor: %w", err)
+	}
+	if err := r.refreshActor(existing, uri, false, nil); err != nil {
+		return nil, fmt.Errorf("refresh actor: %w", err)
+	}
+	return existing, nil
 }
 
 // notifyInstance is a best-effort hook into the instance tracker. ベスト
@@ -1611,7 +1678,10 @@ func (r *Resolver) shouldRefreshActor(u *model.User) bool {
 // refreshActor refetches the remote actor document and updates mutable fields
 // on the local user row. 失敗してもエラーは返さず (呼び出し側はベストエフォート
 // で既存値を使う)、ログは呼び出し元側で残す。
-func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured bool, chain *resolveChain) {
+//
+// 戻り値は actor document の取得・検証の error だけ。DB への書き込みの失敗は
+// 従来どおり握る (次の refresh で再試行される)。
+func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured bool, chain *resolveChain) error {
 	// background refresh は federation-loop 扱いで Strict (request host binding 有効)。
 	actor, err := r.fetchActor(uri, false)
 	if err != nil {
@@ -1640,7 +1710,7 @@ func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured b
 				existing.LastFetchedAt = &now
 			}
 		}
-		return
+		return err
 	}
 	now := r.clock()
 	fields := map[string]any{
@@ -1686,6 +1756,12 @@ func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured b
 	if shared := remoteURIValue(actor.ID, "user.sharedInbox", remoteSharedInbox(actor)); shared != "" {
 		fields["sharedInbox"] = &shared
 		existing.SharedInbox = &shared
+	}
+	// 本家 updatePerson と同じく、actor が followers を出していなければ既存値を残す
+	// (`person.followers ? getApId(...) : undefined`)。
+	if followers := remoteURIValue(actor.ID, "user.followersUri", actor.Followers.String()); followers != "" {
+		fields["followersUri"] = &followers
+		existing.FollowersURI = &followers
 	}
 	if featured := remoteURIValue(actor.ID, "user.featured", actor.Featured.String()); featured != "" {
 		fields["featured"] = &featured
@@ -1842,6 +1918,7 @@ func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured b
 	if !skipFeatured {
 		r.updateFeatured(existing, chain)
 	}
+	return nil
 }
 
 // remoteMoveCooldown is how long a remote account must wait between moves
@@ -2101,6 +2178,10 @@ func (r *Resolver) fetchActor(uri string, allowCrossHost bool) (*activitypub.Per
 		slog.Warn("federation: dropping endpoints.sharedInbox with different host",
 			"uri", uri, "sharedInbox", actor.Endpoints.SharedInbox.String())
 		actor.Endpoints.SharedInbox = ""
+	}
+	if name, ok := actorCollectionsOnActorHost(&actor); !ok {
+		slog.Warn("federation: actor collection host mismatch", "uri", uri, "collection", name)
+		return nil, ErrInvalidActor
 	}
 	// preferredUsername は user.username / usernameLower (varchar(128) NOT NULL)
 	// にそのまま入る。upstream validateActor と同じ条件で弾く (#2662)。素通しすると
@@ -3044,7 +3125,7 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 		UserID:     actor.ID,
 		UserHost:   actor.Host,
 		URI:        &noteURI,
-		Visibility: deriveVisibility(apNote.To, apNote.CC),
+		Visibility: deriveVisibility(actor, apNote.To, apNote.CC),
 	}
 	// HTML 版の permalink。Mastodon 系では `id` (AP object) と `url` (Web ページ)
 	// が別なので、保存しないとクライアントが原文ページへ辿れない (#2729)。
@@ -3221,49 +3302,41 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 				"actor", actor.ID, "noteId", replyTarget.ID, "choice", apNote.Name)
 		}
 	}
-	// メンション抽出は本文と AP `tag` 配列の Mention 両方から行う。本文だけだと
-	// specified DM (本文に @ が無いケース) で受信者を取りこぼす (#397)。
-	// 本文 @username / tag href のいずれも最終的に user ID へ解決して保存する
+	// メンションは AP `tag` 配列の Mention だけから取り、user ID へ解決して保存する
 	// (mentions 列はローカル create 経路と同じ user ID の配列にする)。
-	var textMentions []string
-	if note.Text != nil {
-		var merr error
-		if textMentions, merr = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(*note.Text)); merr != nil {
-			return nil, false, fmt.Errorf("ingest note: %w", merr)
-		}
-	}
+	//
+	// 本家 ApNoteService.createNote は apMentions (= tag の Mention) を
+	// NoteCreateService に渡し、本文からはメンションを取らない。以前は本文の
+	// `@user` も解決して tag の分と合わせていたが、それだと tag に無い
+	// `@alice@<自ホスト>` を本文に書くだけで、alice に通知が届き、フォロワー限定の
+	// 投稿も見えるようになっていた (#3330)。
 	tagHrefs := extractMentionTags(apNote.Tag)
+	var audience []string
+	if note.Visibility == model.NoteVisibilitySpecified {
+		audience = specifiedAudience(actor, apNote.To, apNote.CC)
+	}
+	// DB に無いリモートの actor は先に取りに行く (本家 ApMentionService.
+	// extractApMentions / ApAudienceService.parseAudience の resolvePerson)。
+	// 取れたものは下の DB 照合で引ける。範囲と上限は fetchUnknownMentionActors。
+	// 投稿者の mentionLimit は、取得の上限と下の上限判定で同じ値を 1 回だけ引く。
+	authorMentionLimit := r.lazyMentionLimit(note.UserID)
+	if !ephemeral && depth == 0 {
+		r.fetchUnknownMentionActors(authorMentionLimit, tagHrefs, audience, chain)
+	}
 	tagMentions, merr := r.resolveMentionedUserIDs(tagHrefs)
 	if merr != nil {
 		return nil, false, fmt.Errorf("ingest note: %w", merr)
 	}
-	note.Mentions = mergeMentionIDs(textMentions, tagMentions)
-	// upstream Misskey #17167 (= 2026.5.0 fix / triage #1004): mentionLimit を
-	// 超える note は無効と扱い、保存せずに ErrContainsTooManyMentions を返す。
-	// caller (processor.handleCreate) が当該 sentinel を catch して queue retry
-	// 経路から除外することで、罠の inbox job が永続蓄積するのを防ぐ。
-	// upstream #17576: 制限判定は「解決できたユーザー数」(= len(note.Mentions)) でなく、
-	// remote が宣言した raw mention 数 (AP tag の Mention href ユニーク数) との max で
-	// 行う。一部しか解決できなくても大量 mention をすり抜けさせない。limit 値は
-	// corenote.DefaultMentionLimit (= 20)。local create path は role policy の
-	// 値を優先するようになったが (#2321)、こちらはリモートユーザーが対象で
-	// ローカルの role を持たないため既定値のみで判定する。
-	rawTagSet := make(map[string]struct{}, len(tagHrefs))
-	for _, h := range tagHrefs {
-		rawTagSet[h] = struct{}{}
-	}
-	effectiveMentions := len(note.Mentions)
-	if len(rawTagSet) > effectiveMentions {
-		effectiveMentions = len(rawTagSet)
-	}
-	if corenote.DefaultMentionLimit > 0 && effectiveMentions > corenote.DefaultMentionLimit {
-		return nil, false, corenote.ErrContainsTooManyMentions
-	}
-	// specified visibility では AP `to` 配列が宛先 actor URI 列。CanView の
-	// VisibleUserIDs チェック (core/note/visibility.go) で受信者が note を
-	// 参照できるよう、ここで ID へ解決して埋める (#397)。
+	note.Mentions = mergeMentionIDs(nil, tagMentions)
+	// specified visibility では AP `to` / `cc` の宛先 actor URI 列を ID へ解決して
+	// 埋める。CanView の VisibleUserIDs チェック (core/note/visibility.go) で受信者が
+	// note を参照できるようにするため (#397)。
+	//
+	// 本家 ApAudienceService.parseAudience は `to` と `cc` の両方から public と
+	// 投稿者の followers を除いた残りを宛先にする。以前は `to` だけを見ていたので、
+	// `cc` に置かれた宛先が DM を読めなかった (#3330)。
 	if note.Visibility == model.NoteVisibilitySpecified {
-		visible, verr := r.resolveMentionedUserIDs(apNote.To)
+		visible, verr := r.resolveMentionedUserIDs(audience)
 		if verr != nil {
 			return nil, false, fmt.Errorf("ingest note: %w", verr)
 		}
@@ -3285,6 +3358,29 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 			}
 		}
 		note.VisibleUserIDs = model.StringArray(visible)
+	}
+	// 返信先の作者と specified の宛先も mentions に入れる (本家
+	// NoteCreateService.create が mentionedUsers に足してから insert.mentions に
+	// 書く。ローカルの作成経路と同じ形)。入れないと、Mention tag の無い DM の宛先に
+	// mention 通知が届かず、notes/mentions にも出ない (#3330)。
+	note.Mentions = withImplicitMentions(note, note.Mentions)
+	// upstream Misskey #17167 (= 2026.5.0 fix / triage #1004): mentionLimit を
+	// 超える note は無効と扱い、保存せずに ErrContainsTooManyMentions を返す。
+	// caller (processor.handleCreate) が当該 sentinel を catch して queue retry
+	// 経路から除外することで、罠の inbox job が永続蓄積するのを防ぐ。
+	// upstream #17576: 制限判定は「解決できたユーザー数」でなく、remote が宣言した
+	// raw mention 数 (AP tag の Mention href ユニーク数) との max で行う。一部しか
+	// 解決できなくても大量 mention をすり抜けさせない。limit 値は投稿者の role
+	// policy の mentionLimit。本家は投稿者がリモートでも roleService.getUserPolicies
+	// を引くので、base policy の変更や、リモートの利用者に割り当てた / 条件で当たる
+	// ロールが効く (#3330。以前は既定値 20 固定だった)。
+	//
+	// 本家の「解決できたユーザー」(mentionedUsers) は mention に加えて、返信先の
+	// 作者 (自分への返信を除く) と specified の宛先を含む (NoteCreateService.create)。
+	// 宛先を数えないと、Mention tag を持たない DM で宛先を何人でも並べられる
+	// (#3330)。そのため宛先の解決を判定より前に行う。
+	if exceedsRemoteMentionLimit(note, note.Mentions, tagHrefs, authorMentionLimit) {
+		return nil, false, corenote.ErrContainsTooManyMentions
 	}
 	// AP Note Tag配列からカスタム絵文字を抽出してDBにupsert
 	if actor.Host != nil {
@@ -3368,6 +3464,10 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 		// repliesCount / renoteCount の増分と poll 行の作成は行わない。前者は
 		// 対象が DB に無い可能性があり、後者は poll.noteId が note への FK を
 		// 持つため行を作れない。hashtag 集計も DB 書き込みなので行わない。
+		//
+		// chart は数える。以前 processor が呼んでいたときも ephemeral の投稿を
+		// 数えていたので、その挙動を変えない。
+		r.fireNoteCreated(note)
 		return note, true, nil
 	}
 	if err := r.noteRepo.Create(note); err != nil {
@@ -3400,13 +3500,17 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	}
 	// 同じ投稿が先に relay 経由で ephemeral に入っていたら落とす。放置すると
 	// timeline の合成で DB 行と ephemeral の両方が出て二重表示になる (#2332)。
-	r.dropSupersededEphemeral(apNote.ID, string(note.Visibility), actor)
+	supersededEphemeral := r.dropSupersededEphemeral(apNote.ID, string(note.Visibility), actor)
 	// hashtag table の mentionedUsersCount / userIds 更新 (#680 / #719)。
 	// hook 実装 (core/hashtag.Service) が内部で goroutine を起こす
 	// fire-and-forget 設計なので、IngestNote から見ると即時 return する。
 	// inbox processor の drain time が tag 数に比例して伸びる退行を回避。
 	if r.hashtagHook != nil && len(note.Tags) > 0 {
 		r.hashtagHook.OnNoteCreated(note, actor)
+	}
+	// ephemeral に入っていた投稿は、そこで既に数えてある (#3330)。
+	if !supersededEphemeral {
+		r.fireNoteCreated(note)
 	}
 	return note, true, nil
 }
@@ -3722,6 +3826,27 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 			"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "noteId", existing.ID)
 		return existing, nil
 	}
+	// text が変わらなくても tag 配列の Mention は AP Update で変化しうる (#397)。
+	// IngestNote と同じく tag の Mention だけを user ID 配列にする (本家
+	// ApNoteService.createNote の apMentions と同じ。本文からは取らない、#3330)。
+	tagHrefs := extractMentionTags(apNote.Tag)
+	tagMentions, merr := r.resolveMentionedUserIDs(tagHrefs)
+	if merr != nil {
+		return nil, fmt.Errorf("update remote note: %w", merr)
+	}
+	// 作成時と同じく返信先の作者と specified の宛先も足す。足さないと、編集のたびに
+	// 作成時に入れたそれらが mentions から消える。
+	mentions := withImplicitMentions(existing, mergeMentionIDs(nil, tagMentions))
+	// メンション数の上限も編集経路に掛ける (#3330)。禁止語と同じく upstream には
+	// 対応物が無い (ノートの Update を取り込まない) が、掛けないと「上限内の note を
+	// 投げてから Update で Mention を増やす」で取り込み時の判定 (#17167 / #17576) を
+	// 素通りできる。数え方は IngestNote と同じ。弾くときは禁止語と同じく更新を
+	// 捨てて ack する (書き込みより前に判定する理由も同じ)。
+	if r.exceedsMentionLimit(existing, mentions, tagHrefs) {
+		slog.Info("federation: dropping inbound note update with too many mentions",
+			"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "noteId", existing.ID)
+		return existing, nil
+	}
 	// 連合のルール (#3090) も編集に掛ける。掛けないと「条件に当たらない投稿を
 	// 作ってから Update で差し替える」で素通りできる。判定は更新後の値で行う。
 	var ruleDecision fedrule.Decision
@@ -3758,27 +3883,6 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 		fields["text"] = &newText
 		existing.Text = &newText
 	}
-	// text が変わらなくても tag 配列の Mention は AP Update で変化しうる (#397)。
-	// IngestNote と同じく本文と tag 両方から mention を集めて user ID 配列に
-	// 統一する (mentions 列の意味論を local create 経路と揃えるため)。
-	var (
-		textMentions []string
-		merr         error
-	)
-	switch {
-	case newText != "":
-		textMentions, merr = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(newText))
-	case existing.Text != nil:
-		textMentions, merr = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(*existing.Text))
-	}
-	if merr != nil {
-		return nil, fmt.Errorf("update remote note: %w", merr)
-	}
-	tagMentions, merr := r.resolveMentionedUserIDs(extractMentionTags(apNote.Tag))
-	if merr != nil {
-		return nil, fmt.Errorf("update remote note: %w", merr)
-	}
-	mentions := mergeMentionIDs(textMentions, tagMentions)
 	if !slices.Equal([]string(existing.Mentions), []string(mentions)) {
 		fields["mentions"] = mentions
 		existing.Mentions = mentions
@@ -3881,21 +3985,104 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 	return existing, nil
 }
 
-// ExtractLocalUserID returns the user ID for a URI matching the local
-// /users/{id} pattern, or "" if the URI does not match.
+// ExtractLocalUserID returns the user ID a local URI names the way upstream
+// ApPersonService.fetchPerson reads it: a URI under `{url}/` (a plain string
+// prefix, not a host comparison) names the user whose ID is its last path
+// segment (`uri.split('/').pop()`). It returns "" for any other URI.
+//
+// 以前は `/users/{id}` の直後で切っていたので、`/users/{id}/followers` のような
+// ローカルの利用者の collection の URI がその利用者に解決され、メンション・
+// specified の宛先の対象になっていた。本家は最後の段 (`followers`) を ID として
+// 引くので誰にも解決しない (#3330)。
+//
+// **host ではなく文字列の接頭辞で見る。** 本家 fetchPerson は
+// `uri.startsWith(`${config.url}/`)` で、`config.url` は `new URL(...).origin`
+// (scheme + 小文字の host + 既定でない port)。`http://` を名乗るものや
+// `:443` を付けたものは、host が自分でも接頭辞に当たらず、続く createPerson が
+// isUriLocal (host 比較) で `cannot resolve local user` を投げるので、誰にも
+// 解決しない。mk-go の呼び出し側 (resolveMentionedUserIDs) も、ここで "" なら
+// FindByURI に回り、ローカルの利用者は uri を持たないので同じく解決しない。
+// host で見るように変えると、本家が捨てるそれらの URI をローカルの利用者に
+// 解決してしまう。
+//
+// 接頭辞は `{url}/users/` ではなく `{url}/` (本家と同じ)。通報 (Flag) は本家が
+// `{url}/users/` で絞るので flagTargetUserID を使う。Accept の actor のように
+// 本家が getUserFromApId で読む箇所 (WebFinger の self を含む) と、本家に対応の
+// 無い chat の宛先は localUserIDFromAPID / LocalUserIDFromURI (parseLocalURI) を使う。
 func (r *Resolver) ExtractLocalUserID(uri string) string {
 	if r.urls == nil {
 		return ""
 	}
-	prefix := r.urls.UserURI("")
-	if !strings.HasPrefix(uri, prefix) {
+	// UserURI("") = `{url}/users/`。URLBuilder は baseURL を公開しないので、
+	// 既存の組み立てから `{url}/` を取り出す。
+	return lastSegmentUnder(uri, strings.TrimSuffix(r.urls.UserURI(""), "users/"))
+}
+
+// flagTargetUserID returns the user ID an inbound Flag object URI names the
+// way upstream ApInboxService.flag reads it: a URI under `{url}/users/` names
+// the user whose ID is its last path segment (`uri.split('/').at(-1)`).
+func (r *Resolver) flagTargetUserID(uri string) string {
+	if r.urls == nil {
 		return ""
 	}
-	rest := uri[len(prefix):]
-	if i := strings.Index(rest, "/"); i >= 0 {
-		rest = rest[:i]
+	return lastSegmentUnder(uri, r.urls.UserURI(""))
+}
+
+// lastSegmentUnder returns the last `/`-separated segment of uri when uri
+// starts with prefix, and "" otherwise.
+func lastSegmentUnder(uri, prefix string) string {
+	rest, ok := strings.CutPrefix(uri, prefix)
+	if !ok {
+		return ""
+	}
+	if i := strings.LastIndex(rest, "/"); i >= 0 {
+		rest = rest[i+1:]
 	}
 	return rest
+}
+
+// parseLocalURI reads uri the way upstream ApDbResolverService.parseUri does
+// for this instance: local is whether the host is this instance's (any
+// scheme, like UtilityService.isUriLocal), and for a local URI typ and id are
+// the first and second path segments (`/users/{id}/...` → "users", id).
+func (r *Resolver) parseLocalURI(uri string) (typ, id string, local bool) {
+	if !r.isSelfHostURI(uri) {
+		return "", "", false
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", "", true
+	}
+	// 本家は `new URL(...).pathname` (エスケープされたまま) を `/` で割る。
+	parts := strings.Split(u.EscapedPath(), "/")
+	if len(parts) > 1 {
+		typ = parts[1]
+	}
+	if len(parts) > 2 {
+		id = parts[2]
+	}
+	return typ, id, true
+}
+
+// localUserIDFromAPID returns the user ID a local `/users/{id}[/...]` URI
+// names the way upstream ApDbResolverService.getUserFromApId reads it
+// (parseUri: the segment right after `users`, ignoring the rest). It returns
+// "" for a URI that is not local or not under `/users/`.
+func (r *Resolver) localUserIDFromAPID(uri string) string {
+	id, _ := r.LocalUserIDFromURI(uri)
+	return id
+}
+
+// LocalUserIDFromURI reports whether uri is served by this instance and, for
+// a `/users/{id}[/...]` URI, the user ID, both as upstream parseUri reads them
+// (see parseLocalURI). The WebFinger self link of a remote acct is read this
+// way (RemoteUserResolveService.resolveUser → getUserFromApId).
+func (r *Resolver) LocalUserIDFromURI(uri string) (string, bool) {
+	typ, id, local := r.parseLocalURI(uri)
+	if typ != "users" {
+		id = ""
+	}
+	return id, local
 }
 
 // extractLocalNoteID returns the trailing note ID for a URI rooted at the
@@ -3985,11 +4172,133 @@ func extractMentionTags(tags []any) []string {
 	return out
 }
 
+// inboundMentionFetchBudget is the wall-clock budget of the unknown-actor
+// fetches of one inbound note. 予算を過ぎたら次の取得を始めない。本家には全体の
+// 締め切りが無い。notes/create のメンションの取得 (defaultRemoteMentionFetchTimeout)
+// と同じ 20 秒。
+//
+// **始めた 1 件は止めない。** その 1 件は actor の取得 (fetcher の timeout) に
+// 加えて、新しい actor を作る経路では notifyInstance → RegisterFromHost が
+// インスタンスのメタデータ (nodeinfo など) の取得を同期で行うので、予算の 20 秒に
+// それらの timeout ぶん (最悪 1〜2 分程度) が足されうる。
+var inboundMentionFetchBudget = 20 * time.Second
+
+// fetchUnknownMentionActors resolves (fetches and stores) the remote actors
+// among an inbound note's Mention hrefs and specified recipients that are not
+// in the DB yet, like upstream extractApMentions / parseAudience, which call
+// ApPersonService.resolvePerson on each and ignore failures.
+//
+// 本家との違い (docs/divergence.md):
+//
+//   - **直列に取る。** 本家は 2 並列。resolveChain は 1 つの木を 1 つの goroutine
+//     が触る前提 (resolve_waits.go) なので、同じ木の中で並列にすると待ちの
+//     循環を検出できなくなる
+//   - **件数と時間に上限を置く**。件数は投稿者の mentionLimit ポリシー
+//     (mentionLimitFor。取り込みの上限判定と同じ値) で、それより多く解決できたら
+//     どのみち上限で弾かれる。時間は inboundMentionFetchBudget。到達できなかったホストの残りは取りに行かない
+//   - **同時に取りに行くノートの数を inbox の worker 全体で絞る**
+//     (inboundMentionFetchSlots)。枠が取れなければ取りに行かず、DB の照合だけに
+//     する。応答しないホスト (ワイルドカード DNS の別サブドメインなど) への
+//     メンションを並べたノートを送り続けても、止まる worker は枠の数まで
+//   - **取得に失敗した URI と到達できなかったホストを短い間覚えて飛ばす**
+//     (inboundMentionFailureTTL)
+//   - **新しく取り込んだ actor の featured は取らない。** 取ると 1 件の配送から
+//     メンションの数 × ピン留めの数の取得が起きる。次に actor を取り直したとき
+//     (TTL 切れ) に埋まる
+//   - 連合しないホストは、取りに行く前に飛ばす (どのみち fetchActor が拒否する)
+//   - mentionLimit を超える数の Mention を持つ note は、取得しても数えた時点で
+//     弾かれるので、何も取りに行かない
+//
+// DB の照合に失敗したら、そこで止める。続く resolveMentionedUserIDs が同じ
+// 障害を error にして、inbox job が retry される。
+//
+// mentionLimit は投稿者の mentionLimit ポリシーを遅延で返す (lazyMentionLimit)。
+// 取りに行く候補が無ければ呼ばない (メンションの無い note で role policy を
+// 引かない)。
+func (r *Resolver) fetchUnknownMentionActors(mentionLimit func() int, tagHrefs, audience []string, chain *resolveChain) {
+	if r.userRepo == nil {
+		return
+	}
+	rawTags := make(map[string]struct{}, len(tagHrefs))
+	for _, h := range tagHrefs {
+		rawTags[h] = struct{}{}
+	}
+	if len(rawTags) > 0 && len(rawTags) > mentionLimit() {
+		return
+	}
+	guard := r.mentionFetch
+	if guard == nil {
+		return
+	}
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	start := time.Now()
+	seen := make(map[string]struct{})
+	attempts := 0
+	for _, list := range [][]string{tagHrefs, audience} {
+		for _, href := range list {
+			if _, dup := seen[href]; dup {
+				continue
+			}
+			seen[href] = struct{}{}
+			if href == "" || r.isSelfHostURI(href) {
+				continue
+			}
+			// http(s) 以外は取りに行かない。`ftp://` などは通信せずに失敗するので、
+			// 取りに行っても何も得られない。
+			if !isHTTPURI(href) {
+				continue
+			}
+			host, err := hostFromURI(href)
+			if err != nil || !r.hostAllowed(host) {
+				continue
+			}
+			if guard.failedRecently(href, host, r.clock()) {
+				continue
+			}
+			switch _, ferr := r.userRepo.FindByURI(href); {
+			case ferr == nil:
+				continue
+			case !repository.IsNotFound(ferr):
+				return
+			}
+			if attempts >= mentionLimit() || time.Since(start) > inboundMentionFetchBudget {
+				slog.Info("federation: stopped fetching unknown mentioned actors",
+					"attempts", attempts, "elapsed", time.Since(start))
+				return
+			}
+			if release == nil {
+				var ok bool
+				if release, ok = guard.tryAcquire(); !ok {
+					slog.Debug("federation: skipped fetching unknown mentioned actors: all slots busy")
+					return
+				}
+			}
+			attempts++
+			if _, err := r.resolveActor(href, false, true, chain); err != nil {
+				// DB の障害と、解決の待ち合わせの都合で降りたものは覚えない (相手の
+				// 不備ではない)。
+				if !errors.Is(err, ErrLookupUnavailable) && !errors.Is(err, ErrResolveWouldDeadlock) &&
+					!errors.Is(err, ErrResolveJoinTimeout) && !errors.Is(err, ErrResolveWouldBlock) {
+					guard.recordFailure(href, host, isUnreachableHostError(err, host), r.clock())
+				}
+				slog.Debug("federation: could not resolve mentioned actor",
+					"uri", truncateRunes(href, userURIMaxRunes), "err", err)
+			}
+		}
+	}
+}
+
 // resolveMentionedUserIDs maps actor URIs (typically from AP Mention tags or
 // the `to` array) to local model.User IDs. ローカル URI は ExtractLocalUserID
-// で安価に変換し、リモート URI は既知 (DB に取り込み済) のものだけ
-// userRepo.FindByURI でルックアップする。未知リモート URI は federation fetch
-// すると inbox 処理が重くなるため skip。返り値は入力順を保ち重複排除する。
+// で安価に変換し、リモート URI は DB に取り込み済みのものを
+// userRepo.FindByURI でルックアップする。未知のリモート URI は ingest の前段の
+// fetchUnknownMentionActors が取り込んでおく (ここでは取りに行かない)。
+// 返り値は入力順を保ち重複排除する。
 //
 // **引けなかったものを「未知」に潰さない** (#3121)。潰すと `mentions` や
 // specified note の `visibleUserIds` が空のまま note が確定し、**URI は DB に
@@ -3999,12 +4308,18 @@ func (r *Resolver) resolveMentionedUserIDs(hrefs []string) ([]string, error) {
 	if len(hrefs) == 0 {
 		return nil, nil
 	}
+	existingLocal, err := r.existingLocalUserIDs(hrefs)
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[string]struct{}, len(hrefs))
 	out := make([]string, 0, len(hrefs))
 	for _, href := range hrefs {
 		var id string
 		if local := r.ExtractLocalUserID(href); local != "" {
-			id = local
+			if _, ok := existingLocal[local]; ok || existingLocal == nil {
+				id = local
+			}
 		} else if r.userRepo != nil {
 			u, err := r.userRepo.FindByURI(href)
 			switch {
@@ -4022,37 +4337,6 @@ func (r *Resolver) resolveMentionedUserIDs(hrefs []string) ([]string, error) {
 		}
 		seen[id] = struct{}{}
 		out = append(out, id)
-	}
-	return out, nil
-}
-
-// resolveTextMentionUserIDs maps text-derived `@username[@host]` mentions to
-// local model.User IDs. mentions 列の意味論を local create 経路 (user ID 配列)
-// と揃えるため、リモート受信 Note でも username → ID 解決を必ず通す (#397)。
-// userRepo 未設定 / 未知ユーザーは skip する (NotificationService 等の
-// 既存後段は skip でも username fallback で動くが、mentions 列の query は
-// ID 完全一致なので残しても無駄)。
-func (r *Resolver) resolveTextMentionUserIDs(mentions []corenote.Mention) ([]string, error) {
-	if r.userRepo == nil || len(mentions) == 0 {
-		return nil, nil
-	}
-	out := make([]string, 0, len(mentions))
-	for _, m := range mentions {
-		var host *string
-		if m.Host != "" {
-			h := m.Host
-			host = &h
-		}
-		u, err := r.userRepo.FindByUsernameLower(m.Username, host)
-		if err != nil && !repository.IsNotFound(err) {
-			// 上と同じ (#3121)。引けなかったものを「未知の相手」に潰すと、
-			// 通知の宛先が欠けたまま note が確定する。
-			return nil, fmt.Errorf("resolve text mention %q: %w", m.Username, err)
-		}
-		if err != nil || u == nil {
-			continue
-		}
-		out = append(out, u.ID)
 	}
 	return out, nil
 }
@@ -4318,46 +4602,43 @@ func remoteEmojiLicense(v *string) *string {
 	return &out
 }
 
-// deriveVisibility maps an AS to/cc audience pair to a Misskey visibility,
-// mirroring upstream ApAudienceService.parseAudience (#1864):
-//
-//   - to に Public があれば public
-//   - cc に Public があれば home
-//   - to / cc のいずれかに followers があれば followers
-//   - それ以外 (specific actor 列挙) は specified
-//
-// Public は upstream isPublic と同じく full IRI / as:Public / 裸 Public の 3 形式を
-// 受ける。followers collection の判定は upstream isFollowers のような actor の
-// followersUri 厳密一致ではなく /followers サフィックスで近似する。このため別 actor の
-// followers URL が to/cc に入っていると upstream の specified でなく followers になる等の
-// 差は出るが、to/cc は note の author (Announce では announcer) が自分の note/boost に
-// 対して設定するものなので、緩めても自分のコンテンツの可視性が変わるだけで第三者の
-// note を露出させることはない。
-//
-// #2106 L31 (documented limitation): mk-go は remote user の followersUri を保持しないため
-// upstream ApAudienceService.isFollowers (`id === actor.followersUri ?? actor.uri+'/followers'`)
-// の厳密一致を行えず suffix heuristic で近似する。exotic audience (他人の followers collection
-// を to/cc に含む note) で upstream が specified に倒すところを followers に倒す微差が残る
-// (#1864 の既知トレードオフ)。将来 followersUri を保持・参照できるようになったら厳密化する。
-func deriveVisibility(to, cc []string) model.NoteVisibility {
-	hasFollowers := func(list []string) bool {
-		for _, v := range list {
-			if strings.HasSuffix(v, "/followers") {
-				return true
+// withImplicitMentions appends to mentions the users upstream
+// NoteCreateService.create adds to mentionedUsers besides the Mention tags: the
+// reply target's author (unless it is the note's author), then for a specified
+// note its recipients. n must carry UserID, ReplyUserID, Visibility and
+// VisibleUserIDs. The result is dedup'd and never nil.
+func withImplicitMentions(n *model.Note, mentions model.StringArray) model.StringArray {
+	var extra []string
+	if n.ReplyUserID != nil && *n.ReplyUserID != "" && *n.ReplyUserID != n.UserID {
+		extra = append(extra, *n.ReplyUserID)
+	}
+	if n.Visibility == model.NoteVisibilitySpecified {
+		extra = append(extra, n.VisibleUserIDs...)
+	}
+	return mergeMentionIDs(mentions, extra)
+}
+
+// specifiedAudience returns the addressees of a specified note: `to` then `cc`,
+// without the public collection and the author's followers collection,
+// de-duplicated. Mirrors upstream ApAudienceService.parseAudience
+// (`unique(concat([toGroups.other, ccGroups.other]))`).
+func specifiedAudience(actor *model.User, to, cc []string) []string {
+	followers := authorFollowersURI(actor)
+	var out []string
+	seen := make(map[string]struct{})
+	for _, list := range [][]string{to, cc} {
+		for _, id := range list {
+			if hasPublicAudience([]string{id}) || (followers != "" && id == followers) {
+				continue
 			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
 		}
-		return false
 	}
-	if hasPublicAudience(to) {
-		return model.NoteVisibilityPublic
-	}
-	if hasPublicAudience(cc) {
-		return model.NoteVisibilityHome
-	}
-	if hasFollowers(to) || hasFollowers(cc) {
-		return model.NoteVisibilityFollowers
-	}
-	return model.NoteVisibilitySpecified
+	return out
 }
 
 // hasPublicAudience reports whether list contains the AS public collection in

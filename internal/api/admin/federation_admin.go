@@ -59,7 +59,9 @@ func (h *Handler) FederationDeleteAllFiles(c echo.Context) error {
 	var req struct {
 		Host string `json:"host"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return apierr.JSONInvalidParam(c)
+	}
 	if req.Host == "" {
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -86,7 +88,9 @@ func (h *Handler) FederationRefreshRemoteInstanceMetadata(c echo.Context) error 
 	var req struct {
 		Host string `json:"host"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return apierr.JSONInvalidParam(c)
+	}
 	if h.instanceMetadataFetcher == nil || req.Host == "" {
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -154,9 +158,12 @@ func (h *Handler) cleanupSuspendedUserRelations(userID string) {
 			break
 		}
 		for _, f := range rows {
+			// 本家 unFollowAll は silent: true で積む (利用者の main stream と
+			// Webhook に unfollow を 1 件ずつ出さない)。
 			if err := h.unfollowEnqueuer.EnqueueUnfollow(queue.UnfollowPayload{
 				FollowerID: f.FollowerID,
 				FolloweeID: f.FolloweeID,
+				Silent:     true,
 			}); err != nil {
 				slog.Warn("admin suspend: enqueue unfollow failed",
 					"follower", f.FollowerID, "followee", f.FolloweeID, "err", err)
@@ -172,7 +179,9 @@ func (h *Handler) FederationRemoveAllFollowing(c echo.Context) error {
 	var req struct {
 		Host string `json:"host"`
 	}
-	_ = c.Bind(&req)
+	if err := c.Bind(&req); err != nil {
+		return apierr.JSONInvalidParam(c)
+	}
 	if req.Host == "" || h.followingRepo == nil || h.unfollowEnqueuer == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -192,9 +201,11 @@ func (h *Handler) FederationRemoveAllFollowing(c echo.Context) error {
 			break
 		}
 		for _, f := range rows {
+			// 本家 remove-all-following は silent: true で積む。
 			if err := h.unfollowEnqueuer.EnqueueUnfollow(queue.UnfollowPayload{
 				FollowerID: f.FollowerID,
 				FolloweeID: f.FolloweeID,
+				Silent:     true,
 			}); err != nil {
 				// enqueue 失敗は個別ペアで握りつぶす - admin 操作の best-effort
 				// として残りの enqueue を妨げない。Worker retry が効かないため
@@ -282,7 +293,8 @@ func (h *Handler) FederationUpdateInstance(c echo.Context) error {
 	}
 	var req federationUpdateInstanceRequest
 	if err := c.Bind(&req); err != nil || req.Host == "" {
-		return c.NoContent(http.StatusNoContent)
+		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
+		return apierr.JSONInvalidParam(c)
 	}
 	// upstream は lookup 前に toPuny(host) で punycode / 小文字化する。IDN / 大文字
 	// host でも instance を引けるよう正規化してから FindByHost / UpdateFields に渡す。

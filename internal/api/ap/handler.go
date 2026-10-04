@@ -2,6 +2,7 @@
 package ap
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/userrelation"
 	corenote "github.com/shiroha-a/mk/internal/core/note"
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
+	"github.com/shiroha-a/mk/internal/core/userpack"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -57,6 +59,8 @@ type HostBlockChecker interface {
 
 // Handler handles ActivityPub resource endpoints.
 type Handler struct {
+	// detailExtras は UserDetailed のピン留め・移行先を users/show と同じ規則で埋める (#3330)。
+	detailExtras     userpack.DetailExtras
 	renderer         *activitypub.Renderer
 	userService      *coreuser.Service
 	queryService     *corenote.QueryService
@@ -298,6 +302,9 @@ func (h *Handler) User(c echo.Context) error {
 		// 既存仕様: AP client は 404、browser も 404 (ID 不正)
 		return c.NoContent(http.StatusNotFound)
 	}
+	if bundle.User.IsDeleted && bundle.User.IsLocal() {
+		return c.NoContent(http.StatusNotFound)
+	}
 
 	if !wantsActivityJSON(c.Request().Header.Get("Accept")) {
 		// suspended local user は upstream Misskey TS と同じく 404。SPA の
@@ -328,8 +335,9 @@ func (h *Handler) User(c echo.Context) error {
 // (/@:acct)。upstream ActivityPubServerService.userInfo に相当する。
 func (h *Handler) apUserInfo(c echo.Context, bundle *coreuser.UserWithProfile) error {
 	// suspended は upstream の route query (isSuspended: false) 相当で、
-	// ローカル・リモートを問わず 404 (Person も redirect も返さない)。
-	if bundle.User.IsSuspended {
+	// ローカル・リモートを問わず 404 (Person も redirect も返さない)。retention
+	// した local deleted user も隠すが、remote deleted actor の redirect は維持する。
+	if bundle.User.IsSuspended || (bundle.User.IsDeleted && bundle.User.IsLocal()) {
 		return c.NoContent(http.StatusNotFound)
 	}
 	// リモート actor は原本 URI へリダイレクトする。無いと他サーバーがこの
@@ -427,7 +435,7 @@ func (h *Handler) APIGet(c echo.Context) error {
 		URI string `json:"uri"`
 	}
 	if err := c.Bind(&req); err != nil || req.URI == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "uri is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	// ローカルURIからオブジェクトを解決
@@ -456,7 +464,7 @@ func (h *Handler) APIShow(c echo.Context) error {
 		URI string `json:"uri"`
 	}
 	if err := c.Bind(&req); err != nil || req.URI == "" {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "uri is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+		return apierr.JSONInvalidParam(c)
 	}
 
 	// URI を解析して host を得る。http(s) でない / host 無しは URI_INVALID
@@ -682,6 +690,10 @@ func (h *Handler) packUserForAPI(viewer *model.User, u *model.User, profile *mod
 		return map[string]any{}
 	}
 	d := entity.PackUserDetailed(u, profile, h.idGen)
+	// ピン留めと移行先は users/show と同じ規則で埋める (#3330)。
+	if h.detailExtras != nil {
+		h.detailExtras.FillDetailedExtras(context.Background(), viewer, u, profile, &d)
+	}
 	// upstream は pack(user, me, {schema:'UserDetailedNotMe'}) で me!=null のとき
 	// relation block (isFollowing/isBlocking 等) を埋める。authed viewer に同じ
 	// relation を載せる (#1778)。anonymous / self は Apply 内で no-op。

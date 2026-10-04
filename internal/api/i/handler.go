@@ -49,13 +49,11 @@ type RoleProvider interface {
 	HasRolePolicy(userID, policyKey string) bool
 }
 
-// checkedRoleProvider is the optional, narrower capability used by
-// i/delete-account to resolve effective policies while surfacing provider
-// failures. It is asserted on roleProvider rather than added to RoleProvider so
-// existing implementations and stubs stay unchanged. Unlike HasRolePolicy, the
-// caller applies no administrator bypass.
+// checkedRoleProvider is used by authorization decisions that must distinguish
+// a resolved deny from failures in the native inputs or providers that declare
+// the decision's policy keys.
 type checkedRoleProvider interface {
-	GetUserPoliciesChecked(userID string) (map[string]any, error)
+	GetUserPoliciesCheckedForKeys(userID string, keys ...string) (map[string]any, error)
 }
 
 // EmailSender sends an email message (subject + text + optional HTML).

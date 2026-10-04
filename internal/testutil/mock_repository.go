@@ -222,6 +222,7 @@ func assertUserColumns(u *model.User) error {
 		{"user.inbox", u.Inbox, 512},
 		{"user.sharedInbox", u.SharedInbox, 512},
 		{"user.featured", u.Featured, 512},
+		{"user.followersUri", u.FollowersURI, 512},
 		{"user.movedToUri", u.MovedToURI, 512},
 	} {
 		if c.value == nil {
@@ -565,6 +566,23 @@ func (m *MockUserRepository) UpdateUser(userID string, fields map[string]any) er
 func (m *MockUserRepository) HardDeleteUser(userID string) error {
 	delete(m.Users, userID)
 	delete(m.Profiles, userID)
+	return nil
+}
+
+func (m *MockUserRepository) RevokeDeletedLocalCredentials(userID string) error {
+	if user := m.Users[userID]; user != nil {
+		user.Token = nil
+	}
+	if profile := m.Profiles[userID]; profile != nil {
+		profile.Password = nil
+		profile.EmailVerifyCode = nil
+		profile.TwoFactorTempSecret = nil
+		profile.TwoFactorSecret = nil
+		profile.TwoFactorBackupSecret = model.StringArray{}
+		profile.TwoFactorEnabled = false
+		profile.SecurityKeysAvailable = false
+		profile.UsePasswordLessLogin = false
+	}
 	return nil
 }
 
@@ -944,9 +962,20 @@ func applyUserFields(u *model.User, fields map[string]any) {
 			if s, ok := v.(*string); ok {
 				u.SharedInbox = s
 			}
+		case "followersUri":
+			if s, ok := v.(*string); ok {
+				u.FollowersURI = s
+			}
 		case "lastFetchedAt":
 			if t, ok := v.(*time.Time); ok {
 				u.LastFetchedAt = t
+			}
+		case "uri":
+			switch s := v.(type) {
+			case string:
+				u.URI = &s
+			case *string:
+				u.URI = s
 			}
 		case "isLocked":
 			if b, ok := v.(bool); ok {
@@ -1372,6 +1401,10 @@ func (m *MockNoteRepository) FindByIDWithUser(id string) (*model.Note, error) {
 	return m.FindByID(id)
 }
 
+func (m *MockNoteRepository) FindByIDWithUserOnPrimary(id string) (*model.Note, error) {
+	return m.FindByIDWithUser(id)
+}
+
 // FindByIDWithRelations mirrors the production preloadNoteRelations behavior:
 // shallow-copy the stored note and embed Renote / Reply targets from the map
 // when their IDs are set (#425)。コピーに書き込むので、同じ note を
@@ -1393,6 +1426,10 @@ func (m *MockNoteRepository) FindByIDWithRelations(id string) (*model.Note, erro
 		}
 	}
 	return &out, nil
+}
+
+func (m *MockNoteRepository) FindByIDWithRelationsOnPrimary(id string) (*model.Note, error) {
+	return m.FindByIDWithRelations(id)
 }
 
 func (m *MockNoteRepository) FindByURI(uri string) (*model.Note, error) {
@@ -1763,6 +1800,10 @@ func (m *MockNoteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note,
 		}
 	}
 	return out, nil
+}
+
+func (m *MockNoteRepository) FindManyByIDsWithUserOnPrimary(ids []string) ([]*model.Note, error) {
+	return m.FindManyByIDsWithUser(ids)
 }
 
 func (m *MockNoteRepository) ListFeatured(channelID, untilID string, limit, offset int) ([]*model.Note, error) {
@@ -3655,6 +3696,22 @@ func (m *MockUserNotePiningRepository) ListByUser(userID string) ([]*model.UserN
 	return rows, nil
 }
 
+// ListByUsers implements repository.UserNotePiningBatchReader.
+func (m *MockUserNotePiningRepository) ListByUsers(userIDs []string) ([]*model.UserNotePining, error) {
+	want := make(map[string]bool, len(userIDs))
+	for _, id := range userIDs {
+		want[id] = true
+	}
+	var rows []*model.UserNotePining
+	for _, p := range m.Pinings {
+		if want[p.UserID] {
+			rows = append(rows, p)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID > rows[j].ID })
+	return rows, nil
+}
+
 func (m *MockUserNotePiningRepository) ReplaceByUser(userID string, pins []*model.UserNotePining) error {
 	if m.ReplaceErr != nil {
 		return m.ReplaceErr
@@ -3966,15 +4023,17 @@ func (m *MockInstanceRepository) IncrementCount(host, column string, delta int) 
 	if !ok {
 		return ErrNotFound
 	}
+	// 本物の IncrementCount と同じく 0 で止める。
+	add := func(v int) int { return max(v+delta, 0) }
 	switch column {
 	case "usersCount":
-		inst.UsersCount += delta
+		inst.UsersCount = add(inst.UsersCount)
 	case "notesCount":
-		inst.NotesCount += delta
+		inst.NotesCount = add(inst.NotesCount)
 	case "followingCount":
-		inst.FollowingCount += delta
+		inst.FollowingCount = add(inst.FollowingCount)
 	case "followersCount":
-		inst.FollowersCount += delta
+		inst.FollowersCount = add(inst.FollowersCount)
 	}
 	return nil
 }
@@ -7299,6 +7358,11 @@ func (m *MockAbuseReportRepository) UpdateFields(id string, fields map[string]an
 	if v, ok := fields["moderationNote"]; ok {
 		if s, ok := v.(string); ok {
 			r.ModerationNote = s
+		}
+	}
+	if v, ok := fields["forwarded"]; ok {
+		if f, ok := v.(bool); ok {
+			r.Forwarded = f
 		}
 	}
 	if v, ok := fields["assigneeId"]; ok {

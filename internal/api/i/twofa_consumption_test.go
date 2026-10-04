@@ -128,7 +128,10 @@ func TestTwoFAGatedEndpoints_WrongPasswordKeepsBackupCode(t *testing.T) {
 				h, repo = newExtraHandler(t)
 			}
 			if tt.name == "delete-account" {
-				h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}})
+				h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{
+					role.PolicyCanDeleteAccount: true,
+					role.PolicyCanPurgeAccount:  true,
+				}})
 			}
 			user := setupUserWithPassword(repo, "u1", "oldpass")
 			enableTwoFactorWithBackupCodes(repo, "u1")
@@ -261,7 +264,10 @@ func TestTwoFAGatedEndpoints_SuccessConsumesExactlyOne(t *testing.T) {
 				h, repo = newExtraHandler(t)
 			}
 			if tt.name == "delete-account" {
-				h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}})
+				h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{
+					role.PolicyCanDeleteAccount: true,
+					role.PolicyCanPurgeAccount:  true,
+				}})
 			}
 			user := setupUserWithPassword(repo, "u1", "oldpass")
 			enableTwoFactorWithBackupCodes(repo, "u1")
@@ -327,7 +333,10 @@ func TestTwoFAGatedEndpoints_WrongPasswordReleasesReservation(t *testing.T) {
 				h, repo = newExtraHandler(t)
 			}
 			if tt.name == "delete-account" {
-				h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}})
+				h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{
+					role.PolicyCanDeleteAccount: true,
+					role.PolicyCanPurgeAccount:  true,
+				}})
 			}
 			user := setupUserWithPassword(repo, "u1", "oldpass")
 			enableTwoFactorWithBackupCodes(repo, "u1")

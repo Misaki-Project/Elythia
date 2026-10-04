@@ -16,7 +16,6 @@ import (
 	echomw "github.com/labstack/echo/v4/middleware"
 	"github.com/shiroha-a/mk/internal/activitypub"
 	"github.com/shiroha-a/mk/internal/activitypub/ld"
-	"github.com/shiroha-a/mk/internal/activitypub/mfm"
 	apiadmin "github.com/shiroha-a/mk/internal/api/admin"
 	apiannouncements "github.com/shiroha-a/mk/internal/api/announcements"
 	"github.com/shiroha-a/mk/internal/api/antennas"
@@ -132,11 +131,13 @@ import (
 	coreurlpreview "github.com/shiroha-a/mk/internal/core/urlpreview"
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
 	coreuserlist "github.com/shiroha-a/mk/internal/core/userlist"
+	"github.com/shiroha-a/mk/internal/core/userpack"
 	corewebhook "github.com/shiroha-a/mk/internal/core/webhook"
 	corewebpush "github.com/shiroha-a/mk/internal/core/webpush"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/frontendutil"
 	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/misc/idnhost"
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/queue"
@@ -161,6 +162,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 時の invalidate が両方に反映される (#300 3-3)。
 	userRepo := s.userRepo
 	noteRepo := repository.NewNoteRepository(s.db)
+	if _, ok := noteRepo.(repository.NotePrimaryReader); !ok {
+		panic("repository.NewNoteRepository must implement NotePrimaryReader")
+	}
 	// cross-worker cache invalidation (#1740) のため concrete *CachedMetaRepository
 	// を保持する。internal event bus との配線は streamPubSub 生成箇所で行う。
 	cachedMeta := repository.NewCachedMetaRepositoryWithTTL(repository.NewMetaRepository(s.db), 5*time.Minute)
@@ -214,8 +218,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	suspensionOriginRepo := repository.NewUserSuspensionOriginRepository(s.db)
 	instanceRepo := repository.NewInstanceRepository(s.db)
 	// instance.{followersCount,followingCount} は following service の
-	// adjustInstanceCountsForFollowing (Follow/Unfollow/AcceptRequest) と
-	// blocking service の auto-unfollow で incremental に維持される
+	// adjustInstanceCountsForFollowing (Follow/Unfollow/AcceptRequest) で
+	// incremental に維持される。block による解除も following.Service の
+	// UnfollowForBlock を通るので同じ経路に乗る
 	// (admin/overview の federation pie chart の data source)。起動時の
 	// backfill は、再起動時点での following テーブルとの整合性回復 +
 	// direct DB 改変や過去の counter drift への安全網として残す (#421)。
@@ -314,6 +319,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// incremental 更新する (#596)。未配線でも本機能には影響しないが、admin
 	// dashboard の federation pie chart が起動直後以外で 0 に偏る。
 	followingService.SetInstanceRepo(instanceRepo)
+	// 本家と同じく meta.enableStatsForFederatedInstances が false なら集計列を
+	// 動かさない (#3330)。cachedMeta なので follow ごとの DB 往復は無い。
+	followingService.SetInstanceStatsGate(corefollowing.MetaInstanceStatsGate(metaRepo))
 
 	// Timeline services (Redis-backed fanout)
 	// keyPrefix で TS 本家と同じ `<host>:list:*` 名前空間に揃える (#362)。
@@ -553,7 +561,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	webhookReactionHook := corewebhook.NewReactionCreateHook(webhookService, idGen)
 	webhookReactionHook.SetFollowingRepo(followingRepo)
 	reactionService.SetWebhookHook(webhookReactionHook)
-	followingService.SetWebhookHook(corewebhook.NewFollowingHook(webhookService))
+	webhookFollowingHook := corewebhook.NewFollowingHook(webhookService)
+	followingService.SetWebhookHook(webhookFollowingHook)
 	signupService.SetWebhookHook(corewebhook.NewSignupHook(webhookService))
 	// Webhook delivery: SSRF-safe transport + forward proxy 経由で user-supplied
 	// URL に POST する (#638)。Timeout は processors 側の DefaultWebhookTimeout
@@ -563,12 +572,17 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	s.queueServer.Handle(queue.TaskTypeSystemWebhook, webhookProcessor.HandleSystem)
 
 	// Blocking & Muting
-	blockingService := coreblocking.NewService(userRepo, blockingRepo, followingRepo, idGen)
-	// Block→自動 unfollow 経路でも remote instance counter を更新 (#596)
-	blockingService.SetInstanceRepo(instanceRepo)
+	blockingService := coreblocking.NewService(userRepo, blockingRepo, idGen)
 	// block 時に保留中の follow request を双方向で取り消す。upstream
 	// UserBlockingService.block の cancelRequest 相当。
 	blockingService.SetFollowRequestCanceller(followingService)
+	// block で既存のフォローを双方向に解除する。following.Service の unfollow を
+	// 通すので、カウント・チャート・Undo(Follow) / Reject(Follow) の配送・
+	// unfollow のイベントが通常の解除と同じになる (#3330)。
+	blockingService.SetUnfollower(followingService)
+	// block で、ブロックされた側のリストからブロックした人を外す
+	// (本家 removeFromList、#3330)。
+	blockingService.SetUserListRepo(userListRepo)
 	mutingService := coremuting.NewService(userRepo, mutingRepo, idGen)
 	renoteMutingService := coremuting.NewRenoteService(userRepo, renoteMutingRepo, idGen)
 	followingService.SetBlockingChecker(blockingService)
@@ -813,6 +827,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	if u, err := urlpkg.Parse(s.config.URL); err == nil {
 		localHost = u.Host
 		apRenderer.SetHost(localHost)
+		// `@user@<自ホスト>` をローカルの利用者として解決する (#3330)。
+		// 既定ポートは剥がす (本家の config.host は `new URL().host`)。
+		noteCreateService.SetLocalHost(idnhost.HostPort(u))
 	}
 	// AP outbound client: SSRF-safe transport を適用 (#323)。
 	// config.AllowedPrivateNetworks で開発時の self-loop を許可できる。
@@ -857,9 +874,19 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// apClient.DisableRedirect() の影響を受けないようにする。Timeout は
 	// user-facing API 経由で呼ばれるので応答性優先で 10s に設定する。
 	webfingerClient := activitypub.NewWebFingerClient(s.outboundClient(10*time.Second), s.config.UserAgent)
-	userService.SetRemoteUserResolver(corefederation.NewRemoteUserResolver(
+	// notes/create の DB に無いリモートの利用者へのメンションも同じ経路で取りに行く
+	// (本家 NoteCreateService.extractMentionedUsers → RemoteUserResolveService、#3330)。
+	// 連合しないホストには WebFinger を投げない (hostBlocker は instanceService が
+	// できた後で下の federationResolver と一緒に渡す)。
+	//
+	// **1 つの instance を共有する。** 同じ acct の解決・再同期を singleflight で
+	// まとめるので、users/show と notes/create (と reversi) が別々に持つと、
+	// 同じ acct への WebFinger が経路の数だけ並ぶ。
+	remoteUserResolver := corefederation.NewRemoteUserResolver(
 		webfingerClient, federationResolver, userRepo, localHost,
-	))
+	)
+	userService.SetRemoteUserResolver(remoteUserResolver)
+	noteCreateService.SetRemoteUserResolver(remoteUserResolver)
 
 	// Instance management (Phase 3 Step H)
 	instanceService := coreinstance.NewService(instanceRepo, metaRepo, idGen)
@@ -881,8 +908,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// resolver の入口 (fetchActor / resolveNoteOnce / IngestNoteWithCreated) に
 	// 適用する。deliver_service / inboxProcessor と同じ instanceService を共有。
 	federationResolver.SetHostBlockChecker(instanceService)
+	remoteUserResolver.SetHostBlockChecker(instanceService)
 	federationResolver.SetSilencedHostChecker(instanceService)      // #2106 N14: silenced host の public note を home 降格
 	federationResolver.SetMediaSilencedHostChecker(instanceService) // #3218: media silenced host の添付をセンシティブに
+	// 受信した note の mentionLimit を投稿者 (リモート) の role policy から引く (#3330)。
+	// 未配線だと既定値 20 固定になり、base policy やリモート向けのロールが効かない。
+	federationResolver.SetRolePolicyProvider(roleService)
 	// 連合のルール (#3090)。ホスト単位の設定 (上の hostBlocker / silenced) に
 	// 追加の層として重ねる。activity のルールは inbox の署名検証の後
 	// (dispatchActivity の入口)、投稿のルールは取り込みの全経路で評価する。
@@ -1173,6 +1204,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	deleteAccountProcessor.SetUserRepo(userRepo)
 	// #3293: ページを 1 件ずつ消して、参照するノートの pageCount を減らす。
 	deleteAccountProcessor.SetPageRepo(pageRepo)
+	// #3207: 消した sw_subscription が購読キャッシュに残って push され続けないよう、
+	// Web Push の配送が読むのと同じキャッシュを渡す。
+	deleteAccountProcessor.SetPushSubscriptionCache(webPushCache)
 	s.queueServer.Handle(queue.TaskTypeDeleteAccount, deleteAccountProcessor.Handle)
 
 	// Per-pair Unfollow job (#587): admin/federation/remove-all-following
@@ -1254,7 +1288,19 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	if m, err := metaRepo.Fetch(); err == nil {
 		chartHooks.ChartsForRemoteUser = m.EnableChartsForRemoteUser
 		chartHooks.ChartsForFederatedInst = m.EnableChartsForFederatedInstances
+		chartHooks.StatsForFederatedInst = m.EnableStatsForFederatedInstances
 	}
+	// 上の 3 つは起動時の写しで、読めなかったときの代わり。本家は meta をその場で
+	// 読むので、admin での切り替えが再起動を待たずに効くよう毎回 cachedMeta を
+	// 読ませる (#3330)。
+	chartHooks.SetMetaSource(metaRepo.Fetch)
+	// instance の notesCount / usersCount (#3330)。本家と同じく chart hook の
+	// enableStatsForFederatedInstances の分岐の中で動かす。notesCount の加算は
+	// inbox の最頻経路なので、本家の CollapsedQueue と同じく窓で合算してから書く。
+	instanceCounterBuffer := coreinstance.NewCounterBuffer(instanceRepo, 30*time.Second)
+	instanceCounterBuffer.Start(context.Background())
+	s.registerShutdownHook(func(_ context.Context) { instanceCounterBuffer.Close() })
+	chartHooks.InstanceCounter = instanceCounterBuffer
 	// 各サービスへ chart hook を注入する。Set* は nil 安全なので順序は不問。
 	noteCreateService.SetChartHook(chartHooks)
 	noteDeleteService.SetChartHook(chartHooks)
@@ -1299,6 +1345,10 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// なり、削除 (-1) だけが note_delete_service 経由で記録されてマイナス側に
 	// しか動かなくなる drop-in regression が発生する。
 	federationProcessor.SetNoteChartHook(chartHooks)
+	// resolver が新しく作った note (inbound Create、返信元・引用・Announce の
+	// 対象など) は resolver 側で数える (#3330)。processor は Announce の renote
+	// 行だけを数えるので、こちらも配線しないと Create が一切数えられない。
+	federationResolver.SetNoteChartHook(chartHooks)
 
 	// Hashtag service: ノート作成 (local / federation 両経路) で hashtag table の
 	// mentionedUsersCount / mentionedUserIds を更新する (#680)。/api/hashtags/list
@@ -1411,7 +1461,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		})
 	}
 
-	api := s.echo.Group("/api")
+	// POST / Match で登録する endpoint は、route の認証・権限の middleware の
+	// 後ろに body が object かの検査が付く (requireObjectBody、#3330)。
+	api := apiRoutes{s.echo.Group("/api")}
 
 	// 本家 ApiCallService #sendApiError 互換の WWW-Authenticate 付与 (#1608)。
 	// error envelope の kind を見て header を決めるため、応答を最初に
@@ -1574,6 +1626,20 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		FollowRequest: followRequestRepo,
 		Memo:          repository.NewUserMemoRepository(s.db),
 	}
+	// follow / unfollow の Webhook は本家と同じく、フォローした側から見た
+	// UserDetailedNotMe で相手を送る。followed は UserLite (#3269)。
+	// main stream の同じイベントと blocking/create・delete の応答も同じ packer で
+	// 組む (#3330)。ピン留めと移行先を埋める側 (users の handler) は後で組み立てる
+	// ので、そこで SetDetailExtras する。
+	sharedUserPacker := userpack.New(userpack.Lookups{
+		Instances:  instanceRepo,
+		Emojis:     emojiRepo,
+		Profiles:   userRepo,
+		Relations:  listRelationRepos,
+		Moderators: roleService,
+	}, idGen)
+	webhookFollowingHook.SetUserPacker(sharedUserPacker)
+	followingService.SetUserPacker(sharedUserPacker)
 
 	// CAPTCHA service — meta から有効な provider を選択して構築する。
 	// meta 取得失敗時は captcha 無効として動作する (ログイン不能を避けるため)。
@@ -1753,6 +1819,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Notes endpoints
 	notesHandler := notes.NewHandler(noteRepo, noteCreateService, noteDeleteService, noteQueryService, timelineService, reactionService, pollService, searchService, idGen)
+	notesHandler.SetPiningRepo(piningRepo)
 	// first-page timeline 応答を per-viewer 短期キャッシュ (hit 時に DB + pack +
 	// encode を skip)。opt-in (enableTimelineCache / MK_ENABLETIMELINECACHE)。
 	// staleness trade-off があるため default off。
@@ -1926,6 +1993,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	usersHandler.SetNoteFieldResolver(noteFieldResolver)
 	usersHandler.SetUserRepo(userRepo)
 	usersHandler.SetNoteReactionRepo(reactionRepo)
+	sharedUserPacker.SetDetailExtras(usersHandler)
+	sharedUserPacker.SetDetailExtrasMany(usersHandler) // #3330: 一覧の DetailedMany のピン留め・移行先・instance・絵文字
 	remoteStatsFetcher := corefederation.NewRemoteStatsFetcher(s.config.AllowedPrivateNetworks, s.config.UserAgent, s.outboundOpts()...)
 	// **連合を切った相手へ取りに行かない。** この経路は未認証の
 	// `/api/users/show` から呼ばれるので、放っておくと defederate した相手に
@@ -1991,6 +2060,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	registryRepo := repository.NewRegistryRepository(s.db)
 	iHandler := i.NewHandler(userService, idGen)
 	iHandler.SetUserRepo(userRepo)
+	// フォロー申請の作成・承認・取り消しで followee に meUpdated を流す (#3330)。
+	followingService.SetMeUpdatedPublisher(iHandler)
 	iHandler.SetRoleProvider(roleService)
 	iHandler.SetTOTPReplayGuard(totpReplayGuard)
 	// 現在のパスワードを照合する i/* の照合失敗をアカウント単位で数える。
@@ -2052,6 +2123,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	accountMover.SetBlockQueue(s.queueClient)
 	accountMover.SetRoleAssigner(roleService)
 	accountMover.SetAntennaMover(antennaService)
+	// 本家 adjustFollowingCounts と同じく、旧アカウントがリモートなら instance の
+	// followersCount をローカルのフォロワー数ぶん減らし、chart も動かす (#3330)。
+	accountMover.SetInstanceStats(instanceRepo, corefollowing.MetaInstanceStatsGate(metaRepo), chartHooks)
 	iHandler.SetAccountMover(accountMover)
 	// #2414: リモートアカウントの移行を検知したら、同じ引き継ぎ処理を走らせる。
 	// federation → core/move の一方向依存で循環しない。
@@ -2286,8 +2360,10 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Hashtags endpoints (Phase 6)
 	hashtagsHandler := apihashtags.NewHandler(s.db)
+	hashtagsHandler.SetDetailExtras(usersHandler)       // #3330: hashtags/users のピン留め・移行先
 	hashtagsHandler.SetIDGen(idGen)                     // #2106 L25: 設定済 ID generator を共有 (毎回 aidx 生成を廃止)
 	hashtagsHandler.SetRelationRepos(listRelationRepos) // #1957-a: hashtags/users の embed user に relation
+	hashtagsHandler.SetModeratorChecker(roleService)    // #3330: hashtags/users のモデレーター向けの項目とカウントのゲート
 	api.POST("/hashtags/list", hashtagsHandler.List)
 	api.POST("/hashtags/search", hashtagsHandler.Search)
 	api.POST("/hashtags/show", hashtagsHandler.Show)
@@ -2314,6 +2390,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Blocking endpoints
 	blockingHandler := blocking.NewHandler(blockingService, userRepo, idGen)
+	blockingHandler.SetDetailExtras(usersHandler) // #3330: blocking/list のピン留め・移行先
 	// blocking/create・delete のレスポンスに viewer→blockee の relation block
 	// (isBlocking 等) を載せるための共有 resolver 依存 (#1802)。
 	blockingHandler.SetRelationRepos(userrelation.Repos{
@@ -2325,12 +2402,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		Memo:          repository.NewUserMemoRepository(s.db),
 	})
 	blockingHandler.SetModeratorChecker(roleService) // #1985: blocking/list の count gate で moderator viewer 判定
+	blockingHandler.SetUserPacker(sharedUserPacker)  // #3330: create・delete の応答を本家の UserDetailedNotMe に揃える
 	api.POST("/blocking/create", blockingHandler.Create, middleware.RequireAuth(), middleware.RequireScope("write:blocks"))
 	api.POST("/blocking/delete", blockingHandler.Delete, middleware.RequireAuth(), middleware.RequireScope("write:blocks"))
 	api.POST("/blocking/list", blockingHandler.List, middleware.RequireAuth(), middleware.RequireScope("read:blocks"))
 
 	// Mute endpoints
 	muteHandler := mute.NewHandler(mutingService, userRepo, idGen)
+	muteHandler.SetDetailExtras(usersHandler) // #3330: mute/list のピン留め・移行先
 	muteHandler.SetRelationRepos(listRelationRepos)
 	muteHandler.SetModeratorChecker(roleService) // #1985: mute/list の count gate で moderator viewer 判定
 	api.POST("/mute/create", muteHandler.Create, middleware.RequireAuth(), middleware.RequireNotMoved(), middleware.RequireScope("write:mutes"))
@@ -2339,6 +2418,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Renote mute endpoints
 	renoteMuteHandler := renotemute.NewHandler(renoteMutingService, userRepo, idGen)
+	renoteMuteHandler.SetDetailExtras(usersHandler) // #3330: renote-mute/list のピン留め・移行先
 	renoteMuteHandler.SetRelationRepos(listRelationRepos)
 	renoteMuteHandler.SetModeratorChecker(roleService) // #1985: renote-mute/list の count gate で moderator viewer 判定
 	api.POST("/renote-mute/create", renoteMuteHandler.Create, middleware.RequireAuth(), middleware.RequireNotMoved(), middleware.RequireScope("write:mutes"))
@@ -2428,6 +2508,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// ActivityPub resource endpoints
 	apHandler := ap.NewHandler(apRenderer, userService, noteQueryService, keypairRepo, idGen)
+	apHandler.SetDetailExtras(usersHandler) // #3330: ap/show の利用者のピン留め・移行先
 	apHandler.SetRemote(apFetcher, federationResolver)
 	// ap/show の federation-allow gate (#1557)。instanceService が blocked /
 	// federation policy を判定する。local host は port 無しの hostname
@@ -2464,6 +2545,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		ssrMetaDeps{
 			User:         userRepo,
 			Note:         noteRepo,
+			Pining:       piningRepo,
 			Page:         pageRepo,
 			Clip:         clipRepo,
 			Flash:        flashRepo,
@@ -2516,9 +2598,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			}
 			return entity.IdenticonURL(u)
 		},
-		toHTML: func(text string) string {
-			return mfm.ToHTML(mfm.Parse(text), feedHost)
-		},
+		toHTML: feedNoteHTML(feedHost),
 	}
 
 	// /@<acct> は AP のユーザー解決とフィードの入口を兼ねる。Echo のルータは
@@ -2668,7 +2748,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	federationHandler.SetUserRepo(userRepo)
 	federationHandler.SetIDGen(idGen)
 	federationHandler.SetResolver(federationResolver)
-	federationHandler.SetRelationRepos(listRelationRepos) // #1957-a: followers/following/users の embed user に relation
+	federationHandler.SetListPacker(sharedUserPacker) // #1957-a / #3330: followers/following/users の embed user を本家 packMany と同じ形に
 	// moderationNote は公開エンドポイントで moderator にのみ返す (情報漏洩対策)。
 	federationHandler.SetModeratorChecker(roleService)
 	// instance 一覧 / show-instance の signatureCapability field (#2393)。
@@ -2773,6 +2853,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Pages endpoints (Phase 4.5)
 	pagesHandler := pages.NewHandler(pageService, idGen)
+	pagesHandler.SetUserPacker(sharedUserPacker) // #3330: pageEvent の利用者を持ち主から見た本家 pack と同じ形に
 	// page content の image block / eyeCatchingImageId から drive file を解決して
 	// attachedFiles / eyeCatchingImage を埋める (#1662)。
 	pagesHandler.SetDriveFileRepo(driveFileRepo)
@@ -3277,7 +3358,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// Following endpoints
 	followingHandler := following.NewHandler(followingService, userService)
 	followingHandler.SetIDGen(idGen)
-	followingHandler.SetRelationRepos(listRelationRepos)
+	followingHandler.SetListPacker(sharedUserPacker) // #1912 / #3330: following/list・requests/* の embed user を本家 packMany と同じ形に
 	api.POST("/following/create", followingHandler.Create, middleware.RequireAuth(), middleware.RequireNotMoved(), middleware.RequireScope("write:following"))
 	api.POST("/following/delete", followingHandler.Delete, middleware.RequireAuth(), middleware.RequireScope("write:following"))
 	api.POST("/following/list", followingHandler.List, middleware.RequireAuth(), middleware.RequireScope("read:following"))
@@ -3314,7 +3395,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	rolesHandler.SetNoteFieldResolver(noteFieldResolver)
 	rolesHandler.SetUserRepo(userRepo)
 	rolesHandler.SetMuteBlockRepos(mutingRepo, blockingRepo, channelMutingRepo) // #1544: Notes の mute/block/channel-mute filter
-	rolesHandler.SetRelationRepos(listRelationRepos)                            // #1973: roles/users の embed user に viewer-relation
+	rolesHandler.SetListPacker(sharedUserPacker)                                // #1973 / #3330: roles/users の embed user を本家 packMany と同じ形に
 	api.POST("/roles/list", rolesHandler.List, middleware.RequireAuth(), middleware.RequireScope("read:account"))
 	api.POST("/roles/show", rolesHandler.Show)
 	api.POST("/roles/assignment-show", rolesHandler.AssignmentShow, middleware.RequireAuth(), middleware.RequireScope("read:account"))
@@ -3390,6 +3471,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 未設定でも配線しておいてよい (そのときは送らない)。
 	abuseCreatedNotifier.SetMail(miscsmtp.SubjectBodySenderFromMeta(metaRepo, s.config.ProxySMTP), recipientRepo, userRepo, metaRepo)
 	adminHandler := apiadmin.NewHandler(signupService, roleService, metaRepo, userRepo, idGen)
+	adminHandler.SetDetailExtras(usersHandler)   // #3330: find-by-email・update-proxy-account のピン留め・移行先
+	adminHandler.SetListPacker(sharedUserPacker) // #3330: show-users・roles/users・abuse-user-reports・show-moderation-logs の利用者を本家 packMany と同じ形に
 	// モデレーターの suspend / unsuspend を local 由来として刻む (#2973)。
 	adminHandler.SetSuspensionOriginRepo(suspensionOriginRepo)
 	// catalog 更新を entity 側 packer に即時反映する (#2258)。TTL 任せだと
@@ -3833,6 +3916,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// auth/* — MiAuth/OAuth セッション
 	authSessionRepo := repository.NewAuthSessionRepository(s.db)
 	authHandler := apiauth.NewHandler(authSessionRepo, s.config, idGen)
+	authHandler.SetDetailExtras(usersHandler) // #3330: auth/session/userkey・miauth check のピン留め・移行先
 	api.POST("/auth/session/generate", authHandler.SessionGenerate)
 	api.POST("/auth/session/show", authHandler.SessionShow)
 	api.POST("/auth/session/userkey", authHandler.SessionUserkey)
@@ -3868,6 +3952,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// reversi/* — オセロゲーム (実データ)
 	reversiHandler := apireversi.NewHandler(reversiRepo, idGen)
 	reversiHandler.SetService(reversiService)
+	reversiHandler.SetLiteFiller(sharedUserPacker) // #3330: invitations の招待者の instance・絵文字
 	reversiHandler.SetFederation(s.config.URL, deliverService, reversiFedCache, userRepo)
 	reversiHandler.SetStreamPublisher(reversiPublisher)
 	// #417 P3: reversi 連合対応ホストのみ Invite を送る。Federation check
@@ -3878,11 +3963,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		s.outboundClient(10*time.Second),
 	))
 	// #417 P3: /match の acct 引数で未キャッシュのリモートユーザーを
-	// WebFinger 経由で取り込めるようにする。ここで webfingerClient /
-	// federationResolver は既存の users/show 用と同じインスタンスを再利用。
-	reversiHandler.SetRemoteUserLookup(corefederation.NewRemoteUserResolver(
-		webfingerClient, federationResolver, userRepo, localHost,
-	))
+	// WebFinger 経由で取り込めるようにする。users/show / notes/create と同じ
+	// resolver を共有する (連合しないホストの skip もこれで効く)。
+	reversiHandler.SetRemoteUserLookup(remoteUserResolver)
 	// Service 側にも federation 一式を注入して state 変化時に Update / Leave を
 	// 配信できるようにする (#417 P1)。fedCache も Service 側で
 	// session→game 解決に必要なので忘れず設定する。
@@ -4147,7 +4230,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		enqueuer: s.queueClient,
 	}
 
-	if err := s.setupPlugins(api, registeredPlugins, openPluginStorage); err != nil {
+	// プラグインの route は本家に無い経路なので、body の検査を付けない素の group を渡す。
+	if err := s.setupPlugins(api.Group, registeredPlugins, openPluginStorage); err != nil {
 		s.pluginSetupErr = err
 		return
 	}
@@ -4472,6 +4556,55 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"サイレンスしたホストからのフォローが承認なしで通り、followers 限定ノートが配送される"},
 		{"resolver.silencedHostChecker", federationResolver.HasSilencedHostChecker(),
 			"silenced instance の remote public note が home へ降格されず public timeline に出る"},
+		{"resolver.rolePolicyProvider", federationResolver.HasRolePolicyProvider(),
+			"受信した note の mentionLimit が既定値 20 固定になり、base policy やリモートに当たるロールで絞った上限が効かない (#3330)"},
+		// #3330: follow 系の main stream / Webhook と blocking/create・delete の
+		// 利用者を本家の UserDetailedNotMe に揃える packer。外すと従来の形に落ちる。
+		{"following.userPacker", followingService.HasUserPacker(),
+			"main stream の follow / unfollow が profile を読まない形に落ち、unfollow の後もフォロワー限定のカウントが見える"},
+		{"webhookFollowing.userPacker", webhookFollowingHook.HasUserPacker(),
+			"follow / unfollow の Webhook が送られなくなり、followed は instance と絵文字を欠く"},
+		{"userPacker.detailExtras", sharedUserPacker.HasDetailExtras(),
+			"follow 系の main stream / Webhook と blocking/create・delete で pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"blocking.userPacker", blockingHandler.HasUserPacker(),
+			"blocking/create・delete の応答が instance・絵文字・ピン留め・移行先・モデレーター向けの項目を欠く"},
+		{"following.meUpdatedPublisher", followingService.HasMeUpdatedPublisher(),
+			"フォロー申請の作成・承認・取り消しで meUpdated が流れず、受け取った申請の印がリロードまで変わらない"},
+		{"blocking.unfollower", blockingService.HasUnfollower(),
+			"ブロックしても既存のフォローが外れず、相手のサーバーへ Undo(Follow) / Reject(Follow) も届かない"},
+		{"blocking.userListRepo", blockingService.HasUserListRepo(),
+			"ブロックしても、ブロックされた側のリストにブロックした人が残り、リストのタイムラインに投稿が流れ続ける"},
+		// #3330: 一覧・単体の UserDetailed のピン留め・移行先を users/show と同じ規則で埋める。
+		{"hashtags.detailExtras", hashtagsHandler.HasDetailExtras(),
+			"hashtags/users の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"hashtags.moderatorChecker", hashtagsHandler.HasModeratorChecker(),
+			"hashtags/users でモデレーターにも moderationNote などが出ず、非公開のカウントが 0 のまま返る"},
+		{"blocking.detailExtras", blockingHandler.HasDetailExtras(),
+			"blocking/list の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"mute.detailExtras", muteHandler.HasDetailExtras(),
+			"mute/list の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"renoteMute.detailExtras", renoteMuteHandler.HasDetailExtras(),
+			"renote-mute/list の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"ap.detailExtras", apHandler.HasDetailExtras(),
+			"ap/show の利用者の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"pages.userPacker", pagesHandler.HasUserPacker(),
+			"pageEvent の利用者に、ページの持ち主から見た関係・カウント・ピン留め・移行先が載らない"},
+		{"admin.detailExtras", adminHandler.HasDetailExtras(),
+			"admin/accounts/find-by-email と admin/update-proxy-account の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"userpack.detailExtrasMany", sharedUserPacker.HasDetailExtrasMany(),
+			"共有 packer で組む一覧 (federation・following・roles・admin) の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
+		{"federation.listPacker", federationHandler.HasListPacker(),
+			"federation/users・followers・following の利用者に関係・ピン留め・移行先・instance・絵文字が載らない"},
+		{"following.listPacker", followingHandler.HasListPacker(),
+			"following/list の followee に関係・ピン留め・instance などが載らず、following/requests/* の利用者に instance・絵文字が載らない"},
+		{"roles.listPacker", rolesHandler.HasListPacker(),
+			"roles/users の利用者に関係・ピン留め・移行先・instance・絵文字が載らない"},
+		{"reversi.liteFiller", reversiHandler.HasLiteFiller(),
+			"reversi/invitations のリモートの招待者に instance・絵文字が載らない"},
+		{"admin.listPacker", adminHandler.HasListPacker(),
+			"admin/show-users・roles/users・abuse-user-reports・show-moderation-logs の利用者にピン留め・移行先・instance・絵文字が載らない"},
+		{"auth.detailExtras", authHandler.HasDetailExtras(),
+			"auth/session/userkey と miauth の check の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
 		{"following.blockingChecker", followingService.HasBlockingChecker(),
 			"ブロック関係を無視してフォローが成立する (自分がブロックした相手・自分をブロックしている相手の両方。後者は inbox の Follow も通す)"},
 		{"admin.ipLookupAudit", adminHandler.HasIPLookupAudit(),
@@ -4504,6 +4637,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"匿名 visitor への clips/notes の露出を ugcVisibilityForVisitor で gate できない"},
 		{"deleteAccount.pageRepo", deleteAccountProcessor.HasPageRepo(),
 			"アカウント削除でページが user 行の CASCADE で消え、参照していたノートの pageCount が減らない (リモートのノートが掃除で消えなくなる)"},
+		{"deleteAccount.pushSubscriptionCache", deleteAccountProcessor.HasPushSubscriptionCache(),
+			"アカウント削除で sw_subscription を消しても購読キャッシュが残り、削除後の通知が最大 1 時間、消したはずの購読へ push され続ける"},
 		{"feed.ugcVisibility", feedH.HasUGCVisibility(),
 			"ugcVisibilityForVisitor が none でも Web の feed (.rss / .atom / .json) を返す"},
 
