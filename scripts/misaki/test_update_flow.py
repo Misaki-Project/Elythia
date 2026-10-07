@@ -83,12 +83,12 @@ class UpdateFlowTests(unittest.TestCase):
             (root / 'schema').write_text(source+'|false')
             (root / 'config.yml').write_text('db: {host: localhost, port: 5432, db: mk1, user: misskey, pass: mock-private-password}')
             shutil.copyfile(ROOT / 'update-misaki-helper.py', root / 'update-misaki-helper.py')
-            source = (ROOT / 'update-misaki.sh').read_text()
-            source = source.replace("CONFIG='/home/misskey/cherrypick/.config/default.yml'", 'CONFIG=' + repr(str(root / 'config.yml')))
-            source = source.replace("BACKUP_ROOT='/home/misaki/mk-update-backups'", 'BACKUP_ROOT=' + repr(str(root / 'backups')))
-            source = source.replace('HEALTH_TIMEOUT=180', 'HEALTH_TIMEOUT=1')
+            script_text = (ROOT / 'update-misaki.sh').read_text()
+            script_text = script_text.replace("CONFIG='/home/misskey/cherrypick/.config/default.yml'", 'CONFIG=' + repr(str(root / 'config.yml')))
+            script_text = script_text.replace("BACKUP_ROOT='/home/misaki/mk-update-backups'", 'BACKUP_ROOT=' + repr(str(root / 'backups')))
+            script_text = script_text.replace('HEALTH_TIMEOUT=180', 'HEALTH_TIMEOUT=1')
             script = root / 'update-misaki.sh'
-            script.write_text(source)
+            script.write_text(script_text)
             environment = dict(os.environ, PATH=str(bins) + ':/usr/bin:/bin', MOCK_ROOT=str(root), MOCK_FAILURE=failure, MOCK_SOURCE=source)
             if check:
                 result = subprocess.run(['/bin/bash', str(script), '--check'], env=environment, capture_output=True, timeout=30)
