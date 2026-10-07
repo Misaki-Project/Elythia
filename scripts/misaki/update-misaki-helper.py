@@ -152,10 +152,18 @@ def main(args):
         create(load(rest[0]), *rest[1:])
     elif command == 'plugins':
         plugins(rest[0])
+    elif command == 'capacity':
+        size = int(rest[1])
+        require(size > 0, 'DB容量を取得できません')
+        disk = os.statvfs(rest[0])
+        available = disk.f_bavail * disk.f_frsize
+        # DB snapshot2世代に加え、旧filesystem・ログの余裕を残す。圧縮率に依存しない。
+        require(available >= size * 2 + 2 * 1024**3, 'バックアップ領域の空き容量不足（DB2世代+2GiB以上が必要）')
     elif command == 'unchanged':
         before, after = load(rest[0]), load(rest[1])
         require(all(before[k] == after[k] for k in ('Id', 'Image', 'Config', 'HostConfig', 'Mounts')), '本番container構成が準備中に変化しました')
         require(after['State']['Running'], '本番containerが準備中に停止しました')
+        require(before.get('RestartCount') == after.get('RestartCount') and before['State'].get('StartedAt') == after['State'].get('StartedAt'), '本番containerが準備中に再起動しました')
     else:
         raise SystemExit('不明なhelperコマンド')
 

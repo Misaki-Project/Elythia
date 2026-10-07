@@ -6,6 +6,7 @@ import pathlib
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = pathlib.Path(__file__).parent
 spec = importlib.util.spec_from_file_location('helper', ROOT / 'update-misaki-helper.py')
@@ -90,6 +91,21 @@ class HelperTests(unittest.TestCase):
             config.write_text('db: {host: localhost, port: 5432, db: another, user: misskey, pass: secret}')
             with self.assertRaises(SystemExit):
                 helper.pgpass(fixture(), config, pathlib.Path(tmp) / 'pgpass', '')
+
+    def test_capacity_requires_two_database_snapshots_and_margin(self):
+        with patch.object(helper.os, 'statvfs', return_value=SimpleNamespace(f_bavail=1, f_frsize=4096)):
+            with self.assertRaises(SystemExit):
+                helper.main(['capacity', '/backup', '100'])
+        with patch.object(helper.os, 'statvfs', return_value=SimpleNamespace(f_bavail=1024**3, f_frsize=4096)):
+            helper.main(['capacity', '/backup', '100'])
+
+    def test_yaml_parse_failure_does_not_expose_password(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / 'config'
+            config.write_text('db: [secret-do-not-print')
+            with self.assertRaises(SystemExit) as failure:
+                helper.pgpass(fixture(), config, pathlib.Path(tmp) / 'pgpass', '')
+            self.assertNotIn('secret-do-not-print', str(failure.exception))
 
     def test_create_uses_elythia_and_preserves_operator_settings(self):
         with patch.object(helper.subprocess, 'run') as run:

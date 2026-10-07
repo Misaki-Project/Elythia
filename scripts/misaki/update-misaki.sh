@@ -26,6 +26,8 @@ new_created=0
 healthy=0
 tmp=''
 migration_container=''
+old_id=''
+new_id=''
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 cleanup() {
@@ -34,11 +36,11 @@ cleanup() {
   if (( rc != 0 && mutation && ! healthy )); then
     [[ -z $migration_container ]] || docker stop "$migration_container" >/dev/null 2>&1 || true
     # 名前を変更する前に新旧を混同して起動しない。未知versionのDBへ旧imageを戻さない。
-    if (( new_created )); then docker stop "$CONTAINER" >/dev/null 2>&1 || true; fi
+    if (( new_created )); then docker stop "$new_id" >/dev/null 2>&1 || true; fi
     if (( old_renamed )); then
-      docker stop "$old" >/dev/null 2>&1 || true
+      docker stop "$old_id" >/dev/null 2>&1 || true
     else
-      docker stop "$CONTAINER" >/dev/null 2>&1 || true
+      docker stop "$old_id" >/dev/null 2>&1 || true
     fi
     printf '\n更新失敗: 段階=%s / backup=%s / 旧container=%s\n' "$stage" "$backup" "${old:-$CONTAINER}" >&2
     printf 'DBは自動復元しません。旧containerを起動せず、DB台帳とログを確認してください。\n' >&2
@@ -75,6 +77,7 @@ exec 9>"$BACKUP_ROOT/.update.lock"
 flock -n 9 || die '更新が実行中です'
 tmp=$(mktemp -d "$BACKUP_ROOT/.preflight-XXXXXX")
 docker inspect "$CONTAINER" > "$tmp/inspect.json"
+old_id=$(docker inspect --format '{{.Id}}' "$CONTAINER")
 old_image=$(docker inspect --format '{{.Image}}' "$CONTAINER")
 docker image inspect "$old_image" > "$tmp/image.json"
 python3 "$HELPER" validate "$tmp/inspect.json" "$CONFIG" "$tmp/image.json"
@@ -85,6 +88,8 @@ export PGPASSFILE="$tmp/pgpass" PGCONNECT_TIMEOUT=10
 db_args=(--host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --no-password)
 schema_state() { psql "${db_args[@]}" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT version::text || '\''|'\'' || dirty::text FROM public.schema_migrations;'; }
 [[ $(schema_state) == '109|false' ]] || die 'DBは1.5.0完了version109/dirty=falseである必要があります'
+database_bytes=$(psql "${db_args[@]}" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT pg_database_size(current_database());')
+python3 "$HELPER" capacity "$BACKUP_ROOT" "$database_bytes"
 if (( check_only )); then
   printf '起動構成・DB接続・version109/dirty=falseを確認。pull/停止/migrationなし。\n'
   exit 0
@@ -130,7 +135,7 @@ stage='online-migration'
 mutation=1
 # 公式手順に従いCONCURRENTLY indexを旧サーバー稼働中に作成し、停止時間から外す。
 # その間の自動再起動を禁止。失敗時は旧サーバーも止め、未知versionの起動を防ぐ。
-docker update --restart=no "$CONTAINER"
+docker update --restart=no "$old_id"
 docker run --rm --name "$migration_container" --network host --user 1001:1001 --workdir /app \
   --env-file "$backup/environment.list" \
   --mount "type=bind,source=$CONFIG,target=/app/.config/default.yml,readonly" \
@@ -138,7 +143,7 @@ docker run --rm --name "$migration_container" --network host --user 1001:1001 --
 [[ $(schema_state) == '117|false' ]] || die 'migration完了が117/dirty=falseではありません'
 stage='stopping'
 date -u +%FT%TZ > "$backup/downtime-start.txt"
-docker stop "$CONTAINER"
+docker stop "$old_id"
 stage='final-backup'
 # 切替直前の書込みを漏らさない最終snapshot。既にschema117なので単純に旧imageへは戻せない。
 pg_dump "${db_args[@]}" --format=directory --jobs="$DUMP_JOBS" --file="$backup/database-final"
@@ -146,17 +151,17 @@ pg_restore --list "$backup/database-final" > "$backup/database-final-list.txt"
 [[ $(schema_state) == '117|false' ]] || die '停止中のDB台帳が変化しました'
 sha256sum --check "$backup/config.sha256"
 stage='recreate'
-docker rename "$CONTAINER" "$old"
+docker rename "$old_id" "$old"
 old_renamed=1
-python3 "$HELPER" create "$backup/container-before.json" "$backup/environment.list" "$IMAGE" "$CONTAINER" "$CONFIG"
+new_id=$(python3 "$HELPER" create "$backup/container-before.json" "$backup/environment.list" "$IMAGE" "$CONTAINER" "$CONFIG")
 new_created=1
 stage='starting'
-docker start "$CONTAINER"
+docker start "$new_id"
 deadline=$((SECONDS + HEALTH_TIMEOUT))
 while :; do
-  [[ $(docker inspect --format '{{.State.Running}}/{{.RestartCount}}' "$CONTAINER") == true/0 ]] || die '新containerが停止/再起動しました'
-  docker logs "$CONTAINER" > "$backup/startup.log" 2>&1
-  if docker exec "$CONTAINER" /app/elythia healthcheck -config /app/.config/default.yml > "$backup/healthcheck.log" 2>&1; then
+  [[ $(docker inspect --format '{{.State.Running}}/{{.RestartCount}}' "$new_id") == true/0 ]] || die '新containerが停止/再起動しました'
+  docker logs "$new_id" > "$backup/startup.log" 2>&1
+  if docker exec "$new_id" /app/elythia healthcheck -config /app/.config/default.yml > "$backup/healthcheck.log" 2>&1; then
     if python3 "$HELPER" plugins "$backup/startup.log"; then break; fi
   fi
   (( SECONDS < deadline )) || die 'healthcheckまたは4プラグインの起動確認がタイムアウトしました'
@@ -166,11 +171,11 @@ done
 healthy=1
 date -u +%FT%TZ > "$backup/downtime-end.txt"
 stage='post-start'
-docker inspect "$CONTAINER" > "$backup/container-after.json"
+docker inspect "$new_id" > "$backup/container-after.json"
 # 旧containerの書込層保存を停止時間の外へ移す。失敗しても正常な新版を止めない。
-docker export "$old" > "$backup/container-filesystem.tar"
+docker export "$old_id" > "$backup/container-filesystem.tar"
 [[ -s $backup/container-filesystem.tar ]] || die '旧containerの保存に失敗しました（新版は稼働継続）'
-docker exec "$CONTAINER" /app/elythia doctor -config /app/.config/default.yml > "$backup/doctor.log" 2>&1 || die 'doctor失敗（新版は稼働継続、診断ログを確認）'
+docker exec "$new_id" /app/elythia doctor -config /app/.config/default.yml > "$backup/doctor.log" 2>&1 || die 'doctor失敗（新版は稼働継続、診断ログを確認）'
 printf '更新成功。4プラグイン・healthcheck・doctor・本体version117を確認。\n'
 printf 'backup=%s / 旧container=%s（停止・自動再起動無効）\n' "$backup" "$old"
 printf '実ブラウザのログイン/投稿/画像/XP/原神/fedwatch/hsrは別途確認してください。\n'
