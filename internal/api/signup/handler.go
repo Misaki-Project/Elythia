@@ -12,18 +12,19 @@ import (
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/core/captcha"
-	coreemail "github.com/shiroha-a/mk/internal/core/email"
-	"github.com/shiroha-a/mk/internal/core/role"
-	coresignup "github.com/shiroha-a/mk/internal/core/signup"
-	"github.com/shiroha-a/mk/internal/core/signupform"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/l10n"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/captcha"
+	coreemail "github.com/elythia-network/elythia/internal/core/email"
+	"github.com/elythia-network/elythia/internal/core/role"
+	coresignup "github.com/elythia-network/elythia/internal/core/signup"
+	"github.com/elythia-network/elythia/internal/core/signupform"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/l10n"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	miscsmtp "github.com/elythia-network/elythia/internal/misc/smtp"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 )
 
 // TicketStore abstracts registration_ticket DB operations for testability.
@@ -187,7 +188,7 @@ func registrationClosedError(c echo.Context) error {
 //
 // upstream Misskey TS は \`/api/signup\` の username 重複を Fastify-style
 // reply error 形式 \`{statusCode:400, error:"Bad Request",
-// message:"Error: DUPLICATED_USERNAME"}\` で返す (third_party の
+// message:"Error: DUPLICATED_USERNAME"}\` で返す (本家の
 // SignupApiService.ts:174 で \`throw new FastifyReplyError(400,
 // 'DUPLICATED_USERNAME')\`)。mk-go も同 status / shape に揃える
 // (#798 で status / code、#802 で body shape)。
@@ -495,7 +496,7 @@ func (h *Handler) sendSignupConfirmation(meta *model.Meta, to, code, acceptLangu
 	if h.emailSender == nil {
 		return
 	}
-	siteName := "Misskey"
+	siteName := config.DisplayName
 	if meta != nil && meta.Name != nil && *meta.Name != "" {
 		siteName = *meta.Name
 	}

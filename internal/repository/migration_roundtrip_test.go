@@ -9,12 +9,12 @@ import (
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
-	// pgx5 driver と file source は本番の cmd/migrate と同じものを使う。
+	// pgx5 driver と file source は本番の `elythia migrate` (internal/cli/migrate) と同じものを使う。
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/stretchr/testify/require"
 
-	"github.com/shiroha-a/mk/internal/testutil"
+	"github.com/elythia-network/elythia/internal/testutil"
 )
 
 // migrateURL builds the golang-migrate URL for a dedicated schema.
@@ -119,7 +119,7 @@ func TestMigrations_Fork98UpgradeAppliesRegistrationClosed(t *testing.T) {
 //
 // **`testutil.ApplyMigrations` では代用できない。** あちらは冪等な DDL のために
 // `db.Exec` のエラーを握り潰す (`continue`) ので、壊れた SQL でも緑になる。ここは
-// 本番の `cmd/migrate` と同じ golang-migrate + pgx5 driver に流す。
+// 本番の `elythia migrate` と同じ golang-migrate + pgx5 driver に流す。
 //
 // **専用の schema を使う。** `internal/repository` の schema でやると、down が
 // 他のテストの前提にしているテーブルを消す (#2450)。`OpenTestDBSchema` の兄弟

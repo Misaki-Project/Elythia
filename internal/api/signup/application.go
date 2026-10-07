@@ -7,13 +7,13 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/core/captcha"
+	coresignup "github.com/elythia-network/elythia/internal/core/signup"
+	"github.com/elythia-network/elythia/internal/core/signupapplication"
+	"github.com/elythia-network/elythia/internal/core/signupform"
+	"github.com/elythia-network/elythia/internal/model"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/core/captcha"
-	coresignup "github.com/shiroha-a/mk/internal/core/signup"
-	"github.com/shiroha-a/mk/internal/core/signupapplication"
-	"github.com/shiroha-a/mk/internal/core/signupform"
-	"github.com/shiroha-a/mk/internal/model"
 )
 
 // approvalTicketTTL bounds how long the internally minted invite stays usable.
@@ -443,8 +443,9 @@ func (h *Handler) ApplicationFormToken(c echo.Context) error {
 // formTokenRequired reports whether apply must carry a signed form token.
 //
 // **発動条件は「実 provider が 1 つも有効でないとき」で、新しい meta 列は作らない。**
-// 既存の meta フラグから両側 (サーバー / 画面) が導出できるので、drop-in の復路で
-// fail-open する列が増えない。testcaptcha は実 provider として数えない
+// 既存の meta フラグから両側 (サーバー / 画面) が導出できるので、設定の持ち方が
+// 増えない (当初は TS へ戻したときに fail-open する列を増やさないことも理由だったが、
+// 復路は保証しなくなった。#3191)。testcaptcha は実 provider として数えない
 // (captcha.Service.HasRealProvider)。
 func (h *Handler) formTokenRequired() bool {
 	if h.testMode || h.formTokens == nil {

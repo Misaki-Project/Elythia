@@ -38,7 +38,7 @@ const goDefaultTimeout = "10m"
 // makeTestPackages is the package pattern `make test` must use.
 //
 // **絞ると CI との差が出る。** CI は `go list ./...` から shard を作るので、
-// 手元を `./internal/...` に狭めると `test/e2e*` / `cmd/` / `tools/` /
+// 手元を `./internal/...` に狭めると `tests/e2e*` / `cmd/` / `tools/` /
 // `plugin/` が一切走らないまま緑になる (実測)。
 const makeTestPackages = "./..."
 
@@ -352,7 +352,8 @@ func TestDocsQuoteTheCIShuffleSeed(t *testing.T) {
 	}
 	checked := 0
 	for _, rel := range strings.Fields(string(out)) {
-		if strings.HasPrefix(rel, "third_party/") {
+		// 本家から取り込んだ frontend/ (#3379) は、こちらの CI の条件を書く場所ではない。
+		if strings.HasPrefix(rel, "frontend/") {
 			continue
 		}
 		for _, m := range shuffleSeedPattern.FindAllStringSubmatch(readRepoFile(t, rel), -1) {

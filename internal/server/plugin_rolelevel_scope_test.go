@@ -8,12 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/misc/permissions"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/server/middleware"
-	"github.com/shiroha-a/mk/internal/testutil"
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/misc/permissions"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/server/middleware"
+	"github.com/elythia-network/elythia/internal/testutil"
+	"github.com/elythia-network/elythia/plugin"
 	"github.com/stretchr/testify/require"
 )
 

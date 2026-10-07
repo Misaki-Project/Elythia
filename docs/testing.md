@@ -11,12 +11,12 @@
 | ユニットテスト | APIハンドラ、サービスロジック | モック | `go test ./internal/api/...` |
 | 統合テスト | リポジトリ、Redis連携 | 実 PostgreSQL (`TEST_DB_*`) + Redis (testcontainers) | `go test ./internal/core/...` |
 | E2Eテスト (Playwright) | フロントエンド操作 / API | 実DB + フロントエンド | `make playwright-test` (詳細は[Playwright](playwright.md)) |
-| 連合テスト | mk-go ↔ 本物の Misskey TS の AP 通信 | Docker Compose多段 | `make federation-misskey-e2e` (起動から撤去まで通し。個別に叩くなら `-up` → `-test` → `-down`) |
-| 連合テスト (Mastodon) | mk-go ↔ 本物の Mastodon の引用の承認 (FEP-044f) | Docker Compose多段 | `make federation-mastodon-e2e` (起動から撤去まで通し) |
+| 連合テスト | Elythia ↔ 本物の Misskey TS の AP 通信 | Docker Compose多段 | `make federation-misskey-e2e` (起動から撤去まで通し。個別に叩くなら `-up` → `-test` → `-down`) |
+| 連合テスト (Mastodon) | Elythia ↔ 本物の Mastodon の引用の承認 (FEP-044f) | Docker Compose多段 | `make federation-mastodon-e2e` (起動から撤去まで通し) |
 | Drop-in e2e (pytest) | TS-A backend を mk-A に差し替えて state preservation 検証 | TS 2 instance + mk overlay | `make dropin-swap-test` (#365 / #367 / #372 / #374、詳細は[dropin-e2e.md](dropin-e2e.md)) |
 | Drop-in frontend e2e (cypress) | 3 TS instance + mk overlay swap で frontend 視点の互換 | cypress + 3 TS + mk-A | `make dropin-frontend-swap-test` (#380 / #381 / #387 / #394、詳細は[dropin-frontend-e2e.md](dropin-frontend-e2e.md)) |
-| Playwright e2e | mk-go と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、298 spec ファイル。PR ごとに mk-go、upstream 追従時に TS backend) |
-| 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体無改変で mk-go に向けて実行 | PostgreSQL / Redis + mk-go バイナリ | `make upstream-e2e` (#2347、25 ファイル 1256 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
+| Playwright e2e | Elythia と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、298 spec ファイル。PR ごとに Elythia、upstream 追従時に TS backend) |
+| 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体無改変で Elythia に向けて実行 | PostgreSQL / Redis + Elythia バイナリ | `make upstream-e2e` (#2347、25 ファイル 1256 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
 
 ## 手元の準備
 
@@ -134,7 +134,7 @@ PGPASSWORD=mk psql -h localhost -U mk -d misskey_test \
 | | testcontainers | 外部サービス |
 |---|---|---|
 | Redis | `SetupRedis` を **27 パッケージ**が使う。**`SkipIfNoDocker` を置いているのは 7 つだけで、残り 20 は `TestMain` で `log.Fatalf` する** (= Docker が無いとそのパッケージは落ちる) | — |
-| PostgreSQL | `SetupPostgres` は `internal/api/test` / `test/e2e` / `test/e2e_federation` の **3 パッケージだけ** | `OpenTestDB` / `MustOpenTestDB` を **15 パッケージ**が使い、`TEST_DB_*` の指す PostgreSQL に直接つなぐ |
+| PostgreSQL | `SetupPostgres` は `internal/api/test` / `tests/e2e` / `tests/e2e-federation` の **3 パッケージだけ** | `OpenTestDB` / `MustOpenTestDB` を **15 パッケージ**が使い、`TEST_DB_*` の指す PostgreSQL に直接つなぐ |
 
 つまり **Redis は Docker があれば足りるが、PostgreSQL は自分で用意する必要がある**。`MustOpenTestDB` は失敗時に panic し、しかも `init()` から呼ばれるので、PostgreSQL が無いと該当パッケージはまとめて落ちる (skip されない)。
 
@@ -238,7 +238,7 @@ func newSvc(t *testing.T) *Service {
 
 ## 連合テスト
 
-`docker-compose.federation.misskey.yml`でmk-goとMisskey TSの2インスタンスを起動し、AP通信をテストする。
+`tests/federation/compose.misskey.yml`でElythiaとMisskey TSの2インスタンスを起動し、AP通信をテストする。
 
 ```bash
 # ビルド + 起動
@@ -258,13 +258,13 @@ make federation-misskey-down
 
 ## Playwright e2e (drop-in 互換)
 
-`tests/playwright/` 配下の spec を mk-go と Misskey TS の **両 backend** で並列実行し、drop-in 互換 regression を PR ごとに検出する基盤。
+`tests/playwright/` 配下の spec を Elythia と Misskey TS の **両 backend** で並列実行し、drop-in 互換 regression を PR ごとに検出する基盤。
 
 - 範囲: 298 spec ファイル (upstream 290 = ui 194 / api 96、mkgo 8) / 40 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
 - トリガー: `pull_request` (paths フィルタ) + `workflow_dispatch`。**nightly ではない** (#2291 で移行)。`.github/workflows/playwright.yml`
 - **4 シャード並列** (`--shard=i/4`、`fail-fast: false`)。1 スタックに対しては直列でしか回せない (共有の root と instance meta を spec が取り合う) ので、並列度はシャードごとに独立した stack を立てて稼ぐ (#2609)
-- **TS backend は `workflow_dispatch` 専用**で PR では回らない。upstream が変わらない限り答えも変わらないため、submodule bump のタイミングだけ回す
-- spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/mkgo/` の 8 件 (mk-go 独自機能を見るので公式 image では通らない)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している
+- **TS backend は `workflow_dispatch` 専用**で PR では回らない。upstream が変わらない限り答えも変わらないため、追従する本家の版を上げたタイミングだけ回す
+- spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/mkgo/` の 8 件 (Elythia 独自機能を見るので公式 image では通らない)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している
 
 ### spec を書くときの注意: root の per-user quota
 
@@ -303,7 +303,7 @@ Playwright で発見した drift は LCD 化 → strict 化 のサイクルで�
 1. spec を書いて両 backend で走らせる
 2. 挙動が異なる場合は `expect([200, 204]).toContain(...)` 等の **LCD (Lowest Common Denominator)** で吸収して両 backend pass させる
 3. LCD のコメントで drift 内容を記録、別 issue として起票
-4. drift fix PR で mk-go 側を strict 仕様 (= upstream Misskey TS の挙動) に揃える
+4. drift fix PR で Elythia 側を strict 仕様 (= upstream Misskey TS の挙動) に揃える
 5. 同 PR で spec の LCD を strict (`expect(...).toBe(204)` 等) に格上げ
 
 **実績**: Phase 1-4 で 40+ 件の drift を fix。詳細は [api-compatibility.md](api-compatibility.md) の
@@ -311,11 +311,11 @@ Playwright で発見した drift は LCD 化 → strict 化 のサイクルで�
 
 ## 差分比較 e2e (値レベル)
 
-mk-go と Misskey TS に**同一リクエストを投げてレスポンスを値レベルで diff** する
+Elythia と Misskey TS に**同一リクエストを投げてレスポンスを値レベルで diff** する
 (#2078、endpoint 比較 35 件)。守備範囲が他のゲートと違う。
 
 pytest の総数は 48 だが、うち 13 は `diff_core.py` (差分の取り方そのもの) の
-ユニットテストで、**mk-go と TS を突き合わせているのは 35 件**。
+ユニットテストで、**Elythia と TS を突き合わせているのは 35 件**。
 
 | ゲート | 見ているもの |
 |---|---|
@@ -342,13 +342,13 @@ PR ごとに `.github/workflows/diff-e2e.yml` が実行する (required check �
 
 ## 本家 backend e2e
 
-Misskey 本家の backend e2e (`third_party/misskey/packages/backend/test/e2e/**`) を、
-**テスト本体に一切手を入れずに** mk-go へ向けて実行する。差し替えるのは vitest 設定の
-2 点 (globalSetup = mk-go バイナリの起動、setupFiles = `/api/reset-db`) だけなので、
+Misskey 本家の backend e2e (`make upstream-fetch` が取得する `.cache/misskey/<版>/packages/backend/test/e2e/**`、#3378) を、
+**テスト本体に一切手を入れずに** Elythia へ向けて実行する。差し替えるのは vitest 設定の
+2 点 (globalSetup = Elythia バイナリの起動、setupFiles = `/api/reset-db`) だけなので、
 上流でテストが増えれば自動的に検証対象も増える。
 
 ```bash
-make upstream-e2e-deps         # 初回 / submodule bump 後
+make upstream-e2e-deps         # 初回 / UPSTREAM_MISSKEY_VERSION を上げた後 (本家の取得も行う)
 make upstream-e2e-up           # PostgreSQL / Redis
 make upstream-e2e-migrate
 make upstream-e2e-test         # FILE=test/e2e/note.ts で 1 ファイルだけも可
@@ -367,7 +367,7 @@ state preservation や frontend 視点の drop-in 互換を検証する 2 系統
 
 ### Drop-in e2e (pytest, `tests/dropin/`)
 
-Misskey TS 2 インスタンス (TS-A / TS-B) を起動して federation smoke を実行する基盤に、`docker-compose.dropin.mk.yml` overlay で TS-A の backend を mk-A に差し替えて **state 引き継ぎ** を検証する。
+Misskey TS 2 インスタンス (TS-A / TS-B) を起動して federation smoke を実行する基盤に、`tests/dropin/compose.mk.yml` overlay で TS-A の backend を mk-A に差し替えて **state 引き継ぎ** を検証する。
 
 ```bash
 make dropin-up                 # TS-A / TS-B 起動 (smoke baseline)
@@ -380,21 +380,21 @@ PR ごとに `.github/workflows/dropin-e2e.yml` が **5 シナリオ**を並列�
 
 | check 名 | make target | 見ているもの |
 |---|---|---|
-| `swap-test` | `dropin-swap-test` | TS→mk 切替で state が保たれるか (#374) |
-| `mkgo-born` | `dropin-mkgo-born-test` | **mk-go 生まれの DB を TS に引き渡せるか** (= ロックインの有無、#2383) |
+| `swap-test` | `dropin-swap-test` | TS→mk 切替で state が保たれるか (#374)。TS へ戻す stage 6b-9 は測る対象 (#3191) |
+| `mkgo-born` | `dropin-mkgo-born-test` | **Elythia 生まれの DB を TS に引き渡せるか** (#2383。測る対象で、保証はしない、#3191) |
 | `ed25519-verify` | `dropin-fedibird-test` | Fedibird-like mock との Ed25519 双方向 verify (#1083) |
 | `federation` | `federation-misskey-e2e` | 本物の Misskey TS を相手にした実連合 (#2362) |
 | `federation-mastodon` | `federation-mastodon-e2e` | 本物の Mastodon を相手にした引用の承認 (FEP-044f、#3234) |
 
 `swap-test` と `mkgo-born` は似て見えるが **DB を作った側が違う** (前者は TypeORM、
-後者は mk-go の migration)。TS が一度も触っていない schema を受け取るのは後者だけ。
+後者は Elythia の migration)。TS が一度も触っていない schema を受け取るのは後者だけ。
 
 `make dropin-fedibird-test` は Fedibird-like な AP mock を立てて **Ed25519 署名の
-双方向 verify** を検証する (#1083)。Ed25519 は mk-go 独自の先行実装なので、他実装と
+双方向 verify** を検証する (#1083)。Ed25519 は Elythia 独自の先行実装なので、他実装と
 相互運用できるかは実際に喋らせないと分からない。ユニットテストは「自分で署名して
 自分で検証する」ことしか保証しない。
 
-### Drop-in frontend e2e (cypress, `tests/dropin_frontend/`)
+### Drop-in frontend e2e (cypress, `tests/dropin-frontend/`)
 
 3 Misskey TS インスタンス (A/B/C) + cypress runner で実ブラウザから frontend 視点の drop-in 互換を検証する。Phase 14-3 (#394) で TS-A → mk-A 切替後も spec が pass することを e2e 確認 (`CYPRESS_MODE=baseline|swap` で skip 制御)。
 
@@ -413,7 +413,7 @@ CLAUDE.md の「更新記録」に書かれていた本文を、#3248 でここ�
   (`internal/repository/migration_roundtrip_test.go`)。**書いた瞬間に本物のバグを 1 件
   見つけた** — `000001_initial.down.sql` が `DROP TABLE IF EXISTS "schema_migrations"` を
   持っており、golang-migrate が自分で管理するテーブルを消していた。`Down()` は全 down の
-  あとに `TRUNCATE schema_migrations` を撃つので、**`go run ./cmd/migrate -direction down`
+  あとに `TRUNCATE schema_migrations` を撃つので、**`go run ./cmd/elythia migrate -direction down`
   (CLAUDE.md Section 3 が全段ロールバックとして案内している手順) は毎回最後に
   `relation does not exist (SQLSTATE 42P01)` で落ちていた**。`make migrate-down`
   (`-steps 1`) も version 1 のときは同じ理由で落ちる。**全段 down の後は
@@ -422,7 +422,7 @@ CLAUDE.md の「更新記録」に書かれていた本文を、#3248 でここ�
   直した。
   **`testutil.ApplyMigrations` では代用できない。** あちらの `findMigrationFiles` は
   `*.up.sql` しか glob しないので **down を 1 本も実行しない**。加えて up 側も `db.Exec` の
-  エラーを握り潰す (`continue`) ので壊れた SQL でも緑になる。本番の `cmd/migrate` と同じ
+  エラーを握り潰す (`continue`) ので壊れた SQL でも緑になる。本番の `elythia migrate` と同じ
   golang-migrate + pgx5 driver に流す。
   **down は書いた時点でしか実行されない。** 97 本あって、後から up 側だけ直して対応が
   崩れても誰も気付けない。壊れているのは**戻したくなった当日**に分かる。
@@ -454,7 +454,7 @@ CLAUDE.md の「更新記録」に書かれていた本文を、#3248 でここ�
 - **2026-09-01**: Section 8 の `test-shards` に `-shuffle` を追加 (#2795)。**`internal/server` は `-shuffle` を有効にすると 5 seed すべてで落ちていた** (落ちるテストは seed ごとに違う)。原因は 2 系統で、どちらも**プロセス共有の状態を張り替えて戻していない**もの。(a) `newServer` / `New` が起動時にグローバルを **12 個** 差し替えるが、テストは同じプロセスで何度も呼ぶので、後続の `avatar` / `emoji_redirect` が素の URL ではなく署名付きプロキシURLを受け取る。(b) `frontendutil` の loader キャッシュはプロセスに 1 つで、fixture は `t.TempDir()` に置くため**ディレクトリが消えた後も内容がキャッシュに残る**。
   seed は **全 shard 共通の固定値**にした。`on` (毎回ランダム) は失敗を手元で再現できず、required check が不定期に赤くなる。**shard 番号も使わない** — shard 配属は `NR % 4` なので、テストパッケージが 1 つ増えるだけで既存パッケージの seed が変わり順序が丸ごと入れ替わる (無関係な PR が未実行の順序を引いて赤くなり、ランダム seed と同じ問題を別経路で持ち込む)。
   **seed は実測で選ぶこと。** 覚えやすい値 (issue 番号など) を置くと検出力を持たない値を引く — 実際 `2795` を置いたが、restore を無効化した変異で落ちる seed は 12 個中 7 個だけで、`2795` は落ちない側だった (= 直したバグを CI が検出しない)。採用した `3` は 6 テストが落ちる。
-  **cleanup の登録も一覧も、手で書くと変異検証が効かない形になる。** `TestFrontendHTML_SplashColor` の `<style>` 抽出を splash 名指しに直した時点で、loader cleanup を全部外しても 40 seed で落ちなくなった。restore の一覧も初版は `entity` の 7 つだけで 5 つ落としていた。どちらも AST の gate で形を強制してある (`internal/server/global_state_test.go`)。
+  **cleanup の登録も一覧も、手で書くと変異検証が効かない形になる。** `TestFrontendHTML_SplashColor` (現 `TestFrontendHTML_SplashIgnoresThemeColor`) の `<style>` 抽出を splash 名指しに直した時点で、loader cleanup を全部外しても 40 seed で落ちなくなった。restore の一覧も初版は `entity` の 7 つだけで 5 つ落としていた。どちらも AST の gate で形を強制してある (`internal/server/global_state_test.go`)。
 - **2026-08-31**: Section 4 の「DB を使うテストの分離」に、システムカタログを schema で絞る規則と `Scan(&string)` の罠を追記 (#2777)。あわせて `make catalog-check` を新設し `make gates` に入れた (`make help` の target は 112 → 113)。doc だけだと再発する — schema が 17-19 ある条件は残ったままなので。`pg_indexes` を schema 非限定で引くテストが 3 本あり、**required check の `test` を不定期に落としていた** (PR #2778 の `test-shards (1)` が実際に赤くなった)。#2450 で schema を分けた結果、同名テーブルが 17-19 schema に同時に存在し、他パッケージの `ApplyMigrations` が DDL 中だと `could not open relation with OID (SQLSTATE XX000)` になる。**害はそれだけではない** — 絞らないと他 schema の同名 index を自分のものと取り違えるので、migration が適用されていなくても regression guard が緑になる。実測で `internal_repository_ts` の定義が返っており、3 本とも空振りしていた。`Scan(&string)` は複数行でも**最後の 1 行**を黙って取る (GORM は `*string` に対し全行を走査して dest を上書きする) ので、この取り違えは値が正しく見えて気付けない。
 - **2026-08-30**: Section 4 の「DB を使うテストの分離」に列枠の話を追記 (#2756)。PostgreSQL は `DROP COLUMN` した列も 1600 の上限に数えるので、実行のたびに列を落とすテスト構造だと手元でだけ枠が減り続け、最後に落ちる (実測で `clip` / `auth_session` / `app` が 1593 列まで到達した)。原因は 2 つで、`ApplyMigrations` が毎回全 migration を流し直すこと (再適用で実際に枠を食うのは migration が作る 120 テーブル中 `note` の 1 つだけ — `000033` が ADD し `000036` が DROP するため) と、TS 形状を作るテストが列を落として戻していたこと。前者は適用済みを skip する台帳、後者は専用の兄弟 schema を一度だけその形に作る方式で解消した。復旧手順も併記。
 - **2026-08-10**: Section 4 に「DB を使うテストの分離」を追記 (#2450)。`testutil.OpenTestDB` が呼び出し元パッケージ専用の PostgreSQL schema に接続するようになった。`go test` はパッケージを並行実行し CI の shard は DB を 1 つしか持たないため、共有すると一方の後片付けが他方を壊す (実際に Go を触っていない PR で CI が落ちた)。削除範囲を絞るだけでは解けない (干渉が双方向) 点と、migration の enum guard に `pg_type WHERE typname` を使わない旨も明記。

@@ -12,11 +12,11 @@
 	dropin-mkgo-born-test \
 	dropin-frontend-up dropin-frontend-down dropin-frontend-baseline dropin-frontend-logs \
 	dropin-frontend-mk-up dropin-frontend-mk-down dropin-frontend-swap-test \
-	e2e-submodule-init e2e-frontend-build \
-	uds-init uds-frontend-build uds-build uds-rebuild uds-restart uds-up uds-down uds-down-v uds-logs uds-ps \
+	e2e-frontend-build \
+	uds-init uds-layout-check uds-frontend-build uds-build uds-rebuild uds-restart uds-up uds-down uds-down-v uds-logs uds-ps \
 	bench-up bench-run bench-down bench-logs \
 	apicompat apicompat-routes apicompat-render \
-	test-fast shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check submodulepin-check \
+	test-fast shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check \
 	diff-up diff-test diff-down diff-logs \
 	upstream-e2e upstream-e2e-deps upstream-e2e-up upstream-e2e-down upstream-e2e-migrate upstream-e2e-test
 
@@ -38,28 +38,39 @@ check: fmt lint actionlint golangci-lint test ## コミット前に必須 (lint 
 	# 一度も走らない (レビューで指摘された)。
 	#
 	# **required check の全部ではない。** `build` job (`go build ./...` と同梱
-	# プラグインの vet → `make plugin-vet`)、`lint` job の重複 fixture ID 検査、
+	# プラグインの vet → `make plugin-vet`、同梱サンプル入りの統合バイナリ →
+	# `make plugins-all && go build ./cmd/elythia`)、`lint` job の重複 fixture ID 検査、
 	# `test` のカバレッジ閾値は再現しない。
 
-gates: shapecheck errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check migrationdoc-check mdtable-check notiftype-check pluginembed-check dockerignore-check secretfield-check ipshape-check iprecord-check sqlbind-check submodulepin-check gaterun-check ## 静的 parity ゲートを一括実行
+gates: shapecheck errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check migrationdoc-check mdtable-check notiftype-check pluginembed-check dockerignore-check secretfield-check ipshape-check iprecord-check sqlbind-check gaterun-check ## 静的 parity ゲートを一括実行
 
-version: ## mk-go / 互換 Misskey / submodule のバージョンを表示
-	@printf "mk-go            : %s\n" "$$(sed -n 's/^var MkGoVersion = "\(.*\)"/\1/p' internal/config/config.go)"
+version: ## Elythia / 互換 Misskey / 追従している本家のバージョンを表示
+	@printf "Elythia          : %s\n" "$$(sed -n 's/^var MkGoVersion = "\(.*\)"/\1/p' internal/config/config.go)"
 	@printf "互換 Misskey     : %s\n" "$$(sed -n 's/^var MisskeyVersion = "\(.*\)"/\1/p' internal/config/config.go)"
-	@printf "submodule (fork) : %s\n" "$$(git -C third_party/misskey describe --tags 2>/dev/null || echo '(未取得)')"
+	@printf "追従している本家 : %s\n" "$$(cat UPSTREAM_MISSKEY_VERSION 2>/dev/null || echo '(不明)')"
 
-frontend-check: ## fork の frontend を型チェックし、submodule 依存のゲートを回す
-	# uds-frontend-build / e2e-frontend-build は本番が bind-mount している
-	# third_party/misskey/built を書き換えるため、検証目的では使わないこと。
+# frontend-check / frontend-lint / frontend-test は、frontend が import する
+# pluginbuild の生成物を前提にする (追跡していない、#3379)。無いと vue-tsc などが
+# 解決できずに落ちる。**無いときだけ作る。** `plugins` を前提にすると、CI が先に `make plugins-all`
+# (既定無効の同梱サンプルを含める、#2495) で作ったものを、サンプル抜きで
+# 書き直してしまう。plugin-api.ts を壊してもサンプル側で検出されなくなる。
+FRONTEND_PLUGINS_GENERATED = frontend/packages/frontend/src/server-plugins.generated.ts
+
+$(FRONTEND_PLUGINS_GENERATED):
+	GOWORK=off go run ./tools/pluginbuild
+
+frontend-check: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ を型チェックし、frontend を読むゲートを回す
+	# uds-frontend-build / e2e-frontend-build (と frontend/ での pnpm build /
+	# pnpm -r build) は本番が bind-mount している frontend/built を書き換えるため、
+	# 本番のチェックアウトで検証目的に使わないこと。
 	# 型を見るだけならこちらで済む (Docker 不要、出力物も作らない)。
-	cd third_party/misskey/packages/frontend && npx vue-tsc --noEmit
-	# submodule のソースを読むゲート。**`make gates` には入れない** — あちらは
-	# submodule 無しでも回る前提で、ここを混ぜると checkout していない環境で
-	# skip され「検査していないのに緑」になる。REQUIRE を渡して skip を禁じる
-	# (#2892)。
-	MK_FRONTEND_GATES_REQUIRE_SUBMODULE=1 go test ./internal/server/ \
+	cd frontend/packages/frontend && npx vue-tsc --noEmit
+	# frontend/ のソースを読むゲート。frontend/ を本体で追跡するようになった (#3379)
+	# ので skip せず、required の `test` でも走る。frontend を触ったときに手元で
+	# まとめて回せるよう、ここにも残す。
+	go test ./internal/server/ \
 		-run 'TestCreditImageOriginsCoverAboutMisskey|TestMkGoRolePolicyKeysAreListedInFrontend|TestCanDeleteAccountIsWiredInSettings|TestReactionLongPressIsWired|TestReactableRemoteReactionIsWired|TestMkGoUpdatedDialogIsWired|TestEmojiApplicationIsWired|TestEveryPluginSlotHasAMountPoint|TestAutoLoadingComponentsShowRateLimit|TestRemoteImagesGoThroughMediaProxy|TestRemoteImageProxyGateClassifiesSources|TestEmojiDecorationErrorIDsMatchFrontend|TestStaffNotificationTypesAreOptOutable|TestNotificationBadgeClassesHaveNoPadding|TestEmojiRequestEntriesUseTheSharedHelper|TestCSSModulesHaveNoDuplicateClasses|TestCleanRemoteFilesButtonIsConditional|TestStreamResyncIsWiredInTimelines' -count=1
-	# MFM の Unicode 絵文字の正規表現と記録した版が、submodule の mfm-js / emoji-data と一致するか
+	# MFM の Unicode 絵文字の正規表現と記録した版が、frontend の mfm-js / emoji-data と一致するか
 	# (#3324)。node_modules が無いと落ちる (skip しない)。
 	$(MAKE) emoji-regex-check
 	# **eslint も回す (#2906)。** CI は別 step で `pnpm eslint` を回しており、
@@ -72,7 +83,7 @@ frontend-check: ## fork の frontend を型チェックし、submodule 依存の
 	$(MAKE) frontend-lint
 
 .PHONY: frontend-lint
-frontend-lint: ## fork の frontend を eslint で検査 (CI と同じ範囲)
+frontend-lint: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ の frontend を eslint で検査 (CI と同じ範囲)
 	# CI の `Lint (eslint)` step と同じ。範囲は package.json の script が持つ
 	# (`--quiet "src/**/*.{ts,vue}"`)。**`eslint .` にしないこと** — upstream が
 	# lint していない test/ まで拾い、追従のたびに他人の負債で落ちる。
@@ -82,14 +93,15 @@ frontend-lint: ## fork の frontend を eslint で検査 (CI と同じ範囲)
 	# ずれた)。CI は `pnpm eslint` だが手元に pnpm があるとは限らないので、
 	# 同じ script を呼べる npx/npm 側に寄せる (frontend-check / frontend-test も
 	# npx を使っている)。
-	cd third_party/misskey/packages/frontend && npm run --silent eslint
+	cd frontend/packages/frontend && npm run --silent eslint
 
 .PHONY: frontend-test
-frontend-test: ## fork の frontend の vitest を実行
-	# upstream の `pnpm --filter frontend test` と同じ。CI は frontend-check job で
-	# 回す (#2844)。workspace package の生成物が要るので、初回や submodule bump 後は
-	# 先に `cd third_party/misskey && pnpm install && pnpm build-pre && pnpm -r build`。
-	cd third_party/misskey/packages/frontend && npx vitest --run --globals --config vitest.config.unit.ts
+frontend-test: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ の frontend の vitest を実行
+	# upstream の `pnpm --filter frontend test` と同じ。CI は frontend workflow で
+	# 回す (#3379)。workspace package の生成物が要るので、初回や本家の版を上げた後は
+	# 先に `cd frontend && pnpm install && pnpm build` (plugins は前提として走る)。
+	# この pnpm build は frontend/built を作り直すので、本番のチェックアウトでは流さない。
+	cd frontend/packages/frontend && npx vitest --run --globals --config vitest.config.unit.ts
 
 diff-check: ## 差分比較ハーネスを作り直して実行 (クリーン DB 前提)
 	$(MAKE) diff-down
@@ -112,13 +124,14 @@ playwright-check: ## Playwright を作り直して実行 (クリーン DB 前提
 # 検証用 compose ファイルだけを列挙する。
 E2E_COMPOSE_FILES = \
 	docker-compose.image.yml \
-	docker-compose.diff.yml \
-	docker-compose.playwright.yml \
-	docker-compose.dropin.yml \
-	docker-compose.dropin-frontend.yml \
-	docker-compose.federation.misskey.yml \
-	tests/bench/docker-compose.bench.yml \
-	tests/queue-bench/docker-compose.queue-bench.yml
+	tests/diff/compose.yml \
+	tests/playwright/compose.yml \
+	tests/dropin/compose.yml \
+	tests/dropin-frontend/compose.yml \
+	tests/federation/compose.misskey.yml \
+	tests/federation/compose.mastodon.yml \
+	tests/bench/http/compose.yml \
+	tests/bench/queue/compose.yml
 
 # 使われている profile を全部渡す。**`down` は有効な profile の container しか
 # 消さない**ので、付けないと seed / runner 系が残る。存在しない profile 名を
@@ -133,36 +146,33 @@ e2e-down-all: ## 検証用スタックを一括撤去 (本番 project mk は対�
 
 ##@ 更新 (運用)
 
-# submodule の中でビルドが書き換える tracked ファイル。`make plugins` (pluginbuild) が
-# server-plugins.generated.ts を、`pnpm -r build` の i18n パッケージが locale.ts を
-# 上書きするので、一度でもビルドしたワークツリーは常に dirty になる。**dirty なまま gitlink が動くと `git pull --recurse-submodules` は checkout に
-# 失敗する** — つまり frontend の再ビルドが要る回 (= submodule bump 回) に限って必ず
-# 止まり、しかも親リポだけ進んだ混在状態で止まる (#2885 のレビューで判明)。
+# frontend/ の中でビルドが書き換える tracked ファイル。`pnpm -r build` の i18n
+# パッケージが locale.ts を上書きするので、一度でもビルドしたワークツリーは dirty に
+# なる。**dirty なまま上流がこのファイルを変えると `git pull` は止まる** — つまり
+# frontend の再ビルドが要る回に限って止まる (#2885 で submodule について判明した
+# のと同じ型。#3379 で frontend/ を本体へ取り込んだので、本体の側で同じことが起きる)。
+# pluginbuild の生成物 (server-plugins.generated.ts) は #3379 で追跡をやめた。
 #
 # **生成物だけ**戻す。それ以外の変更が残っていれば git 自身が止めるので、
 # frontend に手を入れている最中の作業を黙って捨てることはない。
-SUBMODULE_GENERATED = \
-	packages/frontend/src/server-plugins.generated.ts \
-	packages/i18n/src/autogen/locale.ts
+FRONTEND_GENERATED = \
+	frontend/packages/i18n/src/autogen/locale.ts
 
-update: ## submodule ごと pull し、frontend 再ビルドの要否を知らせる
-	@for f in $(SUBMODULE_GENERATED); do \
-		git -C third_party/misskey checkout -- "$$f" 2>/dev/null || true; \
-	done
-	@before=$$(git -C third_party/misskey rev-parse HEAD 2>/dev/null); \
-	if ! git pull --recurse-submodules; then \
+update: ## pull し、frontend 再ビルドの要否を知らせる
+	@git checkout -- $(FRONTEND_GENERATED) 2>/dev/null || true
+	@before=$$(git rev-parse HEAD:frontend 2>/dev/null); \
+	if ! git pull; then \
 		printf "\033[31m==> pull に失敗した\033[0m\n"; \
-		printf "    submodule に手を入れている場合は third_party/misskey で\n"; \
-		printf "    変更を commit / stash してからやり直すこと。\n"; \
+		printf "    frontend/ に手を入れている場合は、変更を commit してからやり直すこと。\n"; \
 		exit 1; \
 	fi; \
-	after=$$(git -C third_party/misskey rev-parse HEAD 2>/dev/null); \
+	after=$$(git rev-parse HEAD:frontend 2>/dev/null); \
 	if [ "$$before" != "$$after" ]; then \
-		printf "\n\033[33m==> submodule が更新された。frontend の再ビルドが必要\033[0m\n"; \
+		printf "\n\033[33m==> frontend/ が更新された。frontend の再ビルドが必要\033[0m\n"; \
 		printf "    make docker-update   (Docker Compose 構成)\n"; \
 		printf "    make uds-update      (UDS 本番構成)\n"; \
 	else \
-		printf "\n==> submodule に変更なし。frontend の再ビルドは不要\n"; \
+		printf "\n==> frontend/ に変更なし。frontend の再ビルドは不要\n"; \
 	fi
 
 # plugins/*/ のうち独立した git リポジトリのものを更新する。同梱プラグイン
@@ -193,7 +203,7 @@ pull-plugins: ## plugins/ 配下の独立リポジトリを pull
 		exit 1; \
 	fi
 
-pull: ## 本体・submodule・プラグインをまとめて pull
+pull: ## 本体とプラグインをまとめて pull
 	$(MAKE) update
 	$(MAKE) pull-plugins
 
@@ -238,7 +248,7 @@ uds-update: ## pull → ビルド → 再起動 → 検証 (UDS 本番構成)
 
 
 # Binary output
-BINARY=misskey
+BINARY=elythia
 BUILD_DIR=./built
 
 # Go parameters
@@ -259,14 +269,15 @@ MKGO_VERSION ?=
 MISSKEY_VERSION ?=
 LDFLAGS=-s -w
 ifneq ($(MKGO_VERSION),)
-LDFLAGS += -X github.com/shiroha-a/mk/internal/config.MkGoVersion=$(MKGO_VERSION)
+LDFLAGS += -X github.com/elythia-network/elythia/internal/config.MkGoVersion=$(MKGO_VERSION)
 endif
 ifneq ($(MISSKEY_VERSION),)
-LDFLAGS += -X github.com/shiroha-a/mk/internal/config.MisskeyVersion=$(MISSKEY_VERSION)
+LDFLAGS += -X github.com/elythia-network/elythia/internal/config.MisskeyVersion=$(MISSKEY_VERSION)
 endif
 
-# ビルドした revision と同梱 frontend の版。/about-mkgo が
-# 「mk-go 1.3.0 (abc1234)」「Misskey 2026.9.0-mk.3」として出す (#2700)。
+# ビルドした revision。/about-elythia が「Elythia 1.3.0 (abc1234)」として出す (#2700)。
+# 同梱 frontend の版 (MkGoFrontendVersion) は、frontend を本体へ取り込んで版が
+# 本体と同じになったので廃止した (#3379)。
 #
 # **`$(shell ...)` は使わない。** make の parse 時に必ず走るので、target と
 # 無関係な `make help` でも git を呼ぶことになるうえ、`gaterun-check` が
@@ -276,32 +287,32 @@ endif
 #
 # git が無い / リポジトリ外でビルドした場合は空のまま。読む側が「不明」として
 # 扱うので、ここで `unknown` のような値を作らない (表示に出てしまう)。
-REVISION_LDFLAGS = -X github.com/shiroha-a/mk/internal/config.MkGoCommit=$$(git rev-parse --short HEAD 2>/dev/null) -X github.com/shiroha-a/mk/internal/config.MkGoFrontendVersion=$$(git -C third_party/misskey describe --tags 2>/dev/null)
+REVISION_LDFLAGS = -X github.com/elythia-network/elythia/internal/config.MkGoCommit=$$(git rev-parse --short HEAD 2>/dev/null)
 
 ##@ 開発
 plugins: ## plugins/ を走査して組み込み用ファイルを生成 (#2480)
 	GOWORK=off go run ./tools/pluginbuild
 
-# CI の frontend-check が使う。同梱サンプルは mk-plugin.yml で既定無効なので、
-# 既定の走査では frontend の検証対象から外れてしまう (#2495)。
+# CI の build job と frontend workflow が使う。同梱サンプルは elythia-plugin.yml で既定無効なので、
+# 既定の走査では検証対象から外れてしまう (#2495)。
 plugins-all: ## disabled のプラグインも含めて生成 (CI 検証用)
 	GOWORK=off go run ./tools/pluginbuild -include-disabled
 
 # プラグイン開発用。ソースを監視して 生成 → ビルド → 再起動 を繰り返す (#2477)。
 # frontend の HMR は別端末の Vite dev server が担う:
-#   cd third_party/misskey/packages/frontend && pnpm watch
+#   cd frontend/packages/frontend && pnpm watch
 # GOWORK=off は plugindev 自体を stale な go.work から守るために要る (消した
 # プラグインを指したままだと go run が起動すらしない)。内側の
-# go build ./cmd/misskey は plugindev が GOWORK= で明示的に戻すので、
-# ここで off にしても生成物の mk-plugin-* は go.work 経由で解決できる。
+# go build ./cmd/elythia は plugindev が GOWORK= で明示的に戻すので、
+# ここで off にしても生成物が import するプラグインのモジュールは go.work 経由で解決できる。
 plugin-dev: ## プラグインを編集しながら動かす (PLUGIN=plugins/status)
 	GOWORK=off go run ./tools/plugindev $(if $(PLUGIN),-plugin $(PLUGIN),)
 
-build: plugins ## バイナリを ./built/misskey に生成
-	go build $(GOFLAGS) -ldflags "$(LDFLAGS) $(REVISION_LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/misskey
+build: plugins ## バイナリを ./built/elythia に生成
+	go build $(GOFLAGS) -ldflags "$(LDFLAGS) $(REVISION_LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/elythia
 
 run: build ## build して起動
-	$(BUILD_DIR)/$(BINARY) -config .config/default.yml
+	$(BUILD_DIR)/$(BINARY) serve -config .config/default.yml
 
 # **ビルド済みフロントが無いときだけ MK_DEV=1 を立てる。** mk-go は dev モード
 # (`dev: true` / MK_DEV=1) でしか `/vite/*` を dev server へ流さない —
@@ -311,11 +322,11 @@ run: build ## build して起動
 # 呼び出し側が MK_DEV を export していればそちらを優先する。
 # (recipe の中に置くと make -n / 実行時にこのコメントが echo されるので外に置く)
 dev: ## go run で直接起動 (ビルド済みフロントが無ければ Vite dev server を使う)
-	@if [ -z "$${MK_DEV+x}" ] && [ ! -d "$${MISSKEY_FRONTEND_DIR:-third_party/misskey/built/_frontend_vite_}" ]; then \
+	@if [ -z "$${MK_DEV+x}" ] && [ ! -d "$${MISSKEY_FRONTEND_DIR:-frontend/built/_frontend_vite_}" ]; then \
 		echo "make dev: ビルド済みフロントが無いので MK_DEV=1 で起動します (Vite dev server を localhost:5173 で立てること)"; \
 		export MK_DEV=1; \
 	fi; \
-	go run ./cmd/misskey -config .config/default.yml
+	go run ./cmd/elythia serve -config .config/default.yml
 
 clean: ## ビルド成果物を削除
 	rm -rf $(BUILD_DIR)
@@ -346,16 +357,16 @@ test-fast: ## 全テストを -race 抜きで実行 (反復用。コミット前
 .PHONY: emoji-regex emoji-regex-check
 emoji-regex: ## MFM の Unicode 絵文字の正規表現を mfm-js の emoji-data から生成 (#3324)
 	# 生成物 (internal/activitypub/mfm/emoji_regex_gen.go) を手で直さない。
-	# third_party/misskey に pnpm install 済みであること。mfm-js か emoji-data の版が
+	# frontend/ に pnpm install 済みであること。mfm-js か emoji-data の版が
 	# 変わったら、mfm-js の期待値 (internal/activitypub/mfm/testdata/emoji_mfmjs.json) も
 	# testdata/emoji_mfmjs.mjs で作り直す (どちらかの版がずれるとテストが落ちる)。
 	GOWORK=off go run ./tools/emojiregex
 
-emoji-regex-check: ## 生成した絵文字の正規表現が submodule の mfm-js / emoji-data と一致するか検査
+emoji-regex-check: ## 生成した絵文字の正規表現が frontend/ の mfm-js / emoji-data と一致するか検査
 	# **`make gates` には入れない** — node_modules が要る。frontend-check から呼ぶ。
-	# 生成物と snapshot の突き合わせは submodule 無しで `go test ./tools/emojiregex/`
-	# が見る。こちらは snapshot (正規表現と、mfm-js / emoji-data の版) が submodule に
-	# 入っているものと一致しているかを見る。
+	# 生成物と snapshot の突き合わせは node_modules 無しで `go test ./tools/emojiregex/`
+	# が見る。こちらは snapshot (正規表現と、mfm-js / emoji-data の版) が frontend/ に
+	# pnpm install したものと一致しているかを見る。
 	GOWORK=off go run ./tools/emojiregex -check
 
 plugin-doc-check: ## authoring.md の Go スニペットがコンパイルできるか検査
@@ -372,8 +383,8 @@ BUNDLED_PLUGINS_ENABLED_BY_DEFAULT = rolelevel
 
 plugin-vet: ## 同梱プラグインの既定無効を検査 + go vet (CI の build job の 2 step 相当)
 	@set -e; \
-	markers=$$(git ls-files 'plugins/*/mk-plugin.yml'); \
-	if [ -z "$$markers" ]; then echo "同梱プラグインの mk-plugin.yml が見つかりません (列挙が壊れています)"; exit 1; fi; \
+	markers=$$(git ls-files 'plugins/*/elythia-plugin.yml'); \
+	if [ -z "$$markers" ]; then echo "同梱プラグインの elythia-plugin.yml が見つかりません (列挙が壊れています)"; exit 1; fi; \
 	enabled_by_default=" $(BUNDLED_PLUGINS_ENABLED_BY_DEFAULT) "; \
 	fail=0; \
 	for f in $$markers; do \
@@ -423,7 +434,7 @@ golangci-lint: ## golangci-lint (errcheck / govet / ineffassign / staticcheck)
 	# CI もこの target を呼ぶので、版の定義はここ 1 箇所だけ。
 	#
 	# **CI と同じ条件で回すために `GOWORK=off` を付ける。**
-	# `make build` を一度でも回すと `go.work` と `cmd/misskey/plugins_generated.go`
+	# `make build` を一度でも回すと `go.work` と `cmd/elythia/plugins_generated.go`
 	# が出来る。CI は clean checkout でどちらも持たないので、揃えないと手元だけ
 	# 結果が変わる (actionlint の shellcheck で踏んだのと同じ型)。
 	#
@@ -446,7 +457,7 @@ golangci-lint: ## golangci-lint (errcheck / govet / ineffassign / staticcheck)
 	# `the Go language version (go1.26) used to build golangci-lint is lower than
 	# the targeted Go version (1.27.1)` で止まる (Go 1.27.1 への更新で実測)。
 	@set -e; \
-	gen=cmd/misskey/plugins_generated.go; bak=""; \
+	gen=cmd/elythia/plugins_generated.go; bak=""; \
 	if [ -f "$$gen" ]; then bak=$$(mktemp); cp -p "$$gen" "$$bak"; rm -f "$$gen"; fi; \
 	trap 'if [ -n "$$bak" ]; then cp -p "$$bak" "$$gen"; rm -f "$$bak"; fi' EXIT INT TERM; \
 	gover=$$(awk '/^go [0-9]/ {print $$2; exit}' go.mod); \
@@ -481,14 +492,14 @@ actionlint: ## GitHub Actions の workflow を検査
 # 別の DB へ流すなら -config を渡すか MK_DB_* で上書きする。
 ##@ マイグレーション
 migrate-up: ## マイグレーションを最新まで適用
-	go run ./cmd/migrate -direction up
+	go run ./cmd/elythia migrate -direction up
 
-# **-steps 1 は必須。** cmd/migrate は steps 未指定 (0) を「全部」と解釈するので、
+# **-steps 1 は必須。** `elythia migrate` は steps 未指定 (0) を「全部」と解釈するので、
 # 付け忘れると 1 段のつもりで全 down が走り 全テーブルが消える。
 # 適用済みが 0 件のときは golang-migrate が "file does not exist" で exit 1 する
 # (steps 指定時は ErrNoChange に落ちないため)。冪等に叩くなら呼び出し側で吸収する。
 migrate-down: ## マイグレーションを 1 段階ロールバック
-	go run ./cmd/migrate -direction down -steps 1
+	go run ./cmd/elythia migrate -direction down -steps 1
 
 migrate-create: ## 新規マイグレーションファイルを作成
 	@read -p "Migration name: " name; \
@@ -536,12 +547,12 @@ image-logs: ## 上記スタックのログを表示
 	docker compose -f $(IMAGE_COMPOSE) logs -f
 
 image-build: ## bundled image を手元でビルドする (publish 前の確認用)
-	docker build -f Dockerfile.bundled -t ghcr.io/shiroha-a/mk:bundled .
+	docker build -f Dockerfile.bundled -t ghcr.io/elythia-network/elythia:bundled .
 
 
 # Federation tests ― 本家 Misskey と実際に立ち上げて連合動作を検証する。
-# 各ターゲット (misskey / mastodon / pleroma / ...) ごとに docker-compose.federation.<target>.yml を用意する。
-FEDERATION_MISSKEY_COMPOSE=docker-compose.federation.misskey.yml
+# 各ターゲット (misskey / mastodon / pleroma / ...) ごとに tests/federation/compose.<target>.yml を用意する。
+FEDERATION_MISSKEY_COMPOSE=tests/federation/compose.misskey.yml
 
 ##@ e2e: 連合
 federation-misskey-build: ## 連合テスト用 Misskey イメージをビルド
@@ -565,7 +576,7 @@ federation-misskey-logs: ## 連合テストスタックのログを表示
 	docker compose -f $(FEDERATION_MISSKEY_COMPOSE) logs -f
 
 # 本物の Mastodon を相手にした実連合 e2e (#3234)。引用の承認 (FEP-044f) を見る。
-FEDERATION_MASTODON_COMPOSE=docker-compose.federation.mastodon.yml
+FEDERATION_MASTODON_COMPOSE=tests/federation/compose.mastodon.yml
 
 federation-mastodon-e2e: ## Mastodon との連合テストを起動から撤去まで通しで実行
 	./tests/federation/run-mastodon-test.sh
@@ -576,7 +587,7 @@ federation-mastodon-down: ## Mastodon との連合テストスタックを撤去
 # Drop-in e2e (#365) ― Misskey TS 2 インスタンス (A, B) を立ち上げて
 # 連合基盤を検証する。Phase 13-1 では TS ↔ TS の smoke test のみ。
 # Phase 13-2 以降で mk 差し替え overlay を追加する予定。
-DROPIN_COMPOSE=docker-compose.dropin.yml
+DROPIN_COMPOSE=tests/dropin/compose.yml
 
 ##@ e2e: drop-in 互換
 dropin-up: ## drop-in e2e スタック (TS 2 インスタンス) を起動
@@ -594,18 +605,18 @@ dropin-logs: ## drop-in e2e スタックのログを表示
 # Drop-in mk overlay (#367) — instance A の backend を mk-go に差し替えた
 # 状態で TS-A 用 stack を起動する。連合先 (instance B) は TS のままなので
 # mk ↔ TS federation も同時に検証できる。
-DROPIN_MK_OVERLAY=docker-compose.dropin.mk.yml
+DROPIN_MK_OVERLAY=tests/dropin/compose.mk.yml
 
-dropin-mk-up: ## drop-in e2e に mk-go overlay を適用して起動
+dropin-mk-up: ## drop-in e2e に Elythia overlay を適用して起動
 	docker compose -f $(DROPIN_COMPOSE) -f $(DROPIN_MK_OVERLAY) up -d --build
 
-dropin-mk-test: ## mk-go overlay に対する smoke test を実行
+dropin-mk-test: ## Elythia overlay に対する smoke test を実行
 	docker compose -f $(DROPIN_COMPOSE) -f $(DROPIN_MK_OVERLAY) --profile test run --rm test-runner
 
-dropin-mk-down: ## mk-go overlay を撤去
+dropin-mk-down: ## Elythia overlay を撤去
 	docker compose -f $(DROPIN_COMPOSE) -f $(DROPIN_MK_OVERLAY) --profile test down -v
 
-dropin-mk-logs: ## mk-go overlay のログを表示
+dropin-mk-logs: ## Elythia overlay のログを表示
 	docker compose -f $(DROPIN_COMPOSE) -f $(DROPIN_MK_OVERLAY) logs -f
 
 # Drop-in swap シナリオ (#367): TS-A → mk-A 切替で state が引き継げることを
@@ -615,7 +626,7 @@ dropin-mk-logs: ## mk-go overlay のログを表示
 #   3. TS-A backend を停止
 #   4. overlay で mk-A 起動 (DB-A / Redis-A はそのまま)
 #   5. test_swap_verify.py で state preserved + 新規 federation を確認
-dropin-swap-test: ## TS → mk-go 切替の state preservation を通しで検証
+dropin-swap-test: ## TS → Elythia 切替の state preservation を通しで検証
 	./tests/dropin/run-swap-test.sh
 
 # Drop-in fedibird-mock e2e (#1083) — base + mk + fedibird overlay の stack で
@@ -623,9 +634,9 @@ dropin-swap-test: ## TS → mk-go 切替の state preservation を通しで検�
 # walks through する。ed25519 P2-P5 が実 federation 経路で動くことを担保する
 # nightly 用 e2e。
 # mk-go 生まれの DB を TS に引き渡す経路 (#2379)。swap test (TS→mk-go→TS) とは
-# 別物で、TS が一度も触っていない schema を受け取る。運用上はロックインの有無
-# そのもの (mk-go で始めた人が Misskey に移れるか)。
-dropin-mkgo-born-test: ## mk-go 生まれの DB を TS に引き渡せるか検証
+# 別物で、TS が一度も触っていない schema を受け取る。mk-go で始めた人が Misskey に
+# どこまで移れるかを測る (保証はしない、#3191)。
+dropin-mkgo-born-test: ## Elythia 生まれの DB を TS に引き渡せるか検証
 	./tests/dropin/run-mkgo-born-test.sh
 
 dropin-fedibird-test: ## Fedibird-like AP mock との Ed25519 双方向 verify
@@ -634,7 +645,7 @@ dropin-fedibird-test: ## Fedibird-like AP mock との Ed25519 双方向 verify
 # Drop-in frontend e2e (#380 / Phase 14) ― 3 Misskey TS インスタンス上で
 # cypress を回して、共有 TS フロントエンドから観測可能なアクティビティの
 # 整合性を検証する基盤。Phase 14-1 は baseline (all TS) のみ。
-DROPIN_FRONTEND_COMPOSE=docker-compose.dropin-frontend.yml
+DROPIN_FRONTEND_COMPOSE=tests/dropin-frontend/compose.yml
 
 dropin-frontend-up: ## drop-in frontend e2e スタックを起動
 	docker compose -f $(DROPIN_FRONTEND_COMPOSE) up -d
@@ -648,12 +659,12 @@ dropin-frontend-logs: ## drop-in frontend e2e のログを表示
 # baseline: all TS な状態で cypress spec が全 pass することを確認する
 # (Phase 14-1 #381)。
 dropin-frontend-baseline: ## 3 TS インスタンス + cypress で baseline spec を実行
-	./tests/dropin_frontend/run-frontend-baseline.sh
+	./tests/dropin-frontend/run-frontend-baseline.sh
 
 # Phase 14-3 (#394): TS-A → mk-A 切替後も cypress spec が引き続き pass する
 # ことを確認する swap test orchestrator。baseline 実行 → TS-A 停止 → mk-A
 # 起動 → swap モードで cypress 再実行、を bash で順次制御する。
-DROPIN_FRONTEND_MK_OVERLAY=docker-compose.dropin-frontend.mk.yml
+DROPIN_FRONTEND_MK_OVERLAY=tests/dropin-frontend/compose.mk.yml
 
 # mk-go overlay を直接立ち上げる (手動デバッグ用)。DB は clean からだが、
 # Phase 14-3 の本 test は `dropin-frontend-swap-test` を使う。
@@ -664,12 +675,12 @@ dropin-frontend-mk-down: ## drop-in frontend e2e の mk overlay を撤去
 	docker compose -f $(DROPIN_FRONTEND_COMPOSE) -f $(DROPIN_FRONTEND_MK_OVERLAY) --profile test down -v
 
 dropin-frontend-swap-test: ## TS-A → mk-A 切替まで含む frontend e2e
-	./tests/dropin_frontend/run-frontend-swap-test.sh
+	./tests/dropin-frontend/run-frontend-swap-test.sh
 
 # 本家フロントエンドの取得とビルド。
 #
-# ライセンス境界のため、本家コードはすべて third_party/misskey/ の git submodule
-# 参照で扱う。mk-go のリポジトリには 1 行もコピーしない。
+# フロントエンドは本体の frontend/ (#3379 で fork から取り込んだ pnpm workspace) から
+# ビルドする。比較対象の本家は .cache/misskey/<版> から読む (make upstream-fetch、#3378)。
 #
 # `e2e-frontend-build` は pnpm を docker run で実行する。ビルドに使う Node の版と
 # distro を、upstream がコンテナでビルドするときの組み合わせにそろえるため
@@ -678,12 +689,13 @@ dropin-frontend-swap-test: ## TS-A → mk-A 切替まで含む frontend e2e
 #
 # frontend e2e は Playwright に一本化した (#2437)。Cypress ラッパーは本家が
 # Cypress を廃止して参照先が消滅したため削除済み。spec は tests/playwright/。
-# **base image は upstream 自身の Dockerfile から取る (#2921)。**
-# `third_party/misskey/Dockerfile` の `ARG NODE_VERSION` は `26.4.0-trixie` の形で、
-# **版と distro の両方**を持つ。upstream がコンテナでビルドするときの組み合わせ
-# そのものなので、こちらで distro を決め打つより確か
-# (`docs/update/20260700diff.md` も「base image は submodule bump 時に要確認」と
-# 書いていた)。recipe の中で読む — `$(shell ...)` は使わない (260 行目の理由)。
+# **Node の版は frontend/.node-version から、distro は FRONTEND_NODE_DISTRO から取る。**
+# 以前は upstream の Dockerfile の `ARG NODE_VERSION` (`26.4.0-trixie` の形で、版と
+# distro の両方を持つ) から取っていた (#2921) が、#3379 で本家の Dockerfile は
+# 取り込まなくなった。版は CI (`node-version-file`) と同じ .node-version を見て、
+# distro は upstream 2026.10.0 の Dockerfile と同じ trixie を置く。本家の版を上げた
+# ときは、本家の Dockerfile の distro が変わっていないかを確かめる。
+# recipe の中で読む — `$(shell ...)` は使わない (REVISION_LDFLAGS の理由)。
 #
 # 以前は `node:22-bookworm` 固定で、CI が `.node-version` (Node 26) を使うのに
 # **本番のビルドだけ Node 22** という食い違いがあった。しかも `packages/backend` の
@@ -691,15 +703,11 @@ dropin-frontend-swap-test: ## TS-A → mk-A 切替まで含む frontend e2e
 # ちょうど**。upstream が下限を上げた瞬間に本番のビルドだけが engines で弾かれ、
 # CI は緑のまま気付けない。
 E2E_WORKDIR=/work
+FRONTEND_NODE_DISTRO ?= trixie
 
-# submodule を初期化し、Misskey 本家のフロントエンドソースを取得する。
 ##@ frontend build
-e2e-submodule-init: ## submodule を初期化 (本家フロントエンドの取得)
-	git submodule update --init --recursive third_party/misskey
-
-# 本家フロントエンドを Docker 内でビルドする。数分〜10 分程度かかる。
-# 成果物は third_party/misskey/packages/frontend/... 配下に出力される。
-# パッチは submodule (shiroha-a/misskey-ts、tag 2026.5.4-mk.0) に直接コミット済み。
+# frontend/ を Docker 内でビルドする。数分〜10 分程度かかる。
+# 成果物は frontend/built と frontend/packages/*/built に出力される。
 #
 # CI=true を渡す理由: upstream 2026.5.2 で pnpm 10 → 11 に移行 (#17400 dep bump
 # 系)、pnpm 11 は previous install (node_modules) を消す前に prompt を出す挙動が
@@ -710,7 +718,7 @@ e2e-submodule-init: ## submodule を初期化 (本家フロントエンドの取
 # **corepack は使わない (#2921)。** Node.js 26 の配布物に corepack は含まれて
 # いない (`node:26-bookworm` で `command not found` を実測)。`.node-version` に
 # 追従して image を上げると同時に踏むので、`npm i -g pnpm@<packageManager>` に
-# 変えてある。**版は submodule の `packageManager` から取る** — CI は #2914 で
+# 変えてある。**版は frontend/package.json の `packageManager` から取る** — CI は #2914 で
 # `pnpm/action-setup` + `package_json_file` に寄せてあり、これで両者が同じ
 # 定義を見る。
 #
@@ -726,13 +734,14 @@ e2e-submodule-init: ## submodule を初期化 (本家フロントエンドの取
 # (devcontainer は postCreate.sh がそうする)。ずれた場合はホスト側で
 # `pnpm install` を流し直せば直る。
 e2e-frontend-build: plugins ## フロントエンドをビルド (本番の bind-mount 先を上書きするので注意)
-	@node_tag=$$(sed -n 's/^ARG NODE_VERSION=\(.*\)$$/\1/p' third_party/misskey/Dockerfile | head -1); \
+	@node_ver=$$(tr -d '[:space:]' < frontend/.node-version); \
+	node_tag="$$node_ver-$(FRONTEND_NODE_DISTRO)"; \
 	pnpm_ver=$$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"pnpm@\([^"+]*\).*/\1/p' \
-		third_party/misskey/package.json | head -1); \
-	if [ -z "$$node_tag" ]; then echo "third_party/misskey/Dockerfile の ARG NODE_VERSION を読めない" >&2; exit 1; fi; \
+		frontend/package.json | head -1); \
+	if [ -z "$$node_ver" ]; then echo "frontend/.node-version を読めない" >&2; exit 1; fi; \
 	if [ -z "$$pnpm_ver" ]; then echo "package.json の packageManager を読めない" >&2; exit 1; fi; \
 	echo "==> node:$$node_tag / pnpm@$$pnpm_ver でビルドする"; \
-	docker run --rm -e CI=true -v $(PWD):$(E2E_WORKDIR) -w $(E2E_WORKDIR)/third_party/misskey \
+	docker run --rm -e CI=true -v $(PWD):$(E2E_WORKDIR) -w $(E2E_WORKDIR)/frontend \
 		"node:$$node_tag" \
 		bash -lc "npm i -g pnpm@$$pnpm_ver && pnpm install --frozen-lockfile && pnpm build"
 
@@ -754,18 +763,34 @@ $(UDS_CONFIG):
 ##@ 本番 UDS (実行注意)
 uds-init: | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS 構成を初期化
 
-# 本家 vite フロントエンドを docker 内でビルドする。初回は 3〜10 分程度かかる。
+# frontend/ を docker 内でビルドする。初回は 3〜10 分程度かかる。
 # 既存 e2e-frontend-build のエイリアス (成果物先が同じなので共有して OK)。
-uds-frontend-build: e2e-frontend-build ## 本番向けフロントエンドをビルド (本番の配信物を差し替える)
+# **出力先は frontend/built** (#3379 から。以前は third_party/misskey/built)。本番の
+# compose が bind mount する元も合わせて変える (docs/deployment.md の切り替え手順)。
+# 検査を先に終わらせてからビルドする (前提に並べると -j で並行して走る)。
+uds-frontend-build: uds-layout-check ## 本番向けフロントエンドをビルド (本番の配信物を差し替える)
+	$(MAKE) e2e-frontend-build
+
+# #3379 より前の compose.uds.yaml (gitignore 済み) は third_party/misskey の
+# built と assets を bind mount している。submodule を外した後も作業ツリーには古い
+# third_party/ が残りうる (git は未追跡になったディレクトリを消さない) ので、
+# そのまま uds-update すると新しい frontend/built を作っても誰も mount せず、
+# 古い SPA を警告無しで配り続ける (entry の検証も通ってしまう)。切り替え手順を
+# 踏むまで止める。
+uds-layout-check:
+	@if [ -f $(UDS_COMPOSE) ] && grep -nE '^[^#]*third_party/misskey([/:"]|$$)' $(UDS_COMPOSE); then \
+		echo "==> $(UDS_COMPOSE) がまだ third_party/misskey を mount している。" >&2; \
+		echo "    docs/deployment.md の「frontend を本体へ取り込んだ版へ上げる (#3379)」に従って向け直す" >&2; \
+		exit 1; \
+	fi
 
 # revision は build-arg で渡す。**Dockerfile の中では git を呼べない** —
 # `.dockerignore` が `.git` を落とすので、コンテキストにリポジトリが入らない。
-uds-build: | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックのイメージをビルド
+uds-build: uds-layout-check | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックのイメージをビルド
 	MKGO_COMMIT=$$(git rev-parse --short HEAD 2>/dev/null) \
-	MKGO_FRONTEND_VERSION=$$(git -C third_party/misskey describe --tags 2>/dev/null) \
 	docker compose -f $(UDS_COMPOSE) build
 
-uds-up: | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックを起動
+uds-up: uds-layout-check | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックを起動
 	docker compose -f $(UDS_COMPOSE) up -d --build
 
 uds-rebuild: ## frontend と image をまとめてビルド (本番の配信物を差し替える)
@@ -776,7 +801,7 @@ uds-rebuild: ## frontend と image をまとめてビルド (本番の配信物�
 # bind mount なので、frontend だけ更新したときは mkgo が再起動されず、起動時に
 # キャッシュした古い entry を配り続ける (実体は新しいビルドで消えているので
 # 404、#2885)。restart を明示し、配信中の entry が実在するかまで確かめる。
-uds-restart: | $(UDS_COMPOSE) $(UDS_CONFIG) ## mkgo を再起動して配信アセットを検証
+uds-restart: uds-layout-check | $(UDS_COMPOSE) $(UDS_CONFIG) ## mkgo を再起動して配信アセットを検証
 	@before=$$(docker compose -f $(UDS_COMPOSE) ps -q mkgo 2>/dev/null); \
 	docker compose -f $(UDS_COMPOSE) up -d || exit 1; \
 	after=$$(docker compose -f $(UDS_COMPOSE) ps -q mkgo 2>/dev/null); \
@@ -802,8 +827,8 @@ uds-ps: | $(UDS_COMPOSE) ## UDS スタックのコンテナ一覧
 
 # Benchmark ― mk-go vs 本家 Misskey のストレステスト比較。
 # k6 (Docker) で同一エンドポイントに負荷をかけ、レイテンシ・スループットを比較する。
-# 結果は tests/bench/results/report.md に出力される。
-BENCH_COMPOSE=tests/bench/docker-compose.bench.yml
+# 結果は tests/bench/http/results/report.md に出力される。
+BENCH_COMPOSE=tests/bench/http/compose.yml
 
 ##@ ベンチマーク
 bench-up: ## k6 ベンチのスタックを起動
@@ -826,7 +851,7 @@ bench-logs: ## k6 ベンチのログを表示
 
 # Queue bench (#563): deliver/inbox throughput comparison between
 # Misskey TS (BullMQ) and mk-go (mkq). asynq driver は #2985 で削除。
-QUEUE_BENCH_COMPOSE=tests/queue-bench/docker-compose.queue-bench.yml
+QUEUE_BENCH_COMPOSE=tests/bench/queue/compose.yml
 
 queue-bench-up: ## queue-bench スタックを起動
 	docker compose -f $(QUEUE_BENCH_COMPOSE) up -d --build
@@ -928,8 +953,8 @@ queue-bench-logs: ## queue-bench のログを表示
 # 3 scenario (fixed16 / fixed64 / auto) を同一 mkq stack で逐次実行し、
 # drain time / Redis client count を比較する。queue-bench との同居・
 # 並列実行は想定しない (port は publish していないが volume / network 名は
-# 別)。詳細: tests/queue-bench-autoscale/README.md (or docs/queue-bench.md)
-AUTOSCALE_BENCH_DIR=tests/queue-bench-autoscale
+# 別)。詳細: tests/bench/queue-autoscale/README.md (or docs/queue-bench.md)
+AUTOSCALE_BENCH_DIR=tests/bench/queue-autoscale
 
 queue-bench-autoscale-run: ## worker 数 fixed16 / fixed64 / auto を比較実行
 	cd $(AUTOSCALE_BENCH_DIR) && ./run.sh
@@ -945,10 +970,10 @@ queue-bench-autoscale-logs: ## autoscale ベンチのログを表示
 # upstream Misskey TS 互換挙動を期待値に書いた spec を mk-go backend に
 # 対して走らせ、drop-in 互換 regression を検出する。Phase 1 PR-1 では
 # 基盤 + smoke 1 spec のみ。後続 PR で spec 拡充 + CI 統合する。
-PLAYWRIGHT_COMPOSE=docker-compose.playwright.yml
+PLAYWRIGHT_COMPOSE=tests/playwright/compose.yml
 
 ##@ e2e: Playwright
-playwright-up: ## Playwright スタック (mk-go backend) を起動
+playwright-up: ## Playwright スタック (Elythia backend) を起動
 	docker compose -f $(PLAYWRIGHT_COMPOSE) up -d --build
 
 # PLAYWRIGHT_ARGS は runner の `playwright` に素通しする追加引数。CI が
@@ -959,7 +984,7 @@ playwright-up: ## Playwright スタック (mk-go backend) を起動
 # 丸ごと置き換わるので、`test` を明示してから追加する。
 PLAYWRIGHT_ARGS ?=
 
-playwright-test: ## Playwright spec を実行 (mk-go backend、PLAYWRIGHT_ARGS で引数追加)
+playwright-test: ## Playwright spec を実行 (Elythia backend、PLAYWRIGHT_ARGS で引数追加)
 	# `--build` を付けて runner image を rebuild check させる。package.json
 	# 更新時に node_modules が古いままにならないよう、毎回 build context を
 	# 確認する (cache hit なら ms 単位で済むので overhead 無視可)。
@@ -976,7 +1001,7 @@ playwright-logs: ## Playwright スタックのログを表示
 # 同 spec を upstream Misskey TS image (= 真の互換挙動の baseline) に対しても
 # 走らせる。両方で pass = drop-in 互換が確認される、片方のみ pass = drift /
 # spec 誤りとして調査対象。
-PLAYWRIGHT_TS_OVERLAY=docker-compose.playwright.ts.yml
+PLAYWRIGHT_TS_OVERLAY=tests/playwright/compose.ts.yml
 
 playwright-ts-up: ## Playwright スタック (Misskey TS backend) を起動
 	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) up -d --build
@@ -996,13 +1021,13 @@ playwright-ts-down: ## Playwright TS スタックを撤去
 # 並列に立て、同一 endpoint のレスポンスを diff して entitycompat
 # golden gate がカバーしない値レベル乖離を検出する。詳細は docs/diff-e2e.md。
 # 隔離 stack (own network/volumes)、production UDS には触れない。
-DIFF_COMPOSE=docker-compose.diff.yml
+DIFF_COMPOSE=tests/diff/compose.yml
 
 ##@ e2e: 差分比較ハーネス
 diff-up: ## 差分比較ハーネスのスタックを起動
 	docker compose -f $(DIFF_COMPOSE) up -d --build
 
-diff-test: ## mk-go ↔ TS の値レベル diff を実行
+diff-test: ## Elythia ↔ TS の値レベル diff を実行
 	docker compose -f $(DIFF_COMPOSE) --profile test run --rm --build diff-runner
 
 diff-down: ## 差分比較ハーネスのスタックを撤去
@@ -1012,7 +1037,7 @@ diff-logs: ## 差分比較ハーネスのログを表示
 	docker compose -f $(DIFF_COMPOSE) logs -f
 
 # Misskey 本家の backend e2e (test/e2e/**) を mk-go に向けて実行する。
-# テスト本体には手を入れず、submodule 側の vitest 設定 2 ファイル
+# テスト本体には手を入れず、本家の取得先 (.cache/misskey) の vitest 設定 2 ファイル
 # (globalSetup / setupFiles) だけを差し替えている。上流でテストが増えれば
 # 自動的にこちらの検証対象も増える。詳細は docs/upstream-backend-e2e.md。
 #
@@ -1023,11 +1048,102 @@ diff-logs: ## 差分比較ハーネスのログを表示
 # ポートは本家 .github/misskey/test.yml に合わせてある (54312 / 56312 / 61812)。
 UPSTREAM_E2E_COMPOSE=tests/upstream-e2e/compose.yml
 UPSTREAM_E2E_CONFIG=tests/upstream-e2e/mkgo.yml
-UPSTREAM_E2E_MISSKEY=third_party/misskey
+# 本家そのもの (`make upstream-fetch` の取得先) で走らせる (#3378)。mk-go へ向ける
+# ための 3 ファイルは tests/upstream-e2e/harness/ に置き、upstream-e2e-test が
+# 実行のたびに本家の packages/backend/ へコピーする (編集がすぐ効くように deps
+# ではなく test の側で写す)。vitest の設定を本家の外に置いたまま本家のテストを
+# 走らせる形は採らない — 設定ファイルの import (`vitest/config`、本家の
+# `./vitest.config.js`) は設定ファイルの場所から解決されるので、tests/ には
+# node_modules が無く失敗する。symlink も vite が実体のパスへ解決するので同じ。
+UPSTREAM_E2E_MISSKEY=$(UPSTREAM_DIR)
+UPSTREAM_E2E_HARNESS=tests/upstream-e2e/harness
 UPSTREAM_E2E_BACKEND=$(UPSTREAM_E2E_MISSKEY)/packages/backend
 
+##@ 本家 (比較対象)
+# 比較対象の本家 Misskey は `.cache/misskey/<版>/` から読む
+# (#3378)。版は UPSTREAM_MISSKEY_VERSION の 1 行で、tools とテストは
+# internal/upstreamsrc 経由で同じ場所を見る。MK_UPSTREAM_DIR で場所を変えられる。
+#
+# **`$(shell)` は使わない** (gaterun-check の前提、REVISION_LDFLAGS の注記を参照)。
+# 版は `$(file <...)` で読む。ファイルを読むだけで、`make -pn` に副作用は無い。
+UPSTREAM_MISSKEY_VERSION := $(file <UPSTREAM_MISSKEY_VERSION)
+UPSTREAM_DIR ?= $(if $(MK_UPSTREAM_DIR),$(MK_UPSTREAM_DIR),.cache/misskey/$(UPSTREAM_MISSKEY_VERSION))
+# 版ごとの worktree の元になる bare repository。2 回目以降の取得と、追従作業で
+# 旧版と新版を並べるときに速い (設計 D2 / Q3)。
+UPSTREAM_MIRROR ?= .cache/misskey/mirror.git
+UPSTREAM_REMOTE ?= https://github.com/misskey-dev/misskey.git
+
+# 取得済みなら版を確かめて何もしない。**版が違う worktree は上書きしない** —
+# 手で直した跡があるかもしれないので、消してから取り直すよう案内して落ちる。
+# `worktree prune` は、worktree を `rm -rf` だけで消したときに mirror 側に残る
+# 登録を掃除する (残っていると `worktree add` が already registered で落ちる)。
+upstream-fetch: ## UPSTREAM_MISSKEY_VERSION の本家を .cache/misskey/<版> へ取得
+	@set -e; v="$(UPSTREAM_MISSKEY_VERSION)"; d="$(UPSTREAM_DIR)"; \
+	if [ -z "$$v" ]; then echo "UPSTREAM_MISSKEY_VERSION が読めない" >&2; exit 1; fi; \
+	if [ -e "$$d/.git" ]; then \
+		got=$$(git -C "$$d" describe --tags --exact-match 2>/dev/null || true); \
+		if [ "$$got" = "$$v" ]; then echo "upstream $$v: $$d (取得済み)"; exit 0; fi; \
+		echo "$$d は $$v ではない ($${got:-tag 無し})。git -C $(UPSTREAM_MIRROR) worktree remove --force $$d で消してから取り直す" >&2; exit 1; \
+	fi; \
+	if [ -e "$$d" ]; then echo "$$d が git の worktree ではない。消してから取り直す" >&2; exit 1; fi; \
+	if [ ! -d "$(UPSTREAM_MIRROR)" ]; then \
+		git clone --bare --no-tags "$(UPSTREAM_REMOTE)" "$(UPSTREAM_MIRROR)"; \
+	fi; \
+	git -C "$(UPSTREAM_MIRROR)" fetch --no-tags origin "refs/tags/$$v:refs/tags/$$v"; \
+	git -C "$(UPSTREAM_MIRROR)" worktree prune; \
+	case "$$d" in /*) p="$$d" ;; *) p="$(CURDIR)/$$d" ;; esac; \
+	git -C "$(UPSTREAM_MIRROR)" worktree add --detach "$$p" "refs/tags/$$v"; \
+	echo "upstream $$v: $$d"
+
+# golden が本家の版に追いついているか。本家から作り直して差分が無いことと、
+# 本家を読むテストが skip されずに通ることを見る。本家を取得する
+# apicompat.yml が回す (本家を読まない `make gates` には入れない)。
+upstream-check: ## golden と本家を読むテストが UPSTREAM_MISSKEY_VERSION の本家と一致するか検査
+	$(MAKE) shapecheck-gen
+	git diff --exit-code -- internal/entitycompat/testdata
+	MK_UPSTREAM_REQUIRE=1 go test ./internal/misc/achievement/... -run 'TestTypes_MatchUpstream' -count=1 -v
+
+# 本家の新しい版 (TO=<版>) の差分のうち、frontend/ が取り込むパスだけを 3-way で当てる
+# (設計 D4、#3379)。手順の全体は docs/upstream-catch-up.md。
+#
+#  - mirror (upstream-fetch と共有) に今の版と TO の tag を取ってから、本体の
+#    refs/upstream/ へ取り込む。--3way は当てる前の blob を手元で探すため
+#  - 変更されたパスを D1 の区分で分け、どれにも当たらないパス (本家が直下に新しく
+#    足したものなど) があれば何も当てずに止める
+#  - 衝突はファイル単位で衝突マーカーとして残る。pnpm-lock.yaml は当てず、
+#    `make upstream-sync-lock` で作り直す
+#  - DRY=1 なら分類だけを表示する (DRY に 1 / true / yes 以外を入れても当てる)
+upstream-sync: ## 本家の新しい版 (TO=<版>) の frontend 側の差分を frontend/ へ当てる
+	@set -e; to="$(TO)"; from="$(UPSTREAM_MISSKEY_VERSION)"; \
+	if [ -z "$$to" ]; then echo "TO=<本家の版> を指定する (例: make upstream-sync TO=2026.11.0)" >&2; exit 1; fi; \
+	if [ -z "$$from" ]; then echo "UPSTREAM_MISSKEY_VERSION が読めない" >&2; exit 1; fi; \
+	if [ ! -d "$(UPSTREAM_MIRROR)" ]; then git clone --bare --no-tags "$(UPSTREAM_REMOTE)" "$(UPSTREAM_MIRROR)"; fi; \
+	git -C "$(UPSTREAM_MIRROR)" fetch --no-tags origin "refs/tags/$$from:refs/tags/$$from" "refs/tags/$$to:refs/tags/$$to"; \
+	GOWORK=off go run ./tools/upstreamsync -from "$$from" -to "$$to" -source "$(UPSTREAM_MIRROR)" $(if $(filter 1 true yes,$(DRY)),-dry-run)
+
+# frontend/pnpm-lock.yaml を、**直前の lock を基点に** package.json から作り直す (D4)。
+# 本家の lock は使わない (backend を外した lock は本家より約 4800 行少なく、本家の lock の
+# 差分は毎回衝突する)。--lockfile-only なので node_modules と frontend/built は触らない。
+# 作り直した lock の差分を目で見て、package.json で変わった依存以外が動いていないことを
+# 確かめる (--lockfile-only は lock に無い依存と範囲が変わった依存をその時点の最新に解決する)。
+#
+# **store は container の中に置く** (`pnpm_config_store_dir`)。既定のままだと mount の根
+# (frontend/) に root 所有の frontend/.pnpm-store ができ、Dockerfile.bundled の
+# `COPY frontend/` にも入る。pnpm 11 は `npm_config_*` を読まないので `pnpm_config_*` で
+# 渡す (実測)。**コメントは recipe の中に置かない** — 行継続の途中に挟むとそこで shell が
+# 分かれ、後ろの docker run から変数が見えなくなる。
+upstream-sync-lock: ## frontend/pnpm-lock.yaml を package.json から作り直す (upstream-sync の後)
+	@node_ver=$$(tr -d '[:space:]' < frontend/.node-version); \
+	pnpm_ver=$$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"pnpm@\([^"+]*\).*/\1/p' \
+		frontend/package.json | head -1); \
+	if [ -z "$$node_ver" ] || [ -z "$$pnpm_ver" ]; then echo "frontend/.node-version か packageManager を読めない" >&2; exit 1; fi; \
+	docker run --rm -e CI=true -e pnpm_config_store_dir=/tmp/pnpm-store \
+		-v "$(CURDIR)/frontend:/work/frontend" -w /work/frontend \
+		"node:$$node_ver-$(FRONTEND_NODE_DISTRO)" \
+		bash -lc "npm i -g pnpm@$$pnpm_ver && pnpm install --lockfile-only"
+
 ##@ e2e: 本家 backend e2e
-# submodule 側の依存を用意する。初回と submodule bump 後にだけ必要。
+# 本家の取得先の依存を用意する。初回と UPSTREAM_MISSKEY_VERSION を上げた後にだけ必要。
 #
 #  - misskey-js: exports が built/ を指すのでビルドしないと test/e2e が import できない。
 #    frontend まで含む `pnpm build` (5-10 分) は e2e には不要なので呼ばない。
@@ -1036,7 +1152,7 @@ UPSTREAM_E2E_BACKEND=$(UPSTREAM_E2E_MISSKEY)/packages/backend
 #    NODE_ENV=test で .config/test.yml から生成しておく必要がある。
 #  - build-pre: loadConfig() は built/meta.json も readFileSync する (無いと ENOENT)。
 #    frontend の manifest は existsSync 判定なので無くてよい。
-upstream-e2e-deps: ## 本家 backend e2e に必要な submodule 側の依存を用意 (初回のみ)
+upstream-e2e-deps: upstream-fetch ## 本家 backend e2e に必要な本家側の依存を用意 (初回のみ)
 	cd $(UPSTREAM_E2E_MISSKEY) && \
 		pnpm install --frozen-lockfile && \
 		pnpm build-pre && \
@@ -1048,7 +1164,7 @@ upstream-e2e-up: ## 本家 backend e2e 用の PostgreSQL / Redis を起動
 	docker compose -f $(UPSTREAM_E2E_COMPOSE) up -d --wait
 
 upstream-e2e-migrate: ## e2e 用 DB にマイグレーションを適用
-	go run ./cmd/migrate -config $(UPSTREAM_E2E_CONFIG) -direction up
+	go run ./cmd/elythia migrate -config $(UPSTREAM_E2E_CONFIG) -direction up
 
 # FILE で 1 ファイルだけ流せる: make upstream-e2e-test FILE=test/e2e/note.ts
 # VITEST_ARGS は vitest に素通しする追加引数。CI が `--shard=i/N` を渡して
@@ -1060,9 +1176,23 @@ upstream-e2e-migrate: ## e2e 用 DB にマイグレーションを適用
 # を実行中に消す。シャードごとに DB を分けるのが前提。
 VITEST_ARGS ?=
 
-upstream-e2e-test: build ## 本家 backend e2e を mk-go に対して実行 (VITEST_ARGS で引数追加)
+# **mk-go が配る静的なファイルも本家の取得先から取る** (#3378)。favicon や絵文字の
+# 画像 (`test/e2e/fetch-resource.ts` が見る) は、既定では frontend/assets と、
+# frontend/ へ pnpm install した emoji-assets から配る。この e2e は frontend/ に
+# pnpm install しない (CI) ので、本家の取得先 (upstream-e2e-deps が
+# pnpm install 済み) を環境変数で指す。値は mk-go の cwd (MKGO_CWD = リポジトリ
+# 直下) から解決される。entry.ts は環境変数をそのまま mk-go へ渡す。
+UPSTREAM_E2E_ASSETS_ENV = \
+	MISSKEY_STATIC_DIR=$(UPSTREAM_E2E_BACKEND)/assets \
+	MISSKEY_REPO_ASSETS_DIR=$(UPSTREAM_E2E_MISSKEY)/assets \
+	MISSKEY_TWEMOJI_DIR=$(UPSTREAM_E2E_BACKEND)/node_modules/@misskey-dev/emoji-assets/built/twemoji \
+	MISSKEY_FLUENT_EMOJI_DIR=$(UPSTREAM_E2E_BACKEND)/node_modules/@misskey-dev/emoji-assets/built/fluent-emoji
+
+upstream-e2e-test: build ## 本家 backend e2e を Elythia に対して実行 (VITEST_ARGS で引数追加)
+	cp -R $(UPSTREAM_E2E_HARNESS)/. $(UPSTREAM_E2E_BACKEND)/
 	cd $(UPSTREAM_E2E_BACKEND) && \
-		MKGO_BIN=$(CURDIR)/built/misskey \
+		$(UPSTREAM_E2E_ASSETS_ENV) \
+		MKGO_BIN=$(CURDIR)/built/$(BINARY) \
 		MKGO_CONFIG=$(CURDIR)/$(UPSTREAM_E2E_CONFIG) \
 		MKGO_CWD=$(CURDIR) \
 		npx --no vitest run --config vitest.config.e2e.mkgo.ts $(VITEST_ARGS) $(FILE)
@@ -1075,25 +1205,25 @@ upstream-e2e-down: ## 本家 backend e2e 用のスタックを撤去 (volume ご
 # API compatibility matrix ― mk-go と Misskey TS の API endpoint 実装状況を
 # 突き合わせて docs/api-compat.md を生成する。
 #
-# - APICOMPAT_TS_DIR: TS endpoints ディレクトリ。submodule に依存。
-# - APICOMPAT_CONFIG: --dump-routes 時に読み込む mk-go config。DB/Redis 接続
+# - APICOMPAT_TS_DIR: TS endpoints ディレクトリ。本家の取得先 (`make upstream-fetch`) に依存。
+# - APICOMPAT_CONFIG: dump-routes 時に読み込む mk-go config。DB/Redis 接続
 #   は必須なので、docker compose up された stack を持っていることが前提。
 # - APICOMPAT_ROUTES: dump-routes が書き出す中間ファイルの path。
 #   `$(BUILD_DIR)` 配下にして hermetic に保つ ( /tmp 共有事故を避ける)。
-APICOMPAT_TS_DIR    ?= third_party/misskey/packages/backend/src/server/api/endpoints
+APICOMPAT_TS_DIR    ?= $(UPSTREAM_DIR)/packages/backend/src/server/api/endpoints
 # fastify 直登録 endpoint (signup / signin-flow / miauth check / instance peers)
 # の抽出元。endpoints/ の file-walk では拾えないので source から直接読む。
-APICOMPAT_TS_DIRECT ?= third_party/misskey/packages/backend/src/server/api/ApiServerService.ts
+APICOMPAT_TS_DIRECT ?= $(UPSTREAM_DIR)/packages/backend/src/server/api/ApiServerService.ts
 APICOMPAT_CONFIG    ?= .config/default.yml
 APICOMPAT_ROUTES    ?= $(BUILD_DIR)/apicompat-routes.json
 APICOMPAT_OUT       ?= docs/api-compat.md
 
-# mk-go binary を build → --dump-routes で route 一覧を JSON dump。
+# mk-go binary を build → `elythia dump-routes` で route 一覧を JSON dump。
 # DB / Redis 接続を必要とするので make docker-up 等で stack を立てた状態で
 # 実行すること。
 apicompat-routes: build ## route 一覧を JSON dump (stack 起動が必要)
 	mkdir -p $(dir $(APICOMPAT_ROUTES))
-	$(BUILD_DIR)/$(BINARY) -config $(APICOMPAT_CONFIG) -dump-routes -dump-routes-out $(APICOMPAT_ROUTES)
+	$(BUILD_DIR)/$(BINARY) dump-routes -config $(APICOMPAT_CONFIG) -dump-routes-out $(APICOMPAT_ROUTES)
 
 # 既存 APICOMPAT_ROUTES JSON だけ comparator にかけて matrix を再生成する
 # (DB / Redis 接続不要)。matrix の format / category 表示を iterate する時に
@@ -1120,8 +1250,8 @@ apicompat: apicompat-routes apicompat-render ## API 互換性マトリクス doc
 # TestEntityShapeDrift gate として自動実行される。詳細は docs/shape-drift.md。
 
 # golden snapshot (testdata/golden_schemas.json + golden_error_ids.json) を
-# submodule から再生成する。third_party/misskey を upstream catch-up で bump
-# したら必ず実行し、生成された snapshot を commit すること。
+# 本家 (`make upstream-fetch` の取得先) から再生成する。UPSTREAM_MISSKEY_VERSION
+# を上げたら必ず実行し、生成された snapshot を commit すること。
 ##@ 静的 parity ゲート (サーバー・Docker 不要)
 shapecheck-gen: ## shape drift の golden snapshot を再生成
 	go run ./tools/shapediff
@@ -1181,21 +1311,6 @@ mdtable-check: ## md の表の各行がヘッダと同じ列数か検査 (溢れ
 	# **見るのは列数だけ。** 取りこぼす形はテストの doc コメントに明記してある。
 	go test ./internal/entitycompat/... -run 'TestMarkdownTablesDoNotDropContent' -count=1 -v
 
-.PHONY: submodulepin-check
-submodulepin-check: ## fork frontend の pin が doc / gitlink / bundled image で一致しているか検査
-	# submodule に commit して fork へ push したあと、親リポの gitlink を上げ
-	# 忘れる片側更新が実際に起きた (#2963)。doc には新しい tag を書き、fork の
-	# branch と tag も push 済みなのに gitlink だけ古い、という状態で CI 28
-	# チェックが全部緑のままマージされた。SHA で突き合わせるので submodule の
-	# checkout は要らない。
-	#
-	# 配る bundled image が焼き込む assets image の tag も同じ輪に入れてある
-	# (#3011)。古い tag でも image はビルドできるので CI は落ちず、配った先に
-	# だけ古い frontend が載る。実測で develop は 29 世代ずれていた (pin されていた
-	# `mk.0` から数えた間隔。数字付きの tag 30 個から 1 を引いた値で、英字付きを
-	# 含めると 62 個から 1 を引いて 61)。
-	go test ./internal/entitycompat/... -run 'TestSubmodulePinMatchesDoc|TestSubmodulePinTagMatchesTable|TestBundledAssetsPinMatchesDoc|TestAssetsPinScanners' -count=1 -v
-
 .PHONY: secretfield-check
 secretfield-check: ## モデルの秘密フィールドが json:"-" を保っているか検査
 	# モデルをそのまま JSON 化する経路があるので、`json:"-"` が唯一の防波堤に
@@ -1247,11 +1362,11 @@ dockerignore-check: ## .dockerignore がシークレットと利用者データ�
 	go test ./internal/entitycompat/... -run 'TestDockerignore' -count=1 -v
 
 .PHONY: pluginembed-check
-pluginembed-check: ## mk-go をビルドする Dockerfile が pluginbuild を go build より前に実行するか検査
+pluginembed-check: ## Elythia をビルドする Dockerfile が pluginbuild を go build より前に実行するか検査
 	# 組み込みを忘れた image は **エラーにならない** — plugins/ に置いたのに
 	# 入っていない mk-go が黙って出来る。#2940 で Dockerfile.bundled が実際に
 	# そうなっていた。生成が go build の後でも同じ結果になるので順序も見る。
-	# 検出は動詞 (go build / go install) と対象 (cmd/misskey / cmd/...) の共起で
+	# 検出は動詞 (go build / go install) と対象 (cmd/elythia / cmd/...) の共起で
 	# 行い、行継続は畳んでから判定する。組み込まない Dockerfile は理由付きで
 	# allowlist に登録する。
 	go test ./internal/entitycompat/... -run 'TestDockerfilesEmbedPlugins' -count=1 -v
@@ -1265,8 +1380,8 @@ testflags-check: ## make test が CI と同じテスト条件で走るか検査
 	go test ./internal/entitycompat/... -run 'TestMakeTestMatchesCIConditions|TestDocsQuoteTheCIShuffleSeed' -count=1 -v
 
 .PHONY: compose-check
-compose-check: ## 配布する compose にログの上限があるか検査
-	go test ./internal/entitycompat/... -run 'TestComposeServicesHaveLogLimits' -count=1 -v
+compose-check: ## 配布する compose のログの上限と、検証用 compose の置き場所・相対パス・name: を検査
+	go test ./internal/entitycompat/... -run 'TestComposeServicesHaveLogLimits|TestRootComposeFilesAreOperatorOnly|TestTestComposeFilesAreSelfContained|TestTestComposeUntrackedSourcesAreUsed' -count=1 -v
 
 .PHONY: catalog-check
 catalog-check: ## システムカタログのクエリが schema で絞られているか検査

@@ -11,6 +11,8 @@
 #   7. mk-A backend を停止して TS-A に戻す (#1082 SHOULD shape)
 #   8. TS-A 起動 healthy 待ち + nginx-a restart
 #   9. test_swap_roundtrip_verify.py で TS 戻し後の連合継続を確認
+#      (6b-9 の復路とその準備は守る対象ではなく測る対象。#3191、docs/dropin-e2e.md の
+#      「復路は測る対象」)
 #  10. cleanup
 #
 # pytest セッションを跨いで docker compose を切り替える必要があるため、
@@ -22,12 +24,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-BASE=docker-compose.dropin.yml
-OVERLAY=docker-compose.dropin.mk.yml
+BASE=tests/dropin/compose.yml
+OVERLAY=tests/dropin/compose.mk.yml
 # fedibird mock を同居させる (#2376)。mock は RSA と Ed25519 の両方の鍵を持つ
 # ので、「mk-go が Ed25519 で連合していた相手と、TS に戻したあと RSA で継続
 # できるか」を実測できる。TS-A / TS-B の挙動には影響しない (別サービス)。
-FEDIBIRD=docker-compose.dropin.fedibird.yml
+FEDIBIRD=tests/dropin/compose.fedibird.yml
 
 # 失敗時の診断情報を残してから stack を落とす。
 #

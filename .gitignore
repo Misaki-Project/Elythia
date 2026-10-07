@@ -1,4 +1,5 @@
 # Binary
+/elythia
 /misskey
 /misskey-go
 /built/
@@ -39,6 +40,8 @@ Thumbs.db
 
 # Temporary files
 .tmp/
+# 比較対象の本家 (make upstream-fetch、#3378)
+.cache/
 
 # Config (user-specific). Track example templates only; operator
 # copies them locally (default.yml / docker.yml).
@@ -49,18 +52,20 @@ drive-files/
 /compose.uds.yaml
 
 # Benchmark results
-tests/bench/results/*.json
-tests/bench/results/*.md
-tests/bench/results/profiles/
-tests/queue-bench/results/*.json
-tests/queue-bench/results/*.md
-!tests/bench/results/.gitkeep
+tests/bench/http/results/*.json
+tests/bench/http/results/*.md
+tests/bench/http/results/profiles/
+tests/bench/queue/results/*.json
+tests/bench/queue/results/*.md
+# faker の go build の出力 (#1517 で誤って追跡されていた。#3373 で外した)
+tests/bench/queue/faker/faker
+!tests/bench/http/results/.gitkeep
 # #1158 effect の before/after reference data (#1163 で計測)。reader が
 # bench を再走らせなくても docs/queue-bench.md の表と数値を突き合わせて
 # verify できるよう、この 2 ファイルだけ track する。他の *.json は
 # bench 走るたびに上書きされる ephemeral data なので gitignore のまま。
-!tests/queue-bench/results/inbound-announce-before.json
-!tests/queue-bench/results/inbound-announce-after.json
+!tests/bench/queue/results/inbound-announce-before.json
+!tests/bench/queue/results/inbound-announce-after.json
 
 # Claude Code local state。rules/ だけは共有する (#3248)。
 # `.claude/` と書くとディレクトリごと除外され、中の再包含が効かないので `/*` にする
@@ -70,14 +75,14 @@ tests/queue-bench/results/*.md
 CLAUDE.local.md
 __pycache__/
 
-# Cypress runtime artifacts (tests/dropin_frontend/cypress and e2e/cypress 配下)
+# Cypress runtime artifacts (tests/dropin-frontend/cypress and e2e/cypress 配下)
 **/cypress/videos/
 **/cypress/screenshots/
 **/cypress/downloads/
 **/cypress/node_modules/
 **/cypress/.cache/
 # cypress 15 は project dir 配下に `cypress/` を tmp として作ることがある
-tests/dropin_frontend/cypress/cypress/
+tests/dropin-frontend/cypress/cypress/
 
 # drop-in test orchestrator が失敗時に吐くログ (local fallback)
 .dropin-logs/
@@ -98,4 +103,14 @@ plugins/*
 !plugins/rolelevel/
 go.work
 go.work.sum
-cmd/misskey/plugins_generated.go
+cmd/elythia/plugins_generated.go
+
+# pluginbuild (make plugins) の生成物 (#3379)。frontend はこれを import するので、
+# frontend をビルドする前に make plugins を回す。追跡すると make plugins のたびに
+# 作業ツリーが dirty になり、運営者の git pull が止まりうる。
+/frontend/packages/frontend/src/server-plugins.generated.ts
+/frontend/packages/frontend/mk-plugins.generated.json
+
+# #3379 で外した submodule の残り。片付ける前に `git add -A` すると、中の .git を
+# 埋め込みリポジトリとして gitlink で追加してしまう。片付けの手順は docs/deployment.md。
+/third_party/

@@ -6,13 +6,13 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/core/signup"
+	"github.com/elythia-network/elythia/internal/misc/json5"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/core/role"
-	"github.com/shiroha-a/mk/internal/core/signup"
-	"github.com/shiroha-a/mk/internal/misc/json5"
-	"github.com/shiroha-a/mk/internal/repository"
 	"gorm.io/datatypes"
 )
 
@@ -168,13 +168,13 @@ func (h *Handler) buildMeta(detail bool) (map[string]any, error) {
 		// upstream の `localUsernameSchema` は `^\w{1,20}$` 固定なので
 		// 対応する field が無い。
 		"minimumUsernameLength": signup.EffectiveMinimumUsernameLength(m),
-		// ビルドした revision と同梱 frontend の版 (#2700)。/about-mkgo が
-		// 「mk-go 1.3.0 (abc1234)」「Misskey 2026.9.0-mk.3」として出す。
+		// ビルドした revision (#2700)。/about-elythia が「Elythia 1.3.0 (abc1234)」として
+		// 出す。以前は同梱 frontend の版 (mkGoFrontendVersion) も出していたが、
+		// frontend を本体へ取り込んで版が本体と同じになったので廃止した (#3379)。
 		// **埋まっていないビルドでは空文字**になる (`go run` や build-arg を
 		// 渡さない `docker compose build`)。読む側が表示を省くので、ここで
 		// "unknown" のような代替値を作らない。
 		"mkGoCommit":             config.MkGoCommit,
-		"mkGoFrontendVersion":    config.MkGoFrontendVersion,
 		"name":                   m.Name,
 		"shortName":              m.ShortName,
 		"uri":                    h.config.URL,

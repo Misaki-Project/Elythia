@@ -1,0 +1,88 @@
+packages:
+  - packages/frontend-shared
+  - packages/frontend
+  - packages/frontend-builder
+  - packages/frontend-embed
+  - packages/i18n
+  - packages/icons-subsetter
+  - packages/sw
+  - packages/misskey-js
+  - packages/misskey-js/generator
+  - packages/misskey-reversi
+  - packages/misskey-bubble-game
+  - packages-private/*
+  # backend を取り込まないので動かない (mk-go #3379)
+  - '!packages-private/diagnostics-backend'
+allowBuilds:
+  '@nestjs/core': true
+  '@parcel/watcher': true
+  '@sentry/profiling-node': true
+  '@sentry-internal/node-cpu-profiler': true
+  '@sentry/node-cpu-profiler': true
+  bufferutil: true
+  canvas: true
+  core-js: true
+  esbuild: true
+  msgpackr-extract: true
+  msw: true
+  nice-napi: true
+  re2: true
+  sharp: true
+  utf-8-validate: true
+  v-code-diff: true
+  vue-demi: true
+  exifreader: false
+  protobufjs: false
+  pnpm: true
+minimumReleaseAge: 10080 # delay 7days to mitigate supply-chain attack
+minimumReleaseAgeExclude:
+  - '@misskey-dev/*'
+  - '@syuilo/aiscript'
+  - buraha
+  - mfm-js
+  - slacc
+  - slacc-android-arm-eabi
+  - slacc-android-arm64
+  - slacc-darwin-arm64
+  - slacc-darwin-universal
+  - slacc-darwin-x64
+  - slacc-freebsd-x64
+  - slacc-linux-arm-gnueabihf
+  - slacc-linux-arm64-gnu
+  - slacc-linux-arm64-musl
+  - slacc-linux-x64-gnu
+  - slacc-linux-x64-musl
+  - slacc-win32-arm64-msvc
+  - slacc-win32-x64-msvc
+  - '@typescript/native-preview*'
+  - undici@6.28.1 || 7.29.1 # そのうち消す
+  # Renovate security update: nodemailer@9.1.1
+  - nodemailer@9.1.1
+  # Renovate security update: fastify@5.12.5
+  - fastify@5.12.5
+overrides:
+  '@aiscript-dev/aiscript-languageserver': '-'
+  chokidar: 5.0.0
+  lodash: 4.18.1
+  undici@^7: 7.29.1
+  undici@^6: 6.28.1
+  '@tabler/icons-webfont>sharp': '-'
+  # 以下は、lock が指す版に high の advisory があるため修正版へ上げる (mk-go #3379)。
+  # どれも開発・ビルド・テストの道具の推移的な依存で、配る bundle には入らない。
+  # 本家が追従したら外す。braces (<=3.0.3) は修正版が無く、http-cache-semantics は
+  # 修正版 4.3.0 が minimumReleaseAge に満たないので、この 2 つは残る。
+  '@xmldom/xmldom@0.9.10': 0.9.12
+  axios@<1.20.0: 1.20.0
+  brace-expansion@<1.1.20: 1.1.21
+  brace-expansion@>=2.0.0 <2.1.6: 2.1.7
+  brace-expansion@>=4.0.0 <5.0.11: 5.0.12
+  fast-uri@<3.1.7: 3.1.8
+  fastify@<5.12.2: 5.12.5
+  find-my-way@<9.7.0: 9.9.0
+  immutable@<5.1.8: 5.1.9
+  joi@<18.2.6: 18.2.9
+  js-cookie@<3.0.7: 3.0.8
+  js-yaml@>=4.0.0 <4.3.2: 4.3.2
+engineStrict: true
+saveExact: true
+shellEmulator: true

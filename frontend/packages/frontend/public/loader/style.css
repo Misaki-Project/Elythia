@@ -1,0 +1,180 @@
+/*
+ * SPDX-FileCopyrightText: syuilo and misskey-project
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+html {
+	background-color: var(--MI_THEME-bg);
+	color: var(--MI_THEME-fg);
+}
+
+/*
+ * Elythia: 起動画面は夜空にする。
+ *
+ * **利用者のテーマに依らず、色を固定する。** スプラッシュはテーマが適用される
+ * 前の一瞬を埋めるもので、テーマの背景色に合わせても読み込みの途中で色が
+ * 変わるだけになる。配色は既定アイコンの夜空と三日月から取った。
+ *
+ * 星は boot.js が #splashSky (canvas) に描く。ここで描くのは背景・星雲・
+ * アイコンだけで、スクリプトが動かなくても夜空とアイコンは出る。
+ */
+#splash {
+	position: fixed;
+	z-index: 10000;
+	inset: 0;
+	overflow: hidden;
+	cursor: wait;
+	background: radial-gradient(140% 100% at 50% 110%, #1b1d4a 0%, #0a112e 45%, #060a1f 100%);
+	opacity: 1;
+	transition: opacity 0.5s ease;
+	isolation: isolate;
+}
+
+/*
+ * 星雲。**filter: blur を使わない。** 画面全体の大きさの要素にぼかしをかけると、
+ * 起動処理と同じ時間帯に GPU の負荷が跳ねる。closest-side の放射グラデーション
+ * だけで縁は十分に柔らかい。
+ *
+ * **大きさは vmax で決める。** % だと縦長の画面で縦に引き伸ばされ、雲でなく
+ * 光の筋に見える。
+ */
+#splash .splashNebula {
+	position: absolute;
+	z-index: 0;
+	border-radius: 50%;
+	opacity: 0.55;
+	pointer-events: none;
+}
+
+#splash .splashNebula.n1 {
+	width: 50vmax;
+	height: 40vmax;
+	left: -10%;
+	top: 8%;
+	background: radial-gradient(closest-side, rgba(166, 155, 251, 0.45), rgba(166, 155, 251, 0));
+	animation: splashDrift1 22s ease-in-out infinite alternate;
+}
+
+#splash .splashNebula.n2 {
+	width: 45vmax;
+	height: 38vmax;
+	right: -12%;
+	bottom: -6%;
+	background: radial-gradient(closest-side, rgba(253, 221, 207, 0.22), rgba(253, 221, 207, 0));
+	animation: splashDrift2 26s ease-in-out infinite alternate;
+}
+
+#splash .splashNebula.n3 {
+	width: 34vmax;
+	height: 28vmax;
+	left: 38%;
+	top: -12%;
+	background: radial-gradient(closest-side, rgba(204, 195, 247, 0.3), rgba(204, 195, 247, 0));
+	animation: splashDrift1 30s ease-in-out infinite alternate-reverse;
+}
+
+#splashSky {
+	position: absolute;
+	z-index: 1;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	pointer-events: none;
+}
+
+#splashMark {
+	position: absolute;
+	z-index: 2;
+	left: 50%;
+	top: 50%;
+	/* 大きさは以前のスプラッシュ (upstream) と同じ 64px。夜空を主役にする */
+	width: 64px;
+	height: 64px;
+	transform: translate(-50%, -50%);
+	animation: splashAppear 1.6s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+	pointer-events: none;
+}
+
+/* アイコンの後ろの光の輪 */
+#splashMark::before {
+	content: "";
+	position: absolute;
+	z-index: 0;
+	inset: -70%;
+	border-radius: 50%;
+	background: radial-gradient(closest-side, rgba(204, 195, 247, 0.38), rgba(166, 155, 251, 0.12) 55%, rgba(166, 155, 251, 0));
+	animation: splashHalo 5s ease-in-out infinite;
+}
+
+/* id は upstream の _splash.tsx と同じものを残す */
+#splashIcon {
+	position: relative;
+	z-index: 1;
+	display: block;
+	width: 100%;
+	height: 100%;
+	border-radius: 24%;
+	box-shadow: 0 0 0 1px rgba(204, 195, 247, 0.18), 0 0 30px rgba(166, 155, 251, 0.35);
+	animation: splashFloat 7s ease-in-out infinite;
+}
+
+@keyframes splashDrift1 {
+	from { transform: translate(0, 0) scale(1); }
+	to { transform: translate(6%, 4%) scale(1.12); }
+}
+
+@keyframes splashDrift2 {
+	from { transform: translate(0, 0) scale(1.05); }
+	to { transform: translate(-7%, -5%) scale(0.95); }
+}
+
+@keyframes splashAppear {
+	from {
+		opacity: 0;
+		transform: translate(-50%, -46%) scale(0.94);
+		filter: blur(6px);
+	}
+	to {
+		opacity: 1;
+		transform: translate(-50%, -50%) scale(1);
+		filter: blur(0);
+	}
+}
+
+@keyframes splashFloat {
+	0%, 100% { transform: translateY(0); }
+	50% { transform: translateY(-5px); }
+}
+
+@keyframes splashHalo {
+	0%, 100% {
+		opacity: 0.65;
+		transform: scale(0.92);
+	}
+	50% {
+		opacity: 1;
+		transform: scale(1.06);
+	}
+}
+
+/*
+ * 動きを減らす設定では、夜空とアイコンを止めた絵として出す。
+ * アプリ側の「アニメーション」設定が切られているときは、boot.js が
+ * #splash に .splashStill を付ける。
+ */
+@media (prefers-reduced-motion: reduce) {
+	#splash .splashNebula,
+	#splashMark,
+	#splashMark::before,
+	#splashIcon {
+		animation: none;
+	}
+}
+
+#splash.splashStill .splashNebula,
+#splash.splashStill #splashMark,
+#splash.splashStill #splashMark::before,
+#splash.splashStill #splashIcon {
+	animation: none;
+}

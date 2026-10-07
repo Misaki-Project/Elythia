@@ -30,7 +30,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // Plugin is the entry point the build-time generator references.

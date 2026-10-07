@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // webResourceHandler serves the non-API web resources upstream exposes from
@@ -89,7 +89,7 @@ type openSearchDescription struct {
 // OpenSearchXML serves /opensearch.xml so browsers can register the instance
 // as a search engine.
 func (h *webResourceHandler) OpenSearchXML(c echo.Context) error {
-	name := "Misskey"
+	name := config.DisplayName
 	if m, err := h.metaRepo.Fetch(); err == nil && m != nil && m.Name != nil && *m.Name != "" {
 		name = *m.Name
 	}

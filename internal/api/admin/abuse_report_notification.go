@@ -5,12 +5,12 @@ import (
 	"sort"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/core/moderationlog"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // packedRecipient mirrors the upstream AbuseReportNotificationRecipient schema:
@@ -91,7 +91,7 @@ func (h *Handler) AbuseReportNotificationRecipientCreate(c echo.Context) error {
 	//   required: ['isActive', 'name', 'method']
 	//   method.enum: ['email', 'webhook']
 	// + method='email' で userId 必須、method='webhook' で systemWebhookId 必須
-	// の相関 check (third_party/misskey/.../notification-recipient/create.ts、#929)。
+	// の相関 check (packages/backend/src/.../notification-recipient/create.ts、#929)。
 	// nil-repo branch より先に validate して、不正リクエストを早期 reject する。
 	if req.Name == "" || req.Method == "" || req.IsActive == nil {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("name / method / isActive are required."))

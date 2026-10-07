@@ -1,0 +1,296 @@
+# project name を別に分離 (#804 follow-up)。default だと UDS 本番の
+# container 群と衝突する。
+name: mk-bench
+
+services:
+  # ── Certificate Generator ──────────────────────────────────
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    volumes:
+      - certs:/certs
+      - ../../federation/common/gen-certs.sh:/gen-certs.sh:ro
+
+  # ── mk-go Stack ────────────────────────────────────────────
+  postgres-mkgo:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks: [bench]
+
+  redis-mkgo:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    networks: [bench]
+
+  app-mkgo:
+    build:
+      context: ../../..
+      dockerfile: tests/federation/common/Dockerfile.mkgo
+    environment:
+      SSL_CERT_FILE: /certs/bundle.pem
+      TZ: Asia/Tokyo
+      # レートリミット実装時(#273)にベンチが壊れないよう無効化しておく
+      MK_ENABLEIPRATELIMIT: "false"
+      # per-endpoint rate limit を無効化して Misskey TS の NODE_ENV=development
+      # と公正比較できる状態にする。これが無いと notes/create が 300/hour/user
+      # で頭打ちになり 97% 強が 429 で弾かれる (#563)。production 用途厳禁。
+      MK_DISABLEENDPOINTRATELIMITS: "true"
+      # bench で profile-collector が /debug/pprof/* に到達できるようにする (#500 / #413 #7)
+      MK_ENABLEPPROF: "true"
+      # first-page timeline 応答の per-viewer JSON cache (host env で A/B トグル)。
+      MK_ENABLETIMELINECACHE: "${MK_ENABLETIMELINECACHE:-false}"
+    depends_on:
+      postgres-mkgo: { condition: service_healthy }
+      redis-mkgo: { condition: service_healthy }
+      certs: { condition: service_completed_successfully }
+    volumes:
+      - certs:/certs:ro
+      - ../../federation/common/mkgo.yml:/app/.config/default.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
+    networks: [bench]
+
+  nginx-mkgo:
+    image: nginx:alpine
+    volumes:
+      - ../../federation/common/nginx-mkgo-ssl.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      app-mkgo: { condition: service_healthy }
+    networks:
+      bench:
+        aliases: [mkgo]
+
+  # ── Misskey (TypeScript) Stack ──────────────────────────────
+  postgres-mk:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks: [bench]
+
+  redis-mk:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    networks: [bench]
+
+  misskey-app:
+    image: misskey/misskey:2026.10.0
+    environment:
+      # NODE_ENV=developmentでRateLimiterServiceが全レートリミットを無効化する
+      NODE_ENV: development
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-mk: { condition: service_healthy }
+      redis-mk: { condition: service_healthy }
+    volumes:
+      - ./common/misskey-bench.yml:/misskey/.config/default.yml:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
+    networks: [bench]
+
+  nginx-mk:
+    image: nginx:alpine
+    volumes:
+      - ../../federation/misskey/nginx-misskey-ssl.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      misskey-app:
+        condition: service_started
+      certs:
+        condition: service_completed_successfully
+    networks:
+      bench:
+        aliases: [misskey]
+
+  # ── Data Seeding ───────────────────────────────────────────
+  seed-mkgo:
+    profiles: [bench]
+    build:
+      context: .
+      dockerfile: common/Dockerfile.seed
+    environment:
+      TARGET_URL: https://mkgo
+      TARGET_NAME: mkgo
+      SEED_USERS: "10"
+      SEED_NOTES: "50"
+      # enrich (opt-in, host env で両 stack 同値): media/mute を入れて packing /
+      # file / mute 経路を計測可能にする。default 0 = 従来の text-only seed。
+      SEED_FILES_PER_USER: "${SEED_FILES_PER_USER:-0}"
+      SEED_MUTES_PER_USER: "${SEED_MUTES_PER_USER:-0}"
+      OUTPUT_DIR: /seed
+    volumes:
+      - seed-mkgo:/seed
+      - ./common/seed.py:/app/seed.py:ro
+    depends_on:
+      app-mkgo: { condition: service_healthy }
+      nginx-mkgo: { condition: service_started }
+    networks: [bench]
+
+  seed-misskey:
+    profiles: [bench]
+    build:
+      context: .
+      dockerfile: common/Dockerfile.seed
+    environment:
+      TARGET_URL: https://misskey
+      TARGET_NAME: misskey
+      SEED_USERS: "10"
+      SEED_NOTES: "50"
+      SEED_FILES_PER_USER: "${SEED_FILES_PER_USER:-0}"
+      SEED_MUTES_PER_USER: "${SEED_MUTES_PER_USER:-0}"
+      OUTPUT_DIR: /seed
+    volumes:
+      - seed-misskey:/seed
+      - ./common/seed.py:/app/seed.py:ro
+    depends_on:
+      nginx-mk: { condition: service_started }
+    networks: [bench]
+
+  # ── k6 Benchmark Runner ───────────────────────────────────
+  # grafana/k6はuid=12345で実行されるため、結果ボリュームへの書き込みに
+  # root権限が必要。user: "0:0"で回避する。
+  k6-mkgo:
+    profiles: [bench]
+    image: grafana/k6:0.55.0
+    user: "0:0"
+    environment:
+      TARGET_URL: https://mkgo
+      K6_INSECURE_SKIP_TLS_VERIFY: "true"
+    volumes:
+      - ./k6:/scripts:ro
+      - seed-mkgo:/seed:ro
+      - bench-results:/results
+    command: >
+      run --summary-export=/results/mkgo-summary.json
+          /scripts/all-scenarios.js
+    depends_on:
+      seed-mkgo: { condition: service_completed_successfully }
+    networks: [bench]
+
+  k6-misskey:
+    profiles: [bench]
+    image: grafana/k6:0.55.0
+    user: "0:0"
+    environment:
+      TARGET_URL: https://misskey
+      K6_INSECURE_SKIP_TLS_VERIFY: "true"
+    volumes:
+      - ./k6:/scripts:ro
+      - seed-misskey:/seed:ro
+      - bench-results:/results
+    command: >
+      run --summary-export=/results/misskey-summary.json
+          /scripts/all-scenarios.js
+    depends_on:
+      seed-misskey: { condition: service_completed_successfully }
+      k6-mkgo: { condition: service_completed_successfully }
+    networks: [bench]
+
+  # ── Profile Collector (mk-go only, #413 #7) ────────────────
+  # k6-mkgo と並走して /debug/pprof/* を curl で取得する。
+  # k6-misskey は別シナリオで走るため、CPU profile が混ざらないように
+  # mk-go run window 内に閉じ込める。
+  profile-collector-mkgo:
+    profiles: [bench]
+    image: alpine:3.21
+    environment:
+      HOST: app-mkgo:3000
+      SCENARIO_DURATION: "31"
+      PROFILE_SECONDS: "25"
+      # k6/all-scenarios.js のシナリオ列と一致させる。
+      # script 側で SCENARIO_COUNT は dynamic に算出するので、ここを変えれば
+      # 何個でも対応できる (Devin #501 INFO-3)。
+      SCENARIOS: "ping meta local-timeline users-show i notes-create home-timeline"
+    volumes:
+      - ./common/profile-collector.sh:/profile-collector.sh:ro
+      - ./results:/output
+    # busybox wget で済ませて apk add を避ける。ネット失敗で bench 全体が
+    # block しないようにする (Devin #501 FLAG-2)。
+    command: sh /profile-collector.sh
+    depends_on:
+      seed-mkgo: { condition: service_completed_successfully }
+      app-mkgo: { condition: service_healthy }
+    networks: [bench]
+
+  # ── Report Generator ──────────────────────────────────────
+  compare:
+    profiles: [bench]
+    image: python:3.12-slim
+    volumes:
+      - bench-results:/results:ro
+      - ./common/compare.py:/app/compare.py:ro
+      - ./results:/output
+    command: >
+      python /app/compare.py
+        --mkgo /results/mkgo-summary.json
+        --misskey /results/misskey-summary.json
+        --output /output/report.md
+        --profiles-dir /output/profiles
+    depends_on:
+      k6-misskey: { condition: service_completed_successfully }
+      profile-collector-mkgo: { condition: service_completed_successfully }
+
+volumes:
+  certs:
+  seed-mkgo:
+  seed-misskey:
+  bench-results:
+
+networks:
+  bench:
+    driver: bridge

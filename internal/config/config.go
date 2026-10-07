@@ -7,18 +7,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/misc/password"
+	"github.com/elythia-network/elythia/internal/misc/password"
 	"github.com/spf13/viper"
 )
 
 // MkGoVersion is the mk-go version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MkGoVersion=1.5.0"
-var MkGoVersion = "1.5.0-misaki.1"
+//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MkGoVersion=2.0.0"
+var MkGoVersion = "2.0.0-misaki.1"
 
 // MisskeyVersion is the compatible Misskey version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MisskeyVersion=2026.10.0"
+//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MisskeyVersion=2026.10.0"
 var MisskeyVersion = "2026.10.0"
 
 // MkGoCommit is the source revision this binary was built from (short hash).
@@ -27,19 +27,33 @@ var MisskeyVersion = "2026.10.0"
 // build-arg) で、`go build ./...` や `go run` では入らない。読む側は空を
 // 「不明」として扱い、表示しないこと。Override at build time via:
 //
-//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MkGoCommit=abc1234"
+//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MkGoCommit=abc1234"
 var MkGoCommit = ""
 
-// MkGoFrontendVersion is the version of the fork frontend bundled with this
-// build (`third_party/misskey`), typically its git tag such as "2026.9.0-mk.3".
+// SoftwareName is the machine-facing name of this software, used as the
+// nodeinfo `software.name` (#3394).
 //
-// **frontend を bind mount で差し替えている構成では実物とずれうる。** これが
-// 名乗るのは「このバイナリをビルドしたときの submodule pin」で、`make uds-rebuild`
-// のように両方を同時にビルドする経路でしか一致は保証されない。MkGoCommit と同じく
-// 空になりうる。Override at build time via:
+// 以前は `mk-go`。相手の名前で振る舞いを変える箇所は、旧名を名乗る版とも連合が
+// 続くので旧名も受け付ける (絵文字のメタ情報の取得先は LegacySoftwareName、
+// 画像プロキシのループ検出は LegacyUserAgentProduct)。
+const SoftwareName = "elythia"
+
+// LegacySoftwareName is the nodeinfo `software.name` used before #3394.
+const LegacySoftwareName = "mk-go"
+
+// UserAgentProduct is the product token of the outbound User-Agent
+// (`Elythia/<version> (<url>)`, #3394).
+const UserAgentProduct = "Elythia"
+
+// LegacyUserAgentProduct is the product token used before #3394.
+const LegacyUserAgentProduct = "mk-go"
+
+// DisplayName is the human-facing name of this software, used as the default
+// site name and wherever a user or operator sees the product name.
 //
-//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MkGoFrontendVersion=2026.9.0-mk.3"
-var MkGoFrontendVersion = ""
+// 2.0.0 より前は本家と同じく "Misskey" を出していた。互換のために本家の名前を
+// 名乗る値 (`Bearer realm`、webhook の `X-Misskey-*` など) はここを使わない。
+const DisplayName = "Elythia"
 
 // MkGoRepositoryURL is the canonical source repository of mk-go itself.
 //
@@ -47,7 +61,7 @@ var MkGoFrontendVersion = ""
 // meta.repositoryUrl (operator が改変版を指せる) が担うが、その既定値と
 // nodeinfo の software.repository はどちらも mk-go 本体を指すため、値をここに
 // 一本化する (#2700)。
-const MkGoRepositoryURL = "https://github.com/shiroha-a/mk"
+const MkGoRepositoryURL = "https://github.com/Elythia-Network/elythia"
 
 // MkGoFeedbackURL is the default destination of `meta.feedbackUrl`.
 //
@@ -286,7 +300,7 @@ type Source struct {
 
 	// JobQueueDriver selects the worker / inspector implementation
 	// behind internal/queue. "mkq" (the only driver) uses the
-	// BullMQ-compatible shiroha-a/mkq library. Empty / unset = "mkq".
+	// BullMQ-compatible elythia-network/mkq library. Empty / unset = "mkq".
 	// The legacy "asynq" value was removed in #2985 and now fails at
 	// startup with a migration hint.
 	JobQueueDriver string `mapstructure:"jobQueueDriver"`
@@ -564,7 +578,7 @@ type Config struct {
 //
 // **frontend 側は 2 箇所ある** (`about-misskey.vue` の tarball リンクと
 // `about.overview.vue` の `repositoryUrl || /tarball/...` フォールバック)。ルートを
-// 実装したときはこのメソッドを直すだけでは足りず、mk-go 独自の `about-mkgo.vue` にも
+// 実装したときはこのメソッドを直すだけでは足りず、mk-go 独自の `about-elythia.vue` にも
 // tarball の分岐を足す必要がある (現状は意図的に持っていない)。
 func (c *Config) ProvidesTarball() bool {
 	return false
@@ -869,7 +883,7 @@ func resolve(src *Source) (*Config, error) {
 		NSFWDetectorURL:              strings.TrimRight(src.NSFWDetectorURL, "/"),
 		NSFWDetectorAuthHeader:       src.NSFWDetectorAuthHeader,
 		NSFWDetectorTimeout:          src.NSFWDetectorTimeout,
-		UserAgent:                    fmt.Sprintf("mk-go/%s (%s)", MkGoVersion, src.URL),
+		UserAgent:                    fmt.Sprintf("%s/%s (%s)", UserAgentProduct, MkGoVersion, src.URL),
 		PerChannelMaxNoteCacheCount:  perChannelMaxNoteCacheCount,
 		PerUserNotificationsMaxCount: perUserNotificationsMaxCount,
 		DeactivateAntennaThreshold:   deactivateAntennaThreshold,

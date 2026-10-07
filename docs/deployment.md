@@ -39,7 +39,7 @@ docker compose up -d
 
 ## pg_bigm (日本語の部分一致検索を高速化)
 
-pg_bigm は 2-gram の GIN インデックスで `LIKE` 部分一致を加速する PostgreSQL 拡張。mk-go の `sqlLike` 検索 (デフォルト) は upstream と同じ `lower(text) LIKE ...` 形なので、**拡張とインデックスを作るだけで provider の変更なしに** インデックスが効く (#2514)。
+pg_bigm は 2-gram の GIN インデックスで `LIKE` 部分一致を加速する PostgreSQL 拡張。Elythia の `sqlLike` 検索 (デフォルト) は upstream と同じ `lower(text) LIKE ...` 形なので、**拡張とインデックスを作るだけで provider の変更なしに** インデックスが効く (#2514)。
 
 1. pg_bigm 入りイメージを使う。UDS 構成 (`compose.uds.yaml.example`) は既定でこれをビルドする。他の構成では postgres サービスを差し替える:
 
@@ -70,11 +70,11 @@ EXPLAIN SELECT id FROM note WHERE lower(text) LIKE '%検索語%';
 
 ## Docker Compose (TCP)
 
-最も簡単な起動方法。PostgreSQL、Redis、mk-goの3サービスをTCPで接続する。
+最も簡単な起動方法。PostgreSQL、Redis、Elythiaの3サービスをTCPで接続する。
 
 ```bash
-git clone --recursive https://github.com/shiroha-a/mk.git
-cd mk
+git clone https://github.com/Elythia-Network/elythia.git
+cd elythia
 
 # フロントエンドビルド (初回のみ、3-10分)
 make e2e-frontend-build
@@ -98,28 +98,30 @@ docker compose up -d
 ```
 
 `docker-compose.yml`の構成:
-- **app**: mk-goコンテナ (ポート3000)
+- **app**: Elythiaコンテナ (ポート3000)
 - **db**: PostgreSQL 18 Alpine
 - **redis**: Redis 7 Alpine
 
 ファイルストレージは`./files`にマウントされる。
 
-> **注意**: コンテナは **UID/GID 991** (Misskey TS と同じ) で起動するため、ホスト側の `./files` ディレクトリは UID 991 が書き込めるパーミッションでなければならない。Misskey TS から移行する場合は既に 991 所有なのでそのままで OK。**今まで mk-go の旧 root 構成で運用していて初めて 991 化に追従する場合は、一度だけ `sudo chown -R 991:991 ./files` で所有権を揃える必要がある**。
+> **注意**: コンテナは **UID/GID 991** (Misskey TS と同じ) で起動するため、ホスト側の `./files` ディレクトリは UID 991 が書き込めるパーミッションでなければならない。Misskey TS から移行する場合は既に 991 所有なのでそのままで OK。**今まで Elythia の旧 root 構成で運用していて初めて 991 化に追従する場合は、一度だけ `sudo chown -R 991:991 ./files` で所有権を揃える必要がある**。
 
 ## Docker Compose (bundled image / ビルド不要)
 
 フロントエンドアセットを同梱した `bundled` イメージを pull するだけで起動できる。**フロントエンドのビルドもイメージのビルドも要らない。**
 
 動かすだけならソースを clone する必要は無い。compose と設定のひな形だけを置いた
-[`docker` ブランチ](https://github.com/shiroha-a/mk/tree/docker)を使う (数十 KB)。
+[`docker` ブランチ](https://github.com/Elythia-Network/elythia/tree/docker)を使う (数十 KB)。
 
 ```bash
-git clone --depth 1 -b docker https://github.com/shiroha-a/mk.git mk
+git clone --depth 1 -b docker https://github.com/Elythia-Network/elythia.git mk
 cd mk
 
 mkdir -p files && sudo chown -R 991:991 files
 docker compose up -d
 ```
+
+更新は `git fetch --depth 1 origin docker && git reset --hard FETCH_HEAD` の後に `docker compose pull && docker compose up -d`。`docker` ブランチは更新のたびに履歴を持たない 1 コミットで作り直されるので、**`git pull` は使えない**。`reset --hard` はブランチのファイルへの手元の変更を捨てるので、手元の変更は `docker-compose.override.yml` に置く (詳しくはブランチの `README.md`)。
 
 ソースを持っている場合は Makefile から同じことができる。
 
@@ -136,7 +138,7 @@ make image-down        # 停止
 手元の変更を反映したい場合は先にイメージを作る。
 
 ```bash
-make image-build       # ghcr.io/shiroha-a/mk:bundled をローカルにビルド
+make image-build       # ghcr.io/elythia-network/elythia:bundled をローカルにビルド
 ```
 
 ソースからビルドする従来の構成 (`docker-compose.yml` / `make docker-*`) はそのまま使える。こちらは置き換えではなく並立する選択肢。
@@ -147,14 +149,16 @@ make image-build       # ghcr.io/shiroha-a/mk:bundled をローカルにビル�
 
 | イメージ | 内容 | 用途 |
 |---|---|---|
-| `ghcr.io/shiroha-a/mk:bundled` | Goバイナリ + マイグレーション + [後始末バッチ](#後始末バッチ) + **フロントエンドアセット同梱** | pull して即起動 |
-| `ghcr.io/shiroha-a/mk:latest` | Goバイナリ + マイグレーション + [後始末バッチ](#後始末バッチ) | アセットを別途用意する構成 |
+| `ghcr.io/elythia-network/elythia:bundled` | Goバイナリ + マイグレーション + [後始末バッチ](#後始末バッチ) + **フロントエンドアセット同梱** | pull して即起動 |
+| `ghcr.io/elythia-network/elythia:latest` | Goバイナリ + マイグレーション + [後始末バッチ](#後始末バッチ) | アセットを別途用意する構成 |
 
-`bundled` / `latest` は develop の最新を指す **可変タグ**。本番ではバージョンを固定する。
+`bundled` / `latest` は develop の最新を指す **可変タグ**。本番ではバージョンを固定する。**古い版に固定するときは、その版の compose を使う** (compose は同じ版の image の呼び方に合わせてある。2.0.0 で実行バイナリを `elythia` にまとめた、#3394)。
 
 ```bash
-MK_IMAGE=ghcr.io/shiroha-a/mk:1.5.0-bundled docker compose up -d
+MK_IMAGE=ghcr.io/elythia-network/elythia:2.0.0-bundled docker compose up -d
 ```
+
+**2.0.0 より前の版は、以前の置き場所 `ghcr.io/shiroha-a/mk` にある** ([タグの一覧](https://github.com/users/shiroha-a/packages/container/package/mk)。リポジトリを `Elythia-Network/elythia` へ移した 2.0.0 から、イメージの置き場所も変わった。#3394)。
 
 リリースタグを push すると `<version>` と `<version>-bundled` が publish される
 (`.github/workflows/docker.yml`)。過去のリリースを後追いで publish したい場合は
@@ -167,11 +171,11 @@ gh workflow run docker.yml -f tag=1.1.0
 > `1.0.0` に `-bundled` は存在しない。アセット同梱イメージは 1.1.0 で追加された機能で、
 > 1.0.0 のツリーには `Dockerfile.bundled` が無いため。
 
-同梱アセットは fork (`Misaki-Project/misskey-ts`) が publish する `ghcr.io/misaki-project/misskey-ts-assets:<tag>` 由来で、**mk-go 独自のフロントエンド変更を含む**。
+同梱アセットは本体の `frontend/` を image の中でビルドしたもので (#3379)、**ElythiaとMisaki独自のフロントエンド変更を含む**。
 
-> **注意**: 下記のように upstream の `misskey/misskey` イメージからアセットをコピーする方法もあるが、その場合 **mk-go 独自のフロントエンド変更が失われる** (チャット・リバーシの連合が UI 上で「非対応」表示に戻る等)。drop-in 互換の検証目的でなければ `bundled` イメージを使うこと。
+> **注意**: 下記のように upstream の `misskey/misskey` イメージからアセットをコピーする方法もあるが、その場合 **Elythia 独自のフロントエンド変更が失われる** (チャット・リバーシの連合が UI 上で「非対応」表示に戻る等)。drop-in 互換の検証目的でなければ `bundled` イメージを使うこと。
 
-`ghcr.io/shiroha-a/mk:latest`等のprebuilt imageにはGoバイナリとマイグレーションSQLのみが含まれ、フロントエンドアセットは同梱されていない。prebuilt imageを使用する場合は以下の環境変数でアセットディレクトリを指定する必要がある:
+`ghcr.io/elythia-network/elythia:latest`等のprebuilt imageにはGoバイナリとマイグレーションSQLのみが含まれ、フロントエンドアセットは同梱されていない。prebuilt imageを使用する場合は以下の環境変数でアセットディレクトリを指定する必要がある:
 
 - `MISSKEY_FRONTEND_DIR` — viteビルド出力
 - `MISSKEY_FRONTEND_DIST_DIR` — dist出力 (locales, fonts)
@@ -180,14 +184,14 @@ gh workflow run docker.yml -f tag=1.1.0
 - `MISSKEY_TWEMOJI_DIR` — twemoji SVG
 - `MISSKEY_FLUENT_EMOJI_DIR` — fluent-emoji (実績バッジ / 通知アイコン)
 - `MISSKEY_CLIENT_ASSETS_DIR` — クライアントアセット
-- `MISSKEY_STATIC_DIR` — 静的ファイル (backend/assets: favicon等)
-- `MISSKEY_REPO_ASSETS_DIR` — リポジトリ直下の共通アセット (ai.png, banner等)
+- `MISSKEY_STATIC_DIR` — 静的ファイル (favicon等。本家の `packages/backend/assets`、本体の `frontend/assets`)
+- `MISSKEY_REPO_ASSETS_DIR` — 本家のリポジトリ直下の共通アセット (ai.png, banner等。本体の `frontend/repo-assets`)
 
 TS版Misskeyのイメージからアセットをコピーすることも可能:
 
 ```dockerfile
 FROM misskey/misskey:2026.10.0 AS misskey-assets
-FROM ghcr.io/shiroha-a/mk:latest
+FROM ghcr.io/elythia-network/elythia:latest
 COPY --from=misskey-assets /misskey/built /frontend
 COPY --from=misskey-assets /misskey/packages/frontend/assets /client-assets
 COPY --from=misskey-assets /misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/twemoji /twemoji
@@ -208,7 +212,7 @@ ENV MISSKEY_REPO_ASSETS_DIR=/repo-assets
 本番向け構成。UNIX Domain Socketのみで通信し、TCPポートの露出を最小化する。
 
 ```
-nginx:80 → /run/mkgo/mkgo.sock → mk-go → /var/run/postgresql + /run/valkey/valkey.sock
+nginx:80 → /run/mkgo/mkgo.sock → Elythia → /var/run/postgresql + /run/valkey/valkey.sock
 ```
 
 ```bash
@@ -270,7 +274,7 @@ make build
 make migrate-up
 
 # 起動
-./built/misskey -config .config/default.yml
+./built/elythia serve -config .config/default.yml
 ```
 
 前提条件: Go 1.27+ (ビルド時)、PostgreSQL 18推奨 (16以降で動作、CI検証は18)、Redis 7+。
@@ -282,8 +286,8 @@ make migrate-up
 非正規化カウンタが実データとずれていないかを検査する。
 
 ```bash
-./built/misskey -config .config/default.yml -fsck        # 検査のみ (既定)
-./built/misskey -config .config/default.yml -fsck -fix   # カウンタを直す
+./built/elythia fsck -config .config/default.yml        # 検査のみ (既定)
+./built/elythia fsck -config .config/default.yml -fix   # カウンタを直す
 ```
 
 ```
@@ -333,7 +337,7 @@ make migrate-up
 ## 設定の実効値を確認する
 
 ```bash
-./built/misskey -config .config/default.yml -config-dump
+./built/elythia config-dump -config .config/default.yml
 ```
 
 **サーバーを起動しない**ので、DB / Redis に繋がらない状態でも使える。
@@ -367,8 +371,8 @@ stuck 検出行は全キュー分出るほか `frontend 配信元` / `maxFileSiz
 キューまわりは設定ファイルを読んだだけでは効く値が分からないものが多い。
 worker 数は既定値がキューごとに違い、`stuck 検出` は**キューごと**・
 `handler 期限` は**task type ごと**に対象外があり、実 worker 数の上限は隔離ぶんを含めて設定値を
-超えうる ([#2657](https://github.com/shiroha-a/mk/issues/2657) /
-[#2658](https://github.com/shiroha-a/mk/issues/2658))。**自分のインスタンスで
+超えうる ([#2657](https://github.com/Elythia-Network/elythia/issues/2657) /
+[#2658](https://github.com/Elythia-Network/elythia/issues/2658))。**自分のインスタンスで
 実際にいくつになっているか**はここでしか分からない。
 
 パスワード・鍵・proxy の認証情報はマスクされる。設定の有無だけは分かるようにしてある
@@ -380,18 +384,18 @@ worker 数は既定値がキューごとに違い、`stuck 検出` は**キュ�
 まず走らせると早い。
 
 ```bash
-./built/misskey -config .config/default.yml -doctor
+./built/elythia doctor -config .config/default.yml
 ```
 
 ```
   ok    config.url   https://example.com
-  ok    database     接続 ok / migration version 109
+  ok    database     接続 ok / migration version 117
   ok    database-health dead tuple と VACUUM に問題なし (121 テーブル)
   ok    root user    meta.rootUserId 設定済み
   ok    redis        接続 ok
   FAIL  webfinger    status 403 (連合が無効)
         インスタンス設定の `federation` が `none` になっている。連合するなら管理画面で有効にする
-  ok    nodeinfo     mk-go 1.5.0
+  ok    nodeinfo     elythia 2.0.0
   warn  actor        assertionMethod (Ed25519) が無い
         RSA だけでも連合できる。Ed25519 を公開すると対応実装との署名検証が軽くなる
   ok    tls          証明書の残り 68 日
@@ -427,10 +431,10 @@ warn は「見ておくべき」であって「壊れている」ではないた
 
 ```bash
 # Web ノード: HTTP を提供し、ジョブは積むだけで処理しない
-MK_ONLY_SERVER=1 ./built/misskey -config .config/default.yml
+MK_ONLY_SERVER=1 ./built/elythia serve -config .config/default.yml
 
 # 配送ノード: ジョブを処理する。API は生えない
-MK_ONLY_QUEUE=1 ./built/misskey -config .config/default.yml
+MK_ONLY_QUEUE=1 ./built/elythia serve -config .config/default.yml
 ```
 
 **設定ファイルは両ノードで同じものを使う。** 同じ DB・同じ Redis を向けていることが
@@ -453,10 +457,10 @@ MK_ONLY_QUEUE=1 ./built/misskey -config .config/default.yml
 | chart のメモリバッファ flush | ○ | ○ |
 
 配送ノードは `/healthz` だけ応答する (`enableMetrics` が真なら `/metrics` も)。
-これにより `./built/misskey -healthcheck` と Dockerfile の healthcheck が
+これにより `./built/elythia healthcheck` と Dockerfile の healthcheck が
 **どちらのノードでもそのまま使える**。
 
-なお `-healthcheck` は `127.0.0.1:<port>` を叩くので、`socket` で UDS 運用している
+なお `elythia healthcheck` は `127.0.0.1:<port>` を叩くので、`socket` で UDS 運用している
 場合は role に関係なく使えない (従来からの制限)。
 
 ### 注意
@@ -466,6 +470,17 @@ MK_ONLY_QUEUE=1 ./built/misskey -config .config/default.yml
 - 管理画面の `serverStats` は **Web ノードのホスト**の値しか出ない。配送ノードの
   CPU / メモリは別途 Prometheus (`enableMetrics`) 等で見る
 - 配送ノードを 0 台にすると**ジョブが処理されない**。最低 1 台は必要
+- **プロセスごとのキャッシュは Redis の pub/sub (`redisForPubsub`) で揃える。**
+  例えばノートやユーザーに載せる絵文字 URL の解決 (#3383) は各プロセスのメモリに
+  持ち、リモート絵文字の作成・更新は配送ノードの受信処理で起きる。書いたプロセスが
+  `internal:emojiCacheInvalidated` を publish し、他のプロセスは該当する絵文字だけを
+  落とす。publish は書き込みとは別の goroutine から行い、送り切れずに 1024 件
+  溜まったら「全体を落とす」1 件に畳む (受信処理を Redis の応答待ちで止めない)。
+  停止時は溜まっている分を最大 2 秒かけて送ってから止まる (締め切りの直前に送り始めた 1 件は、自分の 2 秒の timeout まで続くので、最悪で約 4 秒)。
+  **通知が届かない場合の上限は TTL** で、絵文字の更新・削除は 10 分、「その絵文字は
+  無い」は 1 分残りうる。該当するのは、Redis の再接続中などで publish を取りこぼした
+  場合、停止処理の 2 秒で送り切れなかった場合と送信側が止まった後の書き込み
+  (停止中にまだ走っている受信ジョブなど)、DB を直接書く後始末バッチ
 - **更新は配送ノードを先に行う。** AP の配送ジョブは署名鍵を payload に載せず
   `signerUserId` から配送時に引く形になっている。Web ノードだけを新しくすると、
   新しい形のジョブを古い配送ノードが受け取り、鍵を取り出せない。**古いノードは
@@ -478,14 +493,14 @@ MK_ONLY_QUEUE=1 ./built/misskey -config .config/default.yml
 
 ```ini
 [Unit]
-Description=mk-go Misskey Backend
+Description=Elythia (Misskey-compatible server)
 After=network.target postgresql.service redis.service
 
 [Service]
 Type=simple
 User=misskey
 WorkingDirectory=/opt/misskey
-ExecStart=/opt/misskey/misskey -config /opt/misskey/.config/default.yml
+ExecStart=/opt/misskey/elythia serve -config /opt/misskey/.config/default.yml
 Restart=always
 RestartSec=5
 
@@ -495,18 +510,18 @@ WantedBy=multi-user.target
 
 ## フロントエンド配信
 
-mk-goはMisskeyのSPAフロントエンドをそのまま配信する。フロントエンドは`third_party/misskey`サブモジュールからビルドする。
+ElythiaはMisskeyのSPAフロントエンドをそのまま配信する。フロントエンドは本体の`frontend/` (Misskey TSのforkを取り込んだpnpm workspace、#3379) からビルドし、成果物は`frontend/built`に出る。ビルドの前に`make plugins`で`frontend/packages/frontend/src/server-plugins.generated.ts`を生成する (git で追跡していない。`make e2e-frontend-build` / `make uds-frontend-build`は自分で`make plugins`を呼ぶ)。
 
-> **submodule bump 後の追従手順** (= 新 Misskey TS release を取り込んだ PR をマージした後):
-> 詳細は [upstream-catch-up.md](./upstream-catch-up.md#1-既存環境への適用--submodule-bump-pr-マージ後) 参照。`git pull` だけでは submodule の working tree は更新されないため、`git pull --recurse-submodules` または `git submodule update --init --recursive` が必要。frontend asset の再ビルドと再起動は `make uds-update` (または `make uds-rebuild && make uds-restart`) がまとめて行う。**`make uds-frontend-build` 単体で止めないこと** — 再起動しないと配信物と HTML がずれて 404 になる。
+> **`frontend/` が更新された版へ上げた後の追従手順**:
+> 本家の新しい release を取り込んだ版などで `frontend/` が動いたら、frontend asset の再ビルドと再起動が要る。`make uds-update` (または `make uds-rebuild && make uds-restart`) がまとめて行う。**`make uds-frontend-build` 単体で止めないこと** — 再起動しないと配信物と HTML がずれて 404 になる。詳細は[アップデート](#アップデート)。
 
 環境変数でアセットディレクトリを指定:
 
 | 環境変数 | 内容 |
 |---|---|
-| `MISSKEY_FRONTEND_DIR` | viteビルド出力 (`built/_frontend_vite_`) |
-| `MISSKEY_FRONTEND_DIST_DIR` | dist出力 (`built/_frontend_dist_`) |
-| `MISSKEY_CLIENT_ASSETS_DIR` | クライアントアセット (`packages/frontend/assets`) |
+| `MISSKEY_FRONTEND_DIR` | viteビルド出力 (既定 `frontend/built/_frontend_vite_`) |
+| `MISSKEY_FRONTEND_DIST_DIR` | dist出力 (既定 `frontend/built/_frontend_dist_`) |
+| `MISSKEY_CLIENT_ASSETS_DIR` | クライアントアセット (既定 `frontend/packages/frontend/assets`) |
 
 ## 逆プロキシ (nginx)
 
@@ -533,7 +548,7 @@ server {
         return 404;
     }
 
-    # /metrics も塞ぐ。`enableMetrics` を有効にすると mk-go が**無認証で**
+    # /metrics も塞ぐ。`enableMetrics` を有効にすると Elythia が**無認証で**
     # 公開する (下記の注意点を参照)。
     location /metrics {
         return 404;
@@ -554,7 +569,7 @@ server {
 ```
 
 **注意点:**
-- `client_max_body_size`はmk-goの`maxFileSize`設定 (デフォルト250MB) 以上に設定する
+- `client_max_body_size`はElythiaの`maxFileSize`設定 (デフォルト250MB) 以上に設定する
 - `proxy_read_timeout 1d`はWebSocket (`/streaming`)のために必要
 - `Upgrade`/`Connection`ヘッダーはWebSocketパススルーに必要
 - **アクセスログにクエリ文字列を出さない。** 同梱フロントは WebSocket を
@@ -568,7 +583,7 @@ server {
   `/streaming?i=<トークン>` はそちらから出る。レベルを上げても消えない
   (実測では `[crit]`)。収集側でフィルタするか、診断性を捨てて
   `error_log /dev/null;` にすること
-- `location /debug`の404は**`location /`が全部を委譲する構成だから**要る。mk-goは
+- `location /debug`の404は**`location /`が全部を委譲する構成だから**要る。Elythiaは
   `enablePprof: true`のときだけ`/debug/pprof/*`を生やすが、有効化は運用者が診断のために
   行う判断であって公開してよいという意味ではない。ここで落としておかないと、
   一時的に有効化した瞬間に外からruntime内部 (goroutine / heap / 実行中のコマンドライン)
@@ -576,7 +591,7 @@ server {
 
 ### 上限を上げられない場合 (分割アップロード)
 
-Cloudflareを経由する構成ではリクエストボディが**100MB (Free/Pro) を超えるとエッジで弾かれる**。mk-goに到達しないため`maxFileSize`をいくら上げても大きいファイルを送れない。
+Cloudflareを経由する構成ではリクエストボディが**100MB (Free/Pro) を超えるとエッジで弾かれる**。Elythiaに到達しないため`maxFileSize`をいくら上げても大きいファイルを送れない。
 
 この場合は**分割アップロード**を有効にする。ファイルを一定サイズのチャンクに割って複数リクエストで送り、オブジェクトストレージのマルチパートアップロードで結合する。Cloudflare固有ではなく、`client_max_body_size`を上げられないリバースプロキシ全般に効く。
 
@@ -596,7 +611,7 @@ Cloudflareを経由する構成ではリクエストボディが**100MB (Free/Pr
 
 ユーザーごとの可否と上限は**ロールポリシー**でも制御できる (`canUseChunkedUpload` / `chunkedUploadMaxConcurrentSessions` / `chunkedUploadMaxPendingMb`)。上の管理画面設定が上限になるので、ロールに大きい値を入れてもインスタンス設定は超えられない。
 
-**バケット側にライフサイクルルールを設定すること。** オブジェクトストレージは**未完了のマルチパートアップロードにも課金する**。mk-goは期限切れセッションを15分ごとに`AbortMultipartUpload`で回収するが、これが動かない障害時の保険としてバケット側にも「incomplete multipart uploadを N 日で削除」を入れておく。
+**バケット側にライフサイクルルールを設定すること。** オブジェクトストレージは**未完了のマルチパートアップロードにも課金する**。Elythiaは期限切れセッションを15分ごとに`AbortMultipartUpload`で回収するが、これが動かない障害時の保険としてバケット側にも「incomplete multipart uploadを N 日で削除」を入れておく。
 
 ### UDS構成
 
@@ -612,7 +627,7 @@ upstream以外の設定はTCP構成と同じ。
 
 **コントロールパネル → オブジェクトストレージ**で設定する。`meta` テーブルに保存されるため設定ファイルの編集も再起動も不要で、保存した時点から次のアップロードに反映される。**ただし UI に出ているのは有効/無効・チャンクサイズ・TTL の 3 つだけ**で、ロール policy の上限になる `chunkedUploadMaxSessionsPerUser` / `chunkedUploadMaxPendingMbPerUser` は `admin/update-meta` を直接呼ぶしかない (#2900 で確認)。
 
-`objectStorageEndpoint` は**ホスト名だけ**を入れる。`https://` などのスキームやバケット名のパスを含めると、mk-go が `https://` を前置してエンドポイント URL を組むため不正な URL になる (本家 Misskey の `S3Service.getS3Client` も同じ組み立て方をする)。
+`objectStorageEndpoint` は**ホスト名だけ**を入れる。`https://` などのスキームやバケット名のパスを含めると、Elythia が `https://` を前置してエンドポイント URL を組むため不正な URL になる (本家 Misskey の `S3Service.getS3Client` も同じ組み立て方をする)。
 
 | 項目 | 例 |
 |---|---|
@@ -625,7 +640,7 @@ upstream以外の設定はTCP構成と同じ。
 
 ### 有効化前に保存したファイル
 
-オブジェクトストレージを有効にする前にアップロードされたファイルは、`drive_file.storedInternal = true` としてローカル FS (`./drive-files`) に残る。**これらは移動されない。** mk-go は有効化後もこの列を見て配信元を切り替えるので、既存ファイルはそのまま表示できる。
+オブジェクトストレージを有効にする前にアップロードされたファイルは、`drive_file.storedInternal = true` としてローカル FS (`./drive-files`) に残る。**これらは移動されない。** Elythia は有効化後もこの列を見て配信元を切り替えるので、既存ファイルはそのまま表示できる。
 
 したがって、有効化したあともローカルの `drive-files` を消してはいけない。まとめてオブジェクトストレージへ移す機能は未提供。
 
@@ -637,17 +652,19 @@ upstream以外の設定はTCP構成と同じ。
 
 既存のMisskey (TypeScript版)からの移行手順は[TS版からの移行ガイド](migration-from-ts.md)を参照。
 
-mk-goはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの差し替えだけで移行可能。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 18 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
+ElythiaはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの差し替えだけで移行可能。MisakiのマイグレーションはTS版テーブルに対して原則追加のみだが、例外が 19 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
 
 ## アップデート
 
+**1.5.0 から 2.0.0 へ上げるときは、[1.5.0 から 2.0.0 へ上げる](upgrade/2.0.0.md) の手順を構成ごとに上から順に流す。** 名前・配布イメージ・実行バイナリ・frontend の置き場所がまとめて変わる版で、下の各節 (#3379 / #3394 / #3400) の手順をまとめてある。
+
 どの構成でも共通する原則は 3 つ。
 
-1. **`git pull` だけでは submodule が更新されない**。親リポの gitlink ポインタが動くだけで `third_party/misskey/` の実ファイルは古いまま残る。`git pull --recurse-submodules` を使うか、`git config submodule.recurse true` を一度実行しておく
-2. **submodule が動いたらフロントエンドを再ビルドする**。SPA のアセットは image に焼き込まず bind-mount で渡しているため、submodule だけ進めても配信物は変わらない
-3. **フロントエンドを再ビルドしたら mk-go を再起動する**。エントリポイント (`scripts/<hash>.js`) を起動時に 1 回だけ解決してキャッシュする実装なので、再起動しないと消えた古いファイルを指し続けて 404 になる。bind-mount であっても再起動は必要
+1. **`frontend/` のソースは本体と一緒に `git pull` で更新される** (#3379 で本体へ取り込んだ)。ただし成果物の `frontend/built` は git の管理の外にあり、pull しても変わらない
+2. **`frontend/` が動いたらフロントエンドを再ビルドする**。SPA のアセットは image に焼き込まず bind-mount で渡しているため、ソースだけ進めても配信物は変わらない。`make update` (`make pull` も呼ぶ) は、`frontend/` が動いたかどうかを知らせる
+3. **フロントエンドを再ビルドしたら Elythia を再起動する**。エントリポイント (`scripts/<hash>.js`) を起動時に 1 回だけ解決してキャッシュする実装なので、再起動しないと消えた古いファイルを指し続けて 404 になる。bind-mount であっても再起動は必要
 
-**1.3.0 より後へ上げるときは、先に `backfill-remote-host` を流す (#2996)。** リモート
+**1.3.0 より後へ上げるときは、先に `backfill remote-host` を流す (#2996)。** リモート
 host の読み取り側にあった、非正規化のまま保存された行むけの互換経路を撤去した。流して
 いない環境で上げると**非正規化の行が DB から引けなくなる** (`users/show` が呼ばれる
 たび、その acct へメンションした投稿 (`notes/create`) のたびに WebFinger を叩く、
@@ -655,18 +672,20 @@ AP の acct 解決が 404 になる)。メンションは WebFinger で既存の
 配送はされるが、取得が締め切り (20 秒) や到達不能で落ちると、その投稿ではメンションが
 外れて配送されない (#3330)。**保存側を正規化したのが 1.3.0 なので、それより古い版から上げる場合ほど
 対象行は多い。** 確認方法と手順は[後始末バッチ](#後始末バッチ)の
-`backfill-remote-host`。
+`backfill remote-host` (上げる前の版の image では `/app/backfill-remote-host`)。
 
 **`docker compose up -d` は再起動を保証しない。** compose はイメージと設定が変わらなければコンテナを作り直さないが、フロントエンドは bind-mount なのでフロントエンドだけ更新したときは何も変わらない。原則 3 を満たすには `restart` を明示するか、それを行う `make uds-restart` / `make docker-restart` を使う。2026-09-07 にこれで本番のフロントエンドが 10 分近く起動しなくなった (#2885)。
 
 **壊れても CSS では気付けない。** vite のファイル名は内容ハッシュなので、内容が変わらない CSS は再ビルド後も同じ名前で作り直され 200 を返し続ける。判定にはエントリの JS を直接叩く必要がある。`make *-restart` が呼ぶ [`deploy/check-frontend-entry.sh`](../deploy/check-frontend-entry.sh) はそこまで見て、404 なら非ゼロで落ちる。
+
+**#3379 より前の版から UDS 構成を上げるときは、先に[frontend を本体へ取り込んだ版へ上げる](#frontend-を本体へ取り込んだ版へ上げる-3379)の手順を踏む。** compose の bind mount の元と、frontend のビルドの出力先が変わるため。
 
 マイグレーションは構成によって適用方法が違う (下記参照)。golang-migrate が `schema_migrations` で適用済みバージョンを管理するため、何度流しても冪等。
 
 ### Docker Compose (TCP / UDS 共通)
 
 ```bash
-# 本体・submodule・plugins/ の独立リポジトリをまとめて更新し、
+# 本体と plugins/ の独立リポジトリをまとめて更新し、
 # ビルド → 再起動 → 配信アセットの検証まで通す
 make uds-update      # UDS 本番構成
 make docker-update   # Docker Compose 構成
@@ -675,14 +694,14 @@ make docker-update   # Docker Compose 構成
 段階的に実行したい場合は分解できる。
 
 ```bash
-make pull            # 本体 + submodule + プラグイン
+make pull            # 本体 + プラグイン
 make uds-rebuild     # フロントエンド + イメージ (docker 構成では docker-rebuild)
 make uds-restart     # 再起動 + 配信アセットの検証 (同 docker-restart)
 ```
 
 **フロントエンドのビルドは配信中のディレクトリを直接作り直す** (`packages/frontend/build.ts` が出力先を消してから作る)。ビルド開始から再起動完了までフロントエンドは 404 になる。#2885 の事故では、ビルド完了 (13:02:52) から再起動 (13:12:36) まででも **9 分 44 秒**、ビルド開始からならさらに長い窓ができた。**ビルドが失敗した場合はその窓が閉じない** — 配信物が消えたまま残るので、成功するまで直すこと。無停止で入れ替えたい場合は別ディレクトリにビルドして差し替える構成が要る。
 
-> **注意**: `docker-*` 系は `docker-compose.yml` を使うが、このファイルは `name:` を持たないため project 名がディレクトリ名 (`mk`) になり、**UDS 本番と同じ project に合流する**。本番 UDS を動かしているホストでは `uds-*` 系だけを使うこと。
+> **注意**: `docker-*` 系は `docker-compose.yml` を使うが、このファイルは `name:` を持たないため project 名がディレクトリ名 (以前の手順で clone した環境なら `mk`) になり、**UDS 本番と同じ project に合流する**。本番 UDS を動かしているホストでは `uds-*` 系だけを使うこと。
 
 マイグレーションは構成によって適用者が違う。Docker Compose 構成では one-shot の `migrate` サービスが `app` の起動前に自動適用し、`docker compose up -d` が完了した時点で適用済み。UDS 構成には `migrate` サービスが無く、mkgo の entrypoint が起動のたびに流す (したがって再起動には migration の時間が含まれる)。
 
@@ -691,11 +710,11 @@ make uds-restart     # 再起動 + 配信アセットの検証 (同 docker-resta
 ### バイナリ直接実行
 
 ```bash
-# 本体・submodule・plugins/ の独立リポジトリをまとめて更新する。
+# 本体と plugins/ の独立リポジトリをまとめて更新する。
 # make build は plugins を組み込むので、git pull だけだとプラグインが古いまま焼き込まれる。
 make pull
 
-# third_party/misskey が動いていた場合のみ
+# frontend/ が動いていた場合のみ (make pull の中の make update が知らせる)
 make e2e-frontend-build
 
 make build
@@ -707,29 +726,199 @@ make migrate-up
 sudo systemctl restart misskey    # systemd の場合
 ```
 
+### frontend を本体へ取り込んだ版へ上げる (#3379)
+
+この版から、同梱の frontend は submodule (`third_party/misskey`) ではなく、本体の `frontend/` からビルドして配る。UDS 構成 (`compose.uds.yaml`) で運用している場合は、compose の bind mount の元と、frontend のビルドの出力先が変わる。**手順どおりに進めないと、frontend の配信物が空になり 404 を返す。**
+
+`compose.uds.yaml` がまだ `third_party/misskey` を mount している間は、`make uds-frontend-build` / `uds-build` / `uds-up` / `uds-restart` (と、それらを呼ぶ `uds-update` / `uds-rebuild`) がエラーで止まる (`make uds-layout-check`)。新しい `frontend/built` を作っても誰も mount せず、古い frontend を警告無しで配り続けるのを防ぐため。下の 1 で mount を向け直すと通る。
+
+変わるもの:
+
+| | これまで | この版から |
+|---|---|---|
+| frontend のビルドの出力先 (`make uds-frontend-build`) | `third_party/misskey/built` | `frontend/built` |
+| compose の bind mount (`/frontend`) | `./third_party/misskey/built` | `./frontend/built` |
+| compose の bind mount (`/misskey/packages/frontend/assets`) | `./third_party/misskey/packages/frontend/assets` | `./frontend/packages/frontend/assets` |
+
+#### 1. 配信物を git の管理の外へ退避する
+
+submodule を外すコミットを pull したとき、submodule の作業ツリー (`built/` を含む) が残るかどうかは git の版と設定で変わる。配信中のものを git の操作から切り離すため、先に退避して mount を向け直す。
+
+```bash
+SAVE=/srv/mk-frontend-save     # git の管理の外。運用に合わせて選ぶ
+mkdir -p "$SAVE"
+cp -a third_party/misskey/built "$SAVE/built"
+cp -a third_party/misskey/packages/frontend/assets "$SAVE/assets"
+```
+
+`compose.uds.yaml` の 2 行を、退避した先の絶対パスへ書き換える。
+
+```yaml
+      - /srv/mk-frontend-save/built:/frontend:ro
+      - /srv/mk-frontend-save/assets:/misskey/packages/frontend/assets:ro
+```
+
+```bash
+make uds-restart     # 起動し直して、配信アセットを検証する
+```
+
+#### 2. 新しい版を pull する
+
+```bash
+git pull --ff-only
+```
+
+#### 3. `frontend/` からビルドする
+
+```bash
+mkdir -p .tmp && rm -f .tmp/uds-frontend-build.log   # 前回のログの exit= を読まないように消す
+nohup setsid sh -c 'make uds-frontend-build; echo "exit=$?"' > .tmp/uds-frontend-build.log 2>&1 &
+# 終わるまで待つ (数分かかる)。最後の行が exit=0 であることを確かめる
+until grep -q '^exit=' .tmp/uds-frontend-build.log 2>/dev/null; do sleep 10; done
+tail -n 1 .tmp/uds-frontend-build.log | grep -qx 'exit=0' && echo OK || echo "失敗した。.tmp/uds-frontend-build.log を見る"
+```
+
+出力先は `frontend/built` で、まだどこからも mount されていないので、ビルドの途中でも配信には影響しない。**終わる前や失敗したまま 4 へ進まないこと** — 空や作りかけの `frontend/built` を mount することになり、404 を返す。失敗したら、1 で退避した配信物を mount したまま直してやり直す。
+
+#### 4. compose を新しいパスへ向ける
+
+`compose.uds.yaml` の 2 行を書き換える。build-arg に `MKGO_FRONTEND_VERSION` が残っていれば消してよい (#3379 で廃止した。残っていても使われない)。
+
+```yaml
+      - ./frontend/built:/frontend:ro
+      - ./frontend/packages/frontend/assets:/misskey/packages/frontend/assets:ro
+```
+
+#### 5. image を作り直して再起動する
+
+image の静的アセットと絵文字の COPY 元が変わるので、作り直しが要る。
+
+```bash
+mkdir -p .tmp && rm -f .tmp/uds-build.log   # 前回のログの exit= を読まないように消す
+nohup setsid sh -c 'make uds-build; echo "exit=$?"' > .tmp/uds-build.log 2>&1 &
+until grep -q '^exit=' .tmp/uds-build.log 2>/dev/null; do sleep 10; done
+tail -n 1 .tmp/uds-build.log | grep -qx 'exit=0' && echo OK || echo "失敗した。.tmp/uds-build.log を見る"
+# OK と出たときだけ再起動する。失敗したまま再起動すると、古い image で新しい mount を読む
+make uds-restart
+```
+
+`make uds-restart` の最後の検証 (`deploy/check-frontend-entry.sh`) が通れば切り替えは終わり。
+
+#### 6. 片付け (submodule を外す版を pull した後)
+
+submodule を外す版 (#3379 の段階 P4d-2) を pull しても、git は作業ツリーの `third_party/` を消さず、未追跡のディレクトリとして残す。Elythia はもう読まないので消してよい。**消す前に、compose が 4 で `frontend/` を向いていることを確かめる。** `make uds-layout-check` は、`compose.uds.yaml` がまだ `third_party/misskey` を mount していれば止まる。
+
+```bash
+# layout-check が止めたら何も消さない (行を並べるだけだと、止まっても次の行が走る)
+if make uds-layout-check; then
+  git config --remove-section submodule.third_party/misskey 2>/dev/null || true
+  # third_party/ の中には、以前 docker の中で pnpm install した root 所有のファイルが
+  # 残っていることがあり、一般ユーザーの rm では消しきれない。使い捨てのコンテナで消す
+  docker run --rm -v "$PWD":/w alpine rm -rf /w/third_party
+  rm -rf .git/modules/third_party
+fi
+```
+
+Docker Compose 構成 (`compose.uds.yaml` が無い) でも同じ手順でよい。`make uds-layout-check` は `compose.uds.yaml` が無ければ素通りする。
+
+`.git/config` に残る submodule の設定 (`[submodule "third_party/misskey"]`) も外す。gitlink が無くなった後は `git submodule deinit` が対象を見つけられないので、`git config` で消す。
+
+`.git/modules/third_party` は、submodule の git ディレクトリが残っている場所。通常の clone (`.git` がディレクトリ) を前提にしている。`git worktree` で作った作業ツリーでは `.git` がファイルで、場所が変わるので、この部分は消さなくてよい (残っても動作には影響しない)。
+
+退避した `$SAVE` は、新しい版で問題が無いことを確かめてから消す。
+
+### 実行バイナリを `elythia` 1 つにまとめた版へ上げる (#3394)
+
+この版から、実行バイナリは `elythia` 1 つになり、用途をサブコマンドで呼び分ける。旧名のバイナリは置かない (配布イメージの `/app/migrate` の互換を除く。下を参照)。**引数無しの `elythia` はサーバーを起動せず、使い方を出して exit 2 で終わる**ので、旧名から機械的に置き換えただけの起動行はその場で止まる (黙って別の動作にはならない)。
+
+| | これまで | この版から |
+|---|---|---|
+| 起動 | `misskey -config <path>` | `elythia serve -config <path>` |
+| migration | `migrate -config <path> -direction up` | `elythia migrate -config <path> -direction up` |
+| 後始末バッチ | `backfill-<名前> ...` | `elythia backfill <名前> ...` |
+| healthcheck | `misskey -healthcheck -config <path>` | `elythia healthcheck -config <path>` |
+| doctor / fsck / config-dump | `misskey -config <path> -doctor` など | `elythia doctor -config <path>` など (`fsck` の `-fix` はそのまま) |
+| route の dump | `misskey -config <path> -dump-routes -dump-routes-out <file>` | `elythia dump-routes -config <path> -dump-routes-out <file>` |
+| image の中のパス | `/app/misskey`・`/app/migrate`・`/app/backfill-<名前>` | `/app/elythia` (`Dockerfile` / `Dockerfile.bundled` の配布イメージには、互換のための `/app/migrate` もある。下を参照)。`PATH` に `/app` が入るので `docker exec <container> elythia ...` で呼べる |
+| image の ENTRYPOINT / CMD | `["/app/misskey"]` / `["-config", ".config/default.yml"]` | `["/app/elythia"]` / `["serve", "-config", ".config/default.yml"]` |
+| `make build` の出力 | `built/misskey` | `built/elythia` |
+
+各 flag の名前と意味は変わらない。サブコマンドの後ろに、これまでと同じ flag を渡す。
+
+**配布イメージの `/app/migrate` は 2.x の間だけ残す。** `Dockerfile` / `Dockerfile.bundled` の image (`ghcr.io/elythia-network/elythia` の `latest` / `bundled` とリリースのタグ) には `/app/migrate` が `elythia` への symlink として入っていて、その名前で起動すると以前の flag のまま `elythia migrate` として動く。古い compose の `migrate` サービス (`entrypoint: ["/app/migrate"]`) のまま新しい image を pull しても migration は止まらない。**3.0 で撤去する**ので、それまでに compose を新しいものへ差し替えること。他の旧名 (`/app/misskey`・`/app/backfill-<名前>`) は残さない。**UDS の image (`deploy/uds/Dockerfile.mkgo`) には `/app/migrate` を置かない** (entrypoint が `elythia migrate` を呼ぶので要らない)。
+
+構成ごとに手で直すもの:
+
+- **Docker Compose (TCP / bundled)**: リポジトリの `docker-compose.yml` / `docker-compose.image.yml` は追従済み。手元で書き換えている場合は、`migrate` サービスの `entrypoint: ["/app/migrate"]` を `["/app/elythia"]` に、`command` の先頭に `"migrate"` を足す。`app` に `command: ["-config", ...]` を足している場合は先頭に `"serve"` を足す (足さないと exit 2 で起動しない)。healthcheck を足している場合は `["CMD", "/app/elythia", "healthcheck", "-config", ".config/default.yml"]` にする
+- **Docker Compose (UDS)**: image の entrypoint (`deploy/uds/mkgo-entrypoint.sh`) が `elythia migrate` → `elythia serve` を呼ぶので、`compose.uds.yaml` の書き換えは要らない (`compose.uds.yaml.example` の healthcheck は curl で `/healthz` を叩くだけで、バイナリ名に依存しない)。image を作り直して再起動する。手で `docker compose exec mkgo /app/migrate ...` を叩いていた手順は `elythia migrate ...` に変わる。UDS image の entrypoint は、引数を渡すと migrate と serve をせずにそのまま `elythia` に渡すので、`docker compose -f compose.uds.yaml run --rm --no-deps mkgo backfill <名前> ...` の形でも流せる
+- **バイナリ直接実行 (systemd)**: `ExecStart` を `<dir>/elythia serve -config <path>` に変える。`make build` は `built/elythia` を作り、古い `built/misskey` は残るので消しておく
+- **監視・スクリプト**: `-healthcheck` / `-doctor` / `-fsck` / `-config-dump` / `-dump-routes` の flag で呼んでいるものはサブコマンドに直す
+- **ソースから使っている場合**: `make plugins` (`make build` も呼ぶ) を一度回す。プラグインの組み込み用の生成物の置き場所が `cmd/misskey/` から `cmd/elythia/` に変わり、古い checkout に残った `cmd/misskey/plugins_generated.go` を回さないままにすると `go build ./...` が落ちる (`make plugins` が消す)
+
+**後始末バッチは、流す image の版の呼び方に合わせる。** この版より前の image には `elythia` が無いので、旧版のまま流すときは `--entrypoint /app/backfill-<名前>` を使う。
+
+### Go のモジュールパスを変えた版へ上げる (#3394)
+
+この版から、Go のモジュールパスが `github.com/shiroha-a/mk` から `github.com/elythia-network/elythia` に変わる。プラグインを組み込んでおらず、自前のビルドで `-ldflags -X` を渡していない構成では、手で直すものは無い。**自前のビルドで `-X github.com/shiroha-a/mk/internal/config.MkGoVersion=...` のように渡している場合は、パスを書き換える。** 古いパスの `-X` は link が警告なしに無視するので、版と commit が空のまま出荷される。
+
+**プラグインを `plugins/` に置いている場合は、プラグインの側も新しいパスに追従した版へ上げる。** 古いパスのままのプラグインがあると、`make build` (Docker のビルドと `build-with-plugins` も同じ) は、プラグインの組み込み用のコードを作る段階で次のように止まる (黙って動かない状態にはならない)。
+
+```
+pluginbuild: plugins/foo: go.mod が以前のモジュールパス github.com/shiroha-a/mk を参照しています。…
+```
+
+- 同梱プラグイン (`plugins/status` / `plugins/trustlevel`) は追従済み
+- 運営者のリポジトリから `build-with-plugins` を呼んでいる場合も、`plugins:` に並べたプラグインの ref を、追従した版へ上げる。**逆に、本体をこの版より前に固定したまま、プラグインの ref に `main` のような動く名前を渡していると、プラグインが追従した時点でビルドが止まる**ので、本体とプラグインは組にして上げる
+- 自分で書いたプラグインの直し方は[プラグインの互換性](plugins/compatibility.md#go-のモジュールパスの変更-3394)にある
+- `go.mod` だけを直して `.go` の import を直し忘れると、`go build` が `no required module provides package github.com/shiroha-a/mk/...` で止まる
+
+**この版より前へ戻すときは、プラグインも追従する前の版へ戻す。** 本体だけを戻すと、追従した後のプラグインが古い本体に合わず、ビルドが止まる。
+
+### プラグインのマニフェストの名前を変えた版へ上げる (#3400)
+
+この版から、プラグインのマニフェストは `mk-plugin.yml` ではなく `elythia-plugin.yml` を読む。プラグインを組み込んでいない構成では、手で直すものは無い。
+
+- **`plugins/` に置いたプラグインは、マニフェストの名前を変えた版へ上げる** (自分で書いたプラグインなら、ファイルの名前を変えるだけでよい)。旧名のままだと、`make build` (Docker のビルドと `build-with-plugins` も同じ) が、名前を変えるよう案内して止まる。直し方は[プラグインの互換性](plugins/compatibility.md#マニフェストの改名-3400)にある
+- **`disabled: true` で外して置いたままのプラグインも止まる。** 名前を変えるか、`plugins/` から取り除く
+- 同梱プラグイン (`plugins/status` / `plugins/trustlevel`) は追従済み
+- `Peered` を宣言しているプラグインは、nodeinfo の宣言の名前も変わる (`mkGoPlugins` → `elythiaPlugins`)。相手がこの版より前のあいだは、プラグインどうしの連合が止まる。相手が上げれば戻る
+- この版より前へ戻すときは、プラグインも名前を変える前の版へ戻す
+
+### リポジトリとイメージの置き場所を移した版へ上げる (#3394)
+
+2.0.0 から、リポジトリは `Elythia-Network/elythia`、配布イメージは `ghcr.io/elythia-network/elythia` に移った。旧 URL (`https://github.com/shiroha-a/mk`) は GitHub が転送するので git の操作は続けて使えるが、**旧イメージ `ghcr.io/shiroha-a/mk` は移した時点で更新が止まっている** (エラーにはならず、古い版のまま動き続ける)。
+
+- **Docker Compose (docker ブランチ)**: docker ブランチの `README.md` の「更新」の手順 (`git fetch` と `git reset --hard`) で compose を取り直す。新しい compose は既定で新しいイメージを使う。`.env` の `MK_IMAGE` や `docker-compose.override.yml` でイメージを指定しているなら、`ghcr.io/elythia-network/elythia:<タグ>` に書き換える
+- **Docker Compose (ソースからビルド) / UDS / バイナリ直接実行**: イメージは手元で作るので、変えるものは無い。remote の URL は転送で動くが、`git remote set-url origin https://github.com/Elythia-Network/elythia.git` で直しておく
+- **`build-with-plugins` を呼んでいる場合**: `uses:` を `Elythia-Network/elythia/.github/workflows/build-with-plugins.yml@<タグ または コミット SHA>` に、`mk_repository` を渡しているなら `Elythia-Network/elythia` に書き換える
+- **DB**: migration `000116` が、`meta.repositoryUrl` / `meta.feedbackUrl` のうち以前の既定値のままの行を新しい URL にする。自分で設定した値には触らない
+- 2.0.0 より前の版のイメージは、以前の置き場所 (`ghcr.io/shiroha-a/mk`) に残っている
+
 ### 切り戻し
 
-`schema_migrations` のバージョンが進んでいるので、バイナリだけ戻すと古い mk-go が新しいスキーマを読むことになる。追加のみのマイグレーション (`ADD COLUMN` / `CREATE TABLE` / `CREATE INDEX`) であれば旧バイナリでも動くが、破壊的な変更を含むリリースでは `make migrate-down` (1 段) を必要な回数繰り返して戻す。リリースノートで破壊的変更の有無を確認すること。
+`schema_migrations` のバージョンが進んでいるので、バイナリだけ戻すと古い Elythia が新しいスキーマを読むことになる。追加のみのマイグレーション (`ADD COLUMN` / `CREATE TABLE` / `CREATE INDEX`) であれば旧バイナリのサーバーは動くが、破壊的な変更を含むリリースでは `make migrate-down` (1 段) を必要な回数繰り返して戻す。リリースノートで破壊的変更の有無を確認すること。
 
-> **`go run ./cmd/migrate -direction down` を本番で叩かないこと。** `-steps` を省くと「全部」の意味になり、全 down マイグレーションが走って 全テーブルが消える。
+**旧版の `migrate` は、自分の知らない版まで進んだ DB に当たると止まる** (`no migration found for version N`)。compose の `migrate` サービスと UDS の image は起動の前に migration を流すので、追加のみの版でも、**新しい版のまま migration を旧版の最後の版まで戻してから**旧版へ切り替える。2.0.0 から 1.5.0 へ戻す手順は [1.5.0 から 2.0.0 へ上げる](upgrade/2.0.0.md#150-へ戻す)。
+
+> **`elythia migrate -direction down` を本番で叩かないこと。** `-steps` を省くと「全部」の意味になり、全 down マイグレーションが走って 全テーブルが消える。
 >
 > **down が用意されていても戻せない migration がある。** `000081` は孤児行を、`000082` は chat room の owner が持つ membership / 招待行を DELETE するが、どちらも削除した行の内容を保存していないので down は no-op。詳細は [TS版からの移行](migration-from-ts.md#破壊的なマイグレーション)。
 
-Misskey TS へ戻す場合は[TS版からの移行](migration-from-ts.md)を参照。
+Misskey TS へ戻すことは保証しない (#3191)。戻す場合の注意と、今どこまで戻れるかは[TS版からの移行](migration-from-ts.md#misskey-tsへのロールバック)を参照。
 
 ## 後始末バッチ
 
-SQL migration として書けない一回限りの正規化は、独立したバイナリで流す。**migration と
+SQL migration として書けない一回限りの正規化は、`elythia backfill <名前>` で流す。**migration と
 違って自動では走らない**ので、運用者が明示的に実行する必要がある。
 
-**稼働中の本体プロセスに影響しない使い捨てコンテナ**で流す。entrypoint を差し替えるのは
-`docker-compose.yml` の `migrate` サービスと同じ手法。
+**稼働中の本体プロセスに影響しない使い捨てコンテナ**で流す。entrypoint を `/app/elythia` に
+差し替えて、サブコマンドを渡す。`docker-compose.yml` の `migrate` サービスと同じ手法。
 
-### `backfill-instance-counts` — instance の `notesCount` / `usersCount` を数え直す (#3330)
+### `backfill instance-counts` — instance の `notesCount` / `usersCount` を数え直す (#3330)
 
 `instance.notesCount` / `usersCount` (`federation/instances` の `notesCount` / `usersCount`、
-`+notes` / `+users` の並び順) は、#3330 まで mk-go が動かしていなかった。それより前に
-mk-go が作った instance 行は **`notesCount` が 0、`usersCount` が行を作ったときの 1 のまま**
+`+notes` / `+users` の並び順) は、#3330 まで Elythia が動かしていなかった。それより前に
+Elythia が作った instance 行は **`notesCount` が 0、`usersCount` が行を作ったときの 1 のまま**
 残っている。#3330 からリモートの投稿・利用者の取り込みで増減を積むようになったが、
 積むのは差分なので過去の分は埋まらない。このバッチで実件数へ数え直す。
 
@@ -754,21 +943,21 @@ instance 行の無い host は数えない (行を作らない)。値が既に�
 
 ```bash
 # まず差分を見る (書き込まない)
-docker compose run --rm --no-deps --entrypoint /app/backfill-instance-counts app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill instance-counts \
   -config /app/.config/default.yml -dry-run
 
 # 実行
-docker compose run --rm --no-deps --entrypoint /app/backfill-instance-counts app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill instance-counts \
   -config /app/.config/default.yml -batch 100 -sleep-ms 200
 ```
 
-**`--no-deps` を付ける** (理由は `backfill-emoji-system-file` と同じ)。UDS 構成では
+**`--no-deps` を付ける** (理由は `backfill emoji-system-file` と同じ)。UDS 構成では
 サービス名が `mkgo` になる (`docker compose -f compose.uds.yaml run --rm --no-deps
---entrypoint /app/backfill-instance-counts mkgo ...`)。**バイナリが入るのはこのバッチを
+--entrypoint /app/elythia mkgo backfill instance-counts ...`)。**バイナリが入るのはこのバッチを
 含む版のイメージから**なので、先にイメージを作り直す。バイナリ直接実行なら
-`go run ./cmd/backfill-instance-counts -config .config/default.yml -dry-run`。
+`go run ./cmd/elythia backfill instance-counts -config .config/default.yml -dry-run`。
 
-**無指定で書き込み、`-dry-run` で抑止する**側の作法 (`backfill-avatar-public-url` と同じ)。
+**無指定で書き込み、`-dry-run` で抑止する**側の作法 (`backfill avatar-public-url` と同じ)。
 
 出力は差分のある行ごとに `instance <host> notesCount <旧> -> <新> usersCount <旧> -> <新>`、
 最後に `done [...]: scanned=<走査した instance 行> changed=<差分のあった行>
@@ -787,7 +976,7 @@ UPDATE なので、まるごと書かれていない)。
 **数える SELECT と書く UPDATE の 2 文**で処理する。件数は host ごとに
 `note."userHost"` / `user.host` の index の該当範囲だけを読む (note の全件走査には
 ならない。ローカルの投稿は読まない。どちらの index も本家の初期 migration が作り、
-mk-go の `000001` も作るので、TS から引き継いだ DB でも mk-go 生まれの DB でもある)。
+Elythia の `000001` も作るので、TS から引き継いだ DB でも Elythia 生まれの DB でもある)。
 数える文は行ロックを取らない。書く文は数えた値を `VALUES` で受け取るだけで集計を
 含まず、値が変わる行だけを書くので、instance 行のロックを持つのはその短い UPDATE の
 間だけになる (その間、同じ行を更新する処理 — 受信時の `latestRequestReceivedAt` の
@@ -813,12 +1002,12 @@ mk-go の `000001` も作るので、TS から引き継いだ DB でも mk-go �
 流すか、終わってから `-dry-run` をもう一度当てて差分を見る (もう一度流しても同じ
 大きさのずれが起こりうるので、0 にならないことはある)。
 
-**mk-go の再起動と重ねない。** 起動時の `RecomputeFollowCounts` も instance の複数行を
+**Elythia の再起動と重ねない。** 起動時の `RecomputeFollowCounts` も instance の複数行を
 1 本の UPDATE で書くので、バッチの書き込みと重なると行を取る順が食い違い、まれに
 deadlock で片方が失敗する (バッチ側は id の順に渡しているが、行を取る順は planner
 次第)。バッチが落ちたら `-from` で流し直せばよい。
 
-### `backfill-avatar-public-url` — アイコン / バナーの URL を公開用へ寄せ直す
+### `backfill avatar-public-url` — アイコン / バナーの URL を公開用へ寄せ直す
 
 `user.avatarUrl` / `user.bannerUrl` は drive ファイルの**原本**を指していた。原本は
 アップロードされたバイト列そのままで、`/files/:accessKey` は変換せずに返すため、
@@ -839,7 +1028,7 @@ deadlock で片方が失敗する (バッチ側は id の順に渡している�
 
 **対象はローカル利用者だけ。** upstream はリモートのアイコンを drive に保存して
 `avatarId` を書くので、TS から引き継いだ DB にはリモート利用者の古い id が残って
-いる。mk-go はその id を更新しないため、host で絞らないと**取り直した現在の
+いる。Elythia はその id を更新しないため、host で絞らないと**取り直した現在の
 リモート URL を TS 時代のキャッシュへ巻き戻す**。
 
 **アニメーションになりうる形式で公開用を持つ行は触らない。** 公開用はアニメーションを
@@ -865,7 +1054,7 @@ AVIF は、設定し直すと静止画になる** (書き込み経路のアニ�
 プロキシ URL (avatar mode = 高さ 320) を保存するので、移行済みのインスタンスでは
 ローカル利用者がその値を持っている。このバッチはそれを「原本と違う」と判定して
 公開用 (最大 2048px) へ書き換えるため、48px 表示のアイコンに大きな画像が流れる。
-mk-go 生まれの DB では逆に原本 → 公開用なので改善になる。**構成によって向きが
+Elythia 生まれの DB では逆に原本 → 公開用なので改善になる。**構成によって向きが
 反転する**ので、移行済みなら流す前に `docs/divergence.md` の `user.avatarUrl` の行を
 読むこと。
 
@@ -874,19 +1063,19 @@ id が実行中に変わるともう片方も書けない。冪等なので**も
 
 ```bash
 # まず件数を見る
-docker compose run --rm --no-deps --entrypoint /app/backfill-avatar-public-url app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill avatar-public-url \
   -config /app/.config/default.yml -dry-run
 
 # 実行
-docker compose run --rm --no-deps --entrypoint /app/backfill-avatar-public-url app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill avatar-public-url \
   -config /app/.config/default.yml -batch 1000 -sleep-ms 200
 ```
 
-**`--no-deps` を付ける** (理由は下の `backfill-emoji-system-file` と同じ)。UDS 構成では
+**`--no-deps` を付ける** (理由は下の `backfill emoji-system-file` と同じ)。UDS 構成では
 サービス名が `mkgo` になる。バイナリ直接実行なら
-`go run ./cmd/backfill-avatar-public-url -config .config/default.yml -dry-run`。
+`go run ./cmd/elythia backfill avatar-public-url -config .config/default.yml -dry-run`。
 
-**無指定で書き込み、`-dry-run` で抑止する**側の作法。`backfill-emoji-system-file` だけが
+**無指定で書き込み、`-dry-run` で抑止する**側の作法。`backfill emoji-system-file` だけが
 逆 (既定 dry-run + `-apply`) なので打ち間違えないこと。
 
 出力の `updated` は**「書く必要があった件数」**で、実行中に変わって書けなかった行も
@@ -906,7 +1095,7 @@ docker compose run --rm --no-deps --entrypoint /app/backfill-avatar-public-url a
 配送を起こすには利用者が一度プロフィールを更新する必要がある (アイコンを
 設定し直せば同時に両方が片付く)。
 
-### `backfill-emoji-system-file` — 承認済み自作絵文字の画像を system 所有へ複製 (#2990)
+### `backfill emoji-system-file` — 承認済み自作絵文字の画像を system 所有へ複製 (#2990)
 
 #2966 より前に承認された `kind = own` のカスタム絵文字申請は、作られた絵文字が
 **申請者所有の drive ファイルの URL をそのまま参照している**。申請者がそのファイルを
@@ -924,11 +1113,11 @@ drive から消すか、アカウントを削除した時点で表示できな�
 
 ```bash
 # まず分類だけ見る (既定は dry-run)
-docker compose run --rm --no-deps --entrypoint /app/backfill-emoji-system-file app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill emoji-system-file \
   -config /app/.config/default.yml
 
 # 実行
-docker compose run --rm --no-deps --entrypoint /app/backfill-emoji-system-file app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill emoji-system-file \
   -config /app/.config/default.yml -apply
 ```
 
@@ -936,8 +1125,8 @@ docker compose run --rm --no-deps --entrypoint /app/backfill-emoji-system-file a
 ので、stack を落とした状態で叩くと**読み取りだけのつもりで migration まで走る**。
 
 UDS 構成ではサービス名が異なるので `docker compose -f ... run --rm --no-deps
---entrypoint /app/backfill-emoji-system-file mkgo ...` の形になる。バイナリ直接実行なら
-`go run ./cmd/backfill-emoji-system-file -config .config/default.yml`。
+--entrypoint /app/elythia mkgo backfill emoji-system-file ...` の形になる。バイナリ直接実行なら
+`go run ./cmd/elythia backfill emoji-system-file -config .config/default.yml`。
 
 **保存先の解決はサーバーと同じ。** オブジェクトストレージを有効にしていれば複製もそちら
 へ書き、`storedInternal = true` の行 (移行前に保存されたもの) はローカル FS から読む。
@@ -948,8 +1137,8 @@ compose の `run` はサービスの volume をそのまま引き継ぐ。別の
 冪等。途中で失敗しても、作れた複製の分だけ進んだ状態から再実行して安全。
 
 **既定は dry-run で、書き込みには `-apply` が要る。** 姉妹バッチ
-(`backfill-remote-host` / `backfill-note-tags` / `backfill-avatar-public-url` /
-`backfill-instance-counts`) は
+(`backfill remote-host` / `backfill note-tags` / `backfill avatar-public-url` /
+`backfill instance-counts`) は
 **逆** (無指定で書き込み、`-dry-run` で抑止) なので、手が覚えているほうで打たないこと。`-dry-run` と `-apply`
 を両方渡すと落ちる。
 
@@ -1026,7 +1215,7 @@ drive にあるファイルはそのまま残る (バッチと同じ判断)。�
 **このバッチが直すのは申請経由の絵文字だけ。** `admin/emoji/add` は #2999、
 `admin/emoji/update` は #3014 で system 所有へ複製するようになったが、**それ以前に登録・
 差し替えた絵文字は対象外のまま**。**管理画面が使う経路 (`fileId`) からはもう増えない**が、
-`admin/emoji/add` の **`url` 直接指定** (mk-go 独自の escape hatch。「この URL を指す」が
+`admin/emoji/add` の **`url` 直接指定** (Elythia 独自の escape hatch。「この URL を指す」が
 意味なので取り込まない。`docs/divergence.md` §7) に利用者のファイルの URL を渡せば、
 同じ形は今でも作れる。該当するかは以下で分かる (読み取りのみ)。
 
@@ -1043,7 +1232,8 @@ WHERE e.host IS NULL AND NOT (df."userId" IS NULL AND df."userHost" IS NULL);
 直した 3 件を含め、ローカル絵文字 21 件すべてが system 所有を参照している)。
 
 **稼働中の本体には即座には伝わらない。** バッチは DB を直接書き、`emojiUpdated` も
-publish しない。サーバー側は `emoji` のキャッシュ (5 分) とアバターデコレーションの
+publish しない。サーバー側は `emoji` のキャッシュ (`/api/emojis` の一覧が 5 分、
+ノートやユーザーに載せる絵文字 URL の解決が 10 分、#3383) とアバターデコレーションの
 絵文字キャッシュ (30 秒)、**ブラウザ側は同梱 frontend が 1 時間**持つ
 (`packages/frontend/src/custom-emojis.ts`。IndexedDB、使えない環境では localStorage)。
 再起動は要らない。
@@ -1057,7 +1247,7 @@ publish しない。サーバー側は `emoji` のキャッシュ (5 分) とア
 ぶんのストレージ使用量はチャートの累積値に加算されない (行の中身は承認経路が作るものと
 同じ)。
 
-### `backfill-remote-host` — 保存済みリモート host の punycode 正規化 (#2706)
+### `backfill remote-host` — 保存済みリモート host の punycode 正規化 (#2706)
 
 `hostFromURI` は #2706 から保存時に正規化 (小文字化 + punycode) を掛けるが、それ以前に
 取り込んだ行は `Mixed.Example` のような生の表記のまま残る。
@@ -1114,11 +1304,11 @@ acct 解決も #2996 で両当たりを撤去したので引けない。
 
 ```bash
 # まず件数を見積もる (書き込まない)
-docker compose run --rm --no-deps --entrypoint /app/backfill-remote-host app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill remote-host \
   -config /app/.config/default.yml -dry-run
 
 # 実行。負荷を絞りたければ -batch / -sleep-ms
-docker compose run --rm --no-deps --entrypoint /app/backfill-remote-host app \
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill remote-host \
   -config /app/.config/default.yml -batch 1000 -sleep-ms 200
 ```
 
@@ -1133,10 +1323,10 @@ docker compose run --rm --no-deps --entrypoint /app/backfill-remote-host app \
 走査行数が膨らむ。`-batch` / `-sleep-ms` で絞ること。
 
 UDS 構成ではサービス名が異なるので `docker compose -f compose.uds.yaml run --rm
---no-deps --entrypoint /app/backfill-remote-host mkgo ...` の形になる (`mkgo` も
+--no-deps --entrypoint /app/elythia mkgo backfill remote-host ...` の形になる (`mkgo` も
 `depends_on` に `condition: service_healthy` を持つので `--no-deps` は同じく要る)。
 バイナリ直接実行なら
-`go run ./cmd/backfill-remote-host -config .config/default.yml -dry-run`。
+`go run ./cmd/elythia backfill remote-host -config .config/default.yml -dry-run`。
 
 **流すのは「いま動いている版」のバッチにすること。** 対象の列一覧はリリースごとに
 増えるので、**まだ適用していない migration が作る列**を持つ版で流すとそこで落ちる。
@@ -1148,7 +1338,7 @@ backfill chat_room.host (cursor=""): ERROR: column "host" does not exist (SQLSTA
 `chat_room.host` は #2994 の `000090` が作る列で、**それを取り込む前の DB には無い**
 (1.3.0 のタグ時点では `000083` まで)。
 `docker compose run` は現在の image を使うので **pull の前に流せば自然に避けられる**が、
-`git pull` 済みのツリーで `go run ./cmd/backfill-remote-host` を叩くと踏む
+`git pull` 済みのツリーで `go run ./cmd/elythia backfill remote-host` を叩くと踏む
 (自分でビルドしたバイナリを持ち込む場合も同じ)。
 
 **それで取りこぼしは生じない。** 対象一覧はその版の schema をちょうど覆う —
@@ -1181,7 +1371,7 @@ backfill chat_room.host (cursor=""): ERROR: column "host" does not exist (SQLSTA
 IP とアカウントの対応を引く機能は、**照会そのものを別のテーブルに記録する**。
 運用で問い合わせを受けたときに、どこまで答えられるかを先に把握しておくこと。
 
-記録の対象は 4 本。mk-go 独自の `admin/ip/accounts` (#3104) と
+記録の対象は 4 本。Elythia 独自の `admin/ip/accounts` (#3104) と
 `admin/ip/related-accounts` (#3105) に加えて、**upstream から引き継いだ
 `admin/get-user-ips` と `admin/show-user` の `signins` も記録する** — どちらも
 返すのは同じ「利用者 ↔ IP の対応」なので、外すと監査を迂回して同じものを引ける。
@@ -1201,7 +1391,7 @@ signin repository を読まず `signins: []` を返し、照会していない�
 10,100 件までしか遡れない」と合わせて考えること。
 
 **同梱 frontend は `2026.10.0-mk.1` から、利用者ページを開いただけでは記録しない** (#3276)。
-接続先が mk-go のとき (`meta` に `mkGoVersion` があるとき) は、開いたときも操作のあとの引き直しでも
+接続先が Elythia のとき (`meta` に `mkGoVersion` があるとき) は、開いたときも操作のあとの引き直しでも
 `withSignins: false` を渡す。管理者が IP の折りたたまれた欄を開いたときに初めて
 `admin/get-user-ips` を呼び、その照会が `kind: userIps` で 1 行残る (DB 障害で空を返したときは
 記録されない。管理者でないモデレーターには欄に案内だけが出て、照会は起きない)。同じページで
@@ -1217,7 +1407,7 @@ signin repository を読まず `signins: []` を返し、照会していない�
 **`admin/show-user` が返す `signins` にはログインのたびの IP が入る。** これは
 `user_ip` とは別の `signin` テーブルで、**upstream は policy を見ずに全件返す**
 (`admin/show-user.ts` は `requireModerator`、`signin` の json-schema に `ip` がある)。
-mk-go は `canSearchIpHistory` を持つ相手にだけ返し、**返したときだけ記録する**
+Elythia は `canSearchIpHistory` を持つ相手にだけ返し、**返したときだけ記録する**
 (伏せた応答も、DB 障害で引けなかった応答も、開示が起きていないので記録しない)。
 upstream からの意図的な逸脱。**ただし揃っているのは policy 段だけで、scope も
 レート制限も件数の上限も `admin/ip/*` とは違う** (後述)。
@@ -1350,10 +1540,10 @@ policy さえあればログイン IP が読める。**
 - DB を直接操作した場合
 - 起動時に並走する race による微小なズレ
 
-drift は起動時の `RecomputeFollowCounts` で完全に再計算されるため、admin dashboard の federation pie chart に違和感が出たら **mk-go プロセスを再起動** すれば即時整合する。再起動以外で recompute を強制する API はまだ無い (将来 admin endpoint 化を検討)。
+drift は起動時の `RecomputeFollowCounts` で完全に再計算されるため、admin dashboard の federation pie chart に違和感が出たら **Elythia プロセスを再起動** すれば即時整合する。再起動以外で recompute を強制する API はまだ無い (将来 admin endpoint 化を検討)。
 
-列の意味は本家と同じで、どちらも**その host の側から見た**数 (#3330)。`followingCount` はその host の利用者がローカルの利用者をフォローしている数 (federation/instances の `publishing`)、`followersCount` はローカルの利用者がその host の利用者をフォローしている数 (`subscribing`)。#3330 より前の mk-go は incremental 更新・起動時の再計算ともに**逆向きに数えていた**ので、それまでに mk-go を起動したことのある DB では 2 列の値が入れ替わっている (TS 版が正しく積んだ値も、mk-go の起動時の再計算で入れ替わる)。#3330 を含む版に上げて**一度起動すれば、再計算で正しい向きに戻る**。一方、instance chart (`__chart__instance` の `following` / `followers`) の過去の行は作り直さないので、更新前の期間は 2 系列が入れ替わったまま残る。
+列の意味は本家と同じで、どちらも**その host の側から見た**数 (#3330)。`followingCount` はその host の利用者がローカルの利用者をフォローしている数 (federation/instances の `publishing`)、`followersCount` はローカルの利用者がその host の利用者をフォローしている数 (`subscribing`)。#3330 より前の Elythia は incremental 更新・起動時の再計算ともに**逆向きに数えていた**ので、それまでに Elythia を起動したことのある DB では 2 列の値が入れ替わっている (TS 版が正しく積んだ値も、Elythia の起動時の再計算で入れ替わる)。#3330 を含む版に上げて**一度起動すれば、再計算で正しい向きに戻る**。一方、instance chart (`__chart__instance` の `following` / `followers`) の過去の行は作り直さないので、更新前の期間は 2 系列が入れ替わったまま残る。
 
 `meta.enableStatsForFederatedInstances` を false にすると、本家と同じく Follow / Unfollow はこの 2 列も instance chart の following / followers も動かさない (リモートの投稿・利用者の取り込みで動く `notesCount` / `usersCount` と、instance chart の notes / users も同じく止まる)。ただし**起動時の `RecomputeFollowCounts` はこの設定に関係なく走る** (本家には起動時の再計算そのものが無い。docs/divergence.md の 5 節)。chart と集計列の判定は、どちらも次のイベントから効く (meta はキャッシュ越しに読むので、キャッシュの TTL ぶん遅れうる。#3330 より前は chart 側だけ起動時の値に固定されていて、再起動が要った)。
 
-再計算は**移行済みのアカウントが絡むフォロー行を数えない**。本家の値と一致するのは、移行済みのリモートアカウントをローカルの利用者がフォローしている分の `followersCount` だけで、移行したアカウント側のフォローやローカルのアカウントの移行、proxy アカウントの行は本家では数えたまま残る。そのため移行が絡む instance では、mk-go の値が本家より小さくなりうる (詳細は docs/divergence.md の 5 節、#3330)。
+再計算は**移行済みのアカウントが絡むフォロー行を数えない**。本家の値と一致するのは、移行済みのリモートアカウントをローカルの利用者がフォローしている分の `followersCount` だけで、移行したアカウント側のフォローやローカルのアカウントの移行、proxy アカウントの行は本家では数えたまま残る。そのため移行が絡む instance では、Elythia の値が本家より小さくなりうる (詳細は docs/divergence.md の 5 節、#3330)。

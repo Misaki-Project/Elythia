@@ -6,11 +6,11 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/core/moderationlog"
-	"github.com/shiroha-a/mk/internal/misc/idnhost"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/queue"
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
+	"github.com/elythia-network/elythia/internal/misc/idnhost"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/queue"
 )
 
 // toPunyHost normalizes a host the same way upstream UtilityService.toPuny does
@@ -21,7 +21,7 @@ import (
 // 取り込み側 (`resolver.hostFromURI`) も #2706 で同じ正規化を掛けるので、保存形と
 // 引き当ては同じ値になる。**backfill 前に非正規化で保存された行は引けない** —
 // この lookup は完全一致で、#2996 以降は acct 経路も同じになった。
-// `cmd/backfill-remote-host` を流すこと。
+// `elythia backfill remote-host` を流すこと。
 //
 // **既定ポートの扱いだけは違う。** `hostFromURI` は `https://h:443` を `h` として
 // 保存するようになったが (連合ゲートの綴り回避を塞ぐため)、`Puny` はポートを

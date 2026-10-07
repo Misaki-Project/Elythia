@@ -1,4 +1,4 @@
-# status — mk-go プラグインのサンプル
+# status — Elythia プラグインのサンプル
 
 利用者が短い「ひとこと」を設定し、プロフィールに表示するプラグイン。期限を付けると自動で消える。
 
@@ -14,17 +14,17 @@
 ## 動かす
 
 ```bash
-# mk-go のリポジトリルートで
+# Elythia のリポジトリルートで
 make build     # plugins/ を走査してビルドに取り込む
 ```
 
-`plugins/` に置いても**既定では無効**。`mk-plugin.yml` に `disabled: true` があり `make build` の対象から外れる (同梱サンプルなので、clone しただけの人のビルドに勝手に入らないようにしてある)。有効にするには `disabled: true` を消す。
+`plugins/` に置いても**既定では無効**。`elythia-plugin.yml` に `disabled: true` があり `make build` の対象から外れる (同梱サンプルなので、clone しただけの人のビルドに勝手に入らないようにしてある)。有効にするには `disabled: true` を消す。
 
 **UI を出すにはフロントの再ビルドも要る。** `make build` が呼ぶ `pluginbuild` は
 取り込み先の TypeScript を生成するだけで、vite ビルドまでは走らない。手順は環境
 ごとに違うので [デプロイ](../../docs/deployment.md) を見ること。
 
-**手元で動かすだけなら `make plugin-dev PLUGIN=plugins/status`。** tracked ファイル (`mk-plugin.yml`) を編集せずに済む。`disabled: true` を消して push すると、同梱サンプルが既定無効であることを見る CI (`build` job の `Check bundled plugins are disabled by default`) が落ちる。
+**手元で動かすだけなら `make plugin-dev PLUGIN=plugins/status`。** tracked ファイル (`elythia-plugin.yml`) を編集せずに済む。`disabled: true` を消して push すると、同梱サンプルが既定無効であることを見る CI (`build` job の `Check bundled plugins are disabled by default`) が落ちる。
 
 ```yaml
 # .config/default.yml — 変えたいときだけ
@@ -45,7 +45,7 @@ plugins:
 | `Jobs` | **期限切れの掃除**。期限を持つなら必ず要る |
 | `Storage` | 自分の schema への読み書き |
 | `Config` | `maxLength` を運営者が決められるようにする |
-| `API` | **凍結された利用者の分を出さない**。判断を mk-go に任せる |
+| `API` | **凍結された利用者の分を出さない**。判断を Elythia に任せる |
 | `StatusError` | 文字数超過を利用者に伝える（利用者が直せるエラー） |
 | スロット 2 種 | 設定画面とプロフィール |
 | `pages` (宣言) | 一覧ページ (ランチパッドに出る) と管理画面 (コントロールパネルに出る) |

@@ -20,12 +20,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/core/drive"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/misc/imagedecode"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/testutil"
+	"github.com/elythia-network/elythia/internal/core/drive"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/imagedecode"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1398,8 +1398,7 @@ func newSvcWithStorage(t *testing.T, st drive.Storage) (*drive.Service, *testuti
 
 // #2315: storedInternal は「実際にローカルへ書いたか」を反映する。true 固定
 // だった頃は、オブジェクトストレージへ保存したファイルまで「ローカル保存」と
-// 記録され `/files/:accessKey` がローカルを見て 404 になっていた。TS へ
-// 切り戻したときも FileServerService が同じ列を見るので drop-in にも効く。
+// 記録され `/files/:accessKey` がローカルを見て 404 になっていた。
 func TestUpload_StoredInternalReflectsBackend(t *testing.T) {
 	localSvc, _ := newSvcWithStorage(t, drive.NewLocalStorage(t.TempDir(), "https://example.com/files"))
 	f, err := localSvc.Upload(context.Background(), drive.UploadInput{Body: []byte("local"), Name: "a.bin"})

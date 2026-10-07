@@ -8,7 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 
-	"github.com/shiroha-a/mk/internal/misc/idnhost"
+	"github.com/elythia-network/elythia/internal/misc/idnhost"
 )
 
 // HostColumn identifies one remote-host column to normalize.
@@ -125,7 +125,7 @@ type HostConflict struct {
 //
 // **PostgreSQL に IDNA 変換が無い**ので SQL migration では書けない。`lower()` だけ
 // では `パイ.example` → `xn--eckve.example` を作れないため、app-level のバッチにする
-// (`cmd/backfill-note-tags` と同じ理由)。
+// (`elythia backfill note-tags` と同じ理由)。
 //
 // **衝突はマージせず skip して数える。** 同じリモートが表記違いで 2 行に増えている
 // 場合、正規化すると一意制約 (`user` の (usernameLower, host) / `instance` の host /

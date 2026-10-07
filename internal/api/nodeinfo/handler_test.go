@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +31,7 @@ func TestVersion2_1(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Equal(t, "2.1", resp["version"])
 	sw := resp["software"].(map[string]any)
-	assert.Equal(t, "mk-go", sw["name"])
+	assert.Equal(t, "elythia", sw["name"])
 	assert.Equal(t, config.MkGoVersion, sw["version"])
 	// #1925: 2.1 は homepage=repository=softwareRepository。
 	assert.Equal(t, softwareRepository, sw["homepage"])
@@ -114,7 +114,7 @@ func TestVersion2_0(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Equal(t, "2.0", resp["version"])
 	sw := resp["software"].(map[string]any)
-	assert.Equal(t, "mk-go", sw["name"])
+	assert.Equal(t, "elythia", sw["name"])
 	_, hasRepo := sw["repository"]
 	assert.False(t, hasRepo, "schema 2.0 は software.repository を含めない")
 	// #1925: 2.0 は repository を delete するが homepage は残す。
@@ -340,7 +340,7 @@ func TestVersion2_1_PeeredPlugins(t *testing.T) {
 	var out map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
 	meta, _ := out["metadata"].(map[string]any)
-	_, present := meta["mkGoPlugins"]
+	_, present := meta["elythiaPlugins"]
 	assert.False(t, present, "宣言が無ければキーごと出さない")
 
 	h.SetPeeredPlugins([]string{"demo"})
@@ -350,7 +350,9 @@ func TestVersion2_1_PeeredPlugins(t *testing.T) {
 
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
 	meta, _ = out["metadata"].(map[string]any)
-	assert.Equal(t, []any{"demo"}, meta["mkGoPlugins"])
+	assert.Equal(t, []any{"demo"}, meta["elythiaPlugins"])
+	_, legacy := meta["mkGoPlugins"]
+	assert.False(t, legacy, "改名 (#3400) より前の key は出さない")
 }
 
 // --- server-side cache (upstream MemorySingleCache 相当) ---
@@ -542,13 +544,13 @@ func TestNodeinfo_SettersInvalidateCache(t *testing.T) {
 
 	out := getNodeinfo(t, h.Version2_1)
 	meta := out["metadata"].(map[string]any)
-	_, present := meta["mkGoPlugins"]
+	_, present := meta["elythiaPlugins"]
 	require.False(t, present)
 
 	h.SetPeeredPlugins([]string{"demo"})
 	out = getNodeinfo(t, h.Version2_1)
 	meta = out["metadata"].(map[string]any)
-	assert.Equal(t, []any{"demo"}, meta["mkGoPlugins"], "setter 後は build し直す")
+	assert.Equal(t, []any{"demo"}, meta["elythiaPlugins"], "setter 後は build し直す")
 }
 
 // 「受け付けない」(#3186) は、列だけが立っていても登録不可と名乗る。

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	coreemail "github.com/shiroha-a/mk/internal/core/email"
+	coreemail "github.com/elythia-network/elythia/internal/core/email"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -33,7 +33,7 @@ func TestWrapHTML_SiteNameDefault(t *testing.T) {
 		BodyHTML: "x",
 	})
 	assert.NotContains(t, got, "<img ", "LogoURL 空ならロゴ画像は埋まらない")
-	assert.Contains(t, got, ">Misskey<", "site name デフォルトは Misskey")
+	assert.Contains(t, got, ">Elythia<", "site name デフォルトは Elythia")
 }
 
 // Subject の HTML escape (XSS 防御)

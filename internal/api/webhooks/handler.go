@@ -4,20 +4,20 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/optional"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/api/optional"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
-	"github.com/shiroha-a/mk/internal/server/middleware"
 
-	"github.com/shiroha-a/mk/internal/core/role"
+	"github.com/elythia-network/elythia/internal/core/role"
 )
 
 // webhookEventTypes mirrors upstream Misskey TS の webhookEventTypes constant
-// (third_party/misskey/.../models/Webhook.ts)。i/webhooks/test の type enum
+// (packages/backend/src/.../models/Webhook.ts)。i/webhooks/test の type enum
 // validation で使用 (#937)。
 var webhookEventTypes = map[string]struct{}{
 	"mention":  {},
@@ -278,7 +278,7 @@ func (h *Handler) Delete(c echo.Context) error {
 // に渡し、通常の配信パイプラインを通して登録済み webhook に送信する。
 //
 // upstream Misskey TS の paramDef は webhookId + type を required + type に
-// webhookEventTypes enum check を強制している (third_party/misskey/.../i/
+// webhookEventTypes enum check を強制している (packages/backend/src/.../i/
 // webhooks/test.ts、#937)。
 func (h *Handler) Test(c echo.Context) error {
 	user := middleware.GetUser(c)

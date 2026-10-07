@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // manifest の `name` と `Definition.Name` がずれると、ルートが

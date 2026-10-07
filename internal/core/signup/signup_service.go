@@ -10,19 +10,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/activitypub"
-	"github.com/shiroha-a/mk/internal/misc"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/misc/keyword"
-	passwordpkg "github.com/shiroha-a/mk/internal/misc/password"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
+	"github.com/elythia-network/elythia/internal/activitypub"
+	"github.com/elythia-network/elythia/internal/misc"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/keyword"
+	passwordpkg "github.com/elythia-network/elythia/internal/misc/password"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
 // localUsernamePattern は upstream Misskey TS の `localUsernameSchema`
-// (= third_party の models/User.ts:319) に整合する username 検証 regex。
+// (= 本家の packages/backend/src/models/User.ts:319) に整合する username 検証 regex。
 // `^\w{1,20}$` 相当で `\w` = [a-zA-Z0-9_]、length 1-20。
 //
 // Go の regexp は RE2 default で `\w` が ASCII の [0-9A-Za-z_] に限定されるため
@@ -466,8 +466,8 @@ func (s *Service) SignupWithHost(username, password string, isInitialSetup bool,
 		AvatarDecorations: []byte("[]"),
 		// drop-in 互換 (#785): Misskey TS と同じ意味で初回 signup user を
 		// isRoot=true でマークしておく。mk-go pure 経路では meta.rootUserId
-		// で root を判定するので冗長だが、TS との bidirectional drop-in を
-		// 担保するためマーカーを揃える。
+		// で root を判定するので冗長だが、TS から引き継いだ DB の root と同じ
+		// 形に揃えておく。
 		IsRoot: isInitialSetup,
 		Host:   host,
 	}

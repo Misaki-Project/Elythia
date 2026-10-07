@@ -7,12 +7,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/elythia-network/elythia/internal/api/meta"
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/frontendutil"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/meta"
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/frontendutil"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // embedCacheControl mirrors upstream's `public, max-age=3600` on embed pages.
@@ -150,11 +150,11 @@ func (h *embedHandlers) Fallback(c echo.Context) error {
 
 // render writes the embed HTML shell with the optional context payload.
 func (h *embedHandlers) render(c echo.Context, ctx *embedContext) error {
-	instanceName := "Misskey"
+	instanceName := config.DisplayName
 	// upstream base-embed.tsx:46-47 と同じ fallback (SPA shell と共通)。
 	iconURL := "/favicon.ico"
 	appleTouchIconURL := "/apple-touch-icon.png"
-	themeColor := "#86b300"
+	themeColor := defaultThemeColor
 	metaJSON := "{}"
 
 	// CSP の media origin は object storage (meta 依存) から来るので、
@@ -246,7 +246,7 @@ func (h *embedHandlers) buildHTML(instanceName, iconURL, appleTouchIconURL, them
 
 	// LANGS は embed の boot loader が参照する。定義しないと
 	// `LANGS is not defined` で初期化が落ち、iframe に
-	// "Failed to initialize Misskey" だけが出る (HTML 自体は 200 なので
+	// "Failed to initialize Elythia" だけが出る (HTML 自体は 200 なので
 	// status を見る検査では捕まらない)。通常シェルと同じ値にしてある。
 	//
 	// JSON は <script type="application/json"> にそのまま入れる。閉じタグの

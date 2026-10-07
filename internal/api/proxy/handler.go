@@ -9,9 +9,9 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/mediaproxy"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/core/mediaproxy"
 )
 
 // statusClientClosedRequest is nginx's non-standard 499, used when the client
@@ -76,11 +76,14 @@ func (h *Handler) Handle(c echo.Context) error {
 	if ua == "" {
 		return c.String(http.StatusBadRequest, "User-Agent is required")
 	}
-	// #2106 L43: mk-go の outbound UA は "mk-go/" 始まり (#774 で Misskey/ から rename)。
-	// upstream の "misskey/" 判定だけだと自身の proxy 経由リクエストを recursive 検出できず
-	// loop/増幅防御が効かないため両方を見る。
+	// #2106 L43: 自身の outbound UA は "Elythia/" 始まり (#3394。それより前は "mk-go/"、
+	// #774 で Misskey/ から rename)。upstream の "misskey/" 判定だけだと自身の proxy 経由
+	// リクエストを recursive 検出できず loop/増幅防御が効かないため、どれも見る。旧名は
+	// 改名より前の版を動かしている相手のために残す。
 	lowerUA := strings.ToLower(ua)
-	if strings.Contains(lowerUA, "misskey/") || strings.Contains(lowerUA, "mk-go/") {
+	if strings.Contains(lowerUA, "misskey/") ||
+		strings.Contains(lowerUA, strings.ToLower(config.UserAgentProduct)+"/") ||
+		strings.Contains(lowerUA, config.LegacyUserAgentProduct+"/") {
 		return c.String(http.StatusForbidden, "Proxy is recursive")
 	}
 
@@ -260,6 +263,21 @@ func (h *Handler) Handle(c echo.Context) error {
 		if errors.Is(err, mediaproxy.ErrTooLarge) {
 			return c.NoContent(http.StatusRequestEntityTooLarge)
 		}
+		// **原因をログに残す (#3383)。** status だけでは区別できず、本番の 500 の
+		// 原因を確かめられなかった。ここに来るのは、取得の失敗 (502 / 504)・不正な
+		// URL (400)・404・大きすぎる (413) のどれでもないもの。主にリモートが
+		// 404 / 410 以外の非 2xx (401 / 403 / 429 / 5xx) を返したとき
+		// (`remote returned %d`)、表示できない MIME が来たとき、ストレージの障害。
+		// 画像の変換の失敗は原本かダミーを返すので、ここには来ない。許可確認の
+		// DB 障害は 503 で別に返る。
+		//
+		// **未認証の利用者がこのログを生成できる。** allowlist 済みの URL の相手が
+		// 常に 403 を返せば 1 リクエスト 1 行になる。shed / blocked target と同じく、
+		// 1 リクエスト 1 行でローテーションは #2828 で効いているので Warn で残す。
+		// リモートの 403 が常態的に多いと分かったら、`remote returned` だけ Info に
+		// 下げるかサンプリングを検討する。url は shed / blocked と同じ値 (sig は
+		// 別のパラメータなので含まれない)。
+		slog.Warn("mediaproxy: proxy failed", "url", rawURL, "mode", mode.String(), "err", err)
 		if c.QueryParam("fallback") != "" {
 			return h.serveFallback(c)
 		}

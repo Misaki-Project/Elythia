@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shiroha-a/mk/plugin"
-	"github.com/shiroha-a/mk/plugin/plugintest"
+	"github.com/elythia-network/elythia/plugin"
+	"github.com/elythia-network/elythia/plugin/plugintest"
 )
 
 // decode re-marshals a handler result so the assertions run against the JSON the

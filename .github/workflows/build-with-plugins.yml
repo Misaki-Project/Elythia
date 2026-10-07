@@ -15,11 +15,11 @@
 #       permissions:
 #         contents: read
 #         packages: write          # publish するなら caller 側で宣言する
-#       uses: shiroha-a/mk/.github/workflows/build-with-plugins.yml@<タグ または コミット SHA>
+#       uses: Elythia-Network/elythia/.github/workflows/build-with-plugins.yml@<タグ または コミット SHA>
 #       with:
 #         mk_ref: "<同じタグ または コミット SHA>"
 #         plugins: |
-#           weather https://github.com/foo/mk-plugin-weather v1.2.0
+#           weather https://github.com/foo/elythia-plugin-weather v1.2.0
 #       secrets:
 #         plugin_token: ${{ secrets.PLUGIN_TOKEN }}   # private plugin を使う場合のみ
 #
@@ -29,8 +29,8 @@
 # 固定しても workflow 自体は `uses:` の ref で解決されるので防げない)。
 # docs/plugins/operating.md も同じ書き方にしてある。
 #
-# frontend を持つプラグインがあれば、取得済みsubmoduleからSPAを自前でビルドし、
-# ASSETS_SOURCE=localで同梱する。無ければ固定されたassetsイメージを使用する。
+# **frontend を持つプラグインも扱える。** Dockerfile.bundled が image の中で
+# frontend/ をビルドするので、組み込んだプラグインの .vue も SPA に入る (#3379)。
 name: Build with plugins
 
 on:
@@ -49,7 +49,7 @@ on:
         description: "mk-go のリポジトリ (fork して使う場合のみ変更する)"
         required: false
         type: string
-        default: shiroha-a/mk
+        default: Elythia-Network/elythia
       image:
         description: "publish 先の image。既定は ghcr.io/<呼び出し元リポジトリ>"
         required: false
@@ -88,18 +88,16 @@ jobs:
       image: ${{ steps.target.outputs.tags }}
       digest: ${{ steps.build.outputs.digest }}
     steps:
-      # submodule を取る。frontend を持つプラグインがあるかの判定 (pluginbuild) と、
-      # ある場合の SPA ビルドに third_party/misskey が要る。
+      # frontend/ は本体に入っている (#3379)。
       - name: Checkout mk-go
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.mk_repository }}
           ref: ${{ inputs.mk_ref }}
-          submodules: recursive
           # 後続は mk-go の git 操作を一切しない (プラグインの clone は
           # plugins/<name>/ に作る別リポジトリで、この認証情報を使わない)。
           # 残すと `.git/config` に token が載ったまま、第三者のプラグインの
-          # コードや pnpm install の lifecycle script が走る。
+          # コードが走る。
           persist-credentials: false
 
       - name: Set up Go
@@ -121,8 +119,7 @@ jobs:
       #
       # **token の設定と clone を同じ step に置き、抜けるときに必ず消す。**
       # `--global` に書いたまま step を終えると、後続の `go run ./tools/pluginbuild`
-      # や `pnpm install` (依存パッケージの lifecycle script を実行する) からも
-      # `~/.gitconfig` 経由で token が読める。clone が要るのはこの step だけ。
+      # (プラグインの go.mod を解決する) からも `~/.gitconfig` 経由で token が読める。clone が要るのはこの step だけ。
       # trap は EXIT に掛けるので、pluginresolve が失敗して `set -e` で抜ける
       # ときも消える。消し損ねたら step ごと落とす (token が残ったまま後続へ
       # 進ませない)。
@@ -142,11 +139,8 @@ jobs:
           fi
           printf '%s\n' "$MK_PLUGINS" | go run ./tools/pluginresolve
 
-      # プラグインの配線を生成し、frontend を持つものがあるかを判定する。
-      # **`ls plugins/*/frontend` では判定できない** — mk-plugin.yml で無効化
-      # されているプラグインは組み込まれないので、pluginbuild の判断に従う。
-      # 生成は Dockerfile 側でも走る (冪等)。ここで走らせるのは SPA のビルドが
-      # 生成物 (server-plugins.generated.ts) を必要とするため。
+      # プラグインの配線を生成し、要求したプラグインが実際に組み込まれるかを
+      # 突き合わせる。生成は Dockerfile 側でも走る (冪等)。
       - name: Generate plugin wiring
         id: wiring
         env:
@@ -157,7 +151,7 @@ jobs:
           printf '%s\n' "$out"
 
           # **要求したプラグインが実際に組み込まれたかを突き合わせる。**
-          # pluginbuild は mk-plugin.yml が `disabled: true` のプラグインを
+          # pluginbuild は elythia-plugin.yml が `disabled: true` のプラグインを
           # 黙って skip して exit 0 で終わる。しかも `disabled: true` は
           # このプロジェクト自身が同梱プラグインに要求している書き方 (#2701) なので、
           # 作者がそれに倣っていれば必ず踏む。見ないと **指定した N 個のうち
@@ -168,11 +162,11 @@ jobs:
           # 「組み込まれていない」と判定されて落ちるので、空振りはしない。
           #
           # **突き合わせるのはディレクトリ名。** pluginbuild が最初に出す名前は
-          # `mk-plugin.yml` の `name:` で、置いたディレクトリ名とは限らない。
+          # `elythia-plugin.yml` の `name:` で、置いたディレクトリ名とは限らない。
           # 運営者が指定できるのはディレクトリ名だけなので、そちらで照合しないと
           # **正しく組み込まれたプラグインで落ちる** (しかも診断が disabled を
           # 疑わせる方向になり、事実と逆を指す)。`dir=` は name より前に出るので、
-          # mk-plugin.yml の `name:` に細工しても別プラグインの行は偽装できない。
+          # elythia-plugin.yml の `name:` に細工しても別プラグインの行は偽装できない。
           #
           # `GOWORK=off` が要る。ここは pluginbuild が go.work を書いた後に走る
           # 唯一の `go run ./tools/*` で、付けないとプラグイン側の go.mod の問題が
@@ -185,47 +179,12 @@ jobs:
               case "$out" in
                 *"dir=plugins/${name} "*) ;;
                 *)
-                  echo "::error::プラグイン ${name} が組み込まれませんでした。mk-plugin.yml が disabled: true になっていないか確認してください"
+                  echo "::error::プラグイン ${name} が組み込まれませんでした。elythia-plugin.yml が disabled: true になっていないか確認してください"
                   exit 1
                   ;;
               esac
             done < "$RUNNER_TEMP/requested.txt"
           fi
-
-          if printf '%s' "$out" | grep -q 'frontend=true'; then
-            echo "frontend=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "frontend=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up pnpm
-        if: steps.wiring.outputs.frontend == 'true'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          # 版は submodule 側 package.json の packageManager から取る。
-          package_json_file: third_party/misskey/package.json
-
-      - name: Set up Node.js
-        if: steps.wiring.outputs.frontend == 'true'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: third_party/misskey/.node-version
-
-      # 公式の assets イメージにはプラグインの .vue が入っていないので、frontend を
-      # 持つプラグインがあるときは SPA を自前でビルドする。手順は fork 側の
-      # Dockerfile.assets と同じ。**NODE_ENV=production が要る** — frontend / sw /
-      # i18n など 7 パッケージがこれを見ており、production でないと minify されず
-      # _DEV_ フラグも立つ。
-      - name: Build frontend with plugins
-        if: steps.wiring.outputs.frontend == 'true'
-        working-directory: third_party/misskey
-        env:
-          NODE_ENV: production
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build-pre
-          pnpm --filter frontend... --filter sw... --filter frontend-embed... build
-          pnpm build-assets
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -281,11 +240,6 @@ jobs:
           platforms: linux/amd64
           push: ${{ inputs.push }}
           tags: ${{ steps.target.outputs.tags }}
-          # frontend を持つプラグインがあれば、直前でビルドした SPA を使う。
-          # 無ければ公式の assets イメージ (既定) のままにして、pnpm のビルドを
-          # まるごと省く。
-          build-args: |
-            ASSETS_SOURCE=${{ steps.wiring.outputs.frontend == 'true' && 'local' || 'external' }}
           labels: |
             org.opencontainers.image.title=mk-go
             org.opencontainers.image.description=mk-go built with operator-selected plugins
@@ -297,6 +251,9 @@ jobs:
           #
           # **`--mount=type=cache` の中身は cache-to では運ばれない** (min でも max
           # でも空。実測)。runner は毎回まっさらなので Go のビルドはどちらでも
-          # 走り直す。max が追加で救うのは `apk add` と `go mod download` の 2 step
-          # だけで、その対価が 421 MB の layer になる。
+          # 走り直す。max にすると `apk add` と `go mod download` に加えて frontend
+          # stage (`pnpm fetch` の層。#3379 の P4c で約 1.2GB と実測した値は pnpm の store を
+          # 層に含んでいた頃のもので、cache mount へ移した今はそれより小さい) も救えるが、その分が呼び出し元の枠を
+          # 圧迫する。min のままにする代わりに、frontend は毎回ビルドし直す
+          # (手元の冷えたビルドで frontend stage だけ約 3 分、#3379)。
           cache-to: type=gha,mode=min

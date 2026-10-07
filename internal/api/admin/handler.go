@@ -16,33 +16,33 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/meself"
+	"github.com/elythia-network/elythia/internal/api/pagination"
+	"github.com/elythia-network/elythia/internal/config"
+	coreabuse "github.com/elythia-network/elythia/internal/core/abuse"
+	"github.com/elythia-network/elythia/internal/core/captcha"
+	coredrive "github.com/elythia-network/elythia/internal/core/drive"
+	"github.com/elythia-network/elythia/internal/core/emojiapplication"
+	"github.com/elythia-network/elythia/internal/core/iplookuplog"
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
+	"github.com/elythia-network/elythia/internal/core/procstats"
+	"github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/core/signup"
+	"github.com/elythia-network/elythia/internal/core/signupapplication"
+	"github.com/elythia-network/elythia/internal/core/userpack"
+	corewebhook "github.com/elythia-network/elythia/internal/core/webhook"
+	"github.com/elythia-network/elythia/internal/core/webpush"
+	"github.com/elythia-network/elythia/internal/effectivepolicy"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/safehttp"
+	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/api/meself"
-	"github.com/shiroha-a/mk/internal/api/pagination"
-	"github.com/shiroha-a/mk/internal/config"
-	coreabuse "github.com/shiroha-a/mk/internal/core/abuse"
-	"github.com/shiroha-a/mk/internal/core/captcha"
-	coredrive "github.com/shiroha-a/mk/internal/core/drive"
-	"github.com/shiroha-a/mk/internal/core/emojiapplication"
-	"github.com/shiroha-a/mk/internal/core/iplookuplog"
-	"github.com/shiroha-a/mk/internal/core/moderationlog"
-	"github.com/shiroha-a/mk/internal/core/procstats"
-	"github.com/shiroha-a/mk/internal/core/role"
-	"github.com/shiroha-a/mk/internal/core/signup"
-	"github.com/shiroha-a/mk/internal/core/signupapplication"
-	"github.com/shiroha-a/mk/internal/core/userpack"
-	corewebhook "github.com/shiroha-a/mk/internal/core/webhook"
-	"github.com/shiroha-a/mk/internal/core/webpush"
-	"github.com/shiroha-a/mk/internal/effectivepolicy"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/misc/colfit"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/queue"
-	"github.com/shiroha-a/mk/internal/repository"
-	"github.com/shiroha-a/mk/internal/safehttp"
-	"github.com/shiroha-a/mk/internal/server/middleware"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -1985,9 +1985,11 @@ func (h *Handler) maybeAutoGenerateVAPID(fields map[string]any) error {
 // other registration modes (mk-go, #3186).
 //
 // **有効な間は disableRegistration を立てる。** 外から見た値 (nodeinfo の
-// `openRegistrations` / `/api/meta` の `features.registration`) を本家と同じにするため
-// と、TS へ戻したときに招待制へ落とすため (新しい列は無視される)。利用者の指定より
-// 優先する — 閉じたまま登録が開いた値を残すと、TS へ戻したときに開く。
+// `openRegistrations` / `/api/meta` の `features.registration`) は registrationClosed と
+// OR を取って計算するのでこれが無くても閉じるが、admin/meta が返す生の
+// `disableRegistration` (本家の管理画面が読む値) も閉じた状態に揃える。利用者の指定より
+// 優先する。当初は TS へ戻したときに招待制へ落とすことも理由だったが、復路は保証
+// しなくなった (#3191)。
 //
 // **承認制は外さない。** 閉じている間も申請者が状態を照会できるように (照会は承認制の
 // 入口で、閉じている間も開けてある) と、解除したときに元の受け付け方へ戻れるように。

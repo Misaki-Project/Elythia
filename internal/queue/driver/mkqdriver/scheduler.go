@@ -8,9 +8,9 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/shiroha-a/mkq"
+	"github.com/elythia-network/mkq"
 
-	"github.com/shiroha-a/mk/internal/queue/driver"
+	"github.com/elythia-network/elythia/internal/queue/driver"
 )
 
 // Scheduler implements driver.Scheduler over mkq's

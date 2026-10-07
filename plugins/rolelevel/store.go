@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // queryer is satisfied by both *sql.DB and *sql.Tx, so a write that must be atomic

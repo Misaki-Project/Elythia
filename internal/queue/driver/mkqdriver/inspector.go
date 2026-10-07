@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/shiroha-a/mkq"
+	"github.com/elythia-network/mkq"
 
-	"github.com/shiroha-a/mk/internal/queue/driver"
+	"github.com/elythia-network/elythia/internal/queue/driver"
 )
 
 // Inspector implements driver.Inspector over the per-queue API

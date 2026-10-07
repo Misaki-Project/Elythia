@@ -17,24 +17,24 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/cache"
+	"github.com/elythia-network/elythia/internal/core/chart"
+	corefederation "github.com/elythia-network/elythia/internal/core/federation"
+	corenote "github.com/elythia-network/elythia/internal/core/note"
+	corerole "github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/misc/password"
+	"github.com/elythia-network/elythia/internal/misc/redact"
+	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/queue/driver"
+	queuemetrics "github.com/elythia-network/elythia/internal/queue/metrics"
+	"github.com/elythia-network/elythia/internal/queue/runtimestats"
+	"github.com/elythia-network/elythia/internal/repository"
+	mksentry "github.com/elythia-network/elythia/internal/sentry"
+	"github.com/elythia-network/elythia/internal/server/middleware"
+	"github.com/elythia-network/elythia/plugin"
 	"github.com/labstack/echo/v4"
 	echomw "github.com/labstack/echo/v4/middleware"
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/core/cache"
-	"github.com/shiroha-a/mk/internal/core/chart"
-	corefederation "github.com/shiroha-a/mk/internal/core/federation"
-	corenote "github.com/shiroha-a/mk/internal/core/note"
-	corerole "github.com/shiroha-a/mk/internal/core/role"
-	"github.com/shiroha-a/mk/internal/misc/password"
-	"github.com/shiroha-a/mk/internal/misc/redact"
-	"github.com/shiroha-a/mk/internal/queue"
-	"github.com/shiroha-a/mk/internal/queue/driver"
-	queuemetrics "github.com/shiroha-a/mk/internal/queue/metrics"
-	"github.com/shiroha-a/mk/internal/queue/runtimestats"
-	"github.com/shiroha-a/mk/internal/repository"
-	mksentry "github.com/shiroha-a/mk/internal/sentry"
-	"github.com/shiroha-a/mk/internal/server/middleware"
-	"github.com/shiroha-a/mk/plugin"
 	"gorm.io/gorm"
 )
 
@@ -880,7 +880,7 @@ type DumpedRoutes struct {
 }
 
 // DumpRoutes writes all registered Echo routes as JSON to w.
-// `cmd/misskey -dump-routes` から呼ばれ、tools/apicompat が Misskey TS の
+// `elythia dump-routes` から呼ばれ、tools/apicompat が Misskey TS の
 // endpoint 集合 (filename-derived + ApiServerService 直登録) と突き合わせる
 // ための入力になる。echo 内部の "/*" catch-all 等は除外しない (caller 側で
 // 正規化する想定)。出力 path は string sort で安定化。
@@ -1034,7 +1034,7 @@ func (s *Server) Start() error {
 			return err
 		}
 		s.echo.Listener = ln
-		slog.Info("starting Misskey server",
+		slog.Info("starting Elythia server",
 			"socket", s.config.Socket, "url", s.config.URL)
 		// Echo.Start は内部で net.Listen してしまうので、ここでは Start では
 		// なく Serve を使って既に張った listener を使う。
@@ -1045,7 +1045,7 @@ func (s *Server) Start() error {
 	}
 
 	addr := fmt.Sprintf(":%d", s.config.Port)
-	slog.Info("starting Misskey server", "addr", addr, "url", s.config.URL)
+	slog.Info("starting Elythia server", "addr", addr, "url", s.config.URL)
 	return s.echo.Start(addr)
 }
 

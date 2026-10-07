@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/config"
+	corereversi "github.com/elythia-network/elythia/internal/core/reversi"
+	"github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/config"
-	corereversi "github.com/shiroha-a/mk/internal/core/reversi"
-	"github.com/shiroha-a/mk/internal/core/role"
-	"github.com/shiroha-a/mk/internal/repository"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -373,7 +373,7 @@ func (h *Handler) buildDocument(version string) map[string]any {
 	// を持ち、2.0 は repository を delete (homepage は残す)、2.1 は homepage=repository。
 	// mk-go は homepage=repository=softwareRepository で両 version に homepage を出す (#1925)。
 	software := map[string]any{
-		"name":     "mk-go",
+		"name":     config.SoftwareName,
 		"version":  config.MkGoVersion,
 		"homepage": softwareRepository,
 	}
@@ -382,11 +382,12 @@ func (h *Handler) buildDocument(version string) map[string]any {
 		software["repository"] = softwareRepository
 	}
 
-	// mk-go 独自。相手が「同じプラグインを持っているか」を判断するのに使う
+	// 独自の宣言。相手が「同じプラグインを持っているか」を判断するのに使う
 	// (#2537)。宣言が無ければキーごと出さない — 使っていないインスタンスが
-	// 余計な情報を晒さないようにする。
+	// 余計な情報を晒さないようにする。#3400 で `mkGoPlugins` から改めた。旧名は
+	// 出さない (改名より前の版の相手とは、相手が上げるまでプラグインの連合が止まる)。
 	if len(h.peeredPlugins) > 0 {
-		metadata["mkGoPlugins"] = h.peeredPlugins
+		metadata["elythiaPlugins"] = h.peeredPlugins
 	}
 
 	return map[string]any{

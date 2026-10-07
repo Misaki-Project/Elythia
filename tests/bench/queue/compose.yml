@@ -1,0 +1,245 @@
+# project name を別に分離 (#804 follow-up)。default だと UDS 本番の
+# container 群と衝突する。
+name: mk-queue-bench
+
+services:
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    volumes:
+      - certs:/certs
+      - ./common/gen-certs.sh:/gen-certs.sh:ro
+
+  blackhole:
+    build:
+      context: ../../..
+      dockerfile: tests/bench/queue/blackhole/Dockerfile
+    command: ["-addr", ":80"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [bench]
+
+  faker:
+    build:
+      context: ../../..
+      dockerfile: tests/bench/queue/faker/Dockerfile
+    command: ["-host", "faker"]
+    environment:
+      FAKER_HOST: faker
+    depends_on:
+      certs: { condition: service_completed_successfully }
+    volumes:
+      - certs:/certs:ro
+      - faker-state:/state
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      bench:
+        aliases: [faker]
+
+  postgres-mkq:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [bench]
+
+  redis-mkq:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [bench]
+
+  app-mkq:
+    build:
+      context: ../../..
+      dockerfile: tests/federation/common/Dockerfile.mkgo
+    environment:
+      SSL_CERT_FILE: /certs/bundle.pem
+      TZ: Asia/Tokyo
+      MK_ENABLEIPRATELIMIT: "false"
+      MK_DISABLEENDPOINTRATELIMITS: "true"
+      MK_JOBQUEUEDRIVER: mkq
+    depends_on:
+      postgres-mkq: { condition: service_healthy }
+      redis-mkq: { condition: service_healthy }
+      certs: { condition: service_completed_successfully }
+    volumes:
+      - certs:/certs:ro
+      - ./common/mk-mkq.yml:/app/.config/default.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    networks: [bench]
+
+  nginx-mkq:
+    image: nginx:alpine
+    volumes:
+      - ./common/nginx-mk-mkq.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      app-mkq: { condition: service_healthy }
+    networks:
+      bench:
+        aliases: [mk-mkq]
+
+  postgres-ts:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [bench]
+
+  redis-ts:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [bench]
+
+  app-ts:
+    image: misskey/misskey:2026.10.0
+    environment:
+      NODE_ENV: development
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-ts: { condition: service_healthy }
+      redis-ts: { condition: service_healthy }
+    volumes:
+      - ./common/ts.yml:/misskey/.config/default.yml:ro
+    healthcheck:
+      # Misskey の /api/ping は POST 専用 (本家 misskey-js も POST で叩いている)。
+      # curl は image に同梱済 (wget は無いので使えない)。
+      test: ["CMD", "curl", "-sf", "-X", "POST", "-H", "Content-Type: application/json", "-d", "{}", "http://127.0.0.1:3000/api/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    networks: [bench]
+
+  nginx-ts:
+    image: nginx:alpine
+    volumes:
+      - ./common/nginx-ts.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      app-ts: { condition: service_started }
+      certs: { condition: service_completed_successfully }
+    networks:
+      bench:
+        aliases: [ts]
+
+  seed:
+    profiles: [bench]
+    build:
+      context: .
+      dockerfile: common/Dockerfile.driver
+    environment:
+      MKGO_MKQ_URL: https://mk-mkq
+      TS_URL: https://ts
+      FAKER_URL: http://faker:8081
+      FAKER_HOST: faker
+      FAKER_BASE_HTTPS: https://faker
+    depends_on:
+      app-mkq: { condition: service_healthy }
+      nginx-ts: { condition: service_started }
+      faker: { condition: service_healthy }
+      blackhole: { condition: service_healthy }
+    volumes:
+      - ./common:/app/common:ro
+      - ./results:/results
+      - seed-state:/state
+    command: ["python", "/app/common/seed.py"]
+    networks: [bench]
+
+  driver-outbound:
+    profiles: [outbound]
+    build:
+      context: .
+      dockerfile: common/Dockerfile.driver
+    environment:
+      MKGO_MKQ_URL: https://mk-mkq
+      TS_URL: https://ts
+      OUTBOUND_NOTES: "100"
+      OUTBOUND_FOLLOWERS: "100"
+      REDIS_MKQ_HOST: redis-mkq
+      REDIS_TS_HOST: redis-ts
+    volumes:
+      - ./common:/app/common:ro
+      - ./results:/results
+      - seed-state:/state:ro
+    command: ["python", "/app/common/driver_outbound.py"]
+    networks: [bench]
+
+  driver-inbound:
+    profiles: [inbound]
+    build:
+      context: .
+      dockerfile: common/Dockerfile.driver
+    environment:
+      MKGO_MKQ_URL: https://mk-mkq
+      TS_URL: https://ts
+      FAKER_URL: http://faker:8081
+      # 既定値は load test 用 (10000 req × concurrency 128)。CI smoke の
+      # ように regression test 目的で軽く回したい場合は host env で
+      # `INBOUND_COUNT=100 INBOUND_CONCURRENCY=16 make queue-bench-inbound`
+      # 等と override する (#1163)。
+      INBOUND_COUNT: "${INBOUND_COUNT:-10000}"
+      INBOUND_CONCURRENCY: "${INBOUND_CONCURRENCY:-128}"
+      # create (default) または announce。announce は seed が生成した
+      # target_note_uri を faker に渡して Announce 経路の bench を回す。
+      INBOUND_ACTIVITY_TYPE: "${INBOUND_ACTIVITY_TYPE:-create}"
+      REDIS_MKQ_HOST: redis-mkq
+      REDIS_TS_HOST: redis-ts
+    volumes:
+      - ./common:/app/common:ro
+      - ./results:/results
+      - seed-state:/state:ro
+    command: ["python", "/app/common/driver_inbound.py"]
+    networks: [bench]
+
+  report:
+    profiles: [report]
+    build:
+      context: .
+      dockerfile: common/Dockerfile.driver
+    volumes:
+      - ./common:/app/common:ro
+      - ./results:/results
+    command: ["python", "/app/common/report.py", "--out", "/results/queue-report.md"]
+    networks: [bench]
+
+volumes:
+  certs:
+  faker-state:
+  seed-state:
+
+networks:
+  bench:
+    driver: bridge

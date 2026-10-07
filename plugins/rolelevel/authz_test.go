@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/shiroha-a/mk/plugin"
-	"github.com/shiroha-a/mk/plugin/plugintest"
+	"github.com/elythia-network/elythia/plugin"
+	"github.com/elythia-network/elythia/plugin/plugintest"
 )
 
 // **管理用のルートは自分で守る。** Router は認証の有無しか見ないので、管理画面を

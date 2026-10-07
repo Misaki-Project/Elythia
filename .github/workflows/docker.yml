@@ -5,8 +5,9 @@ name: Docker
 # - develop / main への push と `v*` タグ push で実 push する。
 # - PR では build だけ行って、動く Dockerfile かどうかを検証する (push はしない)。
 #
-# image 名は `${{ github.repository }}` をそのまま使うので、upstream では
-# `ghcr.io/shiroha-a/mk`、fork では `ghcr.io/nananek/mk-go` になる。
+# image 名は `${{ github.repository }}` を小文字にしたもの。upstream では
+# `ghcr.io/elythia-network/elythia` (#3394 の移管より前は `ghcr.io/shiroha-a/mk`)、
+# fork では `ghcr.io/nananek/mk-go` になる。
 
 on:
   push:
@@ -54,19 +55,15 @@ jobs:
           # tag input が指定されていればそのタグを、無ければ通常どおり
           # イベントの ref を build する。
           ref: ${{ inputs.tag || github.ref }}
-          # third_party/misskey (packages/backend/assets など) がDockerfileの
-          # COPY対象になるため、submoduleを取得しないとbuildが失敗する。
-          submodules: recursive
           # この job は GHCR へ publish する (packages: write)。後続は git の
-          # 認証を使わない (submodule はこの step の中で取り終える) ので、
-          # token を `.git/config` に残して pnpm install の lifecycle script
-          # などから読める状態にしない。
+          # 認証を使わないので、token を `.git/config` に残して pnpm install の
+          # lifecycle script などから読める状態にしない。
           persist-credentials: false
 
       - name: Set up pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          # pnpm のバージョンは submodule 側 package.json の packageManager から
+          # pnpm のバージョンは frontend/package.json の packageManager から
           # 取る。mk リポジトリ直下には package.json が無い。
           #
           # **corepack を使わない (#2914)。** Node.js 26 の配布物に corepack は
@@ -78,19 +75,19 @@ jobs:
           # ので、`prepare pnpm@latest` を挟んでも workspace 内で走るのは 11.25.0
           # (実測)。ここで消えるのは corepack への依存と、使われない 12.x を毎回
           # ダウンロードしていた無駄。
-          package_json_file: third_party/misskey/package.json
+          package_json_file: frontend/package.json
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version-file: third_party/misskey/.node-version
+          node-version-file: frontend/.node-version
 
       # Dockerfileが /twemoji (本家frontendの絵文字SVG set) をCOPYするが、
-      # その実体は third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/twemoji
+      # その実体は frontend/node_modules/@misskey-dev/emoji-assets/built/twemoji
       # 配下にあり、pnpm install 後にしか存在しない。runner上で事前にinstallして
-      # Docker build contextに含める (issue #359)。
-      - name: Install third_party/misskey node_modules
-        working-directory: third_party/misskey
+      # Docker build contextに含める (issue #359、#3379 で frontend/ の依存にした)。
+      - name: Install frontend/ node_modules
+        working-directory: frontend
         run: |
           pnpm install --frozen-lockfile
 
@@ -112,6 +109,13 @@ jobs:
       #   - `sha-<shortsha>` (immutable 参照用)
       #   - git tag (v* 押した時)
       #   - `latest` (default branch = develop への push 時)
+      # GHCR は image 名に大文字を受け付けない。移管先の organization
+      # (`Elythia-Network`) は大文字を含むので、小文字へ落とす (#3394)。
+      # metadata-action も images を小文字にするが、それに頼らず明示する
+      # (build-with-plugins.yml と同じ)。
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -155,9 +159,8 @@ jobs:
   # `Dockerfile` からアセット非同梱の image を作るので、既存のビルド&起動
   # フローには影響しない。
   #
-  # アセットは fork が publish する専用 image から COPY するため、この job は
-  # submodule も pnpm install も必要としない (= 既存 job のような事前準備が
-  # 一切要らない)。
+  # frontend は Dockerfile.bundled の中でビルドする (#3379) ので、この job は
+  # pnpm install などの事前準備を必要としない。
   build-and-push-bundled:
     runs-on: ubuntu-latest
     env:
@@ -170,60 +173,9 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           # publish する job なので認証情報を残さない (build-and-push と同じ理由)。
           persist-credentials: false
-        # submodule は不要。Dockerfile.bundled は third_party/misskey を参照せず、
-        # アセットを assets image から取る。
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      # Dockerfile.bundled の assets image は `<tag>@sha256:<digest>` で固定して
-      # いる。BuildKit は digest を優先して tag を見ないので、**tag だけ上げて
-      # digest を取り直し忘れると、新しい tag を名乗る古い frontend が焼き込まれる**。
-      # `make submodulepin-check` は tag しか突き合わせられない (ネットワークを
-      # 使わない) ので、registry に問い合わせるのはここで行う。
-      # fork 側が同じ tag を publish し直した場合もここで落ちる (= 中身が変わった
-      # ことに気付ける)。
-      #
-      # **過去タグの再 publish (`-f tag=1.1.1`) では digest が無いのが正しい。**
-      # digest の併記はこの検査より後に入ったので、既存リリースタグの
-      # Dockerfile.bundled は tag だけを持つ。そこで落とすと冒頭の「取りこぼしは
-      # こちらで拾う」経路が bundled だけ塞がる。tag input があって digest が
-      # 無いときは照合を skip して warning を出す (タグを打ち直すのは破壊的なので、
-      # 当時の Dockerfile のまま焼くしかない)。tag input が無いのに digest が
-      # 無いのは pin の付け忘れなので落とす (bundled_assets_pin_test と同じ判定)。
-      - name: Assets image digest matches its tag
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          ref=$(sed -n 's/^ARG MISSKEY_ASSETS_IMAGE=//p' Dockerfile.bundled)
-          if [ -z "$ref" ]; then
-            # 過去タグは ARG の書き方自体が違いうる。照合できないだけで build は
-            # 当時の Dockerfile のまま成立するので、tag input のときは落とさない。
-            if [ -n "$INPUT_TAG" ]; then
-              echo "::warning::$INPUT_TAG の Dockerfile.bundled から MISSKEY_ASSETS_IMAGE を読めなかった。digest の照合を skip する"
-              exit 0
-            fi
-            echo "::error::Dockerfile.bundled から MISSKEY_ASSETS_IMAGE を読めなかった" >&2
-            exit 1
-          fi
-          image=${ref%@*}
-          pinned=${ref#*@}
-          if [ "$image" = "$ref" ]; then
-            if [ -n "$INPUT_TAG" ]; then
-              echo "::warning::$INPUT_TAG の Dockerfile.bundled は assets image を digest で固定していない ($ref)。digest の照合を skip して当時の tag のまま build する"
-              exit 0
-            fi
-            echo "::error::Dockerfile.bundled の MISSKEY_ASSETS_IMAGE ($ref) に digest が無い" >&2
-            exit 1
-          fi
-          # --raw は manifest のバイト列そのものを返すので、その sha256 が digest になる。
-          actual="sha256:$(docker buildx imagetools inspect --raw "$image" | sha256sum | cut -d' ' -f1)"
-          echo "tag=$image pinned=$pinned registry=$actual"
-          if [ "$pinned" != "$actual" ]; then
-            echo "::error::$image の digest が Dockerfile.bundled の pin と違う (pin: $pinned / registry: $actual)。tag を上げたなら digest も取り直すこと (docs/upstream-catch-up.md)" >&2
-            exit 1
-          fi
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -232,6 +184,13 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR は image 名に大文字を受け付けない。移管先の organization
+      # (`Elythia-Network`) は大文字を含むので、小文字へ落とす (#3394)。
+      # metadata-action も images を小文字にするが、それに頼らず明示する
+      # (build-with-plugins.yml と同じ)。
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
 
       - name: Extract metadata
         id: meta
@@ -259,5 +218,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # **scope を分ける。** 既定の scope は build-and-push と共有で、並行して
+          # 走る 2 つの job が書いた index を互いに上書きする。#3379 から frontend の
+          # ビルド (#3379 の P4c で依存込みの層が約 1.2GB と実測。pnpm の store を
+          # cache mount へ移す前の値で、今はそれより小さい) をこの image の中で行うので、取り合いで
+          # キャッシュを失うと毎回 frontend をビルドし直すことになる。
+          cache-from: type=gha,scope=bundled
+          cache-to: type=gha,mode=max,scope=bundled

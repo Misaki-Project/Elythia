@@ -14,18 +14,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/misc/colfit"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/misc/imagedecode"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
-	"github.com/shiroha-a/mk/internal/safehttp"
-	"github.com/shiroha-a/mk/internal/safemath"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/imagedecode"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/safehttp"
+	"github.com/elythia-network/elythia/internal/safemath"
 	"golang.org/x/sync/semaphore"
 	"gorm.io/datatypes"
 
-	"github.com/shiroha-a/mk/internal/core/role"
+	"github.com/elythia-network/elythia/internal/core/role"
 )
 
 // Errors returned by Service.
@@ -860,8 +860,7 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (*model.DriveFile,
 		// upstream DriveService.save は useObjectStorage で true/false を
 		// 出し分ける。ここを true 固定にしていたため、オブジェクトストレージに
 		// 保存したファイルまで「ローカル保存」と記録され、`/files/:accessKey`
-		// がローカルを見に行って 404 になっていた (#2315)。TS へ切り戻した
-		// ときも FileServerService が同じ列を見るので drop-in にも効く。
+		// がローカルを見に行って 404 になっていた (#2315)。
 		StoredInternal:     storedInternal,
 		URL:                url,
 		ThumbnailURL:       thumbnailURL,

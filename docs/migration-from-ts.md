@@ -1,35 +1,35 @@
-# Misskey-TSからmk-goへの移行ガイド
+# Misskey-TSからElythiaへの移行ガイド
 
-本ガイドでは、既存のMisskey-TSインスタンスのバックエンドをmk-goに置き換え、同じデータベース・Redis・フロントエンド資産を共有させる手順を説明する。
+本ガイドでは、既存のMisskey-TSインスタンスのバックエンドをElythiaに置き換え、同じデータベース・Redis・フロントエンド資産を共有させる手順を説明する。
 
 ## 前提条件
 
 - Go 1.27+
-- PostgreSQL 16+ (既存のMisskey-TSデータベース)。**mk-go の compose 群と CI は 18 に統一している** (#2513) ので、docker で運用するなら 18 に上げてから移行する方が構成が揃う。既存の 16 volume はイメージを上げるだけでは開けず dump→restore が要る (手順: [deployment.md](deployment.md#postgresql-16--18-への移行-既存環境))
+- PostgreSQL 16+ (既存のMisskey-TSデータベース)。**Elythia の compose 群と CI は 18 に統一している** (#2513) ので、docker で運用するなら 18 に上げてから移行する方が構成が揃う。既存の 16 volume はイメージを上げるだけでは開けず dump→restore が要る (手順: [deployment.md](deployment.md#postgresql-16--18-への移行-既存環境))
 - Redis 7+
 - git
 
 ## 1. クローンとビルド
 
 ```bash
-git clone --recursive https://github.com/shiroha-a/mk.git mk-go
+git clone https://github.com/Elythia-Network/elythia.git mk-go
 cd mk-go
-go build -o built/misskey ./cmd/misskey
+go build -o built/elythia ./cmd/elythia
 ```
 
-`--recursive` でsubmodule (`third_party/misskey`) も取得される。
+フロントエンドのソースは本体の `frontend/` (Misskey TS の fork を取り込んだ pnpm workspace) に含まれている。
 
 ## 2. フロントエンド資産の準備
 
-mk-goはMisskey-TSと同じフロントエンドを利用する。2つの方法がある。
+ElythiaはMisskey-TSと同じフロントエンドを利用する。2つの方法がある。
 
-### 方法A: submoduleのフロントエンドをビルド (推奨)
+### 方法A: 同梱のフロントエンド (`frontend/`) をビルド (推奨)
 
 ```bash
 make e2e-frontend-build
 ```
 
-Docker内でフロントエンドがビルドされ、成果物は `third_party/misskey/built/` 配下に配置される。mk-goはデフォルトでこのパスを参照するため、環境変数の設定は不要。
+Docker内でフロントエンドがビルドされ、成果物は `frontend/built/` 配下に配置される (ビルドの前に `make plugins` も走る)。Elythiaはデフォルトでこのパスを参照するため、環境変数の設定は不要。
 
 ### 方法B: 既存のMisskey-TSのビルド済み資産を使う
 
@@ -73,31 +73,31 @@ id: aidx             # Misskey-TS側のID生成方式と一致させること
 
 mk-goの追加テーブルを作り、共有テーブルを upstream の形に揃える。**Misskey-TSが書いたデータは原則として保持される** (例外は `000081` / `000084` / `000085` / `000094` / `000098`、後述)。`000082` も行を DELETE するが、対象は upstream Misskey に無い `transfer-ownership` が作った行だけで TS 由来のものは含まない。`000098` は CherryPick 由来のリモートアバターデコレーションだけを削除する。
 
-共有テーブルにも触るものが 18 件あるので、内容と復路への影響を[破壊的なマイグレーション](#破壊的なマイグレーション)にまとめてある。**先に読むこと。**
+共有テーブルにも触るものが 19 件あるので、内容と復路への影響（復路は保証しない）を[破壊的なマイグレーション](#破壊的なマイグレーション)にまとめてある。**先に読むこと。**
 
 ```bash
 # ローカルビルドの場合
-go run ./cmd/migrate -direction up
+go run ./cmd/elythia migrate -direction up
 
 # Docker imageの場合 (migrateバイナリが同梱されている)
-docker compose exec app /app/migrate -config .config/default.yml -direction up
+docker compose exec app /app/elythia migrate -config .config/default.yml -direction up
 ```
 
 これによりGo側で必要な追加テーブル (`app`, `auth_session`, `webhook`, `sw_subscription`, `chat_room`, `chat_message`, `bubble_game_record` 等) が作成される。
 
 ### 破壊的なマイグレーション
 
-「追加のみ」ではない。共有テーブルに触るものが 18 件ある。**うち 13 件は mk-go 側だけが作るもの (列 / FK / index / seed / 重複行 / 譲渡が残した membership) の除去、その初期化、または upstream 追随で、Misskey-TS が書いた列の値には影響しない。残る 5 件 (`000081` / `000084` / `000085` / `000094` / `000098`) は TS が書いた値にも当たる (`000098` は TS fork の CherryPick 由来)。**
+「追加のみ」ではない。共有テーブルに触るものが 19 件ある。**うち 14 件は Elythia / Misaki 側だけが作るものの除去、その初期化、または upstream 追随で、Misskey-TS が書いた列の値には影響しない。残る 5 件 (`000081` / `000084` / `000085` / `000094` / `000098`) は TS が書いた値にも当たる (`000098` は TS fork の CherryPick 由来)。**
 
 | migration | 内容 | 位置づけ |
 |---|---|---|
-| `000029` | `poll_vote."createdAt"` を DROP | mk-goが余分に作った列。upstream の `MiPollVote` に元から無く、mk-go も書き込むだけで読んでいなかった |
-| `000036` | `note."appId"` / `note."score"` を DROP | **mk-goが `000033` で追加した列**。TS 側は `1580148575182` / `1696569742153` で DROP 済みなので、既存 TS インスタンスの DB には元から存在しない |
-| `000053` | `poll."notifiedAt"` の過去分を backfill (`UPDATE`) | mk-go独自列 (`000044` で追加) の初期化。TS 由来の列には触らない。埋めておかないと `ExpiryWorker` の初回 tick で過去のアンケート全件に `pollEnded` 通知が一斉発火する (#1415) |
-| `000056` | `note.uri` の重複行を DELETE (最小 `id` を残す) | **mk-go固有の race で作られた重複コピーの除去** (#1527)。`IngestNote` の `FindByURI` → `Create` が並行すると同一 URI の行が増えていた。`000057` で UNIQUE index を張る前提として要る |
-| `000064` | `registration_ticket_pendingUserId_fkey` を DROP | mk-goが `000026` で余分に張った FK (#2083)。upstream の `pendingUserId` は無制約 `varchar`。この FK があると確認メール再送防止が必ず FK 違反で no-op になっていた |
-| `000067` | `migrations` の seed 行を DELETE + 正式名へ `UPDATE` + 未 seed 分を `INSERT` | **`000029` が seed した mk-go 由来の行を直すもの** (#2244)。TypeORM は `name` 列の文字列一致で未実行判定するので、短縮形のままだと TS 復帰時に本家 migration が再実行される |
-| `000068` | 冗長な index を DROP | **落とすのは mk-go の migration が作った index だけ**。upstream 由来の index は絶対に触らない (触ると本家が再作成できず復路が壊れるため) |
+| `000029` | `poll_vote."createdAt"` を DROP | Elythiaが余分に作った列。upstream の `MiPollVote` に元から無く、Elythia も書き込むだけで読んでいなかった |
+| `000036` | `note."appId"` / `note."score"` を DROP | **Elythiaが `000033` で追加した列**。TS 側は `1580148575182` / `1696569742153` で DROP 済みなので、既存 TS インスタンスの DB には元から存在しない |
+| `000053` | `poll."notifiedAt"` の過去分を backfill (`UPDATE`) | Elythia独自列 (`000044` で追加) の初期化。TS 由来の列には触らない。埋めておかないと `ExpiryWorker` の初回 tick で過去のアンケート全件に `pollEnded` 通知が一斉発火する (#1415) |
+| `000056` | `note.uri` の重複行を DELETE (最小 `id` を残す) | **Elythia固有の race で作られた重複コピーの除去** (#1527)。`IngestNote` の `FindByURI` → `Create` が並行すると同一 URI の行が増えていた。`000057` で UNIQUE index を張る前提として要る |
+| `000064` | `registration_ticket_pendingUserId_fkey` を DROP | Elythiaが `000026` で余分に張った FK (#2083)。upstream の `pendingUserId` は無制約 `varchar`。この FK があると確認メール再送防止が必ず FK 違反で no-op になっていた |
+| `000067` | `migrations` の seed 行を DELETE + 正式名へ `UPDATE` + 未 seed 分を `INSERT` | **`000029` が seed した Elythia 由来の行を直すもの** (#2244)。TypeORM は `name` 列の文字列一致で未実行判定するので、短縮形のままだと TS 復帰時に本家 migration が再実行される |
+| `000068` | 冗長な index を DROP | **落とすのは Elythia の migration が作った index だけ**。upstream 由来の index は絶対に触らない (TS 生まれの DB と Elythia 生まれの DB で index の名前を揃え、後の migration (`000083` など) が upstream の名前を前提に書けるようにするため。当初の理由は TS へ戻したときに本家が再作成できないことだったが、そちらは今は保証しない) |
 | `000080` | `note` の自己参照 FK (`renoteId` / `replyId`) を DROP | **upstream 追随。** 本家も 2025.8.0 の `1753868431598-remove_note_constraints.js` でこの 2 本を削除しており、現在の `MiNote` は `createForeignKeyConstraints: false` で FK を作らない |
 | `000081` | 孤児化した `note` 行を DELETE + 痕跡列を NULL 化 | **TS が書いた行が対象になりうる 1 つ目。** 下記参照 |
 | `000082` | owner が持つ `chat_room_membership` / `chat_room_invitation` を DELETE | **`transfer-ownership` だけが作れる行の除去** (#2858)。この endpoint は upstream Misskey に無い (出自は [乖離一覧](divergence.md))。upstream は owner に membership 行を作らず (`ChatService.ts` の `concat({userId: room.ownerId, isMuted: false})`)、owner 宛の招待も `createRoomInvitation` が弾くので TS 生まれの DB には存在しない |
@@ -109,6 +109,7 @@ docker compose exec app /app/migrate -config .config/default.yml -direction up
 | `000098` | CherryPick の `avatar_decoration."host" IS NOT NULL` の行をすべて DELETE | **CherryPick が連合先から取り込んだリモート由来のデコレーションだけが対象。** `host IS NULL` のローカル行は保持する。upstream / fresh mk-go のテーブルには `host` 列が無いため、その場合は何もしない。down は no-op で、削除した行は復元できない |
 | `000107` | `abuse_report_notification_recipient` の FK を張り替え (`SET NULL` の mk-go 名 2 本を DROP し、本家と同じ名前の `CASCADE` 3 本を足す) | **upstream 追随** (#3264)。本家 `1713656541000-abuse-report-notification.js` と同じ 3 本 (`userId` -> `user` / `user_profile`、`systemWebhookId` -> `system_webhook`) にする。**TS 製 DB には元から本家の 3 本があるので何もしない** (名前で有無を見て足す)。行は消さない — 直す前に `SET NULL` で宛先が NULL になった通知先は残る。**外部キーを張る前に、本家では作れない形の値を NULL にする** — `user_profile` の無い利用者を指す `userId` (残すと検証で失敗して migration が止まる) と、method に合わない側の参照 (webhook 方式の行の `userId`、email 方式の行の `systemWebhookId`。残すと CASCADE で無関係な削除に巻き込まれて通知先ごと消える)。どれも TS が書く値には当たらず、down でも戻らない |
 | `000108` | `note."pageCount"`をページcontentから数え直して補完 (`UPDATE`) | **upstream追従** (#3293)。既存ページが参照するノートを本家と同じ数え方で補完する。参照されているノートだけを触り、TSが維持した値は変わらない。downはno-op。upstreamの番号107を、適用済みMisaki migration107を保持するため108へ割り当てた |
+| `000117` | 以前の既定repository/feedback URLだけを新しい上流URLでUPDATE | **Elythiaが自分で入れた値の更新。** 運営者が設定したURLには触れない。downは以前の既定値へ戻す。上流の番号116をMisakiでは117へ割り当てる |
 
 #### `000081` について
 
@@ -122,7 +123,7 @@ DELETE の対象はこの残骸で、条件は
 
 を**同時に満たす行だけ**。中身を持つ引用リノートは消さない。
 
-**TS が INSERT した行でも、mk-go 稼働中に `renoteId` を失えばこの条件に合致して消える。** 消えるのは表示されない空殻なので実害は小さいが、「TS のデータには一切触らない」わけではない。
+**TS が INSERT した行でも、Elythia 稼働中に `renoteId` を失えばこの条件に合致して消える。** 消えるのは表示されない空殻なので実害は小さいが、「TS のデータには一切触らない」わけではない。
 
 続く 2 つの `UPDATE` は痕跡列の掃除で、`renoteUserId` / `renoteUserHost` / `renoteChannelId` を NULL 化するものと、**`replyId` を失った行の `replyUserId` / `replyUserHost` を NULL 化するもの**。後者は `renoteUserId` の条件を通らない通常の返信行にも当たる。
 
@@ -130,20 +131,20 @@ DELETE の対象はこの残骸で、条件は
 
 #### `000084` について
 
-`meta."repositoryUrl"` が「未設定」のままだと、frontend の `/about-mkgo` と
+`meta."repositoryUrl"` が「未設定」のままだと、frontend の `/about-elythia` と
 `MkSourceCodeAvailablePopup` がソースコードの案内を出せない。AGPL-3.0 section 13 が
 求める案内が既定で存在しない状態なので埋める (#2700)。
 
 **未設定は 2 通りある。**
 
-- `NULL` — mk-go 生まれの DB。`000029` が列 DEFAULT を upstream 互換の
+- `NULL` — Elythia 生まれの DB。`000029` が列 DEFAULT を upstream 互換の
   `https://github.com/misskey-dev/misskey` に設定しているが、meta 行を作るのは GORM の
   `Create(&model.Meta{...})` で、`*string` の nil を **NULL として明示挿入する**ため
   列 DEFAULT が効かない (新規行は `internal/repository/meta.go` の `EnsureInitial` 側で
   入れるようにしたので、この migration の対象は既存行だけ)
 - `https://github.com/misskey-dev/misskey` — **Misskey TS 生まれの DB**。TypeORM は
   未指定の列に `DEFAULT` を書くので、TS が作った meta 行は必ずこの値を持つ。operator の
-  申告ではなく列 DEFAULT の値であり、動いているのが mk-go である以上「このサーバーの
+  申告ではなく列 DEFAULT の値であり、動いているのが Elythia である以上「このサーバーの
   コード」として Misskey 本体を案内するのは誤りになる。さらに frontend は
   `repositoryUrl !== 'https://github.com/misskey-dev/misskey'` で改変版の告知ポップアップを
   出すか決めるので、この値のままだと**告知そのものが出ない**
@@ -153,8 +154,8 @@ DELETE の対象はこの残骸で、条件は
 操作の結果は 1 つ目と区別できない。AGPL 13 条の観点では案内が無い状態のほうが問題なので
 埋める側に倒してある。別の URL を出したい operator は admin 画面で設定し直せる。
 
-**復路 (TS へ戻す) では operator が設定し直すこと。** mk-go が入れた値が残っていると、
-TS 側は「Misskey を改変したバージョン」として mk-go のリポジトリを案内し続ける。
+**TS へ戻す場合 (保証はしない) は operator が設定し直すこと。** Elythia が入れた値が残っていると、
+TS 側は「Misskey を改変したバージョン」として Elythia のリポジトリを案内し続ける。
 `down` は no-op なので自動では戻らない (up 後に operator が同じ値を明示設定した行と
 区別できないため)。
 
@@ -168,7 +169,7 @@ TS 側は「Misskey を改変したバージョン」として mk-go のリポ�
 載る (`internal/api/nodeinfo/handler.go`) ので、未設定だと他インスタンスや一覧サイトから
 見ても欠ける。実際に本番の nodeinfo は `feedbackUrl: null` だった。
 
-既定値は **mk-go の issues** (`https://github.com/shiroha-a/mk/issues/new`)。upstream が
+既定値は **Elythia の issues** (`https://github.com/Elythia-Network/elythia/issues/new`)。upstream が
 列 DEFAULT に Misskey 本体の issues を置いているのと同じ位置づけで、**「ソフトウェアへの
 フィードバック先」**にあたる。「このサーバーへのフィードバック」を受けたい operator は
 admin 画面 (全般 → 情報) で上書きする。
@@ -179,15 +180,15 @@ admin 画面 (全般 → 情報) で上書きする。
 
 `000053` / `000056` / `000067` / `000068` / `000074` / `000081` / `000082` / `000084` / `000085` / `000097` / `000098` / `000108` の 12 本は down が `SELECT 1;` で、upを巻き戻せない。データを不可逆に変えるのはこのうち11本で、変えないのはindexを落とすだけの`000068`。`000074`は補完した行と実観測を区別できず、`000084` / `000085`も補完値とoperatorの明示設定を区別できない。`000097`は解除済み2FAと矛盾するフラグを直す。`000098`はリモート由来デコレーション行を削除する。`000108`はページ参照数を補完し、掃除の保護を外さないため元の値へ戻さない。
 
-#### mk-go 内での切り戻し
+#### Elythia 内での切り戻し
 
-上の表は「TS 製 DB へ流したときに何が起きるか」の観点なので、mk-go 専用テーブルは含めていない。
+上の表は「TS 製 DB へ流したときに何が起きるか」の観点なので、Elythia 専用テーブルは含めていない。
 
 **番号をまたいで `make migrate-down` を繰り返すのは、原則としてデータを失う操作。バックアップを取ってから行うこと。** down の大半は `DROP TABLE` / `DROP COLUMN` で up を打ち消すだけなので、その版で入った値は戻らない。`000022` まで戻せばチャット履歴が、`000025` まで戻せば下書きが、`000001` まで戻せば `user` / `note` / `drive_file` ごと消える。
 
 **個別の migration を見て「これは安全」と判断しないこと。** 判断材料になりそうなものが 2 つあるが、どちらも当てにならない。
 
-- **`-- data loss:` の宣言。** 現行 migration は 109 本（fork の legacy `000098_drop_remote_avatar_decorations` は無変更、upstream の `000098_registration_closed` は `000106_registration_closed`、通知先FKのmigrationは `000107` へ移設。pageCountの補完は `000108`、上流のuser.uriインデックス追加は `000109`）。`-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある。運用も一貫していない — `000076` は `meta` の設定列 1 本を落とすだけで宣言しているが、同じく `meta` の設定列を落とす `000070` は「data loss も無い」と書いている
+- **`-- data loss:` の宣言。** 現行 migration は 117 本（Misakiの既存106〜109を保持し、2.0.0の上流109〜116は110〜117へ割り当てる）。`-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある。運用も一貫していない — `000076` は `meta` の設定列 1 本を落とすだけで宣言しているが、同じく `meta` の設定列を落とす `000070` は「data loss も無い」と書いている
 - **up が冪等かどうか。** `000029` の up は大半が `IF NOT EXISTS` 付きだが、**down は無条件に DROP する**。落ちるのは `user_security_key` / `user_ip` / `user_memo` / `promo_note` / `promo_read` といった **upstream 所有のテーブル**と、`meta` / `user_profile` の 63 列、そして **TypeORM の `migrations` テーブル**。`000067` がわざわざ守っているものを、より悪い形で壊す。宣言は無い。同じ形 (up は冪等、down は無条件 DROP、対象は upstream) は `000030` / `000031` / `000032` / `000038` にもある
 
 方向が違うので別に挙げておくもの:
@@ -196,7 +197,7 @@ admin 画面 (全般 → 情報) で上書きする。
 |---|---|
 | `000077` | **up も down も無条件に `DELETE FROM "signup_application";` を実行する。** 戻すときだけでなく進めるときも申請が消える |
 | `000078` | up で `signup_application."reason"`、down で `"answers"` と `meta."signupApplicationForm"` を DROP する。申請理由・各申請の回答・管理者が定義した申請フォームが失われる |
-| `000072` | `instance_secret` を **テーブルごと** DROP する。`GetOrCreate` はテーブル不在を `ErrRecordNotFound` として扱わないので、**この状態で起動すると `resolveMediaProxySecret` が失敗して mk-go が立ち上がらない**。`mediaProxySecret` を設定ファイルに書いていれば回避できる |
+| `000072` | `instance_secret` を **テーブルごと** DROP する。`GetOrCreate` はテーブル不在を `ErrRecordNotFound` として扱わないので、**この状態で起動すると `resolveMediaProxySecret` が失敗して Elythia が立ち上がらない**。`mediaProxySecret` を設定ファイルに書いていれば回避できる |
 | `000074` | backfill で入れた行と実観測で入った行を区別できないので、`instance_signature_capability` の内容は適用前に戻せない |
 
 両バックエンドは同じデータベース上で共存できる。
@@ -213,10 +214,10 @@ pm2 stop misskey
 docker compose stop web
 ```
 
-## 6. mk-goの起動
+## 6. Elythiaの起動
 
 ```bash
-./built/misskey -config .config/default.yml
+./built/elythia serve -config .config/default.yml
 ```
 
 方法Bで環境変数を使う場合は、**`source .env` では効かない** (`.env` に `export` が無いのでシェル変数にしかならず、子プロセスへ渡らない)。`set -a; . ./.env; set +a` で読み込むか、各行を `export` して起動する。
@@ -238,8 +239,8 @@ docker compose stop web
 新しいインスタンスをDocker Composeで立ち上げる場合は以下で起動できる:
 
 ```bash
-# 1. 起動前に必ずフロントエンドをビルドする (submodule + node_modules を取得し、
-#    third_party/misskey/built/ に SPA 成果物を生成する)。
+# 1. 起動前に必ずフロントエンドをビルドする (frontend/ の node_modules を取得し、
+#    frontend/built/ に SPA 成果物を生成する)。
 make e2e-frontend-build
 
 # 2. 起動 (初回は image build も走る)
@@ -248,42 +249,52 @@ docker compose up -d --build
 
 `docker-compose.yml` には one-shot の `migrate` サービスが含まれており、app 起動前に
 DB マイグレーションが自動適用される (空 DB でも、TS から swap した既存 DB でも冪等)。
-そのため上記の 2 ステップだけで mk-go が PostgreSQL および Redis と共に起動する。
+そのため上記の 2 ステップだけで Elythia が PostgreSQL および Redis と共に起動する。
 詳細は `docker-compose.yml` を参照。
 
-`make e2e-frontend-build` で生成した `third_party/misskey/built`(SPA の vite 成果物、約200MB)は、`docker-compose.yml` が bind-mount でコンテナに渡す（`MISSKEY_FRONTEND_DIR` 等で参照）。static-assets / twemoji / fluent-emoji / repo-assets は image に焼き込まれるためマウント不要。**この frontend ビルドを忘れると SPA の JS/CSS が 404 になりフロントエンドが表示されない**ので注意。
+`make e2e-frontend-build` で生成した `frontend/built`(SPA の vite 成果物、約200MB)は、`docker-compose.yml` が bind-mount でコンテナに渡す（`MISSKEY_FRONTEND_DIR` 等で参照）。static-assets / twemoji / fluent-emoji / repo-assets は image に焼き込まれるためマウント不要。**この frontend ビルドを忘れると SPA の JS/CSS が 404 になりフロントエンドが表示されない**ので注意。
 
-> bare-metal 起動(バイナリを repo root から実行)の場合は、mk-go がデフォルトで `third_party/misskey/built/` 等の相対パスを参照するため環境変数の設定は不要。docker では WORKDIR が `/app` で相対パスが効かないため、上記の bind-mount + 環境変数で渡す。
+> bare-metal 起動(バイナリを repo root から実行)の場合は、Elythia がデフォルトで `frontend/built/` 等の相対パスを参照するため環境変数の設定は不要。docker では WORKDIR が `/app` で相対パスが効かないため、上記の bind-mount + 環境変数で渡す。
 
 ### Docker container の UID
 
-mk-go のコンテナは Misskey-TS と同じ **UID/GID 991** で起動する。`./files` (drive ファイルストレージ) を host volume mount している場合、ホスト側ディレクトリは UID 991 が書き込めるパーミッションでなければならない。
+Elythia のコンテナは Misskey-TS と同じ **UID/GID 991** で起動する。`./files` (drive ファイルストレージ) を host volume mount している場合、ホスト側ディレクトリは UID 991 が書き込めるパーミッションでなければならない。
 
 - **TS から swap する場合**: 既に `./files` の中身が UID 991 で書かれているのでそのまま動く (drop-in 互換)
 - **mk-go-only から旧 root 構成 (#621 以前) で運用していた場合**: 一度だけ `sudo chown -R 991:991 ./files` で所有権を揃える必要がある
 
 ## Misskey-TSへのロールバック
 
-Misskey-TSに戻す場合の手順:
+**Elythia の DB を Misskey-TS へ戻すこと (復路) は保証しない (#3191)。** 往路 (Misskey-TS の DB をそのまま引き継ぐこと) は引き続き保証する。今後の変更には、TS へ戻せることを理由にした制約を課さない。戻せる可能性を残したいなら、**移行の前に取った DB のバックアップから戻す**のが確実な方法になる。
 
-1. mk-goを停止する
+それでも戻す場合の手順:
+
+1. Elythiaを停止する
 2. 従来通りMisskey-TSを起動する
 
-データベースは双方向に互換性があり、mk-goが追加したテーブルはMisskey-TSからは無視される。
+今の版でどこまで戻れるかは、`make dropin-mkgo-born-test` (Elythia 生まれの DB を TS に引き渡す) と `make dropin-swap-test` の復路の段階 (TS → Elythia → TS) で**測っている**。どちらも守る対象ではなく、意図的な変更で通らなくなったら期待値を更新し、何が戻らなくなったかを下の「[戻らなくなったもの](#戻らなくなったもの)」に記録する (手順は [dropin-e2e.md](dropin-e2e.md#復路は測る対象-3191))。Elythia が追加したテーブルは Misskey-TS からは無視される。
+
+[破壊的なマイグレーション](#破壊的なマイグレーション) の 18 件は戻らない。うち 14 件は Elythia が自分で作ったものの除去・初期化か upstream 追随なので**戻す必要が無い**。`000056` / `000081` / `000082` が消した行と `000053` / `000067` / `000084` / `000085` が上書きした値は、down が `SELECT 1;` の no-op なので復元できない。**`000094` は down を持つが、それでも戻らない** — 消すのは自分で足した列と index だけで、正規化した `ip` の値と統合で消えた行は復元できない (統合前の行数も個別の観測時刻も残っていない)。**`000084` / `000085` が書き換えるのは `meta."repositoryUrl"` と `meta."feedbackUrl"` なので、TS へ戻すときは admin 画面で設定し直すこと** (Elythia のリポジトリと issues を案内したままになる)。この経路を CI で測っているのは `make dropin-swap-test` (TS → Elythia → TS) で、`make dropin-mkgo-born-test` は逆に Elythia 生まれの DB を TS に引き渡せるかを見ている。
+
+migration の注記やコードのコメントには、TS へ戻せることを設計の理由にした記述が残っている。**それらは当時の判断の記録で、今は保証ではない。** 往路にも要る制約 (upstream 由来の index を触らない、TS が書いた RSA 鍵のテーブルをそのまま読む、など) は、往路の理由で引き続き守る。
+
+### 戻らなくなったもの
+
+復路の検証 (`mkgo-born` / `swap-test` の復路の段階) が、Elythia の意図的な変更で通らなくなったときに 1 行ずつ足す。書式は「版 / 落ちた段階 / TS へ戻したときに失われるもの、または起きること / 変更の PR」。
 
 ただし [破壊的なマイグレーション](#破壊的なマイグレーション) の 18 件は戻らない。うち 13 件は mk-go が自分で作ったものの除去・初期化か upstream 追随なので**戻す必要が無い**。`000056` / `000081` / `000082` / `000098` が消した行と `000053` / `000067` / `000084` / `000085` が上書きした値は、down が `SELECT 1;` の no-op なので復元できない。**`000094` は down を持つが、それでも戻らない** — 消すのは自分で足した列と index だけで、正規化した `ip` の値と統合で消えた行は復元できない (統合前の行数も個別の観測時刻も残っていない)。**`000107` が空にした通知先の参照もdownでは復元できない。** `000107` のFKを巻き戻してからTS版へ戻すと、本家の3本のFKは再作成されないため、このmigrationを巻き戻さずにTS版へ戻す。**`000084` / `000085` が書き換えるのは `meta."repositoryUrl"` と `meta."feedbackUrl"` なので、TS へ戻すときは admin 画面で設定し直すこと** (mk-go のリポジトリと issues を案内したままになる)。この経路を CI で検証しているのは `make dropin-swap-test` (TS → mk-go → TS) で、`make dropin-mkgo-born-test` は逆に mk-go 生まれの DB を TS に引き渡せるかを見ている。
 
-今回追加した`000108`の補完も巻き戻せない。共有テーブルの非追加変更は合計18件、うち13件はmk-go固有の除去・初期化またはupstream追従である。
+`000108`の補完も巻き戻せない。共有テーブルの非追加変更は合計19件、うち14件はElythia / Misaki固有の除去・初期化またはupstream追従である。
 
 ## drop-in 互換性の現状 (2026-05-09 時点)
 
-Playwright spec (#744) を **298 ファイル / 40 directory** (directory は spec を直接含むもの。`find tests/playwright/specs -name '*.spec.ts' -printf '%h\n' | sort -u | wc -l`) に育て、PR ごとに mk-go backend
+Playwright spec (#744) を **298 ファイル / 40 directory** (directory は spec を直接含むもの。`find tests/playwright/specs -name '*.spec.ts' -printf '%h\n' | sort -u | wc -l`) に育て、PR ごとに Elythia backend
 へ投げている。Misskey TS backend に対しては upstream 追従のタイミングで回し、spec の
-期待値が mk-go の挙動に引きずられていないかを検証する。発見した drop-in 互換 drift は
+期待値が Elythia の挙動に引きずられていないかを検証する。発見した drop-in 互換 drift は
 40+ 件すべて解消済 (詳細: [api-compatibility.md](api-compatibility.md))。
 
 - **API endpoint 互換**: 主要 endpoint (admin / notes / users / i / drive / chat / reactions / timeline / emoji / auth / federation / channels / hashtags / roles 等) は両 backend で同 status / 同 shape を返す
-- **WebSocket チャンネル**: upstream の 18 をすべて実装 (#125)。加えて mk-go 独自の `notifications` があり計 19
+- **WebSocket チャンネル**: upstream の 18 をすべて実装 (#125)。加えて Elythia 独自の `notifications` があり計 19
 - **ActivityPub 連合**: 主要 Activity (Create / Delete / Update / Follow / Accept / Reject / Undo / Like / Announce / Block / Flag / Move / Add/Remove) は送受信対応 (詳細: [federation.md](federation.md))
 
 ## 既知の制限
@@ -293,12 +304,12 @@ Playwright spec (#744) を **298 ファイル / 40 directory** (directory は sp
 - **公開サインアップのメール認証** — `emailRequiredForSignup` 有効時の pending user → 確認メール → promote まで実装済み。**SMTP を配線していないと確認メールが飛ばず、登録が完了できない**。`email` 設定を入れるか、`emailRequiredForSignup` を無効にすること
 - **サーバーマシン統計** — `enableServerMachineStats` 有効時に gopsutil で CPU / メモリ / ディスク / ネットワークを 2 秒間隔で収集する。**コンテナで動かしている場合、既定では host の値が返る** (gopsutil は cgroup の制限値ではなくホストを見る)。コンテナに割り当てたリソースを見たい場合は別途 cgroup を読む必要がある
 - **search backend** — `notes/search` の provider は `fulltextSearch.provider` で切替。既定 `sqlLike` で **Meilisearch 不要のまま動く** (`lower(text) LIKE` による部分一致。**ILIKE ではない** — pg_bigm の GIN index が効かなくなるため)。upstream TS strict-mode (400 UNAVAILABLE) で揃えたい operator は `provider: "none"` を opt-in で選べる (#877)。Meilisearch / pgroonga は optional
-- **promo は作成できても表示されない** — `admin/promo/create` は 204 を返し DB 行も増えるが、**利用者へ提示する経路が upstream にも mk-go にも無い** (#2781)。告知・露出の機能として使えると期待しないこと。詳細は [api-compatibility.md](api-compatibility.md) の「既知の制限」
+- **promo は作成できても表示されない** — `admin/promo/create` は 204 を返し DB 行も増えるが、**利用者へ提示する経路が upstream にも Elythia にも無い** (#2781)。告知・露出の機能として使えると期待しないこと。詳細は [api-compatibility.md](api-compatibility.md) の「既知の制限」
 - **upstream 2026.10.0 まで追従済** — 2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 → 2026.10.0 と段階的に追従した (**2026.8.0 に stable は無い**)。各 release の差分は [docs/update/](update/) を参照 (`<yyyymm><nn>diff.md`)
 
 差分の網羅的な一覧は [divergence.md](divergence.md) を参照。
 
-### mk-go 独自挙動 (TS にない拡張)
+### Elythia 独自挙動 (TS にない拡張)
 
 - **リモートユーザー counts**: `users/show` でリモートユーザーの notesCount / followersCount / followingCount を origin instance の `/api/users/show` から取得して上書き (#943)。TS は自インスタンス観測値のみ表示するため数値が小さくなる問題を解消。フォロー一覧 / フォロワー一覧は引き続き local user のみ
 - **mediaproxy アニメ pass-through**: GIF / APNG をリアクション / 絵文字ピッカー / プレビューで静止化せずに pass-through (#941)
@@ -314,24 +325,24 @@ Playwright spec (#744) を **298 ファイル / 40 directory** (directory は sp
 ### ページが「Loading...」のまま進まない
 
 - フロントエンド資産のパスが正しいか確認する
-- 方法Aの場合: `ls third_party/misskey/built/_frontend_vite_/manifest.json`
+- 方法Aの場合: `ls frontend/built/_frontend_vite_/manifest.json`
 - 方法Bの場合: `ls $MISSKEY_FRONTEND_DIR/manifest.json`
 
 ### スタイル/CSSが崩れる
 
 - プロダクションビルドを使用していることを確認する (Viteのdevモードではない)
-- `manifest.json` のエントリにCSSファイルが含まれていることを確認する: `cat third_party/misskey/built/_frontend_vite_/manifest.json | grep css`
+- `manifest.json` のエントリにCSSファイルが含まれていることを確認する: `cat frontend/built/_frontend_vite_/manifest.json | grep css` (方法Bは `$MISSKEY_FRONTEND_DIR/manifest.json`)
 
 ### 絵文字が表示されない
 
 - twemoji SVGファイルが配置されているか確認する
-- 方法A: `ls third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/twemoji/1f44d.svg`
+- 方法A: `ls frontend/node_modules/@misskey-dev/emoji-assets/built/twemoji/1f44d.svg`
 - 方法B: `ls $MISSKEY_TWEMOJI_DIR/1f44d.svg`
 
 ### favicon/アイコンが表示されない
 
 - static assets のパスを確認する
-- 方法A: `ls third_party/misskey/packages/backend/assets/icons/192.png`
+- 方法A: `ls frontend/assets/icons/192.png`
 - 方法B: `ls $MISSKEY_STATIC_DIR/icons/192.png`
 
 ### 再起動後にタイムラインが空になる
@@ -351,5 +362,5 @@ Playwright spec (#744) を **298 ファイル / 40 directory** (directory は sp
 
 ## 関連ドキュメント
 
-- [docs/playwright.md](./playwright.md) — Playwright による frontend / API の e2e (mk-go backend と Misskey TS backend の両方に対して実行する)
-- [docs/upstream-catch-up.md](./upstream-catch-up.md) — Misskey TS upstream の新 release を mk-go に取り込む際の triage / submodule bump / Wave 単位 PR 運用と、submodule bump PR マージ後の `git pull --recurse-submodules` 等の追従手順
+- [docs/playwright.md](./playwright.md) — Playwright による frontend / API の e2e (Elythia backend と Misskey TS backend の両方に対して実行する)
+- [docs/upstream-catch-up.md](./upstream-catch-up.md) — Misskey TS upstream の新 release を Elythia に取り込む際の triage / Wave 単位 PR 運用と、取り込んだ版へ上げた後の追従手順

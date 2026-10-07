@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/shiroha-a/mk/internal/effectivepolicy"
+	"github.com/elythia-network/elythia/internal/effectivepolicy"
 )
 
 // mk-go 固有の role policy キーは fork frontend の 2 箇所で列挙されている。
@@ -37,13 +37,10 @@ import (
 var notInFrontendUI = map[string]string{}
 
 func TestMkGoRolePolicyKeysAreListedInFrontend(t *testing.T) {
-	root := filepath.Join(repoRootDir(t), "third_party", "misskey")
+	root := filepath.Join(repoRootDir(t), "frontend")
 	consts := filepath.Join(root, "packages", "misskey-js", "src", "consts.ts")
 	if _, err := os.Stat(consts); err != nil {
-		if os.Getenv("MK_FRONTEND_GATES_REQUIRE_SUBMODULE") != "" {
-			require.NoError(t, err, "submodule を要求する job なのに %s を読めない", consts)
-		}
-		t.Skipf("submodule が無い (checkout する job でのみ検査する)")
+		require.NoError(t, err, "frontend/ は追跡しているので、%s を読めないのはパスの誤り", consts)
 	}
 	upstream := parseUpstreamRolePolicies(t, consts)
 	require.NotEmpty(t, upstream, "misskey-js の rolePolicies を読めなかった")
@@ -106,14 +103,9 @@ func TestMkGoRolePolicyKeysAreListedInFrontend(t *testing.T) {
 // デッドコードで、`v-if` を消しても関数自体は残る。**どちらも落としたらその場で
 // 気づける形**にしてある (#2898 / #2900 と同じ形)。
 func TestCanDeleteAccountIsWiredInSettings(t *testing.T) {
-	path := filepath.Join(repoRootDir(t), "third_party", "misskey", "packages", "frontend", "src", "pages", "settings", "other.vue")
+	path := filepath.Join(repoRootDir(t), "frontend", "packages", "frontend", "src", "pages", "settings", "other.vue")
 	raw, err := os.ReadFile(path)
-	if err != nil {
-		if os.Getenv("MK_FRONTEND_GATES_REQUIRE_SUBMODULE") != "" {
-			require.NoError(t, err)
-		}
-		t.Skipf("submodule が無い: %v", err)
-	}
+	require.NoError(t, err)
 	src := htmlComment.ReplaceAll(raw, nil)
 	require.Contains(t, string(src), `import { shouldShowAccountDeletionSection } from '@/utility/account-delete-policy.js';`)
 	require.Regexp(t, regexp.MustCompile(`<SearchMarker\s+:keywords="\['account', 'close', 'delete'\]">\s*<MkFolder\s+v-if="shouldShowAccountDeletionSection\(\$i\.policies,\s*\$i\.isDeleted\)">`), string(src))

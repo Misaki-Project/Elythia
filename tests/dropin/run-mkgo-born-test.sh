@@ -20,8 +20,9 @@
 #
 # ## なぜ重要か
 #
-# 運用上これは **ロックインの有無そのもの**。「mk-go で始めた人が Misskey に
-# 移れるか」に答えるのはこの経路だけ。
+# 「mk-go で始めた人が Misskey に移れるか」に答えるのはこの経路だけ。移れることは
+# 保証しない (#3191) ので、守る対象ではなく、どこまで移れるかを測る対象として回す
+# (落ちたときの手順は docs/dropin-e2e.md の「復路は測る対象」)。
 #
 # ## 流れ
 #
@@ -35,8 +36,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-BASE=docker-compose.dropin.yml
-OVERLAY=docker-compose.dropin.mk.yml
+BASE=tests/dropin/compose.yml
+OVERLAY=tests/dropin/compose.mk.yml
 DIAG_DIR=${DIAG_DIR:-/tmp/dropin-logs}
 
 cleanup() {

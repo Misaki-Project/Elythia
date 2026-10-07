@@ -4,7 +4,7 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 
 ## 全体像
 
-`build` / `test` / `lint` の 3 つだけが **required check** (これが赤いとマージできない)。
+`build` / `test` / `lint` / `frontend` の 4 つだけが **required check** (これが赤いとマージできない)。
 残りは非ブロッキングで、落ちても merge 自体は可能。ただし非ブロッキングは「無視してよい」
 意味ではなく、**merge をブロックするには不確実性が高い**という判断にすぎない。赤いまま
 放置すると誰も見なくなるので、原因を切り分けてから進めること。
@@ -17,9 +17,10 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 
 | check | workflow | 見ているもの | 手元での再現 |
 |---|---|---|---|
-| `build` | CI | 全パッケージがコンパイルできるか + 同梱プラグインの `go vet` + 同梱プラグインが `disabled: true` を持つこと（`rolelevel` だけは allowlist で意図的に既定有効なので判定対象外） | `go build ./...` / `make plugin-vet` |
+| `build` | CI | 全パッケージがコンパイルできるか + 同梱プラグインの `go vet` + 同梱サンプルが既定無効か（`rolelevel`だけはallowlistで既定有効） + 同梱サンプル入りの統合バイナリ | `go build ./...` / `make plugin-vet` / `make plugins-all && go build -o /dev/null ./cmd/elythia` |
 | `lint` | CI | `go vet` + **actionlint** + `gofmt -s -d` の差分 + 重複 fixture ID + **golangci-lint** | `make lint` / `make actionlint` / `make fmt` / `make golangci-lint` |
 | `test` | CI | 4-way shard の集約。どれか 1 つでも落ちれば赤 | `make test` |
+| `frontend` | frontend | `frontend-lint` (9 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) の集約。frontend に関係しない差分では両方を skip して成功する | 下の「`frontend` が落ちたとき」 |
 
 ### `test` が落ちたとき
 
@@ -46,7 +47,7 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 を入れてある。
 
 **`(typecheck)` が出た run は不完全。** typecheck が落ちると他の linter の結果が
-報告されない。自前プラグインを `plugins/` に置いていると `cmd/misskey/plugins_generated.go`
+報告されない。自前プラグインを `plugins/` に置いていると `cmd/elythia/plugins_generated.go`
 が private module を import するので、**`GOWORK=off` を付けて回すと**起きる (`go.work` が
 あるまま素で叩けば解決するが、それだと CI と条件が変わる)。`make golangci-lint` は生成物を
 退避して回すので手元では踏まない。
@@ -56,8 +57,8 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 
 **段階的な有効化は完了した。** `unused` / `ST1003` (命名) / `ST1012` (error var 名) /
 `SA1019` (非推奨 API) はすべて有効で、恒久的に無効なのは `QF*` と `S1016` だけ。
-除外は 1 つだけ — `test/e2e_federation` の**パッケージ名** (ディレクトリ名まで変えると
-24 箇所に波及するため。`git grep -oI e2e_federation -- '*.go' | wc -l`)。
+除外は 1 つだけ — `tests/e2e-federation` の**パッケージ名** `e2e_federation` (Go のパッケージ名に
+ハイフンは使えないので下線のまま残している。理由は `.golangci.yml` のコメント)。
 
 誤検知は `//nolint:staticcheck // 理由` をその行に置く。理由を必ず書く。
 
@@ -101,19 +102,18 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 | `vulncheck` | CI | 依存・Go stdlib の**到達可能な**既知脆弱性 + Go version の pin 整合 | 1 min | `GOOS=linux govulncheck ./...` |
 | `review` | Dependency review | PR が**新しく持ち込む**依存に既知の脆弱性が無いか (base と head の差分を比較、high 以上で失敗) | 未計測 | 手元では回せない (GitHub の advisory DB を引く) |
 | `analyze (go)` / `analyze (actions)` | CodeQL | **自分のコード**の静的解析 (Go の全 module と workflow の式) | 未計測 | 手元では回せない (CodeQL CLI が要る)。Code scanning alerts で見る |
-| `frontend-check` | CI | fork frontend の型 (`vue-tsc --noEmit`) + submodule のソースを読むゲート + eslint (`src/**/*.{ts,vue}`) + vitest + `make plugins-all` と統合バイナリの build | 3〜4 min | 下の「frontend-check の手元再現」。**`make frontend-check` は型・ゲート・eslint まで** (#2906) |
 | `plugin-tests` | CI | 同梱プラグインのテスト (別 module なので `go list ./...` に入らない) | 1 min | `make plugin-test` |
-| `apicompat` | apicompat | **`docs/api-compat.md` が実態とずれていないか** (生成物なので再生成して diff を見る) | 未計測 | `make apicompat` (**プラグイン抜き + testMode が要る**。手順は docs/development.md) |
-| `e2e (1/4)` 〜 `4/4` | Upstream backend e2e | **本家の backend e2e 1256 テスト**が mk-go に対して通るか | 3-7 min | `make upstream-e2e` |
-| `diff` | Diff e2e | mk-go と TS の**レスポンスの値**が一致するか (endpoint 比較 35 件) | 4 min | `make diff-check` |
+| `apicompat` | apicompat | **`docs/api-compat.md` が実態とずれていないか** (生成物なので再生成して diff を見る)。あわせて golden が本家の版に追いついているか (`make upstream-check`、#3378) | 未計測 | `make apicompat` (**プラグイン抜き + testMode が要る**。手順は docs/development.md) |
+| `e2e (1/4)` 〜 `4/4` | Upstream backend e2e | **本家の backend e2e 1256 テスト**が Elythia に対して通るか | 3-7 min | `make upstream-e2e` |
+| `diff` | Diff e2e | Elythia と TS の**レスポンスの値**が一致するか (endpoint 比較 35 件) | 4 min | `make diff-check` |
 | `swap-test` | Drop-in e2e | TS→mk 切替で state が保たれるか | 5 min | `make dropin-swap-test` |
-| `mkgo-born` | Drop-in e2e | **mk-go 生まれの DB を TS に引き渡せるか** (= ロックインの有無) | 5 min | `make dropin-mkgo-born-test` |
+| `mkgo-born` | Drop-in e2e | **Elythia 生まれの DB を TS に引き渡せるか** (測る対象。保証はしない、#3191) | 5 min | `make dropin-mkgo-born-test` |
 | `ed25519-verify` | Drop-in e2e | Fedibird-like mock との Ed25519 双方向 verify | 5 min | `make dropin-fedibird-test` |
 | `federation` | Drop-in e2e | 本物の Misskey TS との実連合 (follow/note/reaction/renote/reply/mention/delete) | 4 min | `make federation-misskey-e2e` |
 | `federation-mastodon` | Drop-in e2e | 本物の Mastodon との引用の承認 (FEP-044f): 双方向の引用が承認済みになるか、取り消しが双方向で効くか | 未計測 | `make federation-mastodon-e2e` |
 | `spec (mk-go 1/4)` 〜 `4/4` | Playwright | ブラウザからの統合互換 (298 spec ファイル) | 4-9 min | `make playwright-check` |
-| `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない) | 4 min | `docker build -f Dockerfile .` |
-| `build / build` | Build with plugins (selftest) | 運営者向けの reusable workflow が通るか。外部プラグインを実際に clone し、frontend を持つので SPA の自前ビルド (`ASSETS_SOURCE=local`) まで走る。**`docker build --check` では見えない範囲** (pluginbuild / go build が通るか、`assets-local` の COPY 元が context に実在するか、pnpm の symlink を越えられるか) を確認できるのはこの check だけ | 6 min | paths に該当する PR で自動発火する。手動なら `gh workflow run build-with-plugins-selftest.yml --ref <branch>` (default branch にある場合のみ) |
+| `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない)。`-bundled` は image の中で frontend もビルドする (#3379) | 4 min (`-bundled` はキャッシュが冷えていると frontend の分だけ延びる。手元の冷えたビルドで frontend stage だけ約 3 分) | `docker build -f Dockerfile .` / `docker build -f Dockerfile.bundled .` |
+| `build / build` | Build with plugins (selftest) | 運営者向けの reusable workflow が通るか。外部プラグインを実際に clone し、frontend を持つので `Dockerfile.bundled` の中でプラグインの .vue を含めた SPA のビルドまで走る。**`docker build --check` では見えない範囲** (pluginbuild / go build / frontend のビルドが通るか、生成物とプラグインの frontend が frontend stage に届くか) を確認できるのはこの check だけ | 6 min | paths に該当する PR で自動発火する。手動なら `gh workflow run build-with-plugins-selftest.yml --ref <branch>` (default branch にある場合のみ) |
 
 ### e2e 系が「何を守っているか」の違い
 
@@ -125,7 +125,7 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 | `diff` | **同じ入力に対する値そのもの** |
 | shape drift (`test` に含まれる) | フィールドの有無・型 |
 | `swap-test` | DB を引き継いだときに壊れないか |
-| `mkgo-born` | **mk-go が作った DB を TS が受け取れるか** |
+| `mkgo-born` | **Elythia が作った DB を TS が受け取れるか** |
 | `federation` / `ed25519-verify` | 他実装と実際に喋れるか |
 | `vulncheck` | **自分のコードではなく依存**に既知の穴が無いか (develop に入った後、到達可能なものだけ) |
 | `review` | **入る前**に、その PR が持ち込む依存に既知の穴が無いか (到達可能性は見ない) |
@@ -148,21 +148,22 @@ CodeQL はその逆で、**依存ではなく自分のコード**をパターン
 
 |  | DB を作ったのは | 経路 |
 |---|---|---|
-| `swap-test` | TypeORM | TS → mk-go → TS |
-| `mkgo-born` | **mk-go の migration** | mk-go → TS |
+| `swap-test` | TypeORM | TS → Elythia → TS |
+| `mkgo-born` | **Elythia の migration** | Elythia → TS |
 
 後者の方が厳しい。TS が一度も触っていない schema を受け取るので、カラム型・制約・
 enum・index 名・default のどれかが TypeORM の期待とずれていれば起動しない。
 `TestMigrationSeed_CoversUpstream` は seed 一覧と upstream の migration file を
 **静的に突き合わせる**だけで、実際に TS を起動して確かめてはいない。
 
-運用上これは**ロックインの有無そのもの**にあたる。「mk-go で始めた人が Misskey に
-移れるか」に答えられるのはこの経路だけで、実際この経路の初回実行で、RSA 秘密鍵が
+「Elythia で始めた人が Misskey に移れるか」に答えられるのはこの経路だけ。移れることは
+保証しない (#3191) が、どこまで移れるかを測るために残している
+([dropin-e2e.md の「復路は測る対象」](dropin-e2e.md#復路は測る対象-3191))。実際この経路の初回実行で、RSA 秘密鍵が
 PKCS#1 のため TS 側の送信連合が全滅する不具合が見つかっている (#2380)。
 
 ### `e2e` (本家 backend e2e) が落ちたとき
 
-まず **意図的な乖離かどうか**を判断する。mk-go では『通らないことが正しい』テストが
+まず **意図的な乖離かどうか**を判断する。Elythia では『通らないことが正しい』テストが
 あり、`tests/upstream-e2e/known-divergences.json` に根拠付きで登録して expected-failure
 として扱っている。
 
@@ -176,7 +177,7 @@ PKCS#1 のため TS 側の送信連合が全滅する不具合が見つかって
 
 **ignore-list を安易に広げないこと。** 空振りさせると本物の乖離が埋もれる。
 
-mk-go 独自の additive field が原因なら `tests/diff/test_endpoints.py` の ignore-list に
+Elythia 独自の additive field が原因なら `tests/diff/test_endpoints.py` の ignore-list に
 **理由付きで**登録する。その際 [divergence.md](divergence.md) に対応する記述があるかを
 確認すること。`META_IGNORE` と `USER_IGNORE` は別定義で後者は前者を継承していないので、
 `policies` のように両方に現れるキーは両方へ足す必要がある。
@@ -198,7 +199,7 @@ workflow が後から集めたもの。前者がある場合はそちらが本�
 
 | 落ちた段階 | 意味 |
 |---|---|
-| stage 4b (TS-A healthy 待ちで timeout) | mk-go の migration が作った schema を TypeORM が受け付けなかった |
+| stage 4b (TS-A healthy 待ちで timeout) | Elythia の migration が作った schema を TypeORM が受け付けなかった |
 | stage 4d (migrations digest 不一致) | migration seed (`000029`) に漏れがあり TS が再実行した |
 | stage 5 (pytest) | schema は通ったがデータを読めない / 連合が続かない |
 
@@ -255,7 +256,7 @@ package load エラーで解析が空振りしうる。**ローカルの `go` �
 同じ理由で、これも required には**含めていない**。
 
 結果は Actions のログではなく **Code scanning alerts** に出る
-(`https://github.com/shiroha-a/mk/security/code-scanning`)。まず alert を読み、
+(`https://github.com/Elythia-Network/elythia/security/code-scanning`)。まず alert を読み、
 
 - 本物なら直す
 - 誤検知なら alert 側で dismiss する (理由を選ぶ)。ソースに抑制コメントを撒かない
@@ -267,40 +268,52 @@ package load エラーで解析が空振りしうる。**ローカルの `go` �
 同梱プラグイン (`plugins/*/go.mod`) のビルドが壊れている。こちらは `build` job と
 `plugin-tests` job でも落ちるはずなので、そちらを先に見る。
 
-### `frontend-check` が落ちたとき
+### `frontend` が落ちたとき
 
-fork frontend (`third_party/misskey`) の型・eslint・vitest のいずれか、または
-submodule のソースを読むゲートの失敗 (#2892)。型・ゲート・eslint は
-`make frontend-check` で再現する (#2906)。**vitest はそこに入っていない**
-(`make frontend-test`)。
+`frontend` は集約 job なので、**落ちた `frontend-lint` / `frontend-test` のログ**を見る。
+`changes` が落ちたときも赤になる (判定できないまま緑にしないため)。
 
-**手元再現（CI job 全体）:**
+- `frontend-lint`: 9 workspace の eslint、typecheck (frontend は `vue-tsc --noEmit`、ほかに sw / misskey-js)、
+  check-dts とその self test、SPDX ヘッダー、locale の検証、misskey-js の API レポート、
+  `emoji-regex-check` (#3324) のいずれか
+- `frontend-test`: 本番設定のビルド、frontend の vitest、misskey-js のテストのいずれか
+
+`frontend/` のソースを読むゲート (`internal/server/*_gate_test.go`、#2892) はこの workflow ではなく
+required の `test` で走る。
+
+**手元再現:**
+
+`make plugins-all` を workspace のビルドより先に回す。frontend が import する
+`frontend/packages/frontend/src/server-plugins.generated.ts` は追跡しておらず (#3379)、
+無いとビルドが import で落ちる。`make frontend-check` は frontend の型・ゲート・
+`emoji-regex-check`・frontend の eslint までを手元でまとめて回す target (CI の job ではない)。
+**vitest はそこに入っていない** (`make frontend-test`)。ほかの workspace の eslint や check-dts などは
+`.github/workflows/frontend.yml` の各 step をそのまま叩く。
 
 ```bash
-cd third_party/misskey && pnpm install && pnpm build-pre && pnpm -r build
-make plugins-all && go build -o /dev/null ./cmd/misskey
+make plugins-all
+cd frontend && pnpm install --frozen-lockfile && pnpm build && cd ..
+go build -o /dev/null ./cmd/elythia
 make frontend-check
 make frontend-test
 ```
 
-eslint だけを回すなら `make frontend-lint` (実測 55 秒)。
+**本番を動かしているチェックアウトでは `pnpm -r build` / `pnpm build` を流さないこと。** frontend 自身のビルドが `frontend/built` を消してから作り直すので、そこを bind mount している本番が 404 になる (#3379 の切り替え後)。手元の検証は別の worktree で行う。
 
-**`emoji-regex-check` が落ちたとき (#3324):** MFM の Unicode 絵文字の正規表現 (`internal/activitypub/mfm/emoji_regex_gen.go`) が、submodule に入っている mfm-js / emoji-data と食い違っている。`… is stale` なら mfm-js か emoji-data の版が上がったので、作り直して差分ごとコミットする。生成ツールが `no longer contains` や構文のエラーで落ちたら、mfm-js の `unicodeEmoji` の書き方か正規表現の構文が変わっているので、生成ツール (`tools/emojiregex/`) を直す。
+eslint (frontend だけ) を回すなら `make frontend-lint` (実測 55 秒)。
+
+**`emoji-regex-check` が落ちたとき (#3324):** MFM の Unicode 絵文字の正規表現 (`internal/activitypub/mfm/emoji_regex_gen.go`) が、`frontend/` に pnpm install した mfm-js / emoji-data と食い違っている。`… is stale` なら mfm-js か emoji-data の版が上がったので、作り直して差分ごとコミットする。生成ツールが `no longer contains` や構文のエラーで落ちたら、mfm-js の `unicodeEmoji` の書き方か正規表現の構文が変わっているので、生成ツール (`tools/emojiregex/`) を直す。
 
 ```bash
 make emoji-regex
-node internal/activitypub/mfm/testdata/emoji_mfmjs.mjs third_party/misskey \
+node internal/activitypub/mfm/testdata/emoji_mfmjs.mjs frontend \
   > internal/activitypub/mfm/testdata/emoji_mfmjs.json
 GOWORK=off go test ./internal/activitypub/mfm/ ./tools/emojiregex/
 ```
 
 **`make uds-frontend-build` / `e2e-frontend-build` は検証に使わないこと。** 本番が
-bind-mount している `third_party/misskey/built` を書き換えてしまう。`vue-tsc --noEmit` なら
-出力物を作らない。
-
-**submodule の gitlink 巻き戻り（祖先関係）はこの job でも検出できない。** 型が通るだけで
-ファイルが消えている場合がある。pointer の確認は
-[upstream-catch-up.md](upstream-catch-up.md#mk-固有パッチだけを載せるときrelease-bump-以外)。
+bind-mount している (または切り替え後に bind-mount する) `frontend/built` を書き換えてしまう。
+`vue-tsc --noEmit` なら出力物を作らない。
 
 ## nightly のみ
 
@@ -315,7 +328,7 @@ PR では回らない。失敗は Actions 上で確認して別 PR で対処す�
 
 | workflow | 内容 | 実行方法 |
 |---|---|---|
-| Playwright (`spec (ts 1/4)` 〜 `4/4`) | 同じ spec を **Misskey TS backend** に対して実行し、spec が mk-go の挙動に引きずられていないかを検証 | upstream 追従で submodule を bump したとき |
+| Playwright (`spec (ts 1/4)` 〜 `4/4`) | 同じ spec を **Misskey TS backend** に対して実行し、spec が Elythia の挙動に引きずられていないかを検証 | upstream 追従で本家の版を上げたとき |
 | Docker (`workflow_dispatch`) | 過去のリリースタグから image を publish し直す | `gh workflow run docker.yml -f tag=1.1.1` |
 
 `spec (ts …)` を常時回さないのは、upstream が変わらない限り答えが変わらないため。詳細は
@@ -365,15 +378,15 @@ git ls-remote https://github.com/actions/checkout 'refs/tags/v7*'
 あわせて **publish する job の `actions/checkout` には `persist-credentials: false` を
 付ける** (`docker.yml` の 2 job / `docker-branch.yml` / `build-with-plugins.yml`)。
 付けないと token が `.git/config` に残ったまま、後続の `pnpm install` の lifecycle script や
-第三者のプラグインのコードが走る。いずれの job も checkout 後に mk-go の git 認証を使って
+第三者のプラグインのコードが走る。いずれの job も checkout 後に Elythia の git 認証を使って
 いない (`docker-branch.yml` の push は token を URL に明示した別リポジトリから行う)。
 
 ## 落ちたときの一般的な注意
 
 **「手元では通るのに CI で落ちる」場合、手元の生成物を疑う。** 過去に何度も踏んでいる。
 
-- `third_party/misskey/built/*` — 過去の docker build が root 所有で残っていることがある
-- `packages/*/built` — 同上。`i18n` / `misskey-bubble-game` が無いと frontend の型が通らない
+- `frontend/built/*` (#3379 より前の版では `third_party/misskey/built/*`) — 過去の docker build が root 所有で残っていることがある
+- `frontend/packages/*/built` — 同上。`i18n` / `misskey-bubble-game` が無いと frontend の型が通らない
 - `built/.config.json` / `built/meta.json` — 本家の `loadConfig()` が読む生成物
 
 CI はまっさらな環境なので、手元にある生成物が要件を隠す。新しく CI に載せる workflow は
@@ -397,15 +410,11 @@ CLAUDE.md の Section 8 にあった各 workflow / job の説明を、#3248 で�
 
 #### `build`ジョブ
 
-checkout / setup-go を除くと step は実行順に 4 つ。**required job なので、コンパイル以外の理由でも赤くなる。**
+checkout / setup-go を除くと step は実行順に 3 つ。**required job なので、コンパイル以外の理由でも赤くなる。**
 
 - `go build ./...`で全パッケージのビルド確認。
-- **`Check submodule commit is pushed` step** で、`third_party/misskey` の gitlink が
-  指す commit が fork に push 済みか、`docs/divergence.md` の pin 行が指す tag が
-  その commit と一致するかを見る (#2969)。submodule を上げたときに fork への push や
-  tag の push を忘れると、ここで落ちる。
 - **`Check bundled plugins are disabled by default` step** で、tracked な
-  `plugins/*/mk-plugin.yml` が全て `disabled: true` を持つことを見る (#2701)。
+  `plugins/*/elythia-plugin.yml` が全て `disabled: true` を持つことを見る (#2701)。
   **検証のために一時的に外して戻し忘れる**のを止めるため (trustlevel が実際に
   そうなっていた)。判定は `git ls-files` + grep だけで完結させてある —
   `pluginbuild` に読ませるほうが parser 一致で厳密だが、`pluginbuild` は git では
@@ -481,7 +490,7 @@ checkout / setup-go を除くと step は実行順に 4 つ。**required job な
   成立しない。**`checks` は既定を置き換える**ので、既定の無効化も明示的に書き出してある
   (書かないと ST1000 / ST1020 / ST1021 等が黙って有効になる)。**段階的な無効化は残っていない**
   — `unused` / `ST1003` / `ST1012` / `SA1019` はすべて有効で、恒久的に無効なのは `QF*` と
-  `S1016` だけ。**除外は 1 つ** — `.golangci.yml` の rule が 1 件 (`test/e2e_federation` の
+  `S1016` だけ。**除外は 1 つ** — `.golangci.yml` の rule が 1 件 (`tests/e2e-federation` の
   パッケージ名 / ST1003) **だけ**。**これは有効化した 4 check に対する数**で、
   `exclusions.presets` の `std-error-handling` (実測 253 件を抑止) は別枠。
   `//nolint:staticcheck` はリポジトリ全体で 2 件 (SA9010 / SA1012) で、どちらも
@@ -516,10 +525,11 @@ checkout / setup-go を除くと step は実行順に 4 つ。**required job な
 - `.github/workflows/codeql.yml` が CodeQL で**自分のコード**を静的解析する。
   `vulncheck` が依存を見るのに対し、こちらはテストが通っていても残る「書いていない分岐」や
   「通ってはいるが危険な形」を拾う。
-- **見るのは `go` と `actions` の 2 つだけ。** submodule の外にある .ts/.js/.vue は実測
+- **見るのは `go` と `actions` の 2 つだけ。** `frontend/` の外にある .ts/.js/.vue は実測
   340 ファイルで大半が `tests/playwright/specs/**` (うち 189 は upstream 由来の UI spec)、
   Python も `tests/` の検証基盤なので、`javascript-typescript` / `python` は入れない。
-  fork frontend は checkout していないので対象外 (upstream のコード)。
+  `frontend/` (#3379 で取り込んだ fork frontend) も引き続き対象外。大半は upstream のコードで、
+  frontend の CI を required にした段階 (#3379 の P4e) でも入れず、判断は後の issue に送った。
 - **autobuild を使わない。** 同梱プラグイン (`plugins/*/go.mod`) は別 module で
   `go build ./...` に含まれないため、`git ls-files` で列挙して個別にビルドする
   (`plugin-tests` job が独立しているのと同じ理由)。`go.work` は gitignore 済みなので
@@ -541,14 +551,14 @@ checkout / setup-go を除くと step は実行順に 4 つ。**required job な
   | check 名 | 実行内容 |
   |---|---|
   | `swap-test` | `make dropin-swap-test` — TS→mk 切替の state preservation (#374) |
-  | `mkgo-born` | `make dropin-mkgo-born-test` — mk-go 生まれの DB を TS に引き渡せるか (#2379 / #2383) |
+  | `mkgo-born` | `make dropin-mkgo-born-test` — Elythia 生まれの DB を TS に引き渡せるか (#2379 / #2383) |
   | `ed25519-verify` | `make dropin-fedibird-test` — Fedibird-like AP mock との Ed25519 双方向 verify (#1083 / #2360) |
   | `federation` | `make federation-misskey-e2e` — 本物の Misskey TS を相手にした実連合 (#2362) |
   | `federation-mastodon` | `make federation-mastodon-e2e` — 本物の Mastodon を相手にした引用の承認 (FEP-044f、#3234) |
 
-- `mkgo-born` は `swap-test` と似て見えるが **DB を作った側が違う** (前者は mk-go の
+- `mkgo-born` は `swap-test` と似て見えるが **DB を作った側が違う** (前者は Elythia の
   migration、後者は TypeORM)。TS が一度も触っていない schema を受け取るのは前者だけで、
-  運用上は**ロックインの有無そのもの**にあたる。`TestMigrationSeed_CoversUpstream` は
+  どこまで移れるかを測る唯一の経路にあたる (保証はしない、#3191)。`TestMigrationSeed_CoversUpstream` は
   seed 一覧と upstream migration file の静的な突き合わせに過ぎず、実際に TS を起動して
   確かめてはいない。
 
@@ -599,15 +609,16 @@ checkout / setup-go を除くと step は実行順に 4 つ。**required job な
 #### `upstream-backend-e2e` workflow (PR トリガー)
 
 - `.github/workflows/upstream-backend-e2e.yml` で Misskey 本家の backend e2e
-  (`third_party/misskey/packages/backend/test/e2e/**`) を mk-go に向けて実行する。
-  テスト本体は無改変で、vitest の `globalSetup` / `setupFiles` だけを差し替える。
+  (本家の `packages/backend/test/e2e/**`) を Elythia に向けて実行する。本家は
+  `UPSTREAM_MISSKEY_VERSION` の版を `.cache/misskey/<版>` に checkout する (#3378)。
+  テスト本体は無改変で、vitest の `globalSetup` / `setupFiles` (`tests/upstream-e2e/harness/`) だけを差し替える。
 - `pull_request` で paths (`internal/**` / `cmd/**` / `migration/**` /
-  `tests/upstream-e2e/**` / `third_party/misskey` / `Makefile` / `go.mod` /
+  `tests/upstream-e2e/**` / `UPSTREAM_MISSKEY_VERSION` / `Makefile` / `go.mod` /
   `go.sum` / 当 workflow) に該当する変更のみ発火。`workflow_dispatch` で任意の
   ref に対して手動実行も可。
 - **4 シャード並列** (`--shard=i/4`)。`fail-fast: false`。**プロセス内では
   並列にできない**: upstream の vitest 設定が `maxWorkers: 1` で、かつ
-  setupFiles がファイルごとに mk-go の `/api/reset-db` (全テーブル truncate) を
+  setupFiles がファイルごとに Elythia の `/api/reset-db` (全テーブル truncate) を
   叩くため、同じ DB に 2 ファイルを並行させると片方が相手のフィクスチャを
   実行中に消す。job を分ければ PostgreSQL / Redis の service container も
   別に立つ (#2609)。
@@ -617,11 +628,11 @@ checkout / setup-go を除くと step は実行順に 4 つ。**required job な
 - 『通らないことが正しい』テストは `tests/upstream-e2e/known-divergences.json` に
   根拠付きで登録し、expected-failure (`task.fails`) として扱う。skip ではないので
   乖離が解消したテストは逆に落ち、一覧の陳腐化に気付ける。
-- 失敗時は mk-go のログを `upstream-e2e-mkgo-log-<shard>` artifact として 14 日保持。
+- 失敗時は Elythia のログを `upstream-e2e-mkgo-log-<shard>` artifact として 14 日保持。
 
 #### `diff-e2e` workflow (PR トリガー)
 
-- `.github/workflows/diff-e2e.yml` が `make diff-check` を実行し、mk-go と Misskey TS に
+- `.github/workflows/diff-e2e.yml` が `make diff-check` を実行し、Elythia と Misskey TS に
   同一リクエストを投げて**レスポンスを値レベルで diff** する (#2078 / #2368、endpoint 比較 35 件)。
 - 守備範囲が他のゲートと違う。本家 backend e2e は「本家のテストが通るか」、shape drift は
   「フィールドの有無・型」、diff-e2e は「**同じ入力に対する値そのもの**」を見る。shape が
@@ -637,44 +648,76 @@ checkout / setup-go を除くと step は実行順に 4 つ。**required job な
   実態とずれていないか**を見る。あれは生成物で CLAUDE.md も「手で直さない」と書いているが、
   **再生成が人手に頼っていた**ので、route を足しても upstream が endpoint を増やしても
   マトリクスは黙って古くなる。読む人は「mk-go only 59 件」のような数字を現状だと思う。
-- **既存のどの job にも相乗りできない。** submodule (TS の endpoints を読む) と DB / Redis
-  (route dump がサーバーを組み立てる) の両方が要るが、`test-shards` は `third_party/misskey`
-  を checkout せず、`frontend-check` は DB を持たない。
+- **既存のどの job にも相乗りできない。** 本家 (TS の endpoints を読む) と DB / Redis
+  (route dump がサーバーを組み立てる) の両方が要るが、`test-shards` は本家を checkout せず、
+  `frontend` workflow は DB を持たない。本家を取得するので、golden の追いつき
+  (`make upstream-check`) もこの workflow で見る (#3378)。
 - **config は `tests/upstream-e2e/mkgo.yml`。** `testMode: true` が要る — 無いと
   `/api/reset-db` が route に載らず、マトリクスが「TS 側に存在するが未実装 1 件」に化ける。
   接続先だけ `MK_*` で service container へ向ける。
 - **プラグインは入らない前提。** 同梱の 2 つは `disabled: true` なので `pluginbuild` が
   skip する (#2701)。自前プラグインを `plugins/` に置いた手元で回すと 19 行混入するが、
   clean checkout では起きない。
-- PR の required check には**含めない**。判定材料に submodule の内容が入るので、こちらの
+- PR の required check には**含めない**。判定材料に本家の内容が入るので、こちらの
   コードを触っていない PR でも upstream の bump で赤くなりうる。
 
-#### `frontend-check` job (ci.yml)
+#### `frontend` workflow (frontend.yml)
 
-- fork frontend (`third_party/misskey`) を `vue-tsc --noEmit` で型チェックする。1.0 以降
-  fork frontend は mk-go 独自に進化させる方針なので、型崩れの検出手段が要る。
-- **submodule のソースを読むゲートもここで回す** (#2892)。`test-shards` は
-  `third_party/misskey` を checkout しないので、そちらでは skip するしかない。
-  skip は成功として扱われるため、この job では `MK_FRONTEND_GATES_REQUIRE_SUBMODULE`
-  を渡して skip を禁じる (`plugin-tests` の `MK_PLUGIN_TESTS_REQUIRE_DB` と同じ形)。
-  **`make gates` には入れない** — あちらは submodule 無しで回る前提で、混ぜると
-  checkout していない環境で「検査していないのに緑」になる。
+- `.github/workflows/frontend.yml`。本家 (fork) が回していた workflow のうち frontend に
+  関わるものを移した (#3379)。1.0 以降 fork frontend は Elythia 独自に進化させる方針なので、
+  型崩れやビルドの崩れの検出手段が要る。以前は `ci.yml` の `frontend-check` job が
+  型・eslint・vitest などを見ていたが、#3379 の P4e でこの workflow へ寄せて job を消した
+  (`make frontend-check` は手元用の target として残っている)。
+- job は 4 つ。
+  - `changes`: 毎回動き、`git diff --name-only <base> HEAD` で frontend に関係する変更が
+    あるかを判定する。対象は `frontend/`・`plugins/`・`plugin/`・`tools/pluginbuild/`・
+    `tools/emojiregex/`・`internal/activitypub/mfm/emoji_regex_gen.go`・workflow 自身・
+    `Makefile`・`go.mod` / `go.sum`。リネームは移動元と移動先の両方を見る
+    (`--no-renames`)。手動実行と、比べる先が無い push (ブランチの作成など) は
+    関係ありとして扱う。**迷ったら関係ありに倒す** — 誤って
+    関係なしにすると、frontend を壊す PR が required を緑のまま通る。パスの一覧は
+    `internal/entitycompat` の `frontend_changes_test` が実際の git の差分で確かめている
+  - `frontend-lint`: `make plugins-all` → `pnpm i --frozen-lockfile` → `pnpm build` →
+    9 workspace の eslint、typecheck (frontend / sw / misskey-js。frontend は `vue-tsc --noEmit`)、
+    check-dts とその self test、SPDX ヘッダー、locale の検証、misskey-js の API レポート、
+    `make emoji-regex-check` (#3324)。同梱サンプル入りの統合バイナリの build (#2495) は、
+    Node が要らないので毎回走る required の `build` job に置いた (Go だけの変更で
+    `cmd/elythia` 側の配線が崩れても拾えるように)
+  - `frontend-test`: `make plugins-all` → `pnpm i --frozen-lockfile` → 本番設定のビルド →
+    frontend の vitest、misskey-js のテスト
+  - `frontend`: 集約 job (`if: always()`)。`changes` が関係なしと判定したら (lint と test は
+    skipped) 成功し、関係ありなら両方の success を要求する。`changes` 自体が落ちたら落ちる
+- **required check はこの集約 job `frontend` だけ** (`test` と同じ形。job を足しても
+  branch protection を触らずに済む)。
+- **paths で絞らず、毎回起動する。** required check は、workflow が起動しないと
+  「結果待ち」のまま PR をマージできなくする。関係するかの判定は `changes` が受け持つ。
+- **`make plugins-all` は workspace のビルドより先に回す** —
+  `frontend/packages/frontend/src/server-plugins.generated.ts` は追跡しておらず (#3379)、
+  無いとビルドが import で落ちる。typecheck・check-dts・API レポート・テストは workspace の
+  各パッケージの `built/` を読むので、ビルドも先に行う。
+- **`frontend/` のソースを読むゲート** (`internal/server/*_gate_test.go`、#2892) は
+  この workflow ではなく required の `test` (`test-shards`) で走る (`make frontend-check` でも回る)。
+  `frontend/` を本体で追跡するようになったので、読めなければ skip せずに落ちる
+  (#3379 より前は submodule を checkout しない `test-shards` で skip し、`ci.yml` の
+  `frontend-check` job だけが `MK_FRONTEND_GATES_REQUIRE_SUBMODULE` で skip を禁じていた。
+  この環境変数はもう無い)。
+- `emoji-regex-check` は `frontend-lint` (と手元の `make frontend-check`) でだけ回る。
+  `frontend/` の node_modules が要るので **`make gates` には入れない**。
 - `make uds-frontend-build` / `e2e-frontend-build` は本番が bind-mount している
-  `third_party/misskey/built` を書き換えるため**検証には使えない**。
-- required check (build / test / lint) には**含めない**。
+  (または切り替え後に bind-mount する) `frontend/built` を書き換えるため**検証には使えない**。
 
 #### `build-with-plugins` workflow (reusable) / `build-with-plugins-selftest` (PR トリガー)
 
 - `build-with-plugins.yml` は **`workflow_call` 専用**。運営者が自分のリポジトリから
   「使いたいプラグインのリスト」を渡して呼ぶと、それらを `plugins/` へ clone して
   `Dockerfile.bundled` を build し、**呼び出し元の GHCR** へ publish する (#2940)。
-  mk-go 側はビルド基盤も成果物も持たない。
+  Elythia 側はビルド基盤も成果物も持たない。
 - **`permissions` を宣言していない。** reusable workflow の permissions は caller の
   権限以下にしか設定できず、宣言すると caller がそれを持たない場合に run ごと
   拒否される (`push: false` でも同じ)。publish する caller が `packages: write` を書く。
-- frontend を持つプラグインがあるかは `pluginbuild` の出力で判定し、あるときだけ
-  SPA を自前でビルドして `ASSETS_SOURCE=local` で焼き込む。無ければ公式の
-  assets イメージを使って pnpm のビルドを丸ごと省く。
+- SPA は `Dockerfile.bundled` の中で毎回ビルドするので、frontend を持つプラグインも
+  そのまま入る (#3379。以前はホストでビルドして `ASSETS_SOURCE=local` で焼き込み、
+  無ければ fork の assets image を使っていた)。
 - **要求したプラグインが組み込まれたかを突き合わせる。** `disabled: true` は黙って
   skip されるので、見ないと「指定したのに 0 個入っている image」が緑で出る。
 - `build-with-plugins-selftest.yml` が `pull_request` (paths フィルタ) と
@@ -684,8 +727,8 @@ checkout / setup-go を除くと step は実行順に 4 つ。**required job な
   job 名 + callee の job 名) で、`gh pr checks` の一覧には現れないので
   `gh run list --workflow build-with-plugins-selftest.yml` で見る。実測 6 分。
   **`docker build --check` が見ない範囲を押さえるのはこれだけ** — stage 名の解決は
-  `--check` で分かるが、`pluginbuild` と `go build` が実際に通るか、`assets-local` の
-  COPY 元が context に実在するか、pnpm の symlink を越えられるかは RUN / COPY を
+  `--check` で分かるが、`pluginbuild` と `go build` と frontend のビルドが実際に
+  通るか、生成物とプラグインの frontend が frontend stage に届くかは RUN / COPY を
   実行しないと分からない。
 - PR の required check には**含めない** (外部リポジトリの clone に依存するため)。
 
