@@ -1,0 +1,24 @@
+name: Misaki update script safety
+
+on:
+  pull_request:
+    branches: [Misaki-develop]
+  push:
+    branches: [Misaki-develop]
+
+permissions:
+  contents: read
+
+jobs:
+  script-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install script check dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck python3-yaml
+      - name: Bash syntax and shellcheck
+        run: |
+          bash -n scripts/misaki/update-misaki.sh
+          shellcheck scripts/misaki/update-misaki.sh
+      - name: Safety regression tests without a production connection
+        run: sudo /usr/bin/python3 -m unittest discover -s scripts/misaki -p 'test_*.py' -v
