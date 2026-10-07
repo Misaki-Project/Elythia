@@ -27,6 +27,7 @@ const props = withDefaults(defineProps<{ embedded?: boolean; initialGame?: strin
 const pages = gameRankingPages(collectPages(serverPlugins, false));
 const game = ref(props.initialGame);
 const selected = computed(() => pages.find(page => page.plugin === game.value) ?? pages[0]);
+
 function moveTab(event: KeyboardEvent, index: number): void {
 	let next: number;
 	if (event.key === 'ArrowRight') next = (index + 1) % pages.length;
@@ -39,6 +40,7 @@ function moveTab(event: KeyboardEvent, index: number): void {
 	const buttons = (event.currentTarget as HTMLElement).parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
 	buttons?.[next].focus();
 }
+
 if (!props.embedded) definePage(() => ({ title: 'ゲームランキング', icon: 'ti ti-trophy' }));
 </script>
 <style lang="scss" module>
