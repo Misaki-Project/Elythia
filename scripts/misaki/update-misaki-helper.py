@@ -31,12 +31,16 @@ def env(config):
     return result
 
 
-def validate(d, config, image):
+def validate(d, config, image, source=None):
     c, h = d['Config'], d['HostConfig']
     require(d['State']['Running'] and not d['State'].get('Paused') and not d['State'].get('Restarting'), '本番containerが正常稼働していません')
     require(h['NetworkMode'] == 'host', 'host networkが必要です')
     require(c['User'] == '1001:1001' and c['WorkingDir'] == '/app', 'ユーザー/作業場所が想定と異なります')
-    require(c['Entrypoint'] == ['/app/misskey'] and c['Cmd'] == ['-config', '.config/default.yml'], '1.5.0の起動コマンドではありません')
+    legacy = c['Entrypoint'] == ['/app/misskey'] and c['Cmd'] == ['-config', '.config/default.yml']
+    elythia = c['Entrypoint'] == ['/app/elythia'] and c['Cmd'] == ['serve', '-config', '/app/.config/default.yml']
+    require(legacy or elythia, '対応する1.5.0/2.0.0の起動コマンドではありません')
+    if source is not None:
+        require((source == '109|false' and legacy) or (source == '117|false' and elythia), 'DB台帳と起動コマンドの組合せが想定と異なります')
     require(h['RestartPolicy']['Name'] == 'unless-stopped', 'restart policyが想定と異なります')
     m = d['Mounts']
     require(len(m) == 1 and m[0]['Type'] == 'bind' and m[0]['Source'] == config and m[0]['Destination'] == '/app/.config/default.yml' and not m[0]['RW'], '設定mountが想定と異なります')
@@ -134,16 +138,16 @@ def plugins(log):
             except ValueError:
                 item = {}
             if isinstance(item, dict) and item.get('msg') == 'plugin loaded' and item.get('name') == name:
-                found = True
+                found = found or name != 'hsr' or (item.get('version') == '0.2.0' and item.get('migrations') == 4)
             if 'plugin loaded' in line and re.search(r'\bname=' + re.escape(name) + r'(?:\s|$)', line):
-                found = True
-        require(found, 'plugin loaded未確認: ' + name)
+                found = found or name != 'hsr' or bool(re.search(r'\bversion=0\.2\.0(?:\s|$)', line) and re.search(r'\bmigrations=4(?:\s|$)', line))
+        require(found, 'plugin loaded未確認（hsrはversion0.2.0/migrations4が必要）: ' + name)
 
 
 def main(args):
     command, rest = args[0], args[1:]
     if command == 'validate':
-        validate(load(rest[0]), rest[1], load(rest[2]))
+        validate(load(rest[0]), rest[1], load(rest[2]), rest[3] if len(rest) > 3 else None)
     elif command == 'pgpass':
         pgpass(load(rest[0]), rest[1], rest[2], sys.stdin.read())
     elif command == 'environment':

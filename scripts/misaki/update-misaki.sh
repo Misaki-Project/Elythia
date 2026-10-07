@@ -3,7 +3,7 @@
 set +x
 set -Eeuo pipefail
 umask 077
-IMAGE='ghcr.io/misaki-project/mk-genshin@sha256:6d31d2e3b8453efff48363215e19b307d1ea4f44035915601adb8ae545a51ca0'
+IMAGE='ghcr.io/misaki-project/mk-genshin@sha256:7ca70e10836b5939ba587210144da4625cbd3c6b2882439dbdf54ebf1ac5f0df'
 CONTAINER='mk-go-production'
 CONFIG='/home/misskey/cherrypick/.config/default.yml'
 BACKUP_ROOT='/home/misaki/mk-update-backups'
@@ -55,7 +55,7 @@ trap 'exit 143' TERM
 case "${1:-}" in
   --help|-h)
     printf '%s\n' 'sudo bash update-misaki.sh --check' 'sudo bash update-misaki.sh' \
-      '--check: 構成・DB接続・migration109/dirty=falseを確認（pull/更新なし）。' \
+      '--check: 構成・DB接続・migration109または117/dirty=falseを確認（pull/更新なし）。' \
       '承認後: image取得→オンラインbackup/migration→短時間停止・最終DBbackup→新container起動・検査。' \
       'ホストOSは再起動しません。object storageのsnapshot/version保全は承認前に確認してください。'
     exit 0 ;;
@@ -87,17 +87,20 @@ unset DB_PASSWORD
 export PGPASSFILE="$tmp/pgpass" PGCONNECT_TIMEOUT=10
 db_args=(--host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME" --no-password)
 schema_state() { psql "${db_args[@]}" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT version::text || '\''|'\'' || dirty::text FROM public.schema_migrations;'; }
-[[ $(schema_state) == '109|false' ]] || die 'DBは1.5.0完了version109/dirty=falseである必要があります'
+source_state=$(schema_state)
+[[ $source_state == '109|false' || $source_state == '117|false' ]] || die 'DBはversion109または117/dirty=falseである必要があります'
+python3 "$HELPER" validate "$tmp/inspect.json" "$CONFIG" "$tmp/image.json" "$source_state"
 database_bytes=$(psql "${db_args[@]}" -X -A -t -v ON_ERROR_STOP=1 -c 'SELECT pg_database_size(current_database());')
 python3 "$HELPER" capacity "$BACKUP_ROOT" "$database_bytes"
 if (( check_only )); then
-  printf '起動構成・DB接続・version109/dirty=falseを確認。pull/停止/migrationなし。\n'
+  printf '起動構成・DB接続・本体台帳%sを確認。pull/停止/migrationなし。\n' "$source_state"
   exit 0
 fi
 [[ -t 0 ]] || die '承認入力のため端末から実行してください'
 printf '対象: %s\nimage: %s\n' "$CONTAINER" "$IMAGE"
 printf '%s\n' '他のwriter・自動更新を停止/無効化し、object storageの復元可能な保全を確認してください。' \
-  'オンラインmigration後はDBが117になり、旧1.5.0の再起動は行えません。' \
+  '本体は117へ更新/維持し、hsrは起動時にmigration4へ更新します。旧登録は再認証まで非公開になります。' \
+  '旧imageの自動再起動・自動DB復元は行いません。元が1.5.0の場合はDB117へ旧版を起動できません。' \
   '承認後は追加入力なしで新containerの起動まで進みます。OS再起動はしません。'
 read -r -p '上記確認済みで更新する場合は UPDATE mk-go-production と入力: ' answer
 [[ $answer == 'UPDATE mk-go-production' ]] || die 'キャンセルしました（本番未変更）'
@@ -108,6 +111,7 @@ cp -- "$tmp/image.json" "$backup/image-before.json"
 old="$CONTAINER-before-$(basename "$backup")"
 migration_container="$CONTAINER-migrate-$(basename "$backup")"
 printf '%s\n' "$old_image" > "$backup/image-before.txt"
+printf '%s\n' "$source_state" > "$backup/schema-before.txt"
 printf '%s\n' "$IMAGE" > "$backup/image-after.txt"
 printf '%s\n' "$old" > "$backup/old-container.txt"
 # 承認後のSIGHUPを無視し、出力を保護されたファイルへ固定する。SIGINT/TERM失敗時は安全停止。
@@ -126,7 +130,7 @@ stage='online-backup'
 # 書込中でも整合したsnapshotを取得。これはmigration前の復元用（以後の書込は含まない）。
 pg_dump "${db_args[@]}" --format=directory --jobs="$DUMP_JOBS" --file="$backup/database-before"
 pg_restore --list "$backup/database-before" > "$backup/database-before-list.txt"
-[[ $(schema_state) == '109|false' ]] || die 'DB台帳が準備中に変化しました'
+[[ $(schema_state) == "$source_state" ]] || die 'DB台帳が準備中に変化しました'
 # 元構成と設定の競合変更を検出。自動更新との競争を継続したまま更新しない。
 docker inspect "$CONTAINER" > "$tmp/inspect.json"
 python3 "$HELPER" unchanged "$backup/container-before.json" "$tmp/inspect.json"
@@ -136,10 +140,14 @@ mutation=1
 # 公式手順に従いCONCURRENTLY indexを旧サーバー稼働中に作成し、停止時間から外す。
 # その間の自動再起動を禁止。失敗時は旧サーバーも止め、未知versionの起動を防ぐ。
 docker update --restart=no "$old_id"
-docker run --rm --name "$migration_container" --network host --user 1001:1001 --workdir /app \
+if [[ $source_state == '109|false' ]]; then
+  docker run --rm --name "$migration_container" --network host --user 1001:1001 --workdir /app \
   --env-file "$backup/environment.list" \
   --mount "type=bind,source=$CONFIG,target=/app/.config/default.yml,readonly" \
-  --entrypoint /app/elythia "$IMAGE" migrate -config /app/.config/default.yml -direction up > "$backup/migration.log" 2>&1
+    --entrypoint /app/elythia "$IMAGE" migrate -config /app/.config/default.yml -direction up > "$backup/migration.log" 2>&1
+else
+  printf '本体117維持。本体migrationは再実行せず、hsr migrationは新版起動時に適用します。\n' > "$backup/migration.log"
+fi
 [[ $(schema_state) == '117|false' ]] || die 'migration完了が117/dirty=falseではありません'
 stage='stopping'
 date -u +%FT%TZ > "$backup/downtime-start.txt"
@@ -168,6 +176,8 @@ while :; do
   sleep 2
 done
 [[ $(schema_state) == '117|false' ]] || die '起動後のDB台帳が不正です'
+psql "${db_args[@]}" -X -A -t -v ON_ERROR_STOP=1 -c "SELECT string_agg(version::text, ',' ORDER BY version) FROM plugin_hsr.schema_migrations;" > "$backup/hsr-migrations.txt"
+[[ $(cat "$backup/hsr-migrations.txt") == '1,2,3,4' ]] || die 'hsrの独立schema migration1〜4が揃っていません'
 healthy=1
 date -u +%FT%TZ > "$backup/downtime-end.txt"
 stage='post-start'
@@ -176,6 +186,6 @@ docker inspect "$new_id" > "$backup/container-after.json"
 docker export "$old_id" > "$backup/container-filesystem.tar"
 [[ -s $backup/container-filesystem.tar ]] || die '旧containerの保存に失敗しました（新版は稼働継続）'
 docker exec "$new_id" /app/elythia doctor -config /app/.config/default.yml > "$backup/doctor.log" 2>&1 || die 'doctor失敗（新版は稼働継続、診断ログを確認）'
-printf '更新成功。4プラグイン・healthcheck・doctor・本体version117を確認。\n'
+printf '更新成功。4プラグイン・hsr0.2.0/migration4・healthcheck・doctor・本体version117を確認。\n'
 printf 'backup=%s / 旧container=%s（停止・自動再起動無効）\n' "$backup" "$old"
 printf '実ブラウザのログイン/投稿/画像/XP/原神/fedwatch/hsrは別途確認してください。\n'
