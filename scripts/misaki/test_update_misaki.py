@@ -32,6 +32,18 @@ class HelperTests(unittest.TestCase):
         d = fixture()
         helper.validate(d, '/config.yml', copy.deepcopy(d))
 
+    def test_source_schema_must_match_approved_command(self):
+        d = fixture()
+        helper.validate(d, '/config.yml', copy.deepcopy(d), '109|false')
+        with self.assertRaises(SystemExit):
+            helper.validate(d, '/config.yml', copy.deepcopy(d), '117|false')
+        d['Config']['Entrypoint'] = ['/app/elythia']
+        d['Config']['Cmd'] = ['serve', '-config', '/app/.config/default.yml']
+        helper.validate(d, '/config.yml', copy.deepcopy(d), '117|false')
+        for state in ('109|false', '117|true', '110|false'):
+            with self.assertRaises(SystemExit):
+                helper.validate(d, '/config.yml', copy.deepcopy(d), state)
+
     def test_unsupported_settings_fail_closed(self):
         for key, value in [('Privileged', True), ('Memory', 1024), ('CapAdd', ['SYS_ADMIN']), ('PortBindings', {'80/tcp': []})]:
             with self.subTest(key=key):
@@ -121,13 +133,16 @@ class HelperTests(unittest.TestCase):
     def test_plugins_require_all_four_and_exact_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = pathlib.Path(tmp) / 'log'
-            log.write_text('\n'.join('msg="plugin loaded" name=' + n for n in ('role-level', 'genshin', 'fedwatch', 'hsr')))
+            log.write_text('\n'.join('msg="plugin loaded" name=' + n + (' version=0.2.0 migrations=4' if n == 'hsr' else '') for n in ('role-level', 'genshin', 'fedwatch', 'hsr')))
             helper.plugins(log)
             log.write_text(log.read_text().replace('name=hsr', 'name=hsr-unrelated'))
             with self.assertRaises(SystemExit):
                 helper.plugins(log)
-            log.write_text('\n'.join(json.dumps({'msg': 'plugin loaded', 'name': n}) for n in ('role-level', 'genshin', 'fedwatch', 'hsr')))
+            log.write_text('\n'.join(json.dumps({'msg': 'plugin loaded', 'name': n, 'version': '0.2.0', 'migrations': 4}) for n in ('role-level', 'genshin', 'fedwatch', 'hsr')))
             helper.plugins(log)
+            log.write_text(log.read_text().replace('0.2.0', '0.1.0'))
+            with self.assertRaises(SystemExit):
+                helper.plugins(log)
 
     def test_shell_flow_keeps_preparation_outside_downtime(self):
         source = (ROOT / 'update-misaki.sh').read_text()
