@@ -34,20 +34,19 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . .
 
-# third_party/misskey (submodule) がruntime stageのCOPY対象になるので、
-# ビルド前に初期化されているか確認する。CIは docker.yml 側で submodules:
-# recursive を指定して取得する。ローカル build 時はユーザに指示を出す。
-RUN test -f third_party/misskey/packages/backend/assets/favicon.ico || \
-    (echo "ERROR: third_party/misskey submodule not initialized (or partial clone)." && \
-     echo "Run: git submodule update --init --recursive" && exit 1)
+# frontend/ (#3379 で本体へ取り込んだ) の静的アセットが runtime stage の COPY 対象に
+# なるので、build context に入っているか先に確かめる。.dockerignore を広げすぎた
+# ときに、COPY の not found より分かりやすい形で落とす。
+RUN test -f frontend/assets/favicon.ico || \
+    (echo "ERROR: frontend/assets is missing (incomplete checkout or .dockerignore)." && exit 1)
 
 # twemojiは本家frontendがUnicode絵文字描画に使うSVG set。pnpm installで
 # node_modulesに hoistされる前提 (make e2e-frontend-build等で install済み)。
 # upstream 2026.5.2 #17381 で `@discordapp/twemoji/dist/svg` から
 # `@misskey-dev/emoji-assets/built/twemoji` に asset path が移行。
-RUN test -f third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/twemoji/1f004.svg || \
+RUN test -f frontend/node_modules/@misskey-dev/emoji-assets/built/twemoji/1f004.svg || \
     (echo "ERROR: twemoji assets not found (pnpm install not run?)." && \
-     echo "Run: make e2e-frontend-build (installs third_party/misskey node_modules)" && exit 1)
+     echo "Run: make e2e-frontend-build (installs frontend/ node_modules)" && exit 1)
 
 # Go の build cache (`$GOCACHE` = /root/.cache/go-build) と module cache を
 # BuildKit cache mount として永続化する。再ビルド時に変更の無いパッケージは
@@ -63,9 +62,9 @@ RUN test -f third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji
 # videoThumbnailGenerator API) への HTTP/UDS 呼び出しで実現するので、ここに
 # ffmpeg バイナリを同梱する必要は無い (#637 M2)。
 #
-# ビルドした revision と同梱 frontend の版を埋め込む (#2700)。**Dockerfile の
+# ビルドした revision を埋め込む (#2700)。**Dockerfile の
 # 中では git を呼べない** — `.dockerignore` が `.git` を落とすのでコンテキストに
-# リポジトリが入らない。渡し忘れたときは空のまま埋まり、/about-mkgo 側が
+# リポジトリが入らない。渡し忘れたときは空のまま埋まり、/about-elythia 側が
 # 「不明」として表示を省く。
 #
 # plugins/ に置かれたプラグインをビルドに取り込む (#2480)。生成物は gitignore
@@ -73,18 +72,13 @@ RUN test -f third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji
 # make plugins を実行済みなら COPY で入るが、それに依存すると再現性が無い)。
 # プラグインが 1 つも無ければ何も生成せず、素の go build と同じになる。
 ARG MKGO_COMMIT=
-ARG MKGO_FRONTEND_VERSION=
-ENV REVISION_LDFLAGS="-X github.com/shiroha-a/mk/internal/config.MkGoCommit=${MKGO_COMMIT} -X github.com/shiroha-a/mk/internal/config.MkGoFrontendVersion=${MKGO_FRONTEND_VERSION}"
+ENV REVISION_LDFLAGS="-X github.com/elythia-network/elythia/internal/config.MkGoCommit=${MKGO_COMMIT}"
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     GOWORK=off go run ./tools/pluginbuild && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w $REVISION_LDFLAGS" -o /app/built/misskey ./cmd/misskey && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/migrate ./cmd/migrate && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-remote-host ./cmd/backfill-remote-host && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-emoji-system-file ./cmd/backfill-emoji-system-file && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-avatar-public-url ./cmd/backfill-avatar-public-url && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-instance-counts ./cmd/backfill-instance-counts
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w $REVISION_LDFLAGS" -o /out/bin/elythia ./cmd/elythia && \
+    ln -s elythia /out/bin/migrate
 
 # Stage 2: Runtime
 #
@@ -94,9 +88,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ので apk add は不要。
 #
 # 注意: distroless は shell も wget も持たないので、healthcheck は
-# `/app/misskey -healthcheck` で binary 自身に叩かせる (cmd/misskey/main.go
-# の -healthcheck フラグ)。docker-compose.dropin*.mk.yml /
-# docker-compose.federation.misskey.yml で使用。
+# `/app/elythia healthcheck` で binary 自身に叩かせる (internal/cli/diag)。
+# tests/dropin*/compose.mk.yml / tests/federation/compose.misskey.yml で使用。
 #
 # tag を省くと `latest` になり、いつ build したかで中身が変わる。builder と
 # 同じく digest で固定する (distroless の更新は dependabot が digest ごと上げる)。
@@ -104,40 +97,47 @@ FROM gcr.io/distroless/static-debian13:latest@sha256:58133991db06659feaabe0f4e97
 
 WORKDIR /app
 
-COPY --from=builder /app/built/misskey /app/misskey
-COPY --from=builder /app/built/migrate /app/migrate
-# 後始末バッチ。runtime は distroless で shell が無いので、entrypoint を差し替えた
-# 使い捨てコンテナで流す (#2706)。
-#   docker compose run --rm --entrypoint /app/backfill-remote-host app -dry-run
-COPY --from=builder /app/built/backfill-remote-host /app/backfill-remote-host
-COPY --from=builder /app/built/backfill-emoji-system-file /app/backfill-emoji-system-file
-COPY --from=builder /app/built/backfill-avatar-public-url /app/backfill-avatar-public-url
-COPY --from=builder /app/built/backfill-instance-counts /app/backfill-instance-counts
+# 実行バイナリは elythia 1 つ (#3394)。サーバー・migration・後始末バッチを
+# サブコマンドで呼び分ける。runtime は distroless で shell が無いので、バッチは
+# command を差し替えた使い捨てコンテナで流す (#2706)。
+#   docker compose run --rm --no-deps app backfill remote-host -dry-run
+# `/app/migrate` は `elythia` への symlink。古い compose の migrate サービス
+# (`entrypoint: ["/app/migrate"]`) のまま新しい image を pull した運営者の migration を
+# 止めないための、D11 の期限付きの例外 (2.x の間だけ。3.0 で撤去)。elythia は
+# この名前で起動されると、以前の flag のまま migrate として動く (internal/cli)。
+# **ディレクトリごと COPY する。** 単独のファイルとして COPY すると symlink が辿られ、
+# バイナリの実体がもう 1 つ image に入る (実測)。
+COPY --from=builder /out/bin/ /app/
+# `docker exec <container> elythia backfill <名前>` のように、パス無しで呼べるように
+# する (設計 R7)。distroless は ENV で既存の PATH を参照できる shell を持たないので、
+# 既定の PATH を書き下して先頭に /app を足す。
+ENV PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 COPY --from=builder /app/migration /app/migration
 
 # 本家のpackages/backend/assets (favicon / icons等) をimageに焼き込む。
 # bind-mountなしでも /favicon.ico / /static-assets/* 等が serve できる
-# (issue #346)。third_party/misskey はsubmoduleなのでビルド前に
-# `git submodule update --init --recursive` が必要。
-COPY --from=builder /app/third_party/misskey/packages/backend/assets /app/static-assets
+# (issue #346)。本家では packages/backend/assets にあり、本体では frontend/assets
+# に置いている (#3379、設計 D3)。
+COPY --from=builder /app/frontend/assets /app/static-assets
 ENV MISSKEY_STATIC_DIR=/app/static-assets
 
 # repo-level assets (ai.png等)。frontendが /assets/ai.png で参照する
-# (mascotImageUrl のデフォルト)。submodule直下 (issue #360)。
-COPY --from=builder /app/third_party/misskey/assets /app/repo-assets
+# (mascotImageUrl のデフォルト)。本家の直下の assets/ を frontend/repo-assets に
+# 置いている (issue #360、#3379)。
+COPY --from=builder /app/frontend/repo-assets /app/repo-assets
 ENV MISSKEY_REPO_ASSETS_DIR=/app/repo-assets
 
 # twemoji SVG set (Unicode絵文字描画)。frontendが /twemoji/<codepoint>.svg
 # で参照する。約18MB (issue #359)。upstream 2026.5.2 #17381 で
 # `@misskey-dev/emoji-assets/built/twemoji` に asset path が移行した。
-COPY --from=builder /app/third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/twemoji /app/twemoji
+COPY --from=builder /app/frontend/node_modules/@misskey-dev/emoji-assets/built/twemoji /app/twemoji
 ENV MISSKEY_TWEMOJI_DIR=/app/twemoji
 
 # fluent-emoji PNG set。frontend が実績バッジ / notification icon を
 # /fluent-emoji/<hex>.png で参照する。twemoji と同じ @misskey-dev/emoji-assets
 # パッケージに含まれる (upstream 2026.5.2 #17381)。これが無いと実績バッジ等が
 # 404 になる (deploy/uds/Dockerfile.mkgo では焼き込み済みだが main は欠落していた)。
-COPY --from=builder /app/third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/fluent-emoji /app/fluent-emoji
+COPY --from=builder /app/frontend/node_modules/@misskey-dev/emoji-assets/built/fluent-emoji /app/fluent-emoji
 ENV MISSKEY_FLUENT_EMOJI_DIR=/app/fluent-emoji
 
 # デフォルト設定ファイルをコピー (docker-compose でマウント上書き可能)。
@@ -157,5 +157,7 @@ EXPOSE 3000
 # drop-in 互換を壊すので使わない。
 USER 991:991
 
-ENTRYPOINT ["/app/misskey"]
-CMD ["-config", ".config/default.yml"]
+# ENTRYPOINT はバイナリだけにして、サブコマンドは CMD に置く。compose の
+# command を差し替えるだけで migrate や backfill を同じ image で流せる。
+ENTRYPOINT ["/app/elythia"]
+CMD ["serve", "-config", ".config/default.yml"]

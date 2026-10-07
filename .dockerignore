@@ -2,10 +2,12 @@
 #
 # **パターンはパス全体で照合される。** スラッシュを含まないパターンは root 直下に
 # しかマッチしないので、入れ子にも効かせたいものは `**/` を前置する (#2942)。
-# `built` を `**/built` にしないのは、`third_party/misskey/built` が SPA の
+# `built` を `**/built` にしないのは、`frontend/built` が SPA の
 # 成果物で image に入る必要があるため。
 **/.git
 .tmp
+# 比較対象の本家 (make upstream-fetch、#3378)。node_modules 入りの木になるので必ず外す
+.cache
 .env
 .env.test
 built
@@ -57,18 +59,30 @@ dist
 .github
 docs
 tests/dropin
-tests/dropin_frontend
+tests/dropin-frontend
 tests/playwright
-tests/bench
+# ベンチのうち http だけを削る。queue の blackhole / faker は Dockerfile が repo root
+# の context から COPY するので残す (#3373 で tests/bench/ の下へまとめた)。
+tests/bench/http
 
-# submodule の依存。実測 1.2GB あり、frontend をビルドしたコンテキストの大半を
-# 占める。**`**/node_modules` にはできない** — それだと
-# `packages/backend/node_modules/` 配下の symlink まで落ち、Dockerfile が
-# COPY する `@misskey-dev/emoji-assets/built/...` が解決できなくなる (#2942)。
-third_party/misskey/node_modules
-# ただし emoji-assets だけは image に入る。Dockerfile / Dockerfile.bundled が
-# /twemoji と /fluent-emoji を **ここから** COPY するので、除外すると
-# runtime で絵文字が全滅する。pnpm は実体を .pnpm 配下に置き、
-# packages/backend/node_modules/... はそこへの symlink なので、
-# **再包含するのは実体側**。外すと COPY が not found で落ちる (実測)。
-!third_party/misskey/node_modules/.pnpm/*emoji-assets*/**
+# #3379 で外した submodule の残り。pull しても git は未追跡になった third_party/ を
+# 消さないので、片付けるまでは node_modules (実測 1.2GB) ごと build context に入る
+# (`COPY . .`)。片付けの手順は docs/deployment.md。
+third_party
+
+# 本体へ取り込んだ frontend/ (#3379) の依存とビルド成果物。手元で pnpm を回すと
+# node_modules だけで 1GB 近くになり、`COPY . .` の build context に入る。
+frontend/node_modules
+frontend/packages/*/node_modules
+frontend/packages-private/*/node_modules
+frontend/packages/*/built
+# ただし emoji-assets だけは image に入る。Dockerfile が /twemoji と /fluent-emoji を
+# ここから COPY する。pnpm が実体を置く .pnpm 側を再包含し、COPY が通る symlink
+# (frontend/node_modules/@misskey-dev/emoji-assets) も除外した frontend/node_modules
+# の中にあるので、symlink の側も戻す。**`**/node_modules` にはできない** — 再包含が
+# 効かなくなり、COPY が not found で落ちる (#2942、実測)。
+!frontend/node_modules/@misskey-dev/emoji-assets
+!frontend/node_modules/@misskey-dev/emoji-assets/**
+!frontend/node_modules/.pnpm/*emoji-assets*/**
+# frontend/built (SPA のビルド成果物) は外さない。連合 e2e の Dockerfile.mkgo が
+# COPY する (Dockerfile.bundled は image の中でビルドし直すので使わない)。

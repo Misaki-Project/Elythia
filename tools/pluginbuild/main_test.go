@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 func TestParseArgs(t *testing.T) {
@@ -90,6 +90,129 @@ func TestDiscover_MissingGoModIsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "go.mod がありません")
 	assert.Contains(t, err.Error(), "独立した Go module")
+}
+
+// 旧名のマニフェストだけがあるディレクトリは、黙って飛ばさずに止める (#3400)。
+// 飛ばすと、プラグインが組み込まれていない image が緑で出来上がる。
+func TestDiscover_LegacyManifestOnlyIsError(t *testing.T) {
+	for name, marker := range map[string]string{
+		"enabled":  validMarker(),
+		"disabled": "name: hello\napiVersion: 1\ndisabled: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := writePlugin(t, root, "old", "example.com/old", "")
+			require.NoError(t, os.WriteFile(filepath.Join(dir, legacyMarkerFile), []byte(marker), 0o644))
+
+			_, err := discover(root, "", include{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), legacyMarkerFile)
+			assert.Contains(t, err.Error(), markerFile)
+			assert.Contains(t, err.Error(), "docs/plugins/compatibility.md")
+		})
+	}
+}
+
+// 旧名が壊れた symlink でも、置いてある以上は改名し忘れなので止める。
+func TestDiscover_LegacyManifestBrokenSymlinkIsError(t *testing.T) {
+	root := t.TempDir()
+	dir := writePlugin(t, root, "old", "example.com/old", "")
+	require.NoError(t, os.Symlink(filepath.Join(dir, "missing.yml"), filepath.Join(dir, legacyMarkerFile)))
+
+	_, err := discover(root, "", include{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), legacyMarkerFile)
+}
+
+// 新しい名前があれば、旧名が残っていてもそちらを読む (コピーして改名したときなど)。
+func TestDiscover_NewManifestWinsOverLegacy(t *testing.T) {
+	root := t.TempDir()
+	dir := writePlugin(t, root, "hello", "example.com/hello", validMarker())
+	require.NoError(t, os.WriteFile(filepath.Join(dir, legacyMarkerFile), []byte("name: legacy\napiVersion: 999\n"), 0o644))
+
+	found, err := discover(root, "", include{})
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	assert.Equal(t, "hello", found[0].name)
+}
+
+// 作業用ディレクトリ (マーカーがどちらも無い) は今までどおり黙って飛ばす。
+func TestDiscover_NoManifestAtAllIsSkipped(t *testing.T) {
+	root := t.TempDir()
+	writePlugin(t, root, "scratch", "example.com/scratch", "")
+
+	found, err := discover(root, "", include{})
+	require.NoError(t, err)
+	assert.Empty(t, found)
+}
+
+// 以前のモジュールパスのままのプラグインは、生成の段階で直し方を示して止める (#3394)。
+func TestDiscover_LegacyModulePathIsError(t *testing.T) {
+	root := t.TempDir()
+	dir := writePlugin(t, root, "old", "example.com/old", validMarker())
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(
+		"module github.com/shiroha-a/mk-plugin-old\n\ngo 1.27.1\n\n"+
+			"require github.com/shiroha-a/mk v0.0.0\n\n"+
+			"replace github.com/shiroha-a/mk => ../..\n"), 0o644))
+
+	_, err := discover(root, "", include{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "github.com/shiroha-a/mk")
+	assert.Contains(t, err.Error(), hostModulePath)
+	assert.Contains(t, err.Error(), "docs/plugins/compatibility.md")
+}
+
+// 無効化したプラグインは、古いパスのままでも止めない (外して残せるようにする)。
+func TestDiscover_DisabledLegacyPluginIsSkipped(t *testing.T) {
+	root := t.TempDir()
+	dir := writePlugin(t, root, "old", "example.com/old", "name: old\napiVersion: 1\ndisabled: true\n")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(
+		"module example.com/old\n\nrequire github.com/shiroha-a/mk v0.0.0\n"), 0o644))
+
+	found, err := discover(root, "", include{})
+	require.NoError(t, err)
+	assert.Empty(t, found)
+}
+
+func TestCheckLegacyModulePath(t *testing.T) {
+	cases := []struct {
+		name  string
+		gomod string
+		bad   bool
+	}{
+		{"single-line require", "module example.com/x\nrequire github.com/shiroha-a/mk v0.0.0\n", true},
+		{"require block", "module example.com/x\nrequire (\n\tgithub.com/shiroha-a/mk v0.0.0\n)\n", true},
+		{"raw-quoted path", "module example.com/x\nrequire `github.com/shiroha-a/mk` v0.0.0\n", true},
+		{"quoted path", "module example.com/x\nrequire \"github.com/shiroha-a/mk\" v0.0.0\n", true},
+		{"replace only", "module example.com/x\nreplace github.com/shiroha-a/mk => ../..\n", true},
+		{"new path", "module example.com/x\nrequire github.com/elythia-network/elythia v0.0.0\nreplace github.com/elythia-network/elythia => ../..\n", false},
+		{"own legacy-style module name", "module github.com/shiroha-a/mk-plugin-x\n", false},
+		{"queue dependency", "module example.com/x\nrequire github.com/shiroha-a/mkq v1.1.1\n", false},
+		{"subpackage-like path", "module example.com/x\nrequire github.com/shiroha-a/mk/v2 v2.0.0\n", false},
+		{"comment only", "module example.com/x\n// moved from github.com/shiroha-a/mk\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "go.mod")
+			require.NoError(t, os.WriteFile(path, []byte(c.gomod), 0o644))
+			err := checkLegacyModulePath(path)
+			if c.bad {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+
+	assert.Error(t, checkLegacyModulePath(filepath.Join(t.TempDir(), "missing.mod")))
+}
+
+// hostModulePath は本体の go.mod の module 行と一致していなければならない。
+// 生成物の import と、古いパスの案内に使っているので、片方だけ変えると壊れる。
+func TestHostModulePathMatchesGoMod(t *testing.T) {
+	got, err := modulePath(filepath.Join("..", "..", "go.mod"))
+	require.NoError(t, err)
+	assert.Equal(t, hostModulePath, got)
 }
 
 // apiVersion 不一致はコンパイル前に落とす。Go のコンパイルエラーや起動時
@@ -248,8 +371,8 @@ func TestRenderFrontendList_WithPlugins(t *testing.T) {
 	assert.Contains(t, out, "serverPlugins: PluginDefinition[] = [p0, p1];")
 }
 
-// **frontend を持たないプラグインだけの場合も生成物は空の形で書く。** 消すと
-// フォークにコミットしてある既定ファイルとの差分になり submodule が汚れる。
+// **frontend を持たないプラグインだけの場合も生成物は空の形で書く。** frontend は
+// このファイルを import するので、無いとビルドが落ちる (生成物は追跡していない、#3379)。
 func TestWriteFrontend_BackendOnlyStillWritesEmptyList(t *testing.T) {
 	root := fakeRepoWithFrontend(t)
 
@@ -286,8 +409,8 @@ func TestWriteFrontend_GeneratesAliasesRelativeToViteConfig(t *testing.T) {
 	// **エントリファイルまで指すこと。** ディレクトリだと rolldown が index を
 	// 自動解決せず "Is a directory" で落ちる (tsconfig の paths は解決するので
 	// 型チェックでは気付けない、実際に本番ビルドで踏んだ)。
-	assert.Equal(t, "../../../../plugins/ui/frontend/index.ts", m.Aliases["@mkplugin/ui"])
-	assert.Equal(t, []string{"../../../../plugins"}, m.Allow)
+	assert.Equal(t, "../../../plugins/ui/frontend/index.ts", m.Aliases["@mkplugin/ui"])
+	assert.Equal(t, []string{"../../../plugins"}, m.Allow)
 	for _, v := range m.Aliases {
 		assert.False(t, filepath.IsAbs(v), "絶対パスを書かない")
 	}
@@ -340,7 +463,7 @@ func TestWriteFrontend_UnwritableTSIsError(t *testing.T) {
 
 // mustRel は固定値同士なので失敗しないが、失敗しても呼び出し元を壊さない。
 func TestMustRel(t *testing.T) {
-	assert.Equal(t, filepath.Join("..", "..", "..", "..", "plugins"),
+	assert.Equal(t, filepath.Join("..", "..", "..", "plugins"),
 		mustRel(frontendSrcRelToFront, "plugins"))
 	// 相対化できない組み合わせでは target をそのまま返す。
 	assert.Equal(t, "/abs", mustRel("rel", "/abs"))
@@ -354,7 +477,7 @@ func fakeRepoWithFrontend(t *testing.T) string {
 	return root
 }
 
-// submodule 未取得でも Go だけのビルドは通す。frontend を持たないプラグインしか
+// frontend/ が無い木でも Go だけのビルドは通す。frontend を持たないプラグインしか
 // 無ければ、書けなくても問題は無い。
 func TestWriteFrontend_MissingForkIsSkippedWhenNoFrontend(t *testing.T) {
 	root := fakeRepo(t) // frontend ディレクトリを作らない
@@ -368,18 +491,18 @@ func TestWriteFrontend_MissingForkIsErrorWhenFrontendNeeded(t *testing.T) {
 
 	err := writeFrontend(root, []discovered{{name: "ui", dir: "plugins/ui", hasFrontend: true}})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "submodule")
+	assert.Contains(t, err.Error(), "frontend/ を含む checkout")
 }
 
 // --- run ---
 
-// fakeRepo builds a repo root with go.mod and cmd/misskey/.
+// fakeRepo builds a repo root with go.mod and cmd/elythia/.
 func fakeRepo(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "go.mod"),
-		[]byte("module github.com/shiroha-a/mk\n\ngo 1.26.5\n"), 0o644))
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "cmd", "misskey"), 0o755))
+		[]byte("module github.com/elythia-network/elythia\n\ngo 1.26.5\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "cmd", "elythia"), 0o755))
 	return root
 }
 
@@ -411,6 +534,62 @@ func TestRun_RemovesStaleArtifacts(t *testing.T) {
 
 	assert.NoFileExists(t, genPath)
 	assert.NoFileExists(t, workPath)
+}
+
+// **改名前の生成物を消す (#3394)。** cmd/misskey/ に残ると main 関数の無い
+// package main になり、`go build ./...` が落ちる。ディレクトリは空になったときだけ消す。
+func TestRun_RemovesLegacyGeneratedFile(t *testing.T) {
+	for _, withPlugin := range []bool{false, true} {
+		root := fakeRepo(t)
+		if withPlugin {
+			writePlugin(t, filepath.Join(root, "plugins"), "hello", "example.com/hello", validMarker())
+		}
+		legacy := filepath.Join(root, legacyGeneratedFile)
+		require.NoError(t, os.MkdirAll(filepath.Dir(legacy), 0o755))
+		require.NoError(t, os.WriteFile(legacy, []byte(renderRegistration(nil)), 0o644))
+
+		require.NoError(t, run(root, "plugins", include{}))
+
+		assert.NoFileExists(t, legacy)
+		assert.NoDirExists(t, filepath.Dir(legacy))
+	}
+
+	root := fakeRepo(t)
+	legacy := filepath.Join(root, legacyGeneratedFile)
+	keep := filepath.Join(filepath.Dir(legacy), "notes.txt")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacy), 0o755))
+	require.NoError(t, os.WriteFile(legacy, []byte(renderRegistration(nil)), 0o644))
+	require.NoError(t, os.WriteFile(keep, []byte("mine"), 0o644))
+
+	require.NoError(t, run(root, "plugins", include{}))
+
+	assert.NoFileExists(t, legacy)
+	assert.FileExists(t, keep, "files the operator put there must survive")
+}
+
+// 生成物の見出しで始まらないファイルは、同じ名前でも消さない (利用者が置いたもの
+// かもしれない)。ディレクトリも残す。
+func TestRun_KeepsHandWrittenFileAtLegacyPath(t *testing.T) {
+	root := fakeRepo(t)
+	legacy := filepath.Join(root, legacyGeneratedFile)
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacy), 0o755))
+	require.NoError(t, os.WriteFile(legacy, []byte("package main\n\n// mine\n"), 0o644))
+
+	require.NoError(t, run(root, "plugins", include{}))
+
+	assert.FileExists(t, legacy)
+}
+
+// 改名前の生成物を消せないときは止める (黙って続けると go build ./... で落ちる)。
+func TestRun_LegacyGeneratedFileThatCannotBeRemoved(t *testing.T) {
+	root := fakeRepo(t)
+	legacy := filepath.Join(root, legacyGeneratedFile)
+	// 中身のあるディレクトリにすると os.Remove が失敗する。
+	require.NoError(t, os.MkdirAll(filepath.Join(legacy, "x"), 0o755))
+
+	err := run(root, "plugins", include{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins_generated.go")
 }
 
 // プラグインが無い状態で 2 回走らせても失敗しない (消すものが無い)。
@@ -466,7 +645,7 @@ func TestDiscover_UnreadableDirIsError(t *testing.T) {
 // go.mod が無い状態で生成しようとしたらエラーにする。go directive を写せない。
 func TestRun_MissingRootGoModIsError(t *testing.T) {
 	root := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "cmd", "misskey"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "cmd", "elythia"), 0o755))
 	writePlugin(t, filepath.Join(root, "plugins"), "hello", "example.com/hello", validMarker())
 
 	err := run(root, "plugins", include{})
@@ -478,8 +657,8 @@ func TestRun_MissingRootGoModIsError(t *testing.T) {
 func TestRun_UnwritableTargetIsError(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "go.mod"),
-		[]byte("module github.com/shiroha-a/mk\n\ngo 1.26.5\n"), 0o644))
-	// cmd/misskey/ を作らないので generated file が書けない。
+		[]byte("module github.com/elythia-network/elythia\n\ngo 1.26.5\n"), 0o644))
+	// cmd/elythia/ を作らないので generated file が書けない。
 	writePlugin(t, filepath.Join(root, "plugins"), "hello", "example.com/hello", validMarker())
 
 	err := run(root, "plugins", include{})

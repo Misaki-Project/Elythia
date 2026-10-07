@@ -1,0 +1,185 @@
+# Drop-in e2e test stack: Misskey TS instance A ↔ Misskey TS instance B.
+#
+# Phase 13-1 (#365) lays the baseline for Phase 13-2 where instance A's
+# backend is swapped with mk-go against the same DB/Redis to verify drop-in
+# compatibility. For now both backends are Misskey TS so the suite just
+# confirms that federation works end-to-end under self-signed TLS.
+#
+# Run via `make dropin-up` / `make dropin-test` / `make dropin-down`.
+
+# project name は repo dir 名 (default = `mk`) と衝突して UDS 本番の
+# `mk-postgres-1` 等の container を取り合うので、別 project に分離する
+# (#804 follow-up)。`down -v` でも UDS service / volume は touch されない。
+name: mk-dropin
+
+services:
+  # ── Certificate Generator ──────────────────────────────────
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    volumes:
+      - certs:/certs
+      - ./gen-certs.sh:/gen-certs.sh:ro
+
+  # ── Instance A (Misskey TS) ────────────────────────────────
+  postgres-a:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - dropin
+
+  redis-a:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - dropin
+
+  app-a:
+    image: misskey/misskey:2026.10.0
+    environment:
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-a:
+        condition: service_healthy
+      redis-a:
+        condition: service_healthy
+    volumes:
+      - ./instance_a.yml:/misskey/.config/default.yml:ro
+    # POST /api/ping が pong を返すまでを healthy と判定する。Misskey TS は
+    # 起動に 20-60s かかるので start_period に余裕を持たせる。
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/ping | grep -q pong"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - dropin
+
+  nginx-a:
+    image: nginx:alpine
+    volumes:
+      - ./nginx_a.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      # service_healthy にすることで Misskey 初期化中に nginx が 502 を
+      # 返す窓を消す (Devin #366 round-2)。
+      app-a:
+        condition: service_healthy
+      # certs は one-shot コンテナなので start ではなく完了を待たないと
+      # /certs/a.crt が無いまま nginx が起動してクラッシュする (Devin #366 #1)。
+      certs:
+        condition: service_completed_successfully
+    networks:
+      dropin:
+        aliases:
+          - a
+
+  # ── Instance B (Misskey TS) ────────────────────────────────
+  postgres-b:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - dropin
+
+  redis-b:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - dropin
+
+  app-b:
+    image: misskey/misskey:2026.10.0
+    environment:
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-b:
+        condition: service_healthy
+      redis-b:
+        condition: service_healthy
+    volumes:
+      - ./instance_b.yml:/misskey/.config/default.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/ping | grep -q pong"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - dropin
+
+  nginx-b:
+    image: nginx:alpine
+    volumes:
+      - ./nginx_b.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      app-b:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    networks:
+      dropin:
+        aliases:
+          - b
+
+  # ── Test Runner ────────────────────────────────────────────
+  test-runner:
+    profiles: ["test"]
+    # 既存の tests/federation/common/Dockerfile は pytest + httpx + 共通
+    # conftest_base をインストールする。そのまま流用する。
+    build:
+      context: ../federation
+      dockerfile: common/Dockerfile
+    environment:
+      A_URL: https://a
+      B_URL: https://b
+      A_DOMAIN: a
+      B_DOMAIN: b
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      # drop-in テストはルートとして tests/dropin を参照するが、shared
+      # `conftest_base.py` は tests/federation/common/ にあるので両方を
+      # マウントする (tests/dropin/conftest.py が sys.path に追加する)。
+      - .:/tests/dropin:ro
+      - ../federation/common:/tests/federation_common:ro
+    working_dir: /tests/dropin
+    depends_on:
+      nginx-a:
+        condition: service_started
+      nginx-b:
+        condition: service_started
+    networks:
+      - dropin
+
+volumes:
+  certs:
+
+networks:
+  dropin:
+    driver: bridge

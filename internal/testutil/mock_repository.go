@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/misc/idnhost"
-	"github.com/shiroha-a/mk/internal/model"
+	"github.com/elythia-network/elythia/internal/misc/idnhost"
+	"github.com/elythia-network/elythia/internal/model"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -321,7 +321,7 @@ func (m *MockUserRepository) FindByUsernameLower(username string, host *string) 
 //
 // **生の形にも当てる互換経路は #2996 で撤去した。** 保存側も #2706 で正規化する
 // ので、正規形どうしの完全一致で引ける。非正規化のまま残っている行は引けなく
-// なる (それが撤去の意味で、`backfill-remote-host` を流してから上げる前提)。
+// なる (それが撤去の意味で、`elythia backfill remote-host` を流してから上げる前提)。
 func hostMatches(query, stored string) bool {
 	return stored == idnhost.Puny(query)
 }
@@ -2759,6 +2759,24 @@ func (m *MockEmojiRepository) FindManyByNamesAndHost(names []string, host *strin
 			continue
 		}
 		out = append(out, e)
+	}
+	return out, nil
+}
+
+// FindManyByKeys returns emojis matching any of the given (name, host) pairs.
+func (m *MockEmojiRepository) FindManyByKeys(keys []model.EmojiKey) ([]*model.Emoji, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	want := make(map[model.EmojiKey]struct{}, len(keys))
+	for _, k := range keys {
+		want[k] = struct{}{}
+	}
+	var out []*model.Emoji
+	for _, e := range m.Emojis {
+		if _, ok := want[model.EmojiKeyOf(e)]; ok {
+			out = append(out, e)
+		}
 	}
 	return out, nil
 }

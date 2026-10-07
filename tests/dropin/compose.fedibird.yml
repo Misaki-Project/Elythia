@@ -1,0 +1,45 @@
+# Drop-in fedibird overlay (#1083).
+#
+# 既存 dropin stack (tests/dropin/compose.yml + compose.mk.yml)
+# に Fedibird-like ActivityPub mock を追加する overlay。
+#
+# Usage (リポジトリ直下から):
+#   docker compose \
+#     -f tests/dropin/compose.yml \
+#     -f tests/dropin/compose.mk.yml \
+#     -f tests/dropin/compose.fedibird.yml up -d --build
+#
+# orchestrator: tests/dropin/run-fedibird-test.sh
+
+name: mk-dropin
+
+services:
+  fedibird-mock:
+    build:
+      context: ./fedibird_mock
+    environment:
+      FEDIBIRD_DOMAIN: fedibird-mock.test
+      # gen-certs.sh はドメイン名でファイルを作る (fedibird-mock.test.crt)。
+      # Dockerfile の既定値は /certs/server.crt なので、指定しないと mock が
+      # 起動直後に FileNotFoundError で落ちる。
+      FEDIBIRD_TLS_CERT: /certs/fedibird-mock.test.crt
+      FEDIBIRD_TLS_KEY: /certs/fedibird-mock.test.key
+    volumes:
+      - certs:/certs:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    networks:
+      dropin:
+        aliases:
+          - fedibird-mock.test
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request, ssl; urllib.request.urlopen('https://localhost/_test/healthz', context=ssl._create_unverified_context()).read()
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s

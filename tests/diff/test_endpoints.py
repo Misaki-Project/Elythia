@@ -29,12 +29,12 @@ META_IGNORE = DEFAULT_IGNORE_KEYS | {
     # バージョンを返す契約なので、mk-go の実装版は別 field にしている (#2274)。
     # TS 側に存在しないのが仕様。
     "mkGoVersion",
-    # ビルドした revision と同梱 fork frontend の版 (#2700)。/about-mkgo が
-    # 「mk-go 1.3.0 (abc1234)」「Misskey 2026.9.0-mk.3」として出す。TS 側に
+    # ビルドした revision (#2700)。/about-elythia が「Elythia 1.3.0 (abc1234)」として
+    # 出す。TS 側に
     # 対応物が無い。docs/divergence.md に additive field として記載済み。
     # **埋め込みの無いビルドでは空文字**になるので、値ではなくキーごと無視する
     # (CI の diff harness は build-arg を渡さないので必ず空になる)。
-    "mkGoCommit", "mkGoFrontendVersion",
+    "mkGoCommit",
     # 新規登録の username の最小文字数 (#3015)。upstream には対応する設定が
     # 無い (`preservedUsernames` は名前を 1 つずつ列挙する仕組みなので
     # 「2 文字以下を全部」を表現できない)。登録フォームが判定に使うので公開
@@ -531,7 +531,7 @@ def test_note_with_poll_parity(mkgo, ts):
 # 投げるので、向きが逆だとページが飛ぶ。
 #
 # **本家 backend e2e には既に 2 本ある** —
-# `third_party/misskey/packages/backend/test/e2e/timelines.ts` が `users/notes` の
+# `packages/backend/test/e2e/timelines.ts` が `users/notes` の
 # sinceId 単独 (ASC) と sinceId+untilId (DESC) を `deepStrictEqual` でリテラル配列に
 # 固定していて、これは mk-go に対しても実行されている (exclude にも
 # known-divergences にも入っていない。`describe.each` の FTT on/off で計 4 実行)。
@@ -540,7 +540,7 @@ def test_note_with_poll_parity(mkgo, ts):
 # `clips/notes` に sinceId を投げるが、3 箇所とも `res.sort(compareBy(s => s.id))`
 # で**両辺を並べ替えてから**比較しており、集合しか見ていない (順序回帰は落ちない)。
 #
-# **無かったのは mk-go 側で管理するゲート**で、`tests/` / `test/` には 1 本も無い。
+# **無かったのは mk-go 側で管理するゲート**で、`tests/` には 1 本も無い。
 #
 # 各テストは diff (mk-go と TS が一致するか) に加えて **向きそのものを直接
 # assert する**。diff だけだと「両方 DESC」でも通ってしまい、TS 側の実装に

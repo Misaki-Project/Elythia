@@ -1,13 +1,13 @@
 # プラグイン — 互換性ポリシー
 
-mk-go 本体を変更する人向け。**公開面を広げてよい条件**と、壊してよい範囲を定める。
+Elythia 本体を変更する人向け。**公開面を広げてよい条件**と、壊してよい範囲を定める。
 
 ## 公開面とは
 
 | | 場所 |
 |---|---|
 | Go | `plugin/` と `plugin/peercache/` と `plugin/plugintest/` |
-| TypeScript | `third_party/misskey/packages/frontend/src/plugin-api.ts` |
+| TypeScript | `frontend/packages/frontend/src/plugin-api.ts` |
 | HTTP | `/api/plugin/<name>/` の名前空間 |
 | ページ | `/plugin/<name>/` と `/admin/plugin/<name>/` の名前空間 |
 | ナビ | `navbarItemDef` の `plugin:<name>` キー |
@@ -38,7 +38,7 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 
 `Definition.Peer`（#2819）と`Context.Queue()`、`plugin.Queue` / `EnqueueOption`の追加も同じ扱い。`Definition.Peer`は既存プラグインが`Routes`の中でpeerを登録していても壊さない（`RoleBoth`ならそのまま動く）が、**ロールを分割した構成では応答が届かない**ので、移すこと。登録が無いロールでは起動時にwarnが出る。
 
-`Context`はmk-goが実装してプラグインは受け取るだけなので、メソッドが増えてもプラグインは壊れない（プラグイン側が`Context`を自前で実装している場合はこの限りではないが、それはサポート対象外）。
+`Context`はElythiaが実装してプラグインは受け取るだけなので、メソッドが増えてもプラグインは壊れない（プラグイン側が`Context`を自前で実装している場合はこの限りではないが、それはサポート対象外）。
 
 ### キューの実装との関係
 
@@ -50,7 +50,7 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 
 既存のシグネチャ変更、削除、意味の変更。
 
-**`plugin.APIVersion` を上げる。** 合わないプラグインは `mk-plugin.yml` の `apiVersion` 検査でビルド時に落ちる。黙って動かない状態にはならない。
+**`plugin.APIVersion` を上げる。** 合わないプラグインは `elythia-plugin.yml` の `apiVersion` 検査でビルド時に落ちる。黙って動かない状態にはならない。
 
 破壊的変更を入れるときは、
 
@@ -58,11 +58,49 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 2. `APIVersion` を上げる
 3. 同梱プラグイン (`plugins/status/` / `plugins/trustlevel/`) を追従させる（サンプルが壊れたまま残らないように）
 
+### Go のモジュールパスの変更 (#3394)
+
+2.0 で、本体の Go のモジュールパスが `github.com/shiroha-a/mk` から `github.com/elythia-network/elythia` に変わった。公開パッケージの import パスも `github.com/elythia-network/elythia/plugin` (`plugintest` / `peercache` / `imagedecode` を含む) に変わる。中身と `plugin.APIVersion` は変えていない。
+
+古いパスのままのプラグインは、`make plugins` が次のように止める (無効化したプラグインは止めない)。
+
+```
+pluginbuild: plugins/foo: go.mod が以前のモジュールパス github.com/shiroha-a/mk を参照しています。…
+```
+
+プラグインのディレクトリで次を流す。`go.mod` の `require` と `replace` を付け替え、`.go` の import を書き換える。
+
+```bash
+go mod edit \
+  -droprequire=github.com/shiroha-a/mk -dropreplace=github.com/shiroha-a/mk \
+  -require=github.com/elythia-network/elythia@v0.0.0 \
+  -replace=github.com/elythia-network/elythia=../..
+grep -rlZ --include='*.go' '"github.com/shiroha-a/mk/' . \
+  | xargs -0 -r sed -i 's#"github.com/shiroha-a/mk/#"github.com/elythia-network/elythia/#g'
+gofmt -w .
+```
+
+- 書き換えた後のプラグインは、2.0 より前の本体ではビルドできない。本体と同じ版の組み合わせで上げる
+- プラグイン自身のモジュール名 (`module` 行) は変えなくても動く。同梱プラグインは `github.com/elythia-network/elythia-plugin-<名前>` にそろえた
+
+### マニフェストの改名 (#3400)
+
+2.0 で、プラグインのマニフェストの名前が `mk-plugin.yml` から `elythia-plugin.yml` に変わった。中身の書式はそのままで、名前を変えるだけでよい。
+
+```bash
+git mv mk-plugin.yml elythia-plugin.yml   # git で管理していなければ mv
+```
+
+- 旧名は読まない。**旧名のマニフェストだけがあるディレクトリは、`make plugins` が止める** (`disabled: true` を書いていても止める)。黙って飛ばすと、プラグインが組み込まれていない image が出来上がるため
+- 新しい名前があれば、旧名のファイルが残っていても新しい方を読む
+- nodeinfo の宣言も `metadata.mkGoPlugins` から `metadata.elythiaPlugins` に変わった。`Peered` を宣言しているプラグインは、相手が 2.0 より前の版のあいだ、相手を対応サーバーと見なさない ([Peer のプロトコル](../plugin-peer-protocol.md#相手が持っているかの判定))
+- マニフェストの名前を変えたプラグインも、2.0 より前の本体では検出されない。本体と同じ版の組み合わせで上げる
+
 ### 上流追従による破壊
 
 `plugin-api.ts` が再公開している Misskey のコンポーネント（`MkInput` 等）は、upstream が props を変えると壊れる。
 
-これは**受け入れている**。見た目の完全一致と引き換えのコストで、どのプラグイン機構でも追従は必要という判断。`frontend-check`（`vue-tsc`）で検出できる。
+これは**受け入れている**。見た目の完全一致と引き換えのコストで、どのプラグイン機構でも追従は必要という判断。CI の `frontend`（`vue-tsc`）と手元の `make frontend-check` で検出できる。
 
 ## 公開面を広げてよい条件
 
@@ -84,7 +122,7 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 | `echo.Context` | Echo は内部の選択。差し替えたときにプラグインが全滅する |
 | `*gorm.DB` | 同上。標準の `*sql.DB` に留める |
 | `model.*` | DB モデルが契約になり、migration が打てなくなる |
-| ActivityPub 関連 | 不具合の症状が他人のサーバー側に出る。**後から塞げない**。プラグイン同士の通信が要る場合は [`Peer`](authoring.md#他のインスタンスとやりとりする) を使う (mk-go 同士に閉じた経路、#2537) |
+| ActivityPub 関連 | 不具合の症状が他人のサーバー側に出る。**後から塞げない**。プラグイン同士の通信が要る場合は [`Peer`](authoring.md#他のインスタンスとやりとりする) を使う (Elythia 同士に閉じた経路、#2537) |
 | repository / service | 可視性判定などのアプリケーション側のガードを迂回できる |
 | ルーターの定義そのもの | プラグインが本体のパスを奪える。名前空間を切った登録だけを許す |
 
@@ -117,10 +155,11 @@ go run ./tools/pluginspec -write
 | job | 見るもの | required |
 |---|---|---|
 | `build` の `Vet bundled plugins` | 各プラグインを `go vet` (テストファイルも含めてコンパイル) | ○ |
+| `build` の `Build integrated binary with sample plugins` | `make plugins-all` (`-include-disabled`) → 統合バイナリのビルド。毎回走る | ○ |
 | `plugin-tests` | 各プラグインのテストを実行 (`replace` で本体の公開面に対してコンパイルされる) | × |
-| `frontend-check` | `make plugins-all` (`-include-disabled`) → 統合バイナリのビルド → `vue-tsc` + submodule 依存のゲート | × |
+| `frontend` (`frontend.yml`) | `make plugins-all` (`-include-disabled`) → frontend のビルド・`vue-tsc`・vitest。`plugins/` か `plugin/` を触った PR では必ず走る | ○ |
 
-required なのは `build` だけ (`docs/ci.md` の required check は `build` / `test` / `lint` の 3 つ)。`plugin-tests` / `frontend-check` だけが落ちる壊れ方はマージをブロックしない。
+required なのは `build` と `frontend` (`docs/ci.md` の required check は `build` / `test` / `lint` / `frontend` の 4 つ)。`plugin-tests` だけが落ちる壊れ方はマージをブロックしない。
 
 `plugins/*` は gitignore されているが、`!plugins/status/`、`!plugins/trustlevel/`、`!plugins/rolelevel/` (#12)で例外指定してある。`status` と `trustlevel` は既定無効、`rolelevel` だけは意図的に既定有効である。allowlist は `make plugin-vet` と CI に重複して定義し、どちらも `rolelevel` の判定をスキップする。`status` は #2495 から。`trustlevel` は #2586 で `disabled: true` 付きで同梱したあと、#2585 の実測を採るために一度外し、実測が終わって #2701 で戻している。既定無効であることは `build` job の `Check bundled plugins are disabled by default` が見る。
 

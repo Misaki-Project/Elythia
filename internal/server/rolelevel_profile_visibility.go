@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 	"gorm.io/gorm"
 )
 

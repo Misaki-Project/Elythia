@@ -3,8 +3,8 @@ package repository
 import (
 	"testing"
 
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/model"
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -136,7 +136,7 @@ func TestMetaRepository_EnsureInitial_SetsRepositoryURL(t *testing.T) {
 
 	got, err := repo.Fetch()
 	require.NoError(t, err)
-	require.NotNil(t, got.RepositoryURL, "repositoryUrl が NULL のままだと /about-mkgo が案内を出せない")
+	require.NotNil(t, got.RepositoryURL, "repositoryUrl が NULL のままだと /about-elythia が案内を出せない")
 	assert.Equal(t, defaultRepositoryURL, *got.RepositoryURL)
 }
 

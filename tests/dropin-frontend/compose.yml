@@ -1,0 +1,222 @@
+# tests/dropin-frontend/compose.yml — Phase 14-1 (#381).
+#
+# 3 インスタンス (A, B, C) の Misskey TS + cypress runner で drop-in 互換を
+# フロントエンド視点から検証するための基盤。Phase 14-2 で spec マトリクスを
+# 拡充し、Phase 14-3 で app-a を mk-go に差し替える overlay を追加する。
+#
+# 使い方:
+#   docker compose -f tests/dropin-frontend/compose.yml up -d
+#   docker compose -f tests/dropin-frontend/compose.yml --profile test run --rm cypress-runner
+
+# project name を別に分離 (#804 follow-up)。default `mk` だと UDS 本番の
+# container 群と衝突するので明示的に切る。
+name: mk-dropin-frontend
+
+services:
+  # ── Certificate Generator ──────────────────────────────────
+  certs:
+    image: alpine:3.21
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null 2>&1 && /gen-certs.sh"
+    volumes:
+      - certs:/certs
+      - ./gen-certs.sh:/gen-certs.sh:ro
+
+  # ── Instance A (Misskey TS) ────────────────────────────────
+  postgres-a:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [dropin_frontend]
+
+  redis-a:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [dropin_frontend]
+
+  app-a:
+    image: misskey/misskey:2026.10.0
+    environment:
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-a: {condition: service_healthy}
+      redis-a: {condition: service_healthy}
+    volumes:
+      - ./instance_a.yml:/misskey/.config/default.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/ping | grep -q pong"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [dropin_frontend]
+
+  nginx-a:
+    image: nginx:alpine
+    volumes:
+      - ./nginx_a.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      app-a: {condition: service_healthy}
+      certs: {condition: service_completed_successfully}
+    networks:
+      dropin_frontend:
+        aliases: [a]
+
+  # ── Instance B (Misskey TS) ────────────────────────────────
+  postgres-b:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [dropin_frontend]
+
+  redis-b:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [dropin_frontend]
+
+  app-b:
+    image: misskey/misskey:2026.10.0
+    environment:
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-b: {condition: service_healthy}
+      redis-b: {condition: service_healthy}
+    volumes:
+      - ./instance_b.yml:/misskey/.config/default.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/ping | grep -q pong"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [dropin_frontend]
+
+  nginx-b:
+    image: nginx:alpine
+    volumes:
+      - ./nginx_b.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      app-b: {condition: service_healthy}
+      certs: {condition: service_completed_successfully}
+    networks:
+      dropin_frontend:
+        aliases: [b]
+
+  # ── Instance C (Misskey TS) ────────────────────────────────
+  postgres-c:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [dropin_frontend]
+
+  redis-c:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [dropin_frontend]
+
+  app-c:
+    image: misskey/misskey:2026.10.0
+    environment:
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      postgres-c: {condition: service_healthy}
+      redis-c: {condition: service_healthy}
+    volumes:
+      - ./instance_c.yml:/misskey/.config/default.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/ping | grep -q pong"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [dropin_frontend]
+
+  nginx-c:
+    image: nginx:alpine
+    volumes:
+      - ./nginx_c.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      app-c: {condition: service_healthy}
+      certs: {condition: service_completed_successfully}
+    networks:
+      dropin_frontend:
+        aliases: [c]
+
+  # ── Cypress Test Runner ────────────────────────────────────
+  cypress-runner:
+    profiles: [test]
+    image: cypress/included:15.11.0
+    environment:
+      # cypress は headless で実行。
+      CYPRESS_A_URL: https://a
+      CYPRESS_B_URL: https://b
+      CYPRESS_C_URL: https://c
+      CYPRESS_A_DOMAIN: a
+      CYPRESS_B_DOMAIN: b
+      CYPRESS_C_DOMAIN: c
+      # Phase 14-3: baseline / swap を spec に伝える。default baseline。
+      CYPRESS_MODE: ${CYPRESS_MODE:-baseline}
+      # cy.request 経由の自己署名証明書許容 (node side の TLS 検証を無効化)。
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      # root が owned の tmp を cypress が書こうとするため。
+      HOME: /tmp/cypress-home
+    volumes:
+      # cypress は project ディレクトリ配下に `cypress/` を一時的に作って
+      # 内部状態を置くため ro だと EROFS になる。rw で mount し、生成物は
+      # .gitignore 側で除外する。
+      - ./cypress:/work
+    working_dir: /work
+    # cypress/included は ENTRYPOINT ["cypress"] なので command は 引数のみ。
+    command: ["run", "--config-file", "cypress.config.ts"]
+    depends_on:
+      # cypress は `https://a`, `https://b`, `https://c` (nginx の alias)
+      # 経由で通信するので nginx-* を待つ必要がある。app-* は nginx-* が
+      # healthy を待つので間接的に起動順は保障される (既存
+      # `tests/dropin/compose.yml` の test-runner も同じ pattern)。Devin #385 #1。
+      nginx-a: {condition: service_started}
+      nginx-b: {condition: service_started}
+      nginx-c: {condition: service_started}
+    networks: [dropin_frontend]
+
+volumes:
+  certs:
+
+networks:
+  dropin_frontend:
+    driver: bridge

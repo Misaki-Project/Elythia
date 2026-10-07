@@ -4,8 +4,8 @@
 # (HTTP / PostgreSQL / Valkey) を end-to-end で使う production-like な参照デプロイ。
 #
 # 前提: ホスト側で `make uds-frontend-build` を実行済みで、
-#   third_party/misskey/built/_frontend_vite_/ と
-#   third_party/misskey/built/_frontend_dist_/ が存在すること。
+#   frontend/built/_frontend_vite_/ と
+#   frontend/built/_frontend_dist_/ が存在すること。
 #
 # 構成:
 #   host:80 → nginx → (mkgo_sock) → mk-go → (pg_sock)     → postgres
@@ -119,13 +119,12 @@ services:
     build:
       context: .
       dockerfile: deploy/uds/Dockerfile.mkgo
-      # ビルドした revision と同梱 frontend の版 (#2700)。Dockerfile 内では
+      # ビルドした revision (#2700)。Dockerfile 内では
       # `.dockerignore` が `.git` を落とすので git を呼べず、build-arg で渡す。
       # `make uds-build` が git から埋める。手で `docker compose build` を叩いた
-      # ときは空になり、/about-mkgo 側が表示を省く。
+      # ときは空になり、/about-elythia 側が表示を省く。
       args:
         MKGO_COMMIT: ${MKGO_COMMIT:-}
-        MKGO_FRONTEND_VERSION: ${MKGO_FRONTEND_VERSION:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -140,9 +139,9 @@ services:
     volumes:
       - ./deploy/uds/config/default.yml:/app/.config/default.yml:ro
       # 本家フロントの vite ビルド成果物。`make uds-frontend-build` で用意する。
-      - ./third_party/misskey/built:/frontend:ro
+      - ./frontend/built:/frontend:ro
       # ClientAssetsDir が読む静的アセット (ゲーム用画像など)。
-      - ./third_party/misskey/packages/frontend/assets:/misskey/packages/frontend/assets:ro
+      - ./frontend/packages/frontend/assets:/misskey/packages/frontend/assets:ro
       # drive ファイルの保存先。router.go がローカルストレージに ./drive-files を
       # ハードコードしており、WORKDIR は /app なので /app/drive-files に書き込まれる。
       - mkgo_files:/app/drive-files

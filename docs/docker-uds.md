@@ -1,23 +1,18 @@
 # docker-compose で動かす UDS-only スタック
 
-Phase 12-1 で入った UNIX domain socket (UDS) 対応を使って、mk-go の全コンポーネントを TCP 無しで動かす参照デプロイメントです。ブラウザ側には本家 Misskey の vite ビルド成果物をそのまま配信するので、`http://localhost/` を開けば Misskey の UI が出ます。
+Phase 12-1 で入った UNIX domain socket (UDS) 対応を使って、Elythia の全コンポーネントを TCP 無しで動かす参照デプロイメントです。ブラウザ側には同梱フロントエンド (`frontend/`、Misskey の fork) の vite ビルド成果物を配信するので、`http://localhost/` を開けば Misskey の UI が出ます。
 
 - nginx が受けるのは host の 80 番だけ (HTTP のみ)
-- nginx → mk-go は UDS (`/run/mkgo/mkgo.sock`)
-- mk-go → postgres は UDS (`/var/run/postgresql/.s.PGSQL.5432`)
-- mk-go → valkey は UDS (`/run/valkey/valkey.sock`、`port 0` で TCP 完全無効)
+- nginx → Elythia は UDS (`/run/mkgo/mkgo.sock`)
+- Elythia → postgres は UDS (`/var/run/postgresql/.s.PGSQL.5432`)
+- Elythia → valkey は UDS (`/run/valkey/valkey.sock`、`port 0` で TCP 完全無効)
 
 既存の `docker-compose.yml` (TCP 版 quick-start) とは別ファイル (`compose.uds.yaml`) として併存しているので、従来の `docker compose up -d` 体験は壊れません。
 
 ## 前提条件
 
 - Docker と docker compose v2
-- `third_party/misskey` サブモジュールの初期化 (**tag はスーパープロジェクトが pin しています**。実際に何が pin されているかは `git -C third_party/misskey describe --tags`)
-- host 側のインストールは不要です。フロントエンドのビルドも docker 経由で行います。
-
-```sh
-git submodule update --init --recursive third_party/misskey
-```
+- host 側のインストールは不要です。フロントエンドは本体の `frontend/` (#3379 で取り込んだ pnpm workspace) から docker 経由でビルドします。
 
 ## 初回セットアップ
 
@@ -31,9 +26,11 @@ make uds-init
 
 `uds-init` は order-only prerequisite で実装されているので、ファイルが既にある場合は何もしません (`.example` を更新してもローカル編集は上書きされない)。`uds-build` / `uds-up` / `uds-restart` / `uds-down` / `uds-down-v` / `uds-logs` / `uds-ps` も同じ prerequisite を持つため、コピー忘れでエラーになることはありません (`uds-frontend-build` は compose / config を参照しないので対象外。`uds-rebuild` 自身は prerequisite を持ちませんが、呼び出す `uds-build` が満たします)。
 
-### 1. 本家フロントエンドのビルド
+### 1. フロントエンドのビルド
 
-初回のみ、本家 Misskey の vite ビルドを行います (3〜10 分)。`make uds-frontend-build` は既存の `e2e-frontend-build` と同一のターゲットで、**submodule 自身の `Dockerfile` の `ARG NODE_VERSION`** (`26.4.0-trixie` の形で版と distro の両方を持つ) が指す image の中で `pnpm install --frozen-lockfile && pnpm build` を走らせます。pnpm の版も submodule の `packageManager` から取ります (#2921)。以前は `node:22-bookworm` 固定で、CI が `.node-version` を見るのに本番のビルドだけ Node 22 という食い違いがあり、しかも `node:22-bookworm` の 22.22.2 は `engines.node` の下限ちょうどでした。
+初回のみ、`frontend/` の vite ビルドを行います (3〜10 分)。`make uds-frontend-build` は既存の `e2e-frontend-build` と同一のターゲットで、`node:<版>-<distro>` の image の中で `pnpm install --frozen-lockfile && pnpm build` を走らせます。Node の版は `frontend/.node-version` (CI の `node-version-file` と同じもの) から、distro は Makefile の `FRONTEND_NODE_DISTRO` (既定 `trixie`) から取ります。pnpm の版は `frontend/package.json` の `packageManager` から取ります (#2921)。以前は `node:22-bookworm` 固定で、CI が `.node-version` を見るのに本番のビルドだけ Node 22 という食い違いがあり、しかも `node:22-bookworm` の 22.22.2 は `engines.node` の下限ちょうどでした。
+
+ビルドの前に `make plugins` が走り、`plugins/` に置いたプラグインの frontend の登録 (`frontend/packages/frontend/src/server-plugins.generated.ts`) を生成します。このファイルは git で追跡していないので、`frontend/` を手で直接ビルドするときも先に `make plugins` を実行してください。
 
 ```sh
 make uds-frontend-build
@@ -41,16 +38,17 @@ make uds-frontend-build
 
 終了すると以下のパスに成果物ができます。`compose.uds.yaml` が read-only で bind mount します。
 
-- `third_party/misskey/built/_frontend_vite_/manifest.json`
-- `third_party/misskey/built/_frontend_dist_/`
+- `frontend/built/_frontend_vite_/manifest.json`
+- `frontend/built/_frontend_dist_/`
 
-なお `pnpm install --frozen-lockfile` が本家のnode_modulesも生成するため、以下も同時に揃います。これらは `deploy/uds/Dockerfile.mkgo` が `COPY` で runtime image に焼き込み、mk-go の `/twemoji/*` / `/fluent-emoji/*` / `/assets/*` ルートから配信します。
+なお `pnpm install --frozen-lockfile` が `frontend/` の node_modules も生成するため、絵文字のアセットも同時に揃います。これらと、git で追跡しているアセットは `deploy/uds/Dockerfile.mkgo` が `COPY` で runtime image に焼き込み、Elythia の `/twemoji/*` / `/fluent-emoji/*` / `/assets/*` / `/static-assets/*` ルートから配信します。
 
-- `third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/twemoji/` (twemoji SVG set)
-- `third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji-assets/built/fluent-emoji/` (実績バッジ / 通知アイコン)
-- `third_party/misskey/assets/` (`ai.png` 等、約684KB)
+- `frontend/node_modules/@misskey-dev/emoji-assets/built/twemoji/` (twemoji SVG set。`pnpm install` で揃う)
+- `frontend/node_modules/@misskey-dev/emoji-assets/built/fluent-emoji/` (実績バッジ / 通知アイコン。`pnpm install` で揃う)
+- `frontend/repo-assets/` (`ai.png` 等、約684KB。git で追跡)
+- `frontend/assets/` (favicon やアイコン等。git で追跡)
 
-`make uds-frontend-build` を省略すると image ビルド時にこれらの存在チェックが fail してビルドが止まります。
+`make uds-frontend-build` を省略すると、image ビルド時に絵文字のアセットの存在チェックが fail してビルドが止まります。
 
 ### 2. スタックの起動
 
@@ -63,7 +61,7 @@ make uds-up
 1. `postgres` — `/var/run/postgresql/.s.PGSQL.5432` を作成
 2. `valkey` — `/run/valkey/valkey.sock` を作成 (TCP は `port 0` で無効)
 3. `mkgo` — マイグレーション実行後、`/run/mkgo/mkgo.sock` で HTTP listen
-4. `nginx` — host の 80 番で受けて mk-go の socket に proxy
+4. `nginx` — host の 80 番で受けて Elythia の socket に proxy
 
 ```sh
 make uds-ps
@@ -137,24 +135,15 @@ docker inspect mk-mkgo-1 --format '{{.HostConfig.LogConfig.Config}}'
 
 ## トラブルシューティング
 
-### `third_party/misskey` 自体が空 (submodule 未初期化)
+### `frontend/built` が無い
 
-`compose.uds.yaml` は `./third_party/misskey/built` と `./third_party/misskey/packages/frontend/assets` を read-only で bind mount しています。submodule をまだ取得していない場合、このディレクトリが空になっていて mount source が存在せず `uds-up` がエラーで止まります。
+`compose.uds.yaml` は `./frontend/built` と `./frontend/packages/frontend/assets` を read-only で bind mount しています。`make uds-frontend-build` を先に実行してください。bind mount の source が存在しないと `uds-up` が失敗します。
 
-```sh
-git submodule update --init --recursive third_party/misskey
-make uds-frontend-build
-```
-
-submodule のチェックアウト先は本リポジトリで pin 済みです (現在の値は `git -C third_party/misskey describe --tags` で確認できます。**doc に版を書くと bump のたびに腐る**ので書きません)。
-
-### `third_party/misskey/built` が無い
-
-`make uds-frontend-build` を先に実行してください。bind mount の source が存在しないと `uds-up` が失敗します。
+#3379 より前の版から上げた環境で、`compose.uds.yaml` がまだ `./third_party/misskey/built` を指している場合は、[デプロイの切り替え手順](deployment.md#frontend-を本体へ取り込んだ版へ上げる-3379)に従って向け直してください。
 
 ### マイグレーションが失敗してコンテナが crash loop する
 
-`mkgo-entrypoint.sh` は `set -e` で migrate を実行してから mk-go server を起動します。migrate が失敗するとそのまま container exit し、`restart: unless-stopped` のため compose が再起動 → 同じエラーで再度 exit、というループに入ります。
+`mkgo-entrypoint.sh` は `set -e` で migrate を実行してから Elythia server を起動します。migrate が失敗するとそのまま container exit し、`restart: unless-stopped` のため compose が再起動 → 同じエラーで再度 exit、というループに入ります。
 
 検出方法:
 
@@ -167,17 +156,17 @@ docker compose -f compose.uds.yaml logs mkgo | tail -50  # mkgo だけ、過去�
 
 対応:
 
-- スキーマが壊れている場合は手動で `psql` で問題を解消する。migration を巻き戻すなら `docker compose -f compose.uds.yaml exec mkgo /app/migrate -direction down -steps 1`。**UDS image は `/app/migrate` を同梱していて entrypoint がこれを叩く** (`deploy/uds/Dockerfile.mkgo`)。コンテナには Go toolchain が無いので `go run ./cmd/migrate` は使えない。手元のツリーから叩く場合は `go run ./cmd/migrate` で、`make build` は `./built/misskey` しか作らない
+- スキーマが壊れている場合は手動で `psql` で問題を解消する。migration を巻き戻すなら `docker compose -f compose.uds.yaml exec mkgo /app/elythia migrate -direction down -steps 1`。**UDS image は `/app/elythia` を同梱していて entrypoint が `elythia migrate` を叩く** (`deploy/uds/Dockerfile.mkgo`)。コンテナには Go toolchain が無いので `go run ./cmd/elythia migrate` は使えない。手元のツリーから叩く場合は `go run ./cmd/elythia migrate` か、`make build` が作る `./built/elythia migrate`
 - volume 自体がおかしい場合は `make uds-down-v` で named volume を消して綺麗な状態から再構築する (**DB データは全部消える**ので注意)
 - **`-steps` を省略すると全段 down する** (全テーブルが消える)。1 段だけ戻したいときは必ず `-steps 1` を付ける
 
 ### `/healthz` が 404 になる
 
-mk-go 側の実装変更で `/healthz` のパスが変わっている可能性があります。`internal/server/router.go` を grep して、存在するパスに合わせてください。**healthcheck を定義しているのは `compose.uds.yaml` の mkgo service** で、`deploy/uds/Dockerfile.mkgo` には `HEALTHCHECK` 命令はありません (Dockerfile がやっているのは curl の同梱だけ)。
+Elythia 側の実装変更で `/healthz` のパスが変わっている可能性があります。`internal/server/router.go` を grep して、存在するパスに合わせてください。**healthcheck を定義しているのは `compose.uds.yaml` の mkgo service** で、`deploy/uds/Dockerfile.mkgo` には `HEALTHCHECK` 命令はありません (Dockerfile がやっているのは curl の同梱だけ)。
 
 ### nginx が `connect() to unix:/run/mkgo/mkgo.sock failed (13: Permission denied)`
 
-`chmodSocket: "666"` が正しく反映されていません。`deploy/uds/config/default.yml` を確認してください。mk-go の起動ログは `starting Misskey server socket=<path> url=<url>` の形 (`[server] listening on unix:` という行は出ません)。実際のパーミッションは `ls -l` で直接見るのが確実です。
+`chmodSocket: "666"` が正しく反映されていません。`deploy/uds/config/default.yml` を確認してください。Elythia の起動ログは `starting Elythia server socket=<path> url=<url>` の形 (1.x は `starting Misskey server`) (`[server] listening on unix:` という行は出ません)。実際のパーミッションは `ls -l` で直接見るのが確実です。
 
 ### valkey への接続が `resource temporarily unavailable` で失敗する
 
@@ -385,8 +374,8 @@ docker logs mk-mkgo-1 | grep -c "worker stop error"          # 同 50 前後
 | ファイル | 役割 |
 |---------|------|
 | `compose.uds.yaml` (`.example` から生成) | 全サービスを繋ぐ compose エントリポイント |
-| `deploy/uds/Dockerfile.mkgo` | mk-go runtime image (migrate 同梱 + curl) |
+| `deploy/uds/Dockerfile.mkgo` | Elythia runtime image (migrate 同梱 + curl) |
 | `deploy/uds/mkgo-entrypoint.sh` | migrate → exec misskey |
 | `deploy/uds/nginx/mkgo.conf` | UDS upstream + WebSocket upgrade 付き nginx 設定 |
 | `deploy/uds/valkey/valkey.conf` | `port 0` + UNIX socket listen の valkey 設定 |
-| `deploy/uds/config/default.yml` (`.example` から生成) | UDS 前提の mk-go 設定 |
+| `deploy/uds/config/default.yml` (`.example` から生成) | UDS 前提の Elythia 設定 |

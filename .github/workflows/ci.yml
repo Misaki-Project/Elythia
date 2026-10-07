@@ -25,109 +25,6 @@ jobs:
       - name: Build
         run: go build ./...
 
-      # submodule の pointer が fork へ push 済みかを見る (#2845)。
-      #
-      # **required check で submodule を取っているものが 1 つも無い。** ci.yml で
-      # `submodules: recursive` を指定しているのは frontend-check だけで、build /
-      # test-shards / lint はいずれも取らない。submodule を取る他の workflow
-      # (diff-e2e / playwright / upstream-backend-e2e / dropin-e2e / docker) も全て
-      # 非 required。したがって pointer が未 push の SHA を指していても **required は
-      # 全部緑のままマージでき**、develop に誰も解決できない pointer が載る。復旧は
-      # その commit を持っている本人にしかできない。
-      #
-      # **`git ls-remote | grep` は使えない。** ls-remote が列挙するのは ref の
-      # 先端だけなので、push 済みブランチの祖先 commit を取りこぼして誤検知する。
-      # GitHub は SHA 指定の fetch を許可しているので、1 commit だけ shallow に
-      # 取れるかで判定する (実測 1.8 秒 / 13 MB。未 push は
-      # `upload-pack: not our ref` で exit 128)。
-      #
-      # 同 job の checkout は submodule を取らないが、gitlink の SHA は
-      # `git ls-tree` で読めるので追加の取得は要らない。
-      - name: Check submodule commit is pushed
-        run: |
-          set -euo pipefail
-          path=third_party/misskey
-          sha=$(git ls-tree HEAD "$path" | awk '{print $3}')
-          if [ -z "$sha" ]; then
-            echo "::error::$path の gitlink を読めませんでした。submodule の構成が変わったならこの step も直してください"
-            exit 1
-          fi
-          url=$(git config -f .gitmodules --get "submodule.$path.url")
-          echo "$path -> $sha ($url)"
-          if ! git fetch --depth=1 -q "$url" "$sha"; then
-            echo "::error::submodule の commit $sha が $url に存在しません。fork へ先に push してください (git -C $path push origin <branch>)"
-            exit 1
-          fi
-
-          # **doc の pin が指す tag が、gitlink と同じ commit か。**
-          # `make submodulepin-check` は SHA だけを突き合わせる — tag から SHA を
-          # 解くにはネットワークが要り、`make gates` はそれを前提にできないため。
-          # **tag 名の正しさを見られるのはここだけ** (#2969)。
-          # #2963 の事故は「tag だけ直して gitlink を忘れた」形だったので、
-          # SHA 側を書き換え忘れると gates は素通りする。ここで塞ぐ。
-          n=$(grep -c '\*\*現在の pin は ' docs/divergence.md || true)
-          if [ "$n" != "1" ]; then
-            echo "::error::docs/divergence.md の pin 行が $n 件です。ちょうど 1 件にしてください (書式: **現在の pin は \`<tag>\` (\`<短縮 SHA>\`)。**)"
-            exit 1
-          fi
-          # shellcheck disable=SC2016  # sed の後方参照なのでシェルに展開させない
-          tag=$(sed -n 's/.*\*\*現在の pin は `\([^`]*\)`.*/\1/p' docs/divergence.md)
-          # annotated tag なら `^{}` が commit を指す。fork の tag は lightweight だが
-          # 将来変わっても壊れないよう両方見る。
-          tagsha=$(git ls-remote "$url" "refs/tags/${tag}^{}" | cut -f1)
-          [ -n "$tagsha" ] || tagsha=$(git ls-remote "$url" "refs/tags/${tag}" | cut -f1)
-          if [ -z "$tagsha" ]; then
-            echo "::error::docs/divergence.md の pin が指す tag $tag が $url にありません。tag を push し忘れていませんか"
-            exit 1
-          fi
-          if [ "$tagsha" != "$sha" ]; then
-            echo "::error::docs/divergence.md の tag $tag は $tagsha を指しますが、gitlink は $sha です。doc と pointer のどちらかが古いままです"
-            exit 1
-          fi
-          echo "pin ok: $tag -> $tagsha"
-
-          # **§4-2 の表の tag が fork に実在するか (#3144)。**
-          # あの表は「還元不能な差分の一覧」の錨なので、typo した tag が残ると行が
-          # 指す先を追えなくなる。`assertForkTagSequence` は表の中の連番しか見て
-          # おらず、実在しない tag を書いても通る。
-          # **submodule の checkout は shallow で tag が降りてこない**ので Go 側の
-          # gate では見られない。`git ls-remote --tags` は ref の一覧だけを取るので
-          # 1 往復で済む (実測 0.5 秒 / 121 tag)。
-          git ls-remote --tags "$url" | sed 's/.*refs\/tags\///; s/\^{}$//' | sort -u > /tmp/fork-tags.txt
-          # shellcheck disable=SC2016  # sed の後方参照なのでシェルに展開させない
-          sed -n 's/^| `\([0-9][0-9.]*-mk\.\(misaki\.\)\{0,1\}[0-9][0-9]*[a-z]*\)` |.*/\1/p' docs/divergence.md | sort -u > /tmp/doc-tags.txt
-          doccount=$(wc -l < /tmp/doc-tags.txt)
-
-          # **件数は冒頭サマリの宣言値と一致すること。** 「1 件以上」のような下限だと
-          # 全滅しか見られず、書式が少し変わって 115 行中 114 行が抽出から落ちても
-          # 緑になる (#3142 のレビューで実測)。サマリの値は `TestDivergenceDoc_*` が
-          # §4-2 の行数と一致することを別途強制しているので、ここと突き合わせれば
-          # 「抽出できた数 == 表の行数 == 宣言値」が閉じる。
-          declared=$(sed -n 's/^| fork frontend の独自変更 | \([0-9]*\) tag .*/\1/p' docs/divergence.md)
-          if [ -z "$declared" ]; then
-            echo "::error::docs/divergence.md 冒頭サマリの \`fork frontend の独自変更\` 行から件数を読めませんでした。書式を変えたならこの step も直してください"
-            exit 1
-          fi
-          if [ "$doccount" != "$declared" ]; then
-            echo "::error::docs/divergence.md §4-2 から $doccount 件しか tag を拾えませんでした (冒頭サマリの宣言は $declared 件)。表の書式を変えたならこの step も直してください"
-            exit 1
-          fi
-          missing=$(comm -23 /tmp/doc-tags.txt /tmp/fork-tags.txt)
-          # 上流同期で追加された履歴タグは元のfrontend repoで確認する。
-          # Misaki固有タグと現在のpinは必ず上記のfork側で検証する。
-          if [ -n "$missing" ]; then
-            git ls-remote --tags https://github.com/shiroha-a/misskey-ts.git | sed 's/.*refs\/tags\///; s/\^{}$//' | sort -u > /tmp/upstream-tags.txt
-            printf '%s\n' "$missing" | grep -v -- '-mk\.misaki\.' > /tmp/legacy-missing-tags.txt || true
-            unresolved=$(comm -23 /tmp/legacy-missing-tags.txt /tmp/upstream-tags.txt)
-            misaki_missing=$(printf '%s\n' "$missing" | grep -- '-mk\.misaki\.' || true)
-            missing=$(printf '%s\n%s\n' "$unresolved" "$misaki_missing" | sed '/^$/d')
-          fi
-          if [ -n "$missing" ]; then
-            echo "::error::docs/divergence.md §4-2 の tag が $url にありません: $(echo "$missing" | tr '\n' ' ')"
-            exit 1
-          fi
-          echo "§4-2 tags ok: $doccount 件すべて fork または上流履歴に存在"
-
       # 同梱サンプルは **既定無効** (#2495)。clone しただけの運営者のバイナリ・
       # フロント・DB に勝手に入らないようにするため。有効なままだと、設定して
       # いなくても plugin_wiring.go が Routes / Jobs の登録より先に専用 schema を
@@ -138,7 +35,7 @@ jobs:
       # 意図的に外し、実測が終わって #2585 が close されても戻っていなかった
       # (#2701)。恒久的に有効にする方針にするならこの step を変える。手元で
       # 動かすだけなら `make plugin-dev PLUGIN=plugins/<name>` を使う
-      # (`mk-plugin.yml` を触らずに済む。docs/plugins/development.md)。
+      # (`elythia-plugin.yml` を触らずに済む。docs/plugins/development.md)。
       #
       # **判定は git ls-files + grep だけで完結させる。** `pluginbuild` に読ませる
       # ほうが parser 一致で厳密だが、`pluginbuild` は git ではなく**ディレクトリ**を
@@ -162,12 +59,12 @@ jobs:
       # 行ベースの完全一致のまま。
       - name: Check bundled plugins are disabled by default
         run: |
-          files=$(git ls-files 'plugins/*/mk-plugin.yml')
+          files=$(git ls-files 'plugins/*/elythia-plugin.yml')
           # **空でも緑にしない。** `plugins/` の移動や marker 名の変更で列挙が
           # 空振りすると、検査していないのに通ってしまう (plugin-tests job の
           # 同型ステップと同じ guard)。
           if [ -z "$files" ]; then
-            echo "同梱プラグインの mk-plugin.yml が 1 つも見つかりません (列挙が壊れています)"
+            echo "同梱プラグインの elythia-plugin.yml が 1 つも見つかりません (列挙が壊れています)"
             exit 1
           fi
           # **意図的に既定有効で同梱するプラグイン (#12 の role-level)。**
@@ -204,6 +101,20 @@ jobs:
             echo "==> $dir"
             (cd "$dir" && GOWORK=off go vet ./...)
           done
+
+      # 生成した glue (plugins_generated.go) を含む統合バイナリのコンパイルも
+      # 見る。上の `Vet bundled plugins` は各プラグインを単体で vet するだけなので、
+      # Register の配線 (cmd/elythia 側) や workspace の依存解決の崩れは検出できない。
+      # 同梱サンプルは既定無効なので、`make build` を経由する他の workflow には
+      # この経路が無い (#2495)。**Node が要らないので、毎回走る build に置く** —
+      # frontend workflow は Go だけの変更で lint を skip するので、そちらに置くと
+      # cmd/elythia の変更を見逃す (#3379。以前は frontend-check job にあった)。
+      # 生成された go.work を使うので GOWORK は無効化しない。job の最後に置くのは、
+      # 生成物 (go.work など) が前の step に影響しないようにするため。
+      - name: Build integrated binary with sample plugins
+        run: |
+          make plugins-all
+          go build -o /dev/null ./cmd/elythia
 
   # 各shardは並列に走るが、checkは `test-shards (N)` という名前で個別に登録される。
   # ブランチ保護が `test` という名前のcheckを要求するため、後段の `test` job が
@@ -504,106 +415,6 @@ jobs:
       # これは分単位なので、速い検査で落ちるものは先に落とす。
       - name: Golangci-lint
         run: make golangci-lint
-
-  # fork frontend (third_party/misskey) の型チェック。
-  #
-  # 1.0 以降 fork frontend は mk-go 独自に進化させる方針なので、型崩れを
-  # 検出する手段が要る。`make uds-frontend-build` / `e2e-frontend-build` は
-  # 本番が bind-mount している third_party/misskey/built を書き換えるため
-  # 検証には使えない。vue-tsc --noEmit なら出力物を作らず型だけ見られる。
-  #
-  # required check には入れない (build / test / lint の 3 つが required)。
-  frontend-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: recursive
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          # pnpm のバージョンは submodule 側 package.json の packageManager から
-          # 取る。mk リポジトリ直下には package.json が無い。
-          package_json_file: third_party/misskey/package.json
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: third_party/misskey/.node-version
-          cache: pnpm
-          cache-dependency-path: third_party/misskey/pnpm-lock.yaml
-
-      - name: Install misskey workspace dependencies
-        working-directory: third_party/misskey
-        run: pnpm install --frozen-lockfile
-
-      # frontend の型解決には workspace package の生成物が要る。i18n (locales の
-      # 型定義) と misskey-bubble-game を落とすと `Cannot find module 'i18n'` 系で
-      # 44 件こける。どれが要るかを絞り込むより `-r build` で全部作る方が、上流が
-      # 依存を増やしたときに壊れない。
-      #
-      # frontend 自身のビルド (build-assets) は型チェックに不要なので呼ばない。
-      - name: Build workspace packages
-        working-directory: third_party/misskey
-        run: pnpm build-pre && pnpm -r build
-
-      # 同梱サンプルの frontend を取り込んでから型を見る。これが無いと
-      # plugin-api.ts を壊してもサンプル側では検出されない。サンプルは
-      # mk-plugin.yml で既定無効 (#2495) なので、disabled も含める
-      # plugins-all を使う。
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Generate plugin artifacts
-        run: make plugins-all
-
-      # 生成した glue (plugins_generated.go) を含む統合バイナリのコンパイルも
-      # 見る。build job の `Vet bundled plugins` は各プラグインを単体で vet する
-      # だけなので、Register の配線や workspace の依存解決の崩れは検出できない。サンプルが既定無効に
-      # なったことで `make build` を経由する他の workflow からもこの経路が
-      # 消えたため、ここで担保する (#2495)。生成された go.work を使うので
-      # GOWORK は無効化しない。
-      - name: Build integrated binary with sample plugin
-        run: go build -o /dev/null ./cmd/misskey
-
-      - name: Type check (vue-tsc)
-        run: make frontend-check
-
-      # fork frontend の eslint (#2843)。**型だけでは足りない。** 1.0 以降
-      # fork frontend は mk-go 独自に進化させる方針で、独自コードは増え続ける
-      # (docs/divergence.md §4-2)。型は vue-tsc が見るが、それ以外の規約違反は
-      # 誰も見ていなかった。実際 mk-go 独自ファイル 2 つに commit 済みの
-      # 違反が 4 箇所残っていた (2026.7.0-mk.22j で修正)。
-      #
-      # upstream AGENTS.md も「変更を出す前の最低チェック」に pnpm lint
-      # (typecheck + eslint) を挙げている。範囲はその `pnpm eslint` と同じ
-      # `src/**/*.{ts,vue}` にする — **`eslint .` にしないこと**。upstream が
-      # lint していない test/ まで拾い、追従のたびに他人の負債で落ちる
-      # (実測で test/ 込みだと 115 件)。
-      #
-      # 依存インストールと workspace ビルドは上の step で済んでいるので、
-      # 追加コストは eslint の実行時間だけ。
-      - name: Lint (eslint)
-        working-directory: third_party/misskey/packages/frontend
-        run: pnpm eslint
-
-      # fork frontend の vitest (#2844)。**どの workflow でも実行されていなかった。**
-      # spec は 20 本あるが ci.yml にも他の workflow にも実行箇所が無く、
-      # dropin-frontend-e2e は cypress で別物。
-      #
-      # #2831 で実際に効いた: frontend の修正 (WebSocket 再接続時の未読件数の
-      # 再同期) は in-flight 重複排除 / スロットル / 世代カウンタの 3 つのガードが
-      # 相互作用する実装なのに、敵対的レビューの「テストがゼロ」という指摘に対して
-      # **テスト基盤が無いこと**を理由に見送っている。
-      #
-      # 依存インストールと workspace ビルドは上の step で済んでいるので、追加
-      # コストは vitest の実行時間だけ。手元の再現は `make frontend-test`。
-      - name: Unit test (vitest)
-        working-directory: third_party/misskey/packages/frontend
-        run: pnpm test
 
   vulncheck:
     runs-on: ubuntu-latest

@@ -155,7 +155,7 @@ func (d *dev) banner() {
 	fmt.Printf(`plugindev: %s を監視します
 
   frontend の HMR は Vite dev server が担います。別の端末で起動してください:
-    cd third_party/misskey/packages/frontend && pnpm watch
+    cd frontend/packages/frontend && pnpm watch
 
   backend はここで自動的に再ビルド・再起動します。
   Ctrl-C で終了します。
@@ -172,7 +172,7 @@ func (d *dev) rebuildAndRestart(ctx context.Context) error {
 	// 生成ツール自体が起動できなくなるため。
 	args := []string{"run", "./tools/pluginbuild"}
 	if d.pluginDir != "" {
-		// -plugin で名指しした監視対象は mk-plugin.yml で disabled でも含める。
+		// -plugin で名指しした監視対象は elythia-plugin.yml で disabled でも含める。
 		// 既定無効の同梱サンプルを、tracked ファイルの編集 (= dirty tree) を
 		// 強いずに開発できるようにするため。
 		//
@@ -186,11 +186,11 @@ func (d *dev) rebuildAndRestart(ctx context.Context) error {
 	}
 
 	bin := filepath.Join(os.TempDir(), "mk-plugindev")
-	// **GOWORK を明示的に戻す。** 生成物が import する mk-plugin-* は go.mod に
+	// **GOWORK を明示的に戻す。** 生成物が import するプラグインのモジュールは go.mod に
 	// 無く go.work 経由でしか解決できないので、呼び出し側から GOWORK=off を
 	// 継承すると `no required module provides package` で落ちる。空文字列は Go では
 	// auto 扱いで、exec.Cmd の env は後勝ちなので上の GOWORK=off を打ち消せる。
-	if err := d.exec(ctx, "go", []string{"build", "-o", bin, "./cmd/misskey"}, "GOWORK="); err != nil {
+	if err := d.exec(ctx, "go", []string{"build", "-o", bin, "./cmd/elythia"}, "GOWORK="); err != nil {
 		return fmt.Errorf("ビルドに失敗しました: %w", err)
 	}
 
@@ -209,7 +209,7 @@ func (d *dev) exec(ctx context.Context, name string, args []string, env ...strin
 
 // startServer launches mk-go in dev mode.
 func (d *dev) startServer(bin string) error {
-	cmd := exec.Command(bin, "-config", d.configPath)
+	cmd := exec.Command(bin, "serve", "-config", d.configPath)
 	// **MK_DEV=1 を必ず立てる。** ビルド済みのフロントが残っていても、
 	// dev では Vite dev server を見に行くようにする (#2477)。
 	cmd.Env = append(os.Environ(), "MK_DEV=1")

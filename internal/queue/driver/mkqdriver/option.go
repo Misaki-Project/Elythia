@@ -4,9 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 
-	"github.com/shiroha-a/mkq"
+	"github.com/elythia-network/mkq"
 
-	"github.com/shiroha-a/mk/internal/queue/driver"
+	"github.com/elythia-network/elythia/internal/queue/driver"
 )
 
 // toMkqAddOptions translates a driver.EnqueueOptions into the

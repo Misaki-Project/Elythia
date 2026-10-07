@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/shiroha-a/mk/internal/core/federation"
-	"github.com/shiroha-a/mk/internal/core/user"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/testutil"
+	"github.com/elythia-network/elythia/internal/core/federation"
+	"github.com/elythia-network/elythia/internal/core/user"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1511,7 +1511,7 @@ func TestShowByUsername_LocalHostShortCircuit(t *testing.T) {
 // `FindByURI` が既存行に当たる。増えるのは**呼ばれるたびの外向きリクエスト**の
 // ほうで、`LookupActorURI` にキャッシュは無い。「引けない」ではなく「WebFinger へ
 // 落ちる」ところまで固定するのが要点。
-// アップグレード前に `backfill-remote-host` を流す前提 (docs/deployment.md)。
+// アップグレード前に `elythia backfill remote-host` を流す前提 (docs/deployment.md)。
 func TestShowByUsername_NonNormalizedStoredHostFallsBackToRemote(t *testing.T) {
 	for _, stored := range []string{"Mixed.Example", "XN--ECKVE.EXAMPLE"} {
 		t.Run(stored, func(t *testing.T) {

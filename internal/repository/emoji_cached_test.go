@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -55,6 +55,9 @@ func (c *countingEmojiRepo) FindByNameAndHost(_ string, _ *string) (*model.Emoji
 func (c *countingEmojiRepo) FindByID(_ string) (*model.Emoji, error)          { return nil, nil }
 func (c *countingEmojiRepo) FindManyByIDs(_ []string) ([]*model.Emoji, error) { return nil, nil }
 func (c *countingEmojiRepo) FindManyByNamesAndHost(_ []string, _ *string) ([]*model.Emoji, error) {
+	return nil, nil
+}
+func (c *countingEmojiRepo) FindManyByKeys(_ []model.EmojiKey) ([]*model.Emoji, error) {
 	return nil, nil
 }
 func (c *countingEmojiRepo) ListWithFilter(_, _ string, _ bool, _, _ string, _, _ int) ([]*model.Emoji, error) {

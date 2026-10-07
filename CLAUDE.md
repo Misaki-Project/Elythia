@@ -4,14 +4,14 @@
 
 ## このプロジェクトについて
 
-**mk-goは、Misskeyとの互換性を保ったまま、独自の機能を育てているGo製のMisskey系サーバーです。** 正式な名前はElythiaに決まっており、改名の作業を#3180で進めています。
+**Elythia(旧称mk-go)は、Misskeyとの互換性を保ったまま、独自の機能を育てているGo製のMisskey系サーバーです。** 改名の作業は#3180で進めています。関数名などコード上の識別子、`/api/meta`の`mkGoVersion` / `mkGoCommit`、環境変数の接頭辞`MK_`は、改名の後も据え置きます(例外はnodeinfoの宣言で、`mkGoPlugins`から`elythiaPlugins`に改めた。#3400)。
 
 出発点は、Misskey(TypeScript/NestJS)のバックエンドをGoで書き換えるリライトでした。本家との互換を一通り満たした今は、次の方針で開発しています。
 
 - **ActivityPubの連合の互換性は必ず守る。** 他のサーバーから見て、Misskeyと同じように振る舞う
 - **REST APIは、本家のクライアントがそのまま動く互換性を保つ。** 独自の拡張は、フィールドやエンドポイントの**追加だけ**で行う。既存のものの意味を変えない
 - **frontendはMisskeyのforkで、独自に手を入れてよい**
-- **TS版Misskeyからの移行は保証する。** TS版のDBをそのまま引き継いで起動できるようにする。TS版へ戻せること(復路)の保証は、#3191でやめる予定
+- **TS版Misskeyからの移行は保証する。** TS版のDBをそのまま引き継いで起動できるようにする。TS版へ戻せること(復路)は保証しない(#3191)。今どこまで戻れるかは`dropin-e2e`で測っており、戻らなくなったものは[docs/migration-from-ts.md](docs/migration-from-ts.md#戻らなくなったもの)に記録する
 - 本家と意図的に違える挙動は、理由と一緒に[docs/divergence.md](docs/divergence.md)に記録する
 
 読み方:
@@ -60,7 +60,7 @@
 ## 2. 構成
 
 ```
-cmd/            実行バイナリ(misskey / migrate / 一回限りのbackfillバッチ)
+cmd/elythia/    実行バイナリ`elythia`。`serve` / `migrate` / `backfill <名前>`などのサブコマンドで呼び分ける
 internal/       本体。依存の向きは api → core → repository → model
   api/          APIハンドラ(エンドポイント単位のサブディレクトリ)
   core/         ビジネスロジック
@@ -68,12 +68,13 @@ internal/       本体。依存の向きは api → core → repository → mode
   model/        DBモデル
   entity/       レスポンス用DTO(ドメインロジックを入れない)
   activitypub/  連合(Inbox / Deliver / Renderer / Resolver / 署名)
+  cli/          `elythia`のサブコマンドの処理(`cmd/elythia`はこれを呼ぶだけ)
   queue/ stream/ server/ config/ testutil/ ほか
 plugin/         プラグインがimportする公開パッケージ
 plugins/        プラグイン本体(gitignore済み。同梱するものだけ例外)
 migration/      NNNNNN_name.up.sql / .down.sql
-test/ tests/    Goのe2e / Go以外の検証基盤
-third_party/misskey/  forkしたMisskey TS(submodule。frontendの供給元)
+tests/          Goのe2e(`tests/e2e` / `tests/e2e-federation`)と、Go以外の検証基盤
+frontend/       本家Misskeyから取り込んだfrontend(pnpm workspace、#3379)
 tools/          parityゲートとコード生成のCLI
 docs/           ドキュメント
 ```
@@ -93,11 +94,12 @@ make test-fast               # -race抜き。反復用で、コミット前の�
 make gates                   # 静的なparityゲートを一括(サーバー・Docker不要)
 make plugin-test             # 同梱プラグインのテスト(別moduleなので./...に入らない)
 make migrate-up / migrate-down   # downは1段だけ戻す
-make frontend-check          # fork frontendの型チェック + eslint
+make frontend-check          # frontend/の型チェック + frontendを読むゲート + 絵文字の正規表現 + eslint
+make frontend-lint / frontend-test   # frontend/のeslint / vitest
 ```
 
 - 全targetは`make help`で見られる。説明は[docs/development.md](docs/development.md)にある
-- **`make tidy`は使わない。** `plugins/`にプラグインを置いた環境では、生成される`cmd/misskey/plugins_generated.go`がプラグインのmoduleをimportするので失敗する。置いていない環境でも、CIと結果がずれる
+- **`make tidy`は使わない。** `plugins/`にプラグインを置いた環境では、生成される`cmd/elythia/plugins_generated.go`がプラグインのmoduleをimportするので失敗する。置いていない環境でも、CIと結果がずれる
 - **Goの版を上げたら、`make plugins`で`go.work`を作り直す。** `go.work`は生成物で、作り直さないと古い版のtoolchainが選ばれ、ビルドが`requires go >= ...`で落ちる
 - **`make uds-*`と`make docker-*`は運営者の環境向け。** 手元の検証には使わない
 
@@ -151,6 +153,15 @@ make frontend-check          # fork frontendの型チェック + eslint
 - エラーは`fmt.Errorf("context: %w", err)`で包む
 - **`//nolint`は、対象の行の行末に置く。** 独立した行に置くと、続くブロック全体が検査されなくなる。理由も書く
 
+### frontend(`frontend/`)
+
+`frontend/`は本家Misskeyのfrontendを取り込んだpnpm workspaceで、本体のコミットとして直接直す(#3379)。詳細は[docs/contributing.md](docs/contributing.md#fork-frontend-frontend-を触るとき)にある。
+
+- **`frontend/`を触ったら、`make frontend-check` / `make frontend-lint` / `make frontend-test`も通す。** `make check`はGoしか見ない。CIではrequiredの`frontend`が見る
+- **新しいファイルにも本家と同じSPDXヘッダーを付ける。** `frontend/scripts/check-spdx.mjs`が落とす。Go側の「SPDXを付けない」方針とは逆
+- **本番のチェックアウトで`pnpm build` / `pnpm -r build` / `make e2e-frontend-build`を検証目的に流さない。** `frontend/built`を消してから作り直すので、そこをbind mountしている本番が404になる。検証は別のworktreeで行う
+- 生成物の`server-plugins.generated.ts`は追跡していない。無ければ`make plugins`で作る
+
 ### コメントとドキュメントの言語
 
 | 種類 | 言語 |
@@ -168,7 +179,7 @@ make frontend-check          # fork frontendの型チェック + eslint
 
 - **レスポンスのフィールド名・型・エラーコード・エラーIDは、本家と一致させる。** 独自の拡張は追加だけにする(冒頭の方針)
 - 版は`internal/config/config.go`の`MisskeyVersion` / `MkGoVersion`で管理する
-- User-Agentは`mk-go/<version> (<url>)`の形にする
+- User-Agentは`Elythia/<version> (<url>)`の形にする(`internal/config.UserAgentProduct`。#3394より前は`mk-go`)
 - IDは`internal/misc/id/`のジェネレータで作る(既定は`aidx`)。モデルから直接`uuid`を呼ばない
 - 内部エラーは`slog`で記録し、利用者には汎用のメッセージを返す
 - Redisは用途ごとに別のクライアントとして扱う(`default` / `pubsub` / `jobQueue` / `timelines` / `reactions`)。接続先が同じでも分ける
@@ -223,23 +234,23 @@ docを直すと、直した先で新しい誤りを作りやすくなります�
 
 ## 8. CI
 
-**required check は`build` / `test` / `lint`の3つです。** 手元で`make check`を通せば、ほぼ再現できます。
+**required check は`build` / `test` / `lint` / `frontend`の4つです。** 手元で`make check`を通せば、ほぼ再現できます。`frontend/`を触ったときは、Section 5の`make frontend-*`も通します。
 
 | workflow / job | 発火 | required | 見ているもの |
 |---|---|---|---|
-| `ci.yml` build | push / PR | ○ | `go build ./...`、submoduleのcommitがforkにpush済みで`docs/divergence.md`のpinのtagと一致するか、同梱プラグインの`disabled: true`、同梱プラグインの`go vet` |
+| `ci.yml` build | push / PR | ○ | `go build ./...`、同梱プラグインの`disabled: true`、同梱プラグインの`go vet`、同梱プラグインを含めた統合バイナリのビルド |
 | `ci.yml` test | push / PR | ○ | 4 shardで`-race -count=1 -shuffle=3`、パッケージごとのカバレッジ閾値 |
 | `ci.yml` lint | push / PR | ○ | vet / gofmt / actionlint / golangci-lint / テストfixtureのID重複 |
 | `ci.yml` plugin-tests | push / PR | | 同梱プラグインのテスト、`authoring.md`のスニペットのコンパイル |
-| `ci.yml` frontend-check | push / PR | | fork frontendの型チェック、eslint、vitest、submoduleを読むゲート |
+| `frontend` | push / PR | ○ | `frontend/`の検査(9 workspaceのeslint、typecheck、SPDX、locale、本番ビルド、vitest)、絵文字の正規表現。frontendに関係しない変更ではlintとtestをskipし、集約jobの`frontend`だけが成功する |
 | `ci.yml` vulncheck | push / PR | | govulncheck、`go.mod`とDockerfileのGoの版の一致 |
 | `dependency-review` | PR | | PRが持ち込む依存の既知脆弱性 |
 | `codeql` | PR / push / 週1回 | | Goとworkflowの静的解析 |
-| `dropin-e2e` | PR(paths限定) | | TS↔mk切替、実Misskey / Mastodonとの連合など5シナリオ |
+| `dropin-e2e` | PR(paths限定) | | TS→mkの切替(往路)、TSへ戻す復路の測定、実Misskey / Mastodonとの連合など5シナリオ |
 | `playwright` | PR(paths限定) | | ブラウザのe2e(4 shard) |
 | `upstream-backend-e2e` | PR(paths限定) | | 本家のbackend e2eを無改変で実行(4 shard) |
 | `diff-e2e` | PR(paths限定) | | TSとの値レベルの差分 |
-| `apicompat` | PR(paths限定) | | `docs/api-compat.md`が実態と一致しているか |
+| `apicompat` | PR(paths限定) | | `docs/api-compat.md`が実態と一致しているか、goldenが本家の版に追いついているか(`make upstream-check`) |
 | `build-with-plugins-selftest` | PR(paths限定) | | 運営者向けreusable workflowのビルド |
 | `docker` | `main` / `develop` / tagへのpush、PR | | imageがビルドできるか。PR以外ではimageをpublishする |
 | `docker-branch` | `develop`へのpush(paths限定) | | composeだけを載せた配布用ブランチ`docker`を更新 |
@@ -272,7 +283,7 @@ docを直すと、直した先で新しい誤りを作りやすくなります�
 - `MK_`で始まる環境変数で設定を上書きできる。ネストしたキーは`_`でつなぐ(例: `MK_DB_HOST`)
 - **`MK_*`は設定ファイルより優先される。** exportしたまま`internal/config`のテストを回すと落ちる
 - **設定ファイルにも`bindEnvKeys()`にも無いキーは、`MK_`では作れない。** exampleでコメントアウトされている`meilisearch:`などは、まずyml側のコメントを外す
-- `cmd/migrate`は`DATABASE_URL`を読まない。`-config`か`MK_DB_*`で接続先を決める
+- `elythia migrate`は`DATABASE_URL`を読まない。`-config`か`MK_DB_*`で接続先を決める
 - 全キーの一覧は`internal/config/config.go`の`bindEnvKeys()`にある。運用向けの説明は[docs/configuration.md](docs/configuration.md)
 
 ## 10. 開発方針
@@ -290,6 +301,7 @@ docを直すと、直した先で新しい誤りを作りやすくなります�
 
 このファイル自体を変えたときだけ、1行で追記します(新しいものを上に)。経緯の本文はリンク先にあります。個別のfixの履歴は`CHANGELOG.md`にあります。
 
+<!-- 以下は1.5.0以前の判断・検証の履歴。現行の保証や本数を示すものではない。 -->
 - **2026-09-23**: mkq を v1.0.8 → **v1.1.1** に更新 (BullMQ 6 へ移行。upstream 2026.9.0 の
   bullmq 6.3.2 と wire が揃う)。**2026-09-22 の SA1019 entry にある「Redis は呼び出し側で
   Start / Stop を入れ替えない」は go-redis v9.21.0 で逆になった** (redis/go-redis#3751)。
@@ -926,6 +938,17 @@ docを直すと、直した先で新しい誤りを作りやすくなります�
 - **2026-04-18**: Section 4 / Section 8 に `internal/repository` パッケージのCIカバレッジ閾値を暫定的に 76% に緩和する例外を追加（#260で90%復帰予定）。
 - **2026-04-12**: Section 4 にテストカバレッジ目標を追記（最低90% / 推奨95% / 目標100%）。
 - **2026-04-11**: 初版作成。
+## 2.0.0での文書更新履歴
+- 2026-10-06: nodeinfoの宣言を`elythiaPlugins`にしたので、冒頭の据え置く識別子の例外を更新した (#3400) → [docs/plugin-peer-protocol.md](docs/plugin-peer-protocol.md)
+- 2026-10-06: 本文の名前をElythiaにし、冒頭に旧称と据え置く識別子を書いた (#3394) → [docs/design/project-restructure.md](docs/design/project-restructure.md)
+- 2026-10-06: User-Agentを`Elythia/<version> (<url>)`にしたので、Section 6を更新した (#3394) → [docs/divergence.md](docs/divergence.md)
+- 2026-10-05: 実行バイナリを`elythia`1つにまとめたので、Section 2の構成、Section 3の`make tidy`の行、Section 9の`migrate`の行を更新した (#3394) → [docs/design/project-restructure.md](docs/design/project-restructure.md)
+- 2026-10-05: submodule(`third_party/misskey`)を外したので、Section 2の構成とSection 8の`build`の行を更新した (#3379) → [docs/divergence.md](docs/divergence.md#4-2b-frontend-の独自変更-3379-で取り込んだ後)
+- 2026-10-05: `frontend`をrequired checkにし、`ci.yml`の`frontend-check` jobをそこへまとめた。Section 3 / 5 / 8に反映し、Section 5にfrontendの節と`.claude/rules/frontend.md`を足した (#3379) → [docs/ci.md](docs/ci.md)
+- 2026-10-05: frontendを`frontend/`から読むようにしたので、Section 2の構成とSection 8の`frontend-check`の行を更新し、`frontend`の行を足した (#3379) → [docs/deployment.md](docs/deployment.md#frontend-を本体へ取り込んだ版へ上げる-3379)
+- 2026-10-05: 比較対象の本家を`.cache/misskey`から読むようにしたので、Section 8の`apicompat`の行を更新した (#3378) → [docs/ci.md](docs/ci.md)
+- 2026-10-04: Goのe2eを`tests/`へ移したのでSection 2の構成を更新した (#3373) → [docs/design/project-restructure.md](docs/design/project-restructure.md)
+- 2026-10-04: 復路の保証をやめたことを冒頭の方針とSection 8に反映した (#3191) → [docs/dropin-e2e.md](docs/dropin-e2e.md#復路は測る対象-3191)
 - 2026-10-01: 他の人のClaudeが読むことを前提に作り直した。更新記録とSection 8の本文をdocsへ移し、運営者の運用を`CLAUDE.local.md`へ、docsの取り込みを`.claude/rules/`へ分けた (#3248)
 - 2026-09-30: `federation-mastodon-e2e`シナリオを追加 (#3234) → [docs/ci.md](docs/ci.md#変更の経緯-旧-claudemd-の更新記録)
 - 2026-09-26: actionとbase imageをSHA / digestで固定 → [docs/ci.md](docs/ci.md#変更の経緯-旧-claudemd-の更新記録)

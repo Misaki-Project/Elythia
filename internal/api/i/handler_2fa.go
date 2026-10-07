@@ -10,12 +10,13 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/twofactor"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/core/twofactor"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/repository"
-	"github.com/shiroha-a/mk/internal/server/middleware"
 	"gorm.io/gorm"
 )
 
@@ -100,14 +101,14 @@ func (h *Handler) TwoFARegister(c echo.Context) error {
 
 // twoFAIssuer returns the TOTP issuer (instance hostname) derived from the
 // configured server URL, matching upstream's config.host (register.ts)。
-// serverURL 未配線 / parse 失敗時は "Misskey" にフォールバックする。
+// serverURL 未配線 / parse 失敗時は config.DisplayName にフォールバックする (upstream は常に config.host)。
 func (h *Handler) twoFAIssuer() string {
 	if h.serverURL != "" {
 		if u, err := url.Parse(h.serverURL); err == nil && u.Host != "" {
 			return u.Host
 		}
 	}
-	return "Misskey"
+	return config.DisplayName
 }
 
 // TwoFADone handles POST /api/i/2fa/done.

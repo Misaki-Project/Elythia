@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,8 +17,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/core/mediaproxy"
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/mediaproxy"
 )
 
 // --- mock AllowlistChecker ---
@@ -228,14 +230,32 @@ func TestHandle_MissingUserAgent(t *testing.T) {
 }
 
 func TestHandle_RecursiveProxy(t *testing.T) {
-	h, e, imgServer := setupHandler(t, map[string]bool{})
+	assertRecursiveProxyRejected(t, "Misskey/2026.5.4 (https://other.example)")
+}
+
+// assertRecursiveProxyRejected requests an allowlisted URL with ua and expects
+// the recursive-proxy rejection.
+//
+// **URL を allowlist に入れてから叩く。** 入れないと認可の段で同じ 403 になり、UA の
+// 判定を消してもテストが通ってしまう (#3394 の変異検証で実測)。本文も見るのは、
+// 403 の出どころを UA の判定に限るため。
+func assertRecursiveProxyRejected(t *testing.T, ua string) {
+	t.Helper()
+	allowed := map[string]bool{}
+	h, e, imgServer := setupHandler(t, allowed)
 	defer imgServer.Close()
+	imgURL := imgServer.URL + "/avatar.png"
+	allowed[imgURL] = true
 
-	rec := doRequest(e, h, http.MethodGet,
-		"/proxy/image.webp?url="+imgServer.URL+"/avatar.png",
-		map[string]string{"User-Agent": "Misskey/2026.5.4 (https://other.example)"})
+	// 同じ URL が普通の UA なら通ることを先に確かめる (前提が崩れたら落とす)。
+	ok := doRequest(e, h, http.MethodGet, "/proxy/image.webp?url="+imgURL,
+		map[string]string{"User-Agent": "TestBrowser/1.0"})
+	require.Equal(t, http.StatusOK, ok.Code, "allowlist に入れた URL が通らない")
 
+	rec := doRequest(e, h, http.MethodGet, "/proxy/image.webp?url="+imgURL,
+		map[string]string{"User-Agent": ua})
 	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "Proxy is recursive")
 }
 
 func TestHandle_MissingURL(t *testing.T) {
@@ -510,6 +530,11 @@ func TestHandle_InternalError_WithFallback(t *testing.T) {
 }
 
 func TestHandle_InternalError_NoFallback(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
 		_, _ = w.Write([]byte("not an image"))
@@ -542,6 +567,11 @@ func TestHandle_InternalError_NoFallback(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.Contains(t, rec.Header().Get("Cache-Control"), "max-age=300")
+	// 500 の原因がログに残る (#3383)。status だけでは変換の失敗と区別できない。
+	assert.Contains(t, logs.String(), "mediaproxy: proxy failed")
+	assert.Contains(t, logs.String(), `err="mediaproxy: rejected MIME type`)
+	assert.Contains(t, logs.String(), "mode=default")
+	assert.Contains(t, logs.String(), "url="+url)
 }
 
 func TestHandle_CacheHeaders(t *testing.T) {
@@ -633,16 +663,18 @@ func TestHandle_TooLarge(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
 }
 
-// #2106 L43: mk-go 自身の UA (mk-go/) も recursive proxy として弾く。
-func TestHandle_RecursiveProxy_MkGoUA(t *testing.T) {
-	h, e, imgServer := setupHandler(t, map[string]bool{})
-	defer imgServer.Close()
-
-	rec := doRequest(e, h, http.MethodGet,
-		"/proxy/image.webp?url="+imgServer.URL+"/avatar.png",
-		map[string]string{"User-Agent": "mk-go/0.9.1 (https://other.example)"})
-
-	assert.Equal(t, http.StatusForbidden, rec.Code)
+// #2106 L43: 自身の UA (Elythia/) も recursive proxy として弾く。改名 (#3394) より
+// 前の版の UA (mk-go/) も、その版を動かしている相手のために弾き続ける。
+func TestHandle_RecursiveProxy_OwnUA(t *testing.T) {
+	for _, ua := range []string{
+		"Elythia/2.0.0 (https://other.example)",
+		"elythia/2.0.0 (https://other.example)",
+		"mk-go/0.9.1 (https://other.example)",
+	} {
+		t.Run(ua, func(t *testing.T) {
+			assertRecursiveProxyRejected(t, ua)
+		})
+	}
 }
 
 // #2905: `static` は mode と直交する軸。

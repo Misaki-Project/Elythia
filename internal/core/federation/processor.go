@@ -11,17 +11,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/activitypub"
-	coreblocking "github.com/shiroha-a/mk/internal/core/blocking"
-	corechat "github.com/shiroha-a/mk/internal/core/chat"
-	corefollowing "github.com/shiroha-a/mk/internal/core/following"
-	corenote "github.com/shiroha-a/mk/internal/core/note"
-	corereaction "github.com/shiroha-a/mk/internal/core/reaction"
-	corereversi "github.com/shiroha-a/mk/internal/core/reversi"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/queue"
-	"github.com/shiroha-a/mk/internal/repository"
+	"github.com/elythia-network/elythia/internal/activitypub"
+	coreblocking "github.com/elythia-network/elythia/internal/core/blocking"
+	corechat "github.com/elythia-network/elythia/internal/core/chat"
+	corefollowing "github.com/elythia-network/elythia/internal/core/following"
+	corenote "github.com/elythia-network/elythia/internal/core/note"
+	corereaction "github.com/elythia-network/elythia/internal/core/reaction"
+	corereversi "github.com/elythia-network/elythia/internal/core/reversi"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/repository"
 )
 
 // nowFn is the time source used by Processor when generating new note IDs.
@@ -1523,7 +1523,7 @@ func (p *Processor) handleAccept(act genericActivity) error {
 // mergeCreateAudience unions the Create activity's to/cc onto the carried Note
 // object's to/cc and fills the object's attributedTo from the activity actor
 // when absent, mirroring upstream ApInboxService.create
-// (third_party/misskey/.../ApInboxService.ts:403-417). The merged JSON is what
+// (packages/backend/src/.../ApInboxService.ts:403-417). The merged JSON is what
 // IngestNoteWithCreated parses, so visibility (public/home/followers/specified)
 // and visibleUserIds are derived from the combined audience rather than the
 // Note object's own to/cc only (#1560).

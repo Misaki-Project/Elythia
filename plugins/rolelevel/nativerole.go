@@ -6,7 +6,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // nativePageSize is the per-page limit of admin/roles/users.

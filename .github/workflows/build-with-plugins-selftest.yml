@@ -26,7 +26,9 @@ on:
       # この job だけ。
       - "plugin/**"
       - "go.mod"
-      - "third_party/misskey"
+      - "frontend/**"
+      - "plugins/rolelevel/**"
+      - ".github/workflows/misaki-genshin-image.yml"
   workflow_dispatch:
 
 jobs:
@@ -37,15 +39,21 @@ jobs:
     # ローカル参照なので、この PR / ブランチの build-with-plugins.yml が使われる。
     uses: ./.github/workflows/build-with-plugins.yml
     with:
-      # fork でも回るように、自分のリポジトリを見る。既定の shiroha-a/mk 固定だと
+      # fork でも回るように、自分のリポジトリを見る。既定の Elythia-Network/elythia 固定だと
       # fork 上の PR / dispatch で checkout が not our ref で落ちる。
       mk_repository: ${{ github.repository }}
       mk_ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      # nowplaying は frontend を持つので、SPA を自前でビルドする経路
-      # (ASSETS_SOURCE=local) まで通る。**ref は固定する** — dispatch の input を
+      # 原神・fedwatch・hsr は frontend を持つので、Dockerfile.bundled の中でプラグインの
+      # .vue を含めて SPA をビルドする経路まで通る。**ref は固定する** — dispatch の input を
       # そのまま埋め込むと、改行を含む値で行を増やして任意のリポジトリを
       # clone させられる。
+      # **ref は commit の SHA にする。** `main` のような動く名前だと、プラグインが
+      # 本体の破壊的な変更 (モジュールパスの変更、#3394) に追従した時点で、
+      # 追従する前の develop から切った PR が落ちる。プラグインを上げるときは、
+      # 本体の変更と同じ PR でこの SHA を進める。
       plugins: |
-        nowplaying https://github.com/shiroha-a/mk-plugin-nowplaying main
+        genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 253a472ab09e87a471c3746dca4a6a0279022a0a
+        fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8
+        hsr https://github.com/Elythia-Network/elythia-plugin-hsr.git 07c5c1bb43cc34de5e79823238567a17623323be
       # publish はしない。検証したいのはビルドが通ることだけ。
       push: false

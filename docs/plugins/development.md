@@ -17,7 +17,7 @@ plugin loaded name=status version=1.0.0 routes=true jobs=true migrations=1 schem
 
 - `PLUGIN=` を省くと `plugins/` 全体を監視する
 - `-config` で設定ファイルを変えられる（既定は `.config/default.yml`）。**ただし `make plugin-dev` は追加引数を転送しない**ので、渡すなら `go run ./tools/plugindev` を直接叩く（後述）
-- 監視対象は**指定したディレクトリだけ**。mk-go 本体を触っている間に再起動し続けることはない
+- 監視対象は**指定したディレクトリだけ**。Elythia 本体を触っている間に再起動し続けることはない
 - `MK_DEV=1` が自動で立つので、ビルド済みのフロントが残っていても Vite dev server を見に行く
 
 **開発用の設定ファイルを別に用意することを勧める。** 本番と同じ設定を使うと、本番の DB に接続してしまう。
@@ -34,16 +34,16 @@ GOWORK=off go run ./tools/plugindev -plugin plugins/status -config .config/dev.y
 別の端末で Vite dev server を立てる。
 
 ```bash
-cd third_party/misskey/packages/frontend && pnpm watch
+cd frontend/packages/frontend && pnpm watch
 ```
 
-`make plugin-dev` 側が `MK_DEV=1` を立てているので、mk-go は `/vite/*` をここへ流す。プラグインの `.vue` / `.ts` を編集すると HMR が効く。
+`make plugin-dev` 側が `MK_DEV=1` を立てているので、Elythia は `/vite/*` をここへ流す。プラグインの `.vue` / `.ts` を編集すると HMR が効く。
 
-プラグインのソースは `packages/frontend` の外にあるが、`mk-plugins.generated.json` の `allow` に `plugins/` が入るので dev server が配信できる（生成は `make plugins` か `make plugin-dev` が行う）。
+プラグインのソースは `packages/frontend` の外にあるが、`mk-plugins.generated.json` の `allow` に `plugins/` が入るので dev server が配信できる（生成は `make plugins` か `make plugin-dev` が行う）。同じく生成物の `server-plugins.generated.ts` は git で追跡していないので、dev server を立てる前に一度 `make plugins` か `make plugin-dev` を実行しておく。
 
 ### node_modules の所有者に注意
 
-`make uds-frontend-build` / `make e2e-frontend-build` は **Docker の中で root として** `pnpm install` するため、`third_party/misskey/node_modules` が root 所有になる。この状態でローカルの `pnpm watch` を起動すると失敗する。
+`make uds-frontend-build` / `make e2e-frontend-build` は **Docker の中で root として** `pnpm install` するため、`frontend/node_modules` と `frontend/packages/*/node_modules` が root 所有になる。この状態でローカルの `pnpm watch` を起動すると失敗する。
 
 ```
 Error: EACCES: permission denied, open '.../node_modules/.vite-temp/vite.config.ts.timestamp-....mjs'
@@ -53,11 +53,11 @@ Error: EACCES: permission denied, open '.../node_modules/.vite-temp/vite.config.
 
 ```bash
 # A. 所有者を自分に移す (以後 Docker ビルドを使わないなら)
-sudo chown -R "$(id -un):$(id -gn)" third_party/misskey/node_modules
+sudo chown -R "$(id -un):$(id -gn)" frontend/node_modules frontend/packages/*/node_modules
 
 # B. dev server も Docker で動かす
-docker run --rm -it -v "$(pwd)":/work -w /work/third_party/misskey/packages/frontend \
-  -p 5173:5173 "node:$(sed -n 's/^ARG NODE_VERSION=\(.*\)$/\1/p' third_party/misskey/Dockerfile)" npx vite --host
+docker run --rm -it -v "$(pwd)":/work -w /work/frontend/packages/frontend \
+  -p 5173:5173 "node:$(tr -d '[:space:]' < frontend/.node-version)-trixie" npx vite --host
 ```
 
 ## 確認できること
@@ -67,17 +67,17 @@ docker run --rm -it -v "$(pwd)":/work -w /work/third_party/misskey/packages/fron
 | プラグインが読み込まれたか | 起動ログの `plugin loaded`（名前・版・ルート/ジョブの有無・migration 数・schema） |
 | 無効化されているか | `plugin disabled` |
 | 消したプラグインのデータ | `使われていないプラグインのデータが残っています` |
-| dev モードか | 起動時の警告と `-config-dump` の「frontend 配信元」 |
+| dev モードか | 起動時の警告と `elythia config-dump` の「frontend 配信元」 |
 
 ## よくある詰まり
 
 **プラグインを置いたのに読み込まれない**
 
-`mk-plugin.yml` と `go.mod` の両方が要る。片方だけだと検出されない（`go.mod` が無い場合は明示的なエラーになる）。
+`elythia-plugin.yml` と `go.mod` の両方が要る。片方だけだと検出されない（`go.mod` が無い場合は明示的なエラーになる）。
 
 **`make plugin-dev` では動くのに `make build` に入らない**
 
-`mk-plugin.yml` に `disabled: true` が残っていないかを見る。`PLUGIN=` で名指しした監視対象は disabled でも含めて動かす（既定無効の同梱サンプルを tracked ファイルの編集なしで開発するため）が、本番ビルドは含めない。
+`elythia-plugin.yml` に `disabled: true` が残っていないかを見る。`PLUGIN=` で名指しした監視対象は disabled でも含めて動かす（既定無効の同梱サンプルを tracked ファイルの編集なしで開発するため）が、本番ビルドは含めない。
 
 **既定無効のプラグインを開発したいのに読み込まれない**
 
@@ -85,7 +85,7 @@ docker run --rm -it -v "$(pwd)":/work -w /work/third_party/misskey/packages/fron
 
 **フロントを再ビルドしたのに変わらない**
 
-mk-go は起動時に一度だけ manifest を読む。**ビルド後は必ず再起動する。** ブラウザ側の Service Worker も掴んでいることがあるのでハードリロードする。
+Elythia は起動時に一度だけ manifest を読む。**ビルド後は必ず再起動する。** ブラウザ側の Service Worker も掴んでいることがあるのでハードリロードする。
 
 **プラグインを消したらビルドが落ちる**
 

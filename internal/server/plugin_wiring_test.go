@@ -20,16 +20,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/shiroha-a/mk/internal/config"
-	corerole "github.com/shiroha-a/mk/internal/core/role"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/queue"
-	"github.com/shiroha-a/mk/internal/queue/driver"
-	"github.com/shiroha-a/mk/internal/repository"
-	"github.com/shiroha-a/mk/internal/server/middleware"
-	"github.com/shiroha-a/mk/internal/testutil"
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/internal/config"
+	corerole "github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/queue/driver"
+	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/server/middleware"
+	"github.com/elythia-network/elythia/internal/testutil"
+	"github.com/elythia-network/elythia/plugin"
 	"gorm.io/datatypes"
 )
 
@@ -1271,7 +1271,7 @@ func TestServerPluginInfos_ReflectsDefinitionsAndConfig(t *testing.T) {
 		{Name: "gameinfo", APIVersion: plugin.APIVersion, Routes: routes},
 	}
 	// **キーは小文字で渡す。** Viper は YAML のキーを全て小文字化するので、
-	// 実運用の config.Plugins に camelCase のキーは現れない (-config-dump の
+	// 実運用の config.Plugins に camelCase のキーは現れない (config-dump の
 	// `status.maxlength` 表示と同じ)。テストが camelCase を「仕様」として
 	// 見せないようにする。
 	settings := map[string]map[string]any{

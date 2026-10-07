@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/shiroha-a/mk/internal/effectivepolicy"
+	"github.com/elythia-network/elythia/internal/effectivepolicy"
 )
 
 // roleLevel plugin は `internal/` を import できないので、native policy の schema を

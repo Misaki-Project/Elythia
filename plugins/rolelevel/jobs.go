@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // maxResumeBatch bounds one reconciliation pass.

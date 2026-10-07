@@ -13,14 +13,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/shiroha-a/mk/internal/api/meself"
-	apimeta "github.com/shiroha-a/mk/internal/api/meta"
-	"github.com/shiroha-a/mk/internal/api/notehide"
-	corenote "github.com/shiroha-a/mk/internal/core/note"
-	coretwofactor "github.com/shiroha-a/mk/internal/core/twofactor"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/frontendutil"
-	"github.com/shiroha-a/mk/internal/misc/password"
+	"github.com/elythia-network/elythia/internal/api/meself"
+	apimeta "github.com/elythia-network/elythia/internal/api/meta"
+	"github.com/elythia-network/elythia/internal/api/notehide"
+	corenote "github.com/elythia-network/elythia/internal/core/note"
+	coretwofactor "github.com/elythia-network/elythia/internal/core/twofactor"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/frontendutil"
+	"github.com/elythia-network/elythia/internal/misc/password"
 )
 
 // restoreProcessGlobals undoes the process-wide state that `New` /
@@ -242,7 +242,7 @@ func readNonCommentSource(t *testing.T, name string) string {
 // よって落ちたり落ちなかったりする。
 //
 // **登録そのものを gate で強制する。** 個々の登録は変異検証が効かない —
-// `TestFrontendHTML_SplashColor` の `<style>` 抽出を splash 名指しに直した時点で、
+// `TestFrontendHTML_SplashColor` (現 `TestFrontendHTML_SplashIgnoresThemeColor`) の `<style>` 抽出を splash 名指しに直した時点で、
 // **登録を全部 (このコミットが足した 7 件 + 元からあった 2 件) 外しても 40 seed で
 // 落ちなくなった** (= 無検証のコードになった)。
 // 「今たまたま誰も踏んでいない」ことと「安全」は別なので、形で縛る。

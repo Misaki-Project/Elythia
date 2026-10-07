@@ -8,7 +8,7 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/shiroha-a/mk/internal/config"
+	"github.com/elythia-network/elythia/internal/config"
 )
 
 // queueOnlyMux builds the tiny HTTP surface a queue-only node exposes.
@@ -20,7 +20,7 @@ import (
 // # upstream との意図的な差分 (#2459)
 //
 // upstream の `onlyQueue` は一切 listen しない。そのまま真似ると
-// `/app/misskey -healthcheck` (Dockerfile が使う) が必ず失敗し、**コンテナの
+// `elythia healthcheck` (Dockerfile が使う) が必ず失敗し、**コンテナの
 // ヘルスチェックを外さないと運用できないノード**ができる。死活監視を捨てる方が
 // upstream との一致より高くつくので、`/healthz` だけは出す。
 //
@@ -53,7 +53,7 @@ func (s *Server) queueOnlyMux() *http.ServeMux {
 // serveQueueOnly listens with the minimal mux and blocks until shutdown.
 //
 // listener の張り方 (unix socket / TCP) は server ノードと揃える。同じ
-// `-healthcheck` が両方の role に効くようにするため。
+// `elythia healthcheck` が両方の role に効くようにするため。
 func (s *Server) serveQueueOnly() error {
 	srv := &http.Server{Handler: s.queueOnlyMux()}
 	applyServerTimeouts(srv)
@@ -66,14 +66,14 @@ func (s *Server) serveQueueOnly() error {
 		if err != nil {
 			return err
 		}
-		slog.Info("starting Misskey queue worker", "socket", s.config.Socket, "url", s.config.URL)
+		slog.Info("starting Elythia queue worker", "socket", s.config.Socket, "url", s.config.URL)
 	} else {
 		addr := fmt.Sprintf(":%d", s.config.Port)
 		ln, err = net.Listen("tcp", addr)
 		if err != nil {
 			return err
 		}
-		slog.Info("starting Misskey queue worker", "addr", addr, "url", s.config.URL)
+		slog.Info("starting Elythia queue worker", "addr", addr, "url", s.config.URL)
 	}
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {

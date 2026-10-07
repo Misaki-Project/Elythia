@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"testing"
+
+	"github.com/elythia-network/elythia/internal/upstreamsrc"
 )
 
 func TestIsValidType(t *testing.T) {
@@ -22,26 +24,33 @@ func TestIsValidType(t *testing.T) {
 	}
 }
 
-// Misskey ACHIEVEMENT_TYPES の件数 (submodule 不在の CI でも効く軽量 tripwire)。
+// Misskey ACHIEVEMENT_TYPES の件数 (本家のソースが無い CI でも効く軽量 tripwire)。
 func TestCount(t *testing.T) {
 	if got := Count(); got != 78 {
 		t.Errorf("Count() = %d, want 78 (Misskey ACHIEVEMENT_TYPES)", got)
 	}
 }
 
-// TestTypes_MatchUpstream は submodule の ACHIEVEMENT_TYPES と types map が完全
-// 一致することを検証する drift gate。submodule 不在 (CI 等) では skip する。
-// submodule bump 時 (= ローカル) に追加 / 削除 / リネームのいずれも検出するので、
+// TestTypes_MatchUpstream は本家の ACHIEVEMENT_TYPES と types map が完全一致する
+// ことを検証する drift gate。本家は .cache/misskey/<版> から読む (#3378)。
+// 本家が無ければ skip するが、MK_UPSTREAM_REQUIRE を立てた CI (`make
+// upstream-check`) では落とす。追加 / 削除 / リネームのいずれも検出するので、
 // 件数が変わらないリネームも TestCount をすり抜けずに捕まえられる。
 func TestTypes_MatchUpstream(t *testing.T) {
-	path := filepath.Join(repoRoot(t), "third_party", "misskey", "packages", "backend", "src", "models", "UserProfile.ts")
-	data, err := os.ReadFile(path)
+	dir, err := upstreamsrc.Locate(repoRoot(t))
 	if err != nil {
-		t.Skipf("submodule UserProfile.ts not available, skipping drift check: %v", err)
+		if upstreamsrc.Required() {
+			t.Fatalf("%s が立っているのに本家を読めない: %v", upstreamsrc.EnvRequire, err)
+		}
+		t.Skipf("upstream Misskey not available, skipping drift check: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "packages", "backend", "src", "models", "UserProfile.ts"))
+	if err != nil {
+		t.Fatalf("read upstream UserProfile.ts: %v", err)
 	}
 	upstream := extractAchievementTypes(string(data))
 	if len(upstream) == 0 {
-		t.Fatal("no ACHIEVEMENT_TYPES parsed from submodule (upstream format change?)")
+		t.Fatal("no ACHIEVEMENT_TYPES parsed from upstream (upstream format change?)")
 	}
 	for name := range upstream {
 		if !IsValidType(name) {

@@ -11,11 +11,11 @@
 ## 動かす
 
 ```bash
-# mk-go のリポジトリルートで
+# Elythia のリポジトリルートで
 make build     # plugins/ を走査してビルドに取り込む
 ```
 
-`plugins/` に置いても**既定では無効**。`mk-plugin.yml` に `disabled: true` があり
+`plugins/` に置いても**既定では無効**。`elythia-plugin.yml` に `disabled: true` があり
 `make build` の対象から外れる (同梱サンプルなので、clone しただけの人のビルドに
 勝手に入らないようにしてある)。有効にするには `disabled: true` の行を消す。
 
@@ -27,7 +27,7 @@ vite ビルドまでは走らない。手順は環境ごとに違うので [デ�
 を見ること。
 
 **手元で動かしてみるだけなら `make plugin-dev PLUGIN=plugins/trustlevel`。**
-tracked ファイル (`mk-plugin.yml`) を編集せずに済む。`disabled: true` を消して
+tracked ファイル (`elythia-plugin.yml`) を編集せずに済む。`disabled: true` を消して
 push すると、同梱サンプルが既定無効であることを見る CI (`build` job の
 `Check bundled plugins are disabled by default`) が落ちる。
 
@@ -40,7 +40,7 @@ push すると、同梱サンプルが既定無効であることを見る CI (`
 消えて**利用者の権限が黙って変わる**。ロールなら切り替えても残り、プラグインを
 止めても最後に確定した状態が生きる。
 
-mk-goは`EffectivePolicies`も提供するが、この判断は変わらない。trustlevelの目的は
+Elythiaは`EffectivePolicies`も提供するが、この判断は変わらない。trustlevelの目的は
 一度確定した昇格を停止・切り戻し後も維持することで、解決時だけの動的な値ではない。
 providerはlevel連動値など、ロール付与だけでは表現できず、停止時に消えることを
 運営者が受け入れた用途に使う。
@@ -66,7 +66,7 @@ plugins:
 
 ### 実行主体について
 
-管理操作は `actorId` の管理者の権限で行う。mk-go には「すべてを迂回する」経路が
+管理操作は `actorId` の管理者の権限で行う。Elythia には「すべてを迂回する」経路が
 無いため (#2476)、必ず誰かの権限で実行される。
 
 このため次の 2 点に注意する。
@@ -78,7 +78,7 @@ plugins:
 
 ### 付与時の通知
 
-`isPublic` なロールを付けると、mk-go が本人へ通知を送る。段階開放を利用者に
+`isPublic` なロールを付けると、Elythia が本人へ通知を送る。段階開放を利用者に
 知らせたいなら公開ロール、静かに広げたいなら非公開ロールにする。
 
 ## 判定

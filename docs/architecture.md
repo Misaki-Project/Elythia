@@ -1,15 +1,15 @@
 # アーキテクチャ
 
-mk-go は Misskey (TypeScript/NestJS) のバックエンドを Go で書き換えたプロジェクトです。
+Elythia は Misskey (TypeScript/NestJS) のバックエンドを Go で書き換えたプロジェクトです。
 本ドキュメントは各レイヤ・パッケージが**どのような責務を持ち、Misskey-TS のどこに対応するか**を
-詳述します。upstream の参照実装は `third_party/misskey/packages/backend/`（submodule）。
+詳述します。upstream の参照実装は `make upstream-fetch` が取得する `.cache/misskey/<版>/packages/backend/`（版は `UPSTREAM_MISSKEY_VERSION`、#3378）。
 
 ## 0. 設計思想
 
 - **wire 互換が最優先**: REST API 応答 shape・エラーコード・ActivityPub の wire format を upstream と一致させる。
 - **Go らしい再構成**: TS のパターンをそのまま移植せず、明示的 interface・エラー値・構造体埋め込みで書き直す。
 - **互換を機械的に守る**: golden/shapetest・drift detector・値レベル diff harness・drop-in e2e で乖離を CI 検出する（§8）。
-- **1.0 以降の方針**: 完全互換 backend から「互換を保ちつつ frontend (third_party/misskey fork) も独自進化させる Misskey ファミリー fork」へ。API 拡張は additive-only、ActivityPub は硬く互換維持、REST は自フロント主導でケースバイケース。
+- **1.0 以降の方針**: 完全互換 backend から「互換を保ちつつ frontend (Misskey TS の fork。#3379 で本体の `frontend/` へ取り込んだ) も独自進化させる Misskey ファミリー fork」へ。API 拡張は additive-only、ActivityPub は硬く互換維持、REST は自フロント主導でケースバイケース。
 
 ---
 
@@ -35,9 +35,9 @@ mk-go は Misskey (TypeScript/NestJS) のバックエンドを Go で書き換�
 
 **依存方向**: `api → core → repository → model` の一方向のみ。逆向き依存は禁止。`entity` は変換専用でドメインロジックを持たない。
 
-### mk-go と Misskey-TS の構造的相違（重要）
+### Elythia と Misskey-TS の構造的相違（重要）
 
-| 観点 | Misskey-TS | mk-go | 理由 |
+| 観点 | Misskey-TS | Elythia | 理由 |
 |---|---|---|---|
 | DI | NestJS (`@Injectable`, `di-symbols.ts`) | **手動配線** (`internal/server/router.go`) | フレームワーク非依存・起動経路の明示化 |
 | データアクセス | サービスが TypeORM repository を直接注入 | **明示的な `repository` interface 層** | mock 注入による単体テスト容易性 |
@@ -50,20 +50,20 @@ mk-go は Misskey (TypeScript/NestJS) のバックエンドを Go で書き換�
 
 ## 2. Misskey-TS との対応関係（全体マップ）
 
-| mk-go | Misskey-TS | 備考 |
+| Elythia | Misskey-TS | 備考 |
 |---|---|---|
 | `internal/api/*` | `server/api/endpoints/*` | endpoint 群（admin, notes, users, i, drive, …） |
 | `internal/api/{inbox,wellknown,nodeinfo,proxy,streaming}` | `server/{ActivityPub,WellKnown,Nodeinfo,FileServer,Streaming}ServerService` | endpoints でなくサーバ層 |
 | `internal/core/*` | `core/*Service.ts` | ドメインサービス（§3.2 に対応表） |
 | `internal/entity/*` | `core/entities/*EntityService` | pack 関数 ↔ EntityService.pack |
-| `internal/repository/*` | （TypeORM repository を各サービスが直接利用） | mk-go のみ明示層 |
+| `internal/repository/*` | （TypeORM repository を各サービスが直接利用） | Elythia のみ明示層 |
 | `internal/model/*` | `models/` (TypeORM entity) | テーブル 1:1 |
 | `internal/activitypub/*` + `internal/core/federation/*` | `core/activitypub/*` | 型/署名/レンダラ/解決/inbox |
 | `internal/queue/processors/*` | `queue/processors/*ProcessorService` | 非同期ジョブ |
 | `internal/stream/channels/*` | `server/api/stream/channels/*` | WS チャンネル |
 | `internal/misc/id` | `core/IdService` | ID 生成 (aidx 既定) |
 | `internal/safehttp` | `core/HttpRequestService`(の SSRF guard) | private-network 拒否 transport |
-| `internal/config` + `cmd/misskey` | `config.ts` + `boot/` | 設定・起動 |
+| `internal/config` + `internal/cli` | `config.ts` + `boot/` | 設定・起動 |
 | `internal/server/router.go` | NestJS `MainModule`/`ServerModule` の配線 | DI 相当を手動で |
 
 ---
@@ -120,7 +120,7 @@ upstream `server/api/endpoints/` の endpoint 群を、ディレクトリ単位�
 | `proxy` | `FileServerService` | メディアプロキシ (`/proxy/*`)、リモート画像キャッシュ |
 | `streaming` | `StreamingApiServerService` | WebSocket 接続のアップグレード（§実体は `internal/stream`） |
 
-**mk-go 固有のヘルパー**（endpoint ではない内部パッケージ）:
+**Elythia 固有のヘルパー**（endpoint ではない内部パッケージ）:
 
 | パッケージ | 役割 |
 |---|---|
@@ -135,7 +135,7 @@ upstream `server/api/endpoints/` の endpoint 群を、ディレクトリ単位�
 
 `core/*Service.ts` に対応。主要対応表:
 
-| mk-go core | Misskey-TS core | 責務 |
+| Elythia core | Misskey-TS core | 責務 |
 |---|---|---|
 | `note` | NoteCreate/NoteDelete/NoteDraft/NotePining Service | ノート作成・削除・下書き・ピン |
 | `user` | UserService / AccountUpdate / UserSuspend / DeleteAccount | ユーザー CRUD・凍結・削除 |
@@ -176,9 +176,9 @@ upstream `server/api/endpoints/` の endpoint 群を、ディレクトリ単位�
 
 ### 3.3 `internal/entity/` — レスポンス DTO
 
-`core/entities/*EntityService.pack()` に対応。ただし mk-go は**純関数 `PackX()`**（DI なし・ドメインロジックなし）。
+`core/entities/*EntityService.pack()` に対応。ただし Elythia は**純関数 `PackX()`**（DI なし・ドメインロジックなし）。
 
-| mk-go | Misskey-TS |
+| Elythia | Misskey-TS |
 |---|---|
 | `PackNote` / `PackNotes` (note.go) | NoteEntityService |
 | `PackUserLite` / `PackUserDetailed` (user系) | UserEntityService |
@@ -186,12 +186,12 @@ upstream `server/api/endpoints/` の endpoint 群を、ディレクトリ単位�
 | `PackDriveFile` / `PackDriveFolder` | DriveFile/DriveFolder EntityService |
 | `note_reaction` 系 | NoteReactionEntityService |
 | `role.go` / `clip.go` / `announcement.go` / `page.go` / … | Role/Clip/Announcement/Page … EntityService |
-| `note_field_resolver.go` | （pack 内の field 解決を batch 化した mk-go 集約） |
+| `note_field_resolver.go` | （pack 内の field 解決を batch 化した Elythia 集約） |
 | `emoji_resolver.go` / `instance_resolver.go` / `mediaurl.go` | 絵文字/instance/メディア URL の解決ヘルパー |
 
 ### 3.4 `internal/repository/` — データアクセス（79 ファイル）
 
-エンティティ毎に `interface + GORM 実装 + コンストラクタ`。**Misskey-TS には明示層が無く**、各サービスが TypeORM repository を直接注入する。mk-go は mock 注入で単体テストを成立させるためにこの層を設けている。
+エンティティ毎に `interface + GORM 実装 + コンストラクタ`。**Misskey-TS には明示層が無く**、各サービスが TypeORM repository を直接注入する。Elythia は mock 注入で単体テストを成立させるためにこの層を設けている。
 
 ```go
 type NoteRepository interface {
@@ -214,7 +214,7 @@ Misskey-TS の `models/`（TypeORM entity）とテーブル 1:1 対応の GORM �
 
 upstream `core/activitypub/*` に対応。型/署名/レンダラは `activitypub` パッケージ、受信処理・解決・配信ロジックは `core/federation` に分かれる。
 
-| mk-go | Misskey-TS | 責務 |
+| Elythia | Misskey-TS | 責務 |
 |---|---|---|
 | `activitypub/types.go` | `activitypub/type.ts` | ActivityStreams 型定義 |
 | `activitypub/renderer.go` | `ApRendererService` | Go model → AP JSON-LD (Person/Note/Activity) |
@@ -236,7 +236,7 @@ upstream `core/activitypub/*` に対応。型/署名/レンダラは `activitypu
 
 driver は `mkq`（BullMQ wire 互換）のみ。legacy の `asynq` は #2985 で削除し、`jobQueueDriver: asynq` は起動エラーになる。`processors/` 配下:
 
-| mk-go processor | Misskey-TS processor | 内容 |
+| Elythia processor | Misskey-TS processor | 内容 |
 |---|---|---|
 | `deliver` | DeliverProcessorService | AP 配信（retry/backoff） |
 | `inbox` | InboxProcessorService | AP 受信（verify-in-worker） |
@@ -260,7 +260,7 @@ driver は `mkq`（BullMQ wire 互換）のみ。legacy の `asynq` は #2985 �
 
 `server/api/stream/channels/*` に対応。`channels/` 配下:
 
-| mk-go | Misskey-TS |
+| Elythia | Misskey-TS |
 |---|---|
 | timeline (home/local/hybrid/global) | home-/local-/hybrid-/global-timeline |
 | main / notifications | main |
@@ -273,12 +273,12 @@ dispatcher が shareable channel の共有・pong ack を upstream `Connection.t
 
 ### 3.9 その他
 
-| mk-go | Misskey-TS | 役割 |
+| Elythia | Misskey-TS | 役割 |
 |---|---|---|
 | `internal/misc/id` | `core/IdService` | ID 生成 (aidx 既定 / aid/meid/ulid/objectid) |
 | `internal/safehttp` | `core/HttpRequestService` の private-network guard | SSRF-safe transport（urlpreview/mediaproxy/federation で共用） |
 | `internal/misc/notesummary` | （push 本文生成） | 通知/Web Push の本文要約 |
-| `internal/config` + `cmd/misskey` | `config.ts` + `boot/` | Viper 設定解決・起動 |
+| `internal/config` + `internal/cli` | `config.ts` + `boot/` | Viper 設定解決・起動 |
 | `internal/entitycompat` | （golden 突合の自前基盤） | autogen 型に対する shape 検証（§8） |
 
 ---
@@ -298,7 +298,7 @@ server.New() → setupRoutes()
 
 ## 5. フック注入パターン
 
-import cycle を避けつつクロスカットを注入する mk-go 固有パターン（TS は NestJS DI + GlobalEventService）。例: `noteCreateService`:
+import cycle を避けつつクロスカットを注入する Elythia 固有パターン（TS は NestJS DI + GlobalEventService）。例: `noteCreateService`:
 
 ```
 noteCreateService
@@ -326,20 +326,20 @@ hook: Fanout / Federation / Notification / Webhook / Chart / Index / BlockingChe
 
 ## 7. parity 品質ゲート（互換性の moat）
 
-wire 互換を機械的に守る多層防御。upstream は **official `misskey/misskey` Docker image** を使うため、`third_party/misskey`（自フロント fork）の改造とは独立して機能する。
+wire 互換を機械的に守る多層防御。upstream は **official `misskey/misskey` Docker image** を使うため、`frontend/`（自フロント fork）の改造とは独立して機能する。
 
 | 仕組み | 内容 | docs |
 |---|---|---|
 | golden / shapetest | misskey-js autogen 型に対する応答 shape 突合（`internal/entitycompat`） | shape-drift.md |
 | drift detector | CanSeeNote ↔ SQL push-down 等のロジック整合検出 | shape-drift.md |
-| 値レベル diff harness | TS インスタンス ↔ mk-go の応答を値単位で diff（`make diff-test`） | diff-e2e.md |
-| drop-in e2e | 実 Misskey TS ↔ mk-go 切替の連合/フロント互換（PR ごと。frontend e2e のみ nightly） | dropin-e2e.md / dropin-frontend-e2e.md |
-| playwright | 298 spec を mk-go backend で（PR ごと、4 シャード）。TS backend は手動 | — |
+| 値レベル diff harness | TS インスタンス ↔ Elythia の応答を値単位で diff（`make diff-test`） | diff-e2e.md |
+| drop-in e2e | 実 Misskey TS ↔ Elythia 切替の連合/フロント互換（PR ごと。frontend e2e のみ nightly） | dropin-e2e.md / dropin-frontend-e2e.md |
+| playwright | 298 spec を Elythia backend で（PR ごと、4 シャード）。TS backend は手動 | — |
 | inbound/outbound 連合 | Fedibird-like mock との Ed25519 双方向 verify | federation.md |
 
 CI（`ci.yml`）は build / 4-shard test（パッケージ毎 90% カバレッジ強制）/ lint を必須化。
 
-## 8. mk-go 独自・cherrypick 拡張
+## 8. Elythia 独自・cherrypick 拡張
 
 upstream に無い、または cherrypick 由来の加算機能（wire 互換を壊さない additive 拡張）。
 下表は概観で、**全項目の網羅カタログは [divergence.md](divergence.md)** を参照。
@@ -352,7 +352,7 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 | Ed25519 / Multikey (FEP-521a) | 連合拡張 | RSA に加え Ed25519 署名 |
 | `_misskey_*` AP 拡張 | Misskey 系共通 | renderPerson 等で常時出力 |
 
-> 注: chat / reversi は vanilla Misskey 2026.x にも存在する。mk-go が持つのは「vanilla 基盤 + cherrypick 由来の連合拡張」であり、vanilla misskey-js golden で厳密 gate するのは不適切（拡張 field を許容）。
+> 注: chat / reversi は vanilla Misskey 2026.x にも存在する。Elythia が持つのは「vanilla 基盤 + cherrypick 由来の連合拡張」であり、vanilla misskey-js golden で厳密 gate するのは不適切（拡張 field を許容）。
 
 ## 9. 設定・マイグレーション
 
@@ -364,12 +364,14 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 `MK_` プレフィックスの環境変数でオーバーライド可（例 `MK_DB_HOST`）。詳細は [configuration.md](configuration.md)。
 
-マイグレーション（`migration/`、golang-migrate、現在 109 本）:
+マイグレーション（`migration/`、golang-migrate、現在 117 本）:
 > 注: fork の `000098_drop_remote_avatar_decorations` は無変更で残し、upstream の `000098_registration_closed` は `000106_registration_closed`、`000106_abuse_report_notification_recipient_fk_cascade` は `000107_abuse_report_notification_recipient_fk_cascade` として統合している。`000107_note_page_count_backfill`は`000108_note_page_count_backfill`へ、Release 1.5.0の`000108_user_uri_index`は`000109_user_uri_index`へ割り当てた。upstream の過去実測本数は履歴上の値。
 
-- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 18 件あり、うち 13 件は mk-go が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
+- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 19 件あり、うち 14 件は Elythia が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Misakiの既存migrationもこの件数に含める。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
 - drop-in テストで発見した補完列は専用マイグレーションで追加。
-- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただし既存の down はこの規約を満たしていない** — 現行 109 本のうち `-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある（[migration-from-ts.md](migration-from-ts.md#mk-go-内での切り戻し)）。
+- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただし既存の down はこの規約を満たしていない** — `-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある（[migration-from-ts.md](migration-from-ts.md#elythia-内での切り戻し)）。
+
+Release 2.0.0の上流migration109〜116はMisakiでは110〜117へ割り当て、適用済みの109を変更しない。
 
 ```bash
 make migrate-up      # 最新まで
@@ -377,7 +379,7 @@ make migrate-down    # 1 段ロールバック
 make migrate-create  # 新規作成
 
 # 全段ロールバック (破壊的。全テーブルが消える)
-go run ./cmd/migrate -direction down
+go run ./cmd/elythia migrate -direction down
 ```
 
 ## 技術スタックとディレクトリ構成 (旧 CLAUDE.md Section 1 / 2)
@@ -403,7 +405,7 @@ CLAUDE.md の Section 1 / 2 にあった表とツリーを、#3248 でここへ�
 |-----------|---------|------|
 | PostgreSQL Driver | **pgx/v5** (`jackc/pgx/v5`) | PostgreSQL接続 |
 | Redis | **go-redis v9** (`redis/go-redis/v9`) | キャッシュ、PubSub |
-| Job Queue | **mkq** (`shiroha-a/mkq`) | BullMQ wire互換のRedisジョブキュー。**唯一のdriver** (legacyの`asynq`は#2985で削除) |
+| Job Queue | **mkq** (`elythia-network/mkq`) | BullMQ wire互換のRedisジョブキュー。**唯一のdriver** (legacyの`asynq`は#2985で削除) |
 | Search | **meilisearch-go** | Meilisearch連携 |
 | Object Storage | **aws-sdk-go-v2/s3** | S3互換ストレージ |
 
@@ -430,14 +432,9 @@ CLAUDE.md の Section 1 / 2 にあった表とツリーを、#3248 でここへ�
 ```
 /
 ├── cmd/
-│   ├── misskey/            # メインバイナリのエントリポイント
-│   ├── migrate/            # マイグレーションCLIツール
-│   ├── backfill-note-tags/ # note.tags を NFKC 正規化し直す一回限りのバッチ
-│   ├── backfill-remote-host/ # 保存済みリモート host を punycode 正規化し直すバッチ
-│   ├── backfill-emoji-system-file/ # 承認済み自作絵文字の画像を system 所有へ複製し直すバッチ
-│   ├── backfill-avatar-public-url/ # アイコン / バナーの URL を公開用へ寄せ直すバッチ
-│   └── backfill-instance-counts/ # instance の notesCount / usersCount を数え直すバッチ
-├── internal/               # 全26ディレクトリ (`git ls-tree -d HEAD internal/ | wc -l`)
+│   └── elythia/            # 実行バイナリ。internal/cli を呼ぶだけ
+├── internal/               # 全28ディレクトリ (`git ls-tree -d HEAD internal/ | wc -l`)
+│   ├── cli/                # elythia のサブコマンド (serve / migrate / backfill <名前> / doctor / fsck / config-dump / healthcheck / dump-routes)
 │   ├── config/             # 設定ローダー（Misskey YAML互換）
 │   ├── db/                 # GORM の PostgreSQL 接続配線
 │   ├── server/             # HTTPサーバーのセットアップ、ルーティング、ミドルウェア
@@ -466,7 +463,7 @@ CLAUDE.md の Section 1 / 2 にあった表とツリーを、#3248 でここへ�
 │   ├── effectivepolicy/    # ロールポリシーの host schema (本番の解決とプラグイン検証で共有)
 │   ├── l10n/               # サーバーが送るメール文面のロケール解決
 │   ├── safemath/           # 固定幅へ寄せるときに飽和させる算術ヘルパー
-│   ├── maintenance/        # SQL migration として書けない後始末バッチ（`cmd/` の CLI から手動で回す）
+│   ├── maintenance/        # SQL migration として書けない後始末バッチ（`elythia backfill <名前>` で手動で回す）
 │   ├── frontendutil/       # 同梱フロントエンドの資産配信ヘルパー
 │   ├── pgarray/            # database/sql 用の PostgreSQL 配列型
 │   ├── sentry/             # sentry-go の配線
@@ -477,9 +474,8 @@ CLAUDE.md の Section 1 / 2 にあった表とツリーを、#3248 でここへ�
 ├── plugins/                # プラグイン本体。gitignore 済で同梱するものだけ例外指定
 ├── tools/                  # parity ゲート / コード生成のCLI群（apicompat、shapediff、pluginbuild 等）
 ├── migration/              # golang-migrate用SQLファイル（`NNNNNN_name.up.sql` / `.down.sql`）
-├── test/                   # Go の e2e（`test/e2e` / `test/e2e_federation`）
-├── tests/                  # Go 以外の検証基盤（playwright / diff / dropin / bench / upstream-e2e 等）
-├── third_party/misskey/    # fork した Misskey TS（submodule。フロントエンドの供給元）
+├── tests/                  # Go の e2e（`tests/e2e` / `tests/e2e-federation`）と、Go 以外の検証基盤（playwright / diff / dropin / bench / upstream-e2e 等）
+├── frontend/               # 同梱フロントエンド。fork した Misskey TS を取り込んだ pnpm workspace（#3379）
 ├── deploy/                 # デプロイ用の補助資材（UDS 構成、pg_bigm 入り postgres image）
 ├── .config/                # 設定ファイル（Misskey互換YAML）
 │   ├── default.yml.example # ローカル開発用テンプレート (track 対象)
@@ -490,7 +486,7 @@ CLAUDE.md の Section 1 / 2 にあった表とツリーを、#3248 でここへ�
 ├── Makefile
 ├── Dockerfile
 ├── docker-compose.yml      # **`name:` が無い**。単体で使うと本番 project `mk` に合流する
-└── go.mod                  # Moduleパス: github.com/shiroha-a/mk
+└── go.mod                  # Moduleパス: github.com/elythia-network/elythia
 ```
 
 `built/` と `drive-files/` は gitignored な生成物 / ローカルストレージ。

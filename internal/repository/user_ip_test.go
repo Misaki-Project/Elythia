@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/model"
+	"github.com/elythia-network/elythia/internal/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,8 +45,8 @@ func TestUserIPRepository_DeleteLastSeenBefore(t *testing.T) {
 }
 
 // **`createdAt` は衝突しても動かない (初回観測)。** upstream の
-// `INSERT ... orIgnore` と同じ意味にするための中核。動かすと純正へ戻したときに
-// 同じ列が別の意味になる。
+// `INSERT ... orIgnore` と同じ意味にするための中核。TS から引き継いだ DB では
+// TS が書いた行は初回観測なので、動かすと同じ列が行によって別の意味になる。
 func TestUserIPRepository_ObserveKeepsFirstSeen(t *testing.T) {
 	repo := NewUserIPRepository(testDB)
 	u := insertTestUser(t, "ip_obs", "ipobs")

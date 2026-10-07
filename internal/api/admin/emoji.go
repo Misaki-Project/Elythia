@@ -6,17 +6,17 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/pagination"
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/api/apierr"
-	"github.com/shiroha-a/mk/internal/api/pagination"
-	"github.com/shiroha-a/mk/internal/core/moderationlog"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/misc/colfit"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/queue"
-	"github.com/shiroha-a/mk/internal/repository"
-	"github.com/shiroha-a/mk/internal/server/middleware"
 )
 
 // 列幅は migration/000001_initial の `emoji` テーブル定義に対応する。
@@ -62,11 +62,11 @@ func emojiBodyFits(v *string, max int) bool {
 // オブジェクトストレージ構成では超えうる。通すと `Create` /
 // `UpdateFields` が SQLSTATE 22001 で落ち、**操作者には直しようのない 5xx** になる。
 //
-// **列は広げない。** upstream も 512 (`models/Emoji.ts`) なので広げると TS が
-// 保存できない値が入り、`emoji` は共有テーブルなので upstream 由来の列を `ALTER`
-// すると復路が壊れる (down で narrow できない)。**URL は切らない** — 途中で切った
-// URL は別物で、取りに行っても無駄なうえ壊れた参照を保存することになる
-// (#3018 の `url` 直接指定と同じ判断)。
+// **列は今のところ広げない。** upstream も 512 (`models/Emoji.ts`)。広げない理由は
+// もともと TS へ戻すこと (復路) で、広げた後に入った値は down で narrow できない。
+// 復路は保証しなくなった (#3191) ので、広げて 5xx を無くすことは将来の
+// 選択肢になる。**URL は切らない** — 途中で切った URL は別物で、取りに行っても
+// 無駄なうえ壊れた参照を保存することになる (#3018 の `url` 直接指定と同じ判断)。
 //
 // **これで 5xx が全部消えるわけではない。** `Storage.Put` が返す URL は
 // `base (+ prefix) + accessKey` で、`accessKey` は 32 桁の hex 固定なので、
@@ -267,7 +267,7 @@ func (h *Handler) EmojiAddAliasesBulk(c echo.Context) error {
 // (#670)。fetcher 未配線時は src の URL をそのまま継承する legacy 挙動を
 // 維持する (テスト容易性 + 未配線環境での graceful degradation 用)。
 //
-// ref: third_party/misskey/packages/backend/src/server/api/endpoints/admin/emoji/copy.ts
+// ref: 本家の packages/backend/src/server/api/endpoints/admin/emoji/copy.ts
 func (h *Handler) EmojiCopy(c echo.Context) error {
 	// **上書き項目は mk-go 独自の additive パラメータ** (#2698)。upstream の
 	// paramDef は `emojiId` のみ必須なので、足しても既存の呼び出しは通る。
@@ -573,7 +573,7 @@ func (h *Handler) EmojiListRemote(c echo.Context) error {
 	// から equality 突合する。保存側も #2706 で同じ正規化を掛けるようになったので、
 	// IDN / 大文字混在の host param を正規化しないと match しない (#1948-13)。
 	// **非正規化のまま保存された行は引けない** — 完全一致なので、`Mixed.Example` の
-	// ような表記で入った emoji は `cmd/backfill-remote-host` を流すまで出てこない
+	// ような表記で入った emoji は `elythia backfill remote-host` を流すまで出てこない
 	// (user の acct 解決も #2996 で同じになった)。
 	host := req.Host
 	if host != "" {

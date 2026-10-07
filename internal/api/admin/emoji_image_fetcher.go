@@ -7,10 +7,10 @@ import (
 	"net/url"
 	"path"
 
-	"github.com/shiroha-a/mk/internal/core/drive"
-	"github.com/shiroha-a/mk/internal/core/emojiapplication"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/safehttp"
+	"github.com/elythia-network/elythia/internal/core/drive"
+	"github.com/elythia-network/elythia/internal/core/emojiapplication"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/safehttp"
 )
 
 // MaxEmojiImageBytes caps the response read from a remote emoji image so a
@@ -42,7 +42,7 @@ type EmojiImageFetcherImpl struct {
 
 // NewEmojiImageFetcher builds a fetcher bound to an SSRF-safe HTTP client and
 // the local drive service. userAgent should normally be cfg.UserAgent so feed
-// servers see the same `mk-go/<ver>` identification used everywhere else.
+// servers see the same `Elythia/<ver>` identification used everywhere else.
 func NewEmojiImageFetcher(httpClient *http.Client, driveSvc *drive.Service, userAgent string) *EmojiImageFetcherImpl {
 	return &EmojiImageFetcherImpl{
 		httpClient: httpClient,

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 func TestEffectivePoliciesRegistration(t *testing.T) {

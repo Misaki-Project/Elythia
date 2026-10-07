@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // requireAdmin gates every level-configuration route.

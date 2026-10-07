@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/shiroha-a/mk/internal/effectivepolicy"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/internal/effectivepolicy"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // ErrEffectivePolicyProvider is returned by GetUserPoliciesChecked when a
@@ -50,7 +50,7 @@ type policyProviderRuntime struct {
 	// 書く goroutine が組み合わさったときに紛れ込みうる。実際にその形が
 	// 成立する経路は本パッケージには見つかっていない。
 	//
-	// production では `cmd/misskey/main.go` が起動時に `slog.SetDefault` を
+	// production では `elythia serve` (internal/cli/serve) が起動時に `slog.SetDefault` を
 	// 済ませてからプラグインを登録する (= runtime 生成はその後) ので挙動は同じ。
 	logger *slog.Logger
 

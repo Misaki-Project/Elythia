@@ -6,10 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/labstack/echo/v4"
-	"github.com/shiroha-a/mk/internal/config"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -79,9 +79,9 @@ func TestOpenSearchXML(t *testing.T) {
 	assert.Contains(t, body, "https://example.test/search?q={searchTerms}")
 }
 
-// インスタンス名が未設定なら upstream 同様 "Misskey" にフォールバックする。
+// インスタンス名が未設定なら config.DisplayName にフォールバックする (upstream は "Misskey")。
 func TestOpenSearchXML_DefaultName(t *testing.T) {
 	h, c, rec := newWebResourceTestHandler(t, &model.Meta{ID: "x"})
 	require.NoError(t, h.OpenSearchXML(c))
-	assert.Contains(t, rec.Body.String(), "<ShortName>Misskey</ShortName>")
+	assert.Contains(t, rec.Body.String(), "<ShortName>Elythia</ShortName>")
 }

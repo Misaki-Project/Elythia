@@ -1,48 +1,34 @@
 # Misskey TS upstream 追従アップデート手順
 
-mk-go は `third_party/misskey` submodule で Misskey TS の特定 release tag を pin して、frontend asset + drop-in 互換性の参照点として利用している。upstream の新 release が出るたびに backend 差分の triage + 取り込み + submodule bump を行う必要がある。
+Elythia の `frontend/` は、本家 Misskey の monorepo から `packages/backend` を除いたもののスナップショットに、Elythia 独自の変更を載せたもの (#3379)。追従している本家の版はリポジトリ直下の `UPSTREAM_MISSKEY_VERSION` に 1 行で書き、比較対象の本家のソースは `make upstream-fetch` で `.cache/misskey/<版>/` に取る (bare mirror の `.cache/misskey/mirror.git` から版ごとに worktree を作る。#3378)。本家の新しい release が出るたびに、frontend の差分の取り込み (`make upstream-sync`) と、backend の差分の triage + Go への移植と、版を上げる作業を行う。
 
-本書は **submodule bump を含む PR がマージされた後、各開発者 / operator が必要な手順** と、**新 upstream release が出た時の triage 運用** を説明する。
+本書は **本家の版を上げた PR がマージされた後、各開発者 / operator が必要な手順** (1 章) と、**本家の新しい release が出た時の取り込み手順** (2 章) を説明する。
+
+> **#3379 より前の運用。** frontend は submodule が指す fork (アーカイブ済み) から供給していて、追従は fork の上での載せ替えと tag の採番、gitlink の bump だった。fork の tag の採番規則と、その頃の独自変更の一覧は凍結した記録として [divergence.md §4-2](divergence.md#4-2-fork-frontend-の独自変更) に残っている。今の独自変更は §4-2b に PR 番号で書く (2-4)。
 
 ---
 
-## 1. 既存環境への適用 (= submodule bump PR マージ後)
+## 1. 既存環境への適用 (= 本家の版を上げた PR のマージ後)
 
-`git pull` だけでは submodule の working tree は更新されない (= 親リポの gitlink ポインタが移動するのみ)。`third_party/misskey/` 配下の実 file を新 release に揃えるには明示的な submodule update が必要。
-
-### 1-1. 推奨: 1 コマンドで pull + submodule update
-
-```bash
-git pull --recurse-submodules
-```
-
-このフラグは `git pull` 単体だと毎回つける必要がある。常時 on にしたい場合は次の設定を 1 度実行:
-
-```bash
-git config submodule.recurse true
-```
-
-→ 以後 `git pull` / `git checkout` / `git merge` で自動的に submodule も追従する。`.git/config` (= repo local) に書かれるため、他開発者には伝播しない。各人が一度設定すること。
-
-### 1-2. 手動 (一括設定なし)
+### 1-1. pull
 
 ```bash
 git pull
-git submodule update --init --recursive
 ```
 
-### 1-3. 確認
+`frontend/` は本体で追跡しているので、`git pull` だけで新しい版の frontend のソースが揃う。
+
+golden の再生成・本家 backend e2e・apicompat のように本家のソースを読む作業をするときだけ、新しい版の本家を取得する (起動とビルドには要らない)。
 
 ```bash
-git -C third_party/misskey describe --tags HEAD
-# → 例: 2026.5.1-mk.0
-git -C third_party/misskey log --oneline HEAD -1
-# → 例: 8c292244e7 fix(frontend): add null guard for MkModal content children[0]
+make upstream-fetch   # UPSTREAM_MISSKEY_VERSION の版を .cache/misskey/<版>/ へ取得
 ```
 
-### 1-4. frontend asset の rebuild が必要なケース
+古い版の worktree は残るので、要らなければ `git -C .cache/misskey/mirror.git worktree remove --force .cache/misskey/<古い版>` で消す。
 
-`third_party/misskey/packages/frontend/` の vite ビルド成果物を mk-go が serve しているため、submodule bump 後に **frontend asset を再ビルド** しないと UI に古い JS が残る:
+### 1-2. frontend asset の rebuild が必要なケース
+
+`frontend/packages/frontend/` の vite ビルド成果物 (`frontend/built`) を Elythia が serve しているため、`frontend/` が変わった後に **frontend asset を再ビルド** しないと UI に古い JS が残る (#3379 より前は `third_party/misskey` の成果物を配信していた):
 
 ```bash
 make uds-frontend-build
@@ -51,28 +37,28 @@ make uds-frontend-build
 
 数分〜10分かかる。docker daemon が必要。UDS / dropin / e2e いずれも同じビルド成果物を共有する。
 
-### 1-5. UDS production stack の再ビルド
+### 1-3. UDS production stack の再ビルド
 
-`compose.uds.yaml` ([リポジトリにあるのは `.example` 版](../compose.uds.yaml.example)) で本番運用している場合、Misskey TS の prebuilt image を pull しているわけではなく **mk-go バイナリ + submodule の静的アセットを image に焼き込んでビルドしている** ([`deploy/uds/Dockerfile.mkgo`](../deploy/uds/Dockerfile.mkgo) の `COPY . .` 経由)。submodule update + frontend rebuild 後に image を作り直さないと古い asset が image にキャッシュされたまま:
+`compose.uds.yaml` ([リポジトリにあるのは `.example` 版](../compose.uds.yaml.example)) で本番運用している場合、Misskey TS の prebuilt image を pull しているわけではなく **Elythia バイナリ + `frontend/` の静的アセットを image に焼き込んでビルドしている** ([`deploy/uds/Dockerfile.mkgo`](../deploy/uds/Dockerfile.mkgo) の `COPY . .` 経由)。`frontend/` の更新 + frontend rebuild 後に image を作り直さないと古い asset が image にキャッシュされたまま:
 
 ```bash
-# 1-1 / 1-2 と 1-4 を済ませた状態 (= submodule + frontend asset が最新) で
+# pull と 1-2 を済ませた状態 (= frontend/ + frontend asset が最新) で
 make uds-build      # image を作り直す
 make uds-restart    # 再起動 + 配信アセットの検証
 ```
 
 **重要**:
-- **image の作り直しと再起動は別の話で、両方要る**。image に焼き込むのは `deploy/uds/Dockerfile.mkgo` が `COPY` する 4 つ — static-assets (`packages/backend/assets`)、repo-assets (`third_party/misskey/assets`)、twemoji、fluent-emoji。submodule bump でこれらが変わるので `uds-build` が要る
-- **SPA のアセット (`built/_frontend_vite_`) は image に入らない**。bind-mount で渡しているので `uds-frontend-build` (1-4) の出力がそのまま配信される
-- **`--build` を付けても再起動は保証されない**。compose は image と設定が変わらなければコンテナを作り直さないので、bind-mount しか変わっていない場合は何も起きず、mk-go は起動時にキャッシュした古いエントリを配り続ける (#2885)。`make uds-restart` は `restart` を明示したうえで配信中のアセットが実在するかまで検証する
+- **image の作り直しと再起動は別の話で、両方要る**。image に焼き込むのは `deploy/uds/Dockerfile.mkgo` が `COPY` する 4 つ — static-assets (`frontend/assets`)、repo-assets (`frontend/repo-assets`)、twemoji、fluent-emoji (`frontend/node_modules/@misskey-dev/emoji-assets` から)。`frontend/` の更新でこれらが変わるので `uds-build` が要る
+- **SPA のアセット (`frontend/built/_frontend_vite_`) は image に入らない**。bind-mount で渡しているので `uds-frontend-build` (1-2) の出力がそのまま配信される。ただし `compose.uds.yaml` がまだ `./third_party/misskey/built` を指している場合は誰も mount していないので、先に [デプロイの切り替え手順](deployment.md#frontend-を本体へ取り込んだ版へ上げる-3379) を済ませる
+- **`--build` を付けても再起動は保証されない**。compose は image と設定が変わらなければコンテナを作り直さないので、bind-mount しか変わっていない場合は何も起きず、Elythia は起動時にキャッシュした古いエントリを配り続ける (#2885)。`make uds-restart` は `restart` を明示したうえで配信中のアセットが実在するかまで検証する
 - **その検証は bind-mount の SPA アセットしか見ない**。image 側の asset (twemoji 等) が古いままでも緑になるので、`uds-build` を省かないこと
 - `make uds-frontend-build` を skip すると Dockerfile builder の sanity check (`test -f .../1f004.svg` 等) で早期 fail する
 
-`postgres` / `valkey` / `nginx` / `video-thumb` 等の外部 image は Misskey 無関係なので submodule bump で影響を受けない。
+`postgres` / `valkey` / `nginx` / `video-thumb` 等の外部 image は Misskey 無関係なので、本家の版を上げても影響を受けない。
 
-### 1-6. migration 適用
+### 1-4. migration 適用
 
-submodule bump PR には mk-go 側の migration が同梱されることが多い (例: PR #998 の `migration/000048_avatar_decoration_category.{up,down}.sql`)。本番環境では:
+本家の版を上げる PR には Elythia 側の migration が同梱されることが多い (例: PR #998 の `migration/000048_avatar_decoration_category.{up,down}.sql`)。本番環境では:
 
 ```bash
 # 接続先は -config (既定 .config/default.yml) から決まる
@@ -85,24 +71,24 @@ migration 連番は `migration/00NNNN_*.up.sql` の命名規則に従う (= 各 
 
 ## 2. 新 upstream release 取り込み手順 (= 開発側)
 
-新 Misskey TS release が出た時、mk-go 側で必要な作業フロー:
+新 Misskey TS release が出た時、Elythia 側で必要な作業フロー。**1 回の追従は 1 PR にまとめ、段階ごとにコミットを分ける** (frontend の取り込み、版を上げる作業、backend の移植の各 item)。各コミットが単体でビルドとテストを通すこと (CLAUDE.md Section 7)。
 
 ### 2-1. tracker issue を起票
 
 `gh issue create --title "Tracker: Misskey TS <prev> → <new> への upstream 追従"` で tracker を作成。次の内容を含める:
 
 - 対象 release tag (例: `2026.5.1`)
-- backend 関連 commits 一覧 (`git -C third_party/misskey log --oneline --no-merges <prev>..<new> -- packages/backend/src/ packages/backend/migration/`)
+- backend 関連 commits 一覧 (`git -C .cache/misskey/mirror.git log --oneline --no-merges <prev>..<new> -- packages/backend/src/ packages/backend/migration/`。本家は `make upstream-fetch` が取得する bare repository から読む (#3378)。`<new>` の tag は `git -C .cache/misskey/mirror.git fetch --no-tags origin "refs/tags/<new>:refs/tags/<new>"` で足す。`make upstream-sync TO=<new> DRY=1` (2-4) も両方の tag を mirror へ取る)
 - 関連 frontend / TS-only 変更の参考リスト
-- 完了条件 (= sub-issue 全 close + submodule bump PR マージ)
+- 完了条件 (= sub-issue 全 close + 追従 PR のマージ)
 
 ### 2-2. triage doc を作成
 
-`docs/update/yyyymmdd-<tracker-issue>-triage.md` を新規作成。前例: `docs/update/20260512-947-triage.md`。
+release ごとの差分 doc `docs/update/<yyyymm><nn>diff.md` (命名は 3 章。直近は [`20261000diff.md`](./update/20261000diff.md)) を新規作成する。古い前例には `docs/update/yyyymmdd-<tracker-issue>-triage.md` (`docs/update/20260512-947-triage.md`) の形もある。
 
 各 upstream commit について:
-- `git -C third_party/misskey show <sha>` で diff 精読
-- mk-go 該当箇所を `grep` で特定し file_path:line_number で記録
+- `git -C .cache/misskey/mirror.git show <sha>` で diff 精読
+- Elythia 該当箇所を `grep` で特定し file_path:line_number で記録
 - Gap 判定 (`既対応 / 部分対応 / 未対応 / 影響なし`)
 - 推定難易度 (`S / M / L / N/A`)
 - 推定実装方針
@@ -120,131 +106,110 @@ triage で判定した item を `gh issue create` で 1 件 1 issue として起
 
 **注意**: GitHub の cross-repo 自動 link を避けるため、upstream PR 参照は `upstream PR <N>` (plain text、`misskey-dev/misskey#N` 形式は使わない) と書く。
 
-### 2-4. submodule bump + Wave 単位の実装 PR
+### 2-4. frontend の差分を当てる (`make upstream-sync`)
 
-実装方針 (PR #998 で確立):
+`develop` から切ったブランチで行う。設計は [project-restructure.md の D4](design/project-restructure.md#d4-本家への追従-make-upstream-sync) で、区分の表は同じ文書の D1。
 
-1. **Infrastructure 先行**: submodule bump (新 tag) + `MisskeyVersion` 定数更新 + hardcode 修正
-2. **Wave 1 (close 候補)**: comment + regression test で意思表明
-3. **Wave 2 (S 難易度)**: 1 commit / 1 sub-issue (or 関連を bundle) で順次
-4. **Wave 3 (M 難易度)**: PR 1 本ずつ / commit 1 件ずつで review しやすく
-5. **Wave 4 (L 難易度)**: submodule bump とセット (例: 削除 endpoint)
-6. **Final audit**: 残り upstream commits も triage 突き合わせて drift を確認、結果を triage doc 末尾に追記
-7. **Follow-up**: review で挙がった improvement を nit commit で取り込む
-
-各 commit は `2026.X.Y Wave N (M/N): <要約>` 命名で、`Closes #<sub-issue>` で sub-issue を自動 close する。
-
-### 2-5. submodule bump 時の fork 運用
-
-mk-go は `Misaki-Project/misskey-ts` fork を経由して submodule を pin している (= upstream の release tag + mk 固有のパッチを cherry-pick したもの)。新 release を取り込む手順:
+**1. 分類だけを見る。**
 
 ```bash
-cd third_party/misskey
-git fetch upstream <tag>
-# 例: <tag>=2026.5.1
-git checkout -b <tag>-fix <tag>
-git cherry-pick <既存 patch sha>  # 例: 79ccc36ec0 (MkModal null guard)
-git tag <tag>-mk.0
-git push origin <tag>-fix
-git push origin <tag>-mk.0
-cd -
-git add third_party/misskey
-# commit + PR
+make upstream-sync TO=<新しい版> DRY=1
 ```
 
-#### fork タグの採番規則
+mirror (`.cache/misskey/mirror.git`、無ければ作る) に今の版 (`UPSTREAM_MISSKEY_VERSION`) と `TO` の tag を取り、`tools/upstreamsync` がそれを本体のリポジトリの `refs/upstream/<版>` へ取り込んで、変更されたパスを D1 の区分で数える。
 
-形式は `<upstream release>-mk.<N>[<英字>]`（例: `2026.9.0-mk.39`、`2026.9.0-mk.34c`）。
-**lightweight tag** で、fork の `mk-<upstream release>` 系列の先端に打つ。
-
-| 進めるもの | いつ | 例 |
+| 区分 | 本家のパス | 扱い |
 |---|---|---|
-| 数字 (`N`) | **新機能**、および**直前の数字タグとは無関係な修正** | `mk.38` → `mk.39` |
-| 英字 | **直前の数字タグで入れた変更の後追い修正** | `mk.39` → `mk.39a` → `mk.39b` |
+| 取り込む | `packages/` (`packages/backend` を除く)、`packages-private/`、`locales/`、`scripts/`、`patches/`、直下の `package.json` など | `frontend/` の下の同じパスへ当てる |
+| 付け替える | `packages/backend/assets/` / 直下の `assets/` | `frontend/assets/` / `frontend/repo-assets/` へ当てる (D3) |
+| 作り直す | `pnpm-lock.yaml` | 当てない。手順 4 で作り直す |
+| 取り込まない | `packages/backend` (アセットを除く)、`.github/`、`.config/`、`Dockerfile`、文書類など | 当てない |
 
-**英字は「直前の数字タグの後始末」に限る。** バグ修正だから英字、ではない —
-**世代をまたぐ修正は新しい数字を取る**。英字は列の順序を保つためのもので、`-mk.24` の後に
-`-mk.12a` を打つと `git describe --tags` が後戻りして見えるため (先例は `-mk.23` /
-`-mk.25` / `-mk.28`。規則の出どころは `docs/divergence.md` の「fork frontend の変更」で、
-`assertForkTagSequence` の GoDoc も同じことを書いている)。
+**どの区分にも当たらないパスがあると、何も当てずに止まる。** 本家が直下に新しく足したファイルや、submodule の gitlink の変更が該当する。「取り込む」で絞るだけだと新しいパスが黙って落ちるため。止まったら、そのパスの区分を決めて `tools/upstreamsync/main.go` の表 (`importFiles` / `importDirs` / `skipFiles` / `skipDirs`) と設計 D1 の表の両方に足し、`go test ./tools/upstreamsync/` を通してからやり直す。
 
-**1 PR = 1 タグ。** frontend に複数コミットを積む PR でも打つタグは 1 つで、`docs/divergence.md`
-§4-2 の表も 1 行になる。1 コミット = 1 タグにしないのは、表を「還元不能な差分の一覧」として
-読むときの単位が PR だから。
+2.0.0以降は本体の`frontend/`へ取り込む。以前のMisaki frontend forkとsubmoduleは履歴として保持し、新releaseの取り込みには使わない。取り込み手順:
 
-**`N` は upstream release ごとに 0 から数え直す。** 取り込み直後の素の状態が `-mk.0` で、
-載せ替え (`git rebase --onto <新 release> <旧 release>`) で持ち込んだ custom commit も
-`-mk.0` に含める。§4-2 の tag 列は「その変更が**最初に入った世代**」なので、載せ替えても
-古い `2026.7.0-mk.*` の行はそのまま残す。
+```bash
+make upstream-sync TO=<新しい版>
+```
 
-**英字が `z` に達したら数字を上げる。** 26 回も後追いの修正が要る変更はもう別物とみなす。
-実測では 2026.9.0 の 82 タグを通して英字の最長連続は 8 なので、通常は到達しない。
+**`frontend/` に commit していない変更があると断る。** 衝突をファイル単位で解くので、手を入れている最中の変更と本家の差分が混ざらないようにするため。当てるのは `git apply --3way` で、付け替え先ごとに 3 回 (`frontend/` / `frontend/assets/` / `frontend/repo-assets/`) に分けて実行する。rename は削除と追加として扱う。
 
-**`fix` のコミットでも数字を取ることがある。** `2026.9.0` の数字タグ 40 件のうち 13 件は
-`fix(...)` だが (`mk.1` / `mk.2` / `mk.4` …)、**どれも直前の数字タグとは無関係な修正**なので
-規則どおり。commit prefix と採番は 1 対 1 ではない — 見るのは「直前の数字タグの後始末か」
-であって、`feat` か `fix` かではない。
+当てる前に全 pass を `git apply --3way --check` で確かめ、1 つでも当たらない差分 (frontend/ に無いファイルや、追跡していないファイルへの変更) があれば何も当てずに止まる。そのときは区分を見直すか、frontend/ を本家に揃えてからやり直す。
+
+衝突しなかったファイルは index に載る。衝突したテキストのファイルは衝突マーカー付きで作業ツリーに残り、index では unmerged になる (`git diff --name-only --diff-filter=U` で一覧できる)。**バイナリが衝突したときはマーカーが付かず、Elythia 側の内容のまま unmerged になる**ので、本家の版を採るなら `git checkout --theirs -- <パス>` で入れ替える。最後に「次にやること」が表示され、衝突が残っていれば終了コードは 0 にならない。
+
+**3. 衝突を解く。** Elythia 独自の frontend の変更は [divergence.md §4-2b](divergence.md#4-2b-frontend-の独自変更-3379-で取り込んだ後) に PR 番号で記録している。衝突したら、その箇所がどの行の変更かを §4-2b で引いて判断する。
+
+- **本家が同じことを直していたら、Elythia の変更を落として本家の形を採り、§4-2b の行を更新する** (消すか、落とした経緯を書く)。§4-2b は「純正へ還元できない差分の一覧」として読むので、本家に入ったものを残さない
+- 本家の変更と Elythia の変更が両立するなら、両方を残す形に解く
+
+解いたら `git add` する。取り込みのコミットは衝突を解いた後の 1 つにまとめる。
+
+**4. lock を作り直す。**
+
+```bash
+make upstream-sync-lock
+```
 
 **過去のタグは振り直さない。** タグは push 済みで、fork 側の
 `Publish frontend assets image` workflow が `*-mk.*` で発火して
 `ghcr.io/misaki-project/misskey-ts-assets:<tag>` を publish しているため、打ち直すと配布物との
 対応が壊れる。
 
-タグを打ったら、**親リポ側で 4 箇所を同時に更新する**（順序は「submodule に commit →
-fork へ push → tag を push → 親リポの gitlink と doc」。逆順だと CI の checkout が
-`not our ref` で死ぬ）:
+**作り直した lock の差分を目で見る。** `package.json` で変わった依存以外が動いていないことを確かめる。`--lockfile-only` は、lock に無い依存と範囲が変わった依存をその時点の最新に解決するので、本家が試した組とずれうる。`frontend/pnpm-workspace.yaml` の `minimumReleaseAge` (公開から 7 日) に満たない版は選ばれないので、本家が出たばかりの版を指定していると解決に失敗するか、古い版に落ちる。
 
-- `docs/divergence.md` の pin 行（tag と**短縮 SHA の併記**。`make submodulepin-check` が gitlink と突き合わせる）
-- `docs/divergence.md` §4-2 の表に 1 行
-- 同ファイル冒頭サマリの件数と範囲（`TestDivergenceDoc_*` が表と突き合わせる）
-- `Dockerfile.bundled` の `MISSKEY_ASSETS_IMAGE`（配る image に焼く frontend。ずれても image はビルドできるので CI は落ちない）。**`<tag>@sha256:<digest>` で書き、digest も取り直す** — BuildKit は digest を優先するので、tag だけ上げると新しい tag を名乗る古い frontend が焼き込まれる。digest は `docker buildx imagetools inspect --raw ghcr.io/shiroha-a/misskey-ts-assets:<tag> | sha256sum` で取れる (manifest のバイト列の sha256 が digest)。tag と digest の対応は `docker.yml` の `build-and-push-bundled` が registry に問い合わせて見る (過去タグを `-f tag=` で publish し直すときは、当時の Dockerfile.bundled が digest を持たないので照合を skip して warning に落とす)
-
-機械で守られているのはこのうち「表の連番が規則どおりか」（`assertForkTagSequence`。
-数字 +1 か、同じ数字への次の英字しか許さない）と「pin 行 ↔ gitlink」「tag → commit」
-(`make submodulepin-check` と CI の `build` job)。
-
-**数字と英字のどちらを選ぶかは機械では見ていないし、見られない。** 判定には「この修正は
-直前の数字タグで入れた変更の後始末か」という意味判断が要り、commit の件名からは導けない。
-`fix` なら英字という形なら機械化できるが、それは上のとおり規則と違う (#3141 で検討して
-採らなかった。実測で 121 タグはすべて規則どおりで、止めるべきドリフトが無かった。
-`docs(` や `Revert:` の commit も実在するので `feat` / `fix` の二択にも寄せられない)。
-
-
-#### mk 固有パッチだけを載せるとき（release bump 以外）
-
-upstream release の取り込み以外で fork frontend だけを直す PR でも、**submodule の gitlink は同じ規律で扱う**。
-
-mk の `develop` が追跡しているのは fork の **`mk-2026.x.x` 系列**（例: `mk-2026.9.0`）であり、fork の `develop` とは別系列。系列ごとに独自コミットが積まれており、**misskey-ts 側の PR を `develop` にマージしただけでは mk の submodule 系列には入らない**。差分の大きさは時期で変わるので、**fork 側** (`third_party/misskey`) で次を実行する:
+**5. frontend を検査する。**
 
 ```bash
-cd third_party/misskey
-git fetch origin develop mk-2026.9.0   # 例: mk が指す系列
-git rev-list --left-right --count origin/develop...origin/mk-2026.9.0
+make frontend-check   # 型チェックと、frontend を読むゲート
+make frontend-lint
+make frontend-test    # 先に cd frontend && pnpm install && pnpm build
 ```
 
-| やること | 理由 |
+mfm-js か emoji-data の版が変わっていたら、下の「MFM の絵文字の正規表現」の手順も要る。
+
+`tools/upstreamsync` が本体に置いた `refs/upstream/<版>` は branch でも tag でもないので push されない。要らなくなったら `git update-ref -d refs/upstream/<版>` で消してよい (次の追従でも、今の版の ref は取り直す)。
+
+### 2-5. 本家の版を上げる
+
+frontend の取り込みと同じ PR で、版を次の場所で揃えて上げる。揃っていることは `internal/entitycompat` の `TestUpstreamVersionIsConsistent` が見る (#3378)。
+
+- `UPSTREAM_MISSKEY_VERSION`
+- `internal/config/config.go` の `MisskeyVersion`
+- e2e で TS 側として立てる `misskey/misskey:<版>` の tag (下の「比較対象の TS image を全部揃える」)
+
+上げたら `make upstream-fetch` で新しい版の本家を取得し、下の「本家の版を上げた後に必須」の節を順に済ませる (golden の再生成、TypeORM migrations seed、index golden など)。`frontend/package.json` の版は `make upstream-sync` が本家の差分として上げるので、手で直さない (`/about-elythia` はこの版を出す)。
+
+### 2-6. backend の移植 (Wave 単位のコミット)
+
+実装方針 (PR #998 で確立):
+
+1. **Infrastructure 先行**: frontend の取り込み (2-4) と版を上げる作業 (2-5)、hardcode 修正
+2. **Wave 1 (close 候補)**: comment + regression test で意思表明
+3. **Wave 2 (S 難易度)**: 1 commit / 1 sub-issue (or 関連を bundle) で順次
+4. **Wave 3 (M 難易度)**: commit 1 件ずつで review しやすく
+5. **Wave 4 (L 難易度)**: 削除 endpoint など、版を上げる作業と切り離せないもの
+6. **Final audit**: 残り upstream commits も triage 突き合わせて drift を確認、結果を triage doc 末尾に追記
+7. **Follow-up**: review で挙がった improvement を nit commit で取り込む
+
+コミットメッセージは CLAUDE.md Section 7 の `<種類> <対象>: <要約> (#issue番号)` の形にする (例: 2026.10.0 の追従 #3285 の `Fix sw: 購読の解除で本家 2026.10.0 と同じパラメータを受け付ける (#3285)`)。sub-issue を閉じるコミットには `Closes #<sub-issue>` を入れる。
+
+### 2-7. 試算: 過去の追従を `make upstream-sync` で分類する
+
+`tools/upstreamsync` を作ったとき (#3379 の段階 P4d-3)、過去 3 回の追従を DRY=1 で分類し、3 回とも分類できないパスが無いことを確かめた。「取り込む」パスの件数は、設計 D4 の試算 (#3370) と同じ。
+
+| 追従 | 「取り込む」パス |
 |---|---|
-| misskey-ts の PR base を **mk が指している `mk-2026.x.x`** に合わせる | マージ後に submodule を fast-forward で載せられる |
-| mk 側の bump 前に祖先関係を確認する | 誤った SHA だと fork 独自コミットが巻き戻る |
-| **閉じた PR の head SHA** を gitlink に使わない | 別系列・古い base のコミットを指しやすい |
+| 2026.7.0 → 2026.9.0 | 105 ファイル |
+| 2026.9.0 → 2026.9.1 | 19 ファイル |
+| 2026.9.1 → 2026.10.0 | 16 ファイル |
 
-bump 前の確認（`third_party/misskey` 内で実行）:
+### 本家の版を上げた後に必須: shape drift snapshot の再生成
 
-```bash
-OLD=<現在の mk develop が指す submodule SHA>
-NEW=<misskey-ts PR マージ後に載せたい SHA>
-
-git merge-base --is-ancestor "$OLD" "$NEW" && echo "fast-forward 可"
-git rev-list --count "$NEW..$OLD"    # 失われる mk 独自コミット数。0 であること
-git diff --diff-filter=D --name-only "$OLD" "$NEW" | wc -l   # 削除ファイル。0 であること
-```
-
-**CI は祖先関係の巻き戻りを検出しない。** `build` job は gitlink の SHA が fork に **push 済みか**は見るが、fast-forward 可能か（祖先関係）は見ない。`build` / `test` / `lint` の required check は submodule を checkout しない。`frontend-check` は型・eslint・vitest を見るが、**ファイルが消えても型が通る**場合がある。pointer の妥当性は上のコマンドで人手確認する。
-
-### submodule bump 後に必須: shape drift snapshot の再生成
-
-`third_party/misskey` を bump したら、entity shape drift gate の golden snapshot を
-再生成して commit すること。新バージョンで追加 / 変更された契約フィールドが次回の
+`UPSTREAM_MISSKEY_VERSION` を新しい版に書き換えて `make upstream-fetch` で本家を取得したら、
+entity shape drift gate の golden snapshot を再生成して commit すること (#3378 から、
+golden は `.cache/misskey/<版>/` の本家から作る)。新バージョンで追加 / 変更された契約フィールドが次回の
 `TestEntityShapeDrift` に反映される。
 
 ```bash
@@ -256,66 +221,67 @@ git add internal/entitycompat/testdata/
 
 詳細は [shape-drift.md](./shape-drift.md)。
 
-### submodule bump 後に必須: TypeORM migrations seed の追加
+### 本家の版を上げた後に必須: TypeORM migrations seed の追加
 
 upstream に新しい migration が入った場合、`migrations` テーブルへの seed も追加する。
-これが漏れると、mk-go で動かした DB に本家を繋ぎ直したときに TypeORM が当該
+これが漏れると、Elythia で動かした DB に本家を繋ぎ直したときに TypeORM が当該
 migration を未実行と判定して**再実行**し、適用済み DDL への `ADD COLUMN` 重複や
 `DROP COLUMN` によるデータ喪失につながりうる (#2244)。
 
+復路は保証しない (#3191) が、この seed は `mkgo-born` で戻れる範囲を測る前提なので引き続き足す。
 `TestMigrationSeed_CoversUpstream` が漏れを検出するので、落ちたら
 `migration/000067_migrations_typeorm_names.up.sql` と同じ形式で seed を足す。
 
-**seed する前に、その migration の DDL が mk-go 側にも入っているか必ず確認すること。**
+**seed する前に、その migration の DDL が Elythia 側にも入っているか必ず確認すること。**
 入っていないまま seed すると、本家が「適用済み」と誤認して skip し、schema が
-ずれたまま放置される。DDL が未実装なら先に mk-go 側の migration を書く。
+ずれたまま放置される。DDL が未実装なら先に Elythia 側の migration を書く。
 
-### submodule bump 後に必須: index golden の再生成
+### 本家の版を上げた後に必須: index golden の再生成
 
 upstream が index を足した場合、`golden_upstream_indexes.json` も撮り直す。これは
 TypeORM の decorator から正規形を再現できないため **実 DB から採る** 必要がある
 (手順は [shape-drift.md](./shape-drift.md#golden-の再生成))。
 
-撮り直したら `TestIndexNaming_NoNewUpstreamDuplicates` を走らせる。mk-go 側に
+撮り直したら `TestIndexNaming_NoNewUpstreamDuplicates` を走らせる。Elythia 側に
 同内容・別名の index があれば検出されるので、upstream 名に揃えるか
 `known_duplicate_indexes.json` に追加して `000068` の扱いを見直す (#2246)。
 
-### submodule bump 後に必須: MFM の絵文字の正規表現
+### 本家の版を上げた後に必須: MFM の絵文字の正規表現
 
-mk-go の MFM パーサは、mfm-js が依存する `@misskey-dev/emoji-data` の `emojiRegex` を Go の正規表現へ移したもの (`internal/activitypub/mfm/emoji_regex_gen.go`) で Unicode 絵文字を読む (#3324)。frontend の mfm-js の版か、それが依存する emoji-data の版が変わると、`make frontend-check` の `emoji-regex-check` が落ちる (正規表現が同じでも、snapshot に記録した版と食い違うため)。mfm-js の `unicodeEmoji` の書き方が変わったときも、生成ツールが前提の形を見つけられずに落ちる (下記)。
+Elythia の MFM パーサは、mfm-js が依存する `@misskey-dev/emoji-data` の `emojiRegex` を Go の正規表現へ移したもの (`internal/activitypub/mfm/emoji_regex_gen.go`) で Unicode 絵文字を読む (#3324)。frontend の mfm-js の版か、それが依存する emoji-data の版が変わると、`emoji-regex-check` (CI では `frontend` workflow の `frontend-lint`、手元では `make frontend-check` から呼ばれる) が落ちる (正規表現が同じでも、snapshot に記録した版と食い違うため)。mfm-js の `unicodeEmoji` の書き方が変わったときも、生成ツールが前提の形を見つけられずに落ちる (下記)。
 
 ```bash
 make emoji-regex     # 生成物と tools/emojiregex/testdata/source.txt を作り直す
-node internal/activitypub/mfm/testdata/emoji_mfmjs.mjs third_party/misskey \
+node internal/activitypub/mfm/testdata/emoji_mfmjs.mjs frontend \
   > internal/activitypub/mfm/testdata/emoji_mfmjs.json   # mfm-js の期待値を作り直す
 GOWORK=off go test ./internal/activitypub/mfm/ ./tools/emojiregex/
 ```
 
 生成ツールは、mfm-js の `unicodeEmoji` の書き方 (`regexp(RegExp(emojiRegex.source))` と、U+FE0F だけのときに文字を返す `map`) と、正規表現が使う構文 (`?` だけの量指定・サロゲートペア・決まった位置の否定の先読み) を前提にしている。前提が崩れると生成の時点で落ちるので、その場合は生成ツールを直す。
 
-### submodule bump 後に必須: divergence doc の件数
+### 本家の版を上げた後に必須: divergence doc の件数
 
-`golden_upstream_columns.json` を撮り直すと `TestDivergenceDoc_ColumnCountMatchesSchema` が動く。**upstream が列を DROP すると、その列は「mk-go 独自カラム」に転じる**ので `docs/divergence.md` §2-2 の件数が増える (`note_favorite.createdAt` がその経緯で独自列になっている)。
+`golden_upstream_columns.json` を撮り直すと `TestDivergenceDoc_ColumnCountMatchesSchema` が動く。**upstream が列を DROP すると、その列は「Elythia 独自カラム」に転じる**ので `docs/divergence.md` §2-2 の件数が増える (`note_favorite.createdAt` がその経緯で独自列になっている)。
 
 落ちたら doc の件数・内訳・冒頭サマリ・表の行をまとめて直す。gate は 4 箇所すべてを見るので、どれか 1 つを直し忘れると通らない (#2634)。
 
-### submodule bump 後に必須: promo の表示経路が upstream に入っていないか見る
+### 本家の版を上げた後に必須: promo の表示経路が upstream に入っていないか見る
 
-**promo (`admin/promo/create` / `promo/read`)** は upstream にも mk-go にも
+**promo (`admin/promo/create` / `promo/read`)** は upstream にも Elythia にも
 **表示経路が無い** — 作成と既読化はできて DB 行も増えるが、`promo_note` を読んで
-利用者へ提示するものがどこにも無い (#2781)。mk-go はこの状態を忠実に再現している。
+利用者へ提示するものがどこにも無い (#2781)。Elythia はこの状態を忠実に再現している。
 
 **upstream は一度実装して外している。** 2020-02 に
 `server/api/common/inject-promo.ts` で timeline へ直挿しする実装が入ったが
 (`a54de07260`)、2021-03 に「クライアントサイドで実装したいため」無効化され
 (`73df95c42d`)、2022-09 にファイルごと削除された (`786f1d8be8`)。frontend の
 menu も 2024-09 の #14554 で消えている。**再実装される見込みは低いが、endpoint は
-残っているので bump ごとに一応見る。**
+残っているので版を上げるごとに一応見る。**
 
-bump 後に確認する:
+版を上げた後に確認する:
 
 ```bash
-grep -rlni "promonote\|promoread" third_party/misskey/packages/backend/src/
+grep -rlni "promonote\|promoread" .cache/misskey/<版>/packages/backend/src/
 ```
 
 期待は **8 件** (case-insensitive にしてあるのは型名 `MiPromoNote` や
@@ -333,73 +299,53 @@ server/api/endpoints/admin/promo/create.ts     ← 表示経路はここに無�
 `docs/divergence.md` §7 の promo 行を更新する。増えていれば表示経路が入った可能性、
 減っていれば endpoint が削除された可能性。
 
-**0 件や `No such file or directory` が出たら、まず submodule の checkout を疑う**
-(`git submodule update --init`)。checkout 済みで 0 件なら、upstream 側でパス構成が
-変わっている。
+**0 件や `No such file or directory` が出たら、まず本家の取得を疑う**
+(`make upstream-fetch`)。取得済みで 0 件なら、upstream 側でパス構成が変わっている。
 
-**CI の Go テストでは検出できない。** submodule を checkout する job は 8 つある
-(`ci.yml` の `frontend-check`、diff-e2e の `diff`、docker の `build-and-push`、
-dropin-e2e の `dropin`、dropin-frontend-e2e の `frontend-e2e`、playwright の `spec`、
-queue-bench-smoke の `smoke`、upstream-backend-e2e の `e2e`) が、**いずれも Go
-テストを実行する step を持たない**。Go テストが走る `test-shards` / `plugin-tests`
-の checkout に `submodules` 指定は無いので、submodule を読むテストは CI では常に
-skip され gate にならない。ローカルの tripwire として書くなら
-`internal/misc/achievement/types_test.go` の `TestTypes_MatchUpstream` が同型
-(submodule を読み、不在なら `t.Skipf`)。
+**CI の Go テストでは検出できない。** Go テストが走る `test-shards` / `plugin-tests`
+は本家を取得しないので、本家を読むテストはそこでは skip される。本家を取得して
+skip を禁じて回すのは `apicompat` workflow の `make upstream-check` だけ (#3378) で、
+そこに足すなら `internal/misc/achievement/types_test.go` の `TestTypes_MatchUpstream`
+が同型 (`internal/upstreamsrc` で本家を探し、不在なら skip、`MK_UPSTREAM_REQUIRE`
+が立っていれば落ちる)。
 
-### submodule bump 後に必須: 比較対象の TS image を全部揃える
+### 本家の版を上げた後に必須: 比較対象の TS image を全部揃える
 
-mk-go と Misskey TS を並べて比較するハーネスは、**比較対象の image tag を
+Elythia と Misskey TS を並べて比較するハーネスは、**比較対象の image tag を
 `MisskeyVersion` と同じ版に上げる**こと。ここがずれていると upstream 自身の
-バージョン間差分が差分として出てしまい、mk-go 固有の乖離と区別できない。
+バージョン間差分が差分として出てしまい、Elythia 固有の乖離と区別できない。
 
 | ファイル | 対象 |
 |---|---|
-| `docker-compose.diff.yml` | 差分比較ハーネス ([diff-e2e.md](./diff-e2e.md)) |
-| `docker-compose.playwright.ts.yml` | Playwright の TS baseline |
+| `tests/diff/compose.yml` | 差分比較ハーネス ([diff-e2e.md](./diff-e2e.md)) |
+| `tests/playwright/compose.ts.yml` | Playwright の TS baseline |
 | `.github/workflows/playwright.yml` | 上記の pre-pull (tag が sync していないと pull が無駄になる) |
 | `.github/workflows/diff-e2e.yml` | diff ハーネスの pre-pull。**compose 側だけ上げて忘れやすい** (#2877 で実際に残した) |
-| `docker-compose.dropin.yml` / `docker-compose.dropin-frontend.yml` / `docker-compose.federation.misskey.yml` | drop-in / 実連合の TS インスタンス |
+| `tests/dropin/compose.yml` / `tests/dropin-frontend/compose.yml` / `tests/federation/compose.misskey.yml` | drop-in / 実連合の TS インスタンス |
 | `.github/workflows/dropin-e2e.yml` / `dropin-frontend-e2e.yml` | 上記の pre-pull と matrix |
 | `tests/bench/` / `tests/queue-bench/` の compose | 性能比較の対象 |
-| `Dockerfile.bundled` の `MISSKEY_ASSETS_IMAGE` | **配る image に焼く frontend**。これだけは TS image ではなく fork の assets image (`ghcr.io/misaki-project/misskey-ts-assets:<tag>-mk.N`) で、**submodule のタグと 1:1 で対応させる**。ずれると 2026.9.0 の backend に古い frontend を載せた image を配ることになる。`make submodulepin-check` が `docs/divergence.md` の pin 行と突き合わせる (#3011) |
+| 1.5.0以前の`MISSKEY_ASSETS_IMAGE` | 履歴上の外部assets image。2.0.0では本体の`frontend/`をビルドするため使用しない。過去のtagとdigestは変更しない。 |
 
-**`Dockerfile.bundled` は表に無かったせいで実際に 23 世代遅れた** (#2877 の時点で
-`2026.7.0-mk.10`。数え方は fork の `*-mk.*` タグを `2026.7.0-mk.10` より後で数えた値で、
-`mk.11`〜`mk.22` の 12 個に加えて `mk.22a`〜`mk.22j` の 10 個と `2026.9.0-mk.0` を含む)。
 **古い tag でも image は問題なくビルドできる**ので、腐っても CI は落ちない —
 落ちるのは配った先だけ。`tests/bench/` も同じ性質で、こちらはどの workflow からも
 参照されていない (`tests/queue-bench/` は nightly の `queue-bench-smoke.yml` が引く)。
-assets image は fork 側の `Publish frontend assets image` workflow が `*-mk.*` タグで
-発火して publish するので、**submodule のタグを push した後**に上げること
-(`gh run list --repo Misaki-Project/misskey-ts` で success を確認できる)。
+1.5.0以前は外部assets imageの公開確認も必要だったが、2.0.0では本体とプラグインのfrontendを同じimageでビルドする。旧assets workflowを2.0.0更新のために再実行しない。
 
 **表に載せただけでは止まらなかった。** #2877 で表へ載せた後も `Dockerfile.bundled` の
 pin は `2026.9.0-mk.0` に置き去りのままで、**リリースした `1.3.0-bundled` は既に 2 世代**
-(submodule は `2026.9.0-mk.2`)、develop では 29 世代ずれていた (pin されていた `mk.0` から数えた間隔。数字付きの tag 30 個から 1 を引いた値で、英字付きを含めると 62 個から 1 を引いて 61)。現在は
-`make submodulepin-check` が pin 行の tag と突き合わせるので、片側だけ上げると
-`make gates` が落ちる (#3011)。**publish 済みかどうかまでは見ない** —
-ネットワークが要るので `make gates` では取れない。tag を上げたら上の `gh run list` で
-assets image の workflow が success していることを必ず確認し、**失敗していたら fork 側で
-回し直す** (`gh workflow run assets-image.yml --repo Misaki-Project/misskey-ts -f tag=<tag>`。
-`tag` は `required: true` の input で、workflow 自身がその tag を checkout するので `--ref` では代用できない)。
-publish されていない tag を pin すると `docker.yml` の `build-and-push-bundled` が `FROM` の
-pull で落ちる。実測で `2026.7.0-mk.18` は**タグはあるのに image が無い**状態で残っている
-(`2026.7.0-mk.4` 以前は workflow 導入前なので期待どおり)。
+(submodule は `2026.9.0-mk.2`)、当時のdevelopでは29世代ずれていた。この経緯は履歴として残す。2.0.0にはsubmoduleも外部assetsのpinも無く、同じ問題を防ぐため本体と4プラグインの同梱ビルドをPRのCIで確認する。Misakiでは過去のassets workflowに暗黙の`latest`更新があったため、修正前の過去タグのworkflowは再実行しない。
 
 **探し方は `grep -rn 'misskey/misskey:' --include='*.yml' --include='*.yaml' --include='*.md' . | grep -v third_party`。**
 表を手で追うより確実で、doc の散文に埋まった版数 (`docs/dropin-e2e.md` のトラブルシュート等) も拾える。
-**ただし `Dockerfile.bundled` だけは拾えない** — image 名が `misskey-ts-assets` で、
-`--include` にも Dockerfile が無い。そちらは `make submodulepin-check` が見る。
 
 **除外リストの「version-gap」注記は、版を揃えたら必ず読み直す。** 実例として、
 diff harness の `META_IGNORE` には `app192IconUrl` / `app512IconUrl` /
 `singleUserMode` が「mk-go 2026.6.0 が持ち TS 2026.5.4 に無い」として除外されて
 いたが、TS を 2026.7.0 に揃えたら 3 件とも残った。実際は upstream では
-`admin/meta` にしか無く公開 `/api/meta` には元から含まれない = **mk-go の余剰
+`admin/meta` にしか無く公開 `/api/meta` には元から含まれない = **Elythia の余剰
 フィールド**で、版ずれが誤診断を固定していた (#2303)。
 
-### submodule bump 後に必須: TS baseline で Playwright を回す
+### 本家の版を上げた後に必須: TS baseline で Playwright を回す
 
 ```bash
 gh workflow run playwright.yml --ref <branch> -f ref=<branch>   # TS backend も含めて実行される
@@ -412,26 +358,26 @@ make playwright-ts-up && make playwright-ts-test && make playwright-ts-down
 **develop のコードを検証する** (2026.9.1 の追従で 2 回踏んだ。落ちた行番号が修正前のものだった)。
 `diff-e2e.yml` / `dropin-e2e.yml` / `upstream-backend-e2e.yml` も同じ形。
 
-Playwright spec は普段 mk-go backend に対してしか走っていない (PR トリガーでも
-mk-go のみ)。**TS backend に対して回すのは upstream 追従のタイミングだけ**という
+Playwright spec は普段 Elythia backend に対してしか走っていない (PR トリガーでも
+Elythia のみ)。**TS backend に対して回すのは upstream 追従のタイミングだけ**という
 運用にしている。
 
-理由は、spec が「mk-go の挙動を正解として」書かれてしまう事故を、追従の節目で
+理由は、spec が「Elythia の挙動を正解として」書かれてしまう事故を、追従の節目で
 検出するため。実際 #2276 で 3 ヶ月ぶりに TS backend で回したところ、spec が
-mk-go 側の挙動に引きずられていた箇所が 19 件見つかり、そのうち 5 件は mk-go の
+Elythia 側の挙動に引きずられていた箇所が 19 件見つかり、そのうち 5 件は Elythia の
 実バグだった (#2283 renoteCount の加算条件 / #2284 必須パラメータの未検証 /
 #2285 `user.updatedAt` のセマンティクス / #2286 ユーザー検索の実装乖離 /
 #2287 余剰フィールド)。
 
 一方で常時 (nightly や PR で) 回す価値は薄い。同一 CI 環境・同一 spec で
-所要時間を比較すると mk-go と TS に実用上の差は無く (TS/mk-go の中央値 0.94)、
+所要時間を比較すると Elythia と TS に実用上の差は無く (TS/Elythia の中央値 0.94)、
 得られるのは所要時間ではなく **spec の前提が upstream とずれていないか**という
 一点だけだから。upstream が変わらない限りその答えも変わらない。
 
 失敗した spec を見るときは以下に注意する。
 
-- mk-go には `docs/divergence.md` に記録した**意図的な差分**がある
-  (例: `NO_SUCH_*` を upstream は 400、mk-go は意味的に正確な 404 で返す)。
+- Elythia には `docs/divergence.md` に記録した**意図的な差分**がある
+  (例: `NO_SUCH_*` を upstream は 400、Elythia は意味的に正確な 404 で返す)。
   spec 側は `tests/playwright/fixtures/backend.ts` の `NOT_FOUND_STATUS` の
   ように backend ごとの期待値で吸収する。ただし**この逃げ道を足すたびに、その
   spec は parity を証明しなくなる**ので、安易に増やさない
@@ -440,9 +386,9 @@ mk-go 側の挙動に引きずられていた箇所が 19 件見つかり、そ�
   更新するのは note 投稿時だけなので、signup 直後の user は一覧に出ない)。
   この種は spec の前提条件を直す
 
-### mk-go 側の migration を書くときの必須ルール
+### Elythia 側の migration を書くときの必須ルール
 
-mk-go の migration は Misskey TS が作った既存 DB にも流れる。以下は
+Elythia の migration は Misskey TS が作った既存 DB にも流れる。以下は
 `TestMigrationIdempotency_RequiresIfExists` が強制する。
 
 - `CREATE TABLE` / `ADD COLUMN` / `CREATE INDEX` は必ず `IF NOT EXISTS`
@@ -458,4 +404,4 @@ mk-go の migration は Misskey TS が作った既存 DB にも流れる。以�
 - upstream release 差分まとめ: `docs/update/<yyyymm><nn>diff.md` (`nn` は**対象 release の patch 番号**。2026.5.4 なら `20260504`。backend に変更が無い release は doc を作らないので番号は飛ぶ)。triage note は `<yyyymmdd>-<issue>-triage.md`
 - PR #998: 2026.3.2 → 2026.5.1 一括取り込みの reference 実装 (= Infrastructure + Wave 1-4 + follow-up audit + #17034)
 - [api-compatibility.md](./api-compatibility.md): 互換性追跡
-- [migration-from-ts.md](./migration-from-ts.md): TS → mk-go drop-in 切替
+- [migration-from-ts.md](./migration-from-ts.md): TS → Elythia drop-in 切替

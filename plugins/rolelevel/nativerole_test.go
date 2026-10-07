@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/shiroha-a/mk/plugin"
+	"github.com/elythia-network/elythia/plugin"
 )
 
 // scriptedCaller answers each endpoint with a pre-baked raw body.

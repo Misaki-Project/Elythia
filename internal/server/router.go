@@ -12,141 +12,142 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/activitypub"
+	"github.com/elythia-network/elythia/internal/activitypub/ld"
+	apiadmin "github.com/elythia-network/elythia/internal/api/admin"
+	apiannouncements "github.com/elythia-network/elythia/internal/api/announcements"
+	"github.com/elythia-network/elythia/internal/api/antennas"
+	"github.com/elythia-network/elythia/internal/api/ap"
+	apiapp "github.com/elythia-network/elythia/internal/api/app"
+	apiauth "github.com/elythia-network/elythia/internal/api/auth"
+	"github.com/elythia-network/elythia/internal/api/avatardecorations"
+	"github.com/elythia-network/elythia/internal/api/blocking"
+	apibubblegame "github.com/elythia-network/elythia/internal/api/bubblegame"
+	apichannels "github.com/elythia-network/elythia/internal/api/channels"
+	apicharts "github.com/elythia-network/elythia/internal/api/charts"
+	apichat "github.com/elythia-network/elythia/internal/api/chat"
+	"github.com/elythia-network/elythia/internal/api/clips"
+	"github.com/elythia-network/elythia/internal/api/drive"
+	apiemojiapplications "github.com/elythia-network/elythia/internal/api/emojiapplications"
+	apiemojis "github.com/elythia-network/elythia/internal/api/emojis"
+	"github.com/elythia-network/elythia/internal/api/endpoints"
+	apifederation "github.com/elythia-network/elythia/internal/api/federation"
+	apifetchexternal "github.com/elythia-network/elythia/internal/api/fetchexternal"
+	apifetchrss "github.com/elythia-network/elythia/internal/api/fetchrss"
+	apiflash "github.com/elythia-network/elythia/internal/api/flash"
+	"github.com/elythia-network/elythia/internal/api/following"
+	apigallery "github.com/elythia-network/elythia/internal/api/gallery"
+	apihashtags "github.com/elythia-network/elythia/internal/api/hashtags"
+	"github.com/elythia-network/elythia/internal/api/i"
+	"github.com/elythia-network/elythia/internal/api/inbox"
+	apiinvite "github.com/elythia-network/elythia/internal/api/invite"
+	"github.com/elythia-network/elythia/internal/api/meself"
+	"github.com/elythia-network/elythia/internal/api/meta"
+	"github.com/elythia-network/elythia/internal/api/mute"
+	"github.com/elythia-network/elythia/internal/api/nodeinfo"
+	"github.com/elythia-network/elythia/internal/api/notehide"
+	"github.com/elythia-network/elythia/internal/api/notes"
+	"github.com/elythia-network/elythia/internal/api/notifications"
+	"github.com/elythia-network/elythia/internal/api/oauth"
+	"github.com/elythia-network/elythia/internal/api/pages"
+	"github.com/elythia-network/elythia/internal/api/promo"
+	apiproxy "github.com/elythia-network/elythia/internal/api/proxy"
+	"github.com/elythia-network/elythia/internal/api/renotemute"
+	apiresetpassword "github.com/elythia-network/elythia/internal/api/resetpassword"
+	apireversi "github.com/elythia-network/elythia/internal/api/reversi"
+	apiroles "github.com/elythia-network/elythia/internal/api/roles"
+	apisignin "github.com/elythia-network/elythia/internal/api/signin"
+	apisignup "github.com/elythia-network/elythia/internal/api/signup"
+	"github.com/elythia-network/elythia/internal/api/stats"
+	"github.com/elythia-network/elythia/internal/api/streaming"
+	apisw "github.com/elythia-network/elythia/internal/api/sw"
+	apitest "github.com/elythia-network/elythia/internal/api/test"
+	apiurl "github.com/elythia-network/elythia/internal/api/url"
+	apiuserlists "github.com/elythia-network/elythia/internal/api/userlists"
+	"github.com/elythia-network/elythia/internal/api/userrelation"
+	"github.com/elythia-network/elythia/internal/api/users"
+	apiwebhooks "github.com/elythia-network/elythia/internal/api/webhooks"
+	"github.com/elythia-network/elythia/internal/api/wellknown"
+	"github.com/elythia-network/elythia/internal/config"
+	coreabuse "github.com/elythia-network/elythia/internal/core/abuse"
+	coreachievement "github.com/elythia-network/elythia/internal/core/achievement"
+	coreannouncement "github.com/elythia-network/elythia/internal/core/announcement"
+	coreantenna "github.com/elythia-network/elythia/internal/core/antenna"
+	"github.com/elythia-network/elythia/internal/core/avatardecoration"
+	coreblocking "github.com/elythia-network/elythia/internal/core/blocking"
+	corebubbleversus "github.com/elythia-network/elythia/internal/core/bubbleversus"
+	corecaptcha "github.com/elythia-network/elythia/internal/core/captcha"
+	corechannel "github.com/elythia-network/elythia/internal/core/channel"
+	"github.com/elythia-network/elythia/internal/core/chart"
+	"github.com/elythia-network/elythia/internal/core/chart/charthook"
+	corechat "github.com/elythia-network/elythia/internal/core/chat"
+	coreclip "github.com/elythia-network/elythia/internal/core/clip"
+	"github.com/elythia-network/elythia/internal/core/dbhealth"
+	"github.com/elythia-network/elythia/internal/core/deliveryhealth"
+	coredrive "github.com/elythia-network/elythia/internal/core/drive"
+	"github.com/elythia-network/elythia/internal/core/driveusage"
+	"github.com/elythia-network/elythia/internal/core/emojiapplication"
+	coreemojiimport "github.com/elythia-network/elythia/internal/core/emojiimport"
+	"github.com/elythia-network/elythia/internal/core/emojimeta"
+	coreephemeral "github.com/elythia-network/elythia/internal/core/ephemeral"
+	"github.com/elythia-network/elythia/internal/core/event"
+	corefeatured "github.com/elythia-network/elythia/internal/core/featured"
+	corefederation "github.com/elythia-network/elythia/internal/core/federation"
+	"github.com/elythia-network/elythia/internal/core/fedrule"
+	coreflash "github.com/elythia-network/elythia/internal/core/flash"
+	corefollowing "github.com/elythia-network/elythia/internal/core/following"
+	"github.com/elythia-network/elythia/internal/core/gonecleanup"
+	corehashtag "github.com/elythia-network/elythia/internal/core/hashtag"
+	coreinstance "github.com/elythia-network/elythia/internal/core/instance"
+	"github.com/elythia-network/elythia/internal/core/iplog"
+	"github.com/elythia-network/elythia/internal/core/iplookuplog"
+	coremediaproxy "github.com/elythia-network/elythia/internal/core/mediaproxy"
+	coremodlog "github.com/elythia-network/elythia/internal/core/moderationlog"
+	coremoderatoractivity "github.com/elythia-network/elythia/internal/core/moderatoractivity"
+	coremove "github.com/elythia-network/elythia/internal/core/move"
+	coremuting "github.com/elythia-network/elythia/internal/core/muting"
+	corenote "github.com/elythia-network/elythia/internal/core/note"
+	corenotification "github.com/elythia-network/elythia/internal/core/notification"
+	corepage "github.com/elythia-network/elythia/internal/core/page"
+	"github.com/elythia-network/elythia/internal/core/passwordguard"
+	corepoll "github.com/elythia-network/elythia/internal/core/poll"
+	"github.com/elythia-network/elythia/internal/core/procstats"
+	corereaction "github.com/elythia-network/elythia/internal/core/reaction"
+	corerelay "github.com/elythia-network/elythia/internal/core/relay"
+	coreretention "github.com/elythia-network/elythia/internal/core/retention"
+	corereversi "github.com/elythia-network/elythia/internal/core/reversi"
+	corerole "github.com/elythia-network/elythia/internal/core/role"
+	coresearch "github.com/elythia-network/elythia/internal/core/search"
+	"github.com/elythia-network/elythia/internal/core/selfcheck"
+	coresignup "github.com/elythia-network/elythia/internal/core/signup"
+	"github.com/elythia-network/elythia/internal/core/signupapplication"
+	"github.com/elythia-network/elythia/internal/core/signupform"
+	coresystemaccount "github.com/elythia-network/elythia/internal/core/systemaccount"
+	coretimeline "github.com/elythia-network/elythia/internal/core/timeline"
+	coretransfer "github.com/elythia-network/elythia/internal/core/transfer"
+	coretranslate "github.com/elythia-network/elythia/internal/core/translate"
+	coretwofactor "github.com/elythia-network/elythia/internal/core/twofactor"
+	coreurlpreview "github.com/elythia-network/elythia/internal/core/urlpreview"
+	coreuser "github.com/elythia-network/elythia/internal/core/user"
+	coreuserlist "github.com/elythia-network/elythia/internal/core/userlist"
+	"github.com/elythia-network/elythia/internal/core/userpack"
+	corewebhook "github.com/elythia-network/elythia/internal/core/webhook"
+	corewebpush "github.com/elythia-network/elythia/internal/core/webpush"
+	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/frontendutil"
+	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/idnhost"
+	miscsmtp "github.com/elythia-network/elythia/internal/misc/smtp"
+	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/queue/processors"
+	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/server/middleware"
+	"github.com/elythia-network/elythia/internal/stream"
+	"github.com/elythia-network/elythia/internal/stream/channels"
+	"github.com/elythia-network/elythia/plugin"
 	"github.com/labstack/echo/v4"
 	echomw "github.com/labstack/echo/v4/middleware"
-	"github.com/shiroha-a/mk/internal/activitypub"
-	"github.com/shiroha-a/mk/internal/activitypub/ld"
-	apiadmin "github.com/shiroha-a/mk/internal/api/admin"
-	apiannouncements "github.com/shiroha-a/mk/internal/api/announcements"
-	"github.com/shiroha-a/mk/internal/api/antennas"
-	"github.com/shiroha-a/mk/internal/api/ap"
-	apiapp "github.com/shiroha-a/mk/internal/api/app"
-	apiauth "github.com/shiroha-a/mk/internal/api/auth"
-	"github.com/shiroha-a/mk/internal/api/avatardecorations"
-	"github.com/shiroha-a/mk/internal/api/blocking"
-	apibubblegame "github.com/shiroha-a/mk/internal/api/bubblegame"
-	apichannels "github.com/shiroha-a/mk/internal/api/channels"
-	apicharts "github.com/shiroha-a/mk/internal/api/charts"
-	apichat "github.com/shiroha-a/mk/internal/api/chat"
-	"github.com/shiroha-a/mk/internal/api/clips"
-	"github.com/shiroha-a/mk/internal/api/drive"
-	apiemojiapplications "github.com/shiroha-a/mk/internal/api/emojiapplications"
-	apiemojis "github.com/shiroha-a/mk/internal/api/emojis"
-	"github.com/shiroha-a/mk/internal/api/endpoints"
-	apifederation "github.com/shiroha-a/mk/internal/api/federation"
-	apifetchexternal "github.com/shiroha-a/mk/internal/api/fetchexternal"
-	apifetchrss "github.com/shiroha-a/mk/internal/api/fetchrss"
-	apiflash "github.com/shiroha-a/mk/internal/api/flash"
-	"github.com/shiroha-a/mk/internal/api/following"
-	apigallery "github.com/shiroha-a/mk/internal/api/gallery"
-	apihashtags "github.com/shiroha-a/mk/internal/api/hashtags"
-	"github.com/shiroha-a/mk/internal/api/i"
-	"github.com/shiroha-a/mk/internal/api/inbox"
-	apiinvite "github.com/shiroha-a/mk/internal/api/invite"
-	"github.com/shiroha-a/mk/internal/api/meself"
-	"github.com/shiroha-a/mk/internal/api/meta"
-	"github.com/shiroha-a/mk/internal/api/mute"
-	"github.com/shiroha-a/mk/internal/api/nodeinfo"
-	"github.com/shiroha-a/mk/internal/api/notehide"
-	"github.com/shiroha-a/mk/internal/api/notes"
-	"github.com/shiroha-a/mk/internal/api/notifications"
-	"github.com/shiroha-a/mk/internal/api/oauth"
-	"github.com/shiroha-a/mk/internal/api/pages"
-	"github.com/shiroha-a/mk/internal/api/promo"
-	apiproxy "github.com/shiroha-a/mk/internal/api/proxy"
-	"github.com/shiroha-a/mk/internal/api/renotemute"
-	apiresetpassword "github.com/shiroha-a/mk/internal/api/resetpassword"
-	apireversi "github.com/shiroha-a/mk/internal/api/reversi"
-	apiroles "github.com/shiroha-a/mk/internal/api/roles"
-	apisignin "github.com/shiroha-a/mk/internal/api/signin"
-	apisignup "github.com/shiroha-a/mk/internal/api/signup"
-	"github.com/shiroha-a/mk/internal/api/stats"
-	"github.com/shiroha-a/mk/internal/api/streaming"
-	apisw "github.com/shiroha-a/mk/internal/api/sw"
-	apitest "github.com/shiroha-a/mk/internal/api/test"
-	apiurl "github.com/shiroha-a/mk/internal/api/url"
-	apiuserlists "github.com/shiroha-a/mk/internal/api/userlists"
-	"github.com/shiroha-a/mk/internal/api/userrelation"
-	"github.com/shiroha-a/mk/internal/api/users"
-	apiwebhooks "github.com/shiroha-a/mk/internal/api/webhooks"
-	"github.com/shiroha-a/mk/internal/api/wellknown"
-	coreabuse "github.com/shiroha-a/mk/internal/core/abuse"
-	coreachievement "github.com/shiroha-a/mk/internal/core/achievement"
-	coreannouncement "github.com/shiroha-a/mk/internal/core/announcement"
-	coreantenna "github.com/shiroha-a/mk/internal/core/antenna"
-	"github.com/shiroha-a/mk/internal/core/avatardecoration"
-	coreblocking "github.com/shiroha-a/mk/internal/core/blocking"
-	corebubbleversus "github.com/shiroha-a/mk/internal/core/bubbleversus"
-	corecaptcha "github.com/shiroha-a/mk/internal/core/captcha"
-	corechannel "github.com/shiroha-a/mk/internal/core/channel"
-	"github.com/shiroha-a/mk/internal/core/chart"
-	"github.com/shiroha-a/mk/internal/core/chart/charthook"
-	corechat "github.com/shiroha-a/mk/internal/core/chat"
-	coreclip "github.com/shiroha-a/mk/internal/core/clip"
-	"github.com/shiroha-a/mk/internal/core/dbhealth"
-	"github.com/shiroha-a/mk/internal/core/deliveryhealth"
-	coredrive "github.com/shiroha-a/mk/internal/core/drive"
-	"github.com/shiroha-a/mk/internal/core/driveusage"
-	"github.com/shiroha-a/mk/internal/core/emojiapplication"
-	coreemojiimport "github.com/shiroha-a/mk/internal/core/emojiimport"
-	"github.com/shiroha-a/mk/internal/core/emojimeta"
-	coreephemeral "github.com/shiroha-a/mk/internal/core/ephemeral"
-	"github.com/shiroha-a/mk/internal/core/event"
-	corefeatured "github.com/shiroha-a/mk/internal/core/featured"
-	corefederation "github.com/shiroha-a/mk/internal/core/federation"
-	"github.com/shiroha-a/mk/internal/core/fedrule"
-	coreflash "github.com/shiroha-a/mk/internal/core/flash"
-	corefollowing "github.com/shiroha-a/mk/internal/core/following"
-	"github.com/shiroha-a/mk/internal/core/gonecleanup"
-	corehashtag "github.com/shiroha-a/mk/internal/core/hashtag"
-	coreinstance "github.com/shiroha-a/mk/internal/core/instance"
-	"github.com/shiroha-a/mk/internal/core/iplog"
-	"github.com/shiroha-a/mk/internal/core/iplookuplog"
-	coremediaproxy "github.com/shiroha-a/mk/internal/core/mediaproxy"
-	coremodlog "github.com/shiroha-a/mk/internal/core/moderationlog"
-	coremoderatoractivity "github.com/shiroha-a/mk/internal/core/moderatoractivity"
-	coremove "github.com/shiroha-a/mk/internal/core/move"
-	coremuting "github.com/shiroha-a/mk/internal/core/muting"
-	corenote "github.com/shiroha-a/mk/internal/core/note"
-	corenotification "github.com/shiroha-a/mk/internal/core/notification"
-	corepage "github.com/shiroha-a/mk/internal/core/page"
-	"github.com/shiroha-a/mk/internal/core/passwordguard"
-	corepoll "github.com/shiroha-a/mk/internal/core/poll"
-	"github.com/shiroha-a/mk/internal/core/procstats"
-	corereaction "github.com/shiroha-a/mk/internal/core/reaction"
-	corerelay "github.com/shiroha-a/mk/internal/core/relay"
-	coreretention "github.com/shiroha-a/mk/internal/core/retention"
-	corereversi "github.com/shiroha-a/mk/internal/core/reversi"
-	corerole "github.com/shiroha-a/mk/internal/core/role"
-	coresearch "github.com/shiroha-a/mk/internal/core/search"
-	"github.com/shiroha-a/mk/internal/core/selfcheck"
-	coresignup "github.com/shiroha-a/mk/internal/core/signup"
-	"github.com/shiroha-a/mk/internal/core/signupapplication"
-	"github.com/shiroha-a/mk/internal/core/signupform"
-	coresystemaccount "github.com/shiroha-a/mk/internal/core/systemaccount"
-	coretimeline "github.com/shiroha-a/mk/internal/core/timeline"
-	coretransfer "github.com/shiroha-a/mk/internal/core/transfer"
-	coretranslate "github.com/shiroha-a/mk/internal/core/translate"
-	coretwofactor "github.com/shiroha-a/mk/internal/core/twofactor"
-	coreurlpreview "github.com/shiroha-a/mk/internal/core/urlpreview"
-	coreuser "github.com/shiroha-a/mk/internal/core/user"
-	coreuserlist "github.com/shiroha-a/mk/internal/core/userlist"
-	"github.com/shiroha-a/mk/internal/core/userpack"
-	corewebhook "github.com/shiroha-a/mk/internal/core/webhook"
-	corewebpush "github.com/shiroha-a/mk/internal/core/webpush"
-	"github.com/shiroha-a/mk/internal/entity"
-	"github.com/shiroha-a/mk/internal/frontendutil"
-	"github.com/shiroha-a/mk/internal/misc/id"
-	"github.com/shiroha-a/mk/internal/misc/idnhost"
-	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
-	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/queue"
-	"github.com/shiroha-a/mk/internal/queue/processors"
-	"github.com/shiroha-a/mk/internal/repository"
-	"github.com/shiroha-a/mk/internal/server/middleware"
-	"github.com/shiroha-a/mk/internal/stream"
-	"github.com/shiroha-a/mk/internal/stream/channels"
-	"github.com/shiroha-a/mk/plugin"
 	"log/slog"
 )
 
@@ -183,7 +184,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// emoji の ListLocal はタイムライン描画ごとに毎回フルスキャンしていた
 	// hot path だが、絵文字テーブルの mutation は admin 経由のみで頻度が低い。
 	// 5 分 TTL の in-memory cache + mutation 時 invalidate で DB 負荷を消す
-	// (#300 3-6)。
+	// (#300 3-6)。ノートを詰めるときの (name, host) → URL の解決も、同じ
+	// wrapper の cache でページをまたいで使い回す (#3383、他プロセスへの
+	// invalidation の配線は internalPubSub の emojiCacheInvalidated)。
 	emojiRepo := repository.NewCachedEmojiRepository(repository.NewEmojiRepository(s.db))
 	// 絵文字由来のアバターデコレーション (#2975) の解決に使う。**catalog と同じ形の
 	// TTL cache だが、載せるのはローカルかつ非センシティブなものだけ**で、その
@@ -204,6 +207,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// mk-go 自身は両形式を読めるが **Misskey TS は PKCS#8 しか読めない** ので、
 	// そのまま TS へ引き渡すとそのユーザーの送信側の連合が全滅する (受信は動くので
 	// 片方向だけ静かに壊れる)。既存インスタンスを救うため起動時に変換する。
+	// TS へ引き渡すこと (復路) は保証しなくなった (#3191) が、鍵の形式は本家と揃えておく。
 	//
 	// 変換するのは PEM のエンコーディングだけで鍵そのものは変わらない。公開鍵も
 	// 鍵 ID も不変なので連合相手から見て何も変わらない。冪等なので毎回走ってよく、
@@ -1685,7 +1689,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// apisignup.TicketStore (FindByCode + MarkUsed) を superset として満たす。
 	// 旧 gormTicketStore wrapper を直接 repo に置き換え (#610 item 1)。
 	// 承認制の登録 (#2554 / #2555)。承認待ちを user 行として持たず、専用
-	// テーブルに閉じ込める。TS へ切り替えても承認待ちが有効化されない。
+	// テーブルに閉じ込める。user 行にすると、user を読む全ての経路に「承認待ちを
+	// 除く」条件が要る (当初は TS へ切り替えても有効化されないことも理由だったが、
+	// 復路は保証しなくなった。#3191)。
 	// signup (申請・登録) と admin (審査) の両方が同じインスタンスを見る。
 	signupApplicationService := signupapplication.NewService(
 		repository.NewSignupApplicationRepository(s.db), idGen)
@@ -1784,7 +1790,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// userSecurityKeyRepo + WebAuthnService を構築して signin と /api/i に注入する。
 	// Redis セッションは redis.default を流用する (用途別分離は不要)。
 	userSecurityKeyRepo := repository.NewUserSecurityKeyRepository(s.db)
-	webauthnSvc, webauthnErr := coretwofactor.NewWebAuthnService(s.config.URL, "Misskey", s.redis.Default)
+	webauthnSvc, webauthnErr := coretwofactor.NewWebAuthnService(s.config.URL, config.DisplayName, s.redis.Default)
 	if webauthnErr != nil {
 		slog.Warn("webauthn service unavailable", "err", webauthnErr)
 	} else {
@@ -2999,6 +3005,66 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		cachedAntenna.Invalidate()
 	})
 
+	// #3383: 絵文字の (name, host) cache の cross-worker invalidation。
+	// リモート絵文字の作成・更新は連合の受信 (MK_ONLY_QUEUE のプロセス) で
+	// 起き、それを表示に使うのは API のプロセスなので、繋がないと作られた
+	// 絵文字が負キャッシュの TTL (1 分) の間、更新・削除が正の TTL (10 分) の
+	// 間反映されない。
+	//
+	// **書き込んだプロセスは自分で精密に落とし済み**なので、自分の publish は
+	// 受け流す (rolesUpdated と同じ)。受信側は ApplyRemoteInvalidation で落とし、
+	// hook を呼ばないので通知の投げ合いにならない。
+	//
+	// **publish は書き込みの経路から切り離す。** upsertEmojis は絵文字 1 つごとに
+	// Create / UpdateFields を呼ぶので、同期で publish すると Redis が詰まった
+	// ときに受信が「絵文字数 x timeout」止まる。queue が溢れたら全体の
+	// invalidation に畳む (黙って捨てない)。publish 自体の失敗は TTL が上限になる。
+	emojiCacheSender := idGen.Generate(time.Now())
+	type emojiCacheMessage struct {
+		From string                            `json:"from"`
+		Inv  repository.EmojiCacheInvalidation `json:"inv"`
+	}
+	emojiInvalidationQueue := repository.NewEmojiInvalidationQueue(1024, func(inv repository.EmojiCacheInvalidation) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := internalPubSub.Publish(ctx, "emojiCacheInvalidated", emojiCacheMessage{From: emojiCacheSender, Inv: inv}); err != nil {
+			slog.Warn("emoji: publish emojiCacheInvalidated failed", "err", err)
+		}
+	})
+	// 停止時は Run が溜まっている分を最大 2 秒 (送信中の 1 件の timeout を足すと最悪約 4 秒)
+	// かけて送ってから返る。プロセスが
+	// 先に終わると送れないので、shutdown の deadline の範囲でその完了を待つ。
+	// Run が返った後の書き込み (停止中にまだ走っている受信ジョブ) は送られず、
+	// TTL が上限になる。
+	emojiInvalidationCtx, stopEmojiInvalidation := context.WithCancel(context.Background())
+	emojiInvalidationDone := make(chan struct{})
+	go func() {
+		defer close(emojiInvalidationDone)
+		emojiInvalidationQueue.Run(emojiInvalidationCtx)
+	}()
+	s.registerShutdownHook(func(ctx context.Context) {
+		stopEmojiInvalidation()
+		select {
+		case <-emojiInvalidationDone:
+		case <-ctx.Done():
+		}
+	})
+	emojiRepo.SetInvalidationHook(emojiInvalidationQueue.Enqueue)
+	internalPubSub.Subscribe(context.Background(), "emojiCacheInvalidated", func(payload []byte) {
+		var msg emojiCacheMessage
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			// **読めない通知は全体を落とす側に倒す。** 何を落とすべきか分からない
+			// まま捨てると、TTL の間古い絵文字を出し続ける。
+			slog.Warn("emoji: malformed emojiCacheInvalidated", "err", err)
+			emojiRepo.ApplyRemoteInvalidation(repository.EmojiCacheInvalidation{All: true})
+			return
+		}
+		if msg.From == emojiCacheSender {
+			return
+		}
+		emojiRepo.ApplyRemoteInvalidation(msg.Inv)
+	})
+
 	// pollVoted / reacted / unreacted / deleted を noteStream:<id> に publish
 	// する共通 publisher。subNote / sn メッセージで購読しているクライアントへ
 	// リアクション・削除イベントが流れる (#690 / #700)。pollService /
@@ -3570,7 +3636,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	adminHandler.SetEmojiApplicationRepo(emojiApplicationRepo)
 	// 連合セルフ診断 (#2463)。migration 本数は起動時に数えず 0 を渡す
 	// (server 側は既に migrate 済みで動いている前提。適用漏れの検出は
-	// `misskey -doctor` の担当で、あちらは同梱ファイルを数えられる)。
+	// `elythia doctor` の担当で、あちらは同梱ファイルを数えられる)。
 	// DB の健全性 (#3095)。統計はプライマリから読み、1 分キャッシュする。
 	dbHealth := dbhealth.NewService(s.db, s.config.DBReplications && len(s.config.DBSlaves) > 0)
 	adminHandler.SetDatabaseHealth(dbHealth)
