@@ -51,7 +51,7 @@ jobs:
               cd "$dir"
               # 外部プラグインにはgo.sumを追跡しないものがある。検証前に準備し、
               # vet/test/build中の依存変更は引き続きreadonlyで禁止する。
-              GOWORK=off go mod download
+              GOWORK=off go mod download all
               export GOWORK=off GOFLAGS=-mod=readonly
               go vet ./...
               go test ./... -v -race -count=1 -shuffle=3
