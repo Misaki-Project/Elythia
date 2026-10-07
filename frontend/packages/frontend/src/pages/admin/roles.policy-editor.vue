@@ -371,14 +371,14 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery(['HSR', 'hsrUidLimit', 'スターレイル'])" v-model:policyMeta="hsrUidLimitMeta" :levelConfig="levelConfig" policyKey="hsrUidLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery(['HSR', 'スターレイル', 'hsrUidLimit'])" v-model:policyMeta="hsrUidLimitMeta" :levelConfig="levelConfig" policyKey="hsrUidLimit" :isBaseRole="isBaseRole" :readonly="readonly">
 			<template #label>スターレイルのUID連携上限</template>
 			<template #valueText>{{ hsrUidLimit }}</template>
 			<template #default="{ disabled }">
 				<MkInput v-model="hsrUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #label>スターレイルのUID連携上限</template><template #caption>本人確認済みのローカルUID数の上限です（既定1件、0で新規連携禁止）。上限を下げても既存の連携は自動解除しません。</template></MkInput>
 			</template>
 		</XFolder>
-		<XFolder v-if="matchQuery(['HSR', 'hsrRefreshIntervalMinutes', 'スターレイル'])" v-model:policyMeta="hsrRefreshIntervalMinutesMeta" :levelConfig="levelConfig" policyKey="hsrRefreshIntervalMinutes" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery(['HSR', 'スターレイル', 'hsrRefreshIntervalMinutes'])" v-model:policyMeta="hsrRefreshIntervalMinutesMeta" :levelConfig="levelConfig" policyKey="hsrRefreshIntervalMinutes" :isBaseRole="isBaseRole" :readonly="readonly">
 			<template #label>スターレイルの自動取得間隔（分）</template>
 			<template #valueText>{{ hsrRefreshIntervalMinutes }}</template>
 			<template #default="{ disabled }">
