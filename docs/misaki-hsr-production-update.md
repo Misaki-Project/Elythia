@@ -1,6 +1,6 @@
 # Misakiのhsr本人確認・実績ランキング版への本番更新
 
-**新hsr同梱imageの公開とmanifest照合は完了しています。更新ツールの最終CI確認・配布前には実行しないでください。本番適用・実DB復元試験は未実施です。**
+**新hsr同梱imageの公開とmanifest照合は完了しています。実行前に[更新ツールPR #24](https://github.com/Misaki-Project/Elythia/pull/24)の最終headの安全CI成功と配布ZIPのチェックサムを確認してください。本番適用・実DB復元試験は未実施です。**
 
 正式Elythia 2.0.0を基準にしたMisaki本体に、hsrの本人確認・複数UID・ロール権限・実績ランキングを同梱します。原神・fedwatch・role-levelを保持し、上流最新developは取り込んでいません。既存の配布ZIP・image・`latest`は変更しません。
 
@@ -16,7 +16,7 @@
 - role-level: 本体同梱。XPのnoteはrole-level監査ログだけへ保存する既存仕様を維持。
 - hsr PR #1・本体PR #22は通常マージ済み。最終統合head `dfd5256a90851a8642f3e14a2b498112241874d3`の本体・frontend・4plugin CIが成功。
 - 公開pin PR #23の本体CI `37621197564`・4plugin統合 `37621197386`・新pin image build `37621198292`・安全CI `37621197091`成功。frontend単独lint/testは変更検出によりskippedであり、成功扱いしません。frontend実検証は4plugin統合CIで実行しています。
-- 更新ツール初回安全CI `37621578658`は24件中3失敗。テストの更新元version変数をスクリプト本文で上書きしていたため、偽containerが117に対応しない状態でした。変数名を分離し、検査・assertionを緩めず修正しました。最終headのCI証拠は配布時に追記します。
+- 更新ツール初回安全CI `37621578658`は24件中3失敗。テストの更新元version変数をスクリプト本文で上書きしていたため、偽containerが117に対応しない状態でした。変数名を分離し、検査・assertionを緩めず修正しました。最終headのCI証拠はPR #24本文と配布READMEに記録します。
 
 ## 対応する更新元
 
