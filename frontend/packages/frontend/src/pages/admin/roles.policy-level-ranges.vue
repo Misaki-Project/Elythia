@@ -120,6 +120,7 @@ const numericPolicyKeys = new Set([
 	'chunkedUploadMaxPendingMb', 'clipLimit', 'driveCapacityMb', 'emojiApplicationMaxPending',
 	'emojiApplicationMaxPerDay', 'emojiApplicationMaxPerMonth', 'emojiApplicationMaxPerWeek',
 	'genshinRefreshIntervalMinutes',
+	'hsrRefreshIntervalMinutes', 'hsrUidLimit',
 	'inviteExpirationTime', 'inviteLimit', 'inviteLimitCycle', 'maxFileSizeMb', 'mentionLimit',
 	'noteDraftLimit', 'noteEachClipsLimit', 'pinLimit', 'rateLimitFactor', 'scheduledNoteLimit',
 	'userEachUserListsLimit', 'userListLimit', 'webhookLimit', 'wordMuteLimit',
@@ -137,7 +138,7 @@ const policyKind = computed<'boolean' | 'number' | 'enum' | 'stringSet'>(() => {
 	if (props.policyKey === 'chatAvailability') return 'enum';
 	return 'boolean';
 });
-const isGenshinRefresh = computed(() => props.policyKey === 'genshinRefreshIntervalMinutes');
+const isGenshinRefresh = computed(() => props.policyKey === 'genshinRefreshIntervalMinutes' || props.policyKey === 'hsrRefreshIntervalMinutes');
 const rangeTypes = computed(() => [
 	{ label: i18n.ts._roleLevel.noPolicyChange, value: 'base' },
 	{ label: i18n.ts._roleLevel.constant, value: 'const' },
@@ -161,6 +162,7 @@ function defaultValue(): unknown {
 
 function updateConstant(range: EditablePolicyRange, value: unknown): void {
 	if (isGenshinRefresh.value && !isGenshinRefreshInterval(value)) return;
+	if (props.policyKey === 'hsrUidLimit' && (!Number.isInteger(Number(value)) || Number(value) < 0 || Number(value) > 100)) return;
 	range.value = Number(value);
 }
 

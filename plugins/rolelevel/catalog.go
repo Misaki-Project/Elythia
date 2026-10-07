@@ -122,7 +122,11 @@ func (c *Catalog) NormalizeConst(key string, value any) (any, error) {
 			return nil, invalid(CodeInvalidRangeValue, "policyRanges.value",
 				"%q は数値ですが %#v が渡されました (%s)", key, value, err)
 		}
-		if key == "genshinRefreshIntervalMinutes" {
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" || key == "hsrUidLimit" {
+			minimum, maximum := 1.0, 1440.0
+			if key == "hsrUidLimit" {
+				minimum, maximum = 0, 100
+			}
 			var minutes float64
 			switch v := n.(type) {
 			case int64:
@@ -130,10 +134,10 @@ func (c *Catalog) NormalizeConst(key string, value any) (any, error) {
 			case float64:
 				minutes = v
 			default:
-				return nil, invalid(CodeInvalidRangeValue, "policyRanges.value", "原神の取得間隔は1〜1440分の整数で指定してください")
+				return nil, invalid(CodeInvalidRangeValue, "policyRanges.value", "%sには%.0f〜%.0fの整数を指定してください", key, minimum, maximum)
 			}
-			if minutes < 1 || minutes > 1440 || math.Trunc(minutes) != minutes {
-				return nil, invalid(CodeInvalidRangeValue, "policyRanges.value", "原神の取得間隔は1〜1440分の整数で指定してください")
+			if minutes < minimum || minutes > maximum || math.Trunc(minutes) != minutes {
+				return nil, invalid(CodeInvalidRangeValue, "policyRanges.value", "%sには%.0f〜%.0fの整数を指定してください", key, minimum, maximum)
 			}
 		}
 		return n, nil

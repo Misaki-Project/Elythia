@@ -41,7 +41,7 @@ jobs:
           printf '%s\n' \
             'genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 253a472ab09e87a471c3746dca4a6a0279022a0a' \
             'fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8' \
-            'hsr https://github.com/Elythia-Network/elythia-plugin-hsr.git 07c5c1bb43cc34de5e79823238567a17623323be' \
+            'hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git 08736dc4eeb0e0f6a383186030430de457958633' \
             | GOWORK=off go run ./tools/pluginresolve
       - name: Vet, race tests and build every production plugin
         run: |

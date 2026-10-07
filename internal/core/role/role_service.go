@@ -1514,7 +1514,7 @@ func aggregatePolicyValues(key string, baseVal any, values []any) any {
 		}
 		return false
 	case int:
-		if key == "genshinRefreshIntervalMinutes" {
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" {
 			// 同じ優先度では短い間隔を採用する。ほかの数値policyは従来のmax。
 			best, found := 1440, false
 			for _, value := range values {

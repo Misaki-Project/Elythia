@@ -13,6 +13,8 @@ import (
 var defaults = map[string]any{
 	// 原神の自動取得間隔（分）。Enka TTLより短く取得することはない。
 	"genshinRefreshIntervalMinutes": 10,
+	"hsrRefreshIntervalMinutes":     10,
+	"hsrUidLimit":                   1,
 	"gtlAvailable":                  true,
 	"ltlAvailable":                  true,
 	"canPublicNote":                 true,
@@ -259,7 +261,7 @@ func valueValid(key string, native, value any) bool {
 		_, ok := value.(bool)
 		return ok
 	case int:
-		if key == "genshinRefreshIntervalMinutes" {
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" {
 			switch v := value.(type) {
 			case int:
 				return v >= 1 && v <= 1440
@@ -267,6 +269,18 @@ func valueValid(key string, native, value any) bool {
 				return v >= 1 && v <= 1440
 			case float64:
 				return v >= 1 && v <= 1440 && math.Trunc(v) == v
+			default:
+				return false
+			}
+		}
+		if key == "hsrUidLimit" {
+			switch v := value.(type) {
+			case int:
+				return v >= 0 && v <= 100
+			case int64:
+				return v >= 0 && v <= 100
+			case float64:
+				return v >= 0 && v <= 100 && math.Trunc(v) == v
 			default:
 				return false
 			}
