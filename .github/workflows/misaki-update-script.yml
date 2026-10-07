@@ -21,4 +21,4 @@ jobs:
           bash -n scripts/misaki/update-misaki.sh
           shellcheck scripts/misaki/update-misaki.sh
       - name: Safety regression tests without a production connection
-        run: /usr/bin/python3 -m unittest discover -s scripts/misaki -p 'test_*.py' -v
+        run: sudo /usr/bin/python3 -m unittest discover -s scripts/misaki -p 'test_*.py' -v
