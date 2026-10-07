@@ -19,8 +19,8 @@ jobs:
       plugins: |
         genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 253a472ab09e87a471c3746dca4a6a0279022a0a
         fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8
-        hsr https://github.com/Elythia-Network/elythia-plugin-hsr.git 07c5c1bb43cc34de5e79823238567a17623323be
+        hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git fd90f729a5ea85f58cd76d094194468e4fadf149
       image: ghcr.io/misaki-project/mk-genshin
       # 再実行でも既存tagを上書きしない。
-      tags: elythia-2-0-20261007-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      tags: elythia-2-0-hsr-20261007-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
       push: true
