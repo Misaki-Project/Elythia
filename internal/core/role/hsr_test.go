@@ -12,4 +12,10 @@ func TestHSRPolicyAggregation(t *testing.T) {
 	if got := aggregatePolicyValues("hsrUidLimit", 1, []any{0, 2, 5}); got != 5 {
 		t.Fatalf("UID上限は同優先度max: %v", got)
 	}
+	if got := aggregatePolicyValues("genshinUidLimit", 1, []any{0, 2, 5}); got != 5 {
+		t.Fatalf("原神UID上限は同優先度max: %v", got)
+	}
+	if got := aggregatePolicyValues("genshinUidLimit", 1, []any{0}); got != 0 {
+		t.Fatalf("原神UID上限0を維持: %v", got)
+	}
 }

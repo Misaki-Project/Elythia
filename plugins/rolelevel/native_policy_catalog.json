@@ -36,6 +36,7 @@
     { "key": "genshinRefreshIntervalMinutes", "kind": "number" },
     { "key": "hsrRefreshIntervalMinutes", "kind": "number" },
     { "key": "hsrUidLimit", "kind": "number" },
+    { "key": "genshinUidLimit", "kind": "number" },
     { "key": "gtlAvailable", "kind": "boolean" },
     { "key": "inviteExpirationTime", "kind": "number" },
     { "key": "inviteLimit", "kind": "number" },

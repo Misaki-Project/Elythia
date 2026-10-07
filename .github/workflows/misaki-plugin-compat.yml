@@ -39,9 +39,9 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' \
-            'genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 253a472ab09e87a471c3746dca4a6a0279022a0a' \
+            'genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 9a50079ec9d198ab44e4b9ff24d0a408109c09da' \
             'fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8' \
-            'hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git fd90f729a5ea85f58cd76d094194468e4fadf149' \
+            'hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git 820068d720654650d5dc05d4136ad9f32f677fef' \
             | GOWORK=off go run ./tools/pluginresolve
       - name: Vet, race tests and build every production plugin
         run: |
@@ -80,6 +80,7 @@ jobs:
           # vitest設定も生成済みi18nを参照するため、workspace全体を先にビルドする。
           pnpm build
           pnpm --filter frontend exec vitest run --config vitest.config.plugins.ts
+          pnpm --filter frontend exec vitest run --config vitest.config.unit.ts test/unit/game-ranking-pages.test.ts test/unit/game-ranking-ui.test.ts test/unit/hsr-policy.test.ts
       - name: Check integrated production frontend
         working-directory: frontend
         run: |

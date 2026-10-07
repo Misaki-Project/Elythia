@@ -64,7 +64,7 @@ func TestLegacyMigrationPolicyAllowlistMatchesCatalog(t *testing.T) {
 	for _, key := range defaultCatalog.Keys() {
 		// Migration 6の後に追加したpolicyは旧データに存在しない。
 		// 新policyのために適用済みmigrationを書き換えない。
-		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" || key == "hsrUidLimit" {
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" || key == "hsrUidLimit" || key == "genshinUidLimit" {
 			if strings.Contains(legacySQL, "'"+key+"'") {
 				t.Fatal("新policyが適用済みlegacy migrationへ混入しています")
 			}

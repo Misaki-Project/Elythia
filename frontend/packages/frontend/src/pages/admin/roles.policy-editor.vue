@@ -371,6 +371,13 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
+		<XFolder v-if="matchQuery(['原神', 'Genshin', 'genshinUidLimit'])" v-model:policyMeta="genshinUidLimitMeta" :levelConfig="levelConfig" policyKey="genshinUidLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+			<template #label>原神のUID連携上限</template>
+			<template #valueText>{{ genshinUidLimit }}</template>
+			<template #editor="{ disabled }">
+				<MkInput v-model="genshinUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #label>原神のUID連携上限</template><template #caption>本人確認済みのローカルUID数の上限です（既定1件、0で新規連携禁止）。上限を下げても既存の連携は自動解除しません。</template></MkInput>
+			</template>
+		</XFolder>
 		<XFolder v-if="matchQuery(['HSR', 'スターレイル', 'hsrUidLimit'])" v-model:policyMeta="hsrUidLimitMeta" :levelConfig="levelConfig" policyKey="hsrUidLimit" :isBaseRole="isBaseRole" :readonly="readonly">
 			<template #label>スターレイルのUID連携上限</template>
 			<template #valueText>{{ hsrUidLimit }}</template>
@@ -704,6 +711,7 @@ const mkGoPolicyMetaKeys: string[] = [
 	'genshinRefreshIntervalMinutes',
 	'hsrRefreshIntervalMinutes',
 	'hsrUidLimit',
+	'genshinUidLimit',
 ];
 
 function setPolicyMeta(incoming: Partial<PolicyMetaRecord> | undefined): PolicyMetaRecord {
@@ -811,6 +819,12 @@ const genshinRefreshIntervalMinutes = computed({
 const genshinRefreshIntervalMinutesMeta = mkGoPolicyMeta('genshinRefreshIntervalMinutes');
 
 const hsrUidLimitModel = mkGoPolicyValue('hsrUidLimit', 1);
+const genshinUidLimitModel = mkGoPolicyValue('genshinUidLimit', 1);
+const genshinUidLimit = computed({
+	get: () => genshinUidLimitModel.value,
+	set: (value: number) => { if (Number.isInteger(value) && value >= 0 && value <= 100) genshinUidLimitModel.value = value; },
+});
+const genshinUidLimitMeta = mkGoPolicyMeta('genshinUidLimit');
 const hsrUidLimit = computed({
 	get: () => hsrUidLimitModel.value,
 	set: (value: number) => { if (Number.isInteger(value) && value >= 0 && value <= 100) hsrUidLimitModel.value = value; },

@@ -122,9 +122,9 @@ func (c *Catalog) NormalizeConst(key string, value any) (any, error) {
 			return nil, invalid(CodeInvalidRangeValue, "policyRanges.value",
 				"%q は数値ですが %#v が渡されました (%s)", key, value, err)
 		}
-		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" || key == "hsrUidLimit" {
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" || key == "hsrUidLimit" || key == "genshinUidLimit" {
 			minimum, maximum := 1.0, 1440.0
-			if key == "hsrUidLimit" {
+			if key == "hsrUidLimit" || key == "genshinUidLimit" {
 				minimum, maximum = 0, 100
 			}
 			var minutes float64

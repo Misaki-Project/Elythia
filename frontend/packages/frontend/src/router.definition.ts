@@ -260,6 +260,10 @@ export const ROUTE_DEF = [{
 	component: page(() => import('@/pages/explore.vue')),
 	hash: 'initialTab',
 }, {
+	path: '/game-rankings',
+	component: page(() => import('@/pages/game-rankings.vue')),
+	query: { game: 'initialGame' },
+}, {
 	path: '/search',
 	component: page(() => import('@/pages/search.vue')),
 	query: {

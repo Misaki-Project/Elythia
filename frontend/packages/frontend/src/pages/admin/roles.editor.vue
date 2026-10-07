@@ -169,6 +169,7 @@ const mkGoRolePolicyKeys: string[] = [
 	'genshinRefreshIntervalMinutes',
 	'hsrRefreshIntervalMinutes',
 	'hsrUidLimit',
+	'genshinUidLimit',
 ];
 
 const role = ref((() => {

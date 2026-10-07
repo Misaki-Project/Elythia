@@ -19,13 +19,14 @@ describe('HSR role policy wiring', () => {
 		const editor = read('packages/frontend/src/pages/admin/roles.policy-editor.vue');
 		const ranges = read('packages/frontend/src/pages/admin/roles.policy-level-ranges.vue');
 		const roles = read('packages/frontend/src/pages/admin/roles.editor.vue');
-		for (const key of ['hsrUidLimit', 'hsrRefreshIntervalMinutes']) {
+		for (const key of ['hsrUidLimit', 'hsrRefreshIntervalMinutes', 'genshinUidLimit']) {
 			expect(editor).toContain(`policyKey="${key}"`);
 			expect(ranges).toContain(`'${key}'`);
 			expect(roles).toContain(`'${key}'`);
 			expect(editor).toContain(`'${key}'])`);
 		}
 		expect(editor).toContain("mkGoPolicyValue('hsrUidLimit', 1)");
+		expect(editor).toContain("mkGoPolicyValue('genshinUidLimit', 1)");
 		expect(editor).toContain("mkGoPolicyValue('hsrRefreshIntervalMinutes', 10)");
 		expect(editor).toContain('Number.isInteger(value) && value >= 0 && value <= 100');
 	});
