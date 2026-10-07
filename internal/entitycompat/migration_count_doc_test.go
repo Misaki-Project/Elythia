@@ -254,7 +254,7 @@ var migrationCountClaims = []struct {
 	{"docs/migration-from-ts.md", `共有テーブルにも触るものが (\d+) 件あるので`, "destructive", 0, "破壊的なマイグレーションの件数 (導入部)"},
 	{"docs/migration-from-ts.md", `共有テーブルに触るものが (\d+) 件ある`, "destructive", 0, "破壊的なマイグレーションの件数 (本文)"},
 	{"docs/migration-from-ts.md", `\*\*うち (\d+) 件は Elythia 側だけが作るもの`, "destructive_mkgo", 0, "破壊的なうち mk-go 由来のもの"},
-	{"docs/migration-from-ts.md", `破壊的なマイグレーション\]\(#破壊的なマイグレーション\) の (\d+) 件は戻らない`, "destructive", 0, "破壊的なマイグレーションの件数 (切り戻し節)"},
+	{"docs/migration-from-ts.md", `破壊的なマイグレーション\]\(#破壊的なマイグレーション\) の (\d+) 件には、downで復元できない変更が含まれる`, "destructive", 0, "破壊的なマイグレーションの件数 (切り戻し節)"},
 	{"docs/migration-from-ts.md", `うち (\d+) 件は Elythia が自分で作ったものの除去`, "destructive_mkgo", 0, "破壊的なうち mk-go 由来のもの"},
 	{"docs/architecture.md", `例外が (\d+) 件あり`, "destructive", 0, "破壊的なマイグレーションの件数"},
 	{"docs/architecture.md", `うち (\d+) 件は Elythia が自分で作ったものの除去`, "destructive_mkgo", 0, "破壊的なうち mk-go 由来のもの"},

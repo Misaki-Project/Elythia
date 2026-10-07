@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/labstack/echo/v4"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/elythia-network/elythia/internal/testutil"
+	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
 )

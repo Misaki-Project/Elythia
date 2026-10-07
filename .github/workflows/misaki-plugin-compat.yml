@@ -31,8 +31,8 @@ jobs:
       TEST_DB_PASS: mk
       MK_PLUGIN_TESTS_REQUIRE_DB: '1'
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Resolve pinned production plugins
@@ -49,16 +49,19 @@ jobs:
           for dir in plugins/rolelevel plugins/genshin plugins/fedwatch plugins/hsr; do
             (
               cd "$dir"
+              # 外部プラグインにはgo.sumを追跡しないものがある。検証前に準備し、
+              # vet/test/build中の依存変更は引き続きreadonlyで禁止する。
+              GOWORK=off go mod download
               export GOWORK=off GOFLAGS=-mod=readonly
               go vet ./...
               go test ./... -v -race -count=1 -shuffle=3
               go build ./...
             )
           done
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           package_json_file: frontend/package.json
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: frontend/.node-version
       - name: Generate plugin frontend wiring

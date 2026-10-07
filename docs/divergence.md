@@ -789,9 +789,9 @@ upstream が `jobState` の型を autogen (`AdminQueueJobsRequest['state'][numbe
 | `2026.10.0-mk.1` | IP 照会の監査の一覧をモデレーションログへ移し、利用者ページの IP を欄を開いたときだけ読む (#3276、backend も同じ issue)。**一覧**: `/admin/modlog` に「モデログ」と「IP照会の記録」のタブを置き、監査の一覧をモデレーションログと同じ `MkTl` + `MkFolder` の形にした。管理画面のメニューからは独立した項目を外し、旧 URL の `/admin/ip-lookup-log` はそのタブへリダイレクトする。タブを出す条件は `2026.9.0-mk.35` のメニューと同じ (照会より緩い経路にしない)。**利用者ページ**: 接続先が mk-go のときは `admin/show-user` に `withSignins: false` を渡し、開いただけでは照会の監査に残さない (操作の後の引き直しも同じ)。IP は管理者が折りたたまれた欄を開いたときに初めて `admin/get-user-ips` を呼び (管理者でないモデレーターには案内だけが出る)、同じページで開き直しても取得済みの結果を使う。失敗したら欄にエラーと再試行の操作を出す。時間をおいて自動で送り直すことはせず、再試行の操作か、欄を開き直したときに送り直す (`admin/get-user-ips` は DB 障害でも 200 と空配列を返すので、その場合は空の一覧として取得済みになり、開き直しても送り直さない)。**純正へは還元できない行** (`withSignins` も監査の一覧も mk-go の backend が要る) |
 | `2026.10.0-mk.2` | frontend CI で時間切れになるバブルゲーム単体テストの timeout と、signup e2e の登録ボタン待機を修正 (shiroha-a/misskey-ts#10)。**テストだけの変更で、配信物は `2026.10.0-mk.1` と同じ。** |
 | `2026.10.0-mk.3` | `canDeleteAccount` / `canPurgeAccount` を base・role policy editor へ追加し、本人退会 UI の表示を policy に連動する (shiroha-a/misskey-ts#9、mk-go #3207)。旧 backend が key を返さない場合は従来どおり表示し、退会処理中の表示も維持する。**純正 backend には両 policy が無いため還元不能。** |
-| `2026.10.0-mk.misaki.1` | Misakiの独自削除ポリシー・role-level・XP・原神の公開設定と取得間隔UIを保持して上流2026.10.0を統合。型・対象lint・67件の回帰・原神18件・production build・SPDXは成功。上流と一致する4言語の翻訳同期によるlocale safety FAILは、ユーザーの限定承認を記録して保持する。 |
 | `2026.10.0-mk.4` | プロフィールの単体テストで、非同期のアクティビティチャートを空の部品へ差し替える。上流のテスト安定化で、配信物はmk.3と同じ。 |
 | `2026.10.0-mk.5` | 標準UIと100件ずつの公開ユーザー取得APIをプラグインへ公開し、プラグインfrontend回帰テスト設定を追加する。2.0.0で本体へ取り込まれた上流の変更。 |
+| `2026.10.0-mk.misaki.1` | Misakiの独自削除ポリシー・role-level・XP・原神の公開設定と取得間隔UIを保持して上流2026.10.0を統合。型・対象lint・67件の回帰・原神18件・production build・SPDXは成功。上流と一致する4言語の翻訳同期によるlocale safety FAILは、ユーザーの限定承認を記録して保持する。 |
 | `2026.10.0-mk.misaki.2` | Release 1.5.0の上流frontend `9eae05e7`を統合。role-level・XP・原神・型付きbooleanによる削除ポリシー判定を保持し、IPの遅延照会と削除処理中の表示に追従。全791件・原神18件・型・lint・production・SPDX・shippingが成功。GitHubのbubble-game3件timeoutはFAILとして記録し、失敗ジョブの再実行で成功を確認した。新しい例外承認は使用していない。 |
 
 `2026.7.0-mk.1` の内訳:

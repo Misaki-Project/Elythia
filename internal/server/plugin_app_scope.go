@@ -3,9 +3,9 @@ package server
 import (
 	"net/http"
 
-	"github.com/labstack/echo/v4"
 	"github.com/elythia-network/elythia/internal/misc/permissions"
 	"github.com/elythia-network/elythia/internal/server/middleware"
+	"github.com/labstack/echo/v4"
 )
 
 // pluginAppTokenPolicy keeps app tokens out of plugin routes by default.

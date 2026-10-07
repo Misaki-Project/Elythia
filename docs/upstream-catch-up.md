@@ -329,22 +329,11 @@ Elythia と Misskey TS を並べて比較するハーネスは、**比較対象�
 **古い tag でも image は問題なくビルドできる**ので、腐っても CI は落ちない —
 落ちるのは配った先だけ。`tests/bench/` も同じ性質で、こちらはどの workflow からも
 参照されていない (`tests/queue-bench/` は nightly の `queue-bench-smoke.yml` が引く)。
-assets image は fork 側の `Publish frontend assets image` workflow が `*-mk.*` タグで
-発火して publish するので、**submodule のタグを push した後**に上げること
-(`gh run list --repo Misaki-Project/misskey-ts` で success を確認できる)。
+1.5.0以前は外部assets imageの公開確認も必要だったが、2.0.0では本体とプラグインのfrontendを同じimageでビルドする。旧assets workflowを2.0.0更新のために再実行しない。
 
 **表に載せただけでは止まらなかった。** #2877 で表へ載せた後も `Dockerfile.bundled` の
 pin は `2026.9.0-mk.0` に置き去りのままで、**リリースした `1.3.0-bundled` は既に 2 世代**
-(submodule は `2026.9.0-mk.2`)、develop では 29 世代ずれていた (pin されていた `mk.0` から数えた間隔。数字付きの tag 30 個から 1 を引いた値で、英字付きを含めると 62 個から 1 を引いて 61)。現在は
-`make submodulepin-check` が pin 行の tag と突き合わせるので、片側だけ上げると
-`make gates` が落ちる (#3011)。**publish 済みかどうかまでは見ない** —
-ネットワークが要るので `make gates` では取れない。tag を上げたら上の `gh run list` で
-assets image の workflow が success していることを必ず確認し、**失敗していたら fork 側で
-回し直す** (`gh workflow run assets-image.yml --repo Misaki-Project/misskey-ts -f tag=<tag>`。
-`tag` は `required: true` の input で、workflow 自身がその tag を checkout するので `--ref` では代用できない)。
-publish されていない tag を pin すると `docker.yml` の `build-and-push-bundled` が `FROM` の
-pull で落ちる。実測で `2026.7.0-mk.18` は**タグはあるのに image が無い**状態で残っている
-(`2026.7.0-mk.4` 以前は workflow 導入前なので期待どおり)。
+(submodule は `2026.9.0-mk.2`)、当時のdevelopでは29世代ずれていた。この経緯は履歴として残す。2.0.0にはsubmoduleも外部assetsのpinも無く、同じ問題を防ぐため本体と4プラグインの同梱ビルドをPRのCIで確認する。Misakiでは過去のassets workflowに暗黙の`latest`更新があったため、修正前の過去タグのworkflowは再実行しない。
 
 **探し方は `grep -rn 'misskey/misskey:' --include='*.yml' --include='*.yaml' --include='*.md' . | grep -v third_party`。**
 表を手で追うより確実で、doc の散文に埋まった版数 (`docs/dropin-e2e.md` のトラブルシュート等) も拾える。

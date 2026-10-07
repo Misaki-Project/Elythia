@@ -367,7 +367,7 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 マイグレーション（`migration/`、golang-migrate、現在 117 本）:
 > 注: fork の `000098_drop_remote_avatar_decorations` は無変更で残し、upstream の `000098_registration_closed` は `000106_registration_closed`、`000106_abuse_report_notification_recipient_fk_cascade` は `000107_abuse_report_notification_recipient_fk_cascade` として統合している。`000107_note_page_count_backfill`は`000108_note_page_count_backfill`へ、Release 1.5.0の`000108_user_uri_index`は`000109_user_uri_index`へ割り当てた。upstream の過去実測本数は履歴上の値。
 
-- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 19 件あり、うち 14 件は Elythia / Misaki が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
+- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 19 件あり、うち 14 件は Elythia が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Misakiの既存migrationもこの件数に含める。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
 - drop-in テストで発見した補完列は専用マイグレーションで追加。
 - down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただし既存の down はこの規約を満たしていない** — `-- data loss:` の宣言があるのは 24 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down は 51 本ある（[migration-from-ts.md](migration-from-ts.md#elythia-内での切り戻し)）。
 
