@@ -9,9 +9,9 @@ import { defineConfig } from 'vitest/config';
 import unitConfig from './vitest.config.unit.js';
 
 const require = createRequire(import.meta.url);
-// 本体の plugins/ を指す (frontend/packages/frontend から 4 段上)。
+// 本体の plugins/ を指す (frontend/packages/frontend から 3 段上)。
 // 外れると include が空振りし、vitest は No test files found で落ちる。
-const pluginRoot = fileURLToPath(new URL('../../../../plugins', import.meta.url));
+const pluginRoot = fileURLToPath(new URL('../../../plugins', import.meta.url));
 const pluginTestPattern = path.join(pluginRoot, '*/frontend/*.test.ts').replaceAll(path.sep, '/');
 
 // ビルド時プラグインの回帰テストは、本体の通常テストとは別に実行する。
