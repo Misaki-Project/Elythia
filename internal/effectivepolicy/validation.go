@@ -15,6 +15,7 @@ var defaults = map[string]any{
 	"genshinRefreshIntervalMinutes": 10,
 	"hsrRefreshIntervalMinutes":     10,
 	"hsrUidLimit":                   1,
+	"genshinUidLimit":               1,
 	"gtlAvailable":                  true,
 	"ltlAvailable":                  true,
 	"canPublicNote":                 true,
@@ -273,7 +274,7 @@ func valueValid(key string, native, value any) bool {
 				return false
 			}
 		}
-		if key == "hsrUidLimit" {
+		if key == "hsrUidLimit" || key == "genshinUidLimit" {
 			switch v := value.(type) {
 			case int:
 				return v >= 0 && v <= 100

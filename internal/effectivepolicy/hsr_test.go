@@ -12,6 +12,7 @@ func TestHSRPolicyBounds(t *testing.T) {
 		valid, invalid []any
 	}{
 		{"hsrUidLimit", 1, []any{0, 1, 100, int64(2), float64(3)}, []any{-1, 101, 1.5, "1", true, nil, math.NaN(), math.Inf(1)}},
+		{"genshinUidLimit", 1, []any{0, 1, 100, int64(2), float64(3)}, []any{-1, 101, 1.5, "1", true, nil, math.NaN(), math.Inf(1)}},
 		{"hsrRefreshIntervalMinutes", 10, []any{1, 10, 1440, int64(60), float64(5)}, []any{0, -1, 1441, 1.5, "10", true, nil, math.NaN(), math.Inf(1)}},
 	} {
 		if Defaults()[tc.key] != tc.defaultValue {

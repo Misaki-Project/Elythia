@@ -16,6 +16,7 @@ import { i18n } from '@/i18n.js';
 import { unisonReload } from '@/utility/unison-reload.js';
 import { collectPages } from '@/plugin-api.js';
 import { serverPlugins } from '@/server-plugins.generated.js';
+import { gameRankingPages, isGameRankingPage, gameRankingsPath } from '@/game-ranking-pages.js';
 
 export const navbarItemDef = reactive<{
 	[key: string]: {
@@ -215,7 +216,20 @@ export const navbarItemDef = reactive<{
  *
  * ルーターと同じく Definition の宣言から読む (setup() の実行順に依存しない)。
  */
-for (const p of collectPages(serverPlugins, false)) {
+const publicPluginPages = collectPages(serverPlugins, false);
+if (gameRankingPages(publicPluginPages).length > 0) {
+	navbarItemDef['game-rankings'] = { title: 'ゲームランキング', icon: 'ti ti-trophy', to: gameRankingsPath };
+	// 既存のカスタムナビ設定は壊さず、列挙される「もっと！」の入口は一つにする。
+	for (const page of gameRankingPages(publicPluginPages)) {
+		Object.defineProperty(navbarItemDef, `plugin:${page.plugin}`, {
+			value: { title: 'ゲームランキング', icon: 'ti ti-trophy', to: `${gameRankingsPath}?game=${page.plugin}` },
+			enumerable: false,
+			configurable: true,
+		});
+	}
+}
+for (const p of publicPluginPages) {
+	if (isGameRankingPage(p)) continue;
 	if (p.navTitle == null) continue;
 	navbarItemDef[`plugin:${p.plugin}`] = {
 		title: p.navTitle,

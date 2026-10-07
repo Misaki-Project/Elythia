@@ -121,6 +121,7 @@ const numericPolicyKeys = new Set([
 	'emojiApplicationMaxPerDay', 'emojiApplicationMaxPerMonth', 'emojiApplicationMaxPerWeek',
 	'genshinRefreshIntervalMinutes',
 	'hsrRefreshIntervalMinutes', 'hsrUidLimit',
+	'genshinUidLimit',
 	'inviteExpirationTime', 'inviteLimit', 'inviteLimitCycle', 'maxFileSizeMb', 'mentionLimit',
 	'noteDraftLimit', 'noteEachClipsLimit', 'pinLimit', 'rateLimitFactor', 'scheduledNoteLimit',
 	'userEachUserListsLimit', 'userListLimit', 'webhookLimit', 'wordMuteLimit',
@@ -162,7 +163,7 @@ function defaultValue(): unknown {
 
 function updateConstant(range: EditablePolicyRange, value: unknown): void {
 	if (isGenshinRefresh.value && !isGenshinRefreshInterval(value)) return;
-	if (props.policyKey === 'hsrUidLimit' && (!Number.isInteger(Number(value)) || Number(value) < 0 || Number(value) > 100)) return;
+	if ((props.policyKey === 'hsrUidLimit' || props.policyKey === 'genshinUidLimit') && (!Number.isInteger(Number(value)) || Number(value) < 0 || Number(value) > 100)) return;
 	range.value = Number(value);
 }
 
