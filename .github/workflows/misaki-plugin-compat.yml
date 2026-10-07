@@ -80,7 +80,7 @@ jobs:
           # vitest設定も生成済みi18nを参照するため、workspace全体を先にビルドする。
           pnpm build
           pnpm --filter frontend exec vitest run --config vitest.config.plugins.ts
-          pnpm --filter frontend exec vitest run test/unit/game-ranking-pages.test.ts test/unit/game-ranking-ui.test.ts test/unit/hsr-policy.test.ts
+          pnpm --filter frontend exec vitest run --config vitest.config.unit.ts test/unit/game-ranking-pages.test.ts test/unit/game-ranking-ui.test.ts test/unit/hsr-policy.test.ts
       - name: Check integrated production frontend
         working-directory: frontend
         run: |
