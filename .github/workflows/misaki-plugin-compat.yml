@@ -49,8 +49,12 @@ jobs:
           for dir in plugins/rolelevel plugins/genshin plugins/fedwatch plugins/hsr; do
             (
               cd "$dir"
-              # 外部プラグインにはgo.sumを追跡しないものがある。検証前に準備し、
-              # vet/test/build中の依存変更は引き続きreadonlyで禁止する。
+              # 外部プラグインの依存台帳は本体SDKのreplaceに合わせて準備する。
+              # runner上の変更をログへ残し、ソースや固定refには手を入れない。
+              if [ "$dir" = plugins/fedwatch ] || [ "$dir" = plugins/hsr ]; then
+                GOWORK=off go mod tidy
+                git diff -- go.mod go.sum
+              fi
               GOWORK=off go mod download all
               export GOWORK=off GOFLAGS=-mod=readonly
               go vet ./...
@@ -75,3 +79,11 @@ jobs:
           set -euo pipefail
           pnpm --filter misskey-js build
           pnpm --filter frontend exec vitest run --config vitest.config.plugins.ts
+      - name: Check integrated production frontend
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          pnpm build
+          pnpm --no-bail --filter frontend --filter sw --filter misskey-js run typecheck
+          pnpm --filter frontend run eslint
+          pnpm --filter misskey-js api-prod
