@@ -3,7 +3,7 @@
 set +x
 set -Eeuo pipefail
 umask 077
-IMAGE='ghcr.io/misaki-project/mk-genshin@sha256:7ca70e10836b5939ba587210144da4625cbd3c6b2882439dbdf54ebf1ac5f0df'
+IMAGE='ghcr.io/misaki-project/mk-genshin@sha256:de6a50f49e7298c5b418e47937007d492f6fbb5cf2a2ff2ab07deebcfcb63292'
 CONTAINER='mk-go-production'
 CONFIG='/home/misskey/cherrypick/.config/default.yml'
 BACKUP_ROOT='/home/misaki/mk-update-backups'
