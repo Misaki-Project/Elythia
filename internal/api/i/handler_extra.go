@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
-	"github.com/elythia-network/elythia/internal/api/notehide"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/notification"
 	"github.com/elythia-network/elythia/internal/core/role"
@@ -38,11 +38,13 @@ const verifierRetryAfterSeconds = "360"
 func (h *Handler) ChangePassword(c echo.Context) error {
 	u := middleware.GetUser(c)
 	var req struct {
-		CurrentPassword string `json:"currentPassword"`
-		NewPassword     string `json:"newPassword"`
-		Token           string `json:"token"`
+		CurrentPassword *string `json:"currentPassword"`
+		NewPassword     string  `json:"newPassword"`
+		Token           string  `json:"token"`
 	}
-	if err := c.Bind(&req); err != nil || req.CurrentPassword == "" || req.NewPassword == "" {
+	// 空のcurrentPasswordは照合に通し、「パスワードが違う」で返す。本家は空でも
+	// bcrypt.compareに渡す(一致しないので500)。キーが無いものは本家も400(#3851)。
+	if err := c.Bind(&req); err != nil || req.CurrentPassword == nil || req.NewPassword == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "currentPassword and newPassword are required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 
@@ -87,7 +89,7 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 	if !ok {
 		return nil
 	}
-	scheme, outcome := password.Verify(c.Request().Context(), *profile.Password, req.CurrentPassword)
+	scheme, outcome := password.Verify(c.Request().Context(), *profile.Password, *req.CurrentPassword)
 	if outcome == password.OutcomeUnavailable {
 		// 照合していないので失敗として数えない。
 		attempt.Release(context.WithoutCancel(c.Request().Context()))
@@ -104,9 +106,8 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 			"userId", u.ID, "profile", password.ProfileForLog(*profile.Password))
 	}
 	if !outcome.OK() {
-		// upstream Misskey TS は raw `throw new Error('authentication failed')` を
-		// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため
-		// 400 INCORRECT_PASSWORD に揃える。
+		// upstream は素の `throw new Error('authentication failed')` で、ApiCallService が
+		// 500 INTERNAL_ERROR に包む。Elythia は理由が伝わるよう 400 INCORRECT_PASSWORD を返す。
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 	attempt.Release(context.WithoutCancel(c.Request().Context()))
@@ -114,7 +115,7 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 	// bcrypt は 73 byte 以上の password で ErrPasswordTooLong を返す。Node 側
 	// (upstream Misskey TS) は silent truncation するが、Go では error で
 	// 弾かれて空 hash が DB に書かれてしまうため明示的に 400 にする (#1075)。
-	hash, err := password.Hash(req.NewPassword)
+	hash, err := h.passwordHasher.Hash(req.NewPassword)
 	if err != nil {
 		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
 			return c.JSON(http.StatusBadRequest, apierr.Error("PASSWORD_TOO_LONG", "Password is too long.", "f2e62243-b80a-43e4-9b17-329b422deded"))
@@ -164,10 +165,12 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 	}
 
 	var req struct {
-		Password string `json:"password"`
-		Token    string `json:"token"`
+		Password *string `json:"password"`
+		Token    string  `json:"token"`
 	}
-	if err := c.Bind(&req); err != nil || req.Password == "" {
+	// 空のpasswordは照合に通し、「パスワードが違う」で返す。本家は空でも
+	// bcrypt.compareに渡す(一致しないので500)。キーが無いものは本家も400(#3851)。
+	if err := c.Bind(&req); err != nil || req.Password == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "password is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 
@@ -200,10 +203,10 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 		}
 	}()
 
-	// upstream Misskey TS は raw `throw new Error('incorrect password')` を
-	// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため 401
-	// に揃える (旧 mk-go は 403 を返していた)。
-	if !h.comparePassword(c, u.ID, *profile.Password, req.Password, "932c904e-9460-45b7-9ce6-7ed33be7eb2c") {
+	// upstream は素の `throw new Error('incorrect password')` で、ApiCallService が
+	// 500 INTERNAL_ERROR に包む。Elythia は理由が伝わるよう 400 INCORRECT_PASSWORD を
+	// 返す (comparePassword)。
+	if !h.comparePassword(c, u.ID, *profile.Password, *req.Password, "932c904e-9460-45b7-9ce6-7ed33be7eb2c") {
 		return nil
 	}
 
@@ -355,11 +358,11 @@ func (h *Handler) isProtectedSelfDelete(u *model.User) (bool, error) {
 func (h *Handler) Favorites(c echo.Context) error {
 	u := middleware.GetUser(c)
 	var req struct {
-		Limit     *int   `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid parameters.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
@@ -368,11 +371,11 @@ func (h *Handler) Favorites(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -389,11 +392,11 @@ func (h *Handler) Favorites(c echo.Context) error {
 			notes = append(notes, f.Note)
 		}
 	}
-	packed := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	packed := h.entityPacker.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	// /api/i/favorites は認証 path なので u が viewer。pinned notes と同じく
 	// 自分の myReaction / Channel / Files を埋める (#426)。
 	h.fieldRes.Apply(packed, u)
-	notehide.HideStoredNotes(u, packed)
+	h.noteHider.HideStoredNotes(u, packed)
 	byID := make(map[string]*entity.NoteEntity, len(packed))
 	for i := range packed {
 		byID[packed[i].ID] = &packed[i]
@@ -422,9 +425,12 @@ func (h *Handler) Favorites(c echo.Context) error {
 func (h *Handler) RegenerateToken(c echo.Context) error {
 	u := middleware.GetUser(c)
 	var req struct {
-		Password string `json:"password"`
+		Password *string `json:"password"`
+		Token    string  `json:"token"`
 	}
-	if err := c.Bind(&req); err != nil || req.Password == "" {
+	// 空のpasswordは照合に通し、「パスワードが違う」で返す。本家は空でも
+	// bcrypt.compareに渡す(一致しないので500)。キーが無いものは本家も400(#3851)。
+	if err := c.Bind(&req); err != nil || req.Password == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "password is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 
@@ -437,10 +443,34 @@ func (h *Handler) RegenerateToken(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "No password set.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 	}
 
-	// upstream Misskey TS は raw `throw new Error('incorrect password')` を
-	// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため 401
-	// に揃える (旧 mk-go は 403 を返していた)。
-	if !h.comparePassword(c, u.ID, *profile.Password, req.Password, "932c904e-9460-45b7-9ce6-7ed33be7eb2c") {
+	// 2FA gate: frontend の認証ダイアログは 2FA 有効なユーザーに TOTP コードも
+	// 求めて token として送る。password だけで通すと、その入力が検証されない
+	// ままになるので、i/change-password / i/delete-account と同じ形で検証する。
+	// 2FA 無効のユーザーは従来どおり token を見ない。
+	//
+	// **順序は他の 2FA gate と同じ (token → password)。** wrong-password +
+	// wrong-token の error code を INVALID_TOKEN に揃えるため。
+	//
+	// **消費は token を書き換えてから確定させる** (#2852)。password の打ち間違い
+	// や書き込みの失敗でバックアップコードを焼かない。
+	var use twoFAUse
+	if profile.TwoFactorEnabled {
+		var ok bool
+		if use, ok = h.check2FAToken(c.Request().Context(), profile, req.Token); !ok {
+			return c.JSON(http.StatusForbidden, apierr.InvalidToken())
+		}
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			use.Rollback()
+		}
+	}()
+
+	// upstream は素の `throw new Error('incorrect password')` で、ApiCallService が
+	// 500 INTERNAL_ERROR に包む。Elythia は理由が伝わるよう 400 INCORRECT_PASSWORD を
+	// 返す (comparePassword)。
+	if !h.comparePassword(c, u.ID, *profile.Password, *req.Password, "932c904e-9460-45b7-9ce6-7ed33be7eb2c") {
 		return nil
 	}
 
@@ -453,12 +483,16 @@ func (h *Handler) RegenerateToken(c echo.Context) error {
 	if err := h.userService.UpdateUserFields(u.ID, map[string]any{"token": newToken}); err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
+	// **token を書き換えられてから確定する。** 先に確定すると、書き込みに
+	// 失敗したときに何も変わっていないのに 2FA だけ焼ける。
+	_ = use.Commit()
+	committed = true
 	// 旧 token が auth middleware の cache で生き残ると regenerate の主目的
 	// (= 旧 token 失効) が機能しない (#884)。invalidator が wire されている
 	// 場合は old token entry を即時削除する。production では router で必ず
 	// wire される。
 	if h.authInvalidator != nil && oldToken != "" {
-		h.authInvalidator.InvalidateToken(oldToken)
+		h.authInvalidator.InvalidateUserToken(u.ID, oldToken)
 	}
 	// TS本家 regenerate-token.ts:60 と同じく、token再生成成功後にmainへ
 	// publishする。body無し(type のみで、他セッションはtoken無効化を

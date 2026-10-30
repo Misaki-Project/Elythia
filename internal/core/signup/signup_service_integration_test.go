@@ -10,11 +10,13 @@ import (
 
 	"github.com/elythia-network/elythia/internal/core/signup"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/password"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -61,12 +63,38 @@ func newTxService(t *testing.T, db *gorm.DB) *signup.Service {
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
 
-	svc := signup.NewService(userRepo, metaRepo, idGen)
+	svc := signup.NewService(userRepo, metaRepo, idGen, db, ticketRepo, repository.NewSignupApplicationRepository(db))
 	svc.SetUserPendingRepo(pendingRepo)
-	svc.SetTicketRepo(ticketRepo)
-	svc.SetSignupApplicationRepo(repository.NewSignupApplicationRepository(db))
-	svc.SetDB(db)
 	return svc
+}
+
+// Explicit pending survives email confirmation and does not create federation keys.
+func TestPromotePending_PreservesExplicitFederationStatusWithoutKeys(t *testing.T) {
+	db := integrationDB(t)
+	const prefix = "itfed_"
+	defer cleanupSignupRows(t, db, prefix)
+	svc := newTxService(t, db)
+	row, err := svc.CreatePendingWithFederationStatus(prefix+"alice", "alice@it.example", "pw123", nil, nil, model.FederationStatusPending)
+	require.NoError(t, err)
+	assert.Equal(t, model.FederationStatusPending, row.FederationStatus)
+	result, err := svc.PromotePending(row.Code)
+	require.NoError(t, err)
+	assert.Equal(t, model.FederationStatusPending, result.User.FederationStatus)
+	var rsaCount, edCount int64
+	require.NoError(t, db.Model(&model.UserKeypair{}).Where(`"userId" = ?`, result.User.ID).Count(&rsaCount).Error)
+	require.NoError(t, db.Model(&model.UserKeypairExtra{}).Where(`"userId" = ?`, result.User.ID).Count(&edCount).Error)
+	assert.Zero(t, rsaCount)
+	assert.Zero(t, edCount)
+}
+
+// Omitting the status preserves the historic default-on behavior.
+func TestCreatePending_DefaultFederationStatusIsOn(t *testing.T) {
+	db := integrationDB(t)
+	const prefix = "itfeddefault_"
+	defer cleanupSignupRows(t, db, prefix)
+	row, err := newTxService(t, db).CreatePending(prefix+"alice", "alice@it.example", "pw123", nil)
+	require.NoError(t, err)
+	assert.Equal(t, model.FederationStatusOn, row.FederationStatus)
 }
 
 // invitation 経由で pending を作成し、PromotePending が ticket を消費する
@@ -335,12 +363,10 @@ func TestPromotePending_TxTicketRepoGenericError(t *testing.T) {
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
 
-	svc := signup.NewService(userRepo, metaRepo, idGen)
-	svc.SetUserPendingRepo(pendingRepo)
-	svc.SetTicketRepo(&errorTicketRepo{
+	svc := signup.NewService(userRepo, metaRepo, idGen, db, &errorTicketRepo{
 		err: errors.New("simulated DB error"),
-	})
-	svc.SetDB(db)
+	}, nil)
+	svc.SetUserPendingRepo(pendingRepo)
 
 	tid := prefix + "tid"
 	row, err := svc.CreatePending(prefix+"err", "err@it.example", "pw", &tid)
@@ -607,6 +633,31 @@ func TestPromotePending_ApplicationRecordsConsumedTicket(t *testing.T) {
 	assert.Equal(t, ticketID, *stored.TicketID, "消費した ticket を申請に残す")
 }
 
+// 申請経由の登録も、配線したHasherのcostでハッシュする(#3780)。
+func TestSignupForApplication_UsesWiredHasher(t *testing.T) {
+	db := integrationDB(t)
+	const prefix = "itphs_"
+	defer cleanupSignupRows(t, db, prefix)
+	defer db.Exec(`DELETE FROM "signup_application" WHERE id LIKE ?`, prefix+"%")
+
+	const configured = bcrypt.MinCost + 1
+	hasher, err := password.NewHasher(configured)
+	require.NoError(t, err)
+	svc := newTxService(t, db)
+	svc.SetPasswordHasher(hasher)
+	app := insertApprovedApplication(t, db, prefix+"app1")
+
+	res, err := svc.SignupForApplication(prefix+"user", "hunter22", app.ID, "")
+	require.NoError(t, err)
+
+	var profile model.UserProfile
+	require.NoError(t, db.Where(`"userId" = ?`, res.User.ID).First(&profile).Error)
+	require.NotNil(t, profile.Password)
+	cost, err := bcrypt.Cost([]byte(*profile.Password))
+	require.NoError(t, err)
+	assert.Equal(t, configured, cost)
+}
+
 // **1 つの承認から作れるアカウントは 1 つ。** 承認済みの申請者が別々の username で
 // 同時に登録すると、状態確認とアカウント作成が別々なら両方が「承認済み」を読んで
 // 両方作れてしまう。申請行を掴んだまま作れば負けた側は巻き戻る (#2580)。
@@ -741,7 +792,7 @@ func TestSignupForApplication_FallsBackWithoutTxWiring(t *testing.T) {
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := signup.NewService(userRepo, metaRepo, idGen)
+	svc := signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil)
 
 	res, err := svc.SignupForApplication(prefix+"u", "hunter22", "no-such-app", "")
 	require.NoError(t, err)
@@ -811,11 +862,9 @@ func newTxServiceWithMeta(t *testing.T, db *gorm.DB, meta *model.Meta) *signup.S
 	idGen, _ := id.NewGenerator("aidx")
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = meta
-	svc := signup.NewService(repository.NewUserRepository(db), metaRepo, idGen)
+	svc := signup.NewService(repository.NewUserRepository(db), metaRepo, idGen, db,
+		repository.NewRegistrationTicketRepository(db), repository.NewSignupApplicationRepository(db))
 	svc.SetUserPendingRepo(repository.NewUserPendingRepository(db))
-	svc.SetTicketRepo(repository.NewRegistrationTicketRepository(db))
-	svc.SetSignupApplicationRepo(repository.NewSignupApplicationRepository(db))
-	svc.SetDB(db)
 	return svc
 }
 

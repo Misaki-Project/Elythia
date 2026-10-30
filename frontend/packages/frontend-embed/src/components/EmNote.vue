@@ -106,7 +106,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <script lang="ts" setup>
 import { computed, inject, ref, shallowRef } from 'vue';
-import * as mfm from 'mfm-js';
+import * as mfm from '@/utility/mfm.js';
 import * as Misskey from 'misskey-js';
 import { shouldCollapsed } from '@@/js/collapsed.js';
 import { url } from '@@/js/config.js';
@@ -123,7 +123,7 @@ import EmA from '@/components/EmA.vue';
 import EmAvatar from '@/components/EmAvatar.vue';
 import EmUserName from '@/components/EmUserName.vue';
 import EmTime from '@/components/EmTime.vue';
-import { userPage } from '@/utils.js';
+import { userPage } from '@@/js/user.js';
 import { i18n } from '@/i18n.js';
 
 function getAppearNote(note: Misskey.entities.Note) {

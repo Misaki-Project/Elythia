@@ -14,11 +14,16 @@ import (
 // 本家 ReversiService の publish パターンと同じ。
 type ReversiGamePublisher struct {
 	pub PubSubPublisher
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。構築子の必須の引数で受ける (#3827)。
+	entityPacker *entity.Packer
 }
 
-// NewReversiGamePublisher constructs a ReversiGamePublisher.
-func NewReversiGamePublisher(pub PubSubPublisher) *ReversiGamePublisher {
-	return &ReversiGamePublisher{pub: pub}
+// NewReversiGamePublisher constructs a ReversiGamePublisher. entityPacker is
+// the Packer it packs users with (#3794). 無いと avatarUrl などを生のまま返し、
+// 閲覧者の IP がリモートへ漏れるので、構築子の必須の引数で受ける (#3827)。
+func NewReversiGamePublisher(pub PubSubPublisher, entityPacker *entity.Packer) *ReversiGamePublisher {
+	return &ReversiGamePublisher{pub: pub, entityPacker: entityPacker}
 }
 
 // PublishGameEvent implements core/reversi.GamePublisher.
@@ -50,7 +55,7 @@ func (p *ReversiGamePublisher) PublishInvited(targetUserID string, inviter *mode
 	env := map[string]any{
 		"type": "invited",
 		"body": map[string]any{
-			"user": entity.PackUserLite(inviter),
+			"user": p.entityPacker.PackUserLite(inviter),
 		},
 	}
 	raw, err := json.Marshal(env)

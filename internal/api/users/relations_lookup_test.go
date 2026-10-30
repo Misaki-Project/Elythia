@@ -53,10 +53,10 @@ func newRelationsLookupHandler(t *testing.T) (*Handler, *countingRemoteResolver)
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	resolver := &countingRemoteResolver{repo: userRepo}
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
 	svc.SetRemoteUserResolver(resolver)
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	h := NewHandler(svc, fSvc, noteRepo, idGen)
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	h.SetFollowingRepo(fRepo)
 	h.SetFollowRequestRepo(frRepo)
 	return h, resolver

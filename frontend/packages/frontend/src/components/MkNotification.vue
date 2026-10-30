@@ -299,8 +299,8 @@ import MkReactionIcon from '@/components/MkReactionIcon.vue';
 import MkButton from '@/components/MkButton.vue';
 import MkFollowButton from '@/components/MkFollowButton.vue';
 import { getNoteSummary } from '@/utility/get-note-summary.js';
-import { notePage } from '@/filters/note.js';
-import { userPage } from '@/filters/user.js';
+import { notePage } from '@@/js/note.js';
+import { userPage } from '@@/js/user.js';
 import { i18n } from '@/i18n.js';
 import { misskeyApi } from '@/utility/misskey-api.js';
 import { ensureSignin } from '@/i.js';
@@ -356,8 +356,7 @@ function getActualReactedUsersCount(notification: Misskey.entities.Notification)
  *
  * misskey-js の autogen 型は upstream の通知タイプしか知らないので、
  * `notification.type === 'abuseReport'` と直接書くと型エラーになる。
- * 実行時は素の文字列比較で足りるため、ここで 1 箇所に閉じ込める
- * (mk-go 独自 endpoint を `as never` で呼ぶのと同じ理由)。
+ * 実行時は素の文字列比較で足りるため、ここで 1 箇所に閉じ込める。
  */
 function isMkGoType(notification: Misskey.entities.Notification, type: string): boolean {
 	return (notification as { type: string }).type === type;

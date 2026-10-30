@@ -118,7 +118,7 @@ jobs:
 
   # 各shardは並列に走るが、checkは `test-shards (N)` という名前で個別に登録される。
   # ブランチ保護が `test` という名前のcheckを要求するため、後段の `test` job が
-  # 全shardを束ねて単一の `test` checkを公開する (needs: test-shards)。
+  # 全shardと bench-helpers を束ねて単一の `test` checkを公開する。
   test-shards:
     runs-on: ubuntu-latest
 
@@ -161,6 +161,11 @@ jobs:
       TEST_DB_SSLMODE: disable
       TEST_REDIS_HOST: localhost
       TEST_REDIS_PORT: 6379
+      # internal/server の TestMain は、PostgreSQL に繋がらないと DB を使うテストを
+      # skip する。skip は成功扱いなので、サーバーを組み立てるテスト (ルートを見る
+      # ゲートなど、#3890) ごと無検証で緑になる。この変数があると skip せずに
+      # 落ちる (plugin-tests の MK_PLUGIN_TESTS_REQUIRE_DB と同じ形)。
+      MK_SERVER_TESTS_REQUIRE_DB: "1"
       SHARD_INDEX: ${{ matrix.shard }}
       SHARD_TOTAL: 4
 
@@ -206,10 +211,11 @@ jobs:
       # **seedは実測で選ぶこと。** 覚えやすい値 (issue番号など) を置くと、
       # 検出力を持たない値を引く。#2795で実測したところ、restoreを無効化した
       # 変異が落ちるseedは12個中7個だけだった (2795自身は落ちない側)。
-      # 3は最も強く6テストが落ちる。変えるときは
-      # `internal/server/global_state_test.go`のrestoreProcessGlobalsの
-      # cleanup本体を`if true { return }`で潰し、その状態で落ちることを
-      # 確認してから差し替える。
+      # 3は最も強く6テストが落ちる。この測り方で潰したrestoreProcessGlobals
+      # は、戻すプロセス共有の状態が無くなったので#3803で消した。変えるときは、
+      # 共有の状態を戻すテストの`t.Cleanup`を外すなどの順序に依存する変異を
+      # 入れ、その状態で落ちることを確認してから差し替える (落ちない変異では
+      # seedの検出力を測れないので、落ちる変異を先に探す)。
       - name: Run tests with coverage
         run: |
           set -o pipefail
@@ -249,19 +255,29 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-shard-${{ matrix.shard }}
           path: coverage-shard-${{ matrix.shard }}.out
           if-no-files-found: ignore
 
-  # ブランチ保護が要求する `test` check を満たすためのaggregator。全shardの結果を
-  # `needs.test-shards.result` で集約し、いずれかが失敗したらこのjob自体を失敗
-  # させる。`if: always()` を付けないとshard失敗時にskipされ "test" check が
-  # 完了状態にならない。
+  # Go の test-shards では実行しない Python/Bash のベンチ補助テスト。
+  bench-helpers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test benchmark helper contracts
+        run: python3 -m unittest discover -s tests/bench/queue/common -p 'test_*.py' -v
+
+      - name: Test A/B benchmark helper safety
+        run: bash tests/bench/ab/test_run_helpers.sh
+
+  # ブランチ保護で必要な `test` check を満たす集約 job。全 shard と bench-helpers の
+  # 結果を集約する。依存先の失敗後も実行するため `if: always()` が必要。
   test:
     runs-on: ubuntu-latest
-    needs: test-shards
+    needs: [test-shards, bench-helpers]
     if: always()
     steps:
       - name: Verify all shards passed
@@ -271,6 +287,14 @@ jobs:
             exit 1
           fi
           echo "All test shards passed"
+
+      - name: Verify benchmark helper tests passed
+        run: |
+          if [ "${{ needs.bench-helpers.result }}" != "success" ]; then
+            echo "bench-helpers result: ${{ needs.bench-helpers.result }}"
+            exit 1
+          fi
+          echo "Benchmark helper tests passed"
 
   # 同梱プラグインのテストを実行する (#2588)。
   #

@@ -104,7 +104,7 @@ func TestDeliverProcessor_RecordEd25519Accepted(t *testing.T) {
 
 func TestDeliverProcessor_SetSignatureCapabilityRecorder(t *testing.T) {
 	recorder := newInternalCapabilityRecorder()
-	p := NewDeliverProcessor(nil)
+	p := NewDeliverProcessor(nil, nil, nil, nil, nil, nil)
 	p.SetSignatureCapabilityRecorder(recorder)
 	p.recordEd25519Accepted("remote.example")
 	require.Equal(t, []string{"remote.example"}, recorder.edHosts)
@@ -112,7 +112,7 @@ func TestDeliverProcessor_SetSignatureCapabilityRecorder(t *testing.T) {
 
 func TestInboxProcessor_SetSignatureCapabilityRecorder(t *testing.T) {
 	recorder := newInternalCapabilityRecorder()
-	p := NewInboxProcessor(nil)
+	p := NewInboxProcessor(nil, nil, nil, nil, nil, nil)
 	p.SetSignatureCapabilityRecorder(recorder)
 	host := "remote.example"
 	p.recordSignatureCapability(&model.User{Host: &host}, activitypub.KeyTypeRSA, nil)

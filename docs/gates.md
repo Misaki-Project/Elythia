@@ -12,13 +12,12 @@
 |---|---|
 | `shapecheck` | レスポンス形状の drift を検査 |
 | `errorid-check` | error id / HTTP status / kind の drift を検査 |
-| `limitspec-check` | ページネーションの default / max の drift を検査 |
 | `perm-check` | router middleware の権限が upstream より緩くないか検査 |
 | `wiring-check` | router で配線が必要なものが外れていないか検査 |
-| `catalog-check` | システムカタログのクエリが schema で絞られているか検査 |
+| `catalog-check` | システムカタログのクエリが schema で絞られ、indexdef を WHERE に書いていないか検査 |
 | `notfound-check` | repository の lookup error を種別を見ずに 4xx にしていないか検査 |
 | `nulparam-check` | 列に入らない値 (NUL) が SQL の bind parameter に載らないか検査 |
-| `compose-check` | 配布する compose のログの上限と、検証用 compose の置き場所・相対パス・name: を検査 |
+| `compose-check` | 配布する compose のログの上限と、検証用 compose の置き場所・相対パス・name:、ベンチの postgres の設定を検査 |
 | `testflags-check` | make test が CI と同じテスト条件で走るか検査 |
 | `migrationdoc-check` | migration の本数を述べた doc が実態と合っているか検査 |
 | `mdtable-check` | md の表の各行がヘッダと同じ列数か検査 (溢れたセルは描画時に捨てられる) |
@@ -29,7 +28,269 @@
 | `ipshape-check` | レスポンス / 連合の shape に IP が出ていないか検査 |
 | `iprecord-check` | 利用者の IP を記録する call site が allowlist の外に増えていないか検査 |
 | `sqlbind-check` | 値をクォート内へ差し込まずバインドしているか検査 |
+| `cachelist-check` | 同期の部品を持つ型と変数が、キャッシュの一覧への登録か理由付きの除外に分類されているか検査 |
 | `gaterun-check` | gates の -run が名指しするテストが実在するか検査 |
+
+## `internal/server` のソースを読むゲート (#3672)
+
+`perm-check` / `errorid-check` / `wiring-check` と、`internal/server` の
+ソースを読むテストは、**`git ls-files` で列挙した `internal/server` 直下の非テストの `.go` を
+全部読む**。`router.go` のような 1 つのファイルを名指ししない。組み立てのコード
+(`setupRoutes`) を別のファイルへ移すたびに、ゲートが「抽出が 0 件」で落ちて直すことに
+ならないようにするため (#3666 の部品化の前提)。`internal/server/middleware` は別の
+パッケージで、route の登録も配線も持たないので読まない。
+
+新しくゲートを書くときも、ファイル名ではなく次のヘルパーを通す。
+
+| パッケージ | ヘルパー | 返すもの |
+|---|---|---|
+| `internal/entitycompat` | `serverSources` / `serverSourcePaths` | 列挙したファイルの本文 / 絶対パス |
+| `internal/entitycompat` | `parseServerFiles` / `inspectServerFiles` | 1 つの `FileSet` に載せた構文木と、その全ファイルの走査 |
+| `internal/entitycompat` | `assertWired(t, serverPkg, ...)` | 全ファイルの配線の集合に、その配線があるか |
+| `internal/entitycompat` | `assertRouteRegisteredBy(t, file, fn, route, ...)` | /api のルートの行が `routes_<領域>.go` の登録の関数 `fn` にあり、`setupRoutes()` がその関数に、引数と同じ名前の変数を渡して 1 回だけ呼んでいるか (#3697) |
+| `internal/entitycompat` | `sectionDepsAliases(files)` | `setupRoutes()` から切り出した節 (`wire…`) が、受け取った値を同じ名前で受け直す文 (`x := d.x`)。`:=` の右辺で作り方を見るゲートは、この文を数えない (#3901、docs/architecture.md 4.2) |
+| `internal/server` | `packageSources` / `packageSourceWithoutComments` | 列挙したファイルの本文 / コメントを落として改行でつないだ本文 |
+| `internal/server` | `assembledSetupRoutes` | `setupRoutes()` の節 (`wire…`) の呼び出しを、節の本文に置き換えた `setupRoutes()`。本文の直下の文を見るテストが使う。順序は本文の添字で比べる (#3901、docs/architecture.md 4.2) |
+
+ルートを解析するヘルパー (`parseRoutes` / `parseRouteRegistrations` / `parseRouteLevels` /
+`parseGetRoutes` / `scanInlineRoutes` / `countInlineHandlers` / `countCriticalWiringEntries`) は
+可変長でファイルを受け取るので、fixture を渡すテストは 1 ファイルでも複数ファイルでも書ける。
+
+### handler の package は型で引く
+
+error id / kind / status / limit とパスワードの rate limit のゲートは、route の handler
+(`recv.Method`) の受け手から `internal/api` の package を引き、そのパッケージのソースと
+突き合わせる。受け手は `collectRoutes` が **Go のスコープと型で** 引く。
+
+1. route を囲むブロック (内側から): `{}`、if / for / switch の初期化、range、case、関数の
+   引数。ブロックの中では route より前の宣言だけを見る。宣言の右辺は、宣言の位置で引く。
+   宣言が見つかったら、型が分からなくても外側へは行かない
+2. パッケージのトップレベルの `var` (どのファイルでもよい。Go と同じ)
+
+**同じ関数の中で同じ名前の宣言 (`:=` / `var` / 引数 / range / type switch) が 2 つ以上あり、
+引いた型が食い違う (引けないものが混じる) ときは「引けない」に倒す。** `=` の代入は数えない
+(Go では `=` で静的な型は変わらず、別の型の値を入れると compile が通らない。数えると、
+wrapper に通して入れ直すような正当な形まで落ちる)。 `{ h := ah ... } { h := ch ... }` のように、ブロックごとに
+同じ名前を別の handler に使う形は、解決を誤ると antennas の route を clips のメソッドとして
+検査する (敵対的レビュー 2 周目で、実際の router.go の antennas 6 本と clips 11 本をこの形へ
+移して実測。引けない側に倒した今は TestAPIRouteHandlersResolve が 17 本を落とす)。ブロックの
+規則を読み違えても、黙って別の package に解決しないための保険で、名前を分ければ通る。
+
+**`go/types` で型検査しない理由。** internal/server の import 先 (約 930 package) の export
+data が要る。`go list -export` は、キャッシュが冷えていると 8 コアで 38 秒 (CPU 3 分 50 秒)
+かかった。CI の test は `-race` と `-cover` で build するので、`-race` 無しの export data は
+キャッシュに無く、毎回この compile が走る。`go list -race -export` なら test の build が
+温めた export data を使えるが、それでも entitycompat が入る shard の package を `-race -cover`
+で build した後に約 18 秒 (8 コアで 17.6 秒。internal/server の shard の後なら 6.7 秒) かかった
+(敵対的レビュー 3 周目の実測)。fixture を型検査が通る形に書き直す手間もある。
+
+型は、引数や `var` の型、`pkg.NewX(...)`、`&pkg.T{}` / `pkg.T{}`、同じパッケージの関数や
+メソッドの戻り値の型、同じパッケージの構造体のフィールドの型から引く。メソッドの戻り値は、
+受け手の型を同じパッケージの型として引けたときだけ使う (他の package の値の `m.Handler()` を、
+同じ名前のローカルのメソッドと取り違えないため)。
+`func registerNotesRoutes(api apiRoutes, h *notes.Handler)` のように handler を引数で
+受け取る形も、`iHandler, _ := s.buildAccount()` のように戻り値で受け取る形も、
+`h.notes.Create` のように構造体で持つ形も解決する。`setupRoutes()` の別名
+(`usersHandler := hSvcs.users`。`hSvcs` は `s.buildHandlers(...)` の戻り値の構造体、#3694) も
+解決する。この形は route の受け手から構造体のフィールドの型までを辿るのに 9 段の再帰が要るので、
+辿る深さの上限 (`maxResolveDepth`) を 8 から 16 に上げた (8 のままだと、解決できる /api の
+route が 280 本に落ちた)。
+
+**名前の表で引いてはいけない。** #3672 の 1 回目の実装は `h := pkg.NewX(...)` の名前の表を
+他のファイルへ落として引いたので、段階 2 で普通に書く `registerNotesRoutes(api apiRoutes,
+h *notes.Handler)` の `h` を、別のファイルの `h := pluginsecrets.New(...)` と取り違えた
+(敵対的レビューで実測。notes の 37 本の route が pluginsecrets のメソッドとして解決され、
+全テストが緑のまま notes の error id が検査から外れた)。引数名を表に無い名前にすると、
+37 本が黙って解決されなくなった。
+
+**解決できない /api の route は 0 本に保つ** (`TestAPIRouteHandlersResolve`)。`/api` の group
+(`api` という名前か `apiRoutes` 型の値) と、そこから `.Group(...)` で作った group に登録した
+route (GET / POST / PUT / DELETE。`api.Match` の chart は含まない) について、(a) handler が
+`x.Method` の形でない、(b) 受け手の型を引けない、(c) 引いた先が `internal/api` の外、
+(d) 引いた先のパッケージにそのメソッドが無い、のどれかなら落とす。正当に残すものは
+`apiRouteResolveAllowlist` に「どの経路で出るか」を書く (今は空。使われていない項目も落とす)。
+#3672 の時点で 528 本がすべて解決する (数え方: `collectRoutes` が拾った
+`X.<METHOD>("/path", ...)` の登録 589 本のうち、上の group に登録したもの。残りの 61 本は
+`s.echo` や pprof の group に登録した /api の外の route で、対象外)。
+
+### ファイルをまたぐときの決まり
+
+- **下限は名指しで置く。** 列挙は `server.go` と `wiring_check.go` を返さなければ落ちる。
+  各ゲートの下限 (`emojis` の GET、`recordCriticalWiring` の呼び出しなど) は従来どおり
+- **closure の束縛、group の変数、method の一覧の変数は、同じファイルの中でだけ引く。**
+  別のファイルの同名の変数は別物
+- **どれを検査するか決まらない形は落とす。** 同じ method と endpoint を 2 つのファイルが
+  登録している、`recordCriticalWiring` が 2 回呼ばれている、`api := apiRoutes{...}` や
+  `/instance-info/:host` の登録が 2 つある、のいずれか。**GET と POST で同じ endpoint を
+  登録しているもの (`emojis` など) は、別々のファイルに分けてよい** (method を鍵に含める)
+- **順序や変数名で突き合わせる検査は、同じファイルにあることを要求する。** offset はファイルの
+  中でだけ意味を持つ (`HideAppUserWithoutRead` の順序)。名前が同じでも別のファイルの変数は
+  同じ instance とは言えない (push の購読のキャッシュ)。例外は `setupRoutes()` の節 (`wire…`) が
+  受け直した名前で、`setupRoutes()` の同じ名前の変数として数える (#3901)
+- **コメントの中の登録は数えない。** 別のファイルのコメントに書いた `api.POST(...)` の例で
+  「両方が登録している」と落ちないようにするため
+- **報告はファイル名と行の組で出す。** 構文木は 1 つの `FileSet` に repository からの
+  相対パスで載せる
+- **/api のルートは `routes_<領域>.go` の `register…Routes(api apiRoutes, …)` で登録し、行に出る
+  名前は関数の引数の名前にする (#3697)。** 引数の名前は `setupRoutes()` の変数の名前と揃え、
+  `setupRoutes()` は同じ名前の変数を渡す。ルートの行を文字列で照合するゲートは、行だけでなく
+  関数と呼び出しまで照合する (`assertRouteRegisteredBy`)。形は `internal/server` の
+  `routes_registrars_test.go` が見る (呼び出しの位置と回数、引数の名前、書き換えていないこと、
+  登録の関数の外で `api` に登録していないこと。docs/architecture.md 4.2)
+- **`setupRoutes()` の範囲を切り出した節 (`wire…`) は、範囲より前の名前を同じ名前で受け直す
+  (#3901)。** 移した文は変わらないので、文字列の照合はそのまま効く。渡す側が同じ名前の変数を
+  渡すことは、`internal/server` の `TestSetupRoutesSectionsReceiveSameNamedVariables` が見る
+  (docs/architecture.md 4.2)
+- **`git add` していない `.go` は読まれない。** 手元と CI で結果はずれないが、`go build` は
+  通るので気付きにくい。列挙するテストが落ちたときは、`internal/server` の未追跡の `.go` の
+  名前をログに出す
+
+**/api のルートの登録は `routes_<領域>.go` に、ほかの配線はほぼ `router.go` にある (#3697)。**
+読む範囲を `router.go` だけに戻すと、ルートを読むゲートは「抽出が 0 件」や下限で落ちるが、
+配線のゲートの多くは緑のまま通る。読む範囲と、ファイルをまたぐ決まりそのものは、2 ファイルの
+fixture を使うテストが見ている (`internal/entitycompat` のものは `make wiring-check` で回る。
+`internal/server` の `TestPackageSourcesCoverEveryFile` / `TestProcessGlobalSettersReadEveryFile` /
+`TestJoinWithoutCommentsSeparatesFiles` / `TestAPIGroupPrefixesFindsEveryLine` は `make check` で回る)。
+
+**既知の限界 (スコープ)**: ローカルの変数が import の名前を隠す形 (`notes := &factory{};
+h := notes.NewHandler()`) は、import の `notes` の constructor とみなす。関数の中で宣言した型が
+パッケージの同じ名前の型を隠す形も、パッケージの型で引く。どちらも黙って別の package に
+解決しうるが、段階 2 で書く見込みは低いので直していない (敵対的レビュー 3 周目の Y17 / Y20)。
+go/types へ移せば消える。
+
+**既知の限界**: perm / secure / oauth / cacheSec と `TestAPICompatDoc_MatchesRouter` の抽出は、
+正規表現で `api.` を見る。`api` 以外の名前で group を渡すと (型が `apiRoutes` でも)、そこに
+登録した route はこれらの抽出から外れる。そのときは `TestAPICompatDoc_MatchesRouter` が
+「api-compat.md にあって internal/server に無い」で落とす (敵対的レビューで、37 本を
+`g apiRoutes` の関数へ移した形で実測。GET の route を含めると `TestCacheSecDrift` も落ちる)。
+`TestAPIRouteHandlersResolve` は型で group を見るので、この形でも handler を検査する。
+また、`api.Group(...)` で作った派生 group を `*echo.Group` 型の引数で別の関数へ渡すと、その
+関数の中の route は /api の外として扱われ、`TestAPIRouteHandlersResolve` の対象からも外れる
+(`parseRoutes` は group の前置きが抜けた path で引くので、error id の golden と照合されない)。
+#3672 の時点で /api の派生 group は `plugin_wiring.go` のプラグイン用だけで、それを引数で
+受け取るのは `registerPluginSecretRoutes` (`plugin_secrets.go`) だけ。そこの route は path を
+定数で書くので、もともとどの抽出にも載らない (プラグインの route は本家の golden に無い)。
+
+**既知の限界 (`TestAPIRegistrationsGoThroughAPIRoutes`、#3677)**: このテストは、`apiRoutes` の
+`POST` / `Match` / `GET` を通らない /api の登録 (`withParamShadow` と `requireObjectBody` が
+付かない) を、**名前の正規表現**で探す。落とすのは、普通に書いたときに踏む形 (`api.Group.POST`、
+`api.Group.Add`、`api.Add`、`api.PUT`、`"/api/..."` を書いた `s.echo.POST` など) だけである。
+次の形は拾わない。
+
+- `*echo.Group` 型の引数で受け取った group に登録する (`registerX(api.Group)` と
+  `func registerX(g *echo.Group)`)
+- `s.echo.Group("/api")` で別の group を作って登録する
+- `g := api.Group` のように別名を通して登録する
+- path の `"/api/"` を定数や変数で書いて `s.echo.POST` に渡す
+- `e := s.echo` のように echo のインスタンスを別名にして、`e.POST("/api/x", h)` と書く
+- path を raw string (`` s.echo.POST(`/api/x`, h) ``) で書く
+
+この列挙は、敵対的レビュー (#3677 の 2 周目と 3 周目) で確かめた形で、網羅ではない。
+
+許可した登録 (`apiRegistrationAllowed`) は、書いてあるファイルでだけ許す (#3697)。catchall を
+`router.go` から `routes_<領域>.go` へ移すと落ちる。1 つ目の形のうち、`register…Routes` という
+名前の関数で最初の引数を `apiRoutes` 以外にしたものは、`internal/server` の
+`TestSetupRoutesCallsEveryRouteRegistrarOnce` が落とす。名前が違う関数は、そこでも拾わない。
+
+本家の golden にある endpoint をこれらの形へ移すと、`TestAPICompatDoc_MatchesRouter` と
+`TestParamShadowChangesNoResponse` が別の理由で落とす (#3677 の敵対的レビュー 2 周目で実測)。
+`collectRoutes` の型で引く方式へ寄せることも検討した。ただし `collectRoutes` は受け手の名前が
+`api` なら /api の group そのものとみなすので、`apiRoutes` と `*echo.Group` を区別しない。
+`*echo.Group` 型の引数 (上の 1 つ目) も /api と結び付けない。どちらも足すと
+`internal/entitycompat` の解析を広げる大きさになるので、ここでは限界として書くにとどめた。
+
+## キャッシュの一覧への登録漏れ(`cachelist-check`、#3777)
+
+キャッシュの一覧(`internal/server`の`addCache`、[architecture.md 4.4](architecture.md))は、新しい
+キャッシュを足した人が登録を忘れても何も落ちなかった。実際に、`/api/emojis`の符号化済みの応答
+(`api/emojis.Handler.encoded`、#3593)が、一覧にも除外の理由にも載っていなかった。
+
+並行で共有するメモリには同期が要り、`-race`がそれを強制するので、普通に書いたキャッシュは同期の部品を
+フィールドかパッケージの変数に持つ。そこで、その形のものを全部数え、表(`cacheEntries`、
+`internal/entitycompat/cache_list_table_test.go`)で人に分類させる。
+
+- **数えるもの(`ScanCacheTypes`、`internal/entitycompat/cache_types.go`)。** `git ls-files internal plugin`で
+  列挙した非テストの`.go`の、次の4つ。#3777の時点で145件
+  - フィールドに同期の部品(`sync.Mutex`・`RWMutex`・`Map`・`Once`、`sync/atomic`の型、`singleflight.Group`、
+    golang-lruの`lru.Cache`・`expirable.LRU`)を持つ名前付きのstruct(106)。ポインタ・slice・mapの値・
+    型引数の中にあっても数える。名前の無いstructのフィールドは、外のフィールド名を前に付けて数える
+  - `DropLocal()`を持つstructで、同期の部品を持たないもの(3。`meta.Handler`など)
+  - 同じパッケージで`DropLocal()`を持つ型からフィールドの型を辿って届くstructで、同期の部品を持たず
+    mapを持つもの(5。`relationKindCache`など)。途中の型は同期の部品を持たなくてよい
+    (`role.Service`→`policyProvider`→`policyProviderRuntime`)
+  - パッケージの変数で、型が同期の部品を持つもの(31)。型は宣言から引き、無ければ値の形(`T{}`・`&T{}`・
+    `new(T)`・`make(T)`)から引く。同じパッケージの、同期の部品を持つstructの型も数える。
+    `sync.OnceFunc`・`sync.OnceValue`・`sync.OnceValues`の呼び出しで作る変数は、型を値の形から引けないが、
+    最初の結果をプロセスの間持つので`sync.Once`として数える(`metaColumnNames`など3つ)
+- **読まないもの。** testutil・plugintest、`testdata`の下、`internal/entitycompat`の`*fixture`の下と、
+  サーバーの世代の部品から使われない`internal/backup/daemon`・`internal/backup/restoreop`(importするのは
+  `internal/cli/backup`だけ)・`internal/cli`。理由は`CacheScanExcludedDirs`に書いてある。
+  `internal/backup`自体は、サーバーが`backupadmin`から使うので読む。どの除外も、追跡されたファイルに
+  1つも当たらなくなったら`TestCacheScanExclusionsAreUsed`が落とす
+- **表の行。** 種類・理由・全部のフィールドの名前(指紋)を持つ。種類は次のとおり(数は#3803の時点。`cache_list_table_test.go`で`grep -c "{kindDropLocal,"`のように種類ごとに数えた)
+  - `dropLocal`(31): `DropLocal()`を持ち、一覧に登録する
+  - `droppedByOwner`(8): 辿って届き、持ち主の`DropLocal()`が捨てるか、`DropLocal()`の後の次の読み込みで
+    置き換わる(`fedrule.compiledRule`は、集合を古いことにされて次の評価で読み直した集合に替わる)。
+    **辿って届くだけでは分類しない。**
+    `mentionFetchGuard`や`resolveGroup`のように、持ち主が捨てないものもあるため
+  - `notCache`(57): 値の写しを持たない(lock・singleflight・世代の起動と停止・数え・ジョブキューの接続・
+    コードから1回だけ組む値)
+  - `processGlobal`(1): 世代をまたいで残るパッケージの状態。残っているのはプラグインの登録(`plugin.registryMu`)だけ。
+    設定だけで決まっていたもの(bcryptのcost・testMode)は#3780で、初回セットアップの判定に使う利用者の
+    数え方(`meta.localUserCounter`)は#3782で、自分自身をMeDetailedへ昇格させるときの補完役(`meself.mu`が守っていた`enricher`)は#3784で依存として渡す形にし、表から消した。`entity`の8つのlookupとそれぞれのlockは、#3788で既定の`entity.Packer`(`defaultPacker`と、書き込みを直列にする`defaultPackerMu`)の2行にまとめ、#3800で既定のPackerを本番から消したので表からも消した(組み立てを直列にしていた`constructionMu`も、#3800で`notCache`から消した)。ローカルの利用者を一度でも見た印(`meta.setupLatch`)と、プロセスで1回だけ読んでいたfrontendのloader(`frontendutil.loaderOnce`・`embedLoaderOnce`)は、#3803で組み立てごとの値にして表から消した。印は`meta.SetupDetector`のフィールドになったので、その型を`throttle`として載せた(捨てても次のリクエストで1回数え直すだけ)
+  - `writeBuffer`(7)・`perConnection`(6)・`throttle`(6)・`contentKeyed`(5)・`perCall`(4)・
+    `followsRegistered`(2)・`reloadOnDrop`(2)
+- **指紋は全部のフィールドの名前。** 埋め込みは型の名前で、変数は名前の無いstructのフィールドと、同じ
+  `var`のブロックの他の名前(`var:<名前>`)で持つ。どのフィールドを足しても一致しなくなって落ちるので、
+  足した人が分類を確かめ直す。同期の部品やmapのフィールドだけを見ると、既にあるmutexで守る値をポインタで
+  足す形(`captcha.Service`に`metaSnap *string`を足すなど)を見逃す。`DropLocal()`を持つ型も指紋を持つ
+  ので、`Resolver`にキャッシュのmapを足しても落ちる。落ちたときの報告は、足した名前・消えた名前と、
+  表に貼れる形の新しい一覧を出す
+- **`keeps`。** `dropLocal`と`droppedByOwner`の行は、`DropLocal()`が捨てずに残す状態(実行中の読み込み、
+  取得の間引き、構築のときの登録)を、フィールドの名前と理由で持つ。`keeps`に無いフィールドの状態は、
+  `DropLocal()`が捨てるか、構築のときに決まる依存や設定。この区別は人が読んで書くもので、検査は名前が
+  フィールドにあることだけを見る
+- **種類と走査の食い違いも落とす**(`TestCacheTypesAreClassified`)。`dropLocal`の行の型に`DropLocal()`が
+  無い、`droppedByOwner`の行に届く持ち主が無い、`DropLocal()`を持つ型を他の種類で除外している、変数を
+  `dropLocal`か`droppedByOwner`にしている、のどれでも落ちる
+- **使われない行は落とす**(`TestCacheEntriesHaveNoDeadRows`)。走査が見つけなくなった行、理由の無い行、
+  `keeps`の名前がフィールドに無い行も落とす
+- **下限。** 検出の枝ごとに実在するものを名指しする(`cacheTypeLowerBounds`。`sync.Mutex`は
+  `RelationCache`、`sync.Map`は`tokenCache`、`sync/atomic`は`emojis.Handler`、`expirable.LRU`は
+  `urlpreview`の`previewCache`など)。同期の部品を持たない`DropLocal()`の型、辿って届くmapの型、全部の
+  フィールドの指紋、変数の3つの形(`versionRegexps`・`parsedCache`・`sync.OnceValue`で作る`metaColumnNames`)と同じブロックの名前も
+  名指しする(`TestCacheTypeScanFindsEveryBranch`)。importの別名・埋め込み・名前の無いstruct・型引数の
+  付いた受け手・変数の値の形は、小さなリポジトリを作って確かめる(`TestScanCacheTypesShapes`)。宣言の型が
+  名前の無いstructの変数は、実在した`setupLatch`を#3803で消したので、こちらのfixture(`declared`)で見る
+- **go/typesを使わない。** 型検査には全パッケージのexport dataが要り、`collectRoutes`
+  (`route_resolve_test.go`)と同じ理由で遅い。フィールドの型は、importの名前と同じパッケージの型名から
+  引く
+
+**一覧に実際に登録したことは、実行時に確かめる。** `internal/server`の
+`TestCaches_ListMatchesTheDropLocalTypes`(`caches_types_test.go`)が、タイムラインのJSONのキャッシュを
+有効にしてサーバーを組み、一覧にある値の型の集合が、同じ走査(`entitycompat.ScanCacheTypes`)で
+`DropLocal()`を持つとした型の集合と一致することを見る。型の一覧をどちらかに書き写すと片方だけ直して
+ずれるので、走査そのものを`internal/entitycompat`の非テストのコードに置き、`internal/server`のテストから
+呼ぶ。こちらは`make gates`ではなく`make test`で回る(サーバーの組み立てにPostgreSQLが要るため)。
+
+**限界。**
+
+- 実行時の検査は型の集合を比べるので、登録した型の2つ目の値を登録し忘れても気付けない。読み直しの
+  項目(`reloadOnDrop`)は2つが同じ型なので、名前は`TestCaches_ReloadedFromMeta`が別に見る。型引数の付いた
+  型は、`reflect`の名前に型引数が入るので一致しない(今は無い)
+- 同期の部品を別のパッケージの型に包んで持つ形(フィールドの型が`internal`の別の型)は、包む側を数えない。
+  包まれる側の型が数えられて分類される
+- 同期の部品を持たないキャッシュ(起動時に読んだ値を変数やフィールドに持つだけのもの)は、`DropLocal()`の
+  型から届くmapの型を除いて数えない。関数の戻り値で作る変数(`var c = newCache()`)と、ブロックを分けて
+  書いたパッケージのmutexとmapの組も、型や関係が構文から分からないので数えない
+- `sync.OnceValue`が返した関数(`func() T`)をstructのフィールドに持つ形は、フィールドの型が関数なので
+  見つけられない。見つけるのはパッケージの変数を、型を書かずに`sync.OnceValue`などの呼び出しで作る形
+  だけで、型を書いて宣言した変数(`var x func() T = sync.OnceValue(...)`)と、型引数を明示した呼び出し
+  (`sync.OnceValue[T](...)`)は見つけられない
+- 指紋は表に載る型のフィールドしか見ない。表に載らない同じパッケージの型(同期の部品もmapも持たず、
+  `DropLocal()`の型から届かないもの)にフィールドを足しても落ちない。たとえば`emojis.Handler.encoded`の
+  中身の`encodedEmojis`。mapやsliceの要素に使う名前の無いstructのフィールドも、指紋に入らない
+- 名前で見る走査なので、意図的な回避は振る舞いのテストで受ける(CLAUDE.md Section 4)
 
 ## 変更の経緯 (旧 CLAUDE.md の更新記録)
 

@@ -3,7 +3,6 @@
 package instance
 
 import (
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -56,6 +55,13 @@ type Service struct {
 	// path の FindByHost DB 往復を cacheTTL の間だけ省く (#1407)。
 	suspendCache map[string]suspendEntry
 	cacheTTL     time.Duration
+	// suspendInvalidated は InvalidateSuspendCache が自プロセスのキャッシュを
+	// 捨てた後に呼ぶ (#3664)。他のプロセスへ伝える配線 (core/cachebus) が入る。
+	// 書き込みの前に読む必要は無いので、配線は構築時に 1 回だけ行う。
+	suspendInvalidated func(host string)
+	// suspendGen は停止判定のキャッシュを捨てるたびに進める。DB を読んでいる
+	// 間に捨てられた判定を、読み終わった後に書き戻さないために使う。
+	suspendGen uint64
 	// requestReceivedCache は host -> 窓失効時刻 (= 最終書込 + requestReceivedWindow)。
 	// MarkRequestReceived の latestRequestReceivedAt 書込を host あたり窓内 1 回に
 	// 間引く。窓内は SELECT も UPDATE も省く。Misskey TS InboxProcessorService の
@@ -70,6 +76,16 @@ type Service struct {
 	// RecordResponseError だけ (確認済み) なので、そこで invalidate すれば整合する。
 	responseHealthyCache map[string]time.Time
 	responseHealthyTTL   time.Duration
+	// dropGen は DropLocal が受信時刻の窓を捨てるたびに進める (#3729)。DB を読んで
+	// いる間に捨てられたとき、読んだ行から作った窓を、読み終わった後に積まないために
+	// 使う。進めるのは DropLocal だけ。
+	dropGen uint64
+	// healthGen は応答の健全のキャッシュを、not-responding への遷移 (RecordResponseError、
+	// #3731) と DropLocal (#3729) で消すときに進める。回復で消す (MarkRequestReceived) とき
+	// は進めない (健全の方向へ動くので、積み直されても正しい)。DB を読んで
+	// いる間に消されたとき、読んだ行から作った「健全」を積まないために使う。積むと、
+	// 遷移の直後の成功が TTL の間 SELECT を省き、回復の UPDATE を取りこぼす。
+	healthGen uint64
 	// lastMetaWarn / metaWarnEvery は meta.Fetch 失敗 warn のレート制限用。
 	// 継続障害時に配送ごとに warn を吐かないよう間引く (#1410)。
 	lastMetaWarn  time.Time
@@ -202,6 +218,7 @@ func (s *Service) MarkRequestReceived(host string) error {
 		s.mu.Unlock()
 		return nil
 	}
+	gen := s.dropGen
 	s.mu.Unlock()
 
 	inst, err := s.repo.FindByHost(host)
@@ -222,11 +239,33 @@ func (s *Service) MarkRequestReceived(host string) error {
 	}
 	// autoSuspendedForNotResponding の instance から正当な inbound を受けたら
 	// suspensionState を none に自動復活させる (upstream の shouldUnsuspend)。
-	if inst.SuspensionState == model.SuspensionStateAutoSuspendedForNotResponding {
+	unsuspend := inst.SuspensionState == model.SuspensionStateAutoSuspendedForNotResponding
+	if unsuspend {
+		// **読んだ時点の自動の停止のままのときだけ解除する (#3731)。** 読んだ後に
+		// 管理者が手動で停止していたら、その停止を外さない。そのときは停止以外の
+		// 列だけを書く。
 		fields["suspensionState"] = string(model.SuspensionStateNone)
-	}
-	if err := s.repo.UpdateFields(host, fields); err != nil {
+		ok, err := s.repo.UpdateFieldsIf(host, model.InstanceUpdateCondition{
+			SuspensionIn: []model.SuspensionState{model.SuspensionStateAutoSuspendedForNotResponding},
+		}, fields)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			unsuspend = false
+			delete(fields, "suspensionState")
+			if err := s.repo.UpdateFields(host, fields); err != nil {
+				return err
+			}
+		}
+	} else if err := s.repo.UpdateFields(host, fields); err != nil {
 		return err
+	}
+	if unsuspend {
+		// 自動の停止の解除も、停止の側 (RecordResponseError) と同じく判定の
+		// キャッシュを捨てて全プロセスへ伝える。捨てないと、戻ってきた相手への
+		// 配送が cacheTTL の間 skip され、skip したジョブは落ちる (#3664)。
+		s.InvalidateSuspendCache(host)
 	}
 	// is-not-responding を clear したので、stale healthy-cache が回復 UPDATE を
 	// 取りこぼす逆経路を避けるため healthy-cache も整合させる。
@@ -236,6 +275,12 @@ func (s *Service) MarkRequestReceived(host string) error {
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
+	if s.dropGen != gen {
+		// 読んでいる間にキャッシュが捨てられた (#3729)。読んだ行は捨てる前のもの
+		// かもしれず、窓を積むと、その間の回復の判定を飛ばす。
+		s.mu.Unlock()
+		return nil
+	}
 	// 書き込みついでに期限切れ entry を amortized に掃除する (suspendCache と同方針)。
 	s.evictExpiredRequestReceivedLocked(now)
 	s.requestReceivedCache[host] = now.Add(s.requestReceivedWindow)
@@ -277,6 +322,7 @@ func (s *Service) RecordResponseSuccess(host string) error {
 		s.mu.Unlock()
 		return nil
 	}
+	gen := s.healthGen
 	s.mu.Unlock()
 
 	inst, err := s.repo.FindByHost(host)
@@ -295,6 +341,12 @@ func (s *Service) RecordResponseSuccess(host string) error {
 	}
 	// healthy と確定したので窓キャッシュに載せ、以降の SELECT を省く。
 	s.mu.Lock()
+	if s.healthGen != gen {
+		// 読んでいる間に判定が消された (#3729、#3731)。読んだ行は消す前のもの
+		// かもしれないので積まない。
+		s.mu.Unlock()
+		return nil
+	}
 	s.evictExpiredResponseHealthyLocked(now)
 	s.responseHealthyCache[host] = now.Add(s.responseHealthyTTL)
 	s.mu.Unlock()
@@ -334,9 +386,28 @@ func (s *Service) RecordResponseError(host string) error {
 		}
 		if inst.SuspensionState == model.SuspensionStateNone &&
 			!inst.NotRespondingSince.After(now.Add(-autoSuspendNotRespondingThreshold)) {
-			return s.repo.UpdateFields(host, map[string]any{
+			// **停止を決めた理由が書く時点でも成り立つときだけ停止する (#3731)。**
+			// 読んだ後に管理者が手動で停止していたら、自動の停止で上書きしない
+			// (上書きすると、相手からの受信で自動の停止として解除される)。読んだ後に
+			// 相手が回復していたら (並行した成功や受信が not-responding を下ろした)、
+			// 回復した相手を停止しない。
+			threshold := now.Add(-autoSuspendNotRespondingThreshold)
+			ok, err := s.repo.UpdateFieldsIf(host, model.InstanceUpdateCondition{
+				SuspensionIn:                 []model.SuspensionState{model.SuspensionStateNone},
+				NotRespondingSinceAtOrBefore: &threshold,
+			}, map[string]any{
 				"suspensionState": string(model.SuspensionStateAutoSuspendedForNotResponding),
 			})
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
+			// 自動の停止も、管理画面からの停止 (Suspend) と同じく判定のキャッシュを
+			// 捨てて全プロセスへ伝える。捨てないと cacheTTL の間は配送が続く (#3664)。
+			s.InvalidateSuspendCache(host)
+			return nil
 		}
 		return nil
 	}
@@ -350,7 +421,10 @@ func (s *Service) RecordResponseError(host string) error {
 	// stale な healthy 判定で回復 UPDATE を取りこぼし、TTL が切れるまで
 	// isNotResponding が解除されない。isNotResponding==true への遷移は本メソッド
 	// だけなので、ここで消せば healthy-cache の整合が保てる (#1429 review)。
+	// 世代も進める (#3731)。消す前に読み始めた RecordResponseSuccess が、消した後に
+	// 「健全」を積み直さないようにする。
 	s.mu.Lock()
+	s.healthGen++
 	delete(s.responseHealthyCache, host)
 	s.mu.Unlock()
 	return nil
@@ -372,10 +446,19 @@ func (s *Service) MarkGoneSuspended(host string) error {
 		inst.SuspensionState == model.SuspensionStateManuallySuspended {
 		return nil
 	}
-	if err := s.repo.UpdateFields(host, map[string]any{
+	// **書く時点でも手動の停止・消えた相手の停止でないときだけ書く (#3731)。** 読んだ
+	// 後に管理者が手動で停止していたら、消えた相手の停止で上書きしない (上書きすると、
+	// 消えた相手のフォローの片付けの候補に並ぶ)。
+	ok, err := s.repo.UpdateFieldsIf(host, model.InstanceUpdateCondition{
+		SuspensionNotIn: []model.SuspensionState{model.SuspensionStateGoneSuspended, model.SuspensionStateManuallySuspended},
+	}, map[string]any{
 		"suspensionState": string(model.SuspensionStateGoneSuspended),
-	}); err != nil {
+	})
+	if err != nil {
 		return err
+	}
+	if !ok {
+		return nil
 	}
 	// 判定のキャッシュを捨てる。残すと cacheTTL の間、消えた相手へ配送が続く
 	// (管理画面からの停止と同じ扱い)。
@@ -440,6 +523,19 @@ func (s *Service) ProhibitedWords() []string {
 	return []string(meta.ProhibitedWords)
 }
 
+// SensitiveWords returns meta.sensitiveWords.
+//
+// 連合の note 取り込み (`federation.Resolver`) が、ローカル投稿と同じく
+// センシティブワードに当たる public の投稿を home にするために読む。meta が
+// 読めない場合は nil を返す (= 判定を skip)。ProhibitedWords と同じ方針。
+func (s *Service) SensitiveWords() []string {
+	meta, err := s.metaRepo.Fetch()
+	if err != nil {
+		return nil
+	}
+	return []string(meta.SensitiveWords)
+}
+
 // IsMediaSilenced reports whether the host matches an entry in
 // meta.mediaSilencedHosts. Used by reaction gating to reject custom emoji
 // reactions from media-silenced remote hosts (#1538) and to mark remote
@@ -465,6 +561,9 @@ type FederationHostSets struct {
 	// SuspendedSoftware は meta.deliverSuspendedSoftware をパースしたもの。
 	// federation/instances 等の softwareSuspended 表示判定に使う (#1732)。
 	SuspendedSoftware []model.SuspendedSoftwareEntry
+	// InboxSuspendedSoftware は meta.inboxSuspendedSoftware をパースしたもの。
+	// 受信を拒否しているかの表示に使う (Elythia 独自、#3362)。
+	InboxSuspendedSoftware []model.SuspendedSoftwareEntry
 	// Federation / FederationHosts は連合モード (`all` / `none` / `specified`) と
 	// `specified` のときの許可リスト。疎通の診断 (#3055) が IsAllowed と同じ判定に使う。
 	Federation      string
@@ -486,18 +585,17 @@ func (s *Service) FederationHostLists() (FederationHostSets, error) {
 		return FederationHostSets{}, err
 	}
 	// deliverSuspendedSoftware (jsonb) を softwareSuspended 判定用に parse する
-	// (#1732)。不正な JSON は空扱い (best-effort)。
-	var suspended []model.SuspendedSoftwareEntry
-	if len(meta.DeliverSuspendedSoftware) > 0 {
-		_ = json.Unmarshal(meta.DeliverSuspendedSoftware, &suspended)
-	}
+	// (#1732)。配送の判定と同じ読み方にする (#3558。読めない要素だけ飛ばす)。
+	suspended := model.ParseSuspendedSoftware(meta.DeliverSuspendedSoftware)
+	inboxSuspended := model.ParseSuspendedSoftware(meta.InboxSuspendedSoftware)
 	return FederationHostSets{
-		Blocked:           meta.BlockedHosts,
-		Silenced:          meta.SilencedHosts,
-		MediaSilenced:     meta.MediaSilencedHosts,
-		SuspendedSoftware: suspended,
-		Federation:        meta.Federation,
-		FederationHosts:   meta.FederationHosts,
+		Blocked:                meta.BlockedHosts,
+		Silenced:               meta.SilencedHosts,
+		MediaSilenced:          meta.MediaSilencedHosts,
+		SuspendedSoftware:      suspended,
+		InboxSuspendedSoftware: inboxSuspended,
+		Federation:             meta.Federation,
+		FederationHosts:        meta.FederationHosts,
 	}, nil
 }
 
@@ -645,11 +743,20 @@ func (s *Service) shouldSkipBySuspend(host string) bool {
 		s.mu.Unlock()
 		return e.skip
 	}
+	gen := s.suspendGen
 	s.mu.Unlock()
 
 	skip := s.lookupSuspended(host)
 
 	s.mu.Lock()
+	if s.suspendGen != gen {
+		// 読んでいる間に停止の変更が届いた。読んだ値は変更の前のものかもしれない
+		// ので、キャッシュに残さない (残すと cacheTTL の間、停止が効かない)。
+		// 他のプロセスからの通知は DB の書き込みの直後に届くので、配送が続いて
+		// いる相手では読み込みと重なりうる (#3664)。
+		s.mu.Unlock()
+		return skip
+	}
 	// cache miss / 期限切れ時に書き込むついでに、既に期限切れの他 entry も
 	// 掃除する。配送先 host は有界 (連合先数) だが、過去に配送した host が
 	// 二度と来ない場合でも map に滞留し続けないよう、書き込みコストに相乗り
@@ -679,18 +786,66 @@ func (s *Service) evictExpiredLocked(now time.Time) {
 //
 // 同じホスト名の別ポート (`host:8443`) の判定も `host` の行を見ているので、
 // あわせて捨てる (lookupSuspended の doc)。
+//
+// **他のプロセスにも伝える (#3664)。** 停止の操作を受けたプロセスだけが捨てると、
+// `MK_ONLY_QUEUE`の配送のプロセスは cacheTTL (5 分) の間、停止したはずの相手へ
+// 配送を続ける。SetSuspendInvalidationHook の hook がそれを担い、自プロセスの
+// キャッシュは hook より先に (Redis に届かなくても) 捨てる。
 func (s *Service) InvalidateSuspendCache(host string) {
 	if host == "" {
 		return
 	}
+	s.DropSuspendCacheLocally(host)
+	if s.suspendInvalidated != nil {
+		s.suspendInvalidated(host)
+	}
+}
+
+// SetSuspendInvalidationHook registers fn, called with the host after every
+// InvalidateSuspendCache has dropped this process's entries (#3664). Call it
+// once while wiring, before the service is used.
+func (s *Service) SetSuspendInvalidationHook(fn func(host string)) {
+	s.suspendInvalidated = fn
+}
+
+// DropSuspendCacheLocally drops this process's cached suspend decision for
+// host (and for the same host name on other ports) without calling the
+// invalidation hook. An empty host drops every entry. It is what an
+// invalidation received from another process applies.
+func (s *Service) DropSuspendCacheLocally(host string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.suspendGen++
+	if host == "" {
+		clear(s.suspendCache)
+		return
+	}
 	delete(s.suspendCache, host)
 	for h := range s.suspendCache {
 		if idnhost.BareHost(h) == host {
 			delete(s.suspendCache, h)
 		}
 	}
-	s.mu.Unlock()
+}
+
+// DropLocal drops this process's cached suspend decisions, response health
+// and received-at windows without calling the invalidation hook, so no other
+// process is told (#3729). It is what the cache list of internal/server calls
+// (docs/architecture.md 4.4).
+//
+// 受信時刻の窓 (requestReceivedCache) も捨てる。書き込みの間引きだが、窓の間は
+// SELECT も省くので、応答なしの解除と自動停止の解除の判定も飛ぶ。古い窓を残すと、
+// 戻した DB で停止になっている相手からの正当な受信でも、窓の間は解除されない
+// (応答の健全を捨てるのと同じ理由)。失うのはホストごとに 1 回分の間引きだけ。
+// 警告の間引き (lastMetaWarn) はログのためだけなので残す。
+func (s *Service) DropLocal() {
+	s.DropSuspendCacheLocally("")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropGen++
+	s.healthGen++
+	clear(s.responseHealthyCache)
+	clear(s.requestReceivedCache)
 }
 
 // SuspendCacheLen returns the number of entries currently held in the suspend
@@ -753,7 +908,7 @@ func (s *Service) warnMetaFetchFailed(host string, err error) {
 // `.<pattern>` (i.e. host is a subdomain).
 //
 // mediaSilencedHosts だけは upstream の `isMediaSilencedHost` が完全一致なので、
-// mk-go の後方一致はサブドメインにも効く分だけ広い (docs/divergence.md §3-3)。
+// mk-go の後方一致はサブドメインにも効く分だけ広い (docs/divergence/federation.md §3-3)。
 //
 // Host is also compared with its port and trailing dot removed, so a remote
 // that publishes its actor on a non-default port (`evil.example:8443`) still

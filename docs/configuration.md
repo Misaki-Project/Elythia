@@ -8,6 +8,10 @@
 ./built/elythia serve -config .config/default.yml
 ```
 
+**設定ファイル(と、それを上書きする`MK_*`の環境変数)は、プロセスの起動時に読んだ値を使い続ける。** [メンテナンスモード](deployment.md#メンテナンスモード)を抜けるときの作り直し(DBへの接続とサーバーの中身を作り直す)でも読み直さない。`Supervisor`(`internal/server/lifecycle.go`)が、起動時に読んだ同じ`*config.Config`で作り直すため。設定ファイルを変えたら、プロセスを再起動する。
+
+管理画面の設定(DBの`meta`)は、これとは別の経路で読む。変えると`internal:metaUpdated`が全プロセスに届き、各プロセスが`meta`のキャッシュを捨てる。DeepLのキー(`deeplAuthKey` / `deeplIsPro`)、`enableReactionsBuffering`、`/nodeinfo`の応答も、再起動せずにこれで変わる(#3663)。ただし`/nodeinfo`で捨てるのはサーバーが持つ分だけで、応答には`Cache-Control: public, max-age=600`を付けているので、前段のプロキシやCDN、取得した側は最大10分古いものを持ちうる。通知を取りこぼしたプロセスでは、DeepLのキーは`meta`のキャッシュの期限(5分)で、`/nodeinfo`は応答のキャッシュの期限(10分)で揃う。`enableReactionsBuffering`は、全部のプロセスがflushの周期(30秒)ごとに`meta`から読み直すので、`meta`のキャッシュの期限(5分)で揃う。
+
 ### 初回セットアップ
 
 `.config/` 配下には Misskey 本家流儀で `.example` テンプレートを配布している。初回は以下のいずれかを手元の `.config/default.yml` (および `docker.yml`) として複製してから編集する:
@@ -41,12 +45,15 @@ cp .config/docker.yml.example .config/docker.yml
 | `mediaProxyConcurrency` | int | `GOMAXPROCS / 2` (最低 1) | media proxy の画像処理 (decode/resize/encode) を同時に何本走らせてよいか (#3032)。**ピークメモリの上限**にあたる — 同時に走る本数がそのまま同時に確保される中間バッファの本数になり、内蔵プロキシは API サーバーと同じプロセスなのでそれがインスタンス全体の RSS になる。8 core で AVIF を c=8 流したときの peak RSS の実測は枠 1 → 131MB / 2 → 409MB / 4 → 636MB / 8 → 995MB / 無制限 → 959MB、同条件の jpg→avatar スループットは 30.7 / 45.5 / 63.9 / 71.2 / 71.6 rps。既定は peak RSS -34% をスループット -11% で買う点。枠が 5 秒空かなければ 503 (`?fallback` 指定時はダミー画像) で落とす。0 以下は既定値扱い |
 | `enableIpRateLimit` | bool | `true` | IPベースのレート制限を有効化 |
 | `disableEndpointRateLimits` | bool | `false` | per-endpoint rate limit table 全体を無効化。Misskey TS の `NODE_ENV=development` 相当で、ベンチマーク等で公正比較する用途専用。**本番で絶対に使わない** |
+| `disableParamShadow` | bool | `false` | 本家の`paramDef`での引数の検証を、応答を変えずに走らせ、handlerと判定が分かれた件数をログに出すのを止める (#3677)。本家に揃えたendpoint (`reset-db`を除く、本家かElythiaの宣言のあるendpointの全部。#3742〜#3888で広げ、#3890で宣言から決める形にした) の検証は止めない。数え方と見方は [docs/param-shadow.md](param-shadow.md) |
+| `paramShadowLogSeconds` | int | `600` | 上の件数の要約をログに出す間隔 (秒)。0 以下は既定に戻す |
 | `pidFile` | string | - | PIDファイルパス |
 | `testMode` | bool | `false` | テスト用エンドポイント(/api/reset-db)を有効化。**本番で絶対に使わない** |
 | `enablePprof` | bool | `false` | `/debug/pprof/*` ハンドラを公開。ローカルプロファイリング専用。**本番で絶対に使わない**。`MK_ENABLEPPROF`で上書き可。診断のためどうしても一時的に有効化する場合は、reverse proxy 側で`/debug`を落としてからにする (`deploy/uds/nginx/mkgo.conf`と[deployment.md](deployment.md)のnginx例はどちらも404にしてある)。取得はUDSへ直接 (`curl --unix-socket`)。 |
 | `enableMetrics` | bool | `false` | Prometheus `/metrics` エンドポイントを公開。job queue 系 metric (`mk_job_workers_active` / `mk_job_workers_quarantined` / `mk_job_handlers_abandoned` / `mk_job_handler_abandonments_total` / `mk_job_queue_pending` / `mk_job_dispatch_wait_seconds` / `mk_job_processing_seconds` / `mk_job_scale_events_total` / `mk_job_scrape_errors_total`) を expose。認証無しで公開されるため、外部公開する場合は nginx / LB ACL で access 制限すること。詳細は `docs/design/auto-scale-job-workers.md` §6.1。`MK_ENABLEMETRICS`で上書き可。 |
 | `jobQueueDriver` | string | `"mkq"` | ジョブキュー実装の選択。**指定できるのは `mkq` だけ** (BullMQ wire-compatible で admin queue 画面が Misskey TS frontend 前提のまま動く + per-queue concurrency / rate-limit が効く)。legacy の `asynq` は #2985 で削除済みで、明示すると**起動エラー**になる (黙って別の driver で起動しないため。行を消せば既定の `mkq`)。**移行は片道** — asynq の未処理ジョブは Redis の `asynq:{<queue>}:*` に居り mkq (`bull:*`) からは見えないので、切り替え前に**旧ビルドで捌ききる**こと (新ビルドは起動を拒むので後から捌けない)。`MK_JOBQUEUEDRIVER`で上書き可。 |
 | `publishTarballInsteadOfProvideRepositoryUrl` | bool | `false` | **Elythia では効かない** (upstream YAML 互換のために読むだけ)。upstream は `built/tarball` を `/tarball/` に静的配信するが Elythia にはそのルートが無く、`/api/meta` の `providesTarball` は常に `false` を返す。有効にすると起動時に warn が出る。**404 で気付ける類ではない** — SPA の catchall が拾うので `misskey-<version>.tar.gz` という名前の HTML が 200 で返る。ソースの案内は `meta.repositoryUrl` (管理画面の 全般 → 情報) で行うこと。新規インスタンスは Elythia のリポジトリが既定で入る (#2700) |
+| `pluginSecretKey` | string | - | サーバープラグインの秘密の値 (API キーなど) を暗号化する鍵 (#3470)。32 バイトを base64 で書いたもの (`openssl rand -base64 32`)。標準 / URL 用の base64 のどちらでもよく、padding の有無も問わない。**長さが違う・base64 として読めない値は起動エラー** (黙って未設定に倒さない)。未設定なら秘密の値を保存できない (管理画面にそう出る)。ロールを分けたときは全プロセスに同じ値を渡す。入れ替えと紛失の手順は[プラグイン — 運営者向け](plugins/operating.md#秘密の値)。`elythia config-dump` では有無だけを出す。`MK_PLUGINSECRETKEY`で上書き可 |
 | `effectivePolicyProviderCacheEntries` | int | `10000` | build-time pluginのeffective-policy providerごとに保持する成功結果LRUの最大件数。正の値だけを受理し、0以下は警告して既定へ戻す。TTLは無く、eviction時はresolverを再実行する。変更にはprocess再起動が必要。`MK_EFFECTIVEPOLICYPROVIDERCACHEENTRIES`で上書き可 |
 
 ### データベース (`db.*`)
@@ -62,8 +69,23 @@ cp .config/docker.yml.example .config/docker.yml
 | `db.extra.ssl` | bool / map / `no-verify` | `false` | TLS接続。`true` は**サーバー証明書とホスト名を検証する** (`sslmode=verify-full`、システムの CA)。upstream (node-postgres) の形 `{ rejectUnauthorized: false }` と `'no-verify'` は検証しない TLS (`sslmode=require`)。詳細は下記 |
 | `db.extra.sslmode` | string | - | **Elythia 独自**。libpq の `sslmode` を直接指定する (`disable` / `allow` / `prefer` / `require` / `verify-ca` / `verify-full`)。`db.extra.ssl` と同時には書けない |
 | `db.extra.sslrootcert` | string | - | **Elythia 独自**。検証に使う CA 証明書 (PEM) の**ファイルパス**。自己署名 / 私設 CA の DB に使う |
+| `db.extra.connectionTimeoutMillis` | int (ミリ秒) | `10000` | 1 回の接続の確立 (TCP / UNIX ソケットの接続、TLS、認証) を待つ上限。`0` は待ち続ける。負の値・数でない値・`2147483647` を超える値は起動エラー。詳細は下記 |
 
-`dbReplications: true`とすると`dbSlaves`設定でリードレプリカを使用可能。レプリカは primary の `db.extra` の TLS 設定を引き継ぐ (ホスト名の検証はレプリカ自身の `host` で行う)。
+`dbReplications: true`とすると`dbSlaves`設定でリードレプリカを使用可能。レプリカは primary の `db.extra` の TLS 設定と接続の待ち時間 (`connectionTimeoutMillis`) を引き継ぐ (ホスト名の検証はレプリカ自身の `host` で行う)。
+
+#### DB への接続を待つ上限 (`db.extra.connectionTimeoutMillis`)
+
+接続を受け付けたまま応答しない相手 (止まりかけの PostgreSQL、経路の途中で詰まったネットワーク) に繋ぐと、上限が無ければ起動も DB を使う処理も戻らない (#3632)。Elythia は既定で 10 秒で区切る。
+
+- **キーと単位は upstream と同じだが、区切る範囲と既定が違う。** upstream は `db.extra` を node-postgres の pool へ素通しするので、`connectionTimeoutMillis` (pool の option、ミリ秒) を書いた設定はそのまま読める
+  - **区切る範囲**: Elythia が区切るのは接続の確立だけ。upstream (pg-pool) は同じ値で、pool が満杯のときに空きを待つ時間も区切る (`timeout exceeded when trying to connect`)。Elythia (database/sql) は空き待ちを区切らない。また upstream は 1 回の接続全体をミリ秒で、Elythia はアドレスごとに秒で区切る (下記)
+  - **既定**: upstream は TypeORM の `connectTimeoutMS` も指定しておらず、node-postgres の既定 `0` (待ち続ける) で動く。Elythia は 10 秒
+- **秒へ切り上げる。** pgx と libpq の `connect_timeout` は秒単位なので、`1500` は 2 秒、`1` は 1 秒になる (切り捨てると 1〜999 が `0` = 待ち続けるになるため)。`pg_dump` / `pg_restore` (libpq) は、libpq 16 以前だけ 1 秒を 2 秒に切り上げる (17 以降は 1 秒のまま。同梱の image は `postgres:18-alpine` の `pg_dump` を使うので 1 秒のまま)
+- **上限は接続先のアドレスごと。** `db.host` が複数のアドレスに解決される (`localhost` が `::1` と `127.0.0.1` になるなど) と、全体ではアドレスの数だけ長く待つことがある
+- 接続の確立だけを区切る。繋がった後のクエリの時間は区切らない (upstream が既定で付ける `statement_timeout` に当たる `db.extra.statement_timeout` は Elythia では読まない)
+- 本体・レプリカ (`dbSlaves`)・`elythia migrate`・バックアップ (`pg_dump` / `pg_restore` を含む)・プラグインの保存先など、`db:` から接続先を作る全ての接続に効く。UNIX ソケットでも効く
+- 起動時の最初の接続が時間切れになると、`elythia serve` と `elythia migrate` は相手のアドレスと設定のキー名を添えたエラーで終了する。serve は `failed to connect to database (PostgreSQL at <host>:<port> did not answer within 10s; ... db.extra.connectionTimeoutMillis ...)` (UNIX ソケットでは `<host>:<port>` の代わりに `<db.host>/.s.PGSQL.<port>`)、migrate は `failed to create migrator` のログの `hint` に同じ文を出す (標準の構成では migrate が先に DB へ繋ぐ)
+- 環境変数 `MK_DB_EXTRA_CONNECTIONTIMEOUTMILLIS` で、設定ファイルに書かなくても変えられる (`bindEnvKeys()` に登録してある)。libpq の `PGCONNECT_TIMEOUT` は読まない (接続文字列に常に書くため)
 
 #### DB 接続の TLS (`db.extra`)
 
@@ -76,11 +98,11 @@ cp .config/docker.yml.example .config/docker.yml
 | `sslmode: <値>` (+ `sslrootcert`) | libpq の意味そのまま (`prefer` / `allow` と `sslrootcert` の併記は起動エラー) | 指定値 |
 
 - **`ssl: true` の意味が変わった (破壊的変更)。** 以前の Elythia は `ssl: 'true'` (文字列) のときだけ `sslmode=require` = **証明書を検証しない TLS** で繋いでいた。しかも YAML の bool の `ssl: true` は設定の読み込みで `"1"` になって比較に外れ、**平文で繋いでいた**。upstream (node-postgres) の `ssl: true` は Node の既定 (`rejectUnauthorized: true`) で検証するので、それに揃えた。自己署名証明書の DB に `ssl: true` で繋いでいた構成は起動時に `certificate signed by unknown authority` 等で落ちる。その場合は (a) CA を `db.extra.sslrootcert` に指定する、または (b) 検証を明示的に無効にする (`ssl: { rejectUnauthorized: false }`) のどちらかを選ぶ。起動エラーにも同じ案内を出す。
-- **upstream の object 形式で解釈するのは `rejectUnauthorized` だけ。** node-postgres の `ca` は PEM の中身を受けるが、pgx はファイルパスしか受けないので `ca` は起動エラーにする (CA をファイルに保存して `sslrootcert` へ)。`cert` / `key` / `servername` 等も黙って捨てずに起動エラーにする。`ssl` 以外の `extra` のキー (`statement_timeout` 等、upstream が pool へ渡すもの) は無視する。
+- **upstream の object 形式で解釈するのは `rejectUnauthorized` だけ。** node-postgres の `ca` は PEM の中身を受けるが、pgx はファイルパスしか受けないので `ca` は起動エラーにする (CA をファイルに保存して `sslrootcert` へ)。`cert` / `key` / `servername` 等も黙って捨てずに起動エラーにする。`ssl` / `sslmode` / `sslrootcert` / `connectionTimeoutMillis` 以外の `extra` のキー (`statement_timeout` 等、upstream が pool へ渡すもの) は無視する。
 - **`ssl: no-verify` は `{ rejectUnauthorized: false }` と同じ。** node-postgres (upstream が使う pg 8.23.0 の `lib/connection-parameters.js`) が同じ意味で受ける書き方なので、そのまま移せる。
 - 矛盾する組み合わせ (`ssl` と `sslmode` の併記、TLS 無効なのに `sslrootcert`、`rejectUnauthorized: false` / `no-verify` と `sslrootcert` の併記、`sslmode: prefer` / `allow` と `sslrootcert` の併記) は起動エラーにする。最後のものは、pgx が `prefer` / `allow` では CA を渡しても**証明書を検証せず**、TLS を断られると**平文へ落ちる**ため (CA を書いた運営者の意図と逆になる)。検証したいなら `verify-full` (または `verify-ca`) にする。
 - 証明書の検証に失敗したときの起動エラーには、書いた設定に合わせた対処を添える (`ssl: true` なら「以前は検証していなかった」旨と `sslrootcert` / `rejectUnauthorized: false`、`sslmode` を明示していれば `sslrootcert` / `sslmode: require`、`sslrootcert` を指定していればその CA ファイルと `db.host` の確認)。
-- **環境変数で渡すなら設定ファイルにキーを書いておく。** `db.extra.*` は `bindEnvKeys()` に登録していないので、`MK_DB_EXTRA_SSL` / `MK_DB_EXTRA_SSLMODE` / `MK_DB_EXTRA_SSLROOTCERT` は**設定ファイルに同じキー (`extra:` の下の `ssl:` 等) があるときだけ**効く (下の「環境変数オーバーライド」を参照)。ファイルに無いまま export しても黙って平文で繋ぐ。
+- **環境変数で渡すなら設定ファイルにキーを書いておく。** `db.extra.*` は (`connectionTimeoutMillis` を除き) `bindEnvKeys()` に登録していないので、`MK_DB_EXTRA_SSL` / `MK_DB_EXTRA_SSLMODE` / `MK_DB_EXTRA_SSLROOTCERT` は**設定ファイルに同じキー (`extra:` の下の `ssl:` 等) があるときだけ**効く (下の「環境変数オーバーライド」を参照)。ファイルに無いまま export しても黙って平文で繋ぐ。
 - **UNIX ソケット (`host` が `/` 始まり) では TLS を張らない** (`sslmode=disable` 固定)。
 - `elythia migrate` / `elythia doctor` / `elythia backfill` などのサブコマンドも本体と同じ接続設定 (TLS・パスワードのエスケープ) を使う。
 
@@ -132,6 +154,7 @@ cp .config/docker.yml.example .config/docker.yml
 
 > **worker 数の扱い**:
 > - `mkq` driver は queue ごとに worker を分けているので `deliverJobConcurrency` / `inboxJobConcurrency` / `relationshipJobConcurrency` はそれぞれの queue 専用 worker 数として扱われる。明示指定の無い queue は hot queue 優先の per-queue 既定値 (inbox=16 / deliver=16 / relationship=4 / objectStorage=4 / webhook=4 / push=4 / export=2 / maintenance=2) を使う。旧来の `総budget / len(queues)` 均等割りだと inbox が starve していた (#1374) ため hot-tuned default に変更。worker 数 ≒ Redis 接続数 (worker 毎に BZPopMin で接続を保持) なので、`redisForJobQueue.poolSize` 未設定時は mkq driver が worker 総数 + 隔離許容ぶん (`queueStuckWorkerSeconds` 参照) + 余裕に自動サイジングする (`<queue>JobConcurrency` を上げると pool も追従)。明示設定した場合はその値が尊重される。**自動サイジングが効くのは `poolSize` 未指定のときだけで、`jobQueueAutoScale` による増加は見込んでいない。** autoscale を有効にするなら、追跡対象キューでは worker が最大 `max(<queue>JobConcurrency, maxWorkers) + max(<queue>JobConcurrency, 4)` 本走りうる (`queueStuckWorkerSeconds` 参照) ので、おおむね `maxWorkers` の 2 倍を賄える値を明示すること (隔離の許容幅は autoscale ではなく**設定値**に紐づくので、`maxWorkers + max(<queue>JobConcurrency, 4)` が正確な上限)。
+> - 落ちた worker が残した job を戻す走査 (stalled-check) は、queue ごとに 1 つの worker だけが回す (#3592)。縮小ではその worker を、queue の worker を全部止めるとき以外は止めない。そのため、縮小のときに idle な worker がその 1 つしか無いと、代わりに処理中の worker を 1 つ止める (縮小 1 回で最大 1 件。止めた job は retry に回り、試行を 1 回消費する)。縮小が起きるのは主に `jobQueueAutoScale` を有効にしたとき
 >
 > **rate limit (`*JobPerSec`) の挙動**:
 > - `mkq.WithRateLimit` で **worker pull レイヤ** に制御が入るため、レート制限が他 queue の処理を阻害しない。
@@ -169,7 +192,7 @@ cp .config/docker.yml.example .config/docker.yml
 | キー | 型 | デフォルト | 説明 |
 |---|---|---|---|
 | `proxy` | string | - | 外向き HTTP のプロキシ URL (PR #485)。`proxyBypassHosts` 以外の宛先は proxy に渡す前に Elythia 側で検査する (リテラル IP はそのまま、ホスト名は手元で解決した全アドレス。1 つでも private / 予約済みなら拒否し、手元で解決できない宛先も渡さない。Unicode の IDN は接続時と同じ punycode の名前で解決する。`0x7f.1` / `2130706433` / `127.1` のような厳密な dotted-quad でない数値表記は渡さない)。通過した宛先は 30 秒間覚えて、その間はリクエストごとの名前解決を省く (拒否した宛先は覚えない)。**ただし proxy は宛先を自分で再解決するので DNS rebinding の窓は残る。proxy 側でも private / loopback / link-local (`169.254.169.254` など) 宛てを拒否する設定にすること** |
-| `proxySmtp` | string | - | SMTP 配送のプロキシ URL。`http://host:port` (HTTP CONNECT)、`https://host:port`、`socks5://[user:pass@]host:port` (#496) |
+| `proxySmtp` | string | - | SMTP 配送のプロキシ URL。`http://host:port` (HTTP CONNECT)、`https://host:port`、`socks5://[user:pass@]host:port` (#496)。**`proxy` と `proxySmtp` は、URL として読めない値や対応していない scheme (`socks4://` など) なら起動しない** (以前は proxy を使わない直結に黙って倒れ、送信元の IP が出ていた)。対応する scheme は `http` / `https` / `socks5` / `socks5h` |
 | `proxyBypassHosts` | []string | - | プロキシを迂回するホスト (HTTP のみ)。リクエストの host を小文字化 + punycode にした形との完全一致で照合する (一覧側も同じ形に揃えるので、Unicode や大文字で書いてもよい) |
 | `allowedPrivateNetworks` | []string | - | プライベート IP / loopback / metadata service へのアウトバウンド接続を許可する CIDR allowlist。AP fetch / URL preview / mediaproxy / `RemoteStatsFetcher` (#943) で共通に効く。`proxy` 設定時も同じ判定を proxy へ渡す前の宛先検査に使うので、ここに入れた範囲は proxy 経由でも許可される (proxy 自体への接続はこの設定と無関係に常に許可)。開発時の self-loop 用途 (`127.0.0.0/8` 等)、本番では空のまま運用する |
 | `outgoingAddress` | string | - | 外向き HTTP の送信元 IP として bind するアドレス。複数 NIC 環境で federation 配信の source IP を固定する用途 (#496)。不正値は警告のみで kernel auto-pick に fallback |
@@ -249,6 +272,50 @@ Elythia 側のマイグレーションには含めていない。pgroonga 拡張
 | `logging.sql.disableQueryTruncation` | bool | SQLログのクエリ切り詰めを無効化 |
 | `logging.sql.enableQueryParamLogging` | bool | SQLログにパラメータ値を含める |
 
+### バックアップ (`backup.*`)
+
+`elythia backup`(バックアップ用のimageの`backup`サービスと、定期実行の`backup-daemon`サービス)と、本体(管理画面。`backup.server.*`)が読む。取る・確かめる・定期実行の手順と保存先に置かれるもの、管理画面は[DBのバックアップ](backup.md)に、戻す手順は[デプロイ](deployment.md#バックアップから戻す-restore)にある。**保存先の認証情報はDBではなくここに置く。** DBが失われたときにも、バックアップを取り出せる必要があるため(ドライブのオブジェクトストレージの設定はDBの`meta`にあるので流用しない)。
+
+| キー | 型 | 説明 |
+|---|---|---|
+| `backup.storage.type` | string | `s3`(S3互換)か`dir`(ディレクトリ)。必須 |
+| `backup.storage.s3.endpoint` | string | 接続先のURL(`https://`。`http://`は経路を信頼できるときだけ)。空ならAWS S3 |
+| `backup.storage.s3.region` | string | region。空なら`us-east-1` |
+| `backup.storage.s3.bucket` | string | bucket。必須 |
+| `backup.storage.s3.prefix` | string | 世代を置くkeyの接頭辞。前後の`/`は無視する |
+| `backup.storage.s3.accessKey` / `secretKey` | string | 認証情報。どちらも必須 |
+| `backup.storage.s3.forcePathStyle` | bool | path形式でbucketを指す(MinIOなど) |
+| `backup.storage.dir.path` | string | 別の機器をmountしたディレクトリ。**既に存在し、根に目印のファイル`.elythia-backup`がある必要がある**(mountが外れているときに、同じホストのディスクへ黙って書き始めないよう、どちらも作らない。作り方は[DBのバックアップ](backup.md#ディレクトリ)) |
+| `backup.encryption.enabled` | bool | dumpをageで暗号化する |
+| `backup.encryption.recipients` | string[] | ageの公開鍵(`age1...`)。`enabled`のとき1つ以上必須。取るのに要るのはこれだけ |
+| `backup.encryption.identityFile` | string | ageの秘密鍵のファイル。確かめる・戻すときに使う。リポジトリの外に置く |
+| `backup.integrityKeyFile` | string | 世代の`meta.json`とRedisのリストアの記録に署名する鍵(HMAC-SHA256)のファイル。32バイト以上(前後の空白は無視)。設定すると、取るときに署名し、戻す・確かめるときに署名の無い・合わない世代を断る。空なら署名しない。バックアップ用のホストにだけ置き、保存先には置かない([DBのバックアップ](backup.md#署名)) |
+| `backup.tools.pgDump` | string | `pg_dump`のパス。空ならPATHから探す |
+| `backup.tools.pgRestore` / `initdb` / `pgCtl` | string | `pg_restore` / `initdb` / `pg_ctl`のパス。空ならPATHから探す。`pg_restore`は、`elythia backup restore`がDBへ戻すときと、`elythia backup verify`が使い捨てのPostgreSQLへ戻すときに使う。`initdb` / `pg_ctl`は`verify`だけが使う |
+| `backup.schedule.interval` | string | `elythia backup daemon`が取る間隔(Goのduration。例: `24h`)。1分以上。空なら定期実行しない |
+| `backup.schedule.at` | string | 取る時刻(`HH:MM`)。プロセスのタイムゾーン(`TZ`)で読む。省略可。付けるなら`interval`は24時間を割り切る値か24時間の倍数にする(それ以外は再起動で枠の位相が変わり、起動時に警告する) |
+| `backup.schedule.keep` | int | 残す使える世代の数。古い世代は、使える新しい世代がこの数そろってから消す。`0`なら消さない |
+| `backup.schedule.verify` | bool | 取った後に毎回確かめる。`true`を推奨する。暗号化しているなら`backup.encryption.identityFile`も要る(空なら起動しない) |
+| `backup.schedule.delayAfter` | string | 最後の使える世代からこの時間を過ぎたら遅れを知らせる。空なら`interval`の1.5倍。`interval`より短くできない |
+| `backup.schedule.listen` | string | daemonの制御API(平文のHTTP)の待ち受け。空なら持たない。composeでは`:3010`(`backup-daemon`はportを公開しない)、バイナリを直接実行するなら`127.0.0.1:3010`のように絞る |
+| `backup.notify.webhookUrl` | string | 失敗・食い違い・遅れの通知先。空ならログにだけ残す |
+| `backup.notify.format` | string | `generic` / `discord` / `slack`。空なら`generic` |
+| `backup.server.storage.*` | object | 本体(管理画面)が読む保存先。`backup.storage`と同じ形。**`type`が空なら`backup.storage`を使う**。本体には一覧・読み取り・削除の権限があればよく、書き込みは要らない。バックアップ用のサービスとは別の鍵を本体に渡したいときに、ここに書く |
+| `backup.server.pricePerGbMonth` | number | 1GBあたりの月額。0より大きいと、管理画面に月額の目安を出す(1GBは2^30バイト。S3・R2の課金の単位に合わせた) |
+| `backup.server.serviceUrl` | string | `elythia backup daemon`の制御API(`backup.schedule.listen`)のURL(例: `http://backup-daemon:3010`)。空なら、管理画面から取る・確かめるができない(一覧・削除・ダウンロードはできる) |
+| `backup.server.serviceToken` | string | 制御APIの認証。本体は`Authorization: Bearer <値>`で送り、daemonは同じ値で照合する。空なら、`serviceUrl`があっても本体は依頼を送らない(起動時に警告する)。daemonは、`schedule.listen`を書いたのにこれが空なら起動しない |
+
+`backup:`の節は`MK_*`の環境変数では作れない(`bindEnvKeys()`に無い)。
+
+### メンテナンスモード (`maintenance.*`)
+
+`elythia maintenance`と、本体の各プロセスが読む。メンテナンスの使い方は[デプロイ](deployment.md#メンテナンスモード)にある。節ごと省略でき、どのキーにも既定がある。どちらも`bindEnvKeys()`にあるので、節が無くても`MK_MAINTENANCE_MAINTENANCEDB` / `MK_MAINTENANCE_DRAINTIMEOUT`で設定できる。
+
+| キー | 型 | 説明 |
+|---|---|---|
+| `maintenance.maintenanceDb` | string | 判定役が`pg_stat_activity`を数えるときに繋ぐDB。既定は`postgres`。`db.db`と同じ名前にはできない(判定役の接続が数に入り、0にならない)。この節があれば設定を読む時点で拒む。節が無いまま`db.db`が`postgres`の構成では起動は止めず、判定役が判定を拒んで`elythia maintenance status`の`judge error`に出す(メンテナンスは`entering`から進まない)。DBのユーザーに`CONNECT`の権限が要る(`postgres`はPUBLICに許されている) |
+| `maintenance.drainTimeout` | string | 判定役がプロセスの手放し始め(報告が`draining`か`drained`)を初めて見てからこの時間を過ぎても、そのプロセスの接続が残っていたら、判定役が、手放すと報告しているプロセス(報告が`drained`か、上限を過ぎても`draining`)のElythiaの接続(`application_name`の`<host>-<pid>-<乱数>`が報告と一致し、判定役と同じroleのもの)を`pg_terminate_backend`で切る(Goのduration)。既定は`30s`。0より大きい値にする。それ以外の接続(運営者の`psql`、報告の無いプロセスや`running`のプロセスの接続)は切らない |
+
 ## 環境変数オーバーライド
 
 `MK_`プレフィックス付きの環境変数で設定値を上書きできる。ネストキーは`_`区切り。
@@ -263,6 +330,7 @@ Elythia 側のマイグレーションには含めていない。pgroonga 拡張
 | `MK_DB_DB` | `db.db` |
 | `MK_DB_USER` | `db.user` |
 | `MK_DB_PASS` | `db.pass` |
+| `MK_DB_EXTRA_CONNECTIONTIMEOUTMILLIS` | `db.extra.connectionTimeoutMillis` |
 | `MK_REDIS_HOST` | `redis.host` |
 | `MK_REDIS_PORT` | `redis.port` |
 | `MK_REDIS_PASS` | `redis.pass` |
@@ -271,8 +339,11 @@ Elythia 側のマイグレーションには含めていない。pgroonga 拡張
 | `MK_ID` | `id` |
 | `MK_MAXFILESIZE` | `maxFileSize` |
 | `MK_MEDIAPROXYSECRET` | `mediaProxySecret` |
+| `MK_PLUGINSECRETKEY` | `pluginSecretKey` |
 | `MK_TESTMODE` | `testMode` |
 | `MK_DISABLEENDPOINTRATELIMITS` | `disableEndpointRateLimits` |
+| `MK_DISABLEPARAMSHADOW` | `disableParamShadow` |
+| `MK_PARAMSHADOWLOGSECONDS` | `paramShadowLogSeconds` |
 | `MK_BCRYPTCOST` | `bcryptCost` |
 | `MK_CROSSORIGINOPENERPOLICY` | `crossOriginOpenerPolicy` |
 | `MK_NOTEHOOKCONCURRENCY` | `noteHookConcurrency` |
@@ -284,11 +355,11 @@ Elythia 側のマイグレーションには含めていない。pgroonga 拡張
 
 用途別Redisも同様 (例: `MK_REDISFORPUBSUB_HOST`)。
 
-**上表は一部。** `internal/config/config.go` の `bindEnvKeys()` は **90 キー**を
+**上表は一部。** `internal/config/config.go` の `bindEnvKeys()` は **96 キー**を
 登録している。内訳は用途別 Redis 5 系統 (`redis` / `redisForPubsub` /
-`redisForJobQueue` / `redisForTimelines` / `redisForReactions`) が各 9、`db.*` が 9、
-`logging.sql.*` が 2、`sentryForBackend.options.{dsn,environment}` が 2、残り 32 が
-トップレベル。全量はその関数を見ること。
+`redisForJobQueue` / `redisForTimelines` / `redisForReactions`) が各 9、`db.*` が 10、
+`logging.sql.*` が 2、`sentryForBackend.options.{dsn,environment}` が 2、
+`maintenance.*` が 2、残り 35 がトップレベル。全量はその関数を見ること。
 
 **登録の有無で「作れるか」だけが変わる。** Viper は `AutomaticEnv` を有効にしている
 ので、**設定ファイルにそのキーが書かれていれば `MK_` で上書きできる**。`bindEnvKeys()`
@@ -319,7 +390,9 @@ Elythia 側のマイグレーションには含めていない。pgroonga 拡張
 ## プロセスの役割 (Web / 配送の分離)
 
 対応するYAMLキーは無く、**環境変数だけ**で指定する (upstream Misskey と同じ変数名)。
-設定ファイルは両ノードで同一のものを使う。
+設定ファイルは両ノードで同一のものを使う。同じホストで複数のプロセスを動かすときは、
+`MK_PORT` / `MK_SOCKET`でプロセスごとにlistenの先を分ける(listenできないと`elythia serve`は
+終了コード1で終わる。#3633)。
 
 | 環境変数 | 用途 |
 |---|---|

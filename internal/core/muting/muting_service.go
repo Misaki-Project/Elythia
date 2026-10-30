@@ -121,6 +121,23 @@ func (s *Service) Mute(muterID, muteeID string, expiresAt *time.Time) (*model.Mu
 	return rec, nil
 }
 
+// notMutingOrNoSuchUser tells why a pair to unmute was not found: the mutee
+// does not exist (ErrMuteeNotFound) or is not muted (ErrNotMuting).
+//
+// 本家の mute/delete・renote-mute/delete は、関係の有無より先に相手の有無を見て
+// NO_SUCH_USER を返す (#3760)。関係の行は相手の行を外部キーで要るので、関係が
+// あれば相手は居る。相手を引くのは、関係が見つからなかったときだけでよい。
+func notMutingOrNoSuchUser(users repository.UserRepository, muteeID string) error {
+	if _, err := users.FindByID(muteeID); err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
+		return ErrMuteeNotFound
+	}
+	return ErrNotMuting
+}
+
 // Unmute removes the muting relationship.
 func (s *Service) Unmute(muterID, muteeID string) error {
 	if muterID == muteeID {
@@ -132,7 +149,7 @@ func (s *Service) Unmute(muterID, muteeID string) error {
 		if !repository.IsNotFound(err) {
 			return err
 		}
-		return ErrNotMuting
+		return notMutingOrNoSuchUser(s.userRepo, muteeID)
 	}
 	if err := s.mutingRepo.Delete(rec); err != nil {
 		return err
@@ -146,13 +163,13 @@ func (s *Service) IsMuted(muterID, muteeID string) (bool, error) {
 	return s.mutingRepo.Exists(muterID, muteeID)
 }
 
-// List returns the user's mutings with cursor (sinceID/untilID) or offset
-// pagination. Cursor 指定時は offset 無視 (upstream makePaginationQuery と一致)。
-func (s *Service) List(muterID, sinceID, untilID string, limit, offset int) ([]*model.Muting, error) {
+// List returns the user's mutings with cursor (sinceID/untilID) pagination.
+// 本家の paramDef に offset は無いので受けない (#3760)。
+func (s *Service) List(muterID, sinceID, untilID string, limit int) ([]*model.Muting, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	return s.mutingRepo.ListByMuter(muterID, sinceID, untilID, limit, offset)
+	return s.mutingRepo.ListByMuter(muterID, sinceID, untilID, limit, 0)
 }
 
 // RenoteService manages renote-only mutes (the mutee can still post original
@@ -228,7 +245,7 @@ func (s *RenoteService) Unmute(muterID, muteeID string) error {
 		if !repository.IsNotFound(err) {
 			return err
 		}
-		return ErrNotMuting
+		return notMutingOrNoSuchUser(s.userRepo, muteeID)
 	}
 	if err := s.renoteMutingRepo.Delete(rec); err != nil {
 		return err
@@ -242,13 +259,13 @@ func (s *RenoteService) IsRenoteMuted(muterID, muteeID string) (bool, error) {
 	return s.renoteMutingRepo.Exists(muterID, muteeID)
 }
 
-// List returns the user's renote mutings with cursor (sinceID/untilID) or
-// offset pagination.
-func (s *RenoteService) List(muterID, sinceID, untilID string, limit, offset int) ([]*model.RenoteMuting, error) {
+// List returns the user's renote mutings with cursor (sinceID/untilID)
+// pagination. 本家の paramDef に offset は無いので受けない (#3760)。
+func (s *RenoteService) List(muterID, sinceID, untilID string, limit int) ([]*model.RenoteMuting, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	return s.renoteMutingRepo.ListByMuter(muterID, sinceID, untilID, limit, offset)
+	return s.renoteMutingRepo.ListByMuter(muterID, sinceID, untilID, limit, 0)
 }
 
 // UserMaterializer promotes a relay-only author out of the ephemeral store

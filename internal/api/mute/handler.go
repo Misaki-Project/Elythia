@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/api/userrelation"
 	coremuting "github.com/elythia-network/elythia/internal/core/muting"
@@ -41,19 +42,10 @@ type Handler struct {
 	moderator ModeratorChecker
 	// extras は一覧の利用者のピン留め・移行先をまとめて埋める (#3330)。
 	extras userpack.DetailExtrasMany
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
-
-// SetDetailExtras wires the batch filler of pinnedNotes / pinnedPage / movedTo /
-// alsoKnownAs for the embedded users of mute/list (#3330).
-func (h *Handler) SetDetailExtras(x userpack.DetailExtrasMany) {
-	h.extras = x
-}
-
-// HasDetailExtras reports whether the detail extras filler was wired.
-//
-// 未配線だと mute/list の利用者の pinnedNotes などが空、movedTo / alsoKnownAs が
-// null のまま返る。起動時検査に使う。
-func (h *Handler) HasDetailExtras() bool { return h.extras != nil }
 
 // SetRelationRepos wires the repositories used to populate viewer-relation flags
 // on the embedded mutee in mute/list (#1912)。
@@ -72,14 +64,19 @@ func (h *Handler) SetModeratorChecker(m ModeratorChecker) {
 // `mutee` user object that the upstream Misskey frontend uses for
 // rendering. They are optional (nil) only in legacy tests; production
 // must wire them.
-func NewHandler(svc *coremuting.Service, userRepo repository.UserRepository, idGen id.Generator) *Handler {
-	return &Handler{svc: svc, userRepo: userRepo, idGen: idGen}
+// entityPacker is the Packer this handler packs entities with (#3792); extras
+// fills pinnedNotes / pinnedPage / movedTo / alsoKnownAs for the embedded users
+// of mute/list (#3330).
+func NewHandler(svc *coremuting.Service, userRepo repository.UserRepository, idGen id.Generator, entityPacker *entity.Packer, extras userpack.DetailExtrasMany) *Handler {
+	return &Handler{svc: svc, userRepo: userRepo, idGen: idGen, entityPacker: entityPacker, extras: extras}
 }
 
 // CreateRequest is the request body for mute/create.
+//
+// expiresAt は、本家(ajv の integer)と同じく値が整数の小数(1e13)も受ける (#3760)。
 type CreateRequest struct {
-	UserID    string `json:"userId"`
-	ExpiresAt *int64 `json:"expiresAt"`
+	UserID    string     `json:"userId"`
+	ExpiresAt *jsnum.Int `json:"expiresAt"`
 }
 
 // Create handles POST /api/mute/create.
@@ -90,9 +87,12 @@ func (h *Handler) Create(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 
+	// **0 は無期限** (upstream create.ts の `ps.expiresAt ? new Date(...) : null`。
+	// JS の 0 は falsy)。0 を 1970 年として渡すと、失効済みの no-op 分岐に入り、
+	// 204 を返すのにミュートを作らなかった。channels/mute/create も同じ扱い。
 	var expires *time.Time
-	if req.ExpiresAt != nil {
-		t := time.UnixMilli(*req.ExpiresAt)
+	if at := req.ExpiresAt.Int64Ptr(); at != nil && *at != 0 {
+		t := time.UnixMilli(*at)
 		expires = &t
 	}
 
@@ -126,6 +126,8 @@ func (h *Handler) Delete(c echo.Context) error {
 		switch {
 		case errors.Is(err, coremuting.ErrSelfMute):
 			return c.JSON(http.StatusBadRequest, apierr.Error("MUTEE_IS_YOURSELF", "You cannot unmute yourself.", "f428b029-6b39-4d48-a1d2-cc1ae6dd5cf9"))
+		case errors.Is(err, coremuting.ErrMuteeNotFound):
+			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "b851d00b-8ab1-4a56-8b1b-e24187cb48ef"))
 		case errors.Is(err, coremuting.ErrNotMuting):
 			return c.JSON(http.StatusBadRequest, apierr.Error("NOT_MUTING", "You are not muting that user.", "5467d020-daa9-4553-81e1-135c0c35a96d"))
 		}
@@ -135,13 +137,16 @@ func (h *Handler) Delete(c echo.Context) error {
 }
 
 // ListRequest is the request body for mute/list.
+//
+// 本家の paramDef に offset は無く、送られても無視して先頭から返すので読まない。
+// limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が整数の
+// 小数(10.0)を受ける (#3760)。
 type ListRequest struct {
-	Limit     *int   `json:"limit"`
-	Offset    int    `json:"offset"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // List handles POST /api/mute/list.
@@ -155,16 +160,16 @@ func (h *Handler) List(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 30, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 30, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	rows, err := h.svc.List(user.ID, sinceID, untilID, limit, req.Offset)
+	rows, err := h.svc.List(user.ID, sinceID, untilID, limit)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -231,7 +236,7 @@ func (h *Handler) fetchMuteeMap(ctx context.Context, viewer *model.User, rows []
 	iAmModerator := h.moderator != nil && viewerID != "" && h.moderator.IsModerator(viewerID)
 	packed := make([]entity.UserDetailed, len(users))
 	for i, u := range users {
-		d := entity.PackUserDetailed(u, profileByUser[u.ID], h.idGen)
+		d := h.entityPacker.PackUserDetailed(u, profileByUser[u.ID], h.idGen)
 		// viewer-relation flag を付与 (#1912)。mute 一覧なので isMuted=true が出る。
 		viewerIsFollowing := h.relation.Apply(&d, viewerID, u, profileByUser[u.ID])
 		// followers-only count を非フォロワーに leak させない (upstream packMany(_, me) の

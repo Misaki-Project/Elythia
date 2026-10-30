@@ -24,8 +24,8 @@ func newHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	userRepo := testutil.NewMockUserRepository()
 	blockingRepo := testutil.NewMockBlockingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreblocking.NewService(userRepo, blockingRepo, idGen)
-	return NewHandler(svc, userRepo, idGen), userRepo
+	svc := coreblocking.NewService(userRepo, blockingRepo, idGen, nil, nil, nil, nil)
+	return NewHandler(svc, userRepo, idGen, nil, nil, nil), userRepo
 }
 
 func newReq(t *testing.T, body string) (echo.Context, *httptest.ResponseRecorder) {
@@ -64,8 +64,8 @@ func TestCreateDelete_ReturnsIsBlockingRelation(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	blockingRepo := testutil.NewMockBlockingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreblocking.NewService(userRepo, blockingRepo, idGen)
-	h := NewHandler(svc, userRepo, idGen)
+	svc := coreblocking.NewService(userRepo, blockingRepo, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, userRepo, idGen, nil, nil, nil)
 	// relation の Blocking は service と同一インスタンスを渡し、block 状態を反映させる。
 	h.SetRelationRepos(userrelation.Repos{Blocking: blockingRepo})
 	addUser(userRepo, "alice")
@@ -96,8 +96,8 @@ func TestList_BlockeeCarriesIsBlocking(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	blockingRepo := testutil.NewMockBlockingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreblocking.NewService(userRepo, blockingRepo, idGen)
-	h := NewHandler(svc, userRepo, idGen)
+	svc := coreblocking.NewService(userRepo, blockingRepo, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, userRepo, idGen, nil, nil, nil)
 	// relation の Blocking は service と同一インスタンスで block 状態を反映。
 	h.SetRelationRepos(userrelation.Repos{Blocking: blockingRepo})
 	addUser(userRepo, "alice")
@@ -132,8 +132,8 @@ func newGatedHandler(t *testing.T, mod ModeratorChecker) (*Handler, *httptest.Re
 	userRepo := testutil.NewMockUserRepository()
 	blockingRepo := testutil.NewMockBlockingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreblocking.NewService(userRepo, blockingRepo, idGen)
-	h := NewHandler(svc, userRepo, idGen)
+	svc := coreblocking.NewService(userRepo, blockingRepo, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, userRepo, idGen, nil, nil, nil)
 	h.SetRelationRepos(userrelation.Repos{
 		Following: testutil.NewMockFollowingRepository(),
 		Blocking:  blockingRepo,
@@ -278,8 +278,8 @@ func TestCreate_RepoError(t *testing.T) {
 	addUser(userRepo, "alice")
 	addUser(userRepo, "bob")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreblocking.NewService(userRepo, &failingBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository()}, idGen)
-	h := NewHandler(svc, nil, nil)
+	svc := coreblocking.NewService(userRepo, &failingBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository()}, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, nil, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{"userId":"bob"}`)
 	setUser(c, "alice")
@@ -320,11 +320,27 @@ func TestDelete_Self(t *testing.T) {
 }
 
 func TestDelete_NotBlocking(t *testing.T) {
-	h, _ := newHandler(t)
+	h, repo := newHandler(t)
+	addUser(repo, "alice")
+	addUser(repo, "bob")
 	c, rec := newReq(t, `{"userId":"bob"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Delete(c))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "NOT_BLOCKING")
+}
+
+// A user that does not exist is NO_SUCH_USER, not NOT_BLOCKING: upstream looks up
+// the user before the relation (#3760).
+func TestDelete_NoSuchUser(t *testing.T) {
+	h, repo := newHandler(t)
+	addUser(repo, "alice")
+	c, rec := newReq(t, `{"userId":"nosuchuser1"}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Delete(c))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"NO_SUCH_USER"`)
+	assert.Contains(t, rec.Body.String(), "8621d8bf-c358-4303-a066-5ea78610eb3f")
 }
 
 // failingDeleteBlockingRepo lets us trigger Delete errors.
@@ -343,8 +359,8 @@ func TestDelete_RepoError(t *testing.T) {
 	mock := testutil.NewMockBlockingRepository()
 	mock.Blockings["b1"] = &model.Blocking{ID: "b1", BlockerID: "alice", BlockeeID: "bob"}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreblocking.NewService(userRepo, &failingDeleteBlockingRepo{MockBlockingRepository: mock}, idGen)
-	h := NewHandler(svc, nil, nil)
+	svc := coreblocking.NewService(userRepo, &failingDeleteBlockingRepo{MockBlockingRepository: mock}, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, nil, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{"userId":"bob"}`)
 	setUser(c, "alice")
@@ -399,11 +415,48 @@ func (f *failingListBlockingRepo) ListByBlocker(_, _, _ string, _, _ int) ([]*mo
 func TestList_RepoError(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreblocking.NewService(userRepo, &failingListBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository()}, idGen)
-	h := NewHandler(svc, nil, nil)
+	svc := coreblocking.NewService(userRepo, &failingListBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository()}, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, nil, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{}`)
 	setUser(c, "alice")
 	require.NoError(t, h.List(c))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// listAfterTwoCreates makes alice target bob and carol, then lists with body.
+func listAfterTwoCreates(t *testing.T, body string) []map[string]any {
+	t.Helper()
+	h, repo := newHandler(t)
+	addUser(repo, "alice")
+	addUser(repo, "bob")
+	addUser(repo, "carol")
+	for _, target := range []string{"bob", "carol"} {
+		c, rec := newReq(t, `{"userId":"`+target+`"}`)
+		setUser(c, "alice")
+		require.NoError(t, h.Create(c))
+		require.Less(t, rec.Code, 300, rec.Body.String())
+	}
+	c, rec := newReq(t, body)
+	setUser(c, "alice")
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	return resp
+}
+
+// list accepts an integer-valued fraction for limit / sinceDate / untilDate,
+// as upstream's ajv does for an integer (#3760).
+func TestList_AcceptsIntegerValuedFractions(t *testing.T) {
+	assert.Len(t, listAfterTwoCreates(t, `{"limit":1.0,"untilDate":1e15}`), 1)
+	assert.Len(t, listAfterTwoCreates(t, `{"sinceDate":1e1}`), 2)
+	assert.Empty(t, listAfterTwoCreates(t, `{"sinceDate":1e15}`), "sinceDate is read, not just accepted")
+}
+
+// list does not read offset, which upstream's paramDef does not have:
+// upstream ignores it and answers from the top (#3760).
+func TestList_IgnoresOffset(t *testing.T) {
+	assert.Len(t, listAfterTwoCreates(t, `{"offset":1}`), 2)
+	assert.Len(t, listAfterTwoCreates(t, `{"offset":"x"}`), 2)
 }

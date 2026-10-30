@@ -17,6 +17,7 @@ import (
 	"github.com/elythia-network/elythia/internal/entitycompat/shapetest"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/labstack/echo/v4"
@@ -80,9 +81,9 @@ func newTestHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	h := NewHandler(svc, fSvc, noteRepo, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	// followingRepo + followRequestRepo を service と共有する形で wire
 	// しておく (#1144 で users/{followers,following} の relation flag +
 	// pending request flag の batch lookup が handler 直配線の repo 経由に
@@ -230,6 +231,49 @@ func TestShow_FiresChartHookAnonymous(t *testing.T) {
 	assert.NotEmpty(t, hook.calls[0].visitor) // RemoteAddr is set by httptest
 }
 
+// 匿名訪問者の visitor key は接続元の IP で、port を含めない。RemoteAddr
+// (ip:port) のままだと、同じ訪問者が接続を張り直すたびに別人として数えられる。
+func TestShow_AnonymousVisitorKeyIsRealIPWithoutPort(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	addTestUser(userRepo)
+	hook := &stubChartHook{}
+	h.SetChartHook(hook)
+
+	e := echo.New()
+	// trustProxy で信頼した proxy の内側を想定し、XFF の値を実 IP として使う。
+	e.IPExtractor = echo.ExtractIPFromXFFHeader(echo.TrustLoopback(true))
+	for _, remoteAddr := range []string{"127.0.0.1:50001", "127.0.0.1:50002"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/users/show", strings.NewReader(`{"userId": "user1"}`))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set(echo.HeaderXForwardedFor, "203.0.113.7")
+		req.RemoteAddr = remoteAddr
+		c := e.NewContext(req, httptest.NewRecorder())
+		require.NoError(t, h.Show(c))
+	}
+
+	require.Len(t, hook.calls, 2)
+	assert.Equal(t, "203.0.113.7", hook.calls[0].visitor)
+	assert.Equal(t, hook.calls[0].visitor, hook.calls[1].visitor, "the same visitor must map to one key across connections")
+}
+
+func TestShow_AnonymousVisitorKeyDropsPortWithoutProxy(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	addTestUser(userRepo)
+	hook := &stubChartHook{}
+	h.SetChartHook(hook)
+
+	e := echo.New()
+	e.IPExtractor = echo.ExtractIPDirect()
+	req := httptest.NewRequest(http.MethodPost, "/api/users/show", strings.NewReader(`{"userId": "user1"}`))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.RemoteAddr = "198.51.100.4:61234"
+	c := e.NewContext(req, httptest.NewRecorder())
+	require.NoError(t, h.Show(c))
+
+	require.Len(t, hook.calls, 1)
+	assert.Equal(t, "198.51.100.4", hook.calls[0].visitor)
+}
+
 func TestShow_ByUsername(t *testing.T) {
 	h, userRepo := newTestHandler(t)
 	addTestUser(userRepo)
@@ -375,10 +419,10 @@ func newTestHandlerWithRemoteResolver(t *testing.T, resolver coreuser.RemoteUser
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
 	svc.SetRemoteUserResolver(resolver)
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	return NewHandler(svc, fSvc, noteRepo, idGen), userRepo
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	return NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil), userRepo
 }
 
 func TestShow_ByUsernameWithHost_RemoteResolveSucceeds(t *testing.T) {
@@ -690,11 +734,11 @@ func TestShow_ViewerDependentFields(t *testing.T) {
 	// blockingリポジトリをセット (viewerがtargetをブロック)
 	blockingRepo := testutil.NewMockBlockingRepository()
 	blockingRepo.Blockings["b1"] = &model.Blocking{ID: "b1", BlockerID: "viewer1", BlockeeID: "target1"}
-	h.SetBlockingRepo(blockingRepo)
+	h.blockingRepo = blockingRepo
 
 	// mutingリポジトリをセット
 	mutingRepo := testutil.NewMockMutingRepository()
-	h.SetMutingRepo(mutingRepo)
+	h.mutingRepo = mutingRepo
 
 	// followRequestリポジトリをセット
 	followRequestRepo := testutil.NewMockFollowRequestRepository()
@@ -901,9 +945,9 @@ func TestSearch_BatchFetchesProfiles(t *testing.T) {
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(repo, noteRepo, piningRepo, idGen)
-	fSvc := corefollowing.NewService(repo, fRepo, frRepo, idGen)
-	h := NewHandler(svc, fSvc, noteRepo, idGen)
+	svc := coreuser.NewService(repo, noteRepo, piningRepo, idGen, nil)
+	fSvc := corefollowing.NewService(repo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	for i := 0; i < 5; i++ {
 		uid := fmt.Sprintf("searchuser-%d", i)
@@ -1010,7 +1054,7 @@ func TestNotes_ExcludesTargetFromMute(t *testing.T) {
 	// viewer1 が target (user1) を mute している。
 	mutingRepo := testutil.NewMockMutingRepository()
 	require.NoError(t, mutingRepo.Create(&model.Muting{ID: "m1", MuterID: "viewer1", MuteeID: "user1"}))
-	h.SetMutingRepo(mutingRepo)
+	h.mutingRepo = mutingRepo
 
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"userId":"user1"}`))
@@ -1306,8 +1350,8 @@ func TestFollowers_PopulatesIsFollowedFromViewer(t *testing.T) {
 	require.NoError(t, err)
 	// 本番と同じく関係の repo をすべて配線する (未配線の関係は、一覧共通の
 	// packer が項目ごと出さない)。
-	h.SetBlockingRepo(testutil.NewMockBlockingRepository())
-	h.SetMutingRepo(testutil.NewMockMutingRepository())
+	h.blockingRepo = testutil.NewMockBlockingRepository()
+	h.mutingRepo = testutil.NewMockMutingRepository()
 	h.SetRenoteMutingRepo(testutil.NewMockRenoteMutingRepository())
 
 	rec := postStub(h.Followers, `{"userId":"user1"}`, repo.Users["bob"])
@@ -1428,6 +1472,10 @@ func TestFollowers_AppliesRemoteStatsOverride(t *testing.T) {
 // /api/users/following — same helper is used so symmetry is expected, but
 // explicit regression guard against prefix routing or pack-side regressions.
 func TestFollowing_AppliesRemoteStatsOverride(t *testing.T) {
+	// ローカルからリモートへのフォローは Accept まで申請になる (#3491)。このテストは
+	// フォローが成立した後の表示を見るので、本家の backend e2e と同じ切り替えで即座に
+	// 成立させる。
+	t.Setenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING", "true")
 	h, repo := newTestHandler(t)
 	addTestUser(repo) // user1 = local target profile
 	remoteHost := "remote.example"
@@ -1599,9 +1647,9 @@ func TestFollowers_BatchFetchesUsers(t *testing.T) {
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(repo, noteRepo, piningRepo, idGen)
-	fSvc := corefollowing.NewService(repo, fRepo, frRepo, idGen)
-	h := NewHandler(svc, fSvc, noteRepo, idGen)
+	svc := coreuser.NewService(repo, noteRepo, piningRepo, idGen, nil)
+	fSvc := corefollowing.NewService(repo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// target user (followee)
 	repo.Users["target"] = &model.User{
@@ -2141,10 +2189,10 @@ func newHandlerWithFailingNoteRepo(t *testing.T) *Handler {
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
 	addTestUser(userRepo)
-	return NewHandler(svc, fSvc, noteRepo, idGen)
+	return NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 }
 
 func newHandlerWithFailingSearch(t *testing.T) *Handler {
@@ -2157,9 +2205,9 @@ func newHandlerWithFailingSearch(t *testing.T) *Handler {
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	return NewHandler(svc, fSvc, noteRepo, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	return NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 }
 
 func newHandlerWithFailingFollowing(t *testing.T) *Handler {
@@ -2171,9 +2219,9 @@ func newHandlerWithFailingFollowing(t *testing.T) *Handler {
 	fRepo := &failingFollowingRepo{MockFollowingRepository: testutil.NewMockFollowingRepository()}
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	return NewHandler(svc, fSvc, noteRepo, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	return NewHandler(svc, fSvc, noteRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 }
 
 func TestSearch_InternalError(t *testing.T) {
@@ -2398,6 +2446,136 @@ func TestShow_PinnedPage_Populated(t *testing.T) {
 	assert.Equal(t, "user1", pageUser["id"])
 }
 
+// TestShow_PinnedPage_PrivateHidesID checks that a private pinned page exposes
+// neither its body nor its ID to anyone but the author (#3479).
+func TestShow_PinnedPage_PrivateHidesID(t *testing.T) {
+	cases := []struct {
+		name   string
+		viewer *model.User
+		wantID bool
+	}{
+		{name: "anonymous gets neither", viewer: nil},
+		{name: "stranger gets neither", viewer: &model.User{ID: "viewer1"}},
+		{name: "author gets both", viewer: &model.User{ID: "user1"}, wantID: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, userRepo := newTestHandler(t)
+			addTestUser(userRepo)
+			pageID := "pg_secret"
+			userRepo.Profiles["user1"] = &model.UserProfile{
+				UserID:       "user1",
+				Fields:       datatypes.JSON([]byte("[]")),
+				PinnedPageID: &pageID,
+			}
+			h.SetPageRepo(&stubPageRepoForPin{page: &model.Page{
+				ID: pageID, Title: "SECRET-TITLE", UserID: "user1", Visibility: model.PageVisibilityPrivate,
+			}})
+
+			e := echo.New()
+			req := httptest.NewRequest(http.MethodPost, "/api/users/show", strings.NewReader(`{"userId": "user1"}`))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			rec := httptest.NewRecorder()
+			c := e.NewContext(req, rec)
+			if tc.viewer != nil {
+				c.Set("misskeyUser", tc.viewer)
+			}
+			require.NoError(t, h.Show(c))
+
+			var resp map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			if tc.wantID {
+				assert.Equal(t, pageID, resp["pinnedPageId"])
+				assert.NotNil(t, resp["pinnedPage"])
+				return
+			}
+			assert.Nil(t, resp["pinnedPageId"])
+			assert.Nil(t, resp["pinnedPage"])
+			assert.NotContains(t, rec.Body.String(), pageID)
+			assert.NotContains(t, rec.Body.String(), "SECRET-TITLE")
+		})
+	}
+}
+
+// TestShow_PinnedPage_MissingKeepsID: Page が無い (削除済み) ときは pinnedPageId を
+// 残し、pinnedPage だけを null にする。本家は FK の ON DELETE SET NULL で ID が
+// 消えるが、Elythia の DB には FK が無い (#3479 より前からの差)。#3479 で private の
+// ID を隠すようにしたが、その条件を広げすぎていないかを見る。
+func TestShow_PinnedPage_MissingKeepsID(t *testing.T) {
+	h, userRepo := newTestHandler(t)
+	addTestUser(userRepo)
+	pageID := "pg_gone"
+	userRepo.Profiles["user1"] = &model.UserProfile{
+		UserID:       "user1",
+		Fields:       datatypes.JSON([]byte("[]")),
+		PinnedPageID: &pageID,
+	}
+	h.SetPageRepo(&stubPageRepoForPin{page: nil})
+
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/api/users/show", strings.NewReader(`{"userId": "user1"}`))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	require.NoError(t, h.Show(c))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, pageID, resp["pinnedPageId"])
+	assert.Nil(t, resp["pinnedPage"])
+}
+
+// failingPageRepoForPin fails every page lookup.
+type failingPageRepoForPin struct{ stubPageRepoForPin }
+
+func (s *failingPageRepoForPin) FindByID(string) (*model.Page, error) {
+	return nil, errors.New("db down")
+}
+
+// TestShow_PinnedPage_LookupFailureHidesIDFromOthers: Page の読み出しに失敗すると
+// private かどうか分からないので、他人には ID を出さない (#3479)。本人には残す。
+func TestShow_PinnedPage_LookupFailureHidesIDFromOthers(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		viewer *model.User
+		wantID bool
+	}{
+		{name: "anonymous", viewer: nil},
+		{name: "author", viewer: &model.User{ID: "user1"}, wantID: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, userRepo := newTestHandler(t)
+			addTestUser(userRepo)
+			pageID := "pg_unknown"
+			userRepo.Profiles["user1"] = &model.UserProfile{
+				UserID:       "user1",
+				Fields:       datatypes.JSON([]byte("[]")),
+				PinnedPageID: &pageID,
+			}
+			h.SetPageRepo(&failingPageRepoForPin{})
+
+			e := echo.New()
+			req := httptest.NewRequest(http.MethodPost, "/api/users/show", strings.NewReader(`{"userId": "user1"}`))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			rec := httptest.NewRecorder()
+			c := e.NewContext(req, rec)
+			if tc.viewer != nil {
+				c.Set("misskeyUser", tc.viewer)
+			}
+			require.NoError(t, h.Show(c))
+
+			var resp map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			if tc.wantID {
+				assert.Equal(t, pageID, resp["pinnedPageId"])
+			} else {
+				assert.Nil(t, resp["pinnedPageId"])
+			}
+			assert.Nil(t, resp["pinnedPage"])
+		})
+	}
+}
+
 func TestShow_PinnedFields_Defaults(t *testing.T) {
 	h, userRepo := newTestHandler(t)
 	addTestUser(userRepo)
@@ -2477,6 +2655,21 @@ func TestSetters_WireOptionalDeps(t *testing.T) {
 	assert.Empty(t, show("u1"))
 }
 
+// リモートの利用者の emojis には、形の崩れた URL の絵文字を載せない。括弧などは
+// 符号化した値を載せる。
+func TestPopulateUserEmojis_RemoteURLForm(t *testing.T) {
+	h, _ := newTestHandler(t)
+	host := "remote.example"
+	emojiRepo := testutil.NewMockEmojiRepository()
+	require.NoError(t, emojiRepo.Create(&model.Emoji{ID: "e1", Name: "bad", Host: &host, PublicURL: "https:///remote.example/bad.png"}))
+	require.NoError(t, emojiRepo.Create(&model.Emoji{ID: "e2", Name: "ok", Host: &host, PublicURL: "https://remote.example/ok (1).png"}))
+	h.SetEmojiRepo(emojiRepo)
+
+	lite := &entity.UserLite{}
+	h.populateUserEmojis(&model.User{ID: "u2", Host: &host, Emojis: []string{"bad", "ok"}}, lite)
+	assert.Equal(t, map[string]string{"ok": "https://remote.example/ok%20%281%29.png"}, lite.Emojis)
+}
+
 // stubBufferedReactions implements entity.BufferedReactionsReader as a no-op
 // for setter wiring tests (#739)。
 type stubBufferedReactions struct{}
@@ -2498,10 +2691,10 @@ func TestFollowers_PopulatesBlockMute(t *testing.T) {
 	// viewer(bob) が alice を block + mute。
 	blockRepo := testutil.NewMockBlockingRepository()
 	require.NoError(t, blockRepo.Create(&model.Blocking{ID: "bl1", BlockerID: "bob", BlockeeID: "alice"}))
-	h.SetBlockingRepo(blockRepo)
+	h.blockingRepo = blockRepo
 	muteRepo := testutil.NewMockMutingRepository()
 	require.NoError(t, muteRepo.Create(&model.Muting{ID: "mu1", MuterID: "bob", MuteeID: "alice"}))
-	h.SetMutingRepo(muteRepo)
+	h.mutingRepo = muteRepo
 	h.SetRenoteMutingRepo(testutil.NewMockRenoteMutingRepository())
 
 	rec := postStub(h.Followers, `{"userId":"user1"}`, repo.Users["bob"])
@@ -2540,7 +2733,7 @@ func TestPinnedPageVisibleTo(t *testing.T) {
 	pub := &model.Page{ID: "p1", UserID: "owner", Visibility: model.PageVisibilityPublic}
 	require.True(t, pinnedPageVisibleTo(pub, nil), "public は未認証にも見せる")
 
-	hidden := &model.Page{ID: "p2", UserID: "owner", Visibility: model.PageVisibilityFollowers}
+	hidden := &model.Page{ID: "p2", UserID: "owner", Visibility: model.PageVisibilityPrivate}
 	require.False(t, pinnedPageVisibleTo(hidden, nil), "非公開は未認証に見せない")
 	require.False(t, pinnedPageVisibleTo(hidden, stranger), "非公開は他人に見せない")
 	require.True(t, pinnedPageVisibleTo(hidden, owner), "本人には見せる")
@@ -2550,4 +2743,14 @@ func TestPinnedPageVisibleTo(t *testing.T) {
 	// visibility 未設定は既定 (public) 扱い。
 	def := &model.Page{ID: "p3", UserID: "owner"}
 	require.True(t, pinnedPageVisibleTo(def, nil))
+}
+
+// viewerRelationRepos hands the reader NewHandler received to the
+// relation bundle, so users/show reads the relation in one statement (#3608).
+func TestViewerRelationReposCarriesRelationReader(t *testing.T) {
+	h, _ := newTestHandler(t)
+	assert.Nil(t, h.viewerRelationRepos().Relation)
+	reader := repository.NewUserRelationRepository(nil)
+	h.relationReader = reader
+	assert.Equal(t, reader, h.viewerRelationRepos().Relation)
 }

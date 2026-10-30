@@ -13,10 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/elythia-network/elythia/internal/activitypub/mfm"
+	apmfm "github.com/elythia-network/elythia/internal/activitypub/mfm"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/google/uuid"
+
+	"github.com/elythia-network/mfm"
 )
 
 // publishedLayout is the millisecond ISO8601 layout (JS Date.toISOString()) used
@@ -36,6 +38,9 @@ type URLBuilder struct {
 func NewURLBuilder(baseURL string) *URLBuilder {
 	return &URLBuilder{baseURL: baseURL}
 }
+
+// BaseURL returns the canonical origin used by this builder.
+func (b *URLBuilder) BaseURL() string { return b.baseURL }
 
 // UserURI returns the canonical actor URI for a local user.
 func (b *URLBuilder) UserURI(userID string) string {
@@ -69,6 +74,20 @@ func (b *URLBuilder) LocalUserIDFromURI(uri string) string {
 	// `/users/<id>` ちょうどの形だけを受ける (配下のサブパスは actor ではない)。
 	if rest == "" || strings.Contains(rest, "/") {
 		return ""
+	}
+	return rest
+}
+
+// LocalNoteIDFromURI returns the ID named by a canonical local note URI,
+// including activity and fragment variants that identify the same note.
+func (b *URLBuilder) LocalNoteIDFromURI(uri string) string {
+	prefix := b.baseURL + "/notes/"
+	if b.baseURL == "" || !strings.HasPrefix(uri, prefix) {
+		return ""
+	}
+	rest := uri[len(prefix):]
+	if i := strings.IndexAny(rest, "/#?"); i >= 0 {
+		rest = rest[:i]
 	}
 	return rest
 }
@@ -307,6 +326,9 @@ type Renderer struct {
 	// quoteApproval は引用する投稿の承認 URI (FEP-044f の quoteAuthorization) を
 	// 引く lookup (#3234)。承認が無ければ空文字列。nil なら付けない。
 	quoteApproval func(n *model.Note) (string, error)
+	// idGen はローカルの人の ID から作成日時を出し、actor の `published` に
+	// 載せるために使う (#3465)。nil なら `published` を出さない。
+	idGen id.Generator
 }
 
 // NewRenderer constructs a Renderer.
@@ -332,6 +354,13 @@ func (r *Renderer) SetQuoteApprovalResolver(fn func(n *model.Note) (string, erro
 // QuoteRequest を送るかどうかもこれに揃える。
 func IsQuote(n *model.Note) bool {
 	return n.RenoteID != nil && stringValue(n.Text) != ""
+}
+
+// SetIDGenerator wires the ID generator used to derive a local actor's
+// `published` (account creation time) from the user ID in RenderPerson
+// (#3465). nil disables `published` on actors.
+func (r *Renderer) SetIDGenerator(gen id.Generator) {
+	r.idGen = gen
 }
 
 // SetInstanceImageLookup wires a lookup for meta.iconUrl / meta.bannerUrl used
@@ -465,6 +494,16 @@ func (r *Renderer) RenderPerson(u *model.User, profile *model.UserProfile, publi
 		Discoverable:     APLenientBool(u.IsExplorable),
 		IsCat:            APLenientBool(u.IsCat),
 	}
+	// アカウントの作成日時を `published` として載せる (#3465)。upstream の
+	// renderPerson は出さないが、Mastodon は出しており、受信側は無ければ
+	// 無視するだけなので連合の互換は崩れない。ローカルの人の ID は登録時に
+	// 作るので、TS から移行した DB でも元の登録日になる。読めない ID のときは
+	// 現在時刻で埋めず、出さない (嘘の作成日時を配るよりよい)。
+	if r.idGen != nil {
+		if t, err := r.idGen.ParseTime(u.ID); err == nil {
+			p.Published = APLenientTimestamp(t.UTC().Format(publishedLayout))
+		}
+	}
 	// Ed25519 鍵を持つ user に対しては assertionMethod に Multikey として
 	// 追加 expose する。Fedibird など FEP-521a 対応サーバーが Ed25519 鍵で
 	// HTTP Signature を verify できるようにするための拡張 (#1067 / #1069)。
@@ -504,7 +543,7 @@ func (r *Renderer) RenderPerson(u *model.User, profile *model.UserProfile, publi
 		p.Icon = &Image{Type: "Image", URL: APLenientHref(instanceIcon)}
 	default:
 		// identicon URL は mk-go の /identicon/<username> route 規則に合わせる
-		// (entity.IdenticonURL と同一 seed なので REST avatarUrl と同じ画像)。
+		// ((*entity.Packer).IdenticonURL と同一 seed なので REST avatarUrl と同じ画像)。
 		p.Icon = &Image{Type: "Image", URL: APLenientHref(r.urls.baseURL + "/identicon/" + u.Username)}
 	}
 	switch {
@@ -574,7 +613,7 @@ func (r *Renderer) enrichPersonFromProfile(p *Person, profile *model.UserProfile
 	p.MisskeySummary = lenientStringPtr(profile.Description)
 	if profile.Description != nil && *profile.Description != "" {
 		nodes := mfm.Parse(*profile.Description)
-		p.Summary = APLenientString(mfm.ToHTML(nodes, r.host))
+		p.Summary = APLenientString(apmfm.ToHTML(nodes, r.host))
 	}
 	if profile.Birthday != nil && *profile.Birthday != "" {
 		p.VcardBday = APLenientString(*profile.Birthday)
@@ -646,7 +685,7 @@ func (r *Renderer) renderNote(n *model.Note, idGen id.Generator, approvalOf func
 		nodes = mfm.Parse(text)
 		// 本家 ApMfmService.getNoteHtml と同じく、ノートの mentionedRemoteUsers 列を
 		// 渡し、リモートのメンションをその利用者の url (無ければ uri) へリンクする
-		htmlContent = mfm.ToHTMLWithMentions(nodes, r.host, mfm.ParseMentionedRemoteUsers(n.MentionedRemoteUsers))
+		htmlContent = apmfm.ToHTMLWithMentions(nodes, r.host, apmfm.ParseMentionedRemoteUsers(n.MentionedRemoteUsers))
 	}
 
 	out := &Note{
@@ -674,7 +713,7 @@ func (r *Renderer) renderNote(n *model.Note, idGen id.Generator, approvalOf func
 	// noMisskeyContent=false を強制するため、simple text でも必ず source/
 	// _misskey_content を出す (受信 Misskey が raw markdown を失わないように、#1948-11)。
 	hasExtraHTML := quoteURI != ""
-	if text != "" && (hasExtraHTML || !mfm.IsSimple(nodes)) {
+	if text != "" && (hasExtraHTML || !apmfm.IsSimple(nodes)) {
 		out.MisskeyContent = APLenientString(text)
 		out.Source = &Source{
 			Content:   text,
@@ -718,7 +757,7 @@ func (r *Renderer) renderNote(n *model.Note, idGen id.Generator, approvalOf func
 		// 付ける (#1560、upstream ApRendererService.ts:436-441)。class名
 		// `quote-inline` は非 Misskey クライアントの quote 表示に使われる。
 		// エスケープは本家と同じく escapeHtml (`'` は `&#039;`、`"` は `&quot;`)
-		esc := mfm.EscapeHTML(quoteURI)
+		esc := apmfm.EscapeHTML(quoteURI)
 		out.Content += `<br><br><span class="quote-inline">RE: <a href="` + esc + `">` + esc + `</a></span>`
 	}
 
@@ -1637,7 +1676,7 @@ func (r *Renderer) RenderUndoAnnounce(renoter *model.User, announce *Announce) *
 //
 // **Delete(Tombstone) では取り消せない。** Announce の id は
 // `<noteURI>/activity` で、受信側はその id を renote の uri として保存する
-// (mk-go 自身も processor.go が `renote.URI = act.ID` とする)。Tombstone の
+// (mk-go 自身も processor_like_announce.go が `renote.URI = act.ID` とする)。Tombstone の
 // id は `/activity` の付かない note URI なので一致せず、ブーストが相手側に
 // 残り続ける。
 //
@@ -1790,8 +1829,8 @@ func (r *Renderer) RenderMove(src *model.User, dstURI string) *Move {
 // `content` は mediaType を出していないので AS2 既定の text/html として解釈
 // される。生の本文をそのまま入れると `<script>` や `onerror=` が受信側の
 // content に HTML として載る (chat には入力時のサニタイズも無い)。RenderNote
-// と同じ mfm.Parse -> mfm.ToHTML を通すことで、text ノードは
-// mfm.EscapeHTML (本家の escapeHtml と同じ置き換え) でエスケープされ、MFM は
+// と同じ mfm.Parse -> apmfm.ToHTML を通すことで、text ノードは
+// apmfm.EscapeHTML (本家の escapeHtml と同じ置き換え) でエスケープされ、MFM は
 // ノートの content と同じ HTML になる。
 //
 // **source は常に出す (レビュー M1)。** RenderNote は「標準ノードだけなら
@@ -1805,7 +1844,7 @@ func (r *Renderer) setChatMessageContent(note *Note, text *string) {
 		return
 	}
 	nodes := mfm.Parse(*text)
-	note.Content = mfm.ToHTML(nodes, r.host)
+	note.Content = apmfm.ToHTML(nodes, r.host)
 	note.MisskeyContent = APLenientString(*text)
 	note.Source = &Source{
 		Content:   *text,

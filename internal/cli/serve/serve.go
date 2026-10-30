@@ -5,11 +5,15 @@ package serve
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,20 +22,32 @@ import (
 	"github.com/elythia-network/elythia/internal/cli/cliflag"
 	"github.com/elythia-network/elythia/internal/config"
 	"github.com/elythia-network/elythia/internal/core/cache"
+	mkdb "github.com/elythia-network/elythia/internal/db"
+	"github.com/elythia-network/elythia/internal/maintmode"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/redislog"
 	mksentry "github.com/elythia-network/elythia/internal/sentry"
 	"github.com/elythia-network/elythia/internal/server"
 )
 
-// shutdownTimeout bounds the graceful shutdown after a signal.
-const shutdownTimeout = 10 * time.Second
+// shutdownTimeout bounds the graceful shutdown after a signal or a start
+// failure.
+//
+// docker の既定の停止猶予 (10 秒) より短くする。終了の後に Sentry の flush
+// (最大 2 秒、internal/sentry の flushTimeout) が続くので、それを足しても 10 秒に
+// 届かない値にする。届くと SIGKILL と重なり、最後の DB を閉じる処理やログが
+// 途中で切られる (#3463)。
+const shutdownTimeout = 7 * time.Second
 
-// httpServer is the part of *server.Server these subcommands drive.
+// httpServer is the part of *server.Server dump-routes drives.
 type httpServer interface {
+	DumpRoutes(w io.Writer) error
+}
+
+// supervisor is the part of *server.Supervisor serve drives.
+type supervisor interface {
 	Start() error
 	Shutdown(ctx context.Context) error
-	DumpRoutes(w io.Writer) error
 }
 
 // env carries the process-level dependencies so tests can replace them.
@@ -51,9 +67,14 @@ type env struct {
 	// openRedis returns the clients and the function that closes them.
 	openRedis func(cfg *config.Config) (*cache.RedisClients, func(), error)
 	newServer func(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients) (httpServer, error)
+	// newSupervisor opens the DB and builds the first server generation under
+	// a Supervisor, which owns the listener (#3463).
+	newSupervisor func(cfg *config.Config, redis *cache.RedisClients) (supervisor, error)
 	// signalContext is canceled when the process is asked to stop.
 	signalContext func() (context.Context, context.CancelFunc)
 	createFile    func(path string) (io.WriteCloser, error)
+	// shutdownTimeout overrides the shutdownTimeout constant when non-zero.
+	shutdownTimeout time.Duration
 }
 
 func defaultEnv() env {
@@ -74,6 +95,20 @@ func defaultEnv() env {
 		},
 		newServer: func(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients) (httpServer, error) {
 			return server.New(cfg, db, redis)
+		},
+		newSupervisor: func(cfg *config.Config, redis *cache.RedisClients) (supervisor, error) {
+			return server.NewSupervisor(cfg, redis, server.SupervisorDeps{
+				OpenDB:      model.NewDatabase,
+				NewServer:   server.New,
+				CloseDB:     mkdb.Close,
+				Maintenance: maintmode.NewStore(redis.Default, redis.Pubsub, cfg.Redis.KeyPrefix()),
+				// どのプロセスも判定役の候補になる。管理画面から入れたときに受けた
+				// プロセスが落ちても、ほかのプロセスが判定を引き継ぐ (設計第2版 §2.1)。
+				MaintenanceCounter: &maintmode.PGCounter{
+					Targets: maintmode.TargetsFromConfig(cfg, "elythia-judge/"+processID()),
+				},
+				ProcessID: processID(),
+			})
 		},
 		signalContext: func() (context.Context, context.CancelFunc) {
 			return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -97,7 +132,9 @@ func setupLogging(w io.Writer) *slog.Logger {
 
 // Serve implements "elythia serve": it starts the server and blocks until
 // SIGINT / SIGTERM, then shuts down gracefully. It returns the process exit
-// code.
+// code: 0 after a signal, non-zero when the server failed to start or stopped
+// serving with an error, in which case it shuts down without waiting for a
+// signal.
 func Serve(args []string) int { return serve(defaultEnv(), args) }
 
 // DumpRoutes implements "elythia dump-routes": it constructs the server,
@@ -140,33 +177,124 @@ func serve(e env, args []string) int {
 	}
 	defer flushSentry()
 
-	srv, closeRedis, code := build(e, log, cfg)
-	if code != 0 {
-		return code
+	// 本体の接続に名前を付ける。メンテナンスに入ったとき、pg_stat_activity で
+	// Elythia の接続が残っていないかを名前で数えるため (#3463)。
+	cfg.DBApplicationName = dbApplicationName()
+
+	// Redis を先に開く。DB と Server は Supervisor が開いて作る (#3463)。
+	redisClients, closeRedis, err := e.openRedis(cfg)
+	if err != nil {
+		log.Error("failed to connect to Redis", "error", err)
+		return 1
 	}
-	defer closeRedis()
+	// Shutdown が期限で返ったときは、shutdown hook (chart の保存・バッファの
+	// flush) が裏でまだ走っていて Redis を使いうる。閉じずにプロセスの終了に任せる
+	// (#3463 のレビュー1周目 L-7)。
+	keepRedis := false
+	defer func() {
+		if keepRedis {
+			log.Warn("leaving Redis open: shutdown hooks may still be running")
+			return
+		}
+		closeRedis()
+	}()
+	srv, err := e.newSupervisor(cfg, redisClients)
+	if err != nil {
+		log.Error("failed to construct server", "error", err)
+		return 1
+	}
 
 	ctx, stop := e.signalContext()
 	defer stop()
 
+	// Start は listener を閉じるまで返らない。正常な停止 (Shutdown の後の
+	// http.ErrServerClosed) では nil を返すので、エラーで返ったときだけ起動の失敗と
+	// みなす。listen に失敗したまま生き続けると、コンテナの再起動にもヘルスチェック
+	// にも任せられないので、シグナルを待たずに終了処理へ進み 0 以外で終える (#3633)。
+	// ログは goroutine の中で出す。シグナルの後 (終了処理の最中) に返ったエラーは
+	// 下の select では受けないので、ここで出さないと残らない。
+	startErr := make(chan error, 1)
+	startDone := make(chan struct{})
 	go func() {
+		defer close(startDone)
 		if err := srv.Start(); err != nil {
 			log.Error("server error", "error", err)
+			startErr <- err
 		}
 	}()
 
-	<-ctx.Done()
-	log.Info("shutting down server...")
+	exitCode := 0
+	select {
+	case <-ctx.Done():
+		log.Info("shutting down server...")
+	case <-startErr:
+		log.Info("shutting down server after a start failure...")
+		exitCode = 1
+	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	// 0 のときは定数を使う。テストの env はこのフィールドを埋めないので、既定を
+	// 0 で表す。
+	timeout := e.shutdownTimeout
+	if timeout == 0 {
+		timeout = shutdownTimeout
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("server shutdown error", "error", err)
+		keepRedis = errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	}
+	// Start が終了処理の最中にエラーで返ったとき、そのログをプロセスの終了より前に
+	// 出し切る。待つのは終了処理の期限までで、期限は延ばさない。
+	select {
+	case <-startDone:
+	case <-shutdownCtx.Done():
 	}
 
 	fmt.Fprintln(e.stdout, "Elythia stopped.")
-	return 0
+	return exitCode
+}
+
+// processID names this process in the maintenance reports, as the judge
+// and in application_name: "<host>-<pid>-<random>". It is fixed for the
+// life of the process.
+//
+// コンテナの中では PID がほぼ 1 で、hostname: を指定した scale や host network
+// では host も重なる。重なると報告が上書きされ、判定役のロックの ID も同じに
+// なる (#3463 のレビュー2周目 5) ので、起動ごとの乱数を付ける。
+var processID = sync.OnceValue(func() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return buildProcessID(host, os.Getpid(), hex.EncodeToString(b[:]))
+})
+
+// processIDHostMax bounds the host part of processID so that
+// "elythia/<longest role>/<processID>" fits in the 63 bytes PostgreSQL keeps
+// of application_name: 63 - len("elythia/invalid/") - len("-<7 digits>-<8 hex>").
+const processIDHostMax = 63 - len("elythia/invalid/") - len("-1234567-01234567")
+
+// buildProcessID joins host, pid and random, shortening host so that the pid
+// and the random part always survive PostgreSQL's truncation.
+func buildProcessID(host string, pid int, random string) string {
+	if len(host) > processIDHostMax {
+		host = host[:processIDHostMax]
+	}
+	return fmt.Sprintf("%s-%d-%s", host, pid, random)
+}
+
+// dbApplicationName returns the application_name of this process's DB
+// connections: "elythia/<role>/<processID>".
+func dbApplicationName() string {
+	role := "invalid"
+	if r, err := config.ResolveProcessRole(); err == nil {
+		role = string(r)
+	}
+	return "elythia/" + role + "/" + processID()
 }
 
 func dumpRoutes(e env, args []string) int {

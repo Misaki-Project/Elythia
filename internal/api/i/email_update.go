@@ -1,6 +1,7 @@
 package i
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
@@ -15,9 +16,13 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// generateVerifyCode returns a random 16-char hex code for email verification.
+// generateVerifyCode returns a random 32-char hex code for email verification.
+//
+// 128 bit にする (登録の確認コードの generatePendingCode と同じ)。upstream は
+// secureRndstr(16) (約 83 bit)。verify-email は認証も回数の上限も無く、コードだけで
+// 照合する。
 func generateVerifyCode() string {
-	b := make([]byte, 8)
+	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
@@ -148,11 +153,8 @@ func (h *Handler) UpdateEmail(c echo.Context) error {
 				EmailSettingsLabel: l10n.EmailSettingsLabel(lang),
 				BodyHTML:           bodyHTML,
 			})
-			go h.emailSender(addr, miscsmtp.Message{
-				Subject: subject,
-				Text:    text,
-				HTML:    html,
-			})
+			msg := miscsmtp.Message{Subject: subject, Text: text, HTML: html}
+			h.background.Go(func(context.Context) { h.emailSender(addr, msg) })
 		}
 	}
 
@@ -170,13 +172,19 @@ func (h *Handler) UpdateEmail(c echo.Context) error {
 // emailVerifyCode が一致すれば emailVerified を true にする。
 func (h *Handler) VerifyEmail(c echo.Context) error {
 	var req struct {
-		Code string `json:"code"`
+		Code *string `json:"code"`
 	}
-	if err := c.Bind(&req); err != nil || req.Code == "" {
+	if err := c.Bind(&req); err != nil || req.Code == nil {
 		return apierr.JSONInvalidParam(c)
 	}
+	// 本家の paramDef は code を required の string とするだけなので、空文字は
+	// 該当するコードが無いものとして NO_SUCH_CODE にする (#3845)。空文字のコードを
+	// 保存した行が万一あっても当てないよう、引かずに返す。
+	if *req.Code == "" {
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_CODE", "No such code.", "97c1f576-e4b8-4b8a-a6dc-9cb65e7f6f85"))
+	}
 
-	profile, err := h.userService.FindProfileByVerifyCode(req.Code)
+	profile, err := h.userService.FindProfileByVerifyCode(*req.Code)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return apierr.JSONInternalError(c)

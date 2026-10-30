@@ -338,7 +338,7 @@ type Service struct {
 	// invalidationHook は**ローカルの**変更でキャッシュを落とした後に呼ぶ。
 	// 複数ワーカー構成 (`MK_ONLY_SERVER` / `MK_ONLY_QUEUE`) では、これを繋がない
 	// と剥奪を受け付けなかった側のノードで最大 roleCacheTTL のあいだ古いロールが
-	// 通り続ける。配線は router.go (`internal:rolesUpdated`)。
+	// 通り続ける。配線は internal/server の wiring_cache_invalidation.go (`internal:rolesUpdated`)。
 	invalidationHook func()
 
 	userRoleCacheMu  sync.RWMutex
@@ -1133,7 +1133,10 @@ func (s *Service) capServerMaxFileSize(policies map[string]any) map[string]any {
 		return policies
 	}
 	if v, ok := policies["maxFileSizeMb"]; ok {
-		if policyUnlimitedOrAboveCap(v, s.serverMaxFileSizeMb) {
+		// 本家は `Math.min(serverMaxFileSizeMb, Math.max(...vs))` なので、上限を
+		// 超える値だけを下げ、0 以下はそのまま残す (drive 側で「保存できない」に
+		// なる)。
+		if policyAboveCap(v, s.serverMaxFileSizeMb) {
 			policies["maxFileSizeMb"] = s.serverMaxFileSizeMb
 		}
 	}
@@ -1182,6 +1185,21 @@ func capIntPolicy(policies map[string]any, key string, limit int) {
 // GetUserPolicies の全 return 直前で呼ぶ。
 func (s *Service) applyServerCaps(policies map[string]any) map[string]any {
 	return s.capChunkedUpload(s.capServerMaxFileSize(policies))
+}
+
+// policyAboveCap reports whether a numeric policy exceeds a positive instance
+// cap. Unlike policyUnlimitedOrAboveCap it leaves 0 and negative values alone,
+// for policies where those mean "nothing allowed" rather than "unlimited".
+func policyAboveCap(v any, limit int) bool {
+	switch x := v.(type) {
+	case int:
+		return x > limit
+	case int64:
+		return x > int64(limit)
+	case float64:
+		return x > float64(limit)
+	}
+	return false
 }
 
 // policyUnlimitedOrAboveCap reports whether a numeric policy would disable a
@@ -1245,9 +1263,33 @@ func (s *Service) applyMetaBasePolicies(base map[string]any) error {
 		return err
 	}
 	for k, v := range metaPolicies {
-		base[k] = coerceToBaseType(base[k], v)
+		base[k] = coerceBasePolicy(k, base[k], v)
 	}
 	return nil
+}
+
+// fractionalPolicyKeys are int-typed base policies whose consumers read them
+// through PolicyNumber, so a fractional value is kept as float64 instead of
+// being truncated by coerceToBaseType (#3489).
+//
+// 切り捨てると 0.5 が 0 になり、drive の size policy では「保存できない」に
+// 変わる (本家は 0.5MB まで通す)。role に付けた値は maxNumber が小数のまま
+// 渡すので、consumer はもともと float64 を受けられる。他の int の key は
+// `.(int)` で読む consumer があるので、今の丸めを保つ。集約 (aggregatePolicyValues)
+// も同じ key だけ float64 の base を数値として扱う。
+var fractionalPolicyKeys = map[string]bool{
+	"maxFileSizeMb":   true,
+	"driveCapacityMb": true,
+}
+
+// coerceBasePolicy is coerceToBaseType that keeps finite fractional values of
+// fractionalPolicyKeys.
+func coerceBasePolicy(key string, base, override any) any {
+	if f, ok := override.(float64); ok && fractionalPolicyKeys[key] &&
+		!math.IsNaN(f) && !math.IsInf(f, 0) && f != math.Trunc(f) {
+		return f
+	}
+	return coerceToBaseType(base, override)
 }
 
 // coerceToBaseType normalises a JSON-decoded value (typically float64 for
@@ -1499,8 +1541,9 @@ func aggregatesByIntersection(key string) bool {
 // so unknown policies behave like "useDefault for every role".
 //
 // Only the types actually present in `DefaultPolicies()` are wired here:
-// bool, int, string (chatAvailability), []string (uploadableFileTypes)。
-// 新規 policy 追加で int64 / float64 / 他の type が必要になったら分岐を追加。
+// bool, int, string (chatAvailability), []string (uploadableFileTypes), plus
+// float64 for the fractionalPolicyKeys whose base may be fractional (#3489)。
+// 新規 policy 追加で int64 / 他の type が必要になったら分岐を追加。
 func aggregatePolicyValues(key string, baseVal any, values []any) any {
 	if len(values) == 0 {
 		return baseVal
@@ -1529,6 +1572,14 @@ func aggregatePolicyValues(key string, baseVal any, values []any) any {
 			return baseVal
 		}
 		return maxNumber(values, baseVal)
+	case float64:
+		// 基本ポリシーの小数を残す key (coerceBasePolicy) は、base が float64 に
+		// なっても int と同じく role の値の最大を取る。他の key で float64 の
+		// base は来ない想定なので、従来どおり base を返す。
+		if fractionalPolicyKeys[key] {
+			return maxNumber(values, baseVal)
+		}
+		return baseVal
 	case string:
 		if key == "chatAvailability" {
 			return aggregateChatAvailability(values)
@@ -2250,7 +2301,7 @@ func MergeMetaPolicies(rawPolicies []byte) map[string]any {
 		return base
 	}
 	for k, v := range override {
-		base[k] = coerceToBaseType(base[k], v)
+		base[k] = coerceBasePolicy(k, base[k], v)
 	}
 	return base
 }

@@ -26,14 +26,14 @@ make playwright-down
 frontend asset を組み込んだ Elythia に対して実ブラウザから叩く。nginx は
 self-signed cert で TLS を終端する (spec 側は `ignoreHTTPSErrors` で受ける)。
 
-## upstream / mkgo の分割
+## upstream / elythia の分割
 
 ```
 specs/
 ├── upstream/       # upstream Misskey にも存在する機能の検証
 │   ├── ui/         # ブラウザを駆動する (194 spec)
 │   └── api/        # API の shape / 挙動 (96 spec)
-└── mkgo/           # Elythia 独自機能の検証 (8 件)
+└── elythia/        # Elythia 独自機能の検証 (9 件)
 ```
 
 ### ui と api の境界
@@ -67,12 +67,12 @@ shape や挙動を検証する spec。
 この境界は「どちらが上等か」ではない。API の shape 検証は drop-in 互換の regression
 検出に不可欠で、UI 操作より速く安定する。両方を別々に育てる。
 
-**290 spec が `upstream/`、8 spec が `mkgo/`。** 分割時に全 spec を確認したが、Elythia 独自
+**290 spec が `upstream/`、9 spec が `elythia/`。** 分割時に全 spec を確認したが、Elythia 独自
 機能 (cherrypick 由来の chat 拡張、`mkGoVersion` 等の additive field) を検証するものは
 1 件も無かった。むしろ `i/profile_extra.spec.ts` のように **Elythia 拡張を明示的に scope
 外としている** spec もある。
 
-`mkgo/` の 8 件はいずれも公式 image では通らない。`ui/about_elythia.spec.ts` (#2700)
+`elythia/` の 9 件はいずれも公式 image では通らない。`ui/about_elythia.spec.ts` (#2700)
 は Elythia 固有ページ `/about-elythia` を開く。`ui/boot_error_reload.spec.ts`
 (#2786) は fork の `2026.7.0-mk.22c` で足した `#mkBootReload` を見る。
 `ui/csp_enforce.spec.ts` (#2788) は Elythia 独自キー
@@ -88,6 +88,8 @@ header 自体が無い。`ui/note_report_abuse_via_menu.spec.ts` と
 endpoint 自体が無い。`ui/profile_avatar_lightbox.spec.ts` (#3124) は fork の
 `2026.9.0-mk.38` で入れた「プロフィールのアイコンを押すと拡大表示する」を見るが、
 **純正のアイコンは押せない素の画像**なので公式 image では何も開かない。
+`ui/embed_iframe_id.spec.ts` (#3892) は埋め込みページが親ウィンドウ以外から届いた
+`iframeId` を受けないことを見るが、**純正は送り元を確かめない**ので公式 image では落ちる。
 **`make playwright-ts-test` は `specs/upstream` に絞ってある**ので、TS backend 実行が
 これで落ちることはない。
 
@@ -99,7 +101,7 @@ endpoint 自体が無い。`ui/profile_avatar_lightbox.spec.ts` (#3124) は fork
   - **本家へ還元しやすい**。`upstream/` の spec は本家にも存在する機能を検証しているので、
     本家の Playwright スイートへ持っていける
 
-Elythia 独自機能の spec を書くときは `mkgo/` に置く。そちらは TS backend では通らないので、
+Elythia 独自機能の spec を書くときは `elythia/` に置く。そちらは TS backend では通らないので、
 `upstream/` に混ぜると `playwright-ts-test` が壊れる。
 
 ## ライセンスヘッダ
@@ -108,7 +110,7 @@ Elythia 独自機能の spec を書くときは `mkgo/` に置く。そちらは
 
 ```
 /*
- * SPDX-FileCopyrightText: mk-go project
+ * SPDX-FileCopyrightText: Elythia-Network
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 ```
@@ -132,7 +134,7 @@ tests/playwright/
 ├── specs/
 │   ├── upstream/ui/            # ブラウザを駆動する (194 spec)
 │   ├── upstream/api/           # API の shape / 挙動 (96 spec)
-│   └── mkgo/                   # Elythia 独自 (8 件)
+│   └── elythia/                # Elythia 独自 (9 件)
 └── fixtures/                   # 14 ファイル
     ├── api.ts                  # POST /api/<endpoint> ラッパ
     ├── auth.ts                 # signup / signin helper
@@ -143,7 +145,7 @@ tests/playwright/
 
 ## 並列度
 
-**1 スタックに対しては直列で回すしかない** (`workers: 1`)。298 spec のうち 179 が
+**1 スタックに対しては直列で回すしかない** (`workers: 1`)。299 spec のうち 179 が
 共有の root (alice) で**ブラウザからサインイン**し (数え方は
 `grep -rlE 'uiSigninAsRoot|signin-username' specs --include='*.spec.ts' | wc -l`。
 helper 経由が 178 で、`upstream/ui/signin.spec.ts` だけ signin フォームを直接駆動する)、

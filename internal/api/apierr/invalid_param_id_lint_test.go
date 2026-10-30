@@ -35,14 +35,17 @@ func TestInvalidParamIDLint(t *testing.T) {
 		// code INVALID_PARAM / id ab36de0e-… を持つ (本家の定義そのもの)。
 		"userlists/handler.go": {1, "users/lists/list で userId の利用者がいないとき"},
 		// 以下は mk-go 独自の endpoint (本家に対応物が無い)。
-		"admin/federation_rules.go": {6, "admin/federation/rules/* の ruleId 欠落・規則の検証失敗"},
+		"admin/federation_rules.go": {5, "admin/federation/rules/* の ruleId 欠落・本文を読めない (規則の検証失敗は INVALID_RULE、#3877)"},
 		"admin/gone_instance.go":    {1, "admin/federation/clean-gone-instance の host 欠落"},
 		"admin/remote_check.go":     {1, "admin/federation/check-host の host 欠落"},
 		"bubblegame/versus.go":      {1, "bubble-game/versus/* の引数の検証失敗"},
 		// 本家の reset-password は存在しない・期限切れの token を素の Error
 		// (500 INTERNAL_ERROR) で落とす。mk-go は 400 で返しており、ajv の
 		// 失敗ではないので独自の id のまま残す (docs/divergence.md)。
-		"resetpassword/handler.go": {3, "reset-password の token が無い・期限切れ"},
+		// 4 件目は token の持ち主がプラグインの管理するアカウントのとき (#3468)。
+		// 無い token と同じ応答にする。5 件目は空の token で、本家の paramDef は
+		// 通すので、無い token と同じ応答にする (#3845)。
+		"resetpassword/handler.go": {5, "reset-password の token が空・無い・期限切れ・管理するアカウントのもの"},
 	}
 
 	root, err := filepath.Abs("..")

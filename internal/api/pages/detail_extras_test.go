@@ -25,7 +25,7 @@ func (r *recordingPacker) DetailedNotMe(_ context.Context, target, viewer *model
 	if r.fail {
 		return entity.UserDetailed{}, false
 	}
-	d := entity.PackUserDetailed(target, nil)
+	d := (*entity.Packer)(nil).PackUserDetailed(target, nil)
 	d.PinnedNoteIDs = []string{"pinned"}
 	return d, true
 }
@@ -44,9 +44,7 @@ func pagePushFixture(t *testing.T, p *recordingPacker) (*Handler, *stubMainStrea
 	t.Helper()
 	h, repo, _ := newHandler(t)
 	if p != nil {
-		assert.False(t, h.HasUserPacker())
-		h.SetUserPacker(p)
-		assert.True(t, h.HasUserPacker())
+		h.userPacker = p
 	}
 	pub := &stubMainStreamPublisher{}
 	h.SetMainStreamPublisher(pub)

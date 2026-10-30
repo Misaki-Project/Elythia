@@ -5,10 +5,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	coredrive "github.com/elythia-network/elythia/internal/core/drive"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/labstack/echo/v4"
 )
@@ -37,12 +38,13 @@ type ChunkedStartRequest struct {
 	Name string `json:"name"`
 	// Size is the total byte length the client intends to upload. It is
 	// validated against every quota up front and bounds what append accepts;
-	// the real size is re-derived from the assembled object at finish.
-	Size        int64   `json:"size"`
-	Comment     *string `json:"comment"`
-	FolderID    *string `json:"folderId"`
-	IsSensitive bool    `json:"isSensitive"`
-	Force       bool    `json:"force"`
+	// the real size is re-derived from the assembled object at finish. Like
+	// upstream's ajv, it takes an integer written as a decimal (10.0, #3872).
+	Size        jsnum.Int `json:"size"`
+	Comment     *string   `json:"comment"`
+	FolderID    *string   `json:"folderId"`
+	IsSensitive bool      `json:"isSensitive"`
+	Force       bool      `json:"force"`
 }
 
 // ChunkedSessionRequest identifies a session for finish / abort.
@@ -67,14 +69,16 @@ func (h *Handler) FilesCreateChunkedStart(c echo.Context) error {
 	} else if !coredrive.ValidateFileName(name) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_FILE_NAME", "Invalid file name.", "f449b209-0c60-4e51-84d5-29486263bfd4"))
 	}
-	if req.Comment != nil && utf8.RuneCountInString(*req.Comment) > maxDriveCommentLength {
+	// drive/files/create と同じく NUL と不正な UTF-8 も落とす (SQLSTATE 22021 で
+	// 500 になっていた)。
+	if req.Comment != nil && !colfit.Fits(*req.Comment, maxDriveCommentLength) {
 		return apierr.JSONInvalidParam(c)
 	}
 
 	in := coredrive.StartChunkedUploadInput{
 		User:        user,
 		Name:        name,
-		Size:        req.Size,
+		Size:        int64(req.Size),
 		Comment:     req.Comment,
 		FolderID:    req.FolderID,
 		IsSensitive: req.IsSensitive,
@@ -154,7 +158,7 @@ func (h *Handler) FilesCreateChunkedFinish(c echo.Context) error {
 	if err != nil {
 		return h.chunkedError(c, err)
 	}
-	return c.JSON(http.StatusOK, packDriveFileSelfSingle(f, h.idGen))
+	return c.JSON(http.StatusOK, packDriveFileSelfSingle(h.entityPacker, f, h.idGen))
 }
 
 // FilesCreateChunkedAbort handles POST /api/drive/files/create-chunked/abort.

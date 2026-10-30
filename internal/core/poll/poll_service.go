@@ -82,20 +82,30 @@ type Service struct {
 
 // NewService constructs a PollService.
 // followingRepo は followers 可視性ノートへの投票チェックに使われる (省略可)。
+//
+// blockingChecker makes Vote reject votes from users the note author has
+// blocked (upstream youHaveBeenBlocked). nil skips the check (local-only
+// tests).
+//
+// 無いと**自分をブロックしている**相手のアンケートに投票でき、しかも黙って
+// 劣化するので、構築子の必須の引数で受ける (#3825)。判定は
+// `IsBlocked(target.UserID, user.ID)` (blocker が note 著者)。
 func NewService(
 	noteRepo repository.NoteRepository,
 	pollRepo repository.PollRepository,
 	pollVoteRepo repository.PollVoteRepository,
 	followingRepo repository.FollowingRepository,
 	idGen id.Generator,
+	blockingChecker BlockingChecker,
 ) *Service {
 	return &Service{
-		noteRepo:      noteRepo,
-		pollRepo:      pollRepo,
-		pollVoteRepo:  pollVoteRepo,
-		followingRepo: followingRepo,
-		idGen:         idGen,
-		nowFn:         time.Now,
+		noteRepo:        noteRepo,
+		pollRepo:        pollRepo,
+		pollVoteRepo:    pollVoteRepo,
+		followingRepo:   followingRepo,
+		idGen:           idGen,
+		blockingChecker: blockingChecker,
+		nowFn:           time.Now,
 	}
 }
 
@@ -109,13 +119,6 @@ func (s *Service) SetNotificationHook(h NotificationHook) {
 // (フロントは reload で count を取り直すフォールバックに頼る、#690)。
 func (s *Service) SetEventPublisher(p NoteEventPublisher) {
 	s.eventPub = p
-}
-
-// SetBlockingChecker attaches a BlockingChecker used by Vote to reject votes
-// from users the note author has blocked (upstream youHaveBeenBlocked)。nil
-// 配線時は block 判定を skip (local-only テスト環境向け)。
-func (s *Service) SetBlockingChecker(c BlockingChecker) {
-	s.blockingChecker = c
 }
 
 // SetFederationHook attaches a FederationDeliveryHook used after a vote is
@@ -209,18 +212,28 @@ func (s *Service) Vote(user *model.User, noteID string, choice int) error {
 		NoteID: target.ID,
 		Choice: choice,
 	}
-	if err := s.pollVoteRepo.Create(v); err != nil {
+	// 上の検査は先に弾くための近道で、同時に届いた投票の重複はここで防ぐ
+	// (上の検査は並行する投票を見られないため)。
+	created, err := s.pollVoteRepo.CreateIfNotVoted(v, !p.Multiple)
+	if err != nil {
 		return err
+	}
+	if !created {
+		return ErrAlreadyVoted
 	}
 	_ = s.pollRepo.IncrementVote(target.ID, choice, 1)
 
 	// pollVoted を note の stream topic に publish して subscribe 中の
 	// frontend (note 詳細画面 / timeline) が reload なしで count を更新
-	// できるようにする (#690)。Misskey TS の PollService.vote と同じ payload。
+	// できるようにする (#690)。wire 上の形は Misskey TS の PollService.vote と
+	// 同じ {choice, userId} だが、投票者の ID は本人の接続にだけ渡す。購読者ごとの
+	// 差し替えは stream の配信段 (Dispatcher.forwardNoteEvent) で行い、本人以外
+	// には userId の代わりに voteId を載せる。voteId は購読者には直接は流れない。
 	if s.eventPub != nil {
 		s.eventPub.PublishToNoteStream(target.ID, "pollVoted", map[string]any{
 			"choice": choice,
 			"userId": user.ID,
+			"voteId": v.ID,
 		})
 	}
 
@@ -271,10 +284,3 @@ func (s *Service) materializeIfMissing(noteID string, lookupErr error) bool {
 	_, err := s.materializer.EnsureNote(context.Background(), noteID)
 	return err == nil
 }
-
-// HasBlockingChecker reports whether the blocking checker was wired.
-//
-// 未配線だと**自分をブロックしている**相手のアンケートに投票できる。gate は
-// `IsBlocked(target.UserID, user.ID)` (blocker が note 著者)。起動時検査に
-// 使う (#2708)。
-func (s *Service) HasBlockingChecker() bool { return s.blockingChecker != nil }

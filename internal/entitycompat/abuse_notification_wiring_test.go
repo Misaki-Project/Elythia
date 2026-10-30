@@ -13,16 +13,34 @@ import "testing"
 func TestAbuseReportNotifierIsWired(t *testing.T) {
 	// 通知欄: notifier の中身も固定する (#3200)。構築の引数を nil にしても
 	// Set 側だけ見る gate は緑のまま、NotifyNewReport が黙って no-op になる。
-	assertWired(t, routerGo, "coreabuse.NewInAppNotifier(roleService, notificationService, repository.NewAbuseReportRepository(s.db))",
+	assertWired(t, serverPkg, "coreabuse.NewInAppNotifier(roleService, notificationService, repository.NewAbuseReportRepository(s.db))",
 		"通報の通知を作る依存が欠け、通知欄に何も残らなくなる。")
-	assertWired(t, routerGo, "coreabuse.NewCreatedNotifier(abuseInAppNotifier, roleService, stream.NewAdminStreamPublisher(streamPubSub))",
+	// 上の構築の行は buildCore の中にある (#3686)。setupRoutes が使うのは別名なので、
+	// 構築から別名までの段も照合する。上の行だけだと、setupRoutes の別名を nil に
+	// 書き換えても緑のまま通る (docs/architecture.md 4.2)。別名は buildCore の戻り値を
+	// 受けた変数 coreSvcs から取る形にしてあり、別名を buildCore の呼び出しより前に
+	// 書くとコンパイルが通らない。照合もその形で行う。
+	assertWired(t, serverPkg, "abuseInAppNotifier: abuseInAppNotifier",
+		"buildCore が作った通報の通知を core に入れていない。")
+	assertWired(t, serverPkg, "coreSvcs := s.buildCore(w, idGen, roleService, streamPubSub, entityPacker, sharedUserPacker)",
+		"setupRoutes が buildCore の core service を使っていない。")
+	// buildCore の中の roleService は引数で受ける (#3825)。setupRoutes が buildRole で
+	// 作ったものを渡していることも照合する。
+	assertWired(t, serverPkg, "roleService := s.buildRole(w, idGen)",
+		"通報の通知の宛先を決める role service が buildRole で作ったものでなくなる。")
+	assertWired(t, serverPkg, "w.core = coreSvcs",
+		"buildCore の core service を wiring に入れていない。")
+	assertWired(t, serverPkg, "abuseInAppNotifier := coreSvcs.abuseInAppNotifier",
+		"setupRoutes の通報の通知が buildCore で作ったものでなくなる。")
+	// 世代の箱と Packer は構築子の必須の引数 (#3823)。
+	assertWired(t, serverPkg, "coreabuse.NewCreatedNotifier(abuseInAppNotifier, roleService, stream.NewAdminStreamPublisher(streamPubSub), s.background, entityPacker)",
 		"通報の通知欄と admin stream (newAbuseUserReport) が出なくなる。")
-	assertWired(t, routerGo, "usersHandler.SetAbuseReportCreatedNotifier(abuseCreatedNotifier)",
+	assertWired(t, serverPkg, "usersHandler.SetAbuseReportCreatedNotifier(abuseCreatedNotifier)",
 		"ローカルの通報 (users/report-abuse) で通知が一切出なくなる。")
-	assertWired(t, routerGo, "federationProcessor.SetAbuseReportCreatedNotifier(abuseCreatedNotifier)",
+	assertWired(t, serverPkg, "federationProcessor.SetAbuseReportCreatedNotifier(abuseCreatedNotifier)",
 		"連合経由の通報 (Flag) で通知が一切出なくなる (#3256 と同じ形の穴)。")
-	assertWired(t, routerGo, "abuseCreatedNotifier.SetWebhook(webhookService, recipientRepo, coreabuse.UserLookups{Instances: instanceRepo, Emojis: emojiRepo}, idGen)",
+	assertWired(t, serverPkg, "abuseCreatedNotifier.SetWebhook(webhookService, recipientRepo, coreabuse.UserLookups{Instances: instanceRepo, Emojis: emojiRepo}, idGen)",
 		"通報の abuseReport system webhook が、ローカルでも連合経由でも出なくなる。")
-	assertWired(t, routerGo, "abuseCreatedNotifier.SetMail(miscsmtp.SubjectBodySenderFromMeta(metaRepo, s.config.ProxySMTP), recipientRepo, userRepo, metaRepo)",
+	assertWired(t, serverPkg, "abuseCreatedNotifier.SetMail(miscsmtp.SubjectBodySenderFromMeta(metaRepo, s.config.ProxySMTP), recipientRepo, userRepo, metaRepo)",
 		"通報のメールが、通知先にも meta.email にも届かなくなる (#3265)。")
 }

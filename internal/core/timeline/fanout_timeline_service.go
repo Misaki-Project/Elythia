@@ -155,6 +155,86 @@ func (s *FanoutTimelineService) Push(ctx context.Context, name Name, noteID stri
 	return nil
 }
 
+// PushMany is Push for many timelines at once: the same note goes onto every
+// list in names. The returned slice is nil when every push succeeded;
+// otherwise it has len(names) entries and errs[i] is the error of names[i].
+//
+// フォロワーへの配送 (#3606) で、宛先ごとに LPUSH を 1 往復ずつ送っていたのを
+// 1 本の pipeline にまとめる。**送るコマンドと順序は Push を宛先の順に呼んだ
+// ときと同じにする。** 直近のノートは宛先ごとに LPUSH と、確率で LTRIM を
+// 送る。pipeline の中の 1 コマンドが失敗しても他のコマンドは実行されるので、
+// 宛先ごとの成否は Push を 1 回ずつ呼んだときと同じに取れる。違いは、LTRIM を
+// LPUSH の結果を待たずに積むことだけで、LPUSH が失敗した宛先に LTRIM が
+// 届いても list を縮めるだけ (サイズはもともと確率で守るソフトな上限)。
+//
+// 古いノート (猶予の 3 分より前) は末尾と比べてから入れるので、LINDEX の
+// 結果を見て分岐する。pipeline にはできないので、Push を宛先ごとに呼ぶ。
+func (s *FanoutTimelineService) PushMany(ctx context.Context, names []Name, noteID string, maxLen int) []error {
+	if len(names) == 0 {
+		return nil
+	}
+	if maxLen <= 0 {
+		maxLen = defaultMaxLen
+	}
+	noteTime, err := s.idGen.ParseTime(noteID)
+	if err != nil {
+		err = fmt.Errorf("invalid note id %q: %w", noteID, err)
+		errs := make([]error, len(names))
+		for i := range errs {
+			errs[i] = err
+		}
+		return errs
+	}
+
+	var errs []error
+	setErr := func(i int, err error) {
+		if errs == nil {
+			errs = make([]error, len(names))
+		}
+		errs[i] = err
+	}
+	if s.nowFn().Sub(noteTime) > recentInsertGracePeriod {
+		for i, name := range names {
+			if err := s.Push(ctx, name, noteID, maxLen); err != nil {
+				setErr(i, err)
+			}
+		}
+		return errs
+	}
+
+	pipe := s.client.Pipeline()
+	pushes := make([]*redis.IntCmd, len(names))
+	for i, name := range names {
+		key := s.key(name)
+		pushes[i] = pipe.LPush(ctx, key, noteID)
+		if s.randFn() < trimProbability {
+			// Push と同じく LTRIM の失敗は握り潰す (下で結果を見ない)。
+			pipe.LTrim(ctx, key, 0, int64(maxLen-1))
+		}
+	}
+	// Exec の戻り値は最初に失敗したコマンドのエラーでしかないので、
+	// 宛先ごとの成否は各コマンドから取る。接続が切れたときは全コマンドに
+	// 同じエラーが入る。
+	//
+	// **既知の差: 送り直しで 1 ページ分が重複しうる。** go-redis は読み取りの
+	// EOF やタイムアウトで pipeline を丸ごと送り直すので、Redis が途中まで
+	// (または全部) 実行していれば、そのページの LPUSH が 2 回入る。1 件ずつ
+	// 送っていたころも単発のコマンドは同じ条件で送り直されていたので、起きる
+	// こと自体は同じで、重複の単位が 1 件から 1 ページになっただけ。list に
+	// 同じ ID が 2 つ入ると、読み出しの 1 回の hydrate (FindManyByIDsWithUser の
+	// `id IN`) の中では 1 件になる。ただし DB fallback を切っているときは、
+	// scanOlder が残りの ID を別の hydrate で引くので、重複した 2 つが 1 回目の
+	// 末尾と残りの先頭に分かれると、1 回の応答に同じノートが 2 回入りうる
+	// (filterAndSort は並べ替えるだけで重複を除かず、重複は隣り合う)。
+	_, _ = pipe.Exec(ctx)
+	for i, cmd := range pushes {
+		if err := cmd.Err(); err != nil {
+			setErr(i, err)
+		}
+	}
+	return errs
+}
+
 // Get returns IDs from the timeline filtered by the given since/until window.
 // 結果の向きは cursor に従う (sinceId 単独なら ASC、それ以外は id 降順)。limit<=0 のときは全件返す。
 func (s *FanoutTimelineService) Get(ctx context.Context, name Name, untilID, sinceID string, limit int) ([]string, error) {
@@ -165,54 +245,37 @@ func (s *FanoutTimelineService) Get(ctx context.Context, name Name, untilID, sin
 	return filterAndSort(ids, untilID, sinceID, limit), nil
 }
 
-// GetMerged retrieves IDs from multiple timelines and merges them into one
-// de-duplicated list, ordered by the cursor direction.
-//
-// upstream FanoutTimelineEndpointService は redisTimelines に複数キーを渡し、
-// 取得結果をマージして 1 本の timeline として返す。LTL の返信振り分け
-// (localTimeline / WithReplies / WithReplyTo) がこれに当たる。
-func (s *FanoutTimelineService) GetMerged(ctx context.Context, names []Name, untilID, sinceID string, limit int) ([]string, error) {
-	if len(names) == 0 {
-		return nil, nil
-	}
-	if len(names) == 1 {
-		return s.Get(ctx, names[0], untilID, sinceID, limit)
-	}
-	lists, err := s.GetMulti(ctx, names, untilID, sinceID, limit)
-	if err != nil {
-		return nil, err
-	}
-	seen := make(map[string]struct{})
-	merged := make([]string, 0, limit)
-	for _, ids := range lists {
-		for _, id := range ids {
-			if _, dup := seen[id]; dup {
-				continue
-			}
-			seen[id] = struct{}{}
-			merged = append(merged, id)
-		}
-	}
-	// 向きは cursor に従う (#2720)。Get / GetMulti が per-key で ASC を返しても、
-	// ここで降順に並べ直すと昇順ページングで最新 N 件を切り出してしまう。
-	// LocalTimeline はログイン中だとキーが 2 本になるので、この分岐を落とすと
-	// **ログインの有無で向きが変わる**。
-	if isAscending(sinceID, untilID) {
-		sort.Strings(merged)
-	} else {
-		sort.Sort(sort.Reverse(sort.StringSlice(merged)))
-	}
-	if len(merged) > limit {
-		merged = merged[:limit]
-	}
-	return merged, nil
-}
-
 // GetMulti retrieves IDs from multiple timelines in a single pipeline call.
 // 戻り値の順序はnamesと同じ。
 func (s *FanoutTimelineService) GetMulti(ctx context.Context, names []Name, untilID, sinceID string, limit int) ([][]string, error) {
+	lists, _, err := s.GetMultiWithTails(ctx, names, untilID, sinceID, limit)
+	return lists, err
+}
+
+// GetMultiWithTails is GetMulti that also reports, for each list, the id at
+// its tail over the whole list, ignoring the cursor window: the oldest
+// entry that was pushed and is still kept. tails[i] is "" when names[i] holds
+// nothing (the key does not exist).
+//
+// tail は「その list がどこまで遡って持っているか」を表す (#3449)。複数の list を
+// 混ぜる timeline は、一番浅い list の tail より古い分を Redis から返せない
+// (coverageCutoff を参照)。窓の中の最古ではなく list 全体の tail を返すのは、
+// 「窓の中は空だが list はある」(= 窓より新しい分しか持っていない) と
+// 「list が無い」を区別するため。
+//
+// **最小値ではなく、位置としての末尾 (最も前に push された要素) を取る。**
+// Push は 3 分の猶予内の ID を時刻に関係なく先頭へ LPUSH するので、遅れて
+// 届いた古い ID は先頭側に入り、list の最小値になりうる。最小値を tail にすると、
+// その ID より新しく、それより前に push されて LTRIM で押し出された note の
+// 期間まで「持っている」ことになり、そこが抜ける。list は push の順に並ぶので、
+// 末尾より後に push された要素だけが残っている。末尾より新しい時刻の note で
+// 欠けうるのは、末尾の要素より前に push されたもの = 末尾の要素自身の配送の
+// 遅れ (猶予の 3 分以内) の間に作られたものだけになる。猶予の分まで新しい側へ
+// ずらすと、LTL の深さが 3 分を切るインスタンス (上限 200 件) では 1 ページ目から
+// 常に DB へ倒れるので、そこまではしない。
+func (s *FanoutTimelineService) GetMultiWithTails(ctx context.Context, names []Name, untilID, sinceID string, limit int) (lists [][]string, tails []string, err error) {
 	if len(names) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	pipe := s.client.Pipeline()
 	cmds := make([]*redis.StringSliceCmd, 0, len(names))
@@ -220,16 +283,22 @@ func (s *FanoutTimelineService) GetMulti(ctx context.Context, names []Name, unti
 		cmds = append(cmds, pipe.LRange(ctx, s.key(n), 0, -1))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out := make([][]string, 0, len(cmds))
+	lists = make([][]string, 0, len(cmds))
+	tails = make([]string, 0, len(cmds))
 	for _, cmd := range cmds {
 		// pipe.Exec が成功した時点で個々の cmd.Result() は基本的にエラーを返さない。
 		// 万一エラーを返した場合は空スライスとして扱う。
 		ids, _ := cmd.Result()
-		out = append(out, filterAndSort(ids, untilID, sinceID, limit))
+		lists = append(lists, filterAndSort(ids, untilID, sinceID, limit))
+		tail := ""
+		if len(ids) > 0 {
+			tail = ids[len(ids)-1]
+		}
+		tails = append(tails, tail)
 	}
-	return out, nil
+	return lists, tails, nil
 }
 
 // Purge removes the named timeline list.
@@ -305,11 +374,9 @@ func filterAndSort(ids []string, untilID, sinceID string, limit int) []string {
 	// **upstream は窓を切らない。** `FanoutTimelineService.getMulti` が
 	// `lrange 0 -1` で list 全体を返し、`FanoutTimelineEndpointService` 側の
 	// while ループが「limit 件が埋まるまで窓の奥へ読み進めながら hydrate する」
-	// 形になっている。mk-go はここで limit 件に切り、足りない分は DB で継ぎ足す。
-	//
-	// 既定では差が出ない (どちらも limit 件を返す) が、
-	// `meta.enableFanoutTimelineDbFallback` を off にすると upstream のほうが
-	// 件数が揃いやすい (#2762。詳細は docs/divergence.md §5.6)。
+	// 形になっている。timeline service もこれに合わせ、limit<=0 で窓全体を
+	// 1 回だけ読み、メモリ上で切り出す (readFanout、#3448)。窓の奥を読み進めるのは
+	// DB fallback を切っているときだけ (docs/divergence/operations.md §5.6)。
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}

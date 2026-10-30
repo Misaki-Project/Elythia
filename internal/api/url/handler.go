@@ -14,11 +14,16 @@ import (
 // Handler handles the URL preview endpoint.
 type Handler struct {
 	fetcher *urlpreview.Fetcher
+	// entityPacker は entity を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3798)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// NewHandler creates a new URL preview handler.
-func NewHandler(fetcher *urlpreview.Fetcher) *Handler {
-	return &Handler{fetcher: fetcher}
+// NewHandler creates a new URL preview handler. entityPacker is the Packer
+// this Handler packs entities with (#3798); 無いとプレビューの画像の URL を
+// media proxy に通さずに返すので、構築子の必須の引数で受ける (#3823)。
+func NewHandler(fetcher *urlpreview.Fetcher, entityPacker *entity.Packer) *Handler {
+	return &Handler{fetcher: fetcher, entityPacker: entityPacker}
 }
 
 // Preview handles GET /url (matches Misskey's endpoint path).
@@ -57,8 +62,8 @@ func (h *Handler) Preview(c echo.Context) error {
 	// 無期限の署名を出すと、それを貼るだけで media proxy の allowlist を
 	// 恒久的に迂回できる (allowlist は mk-go 独自の硬化で、upstream の
 	// `/proxy` は元から open proxy なので「退化」の概念が無い)。
-	result.Thumbnail = entity.ProxyUserSuppliedMediaURLPtr(result.Thumbnail)
-	result.Icon = entity.ProxyUserSuppliedMediaURLPtr(result.Icon)
+	result.Thumbnail = h.entityPacker.ProxyUserSuppliedMediaURLPtr(result.Thumbnail)
+	result.Icon = h.entityPacker.ProxyUserSuppliedMediaURLPtr(result.Icon)
 	// #2106 N18: upstream は成功 preview を 1 日キャッシュさせる。
 	c.Response().Header().Set("Cache-Control", "max-age=86400, immutable")
 	return c.JSON(http.StatusOK, result)

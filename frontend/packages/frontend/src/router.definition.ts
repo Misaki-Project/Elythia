@@ -483,6 +483,11 @@ export const ROUTE_DEF = [{
 		name: 'database',
 		component: page(() => import('@/pages/admin/database.vue')),
 	}, {
+		// mk-go: DB のバックアップ (#3462)。閲覧を含む全ての操作に再認証を求める
+		path: '/backups',
+		name: 'backups',
+		component: page(() => import('@/pages/admin/backups.vue')),
+	}, {
 		// mk-go: 承認制の登録の審査 (#2555)
 		path: '/signup-applications',
 		name: 'signup-applications',
@@ -595,6 +600,11 @@ export const ROUTE_DEF = [{
 	path: '/my/follow-requests',
 	component: page(() => import('@/pages/follow-requests.vue')),
 	loginRequired: true,
+	// プライバシーの設定から「通知せずに受け入れたフォロー」のタブへ直接開く
+	// (#3466)。宣言しないと props に入らない (上の custom-emojis-manager と同じ)。
+	query: {
+		tab: 'tab',
+	},
 }, {
 	path: '/my/lists/:listId',
 	component: page(() => import('@/pages/my-lists/list.vue')),

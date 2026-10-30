@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: mk-go project
+SPDX-FileCopyrightText: Elythia-Network
 SPDX-License-Identifier: AGPL-3.0-only
 -->
 
@@ -174,6 +174,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <script lang="ts" setup>
 import { computed, ref, onMounted, onUnmounted } from 'vue';
+import type * as Elythia from 'elythia-js';
 import MkButton from '@/components/MkButton.vue';
 import MkFolder from '@/components/MkFolder.vue';
 import MkInfo from '@/components/MkInfo.vue';
@@ -189,27 +190,6 @@ import { instance } from '@/instance.js';
 import { login } from '@/accounts.js';
 import { resolveLocalUsernameState, resolveMinimumUsernameLength } from '@/utility/local-username.js';
 import { isRegistrationClosed } from '@/utility/registration-mode.js';
-
-type ApplicationStatus = 'pending' | 'approved' | 'rejected' | 'expired' | 'completed';
-
-type FormField = {
-	label: string;
-	type: 'text' | 'textarea';
-	required: boolean;
-	maxLength?: number;
-};
-
-type ApplicationView = {
-	status: ApplicationStatus;
-	createdAt: string;
-	expiresAt: string;
-};
-
-// mk-go 独自のエンドポイントなので misskey-js の型集合には無い。
-// server-plugins.vue と同じ理由の cast。
-function api<T>(endpoint: string, params: Record<string, unknown> = {}): Promise<T> {
-	return misskeyApi(endpoint as never, params as never) as unknown as Promise<T>;
-}
 
 const claimCode = ref('');
 const issuedCode = ref('');
@@ -232,7 +212,7 @@ const emailRequired = computed(() => instance.emailRequiredForSignup === true);
 const busy = ref(false);
 const fatal = ref<string | null>(null);
 const registrationClosed = isRegistrationClosed();
-const application = ref<ApplicationView | null>(null);
+const application = ref<Elythia.SignupApplicationView | null>(null);
 // **有効な provider のトークンを全部送る (#3037 レビュー)。**
 //
 // サーバーは有効な provider を**全部**検証する (upstream `SignupApiService` と
@@ -274,7 +254,7 @@ const waitingForForm = computed(() =>
 
 async function fetchFormToken() {
 	try {
-		const res = await api<{ token: string; minWaitSeconds: number }>('signup-application/form-token');
+		const res = await misskeyApi('signup-application/form-token');
 		formToken.value = res.token;
 		formTokenReadyAt.value = Date.now() + res.minWaitSeconds * 1000;
 		formTokenFailed.value = false;
@@ -304,10 +284,11 @@ onUnmounted(() => {
 	if (ticker != null) window.clearInterval(ticker);
 });
 
-// mk-go 独自の meta なので misskey-js の型集合には無い (#2570)。
-const form = computed<FormField[]>(() => {
-	const raw = (instance as unknown as Record<string, unknown>).signupApplicationForm;
-	return Array.isArray(raw) ? raw as FormField[] : [];
+// Elythia 独自の meta (#2570)。型は elythia-js の MetaDetailed が持つ (#3418)。
+// 端末に残った古い meta では欠けうるので、配列でなければ空にする
+const form = computed<Elythia.SignupApplicationFormField[]>(() => {
+	const raw = instance.signupApplicationForm;
+	return Array.isArray(raw) ? raw : [];
 });
 
 // **定義と同じ順序の値の配列を送る。** ラベルはサーバーが定義から埋めるので、
@@ -355,7 +336,7 @@ function resetCaptchas(): void {
 	testcaptchaResponse.value = null;
 }
 
-function captchaParams(): Record<string, unknown> {
+function captchaParams() {
 	return {
 		'hcaptcha-response': hCaptchaResponse.value,
 		'm-captcha-response': mCaptchaResponse.value,
@@ -393,7 +374,7 @@ async function apply() {
 	busy.value = true;
 	fatal.value = null;
 	try {
-		const res = await api<{ claimCode: string; application: ApplicationView }>(
+		const res = await misskeyApi(
 			'signup-application/apply',
 			{ answers: answers.value, formToken: formToken.value, ...captchaParams() });
 		// **コードを表示するのはここだけ。** サーバーは hash しか持っていない。
@@ -423,7 +404,7 @@ async function refresh() {
 	busy.value = true;
 	fatal.value = null;
 	try {
-		const res = await api<{ application: ApplicationView }>(
+		const res = await misskeyApi(
 			'signup-application/status', { claimCode: claimCode.value });
 		application.value = res.application;
 	} catch (err) {
@@ -445,12 +426,13 @@ async function register() {
 	busy.value = true;
 	fatal.value = null;
 	try {
-		const res = await api<{ id: string; token: string } | null>(
+		const res = await misskeyApi(
 			'signup-application/register',
 			{
 				claimCode: claimCode.value,
 				username: username.value,
 				password: password.value,
+				federationStatus: 'pending',
 				...(emailRequired.value ? { emailAddress: emailAddress.value } : {}),
 			});
 		// メール必須のときサーバーは 204 を返す (本体なし)。確認リンクを踏むまで

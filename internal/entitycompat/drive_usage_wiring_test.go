@@ -16,10 +16,15 @@ import (
 // テストが変異検証付きで固定している。ここが見るのは「router から正しい引数で
 // 呼ばれていること」だけ。引数まで照合するので、`driveusage.NewService(..., 0, 0)`
 // のように定数へ書き換えてキャッシュを無効化する形も落ちる。
+//
+// 集計はキャッシュの一覧に登録するので (#3738)、作る行と渡す行を分けて照合する。
 func TestDriveUsageProviderIsWired(t *testing.T) {
-	assertWired(t, routerGo,
-		"adminHandler.SetDriveUsageProvider(driveusage.NewService("+
-			"repository.NewDriveUsageRepository(s.db), driveusage.DefaultTTL, driveusage.DefaultTopN))",
+	assertWired(t, serverPkg,
+		"driveUsage := driveusage.NewService("+
+			"repository.NewDriveUsageRepository(s.db), driveusage.DefaultTTL, driveusage.DefaultTopN)",
+		"admin/drive/usage の集計が別の引数で作られ、キャッシュが効かなくなるか DB を読まなくなる (#3053)")
+	assertWired(t, serverPkg,
+		"adminHandler.SetDriveUsageProvider(driveUsage)",
 		"admin/drive/usage が 500 を返し、ストレージ使用量の画面が開かなくなる (#3053)")
 }
 
@@ -31,7 +36,7 @@ func TestDriveUsageProviderIsWired(t *testing.T) {
 // 固定されていない。middleware を落として誰でも叩ける状態にすると、リモート
 // ホストの一覧と利用者ごとの使用量が無認証で読めることになる。
 func TestDriveUsageRouteIsRegistered(t *testing.T) {
-	assertWired(t, routerGo,
+	assertRouteRegisteredBy(t, "routes_admin.go", "registerAdminRoutes",
 		`api.POST("/admin/drive/usage", adminHandler.DriveUsage, `+
 			`middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:drive"))`,
 		"admin/drive/usage が 404 になる、あるいは認証段が緩む (#3053)")

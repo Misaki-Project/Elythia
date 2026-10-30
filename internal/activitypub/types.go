@@ -999,6 +999,13 @@ type Person struct {
 	MisskeyCanChat *APLenientBool `json:"_misskey_canChat,omitempty"`
 	MovedTo        APLenientID    `json:"movedTo,omitempty"`
 	AlsoKnownAs    APIDList       `json:"alsoKnownAs,omitempty"`
+	// Published は actor (アカウント) が作られた日時 (#3465)。
+	//
+	// Mastodon は日付の単位 (`2017-04-08T00:00:00Z`) で送り、upstream Misskey の
+	// renderPerson は送らない。受信側は `user.accountCreatedAt` に取り込み、
+	// 送信側の `RenderPerson` はローカルの人の作成日時 (ID の日時) を載せる。
+	// 読めない形は空文字列になる (`APLenientTimestamp`) ので、actor を落とさない。
+	Published APLenientTimestamp `json:"published,omitempty"`
 	// AssertionMethod は FEP-521a Multikey 形式で expose する追加公開鍵リスト
 	// (mk-go では現状 Ed25519 のみ)。omitzero (IsZero) なので Ed25519 鍵を持たない
 	// user / TS で signup した user では出力されず、drop-in 互換を維持する
@@ -1036,7 +1043,7 @@ type Note struct {
 	// string ならそれ / object なら `href`)。**`id` は見ない**。ただし inbox
 	// 経路では手前の `Normalize` が JSON-LD の展開形を剥がすので、**単一キーの**
 	// `{"@id": ...}` のような形は string になって届く (2 キーあると潰れない。
-	// `docs/divergence.md` の `note.url` の節)。
+	// `docs/divergence/security.md` の `note.url` の節)。
 	//
 	// upstream の `renderNote` は note に `url` を出さないので、outbound には
 	// 影響しない (omitempty で消える)。

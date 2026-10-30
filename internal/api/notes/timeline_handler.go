@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/role"
 	"github.com/elythia-network/elythia/internal/core/timeline"
@@ -20,32 +21,39 @@ import (
 
 // TimelineRequest is the common request body for the four timeline endpoints.
 type TimelineRequest struct {
-	Limit                 *int   `json:"limit"`
-	SinceID               string `json:"sinceId"`
-	UntilID               string `json:"untilId"`
-	SinceDate             *int64 `json:"sinceDate"`
-	UntilDate             *int64 `json:"untilDate"`
-	WithFiles             bool   `json:"withFiles"`
-	WithRenotes           *bool  `json:"withRenotes"`
-	WithReplies           *bool  `json:"withReplies"`
-	IncludeMyRenotes      *bool  `json:"includeMyRenotes"`
-	IncludeRenotedMyNotes *bool  `json:"includeRenotedMyNotes"`
-	IncludeLocalRenotes   *bool  `json:"includeLocalRenotes"`
-	AllowPartial          bool   `json:"allowPartial"`
+	Limit                 *jsnum.Int `json:"limit"`
+	SinceID               string     `json:"sinceId"`
+	UntilID               string     `json:"untilId"`
+	SinceDate             *jsnum.Int `json:"sinceDate"`
+	UntilDate             *jsnum.Int `json:"untilDate"`
+	WithFiles             bool       `json:"withFiles"`
+	WithRenotes           *bool      `json:"withRenotes"`
+	WithReplies           *bool      `json:"withReplies"`
+	IncludeMyRenotes      *bool      `json:"includeMyRenotes"`
+	IncludeRenotedMyNotes *bool      `json:"includeRenotedMyNotes"`
+	IncludeLocalRenotes   *bool      `json:"includeLocalRenotes"`
+	AllowPartial          bool       `json:"allowPartial"`
 
 	// visitorPolicy is meta.ugcVisibilityForVisitor resolved once per request
 	// by serveTimeline (empty for signed-in viewers).
 	visitorPolicy string
+	// pageFilter is applyMuteBlock for this request's viewer, set by
+	// serveTimeline. The endpoints pass it as TimelineFilter.PageFilter.
+	pageFilter func([]*model.Note) ([]*model.Note, error)
+	// rel holds the viewer's relation lists, loaded at most once per request
+	// and shared by TimelineFilter and pageFilter (#3607). Set by serveTimeline.
+	rel *requestRelations
 }
 
 // normalize validates limit against upstream の paramDef。ok=false は範囲外で、
 // 呼び出し側は 400 INVALID_PARAM を返す。
 func (r *TimelineRequest) normalize() bool {
-	limit, ok := pagination.ResolveLimit(r.Limit, 10, 100)
+	limit, ok := pagination.ResolveLimit(r.Limit.IntPtr(), 10, 100)
 	if !ok {
 		return false
 	}
-	r.Limit = &limit
+	v := jsnum.Int(limit)
+	r.Limit = &v
 	return true
 }
 
@@ -86,15 +94,16 @@ func (h *Handler) Timeline(c echo.Context) error {
 			IncludeRenotedMyNotes: req.IncludeRenotedMyNotes,
 			IncludeLocalRenotes:   req.IncludeLocalRenotes,
 			AllowPartial:          req.AllowPartial,
-			MutedChannelIDs:       h.loadMutedChannelIDs(viewer),
-			MutedUserIDs:          h.loadMutedUserIDs(viewer),
-			RenoteMutedUserIDs:    h.loadRenoteMutedUserIDs(viewer),
-			BlockerIDs:            h.loadBlockerIDs(viewer),
+			PageFilter:            req.pageFilter,
+			MutedChannelIDs:       req.rel.timelineMutedChannelIDs(),
+			MutedUserIDs:          req.rel.timelineMutedUserIDs(),
+			RenoteMutedUserIDs:    req.rel.timelineRenoteMutedUserIDs(),
+			BlockerIDs:            req.rel.timelineBlockerIDs(),
 			MutedInstances:        h.loadMutedInstances(viewer),
-			FollowedChannelIDs:    h.loadFollowedChannelIDs(viewer),
-			FollowingIDs:          h.loadFollowingIDs(viewer),
+			FollowedChannelIDs:    req.rel.timelineFollowedChannelIDs(),
+			FollowingIDs:          req.rel.timelineFollowingIDs(),
 		}
-		return h.timelineService.HomeTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, *req.Limit, f)
+		return h.timelineService.HomeTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, int(*req.Limit), f)
 	}, true)
 }
 
@@ -109,13 +118,14 @@ func (h *Handler) LocalTimeline(c echo.Context) error {
 			WithRenotes:        req.WithRenotes,
 			WithReplies:        req.WithReplies,
 			AllowPartial:       req.AllowPartial,
-			MutedChannelIDs:    h.loadMutedChannelIDs(viewer),
-			MutedUserIDs:       h.loadMutedUserIDs(viewer),
-			RenoteMutedUserIDs: h.loadRenoteMutedUserIDs(viewer),
-			BlockerIDs:         h.loadBlockerIDs(viewer),
+			PageFilter:         req.pageFilter,
+			MutedChannelIDs:    req.rel.timelineMutedChannelIDs(),
+			MutedUserIDs:       req.rel.timelineMutedUserIDs(),
+			RenoteMutedUserIDs: req.rel.timelineRenoteMutedUserIDs(),
+			BlockerIDs:         req.rel.timelineBlockerIDs(),
 			MutedInstances:     h.loadMutedInstances(viewer),
 		}
-		return h.timelineService.LocalTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, *req.Limit, f)
+		return h.timelineService.LocalTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, int(*req.Limit), f)
 	}, false)
 }
 
@@ -129,10 +139,11 @@ func (h *Handler) GlobalTimeline(c echo.Context) error {
 			WithFiles:          req.WithFiles,
 			WithRenotes:        req.WithRenotes,
 			AllowPartial:       req.AllowPartial,
-			MutedChannelIDs:    h.loadMutedChannelIDs(viewer),
-			MutedUserIDs:       h.loadMutedUserIDs(viewer),
-			RenoteMutedUserIDs: h.loadRenoteMutedUserIDs(viewer),
-			BlockerIDs:         h.loadBlockerIDs(viewer),
+			PageFilter:         req.pageFilter,
+			MutedChannelIDs:    req.rel.timelineMutedChannelIDs(),
+			MutedUserIDs:       req.rel.timelineMutedUserIDs(),
+			RenoteMutedUserIDs: req.rel.timelineRenoteMutedUserIDs(),
+			BlockerIDs:         req.rel.timelineBlockerIDs(),
 			MutedInstances:     h.loadMutedInstances(viewer),
 			// upstream global-timeline は未ログインの閲覧者に
 			// generateUgcVisibilityQueryForVisitor を掛ける (`local` ならリモートの
@@ -140,7 +151,7 @@ func (h *Handler) GlobalTimeline(c echo.Context) error {
 			// Redis 経路と DB 経路の両方で落とす。
 			LocalUsersOnly: req.visitorPolicy == ugcvisibility.Local,
 		}
-		return h.timelineService.GlobalTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, *req.Limit, f)
+		return h.timelineService.GlobalTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, int(*req.Limit), f)
 	}, false)
 }
 
@@ -162,19 +173,20 @@ func (h *Handler) HybridTimeline(c echo.Context) error {
 			IncludeRenotedMyNotes: req.IncludeRenotedMyNotes,
 			IncludeLocalRenotes:   req.IncludeLocalRenotes,
 			AllowPartial:          req.AllowPartial,
-			MutedChannelIDs:       h.loadMutedChannelIDs(viewer),
-			MutedUserIDs:          h.loadMutedUserIDs(viewer),
-			RenoteMutedUserIDs:    h.loadRenoteMutedUserIDs(viewer),
-			BlockerIDs:            h.loadBlockerIDs(viewer),
+			PageFilter:            req.pageFilter,
+			MutedChannelIDs:       req.rel.timelineMutedChannelIDs(),
+			MutedUserIDs:          req.rel.timelineMutedUserIDs(),
+			RenoteMutedUserIDs:    req.rel.timelineRenoteMutedUserIDs(),
+			BlockerIDs:            req.rel.timelineBlockerIDs(),
 			MutedInstances:        h.loadMutedInstances(viewer),
 			// upstream hybrid-timeline も getFromDb で
 			// `channelId IN (followingChannelIds) OR channelId IS NULL` を
 			// 付ける。渡さないと DB 経路 (FTT 無効時・cache miss 時) で
 			// フォロー中チャンネルの投稿が STL から丸ごと落ちる。
-			FollowedChannelIDs: h.loadFollowedChannelIDs(viewer),
-			FollowingIDs:       h.loadFollowingIDs(viewer),
+			FollowedChannelIDs: req.rel.timelineFollowedChannelIDs(),
+			FollowingIDs:       req.rel.timelineFollowingIDs(),
 		}
-		return h.timelineService.HybridTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, *req.Limit, f)
+		return h.timelineService.HybridTimeline(c.Request().Context(), viewer, req.UntilID, req.SinceID, int(*req.Limit), f)
 	}, true)
 }
 
@@ -183,62 +195,67 @@ func (h *Handler) HybridTimeline(c echo.Context) error {
 // error the mute list is skipped (best-effort) and a warning is logged so
 // operators can see silent filter failures.
 func (h *Handler) loadMutedChannelIDs(viewer *model.User) []string {
-	if viewer == nil || h.channelMutingRepo == nil {
-		return nil
-	}
-	rows, err := h.channelMutingRepo.ListByUser(viewer.ID)
+	return h.newRequestRelations(viewer).timelineMutedChannelIDs()
+}
+
+// loadFollowedChannelIDs returns the channel IDs the viewer follows, excluding
+// muted channels. See requestRelations.timelineFollowedChannelIDs.
+func (h *Handler) loadFollowedChannelIDs(viewer *model.User) []string {
+	return h.newRequestRelations(viewer).timelineFollowedChannelIDs()
+}
+
+// loadRenoteMutedUserIDs returns userIDs that viewer has renote-muted.
+func (h *Handler) loadRenoteMutedUserIDs(viewer *model.User) []string {
+	return h.newRequestRelations(viewer).timelineRenoteMutedUserIDs()
+}
+
+// loadFollowingIDs returns the set of users the viewer follows.
+func (h *Handler) loadFollowingIDs(viewer *model.User) map[string]struct{} {
+	return h.newRequestRelations(viewer).timelineFollowingIDs()
+}
+
+// loadBlockerIDs returns the ids of users who block the viewer.
+func (h *Handler) loadBlockerIDs(viewer *model.User) []string {
+	return h.newRequestRelations(viewer).timelineBlockerIDs()
+}
+
+// timelineMutedChannelIDs is mutedChannelIDs for TimelineFilter: a load error
+// is logged and treated as "no mutes" (best-effort, #874)。取得後の
+// newMuteBlockFilter は同じ失敗を 500 にするので、ここで握り潰しても
+// ミュートしたチャンネルの投稿がそのまま返ることはない。
+func (r *requestRelations) timelineMutedChannelIDs() []string {
+	ids, err := r.mutedChannelIDs()
 	if err != nil {
-		slog.Warn("timeline: failed to load muted channels", "userId", viewer.ID, "err", err)
+		slogWarnRelation("muted channels", r.viewer, err)
 		return nil
 	}
-	if len(rows) == 0 {
+	if len(ids) == 0 {
 		return nil
-	}
-	ids := make([]string, 0, len(rows))
-	for _, m := range rows {
-		ids = append(ids, m.ChannelID)
 	}
 	return ids
 }
 
-// loadFollowedChannelIDs returns the channel IDs the viewer follows, excluding
-// muted channels (#1686, upstream timeline.ts の followingChannelIds から
-// mutingChannelIds を除く分岐)。home timeline でのみ使い、空なら home は
-// channelId IS NULL の note のみ。anonymous viewer / repo 未配線 / 取得失敗時は
-// nil (best-effort、warning ログ)。
-func (h *Handler) loadFollowedChannelIDs(viewer *model.User) []string {
-	if viewer == nil || h.channelFollowingRepo == nil {
+// timelineFollowedChannelIDs returns the channel IDs the viewer follows,
+// excluding muted channels (#1686, upstream timeline.ts の followingChannelIds
+// から mutingChannelIds を除く分岐)。空なら home は channelId IS NULL の note
+// のみ。anonymous viewer / repo 未配線 / 取得失敗時は nil (best-effort、warning
+// ログ)。
+func (r *requestRelations) timelineFollowedChannelIDs() []string {
+	followed, err := r.followedChannelIDsRaw()
+	if err != nil {
+		slogWarnRelation("followed channels", r.viewer, err)
 		return nil
-	}
-	// 1 user の follow channel 数は通常少ないが、暴走防止に上限で打ち切る。
-	const pageSize = 100
-	const maxFollowedChannels = 500
-	var followed []string
-	for offset := 0; offset < maxFollowedChannels; offset += pageSize {
-		rows, err := h.channelFollowingRepo.ListFollowed(viewer.ID, "", "", pageSize, offset)
-		if err != nil {
-			slog.Warn("timeline: failed to load followed channels", "userId", viewer.ID, "err", err)
-			return nil
-		}
-		for _, f := range rows {
-			followed = append(followed, f.FolloweeID)
-		}
-		if len(rows) < pageSize {
-			break
-		}
 	}
 	if len(followed) == 0 {
 		return nil
 	}
-	muted := h.loadMutedChannelIDs(viewer)
-	if len(muted) == 0 {
-		return followed
-	}
+	muted := r.timelineMutedChannelIDs()
 	mutedSet := make(map[string]struct{}, len(muted))
 	for _, id := range muted {
 		mutedSet[id] = struct{}{}
 	}
-	out := followed[:0]
+	// 覚えている一覧を書き換えないよう、新しい slice に詰める。
+	out := make([]string, 0, len(followed))
 	for _, id := range followed {
 		if _, m := mutedSet[id]; !m {
 			out = append(out, id)
@@ -250,54 +267,45 @@ func (h *Handler) loadFollowedChannelIDs(viewer *model.User) []string {
 	return out
 }
 
-// loadMutedUserIDs returns userIDs that viewer has muted (active mutes only,
-// non-expired). nil for anonymous viewers or when the repo is not wired.
+// timelineMutedUserIDs returns userIDs that viewer has muted (active mutes
+// only, non-expired). nil for anonymous viewers or when the repo is not wired.
 // repository error は best-effort で nil 扱いにし slog.Warn で観測する
 // (= channel mute 同様の pattern、#874)。
-func (h *Handler) loadMutedUserIDs(viewer *model.User) []string {
-	if viewer == nil || h.mutingRepo == nil {
-		return nil
-	}
-	ids, err := h.mutingRepo.ListMuteeIDs(viewer.ID)
+func (r *requestRelations) timelineMutedUserIDs() []string {
+	ids, err := r.mutedUserIDs()
 	if err != nil {
-		slog.Warn("timeline: failed to load muted users", "userId", viewer.ID, "err", err)
+		slogWarnRelation("muted users", r.viewer, err)
 		return nil
 	}
 	return ids
 }
 
-// loadRenoteMutedUserIDs returns userIDs that viewer has renote-muted.
+// timelineRenoteMutedUserIDs returns userIDs that viewer has renote-muted.
 // nil for anonymous viewers or when the repo is not wired (#903)。
 // MutedUserIDs と異なり投稿者の plain note は除外せず、pure renote のみ
 // filter する (logic は ApplyFilter / applyTimelineFilter 側で実装)。
-func (h *Handler) loadRenoteMutedUserIDs(viewer *model.User) []string {
-	if viewer == nil || h.renoteMutingRepo == nil {
-		return nil
-	}
-	ids, err := h.renoteMutingRepo.ListMuteeIDs(viewer.ID)
+func (r *requestRelations) timelineRenoteMutedUserIDs() []string {
+	ids, err := r.renoteMutedUserIDs()
 	if err != nil {
-		slog.Warn("timeline: failed to load renote-muted users", "userId", viewer.ID, "err", err)
+		slogWarnRelation("renote-muted users", r.viewer, err)
 		return nil
 	}
 	return ids
 }
 
-// loadBlockerIDs returns the ids of users who block the viewer (被block、#1681)。
-// timeline で note/reply/renote の author が viewer を block していれば除外する
-// (upstream generateBlockedUserQueryForNotes)。
-// loadFollowingIDs returns the set of users the viewer follows.
+// timelineFollowingIDs returns the set of users the viewer follows.
 //
 // upstream timeline.ts は HTL の noteFilter で followings を引き、「返信先が
 // followers 限定の投稿で、その投稿者をフォローしていない」ノートを弾く。
 // fanout 側にも同等のガードはあるが DB fallback には効かないので、取得側でも
 // 同じ判定ができるようにする。
-func (h *Handler) loadFollowingIDs(viewer *model.User) map[string]struct{} {
-	if viewer == nil || h.userFollowingRepo == nil {
+func (r *requestRelations) timelineFollowingIDs() map[string]struct{} {
+	if r.viewer == nil || r.h.userFollowingRepo == nil {
 		return nil
 	}
-	ids, err := h.userFollowingRepo.ListFolloweeIDs(viewer.ID)
+	ids, err := r.followeeIDs()
 	if err != nil {
-		slog.Warn("timeline: failed to load followings", "userId", viewer.ID, "err", err)
+		slogWarnRelation("followings", r.viewer, err)
 		return nil
 	}
 	out := make(map[string]struct{}, len(ids))
@@ -307,16 +315,20 @@ func (h *Handler) loadFollowingIDs(viewer *model.User) map[string]struct{} {
 	return out
 }
 
-func (h *Handler) loadBlockerIDs(viewer *model.User) []string {
-	if viewer == nil || h.blockingRepo == nil {
-		return nil
-	}
-	ids, err := h.blockingRepo.ListBlockerIDs(viewer.ID)
+// timelineBlockerIDs returns the ids of users who block the viewer (被block、
+// #1681)。timeline で note/reply/renote の author が viewer を block していれば
+// 除外する (upstream generateBlockedUserQueryForNotes)。
+func (r *requestRelations) timelineBlockerIDs() []string {
+	ids, err := r.blockerIDs()
 	if err != nil {
-		slog.Warn("timeline: failed to load blockers", "userId", viewer.ID, "err", err)
+		slogWarnRelation("blockers", r.viewer, err)
 		return nil
 	}
 	return ids
+}
+
+func slogWarnRelation(what string, viewer *model.User, err error) {
+	slog.Warn("timeline: failed to load "+what, "userId", viewer.ID, "err", err)
 }
 
 // loadMutedInstances returns the viewer's muted instance hosts (lowercase、#1681)。
@@ -377,7 +389,7 @@ func (h *Handler) serveTimeline(
 	// を生成していたが、SQL `id > Generate(time)` 比較では同 msec の早期 ID
 	// を取りこぼすバグがあった。AidxCutoffPrefix (= time prefix + "00000000")
 	// で deterministic + 同 msec 内全 ID を含む正しい cutoff に修正。
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -405,6 +417,7 @@ func (h *Handler) serveTimeline(
 	// pack + encode を丸ごとスキップ。cache 無効時 / cursor 付きは cacheKey="" で
 	// 従来通り c.JSON 経路を通る (= default 挙動は byte 一致のまま)。
 	var cacheKey string
+	var cacheGen uint64
 	if h.timelineCache != nil && req.SinceID == "" && req.UntilID == "" {
 		// 匿名の応答は ugcVisibilityForVisitor で中身が変わるので、設定ごとに
 		// 別のキーにする。同じキーだと、設定を締めた直後も TTL の間は締める前の
@@ -414,11 +427,14 @@ func (h *Handler) serveTimeline(
 			vid = viewer.ID
 		}
 		cacheKey = timelineCacheKey(kind, vid, req)
+		cacheGen = h.timelineCache.generation()
 		if body, ok := h.timelineCache.get(cacheKey, time.Now()); ok {
 			return c.JSONBlob(http.StatusOK, body)
 		}
 	}
 
+	req.rel = h.newRequestRelations(viewer)
+	req.pageFilter = h.newMuteBlockFilterWith(viewer, req.rel)
 	notes, err := fn(viewer, req)
 	if err != nil {
 		// requireAuthでviewer nilチェックは事前に行っているので、Service層からの
@@ -431,7 +447,11 @@ func (h *Handler) serveTimeline(
 	// こぼす。upstream FanoutTimelineEndpointService は note と note.renote の
 	// 両方に isUserRelated を適用しており (#2345 の調査で判明)、mk-go でも
 	// 同じ判定を持つ ApplyMuteBlockChannel を timeline 経路に通して揃える。
-	if notes, err = h.applyMuteBlock(viewer, notes); err != nil {
+	//
+	// Redis から読んだページには service が PageFilter として既に通している
+	// (#3448)。ここで判定するのは DB fallback の行だけで、通過済みの Redis の行は
+	// 判定し直さない (newMuteBlockFilter の doc)。読み込みも使い回す。
+	if notes, err = req.pageFilter(notes); err != nil {
 		return apierr.JSONInternalError(c)
 	}
 	packed := h.packMany(c.Request().Context(), notes, viewer)
@@ -440,7 +460,7 @@ func (h *Handler) serveTimeline(
 			// echo の c.JSON は json.Encoder 経由で末尾に改行を付ける。cache 経路も
 			// 同じ byte 列にして default (c.JSON) 経路と応答を一致させる。
 			body = append(body, '\n')
-			h.timelineCache.set(cacheKey, body, time.Now())
+			h.timelineCache.set(cacheGen, cacheKey, body, time.Now())
 			return c.JSONBlob(http.StatusOK, body)
 		}
 		// marshal 失敗時は通常の c.JSON 経路へ fallthrough。

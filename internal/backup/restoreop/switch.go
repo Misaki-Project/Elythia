@@ -1,0 +1,558 @@
+package restoreop
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/elythia-network/elythia/internal/backup"
+	"github.com/elythia-network/elythia/internal/maintmode"
+)
+
+// stopping reports whether the service is stopping.
+//
+// 止められた段は、失敗として扱わずに記録を進めないまま返る。失敗として扱うと、
+// サービスを止めただけで中止・戻す・諦める (unknown) へ進んでしまう。記録は最後に
+// 書いた段のまま残り、起動し直したときに Recover が名前と状態から続きを決める。
+// 確かめるのは、失敗を受けて記録を進める入口 (abortBeforeSwitch・revert・giveUp)
+// にまとめる。どの段の失敗も、このどれかを通る。
+func stopping(ctx context.Context) bool { return ctx.Err() != nil }
+
+// advance writes the step before an action outside (the maintenance, the
+// database names) depends on it.
+//
+// 書けなければ、外への作用の前で止まって返す (false)。記録が遅れたまま作用を
+// 進めると、起動し直した回復が古い段から逆の方向を選ぶ (例: switched のまま
+// 戻した DB で再開させると、回復が元の DB へ戻して書き込みを失う)。記録は最後に
+// 書けた段のまま残り、settle が同じ goroutine で回復に入って続きを決める。
+func (m *Manager) advance(ctx context.Context, opID, from, to string, extra ...any) bool {
+	if err := m.setStep(ctx, opID, from, to, extra...); err != nil {
+		m.log.Error("backup: cannot record the step of a restore; recovering from the written step", "opId", opID, "from", from, "to", to, "err", err)
+		m.stalled.Store(true)
+		return false
+	}
+	return true
+}
+
+// stalledNotifyAfter is how long settle waits for the record before it
+// notifies an operator once.
+const stalledNotifyAfter = time.Minute
+
+// settle finishes an operation that stopped because a step could not be
+// written: it reads the record again (Poll apart, as long as it takes) and
+// recovers from the step that was written, holding the judge and the job
+// slot of the caller. It returns at once when nothing stopped, and without
+// moving the record when the service is stopping.
+//
+// 止まったまま返すと、名前を入れ替えた後でもメンテナンスのまま、起動し直すまで
+// 誰も続きを決めない。回復の中で記録が書けなかったときも、ここで繰り返す
+// (呼び出しを重ねない)。
+func (m *Manager) settle(ctx context.Context, opID string) {
+	notified := false
+	since := m.now()
+	// 読めない間だけでなく、読めるが書けない間 (maxmemory の OOM など) も、回復を
+	// 繰り返すだけでメンテナンスが外れないので、どちらも同じ期限で 1 回知らせる。
+	notify := func(cause error) {
+		if notified || m.now().Sub(since) < stalledNotifyAfter {
+			return
+		}
+		notified = true
+		m.notifyStalled(ctx, fmt.Sprintf("restore %s stopped: it cannot write or read its record in Redis, so it cannot go on (%v). "+
+			"It keeps trying; the maintenance stays as it is until then", opID, cause))
+	}
+	for m.stalled.Swap(false) {
+		var rec *Record
+		for rec == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(m.o.Poll):
+			}
+			r, err := m.o.Store.Get(ctx, opID)
+			switch {
+			case err == nil:
+				rec = r
+			case errors.Is(err, ErrNotFound):
+				// 記録が消えている (期限切れや手で消された)。続きを決められないので、
+				// 読み直し続けずに運営者に渡し、枠を返す。
+				m.notifyStalled(ctx, fmt.Sprintf("restore %s stopped: its record is gone, so it cannot decide how to go on. "+
+					"Check pg_database and the maintenance (elythia maintenance status) and put things right by hand", opID))
+				return
+			default:
+				notify(err)
+			}
+		}
+		if Final(rec.Step) {
+			return
+		}
+		notify(errors.New("a step could not be written"))
+		m.journal(ctx, opID, rec.Step, "a step could not be written; recovering from step %s", rec.Step)
+		m.recoverRecord(ctx, rec)
+	}
+}
+
+// notifyStalled logs msg and notifies an operator.
+func (m *Manager) notifyStalled(ctx context.Context, msg string) {
+	m.log.Error("backup: " + msg)
+	if m.o.Notify != nil {
+		m.o.Notify(context.WithoutCancel(ctx), msg)
+	}
+}
+
+// runJudge runs the judge until the returned function is called.
+func (m *Manager) runJudge(ctx context.Context) func() {
+	if m.o.RunJudge == nil {
+		return func() {}
+	}
+	jctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.o.RunJudge(jctx)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// waitResult is how a wait on the maintenance state ended.
+type waitResult int
+
+const (
+	waitReached waitResult = iota
+	// waitGone: the state is gone or belongs to another operation.
+	waitGone
+	waitTimeout
+	waitCancelled
+)
+
+// waitPhase waits until the maintenance of opID is at phase.
+func (m *Manager) waitPhase(ctx context.Context, opID, phase string, timeout time.Duration) waitResult {
+	deadline := m.now().Add(timeout)
+	for {
+		st, err := m.o.Maint.Get(ctx)
+		switch {
+		case err != nil:
+			// 読めないだけなら待ち続ける (Redis の瞬断)。
+		case st == nil || st.OpID != opID:
+			return waitGone
+		case st.Phase == phase:
+			return waitReached
+		}
+		if !m.now().Before(deadline) {
+			return waitTimeout
+		}
+		select {
+		case <-ctx.Done():
+			return waitCancelled
+		case <-time.After(m.o.Poll):
+		}
+	}
+}
+
+// waitCleared waits until the maintenance of opID is over (the judge clears
+// it once every process serves again).
+func (m *Manager) waitCleared(ctx context.Context, opID string, timeout time.Duration) waitResult {
+	deadline := m.now().Add(timeout)
+	for {
+		st, err := m.o.Maint.Get(ctx)
+		if err == nil && (st == nil || st.OpID != opID) {
+			return waitReached
+		}
+		if !m.now().Before(deadline) {
+			return waitTimeout
+		}
+		select {
+		case <-ctx.Done():
+			return waitCancelled
+		case <-time.After(m.o.Poll):
+		}
+	}
+}
+
+// switchOver runs the confirmed operation: C3 to C10 of the design.
+//
+// ctx はサービスの寿命。止められたら (waitCancelled) 何もせずに返る。記録は
+// 最後に書いた段のまま残り、起動し直したときに Recover が続きを決める。
+func (m *Manager) switchOver(ctx context.Context, rec *Record) {
+	stopJudge := m.runJudge(ctx)
+	defer stopJudge()
+	m.switchSteps(ctx, rec)
+	m.settle(ctx, rec.OpID)
+}
+
+func (m *Manager) switchSteps(ctx context.Context, rec *Record) {
+
+	// C3: メンテナンスに入れる。
+	err := m.o.Maint.Enter(ctx, maintmode.State{
+		OpID: rec.OpID, Kind: maintKind(rec), RequestedBy: rec.UserID, StartedAt: m.now(),
+	})
+	if err != nil {
+		// 書き込みは済んだのに応答を読めなかっただけのことがあり、書き込みが後から届く
+		// こともある。読み直しでは決められないので、この操作の状態だけを消し (opId の
+		// CAS)、間を置いてもう一度消してから中止する (残したまま aborted にすると、誰も
+		// 外さない)。消せなければ運営者に渡す。
+		if cerr := m.clearOwnTwice(ctx, rec.OpID); cerr != nil {
+			m.giveUp(ctx, rec, StepEntering, fmt.Errorf("enter the maintenance: %w; then clear it: %v", err, cerr))
+			return
+		}
+		m.abortBeforeSwitch(ctx, rec, fmt.Errorf("enter the maintenance: %w", err), false)
+		return
+	}
+	m.journal(ctx, rec.OpID, StepEntering, "waiting for every process to let go of %s", rec.Database)
+
+	// C4: held を待つ。held は判定役が pg_stat_activity で数えた結果。
+	switch m.waitPhase(ctx, rec.OpID, maintmode.PhaseHeld, m.o.HeldTimeout) {
+	case waitCancelled:
+		return
+	case waitGone:
+		m.abortBeforeSwitch(ctx, rec, errors.New("the maintenance was ended by someone else"), false)
+		return
+	case waitTimeout:
+		m.abortBeforeSwitch(ctx, rec, fmt.Errorf("the processes did not let go of the database within %s", m.o.HeldTimeout), true)
+		return
+	}
+	m.journal(ctx, rec.OpID, StepEntering, "held; switching the databases")
+
+	// C5: 名前を入れ替える。SwitchDatabase は入れ替える直前に、もう一度
+	// pg_stat_activity で接続が無いことを確かめる (held は根拠にしない)。
+	// 入れ替える直前に、退避する側 (今の本番) へ進行中の印を付ける。付けられない
+	// なら入れ替えない (印の無い入れ替えは、回復が巻き戻せない)。
+	if err := m.o.DB.MarkOperation(ctx, m.o.MaintenanceDB, rec.Database, backup.MarkActive, rec.OpID); err != nil {
+		m.abortBeforeSwitch(ctx, rec, fmt.Errorf("mark %s before the switch: %w", rec.Database, err), true)
+		return
+	}
+	err = m.o.DB.SwitchDatabase(ctx, m.o.MaintenanceDB, rec.Database, rec.Before, rec.Target)
+	switch {
+	case errors.Is(err, backup.ErrRestoreSwitchUnknown):
+		m.giveUp(ctx, rec, StepEntering, err)
+		return
+	case err != nil:
+		m.abortBeforeSwitch(ctx, rec, err, true)
+		return
+	}
+	if !m.advance(ctx, rec.OpID, StepEntering, StepSwitched) {
+		return
+	}
+	m.journal(ctx, rec.OpID, StepSwitched, "%s is now the %s database; the previous one is %s", rec.Database, swappedIn(rec), rec.Before)
+
+	// C6 / C7: Redis の後始末と検査。
+	if err := m.cleanAndCheck(ctx); err != nil {
+		m.revert(ctx, rec, StepSwitched, err)
+		return
+	}
+	// C8
+	m.modlog(ctx, rec.Database, rec, "switch")
+
+	// C9 / C10
+	if !m.advance(ctx, rec.OpID, StepSwitched, StepResuming) {
+		return
+	}
+	if err := m.o.Maint.SetPhase(ctx, rec.OpID, maintmode.PhaseResuming); err != nil {
+		m.revert(ctx, rec, StepResuming, fmt.Errorf("resume: %w", err))
+		return
+	}
+	m.awaitResume(ctx, rec)
+}
+
+// clearOwnTwice clears the maintenance of opID (only if it is that one's),
+// waits Poll and clears it again for a write that arrives late.
+func (m *Manager) clearOwnTwice(ctx context.Context, opID string) error {
+	for i := 0; i < 2; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(m.o.Poll):
+			}
+		}
+		if err := m.o.Maint.Clear(ctx, opID); err != nil && !errors.Is(err, maintmode.ErrOpMismatch) {
+			return err
+		}
+	}
+	return nil
+}
+
+// awaitResume waits for the processes to serve on the restored database and
+// puts the previous one back when they do not within ResumeTimeout (A3).
+func (m *Manager) awaitResume(ctx context.Context, rec *Record) {
+	m.journal(ctx, rec.OpID, StepResuming, "waiting for every process to serve again")
+	switch m.waitCleared(ctx, rec.OpID, m.o.ResumeTimeout) {
+	case waitCancelled:
+		return
+	case waitTimeout:
+		m.revert(ctx, rec, StepResuming, fmt.Errorf("the processes did not serve again within %s", m.o.ResumeTimeout))
+		return
+	}
+	m.markFinished(ctx, rec)
+	l := say(StepDone, "restored generation %s; the previous database is kept as %s", rec.GenerationID, rec.Before)
+	if rec.Kind == KindRollback {
+		l = say(StepDone, "rolled back to %s; the previous database is kept as %s", rec.Target, rec.Before)
+	}
+	m.recordWithLine(ctx, rec.OpID, StepResuming, StepDone, l)
+}
+
+func (m *Manager) cleanAndCheck(ctx context.Context) error {
+	if m.o.CleanRedis != nil {
+		if err := m.o.CleanRedis(ctx); err != nil {
+			return fmt.Errorf("clean redis: %w", err)
+		}
+	}
+	if m.o.Check != nil {
+		if err := m.o.Check(ctx); err != nil {
+			return fmt.Errorf("check the restored database: %w", err)
+		}
+	}
+	return nil
+}
+
+// abortBeforeSwitch ends an operation whose names were not swapped (A1): the
+// processes resume on the current database and the new one is dropped.
+func (m *Manager) abortBeforeSwitch(ctx context.Context, rec *Record, cause error, inMaintenance bool) {
+	if stopping(ctx) {
+		return
+	}
+	m.journal(ctx, rec.OpID, StepEntering, "not switching: %v", cause)
+	if !m.advance(ctx, rec.OpID, "", StepAborting, "error", cause.Error()) {
+		return
+	}
+	if inMaintenance {
+		m.resumeCurrent(ctx, rec)
+		if stopping(ctx) {
+			// aborting のまま残す。Recover がもう一度戻してから消す。
+			return
+		}
+	}
+	m.dropTarget(ctx, rec)
+	l := say(StepAborted, "the current database %s was not changed", rec.Database)
+	if rec.Kind == KindRollback {
+		l = say(StepAborted, "the current database %s was not changed; %s", rec.Database, targetFate(rec))
+	}
+	m.recordWithLine(ctx, rec.OpID, StepAborting, StepAborted, l)
+}
+
+// resumeCurrent lets the processes come back and waits for them (best
+// effort: they keep retrying on their own).
+// markFinished replaces the active mark on the database kept aside with the
+// finished one, so that a record put back to an earlier step is not
+// recovered (recoverRecord). 書けなくても操作は終える (進行中の印が残り、その
+// 操作の記録の再生を防げないだけ)。
+func (m *Manager) markFinished(ctx context.Context, rec *Record) {
+	if err := m.o.DB.MarkOperation(ctx, m.o.MaintenanceDB, rec.Before, backup.MarkFinished, rec.OpID); err != nil {
+		m.log.Warn("backup: cannot mark the kept database as finished", "opId", rec.OpID, "database", rec.Before, "err", err)
+		m.journal(ctx, rec.OpID, "", "could not mark %s as finished: %v", rec.Before, err)
+	}
+}
+
+// retireMark marks the database kept aside as handed to the operator when it
+// carries this operation's active mark. giveUp uses it: an operation handed to
+// the operator must not be reverted later by a record put back to an earlier
+// step.
+//
+// 「終わった」と別の印にする。運営者に渡した直後に記録 (unknown) が書けずに
+// 途中の段のまま残ると、次の起動の回復は印を見る。「終わった」と書いていると、
+// 運営者に渡したメンテナンスを外して done にしてしまう。渡した印なら、回復も
+// 運営者に渡す。読み書きは時間を区切る (DB に繋がらないときに、通知を遅らせない)。
+func (m *Manager) retireMark(ctx context.Context, rec *Record) {
+	ctx, cancel := context.WithTimeout(ctx, markTimeout)
+	defer cancel()
+	state, op, exists, err := m.o.DB.OperationMark(ctx, m.o.MaintenanceDB, rec.Before)
+	if err != nil {
+		m.log.Warn("backup: cannot read the mark of the kept database", "opId", rec.OpID, "database", rec.Before, "err", err)
+		m.journal(ctx, rec.OpID, "", "could not read the mark of %s: %v", rec.Before, err)
+		return
+	}
+	if !exists || op != rec.OpID || state != backup.MarkActive {
+		return
+	}
+	if err := m.o.DB.MarkOperation(ctx, m.o.MaintenanceDB, rec.Before, backup.MarkHanded, rec.OpID); err != nil {
+		m.log.Warn("backup: cannot mark the kept database as handed to the operator", "opId", rec.OpID, "database", rec.Before, "err", err)
+		m.journal(ctx, rec.OpID, "", "could not mark %s as handed to the operator: %v", rec.Before, err)
+	}
+}
+
+// markTimeout bounds the mark retireMark reads and writes.
+const markTimeout = 15 * time.Second
+
+func (m *Manager) resumeCurrent(ctx context.Context, rec *Record) {
+	if err := m.o.Maint.SetPhase(ctx, rec.OpID, maintmode.PhaseResuming); err != nil {
+		if !errors.Is(err, maintmode.ErrNotActive) && !stopping(ctx) {
+			m.journal(ctx, rec.OpID, "", "could not end the maintenance: %v", err)
+		}
+		return
+	}
+	if m.waitCleared(ctx, rec.OpID, m.o.ResumeTimeout) == waitTimeout {
+		m.journal(ctx, rec.OpID, "", "the processes have not served again within %s; the maintenance stays at resuming and they keep retrying", m.o.ResumeTimeout)
+	}
+}
+
+// revert puts the previous database back after the names were swapped (A2,
+// and A3 when the processes already came back).
+func (m *Manager) revert(ctx context.Context, rec *Record, from string, cause error) {
+	if stopping(ctx) {
+		return
+	}
+	m.journal(ctx, rec.OpID, from, "putting the previous database back: %v", cause)
+	aside := rec.Aside
+	switch {
+	case aside != "":
+	case rec.Kind == KindRollback:
+		// ロールバックを戻すときは、戻した DB を元の名前 (退避したときの名前) へ戻す。
+		// 新しい _rolled_back_ の名前で残すと、いつ退避した DB だったかが名前から
+		// 分からなくなる。
+		aside = rec.Target
+	default:
+		aside = rec.Database + "_rolled_back_" + m.now().UTC().Format("20060102150405")
+	}
+	if !m.advance(ctx, rec.OpID, "", StepReverting, "aside", aside, "error", cause.Error()) {
+		return
+	}
+	rec.Aside = aside
+	m.revertSwitch(ctx, rec)
+}
+
+// revertSwitch swaps the names back once every process has let go again.
+func (m *Manager) revertSwitch(ctx context.Context, rec *Record) {
+	if !m.holdAgain(ctx, rec) {
+		return
+	}
+	err := m.o.DB.SwitchDatabase(ctx, m.o.MaintenanceDB, rec.Database, rec.Aside, rec.Before)
+	if err != nil {
+		m.giveUp(ctx, rec, StepReverting, fmt.Errorf("put %s back: %w", rec.Before, err))
+		return
+	}
+	m.finishRevert(ctx, rec)
+}
+
+// holdAgain brings the maintenance of rec back to held. It reports false
+// when it gave up (or the service is stopping).
+func (m *Manager) holdAgain(ctx context.Context, rec *Record) bool {
+	st, err := m.o.Maint.Get(ctx)
+	if err != nil {
+		m.giveUp(ctx, rec, StepReverting, fmt.Errorf("read the maintenance: %w", err))
+		return false
+	}
+	if st == nil || st.OpID != rec.OpID {
+		// 状態が消えている。プロセスは戻した DB で動いているので、ここで入れ替えると
+		// 書き込みを失う。運営者に任せる。
+		m.giveUp(ctx, rec, StepReverting, errors.New("the maintenance is no longer active, so the processes may be serving the restored database"))
+		return false
+	}
+	if st.Phase != maintmode.PhaseHeld {
+		if st.Phase == maintmode.PhaseResuming {
+			if err := m.o.Maint.SetPhase(ctx, rec.OpID, maintmode.PhaseEntering); err != nil {
+				m.giveUp(ctx, rec, StepReverting, fmt.Errorf("enter the maintenance again: %w", err))
+				return false
+			}
+		}
+		switch m.waitPhase(ctx, rec.OpID, maintmode.PhaseHeld, m.o.HeldTimeout) {
+		case waitCancelled:
+			return false
+		case waitReached:
+		default:
+			m.giveUp(ctx, rec, StepReverting, fmt.Errorf("the processes did not let go of the restored database within %s", m.o.HeldTimeout))
+			return false
+		}
+	}
+	return true
+}
+
+// finishRevert cleans Redis again and lets the processes resume on the
+// previous database.
+//
+// 再開 (resuming) を先に出してから reverted を書く。逆だと、その間で止められた
+// ときに最終の段だけが残り、メンテナンスが外れなくなる。
+func (m *Manager) finishRevert(ctx context.Context, rec *Record) {
+	st, err := m.o.Maint.Get(ctx)
+	if err != nil {
+		m.giveUp(ctx, rec, StepReverting, fmt.Errorf("read the maintenance: %w", err))
+		return
+	}
+	held := st != nil && st.OpID == rec.OpID && st.Phase != maintmode.PhaseResuming
+	m.journal(ctx, rec.OpID, StepReverting, "%s is the previous database again; the restored one is kept as %s", rec.Database, rec.Aside)
+	if held && m.o.CleanRedis != nil {
+		// 戻した DB で動いた間に Redis に積まれたものを消す。プロセスが元の DB で
+		// 動き始めた後 (resuming や状態が消えた後) に消すと、元の DB の分まで消す
+		// ので、止まっている間だけにする。失敗しても元の DB へは戻っているので、
+		// 止めずに記録だけ残す。
+		if err := m.o.CleanRedis(ctx); err != nil {
+			m.journal(ctx, rec.OpID, StepReverting, "could not clean redis: %v", err)
+		}
+	}
+	if held {
+		if err := m.o.Maint.SetPhase(ctx, rec.OpID, maintmode.PhaseResuming); err != nil && !errors.Is(err, maintmode.ErrNotActive) {
+			m.giveUp(ctx, rec, StepReverting, fmt.Errorf("resume: %w", err))
+			return
+		}
+	}
+	// 結末の行は段と一緒に書く。待ちの後に書くと、reverted を読んで読み直しを止めた
+	// 管理画面には、戻したことが最大 ResumeTimeout の間 (待ちが終わるまで) 出ない。
+	m.recordWithLine(ctx, rec.OpID, StepReverting, StepReverted, say(StepReverted, "reverted to the previous database"))
+	if m.waitCleared(ctx, rec.OpID, m.o.ResumeTimeout) == waitTimeout {
+		m.journal(ctx, rec.OpID, "", "the processes have not served again within %s; the maintenance stays at resuming and they keep retrying", m.o.ResumeTimeout)
+	}
+}
+
+// giveUp stops and leaves the decision to an operator (it cannot tell the
+// state of the names, or cannot get the processes off the database).
+//
+// 勧める手順は、メンテナンスが残っているかで変える。残っていないときに
+// -rollback だけを勧めると、プロセスが動いている DB の名前を変えさせることになる
+// (接続があれば PostgreSQL が拒むが、運営者が接続を切ってから試しかねない)。
+func (m *Manager) giveUp(ctx context.Context, rec *Record, from string, cause error) {
+	if stopping(ctx) {
+		return
+	}
+	names := fmt.Sprintf("Check pg_database for %s, %s, %s and %s", rec.Database, rec.Target, rec.Before, rec.Aside)
+	var msg string
+	st, err := m.o.Maint.Get(ctx)
+	switch {
+	case err != nil:
+		msg = fmt.Sprintf("%s %s stopped: %v. It could not read the maintenance state (%v); check it with elythia maintenance status. %s. "+
+			"With the maintenance on, put the right database under %s (elythia backup restore -rollback), then end the maintenance (elythia maintenance exit)",
+			kindWord(rec), rec.OpID, cause, err, names, rec.Database)
+	case st != nil && st.OpID == rec.OpID:
+		msg = fmt.Sprintf("%s %s stopped and left the maintenance on: %v. %s, "+
+			"put the right database under %s (elythia backup restore -rollback), then end the maintenance (elythia maintenance exit)",
+			kindWord(rec), rec.OpID, cause, names, rec.Database)
+	default:
+		msg = fmt.Sprintf("%s %s stopped: %v. The maintenance is not on, so the processes serve the database named %s now. %s. "+
+			"To put another database under %s, enter the maintenance first (elythia maintenance enter), then elythia backup restore -rollback, then elythia maintenance exit",
+			kindWord(rec), rec.OpID, cause, rec.Database, names, rec.Database)
+	}
+	m.retireMark(ctx, rec)
+	m.recordWithLine(ctx, rec.OpID, "", StepUnknown, journalLine{step: from, msg: msg}, "error", cause.Error())
+	m.log.Error("backup: " + msg)
+	if m.o.Notify != nil {
+		m.o.Notify(context.WithoutCancel(ctx), msg)
+	}
+}
+
+// kindWord names the kind of rec in messages to an operator.
+func kindWord(rec *Record) string {
+	if rec.Kind == KindRollback {
+		return "rollback"
+	}
+	return "restore"
+}
+
+// maintKind is the maintenance kind of rec.
+//
+// 公開の進み具合の画面には種類を出さない (v1 §7-5) が、運営者の
+// elythia maintenance status と判定役のログでは見分けられるようにする。
+func maintKind(rec *Record) string {
+	if rec.Kind == KindRollback {
+		return maintmode.KindRollback
+	}
+	return maintmode.KindRestore
+}
+
+// swappedIn describes the database rec swaps in, for the journal.
+func swappedIn(rec *Record) string {
+	if rec.Kind == KindRollback {
+		return "kept"
+	}
+	return "restored"
+}

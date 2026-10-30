@@ -2,6 +2,7 @@ package signin
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	jsonv2 "encoding/json/v2"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/core/captcha"
 	coreemail "github.com/elythia-network/elythia/internal/core/email"
 	"github.com/elythia-network/elythia/internal/core/twofactor"
@@ -62,6 +64,9 @@ type MainStreamPublisher interface {
 
 // Handler handles signin-related API endpoints.
 type Handler struct {
+	// background は応答の後の処理 (サインインの記録・通知・メール) を起動する箱 (#3661)。世代の停止で
+	// 待つ。nil なら素の goroutine で起動する (テスト)。
+	background          *bgwork.Group
 	userRepo            repository.UserRepository
 	webauthnSvc         *twofactor.WebAuthnService
 	securityKeyRepo     repository.UserSecurityKeyRepository
@@ -83,6 +88,9 @@ type Handler struct {
 	testMode bool
 	// metaRepo はメール l10n の instance fallback 用。未配線なら英語 fallback。
 	metaRepo repository.MetaRepository
+	// passwordHasher はログインのときの焼き直しと、Argon2からの移行に使う(#3780)。
+	// 零値は既定のcost。
+	passwordHasher password.Hasher
 }
 
 // LoginNotifier records a 'login' notification on signin success (#1559)。
@@ -104,20 +112,20 @@ func (h *Handler) SetEmailSender(serverURL string, send func(to string, msg misc
 	h.emailSender = send
 }
 
-// SetMetaRepo wires meta lookup for email locale fallback.
-func (h *Handler) SetMetaRepo(r repository.MetaRepository) { h.metaRepo = r }
-
-// HasMetaRepo reports whether the meta repository was wired for email l10n.
-func (h *Handler) HasMetaRepo() bool { return h.metaRepo != nil }
-
 // SetIPRecorder attaches the IP recorder. 未設定なら記録しない。
 func (h *Handler) SetIPRecorder(rec IPRecorder) {
 	h.ipRecorder = rec
 }
 
 // NewHandler creates a new signin Handler.
-func NewHandler(userRepo repository.UserRepository) *Handler {
-	return &Handler{userRepo: userRepo}
+//
+// background is the group the work after a response (the signin record, the
+// notification and the mail) runs in, so stopping the server generation
+// waits for it (#3661). metaRepo is the meta lookup for the new-login mail's
+// locale fallback. totpReplayGuard is the per-user replay guard that refuses
+// a TOTP code already consumed within its acceptance window (RFC 6238 §5.2).
+func NewHandler(userRepo repository.UserRepository, background *bgwork.Group, metaRepo repository.MetaRepository, totpReplayGuard twofactor.ReplayGuard) *Handler {
+	return &Handler{userRepo: userRepo, background: background, metaRepo: metaRepo, totpReplayGuard: totpReplayGuard}
 }
 
 // SetSigninRepo attaches a SigninRepository for recording login history.
@@ -133,10 +141,15 @@ func (h *Handler) SetCaptcha(svc *captcha.Service) {
 }
 
 // SetTestMode enables the captcha bypass (本家 `process.env.NODE_ENV !== 'test'`
-// 相当)。signup 側の同名 setter と対にして配線する。
+// 相当) and the TOTP bypass of twofactor.ValidateWithReplay. signup 側の同名
+// setter と対にして配線する。
 func (h *Handler) SetTestMode(v bool) {
 	h.testMode = v
 }
+
+// SetPasswordHasher sets the Hasher that rehashes and migrates passwords at
+// signin. Unset, the default cost is used.
+func (h *Handler) SetPasswordHasher(hasher password.Hasher) { h.passwordHasher = hasher }
 
 // SetWebAuthn attaches optional WebAuthn dependencies to enable 2FA login
 // via security keys. Without it the handler still supports TOTP and backup
@@ -150,14 +163,6 @@ func (h *Handler) SetWebAuthn(svc *twofactor.WebAuthnService, repo repository.Us
 // event after a successful login. Optional — nil disables emit.
 func (h *Handler) SetMainStreamPublisher(p MainStreamPublisher) {
 	h.mainStreamPublisher = p
-}
-
-// SetTOTPReplayGuard wires the per-user replay guard used to refuse a
-// TOTP code that was already consumed within its acceptance window
-// (RFC 6238 §5.2). nil disables the protection (= upstream-compatible
-// fallback for unit tests / dev environments without Redis).
-func (h *Handler) SetTOTPReplayGuard(g twofactor.ReplayGuard) {
-	h.totpReplayGuard = g
 }
 
 // Signin handles POST /api/signin.
@@ -193,6 +198,13 @@ func (h *Handler) Signin(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	if err != nil {
+		return c.JSON(http.StatusNotFound, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
+	}
+	// **プラグインが管理するアカウントには、どの経路からもログインさせない
+	// (#3468)。** 居ない利用者と同じ応答にする。パスワードを持たないので
+	// 下の検証でも落ちるが、パスワードやパスキーが何かの経路で入っても
+	// ログインできないことを、ここで保証する。
+	if user.IsPluginManaged() {
 		return c.JSON(http.StatusNotFound, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
 	}
 
@@ -340,6 +352,13 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusNotFound, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
 	}
+	// **プラグインが管理するアカウントには、どの経路からもログインさせない
+	// (#3468)。** 居ない利用者と同じ応答にする。パスワードを持たないので
+	// 下の検証でも落ちるが、パスワードやパスキーが何かの経路で入っても
+	// ログインできないことを、ここで保証する。
+	if user.IsPluginManaged() {
+		return c.JSON(http.StatusNotFound, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
+	}
 
 	if user.IsSuspended {
 		return c.JSON(http.StatusForbidden, errBody("e03a5f46-d309-4865-9b69-56282d94e1eb"))
@@ -460,7 +479,7 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 		// ValidateWithReplay は RFC 6238 §5.2 に従い同コードの 2 回目以降
 		// (acceptance window 内) を拒否する。**upstream も 2026.6.0 で同等の
 		// 機構を持つ** (`UserAuthService.validateOtp`)。mk-go が先行実装したもの。
-		if profile.TwoFactorSecret != nil && twofactor.ValidateWithReplay(c.Request().Context(), h.totpReplayGuard, user.ID, *req.Token, *profile.TwoFactorSecret) {
+		if profile.TwoFactorSecret != nil && twofactor.ValidateWithReplay(c.Request().Context(), h.totpReplayGuard, user.ID, *req.Token, *profile.TwoFactorSecret, h.testMode) {
 			return h.ok(c, user)
 		}
 		if _, berr := twofactor.ConsumeBackupCode([]string(profile.TwoFactorBackupSecret), *req.Token); berr == nil {
@@ -578,7 +597,7 @@ func (h *Handler) migratePendingPassword(c echo.Context, userID string) {
 	if !ok {
 		return
 	}
-	fresh, err := password.Hash(pending.plain)
+	fresh, err := h.passwordHasher.Hash(pending.plain)
 	if err != nil {
 		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
 			// **恒久保留。** bcrypt は 72 byte で切るので、移行すると password が
@@ -625,13 +644,13 @@ func (h *Handler) RecordSuccessfulSignin(userID, ip string, headers http.Header)
 		h.ipRecorder.Record(userID, ip)
 	}
 	if h.signinRepo != nil && h.idGen != nil {
-		go h.recordSignin(userID, ip, headers, true)
+		h.background.Go(func(context.Context) { h.recordSignin(userID, ip, headers, true) })
 	}
 	if h.loginNotifier != nil {
-		go h.loginNotifier.OnLogin(userID)
+		h.background.Go(func(context.Context) { h.loginNotifier.OnLogin(userID) })
 	}
 	if h.emailSender != nil {
-		go h.sendNewLoginEmail(userID)
+		h.background.Go(func(context.Context) { h.sendNewLoginEmail(userID) })
 	}
 }
 
@@ -796,7 +815,8 @@ const verifierRetryAfterSeconds = "360"
 func (h *Handler) fail(c echo.Context, user *model.User, status int, errID string) error {
 	if user != nil && h.signinRepo != nil && h.idGen != nil {
 		hdrs := c.Request().Header.Clone()
-		go h.recordSignin(user.ID, c.RealIP(), hdrs, false)
+		uid, ip := user.ID, c.RealIP()
+		h.background.Go(func(context.Context) { h.recordSignin(uid, ip, hdrs, false) })
 	}
 	return c.JSON(status, errBody(errID))
 }
@@ -951,10 +971,10 @@ func encodeCredID(raw []byte) string {
 // 呼ぶのは**パスワードの照合が通った後だけ**。失敗しても認証自体は成立して
 // いるので握りつぶす (次のログインでまた試す)。
 func (h *Handler) maybeRehashPassword(userID, storedHash, plain string) {
-	if !password.NeedsRehash(storedHash) {
+	if !h.passwordHasher.NeedsRehash(storedHash) {
 		return
 	}
-	fresh, err := password.Hash(plain)
+	fresh, err := h.passwordHasher.Hash(plain)
 	if err != nil {
 		// 72 byte を超える平文で通ることは無い (登録時に弾いている) が、
 		// 通ったとしても認証は済んでいるので進める。
@@ -976,10 +996,3 @@ func (h *Handler) maybeRehashPassword(userID, storedHash, plain string) {
 		slog.Info("signin: skipped password rehash (concurrent update)", "userId", userID)
 	}
 }
-
-// HasTOTPReplayGuard reports whether the TOTP one-time-use guard is wired.
-//
-// 未配線だと ValidateWithReplay が guard 無しで true を返し、**有効な TOTP
-// コードを window 内で再利用できる** (コード自体の検証は残る)。本番では必ず
-// 配線される (#2682)。
-func (h *Handler) HasTOTPReplayGuard() bool { return h.totpReplayGuard != nil }

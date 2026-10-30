@@ -66,6 +66,10 @@ type UserRepository interface {
 	// や "." の取り扱い (= local 限定への remap) は Service レイヤで行う。
 	SearchByUsernameAndHost(query string, host *string, localOnly bool, limit int) ([]*model.User, error)
 	UpdateUser(userID string, fields map[string]any) error
+	// SetAccountCreatedAtIfNull stores a remote account's creation time only
+	// while "accountCreatedAt" is still NULL (#3465). The bool reports whether
+	// the row was updated.
+	SetAccountCreatedAtIfNull(userID string, createdAt time.Time) (bool, error)
 	UpdateProfile(userID string, fields map[string]any) error
 	// UpdatePasswordIfCurrent replaces a profile password only when the stored
 	// hash still equals currentHash. The bool reports whether one row changed.
@@ -81,9 +85,15 @@ type UserRepository interface {
 	// the address. 登録・変更の**書き込み側**で使う。
 	EmailVerifiedInUse(email string) (bool, error)
 	CountOnlineUsers() (int64, error)
-	// CountLocalUsers returns the number of non-deleted local users, used by
-	// nodeinfo `usage.users.total` (#403).
+	// CountLocalUsers returns the number of local users people use, used by
+	// nodeinfo `usage.users.total` (#403): it leaves out deleted users,
+	// system accounts and the accounts plugins manage (#3881).
 	CountLocalUsers() (int64, error)
+	// CountLocalUsersForSetup returns the number of non-deleted local users
+	// that are neither managed by a plugin nor a system account. The
+	// initial-setup window (admin/accounts/create and meta's requireSetup)
+	// opens only while this is 0 (#3468).
+	CountLocalUsersForSetup() (int64, error)
 	// CountLocalUsersActiveSince returns the number of local users whose
 	// lastActiveDate falls on or after `since`. Used by nodeinfo
 	// `usage.users.activeMonth / activeHalfyear` (#403).
@@ -115,11 +125,18 @@ type UserRepository interface {
 
 type userRepository struct {
 	db *gorm.DB
+	rc *RelationCache
 }
 
 // NewUserRepository creates a new UserRepository.
 func NewUserRepository(db *gorm.DB) UserRepository {
-	return &userRepository{db: db}
+	return NewUserRepositoryWithRelationCache(db, nil)
+}
+
+// NewUserRepositoryWithRelationCache creates a UserRepository whose
+// HardDeleteUser drops every RelationCache entry (#3607).
+func NewUserRepositoryWithRelationCache(db *gorm.DB, rc *RelationCache) UserRepository {
+	return &userRepository{db: db, rc: rc}
 }
 
 func (r *userRepository) Create(u *model.User) error {
@@ -497,13 +514,40 @@ func (r *userRepository) UpdateUser(userID string, fields map[string]any) error 
 	return r.db.Model(&model.User{}).Where("id = ?", userID).Updates(fields).Error
 }
 
+// SetAccountCreatedAtIfNull implements UserRepository.
+//
+// 列が空のときだけ書く。users/show から埋める経路 (フォローの受信) は、
+// 読んだ時点の行を元に判断するので、その間に refresh が actor の `published`
+// を書いていたら、そちらを残す (published を優先する)。
+func (r *userRepository) SetAccountCreatedAtIfNull(userID string, createdAt time.Time) (bool, error) {
+	res := r.db.Model(&model.User{}).
+		Where(`"id" = ? AND "accountCreatedAt" IS NULL`, userID).
+		Update("accountCreatedAt", createdAt)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
 // HardDeleteUser permanently removes the user row, relying on FK ON DELETE
 // CASCADE to purge dependent rows (profile/keypair/following/...) (#2230).
 func (r *userRepository) HardDeleteUser(userID string) error {
 	if userID == "" {
 		return nil
 	}
-	return r.db.Exec(`DELETE FROM "user" WHERE "id" = ?`, userID).Error
+	if err := r.db.Exec(`DELETE FROM "user" WHERE "id" = ?`, userID).Error; err != nil {
+		return err
+	}
+	// ON DELETE CASCADE で muting / blocking / following などの行が repository を
+	// 通らずに消え、消えた行を持っていた相手を知る手段が無い。物理削除はローカルの
+	// アカウントの削除だけで頻度が低いので、関係のキャッシュを丸ごと捨てる。
+	//
+	// DeleteOrphanRemoteUsers は following / follow_request / blocking / muting の
+	// 行が無い利用者だけを消すので、ここに並べていない。CASCADE で消えうるのは
+	// renote_muting と channel_* の行だが、消えるのは削除された利用者の ID で、
+	// 古い一覧に残っても存在しない利用者を余分に除くだけになる。
+	r.rc.InvalidateAll()
+	return nil
 }
 
 // UpdateProfile updates the given columns on the user_profile table.
@@ -843,8 +887,9 @@ func (r *userRepository) ListLocalUserIDsRegisteredAfter(idCursor string) ([]str
 // job to determine the "active today" cohort (#421)。
 //
 // 定着 (active) 側は削除済みユーザーを除外する。退会したアカウントを「定着」
-// と数えると分子が膨らんで誤った retention 率になるため。`CountLocalUsers`
-// /`CountLocalUsersActiveSince` と同じフィルタ方針。
+// と数えると分子が膨らんで誤った retention 率になるため。削除済みを外す点は
+// `CountLocalUsers` / `CountLocalUsersActiveSince` と同じ (`CountLocalUsers` は
+// さらにシステムアカウントとプラグインが管理するアカウントも外す、#3881)。
 func (r *userRepository) ListLocalUserIDsActiveSince(since time.Time) ([]string, error) {
 	var ids []string
 	err := r.db.Model(&model.User{}).
@@ -855,12 +900,48 @@ func (r *userRepository) ListLocalUserIDsActiveSince(since time.Time) ([]string,
 	return ids, err
 }
 
-// CountLocalUsers returns the number of non-deleted local users.
+// CountLocalUsers returns the number of local users people use: not
+// deleted, not a system account and not managed by a plugin.
+//
+// システムアカウント (instance・relay・proxy) とプラグインが管理するアカウントには
+// 誰もログインできない。数えると、人が 1 人のサーバーでも規模が大きく見える
+// (#3881)。本家は nodeinfo に利用者のチャートの値 (削除済みとシステムアカウントを
+// 含む) を出すので、ここは本家と違う。
 func (r *userRepository) CountLocalUsers() (int64, error) {
 	var count int64
 	err := r.db.Model(&model.User{}).
 		Where("host IS NULL").
 		Where(`"isDeleted" = false`).
+		Where(`"managedByPlugin" IS NULL`).
+		Where(`NOT EXISTS (SELECT 1 FROM "system_account" sa WHERE sa."userId" = "user".id)`).
+		Count(&count).Error
+	return count, err
+}
+
+// CountLocalUsersForSetup は初回セットアップの判定にだけ使う (#3468)。
+//
+// **プラグインが管理するアカウントを数えない。** プラグインが起動時に bot を
+// 作ると、新しいインスタンスでは最初の管理者を作る前にローカル利用者が 1 になり、
+// セットアップの窓が閉じて誰も管理者を作れなくなる (復旧する CLI も無い)。
+// 管理するアカウントには誰もログインできないので、窓を閉じる理由にならない。
+//
+// **システムアカウントも数えない。** システムアカウント (instance・relay・proxy) は
+// 使ったときに作られ、最初の管理者より先に作られることがある。数えると、その
+// 時点で窓が閉じる。システムアカウントにも誰もログインできない。
+//
+// **外してよいのは、誰もログインできないアカウントだけ。** nodeinfo の利用者数
+// (CountLocalUsers) は今は同じものを外すが、あちらは「人が使っている利用者」を
+// 数えるもので、bot や活動していない利用者を外す方向へ変わりうる。こちらは
+// rootUserId が無いまま利用者がいるとき、未認証の窓を閉じる唯一の判定なので、
+// あちらを呼ばずに独立して持つ。bot・活動していない・凍結された利用者も数える
+// ことを TestUserRepository_CountLocalUsersForSetup が確かめる。
+func (r *userRepository) CountLocalUsersForSetup() (int64, error) {
+	var count int64
+	err := r.db.Model(&model.User{}).
+		Where("host IS NULL").
+		Where(`"isDeleted" = false`).
+		Where(`"managedByPlugin" IS NULL`).
+		Where(`NOT EXISTS (SELECT 1 FROM "system_account" sa WHERE sa."userId" = "user".id)`).
 		Count(&count).Error
 	return count, err
 }

@@ -35,7 +35,9 @@ type ssrMetaHandler struct {
 	metaRepo      repository.MetaRepository
 	proxyResolver meta.ProxyAccountResolver
 	chunkedUpload meta.ChunkedUploadCapability
+	setup         *meta.SetupDetector
 	clientEntry   frontendutil.ClientEntryInfo
+	loader        frontendutil.LoaderAssets
 
 	userRepo      repository.UserRepository
 	noteRepo      repository.NoteRepository
@@ -50,6 +52,9 @@ type ssrMetaHandler struct {
 	announceRepo  repository.AnnouncementRepository
 	// idGen は drive file の pack (createdAt の復元) に要る。
 	idGen id.Generator
+	// entityPacker は entity を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3796)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // ssrMetaDeps carries the repositories the permalink pages read from.
@@ -70,19 +75,26 @@ type ssrMetaDeps struct {
 	IDGen id.Generator
 }
 
+// newSSRMetaHandler builds the permalink SSR meta handler. entityPacker is the
+// Packer this ssrMetaHandler packs entities with (#3796); 無いとファイルの url
+// などを生のまま返すので、構築子の必須の引数で受ける (#3823)。
 func newSSRMetaHandler(
 	cfg *config.Config,
 	metaRepo repository.MetaRepository,
 	proxyResolver meta.ProxyAccountResolver,
 	chunkedUpload meta.ChunkedUploadCapability,
+	setup *meta.SetupDetector,
 	deps ssrMetaDeps,
+	entityPacker *entity.Packer,
 ) *ssrMetaHandler {
 	return &ssrMetaHandler{
 		cfg:           cfg,
 		metaRepo:      metaRepo,
 		proxyResolver: proxyResolver,
 		chunkedUpload: chunkedUpload,
+		setup:         setup,
 		clientEntry:   clientEntryFor(cfg),
+		loader:        loaderAssetsFor(cfg),
 		userRepo:      deps.User,
 		noteRepo:      deps.Note,
 		piningRepo:    deps.Pining,
@@ -95,12 +107,13 @@ func newSSRMetaHandler(
 		reversiRepo:   deps.Reversi,
 		announceRepo:  deps.Announcement,
 		idGen:         deps.IDGen,
+		entityPacker:  entityPacker,
 	}
 }
 
 // render serves the shell with the given per-page overrides.
 func (h *ssrMetaHandler) render(c echo.Context, ov shellOverrides) error {
-	return renderFrontendShell(c, h.cfg, h.metaRepo, h.proxyResolver, h.chunkedUpload, h.clientEntry, ov)
+	return renderFrontendShell(c, h.cfg, h.metaRepo, h.proxyResolver, h.chunkedUpload, h.setup, h.clientEntry, h.loader, ov)
 }
 
 // renderPlain serves the shell without any page-specific override. 対象が
@@ -161,7 +174,6 @@ func linkTag(rel, typ, href string) string {
 const (
 	ssrPermalinkCacheControl = "public, max-age=15"
 	ssrArchiveCacheControl   = "public, max-age=3600"
-	ssrPrivateCacheControl   = "private, max-age=0, must-revalidate"
 )
 
 // remoteHost reports whether host identifies another instance.
@@ -344,13 +356,13 @@ func (h *ssrMetaHandler) absoluteURL(u string) string {
 	return strings.TrimSuffix(h.cfg.URL, "/") + "/" + strings.TrimPrefix(u, "/")
 }
 
-// avatarURL resolves the OGP image for a user. entity.IdenticonURL が
+// avatarURL resolves the OGP image for a user. (*entity.Packer).IdenticonURL が
 // proxy 化と identicon fallback をまとめて面倒を見る (#1529 / #710)。
 func (h *ssrMetaHandler) avatarURL(u *model.User) string {
 	if u == nil {
 		return ""
 	}
-	return h.absoluteURL(entity.IdenticonURL(u))
+	return h.absoluteURL(h.entityPacker.IdenticonURL(u))
 }
 
 // filesOf packs the drive files attached to a note / gallery post.
@@ -372,7 +384,7 @@ func (h *ssrMetaHandler) filesOf(ids []string) []entity.DriveFileEntity {
 	out := make([]entity.DriveFileEntity, 0, len(ids))
 	for _, fid := range ids {
 		if f, ok := byID[fid]; ok {
-			out = append(out, entity.PackDriveFile(f, h.idGen))
+			out = append(out, h.entityPacker.PackDriveFile(f, h.idGen))
 		}
 	}
 	return out
@@ -392,9 +404,17 @@ func (h *ssrMetaHandler) summaryMap(note *model.Note, hydrate bool) map[string]a
 		return nil
 	}
 	m := map[string]any{}
-	if note.Visibility != model.NoteVisibilityPublic {
-		// viewer なしでは読めない note。upstream の packed note と同じく
-		// isHidden として扱い、本文を出さない。
+	if note.Visibility != model.NoteVisibilityPublic && note.Visibility != model.NoteVisibilityHome {
+		// viewer なしでは読めない note (followers / specified)。upstream の
+		// packed note と同じく isHidden として扱い、本文を出さない。home は
+		// 未ログインでも読めるので、upstream と同じく本文を出す (#3848)。
+		m["isHidden"] = true
+		return m
+	}
+	if !hydrate && embedHiddenFromVisitor(note, h.noteCreatedAtMs(note), time.Now().UnixMilli()) {
+		// 返信先・引用先は公開でも、作者の設定 (ログイン必須・期間で隠す) で
+		// 未ログインには見せないことがある。upstream は pack の shouldHideNote で
+		// (⛔) に落とすので、/embed/notes の notehide と同じ判定に揃える。
 		m["isHidden"] = true
 		return m
 	}
@@ -430,11 +450,27 @@ func (h *ssrMetaHandler) summaryMap(note *model.Note, hydrate bool) map[string]a
 	return m
 }
 
+// embedHiddenFromVisitor reports whether an embedded reply / renote must be
+// summarized as hidden for an anonymous visitor, using the same decision as
+// the REST embed gate (notehide.Hider.HideEmbeds with viewer=nil).
+//
+// 作者の行が読めない (User が nil) ときは、設定を確かめられないので隠す。
+// REST の embed gate は設定が不明なら作者の設定を見ないが、SSR はクローラに
+// 渡る経路なので fail closed にする。
+func embedHiddenFromVisitor(note *model.Note, createdAtMs, nowMs int64) bool {
+	if note.User == nil {
+		return true
+	}
+	return corenote.HideEmbedDecision(nil, corenote.FactsFromModel(note, createdAtMs), nil, nowMs)
+}
+
+// noteByID fetches a reply / renote target with its author preloaded, so that
+// embedHiddenFromVisitor can read the author's preferences.
 func (h *ssrMetaHandler) noteByID(id string) *model.Note {
 	if h.noteRepo == nil || id == "" {
 		return nil
 	}
-	n, err := h.noteRepo.FindByID(id)
+	n, err := h.noteRepo.FindByIDWithUser(id)
 	if err != nil {
 		return nil
 	}
@@ -637,7 +673,11 @@ func (h *ssrMetaHandler) UserPagePage(c echo.Context) error {
 	}
 	p := h.profileOf(u.ID)
 	page, err := h.pageRepo.FindByUserAndName(u.ID, c.Param("page"))
-	if err != nil || page == nil {
+	// private の Page は作者にしか見せない (#3479)。HTML は閲覧者を区別せずに
+	// 返すので、作者以外に題名・要約・ID を出さないよう「無い」ときと同じ応答に
+	// する (Cache-Control も同じにしないと、ヘッダーで存在が分かる)。作者は
+	// SPA が pages/show で本文を引くので困らない。本家は private を持たない。
+	if err != nil || page == nil || page.Visibility != model.PageVisibilityPublic {
 		return h.render(c, shellOverrides{Head: userHead(u, p, false)})
 	}
 	og := propertyTag("og:type", "article") +
@@ -652,18 +692,12 @@ func (h *ssrMetaHandler) UserPagePage(c echo.Context) error {
 	} else {
 		og += authorImageOG(h.avatarURL(u))
 	}
-	// upstream は公開ページだけ共有キャッシュに載せ、それ以外は revalidate を
-	// 強制する (limited / specified なページが CDN に残らないようにする)。
-	cache := ssrPermalinkCacheControl
-	if page.Visibility != model.PageVisibilityPublic {
-		cache = ssrPrivateCacheControl
-	}
 	return h.render(c, shellOverrides{
 		Head:         userHead(u, p, false) + metaTag("misskey:page-id", page.ID),
 		OG:           og,
 		Title:        h.pageTitle(page.Title),
 		Description:  strOrEmpty(page.Summary),
-		CacheControl: cache,
+		CacheControl: ssrPermalinkCacheControl,
 		RobotsTag:    robotsTagsFor(p),
 	})
 }
@@ -683,15 +717,23 @@ func (h *ssrMetaHandler) NotePage(c echo.Context) error {
 	if err != nil || note == nil {
 		return h.renderPlain(c)
 	}
-	// visibility が public 以外の note は meta を出さない。クローラや
-	// リンク展開に非公開投稿の本文・著者を渡さないため (upstream も
-	// public 以外は SSR しない)。
+	// visibility が public / home 以外 (followers / specified) の note は meta を
+	// 出さない。クローラやリンク展開に、未ログインでは読めない投稿の本文・著者を
+	// 渡さないため。upstream も /notes/:id を visibility In(['public', 'home'])
+	// で引く (ClientServerService)。以前はピン留めしていない home を出して
+	// いなかったので、home のノートのリンクがサーバー全体の meta だけのカードに
+	// なっていた (#3848)。
 	pinned := h.noteIsCurrentlyPinned(note)
-	if note.Visibility != model.NoteVisibilityPublic && !(pinned && note.Visibility == model.NoteVisibilityHome) {
+	if note.Visibility != model.NoteVisibilityPublic && note.Visibility != model.NoteVisibilityHome {
 		return h.renderBareShell(c, noteIsRemote(note))
 	}
 	// 投稿者が「ログインしないと見せない」設定なら meta も出さない。
 	// upstream note ハンドラの `!note.user.requireSigninToViewContents` (#2533)。
+	// 作者の行が読めないときは設定を確かめられないので、返信先・引用先と同じく
+	// 出さない側に倒す。
+	if note.User == nil {
+		return h.renderBareShell(c, noteIsRemote(note))
+	}
 	if !corenote.AnonymousPublicationAllowed(corenote.FactsFromModel(note, h.noteCreatedAtMs(note)), pinned, time.Now().UnixMilli()) {
 		return h.renderBareShell(c, noteIsRemote(note))
 	}

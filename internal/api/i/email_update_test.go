@@ -103,10 +103,23 @@ func TestVerifyEmail_InvalidCode(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-func TestVerifyEmail_EmptyCodeRejected(t *testing.T) {
+func TestVerifyEmail_MissingCodeRejected(t *testing.T) {
 	h, _ := newExtraHandler(t)
 	rec := postExtra(h.VerifyEmail, `{}`, stubUser)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// 本家の paramDef は code を required の string とするだけなので、空文字は該当する
+// コードが無いものとして NO_SUCH_CODE にする。空のコードを持つ profile があっても
+// 当てない (#3845)。
+func TestVerifyEmail_EmptyCodeIsNoSuchCode(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	empty := ""
+	repo.Profiles["u1"] = &model.UserProfile{UserID: "u1", EmailVerifyCode: &empty}
+	rec := postExtra(h.VerifyEmail, `{"code":""}`, stubUser)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "NO_SUCH_CODE")
+	assert.False(t, repo.Profiles["u1"].EmailVerified)
 }
 
 func TestVerifyEmail_Success(t *testing.T) {
@@ -157,7 +170,7 @@ func TestVerifyEmail_DBFailureIsNot4xx(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	piningRepo := testutil.NewMockUserNotePiningRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(coreuser.NewService(userRepo, noteRepo, piningRepo, idGen), idGen)
+	h := NewHandler(coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil), idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	assert.Equal(t, http.StatusInternalServerError,
 		postExtra(h.VerifyEmail, `{"code":"abc"}`, stubUser).Code)
@@ -185,4 +198,17 @@ func TestUpdate_PinnedPage_DBFailureIsNot4xx(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError,
 		postExtra(h.Update, `{"pinnedPageId":"p1"}`, stubUser).Code)
+}
+
+// 確認コードは 128 bit (hex 32 文字) にすること。verify-email は認証も回数の
+// 上限も無く、コードだけで照合する。
+func TestGenerateVerifyCode_Strength(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 50; i++ {
+		code := generateVerifyCode()
+		assert.Len(t, code, 32)
+		assert.Regexp(t, `^[0-9a-f]{32}$`, code)
+		assert.False(t, seen[code], "重複した")
+		seen[code] = true
+	}
 }

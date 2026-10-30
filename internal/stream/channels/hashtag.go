@@ -3,7 +3,9 @@ package channels
 import (
 	"encoding/json"
 	"sync"
+	"unicode/utf8"
 
+	"github.com/elythia-network/elythia/internal/misc/hashtag"
 	"github.com/elythia-network/elythia/internal/misc/searchnorm"
 	"github.com/elythia-network/elythia/internal/stream"
 )
@@ -50,16 +52,34 @@ func (c *HashtagChannel) Init(params json.RawMessage) error {
 	}
 	// **購読するトピック数に上限を置く。**
 	//
-	// mk-go は distinct なタグごとに Redis の SUBSCRIBE を張る。upstream は
-	// `q` の内容に関わらずリスナー 1 本でメモリ上でマッチングするので上限が
-	// 要らないが、こちらは 1 通の `connect` で Redis 接続を任意個増やせる。
-	// 本番 valkey の `maxclients` に達すると、同じ valkey を使う job queue /
-	// timelines / reactions を含めてインスタンス全体が新規接続を拒否する。
+	// Elythia は distinct なタグごとにトピックを購読する。upstream は `q` の
+	// 内容に関わらずリスナー 1 本でメモリ上でマッチングするので上限が要らない
+	// が、こちらは 1 通の `connect` でトピックの枠を任意個増やせる。
+	// (Redis の購読は `PubSubService` が 1 本にまとめているので、Redis の接続は
+	// 増えない。)
 	//
 	// 値は 1 接続あたりのチャンネル数上限 (`maxChannelsPerConnection` = 32) と
 	// 揃える。実運用でタグを 32 個超える購読は想定していない。
 	if distinct := countDistinctTags(p.Q); distinct > maxHashtagTopics {
 		return stream.ErrInvalidParams
+	}
+	// **保存できる長さを超えるタグは拒否する。** hashtag.name は varchar(128)
+	// なので、それより長いタグを持つノートは無く、購読しても何も届かない。名前は
+	// 利用者が自由に決められるので、長い名前でトピックの枠と Redis のチャネル名を
+	// 膨らませる余地を残さない。購読より前に全部を確かめる (途中で拒否すると、
+	// それまでのタグを購読したまま返してしまう)。
+	//
+	// **長さは正規化の前に見る** (本家 hashtag.ts の `Array.from(y).length <= 128`)。
+	// 正規化 (NFKC) の手間は入力の長さに応じて増えるので、長い入力を正規化して
+	// から数えると、拒否する入力にも手間を掛けることになる。正規化の後の長さでは
+	// 拒否しない (本家と同じ。NFKC で膨らむ幅には上限があるので、トピック名も
+	// 正規化前の上限から決まる長さに収まる)。
+	for _, group := range p.Q {
+		for _, tag := range group {
+			if utf8.RuneCountInString(tag) > hashtag.MaxTagLength {
+				return stream.ErrInvalidParams
+			}
+		}
 	}
 	c.filter = parseNoteFilter(params)
 	// q を正規化して保持し、全グループの全タグの distinct 正規化キーを購読する。

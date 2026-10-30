@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 
 	"github.com/elythia-network/elythia/internal/cli/backfill"
+	clibackup "github.com/elythia-network/elythia/internal/cli/backup"
 	"github.com/elythia-network/elythia/internal/cli/diag"
+	"github.com/elythia-network/elythia/internal/cli/maintenance"
 	"github.com/elythia-network/elythia/internal/cli/migrate"
 	"github.com/elythia-network/elythia/internal/cli/serve"
 )
@@ -36,10 +38,26 @@ func Commands() []Command {
 		{Name: "migrate", Summary: "apply or roll back database migrations", Run: migrate.Run},
 		{Name: "backfill", Summary: "run a one-off maintenance batch", Sub: []Command{
 			{Name: "avatar-public-url", Summary: "point avatar / banner URLs at the metadata-stripped variant", Run: backfill.AvatarPublicURL},
+			{Name: "chat-reads", Summary: "carry the direct-message read state of Misskey / CherryPick from Redis into chat_message.reads (-before required)", Run: backfill.ChatReads},
 			{Name: "emoji-system-file", Summary: "copy approved custom emoji images to system-owned files (dry-run unless -apply)", Run: backfill.EmojiSystemFile},
+			{Name: "hashtag-mentions", Summary: "drop hashtag users counted only through followers / specified notes", Run: backfill.HashtagMentions},
 			{Name: "instance-counts", Summary: "recompute instance notesCount / usersCount", Run: backfill.InstanceCounts},
 			{Name: "note-tags", Summary: "normalize note.tags to NFKC + lowercase", Run: backfill.NoteTags},
 			{Name: "remote-host", Summary: "normalize stored remote hosts (UTS#46 + punycode)", Run: backfill.RemoteHost},
+		}},
+		// 後の段階はこの Sub に足す (#3457)。
+		{Name: "backup", Summary: "take database backups into storage outside the host, list, verify and restore them, or run it on a schedule", Sub: []Command{
+			{Name: "take", Summary: "dump the database (pg_dump -Fc) and store it as a new generation", Run: clibackup.Take},
+			{Name: "list", Summary: "list the generations in the storage", Run: clibackup.List},
+			{Name: "verify", Summary: "check that a backup can be restored (writes verify.json)", Run: clibackup.Verify},
+			{Name: "restore", Summary: "restore a backup into this server's database (-mode swap or empty)", Run: clibackup.Restore},
+			{Name: "daemon", Summary: "take, verify and prune backups on a schedule and serve the control API", Run: clibackup.Daemon},
+		}},
+		{Name: "maintenance", Summary: "enter or leave maintenance mode (every process lets go of the database)", Sub: []Command{
+			{Name: "enter", Summary: "start a maintenance and wait until every process has let go of the database", Run: maintenance.Enter},
+			{Name: "exit", Summary: "end the maintenance and wait until every process serves again", Run: maintenance.Exit},
+			{Name: "status", Summary: "print the maintenance state, the sessions on the database and the process reports", Run: maintenance.Status},
+			{Name: "wait", Summary: "judge the active maintenance until it is held (or over, when resuming)", Run: maintenance.Wait},
 		}},
 		{Name: "doctor", Summary: "check configuration, dependencies and federation, then exit", Run: diag.Doctor},
 		{Name: "fsck", Summary: "check denormalized counters (read-only unless -fix)", Run: diag.Fsck},

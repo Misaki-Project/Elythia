@@ -59,9 +59,19 @@ frontend は #3379 で Misskey TS の fork (`shiroha-a/misskey-ts`) から
 直接直し、Go 側の変更と同じ PR に入れてよい。fork はアーカイブしたので、fork へ
 commit する手順は無い。
 
+### Elythia 独自の API の型 (`frontend/packages/elythia-js`)
+
+本家の misskey-js の型には Elythia 独自のエンドポイントと、`/api/meta` などの独自の項目が無い。これらの型は `frontend/packages/elythia-js` に手で書く (#3417)。misskey-js には手を入れない (本家への追従とぶつからないように)。
+
+- frontend の `misskeyApi` / `misskeyApiGet` / `os.apiWithDialog` と `instance` は `elythia-js` の型を使う。独自のエンドポイントを型を外して (`as never` で) 呼ばず、`elythia-js/src/endpoints.ts` の `ElythiaEndpoints` に型を書く
+- **本家のエンドポイントに Elythia が引数を足したら、`elythia-js/src/extensions.ts` の `ElythiaRequestExtensions` に型を書く** (#3439)。こちらはゲートの対象ではない。misskey-js の応答の型が実際と違うものは、同じファイルの `ResponseOverrides` で差し替える
+- `misskeyApi` などは、引数の型に無いキーを型エラーにし、応答の型を代入先から推論しない (#3439)。新しく型エラーが出たら、キーを打ち間違えていないか、サーバーが読まないキーを送っていないかを先に疑う。応答の型を明示する (`misskeyApi<T>(...)`) と引数の型の検査が効かなくなるので、汎用の呼び出し (`paginator.ts`) 以外では使わない。逆に、エンドポイントを型引数のまま受け渡す包み関数は、明示しないとコンパイルできない。引数の検査を残したいなら、`os.apiWithDialog` のように `P & ExcessKeys<E, P>` で受けて `misskeyApi<void, E, P>(...)` と渡す
+- **Go に Elythia 独自のエンドポイントを足したら、`ElythiaEndpoints` に型を書くか `pending-endpoints.txt` に足す。** `TestElythiaJS_EndpointsMatchRouter` が `docs/api-compat.md` の一覧と突き合わせて、どちらにも無ければ落とす (型を書いたら `pending-endpoints.txt` から外す)
+- 新しいパッケージを足したので、手元の `node_modules` が古いと `elythia-js` を解決できない。`frontend/` で `pnpm install` をし直す
+
 ### 手元での確認（CI `frontend` workflow 相当）
 
-CI では `.github/workflows/frontend.yml` の集約 job `frontend` が required check になっている。中身は `frontend-lint` (9 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) で、詳細は [ci.md](ci.md) にある。
+CI では `.github/workflows/frontend.yml` の集約 job `frontend` が required check になっている。中身は `frontend-lint` (10 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) で、詳細は [ci.md](ci.md) にある。
 
 手元では `make frontend-check` (target。CI の job ではない) が**型 (`vue-tsc`) + `frontend/` のソースを読むゲート + `emoji-regex-check` + frontend の eslint** までをまとめて回す (#2892 / #2906 / #3324)。vitest は `make frontend-test`。frontend 以外の workspace の eslint や check-dts などは、`frontend.yml` の各 step を `frontend/` で叩く。
 
@@ -177,7 +187,7 @@ git grep -n "<直す前の固有の語>"
 
 「upstream と同じ」「対応済み」と書くときは、その反対が既に登録されていないかを見る。
 
-- `docs/divergence.md` — 意図的な乖離の一次資料
+- `docs/divergence.md` — 意図的な乖離の一次資料 (目次。中身は領域ごとに `docs/divergence/` の下)
 - コードコメントの `#<issue> L<n>` / `N<n>` — documented limitation の印。
   **`docs/divergence.md` には載っていないものがある** (`grep -rn "#2106 L" internal/`
   が辿り方)
@@ -206,7 +216,7 @@ doc が「upstream と同じ順序」と打ち消していた (その後、転�
 ```
 
 母集団が doc 間で違うのは構わない (`docs/api-compatibility.md` の 9 と
-`docs/divergence.md` の 12 は取り方が違うだけ) が、**違うことを両方に書く**。
+`docs/divergence/api.md` の 12 は取り方が違うだけ) が、**違うことを両方に書く**。
 片方だけに注記を置くと、もう片方から来た人には矛盾に見える。
 
 ### 5. 識別子の出どころを取り違えていないか
@@ -248,8 +258,8 @@ rate limit の例:
   誤認させる分だけ有害
 - **gate を doc で説明するときは、その gate が検査していない半分も書く。** 7 周の
   Medium / Low で最も繰り返された型がこれ (射程の過大主張・fail-open・偽陽性)。
-  手本は `docs/divergence.md` §4-1 の「固定できるのは Elythia 側だけで、
-  『upstream は 18』『名前も upstream に揃えてある』は検証していない
+  手本は `docs/divergence/config.md` §4-1 の「固定できるのは Elythia 側だけで、
+  『upstream は 19』『名前も upstream に揃えてある』は検証していない
   (`test-shards` は本家のソースを取得しない)」
 
 ## コーディング規約
@@ -279,9 +289,23 @@ misskey-project` は upstream Misskey の著作権表示なので、Elythia 自�
 **fork frontend (`frontend/`) は別。** 本体へ取り込んだ後も、上流の SPDX ヘッダーは
 そのまま残す。消すのは §4 の「既存の告知をそのまま残す」に反する。AGPL 管轄
 ディレクトリへ新規ファイルを足すときも、`frontend/scripts/check-spdx.mjs`
-(CI の `frontend` workflow が回す) が落とすのでヘッダーが要る。`tools/pluginbuild`
-が生成する `server-plugins.generated.ts` がヘッダーを持つのも同じ理由で、あれは
-Go 側の方針の例外ではなく `frontend/` 側の要件。
+(CI の `frontend` workflow が回す) が落とすのでヘッダーが要る。
+
+新しく書くファイルのヘッダーは、上流の名義ではなく Elythia の名義にする (#3533)。
+理由は上の Go の場合と同じで、上流の行を付けると帰属が逆になる。
+
+```
+SPDX-FileCopyrightText: Elythia-Network
+SPDX-License-Identifier: AGPL-3.0-only
+```
+
+上流から移したコードを含むファイルは、上流の `SPDX-FileCopyrightText` の行を残し、
+Elythia-Network の `SPDX-FileCopyrightText` の行を足す (著作権の行が 2 行、
+ライセンスの行が 1 行になる)。`check-spdx.mjs --fix` が足すヘッダーと、`tools/pluginbuild`
+が生成する `server-plugins.generated.ts` のヘッダーも Elythia-Network
+の名義になっている。検査はライセンスの行 (または上流の著作権の行) があれば通すので、
+名義を変えても落ちない。生成物がヘッダーを持つのは Go 側の方針の例外ではなく、
+`frontend/` 側の要件。
 
 ## 変更の経緯 (旧 CLAUDE.md の更新記録)
 

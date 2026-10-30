@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/notehide"
+	"github.com/elythia-network/elythia/internal/api/optional"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	coreantenna "github.com/elythia-network/elythia/internal/core/antenna"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
@@ -22,13 +25,16 @@ import (
 
 // Handler handles antenna-related API endpoints.
 type Handler struct {
-	svc          *coreantenna.Service
-	noteRepo     repository.NoteRepository
-	idGen        id.Generator
-	instanceRepo repository.InstanceRepository
-	emojiRepo    repository.EmojiRepository
-	bufReader    entity.BufferedReactionsReader
-	fieldRes     *entity.NoteFieldResolver
+	// relationCache は閲覧者のミュート・ブロックの一覧を要求をまたいで持つ
+	// (#3607)。nil なら repository から読む。
+	relationCache *repository.RelationCache
+	svc           *coreantenna.Service
+	noteRepo      repository.NoteRepository
+	idGen         id.Generator
+	instanceRepo  repository.InstanceRepository
+	emojiRepo     repository.EmojiRepository
+	bufReader     entity.BufferedReactionsReader
+	fieldRes      *entity.NoteFieldResolver
 	// userRepo は antennas/notes の hardMutedWords filter (#787) のために
 	// viewer profile を引く。未配線時は filter skip。
 	userRepo repository.UserRepository
@@ -49,11 +55,13 @@ type Handler struct {
 	// generateBlockedHostQueryForNote) のために meta.blockedHosts を引く。clips/notes と
 	// 同じ設計。未配線時は blocked-host filter skip。
 	metaRepo repository.MetaRepository
-}
-
-// SetMetaRepo wires a MetaRepository used by the antennas/notes blocked-host filter.
-func (h *Handler) SetMetaRepo(r repository.MetaRepository) {
-	h.metaRepo = r
+	// noteHider は閲覧者が見てはいけない投稿の中身を隠す (#3786)。未配線だと
+	// 匿名の閲覧者への ugcVisibilityForVisitor が効かないので、NewHandler の
+	// 必須の引数で受ける (#3817)。
+	noteHider *notehide.Hider
+	// entityPacker は投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3790)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // blockedHosts returns meta.blockedHosts, or nil when the meta repo is unwired.
@@ -69,20 +77,6 @@ func (h *Handler) blockedHosts() ([]string, error) {
 		return nil, nil
 	}
 	return meta.BlockedHosts, nil
-}
-
-// SetMuteBlockRepos wires the muting / blocking / channel-muting repositories so
-// antennas/notes excludes notes from users the viewer muted or who blocked the
-// viewer, plus notes in channels the viewer muted (#1544). Unwired repos simply
-// disable that filter dimension.
-func (h *Handler) SetMuteBlockRepos(
-	muting repository.MutingRepository,
-	blocking repository.BlockingRepository,
-	channelMuting repository.ChannelMutingRepository,
-) {
-	h.mutingRepo = muting
-	h.blockingRepo = blocking
-	h.channelMutingRepo = channelMuting
 }
 
 // SetUserRepo wires a UserRepository so antennas/notes filters out notes that
@@ -107,8 +101,34 @@ func (h *Handler) SetNoteFieldResolver(r *entity.NoteFieldResolver) {
 
 // NewHandler constructs an antennas Handler. noteRepo は antennas/notes で
 // note id → entity 変換に使う。
-func NewHandler(svc *coreantenna.Service, noteRepo repository.NoteRepository, idGen id.Generator) *Handler {
-	return &Handler{svc: svc, noteRepo: noteRepo, idGen: idGen}
+// noteHider applies the per-viewer hideNote gate to the notes this handler
+// packs (#3786) and entityPacker is the Packer it packs entities with (#3790).
+// metaRepo backs the antennas/notes blocked-host filter. mutingRepo,
+// blockingRepo and channelMutingRepo let antennas/notes exclude notes from
+// users the viewer muted or who blocked the viewer, plus notes in channels the
+// viewer muted (#1544); a nil repository disables that filter dimension.
+func NewHandler(
+	svc *coreantenna.Service,
+	noteRepo repository.NoteRepository,
+	idGen id.Generator,
+	noteHider *notehide.Hider,
+	entityPacker *entity.Packer,
+	metaRepo repository.MetaRepository,
+	mutingRepo repository.MutingRepository,
+	blockingRepo repository.BlockingRepository,
+	channelMutingRepo repository.ChannelMutingRepository,
+) *Handler {
+	return &Handler{
+		svc:               svc,
+		noteRepo:          noteRepo,
+		idGen:             idGen,
+		noteHider:         noteHider,
+		entityPacker:      entityPacker,
+		metaRepo:          metaRepo,
+		mutingRepo:        mutingRepo,
+		blockingRepo:      blockingRepo,
+		channelMutingRepo: channelMutingRepo,
+	}
 }
 
 // SetInstanceRepo attaches an InstanceRepository so antennas/notes populates
@@ -176,12 +196,33 @@ func (r *CreateRequest) missingRequired() bool {
 		r.CaseSensitive == nil || r.WithReplies == nil || r.WithFile == nil
 }
 
+// antennaNameMaxLength is upstream paramDef's maxLength of name. ajv counts
+// code points, so runes are counted.
+const antennaNameMaxLength = 100
+
+// nameTooLong reports whether name exceeds upstream's maxLength.
+//
+// 本家に揃えた検証 (#3748) が先に 400 にするが、上限 (16KiB、トークン 256) を
+// 超える body は検証せずに handler へ渡る。本家はキーワードや利用者の数に上限
+// を持たないので、普通の編集でも超えうる。そのときも名前の長さは本家と同じに
+// 見る (以前は 128 文字まで保存し、それより長いと列に入らず 500 だった)。
+func nameTooLong(name string) bool {
+	return utf8.RuneCountInString(name) > antennaNameMaxLength
+}
+
+func invalidName(c echo.Context) error {
+	return apierr.JSONInvalidParamClient(c, "#/properties/name/maxLength", "must NOT have more than 100 characters")
+}
+
 // Create handles POST /api/antennas/create.
 func (h *Handler) Create(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req CreateRequest
 	if err := c.Bind(&req); err != nil || req.missingRequired() {
 		return apierr.JSONInvalidParam(c)
+	}
+	if nameTooLong(req.Name) {
+		return invalidName(c)
 	}
 	// upstream create.ts: keywords と excludeKeywords が両方とも空なら EMPTY_KEYWORD。
 	if coreantenna.AllKeywordsEmpty(req.Keywords) && coreantenna.AllKeywordsEmpty(req.ExcludeKeywords) {
@@ -249,20 +290,22 @@ func (h *Handler) Show(c echo.Context) error {
 
 // UpdateRequest is the request body for antennas/update.
 type UpdateRequest struct {
-	AntennaID                      string               `json:"antennaId"`
-	Name                           *string              `json:"name"`
-	Src                            *model.AntennaSource `json:"src"`
-	UserListID                     *string              `json:"userListId"`
-	Users                          *[]string            `json:"users"`
-	Keywords                       *[][]string          `json:"keywords"`
-	ExcludeKeywords                *[][]string          `json:"excludeKeywords"`
-	CaseSensitive                  *bool                `json:"caseSensitive"`
-	ExcludeBots                    *bool                `json:"excludeBots"`
-	WithReplies                    *bool                `json:"withReplies"`
-	WithFile                       *bool                `json:"withFile"`
-	LocalOnly                      *bool                `json:"localOnly"`
-	IsActive                       *bool                `json:"isActive"`
-	ExcludeNotesInSensitiveChannel *bool                `json:"excludeNotesInSensitiveChannel"`
+	AntennaID string               `json:"antennaId"`
+	Name      *string              `json:"name"`
+	Src       *model.AntennaSource `json:"src"`
+	// UserListID distinguishes null (clear the list, like upstream) from
+	// absent (#3748).
+	UserListID                     optional.Nullable[string] `json:"userListId"`
+	Users                          *[]string                 `json:"users"`
+	Keywords                       *[][]string               `json:"keywords"`
+	ExcludeKeywords                *[][]string               `json:"excludeKeywords"`
+	CaseSensitive                  *bool                     `json:"caseSensitive"`
+	ExcludeBots                    *bool                     `json:"excludeBots"`
+	WithReplies                    *bool                     `json:"withReplies"`
+	WithFile                       *bool                     `json:"withFile"`
+	LocalOnly                      *bool                     `json:"localOnly"`
+	IsActive                       *bool                     `json:"isActive"`
+	ExcludeNotesInSensitiveChannel *bool                     `json:"excludeNotesInSensitiveChannel"`
 }
 
 // Update handles POST /api/antennas/update.
@@ -271,6 +314,9 @@ func (h *Handler) Update(c echo.Context) error {
 	var req UpdateRequest
 	if err := c.Bind(&req); err != nil || req.AntennaID == "" {
 		return apierr.JSONInvalidParam(c)
+	}
+	if req.Name != nil && nameTooLong(*req.Name) {
+		return invalidName(c)
 	}
 	// upstream update.ts: keywords/excludeKeywords が両方指定され、かつ両方とも
 	// 空なら EMPTY_KEYWORD (片方のみ指定の場合は検査しない)。
@@ -281,7 +327,8 @@ func (h *Handler) Update(c echo.Context) error {
 	a, err := h.svc.Update(user.ID, req.AntennaID, coreantenna.UpdateInput{
 		Name:                           req.Name,
 		Src:                            req.Src,
-		UserListID:                     req.UserListID,
+		UserListID:                     req.UserListID.Value,
+		ClearUserListID:                req.UserListID.IsNull(),
 		Users:                          req.Users,
 		Keywords:                       req.Keywords,
 		ExcludeKeywords:                req.ExcludeKeywords,
@@ -376,12 +423,12 @@ func (h *Handler) List(c echo.Context) error {
 // 設定しないと FE が無限スクロールするたびに同じ最新 N 件を取り続けて
 // 「同じノートが何度も表示される」現象になる。
 type NotesRequest struct {
-	AntennaID string `json:"antennaId"`
-	Limit     *int   `json:"limit"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	AntennaID string     `json:"antennaId"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // Notes handles POST /api/antennas/notes.
@@ -392,11 +439,11 @@ func (h *Handler) Notes(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -448,7 +495,7 @@ func (h *Handler) Notes(c echo.Context) error {
 	// notes.ts の generateBaseNoteFilteringQuery + channelMuting に相当。set の
 	// ロードに失敗したら fail-closed で 500 を返す (security 項目なので
 	// silently leak しない)。renote 先の入れ子 author 検査は h.noteRepo 経由。
-	mbSets, err := notesfilter.LoadMuteBlockSets(user, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
+	mbSets, err := notesfilter.LoadMuteBlockSetsCached(h.relationCache, user, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -456,7 +503,7 @@ func (h *Handler) Notes(c echo.Context) error {
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
-	notes = notesfilter.ApplyHardMute(h.userRepo, user, notes)
+	notes = notesfilter.ApplyHardMute(h.userRepo, user, notes, h.idGen)
 	// #2106 N5: admin の blockedHosts でブロックした remote host の note と、suspended な
 	// author の note を除外する (upstream notes.ts:132-133 の generateBaseNoteFilteringQuery
 	// = generateBlockedHostQueryForNote + generateSuspendedUserQueryForNote)。clips/notes が
@@ -472,9 +519,9 @@ func (h *Handler) Notes(c echo.Context) error {
 	if len(notes) > limit {
 		notes = notes[:limit]
 	}
-	entities := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	entities := h.entityPacker.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(entities, user)
-	notehide.HideEmbeds(user, entities)
+	h.noteHider.HideEmbeds(user, entities)
 	out := make([]any, 0, len(entities))
 	for _, pn := range entities {
 		out = append(out, pn)
@@ -549,18 +596,8 @@ func jsonArrayOrEmpty(b []byte) any {
 	return json.RawMessage(b)
 }
 
-// HasMetaRepo reports whether the meta repository was wired.
-//
-// 未配線だと blocked-host の note が post-fetch 経路で漏れる。起動時検査に
-// 使う (#2708)。
-func (h *Handler) HasMetaRepo() bool { return h.metaRepo != nil }
-
-// HasMuteBlockRepos reports whether all three mute/block repositories were wired.
-//
-// **3 つを 1 つの述語で見る。** 呼び出しは `LoadMuteBlockSets` への直渡しで、
-// 各 repo は nil を**空集合として素通し**するため、1 つ欠けるだけでその次元の
-// filter が黙って消える。notes 側と違い呼び出し元の gate も無い。起動時検査に
-// 使う (#2709 review)。
-func (h *Handler) HasMuteBlockRepos() bool {
-	return h.mutingRepo != nil && h.blockingRepo != nil && h.channelMutingRepo != nil
+// SetRelationCache wires the per-user relation cache used by the mute / block
+// filter (#3607). nil keeps reading the repositories.
+func (h *Handler) SetRelationCache(rc *repository.RelationCache) {
+	h.relationCache = rc
 }

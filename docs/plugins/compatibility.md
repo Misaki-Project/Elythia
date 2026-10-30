@@ -38,11 +38,13 @@ Elythia 本体を変更する人向け。**公開面を広げてよい条件**�
 
 `Definition.Peer`（#2819）と`Context.Queue()`、`plugin.Queue` / `EnqueueOption`の追加も同じ扱い。`Definition.Peer`は既存プラグインが`Routes`の中でpeerを登録していても壊さない（`RoleBoth`ならそのまま動く）が、**ロールを分割した構成では応答が届かない**ので、移すこと。登録が無いロールでは起動時にwarnが出る。
 
+`plugin.ErrBadPeerPayload`の追加も同じ扱い。`PeerHandler`がこれを包んだエラーを返したときだけ受信側が`400`を返す (送信側は再送しない)。包まないエラーの扱い (`500` + ERROR、送信側が再送) は変えていないので、既存のプラグインの挙動は変わらない。
+
 `Context`はElythiaが実装してプラグインは受け取るだけなので、メソッドが増えてもプラグインは壊れない（プラグイン側が`Context`を自前で実装している場合はこの限りではないが、それはサポート対象外）。
 
 ### キューの実装との関係
 
-**`plugin.Queue`はmkqを再公開しない。** 本体のworkerはペイロードを`{type, body}`で包んで`type`でdispatchするので、素のmkqハンドルから積んだジョブは処理者が見つからない。包み方は本体のenqueueとworkerの間の契約であって、プラグインに晒す面ではない（`internal/queue/driver/mkqdriver`）。
+**`plugin.Queue`はmkqを再公開しない。** 本体のworkerはペイロードを`{type, bodyJson}`(JSONとして埋め込めないものは`{type, body}`。#3614)で包んで`type`でdispatchするので、素のmkqハンドルから積んだジョブは処理者が見つからない。包み方は本体のenqueueとworkerの間の契約であって、プラグインに晒す面ではない（`internal/queue/driver/mkqdriver`）。
 
 したがって**`plugin.APIVersion`はmkqのメジャー版に連動しない**。mkqを差し替えても`plugin.Queue`の形が変わらなければ、プラグインは再ビルドだけで動く。逆に`EnqueueOptions`のフィールドの意味を変えるときは、mkqが同じままでも破壊的変更になる。
 

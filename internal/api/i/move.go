@@ -36,12 +36,26 @@ import (
 // src を指している必要があり、その時点で local に解決済のため local lookup で足りる。
 func (h *Handler) Move(c echo.Context) error {
 	me := middleware.GetUser(c)
-	var req struct {
-		MoveToAccount string `json:"moveToAccount"`
-		Password      string `json:"password"`
+	if me != nil && h.localFederationObserver != nil && !h.localFederationObserver.IsExternallyAvailable(me) {
+		return c.JSON(http.StatusBadRequest, apierr.Error(
+			"FEDERATION_DISABLED", "Account migration is unavailable while federation is disabled for this account.",
+			"abdc2832-1f6d-4a33-8a10-b5731ca33884",
+		))
 	}
-	if err := c.Bind(&req); err != nil || req.MoveToAccount == "" {
+	var req struct {
+		MoveToAccount *string `json:"moveToAccount"`
+		Password      string  `json:"password"`
+	}
+	if err := c.Bind(&req); err != nil || req.MoveToAccount == nil {
 		return apierr.JSONInvalidParam(c)
+	}
+	// 空のmoveToAccountは、本家と同じくrootの判定より先にNO_SUCH_USERで返す
+	// (move.tsの`if (!ps.moveToAccount)`)。以前は400にしていた(#3851)。
+	if *req.MoveToAccount == "" {
+		return c.JSON(http.StatusNotFound, apierr.Error(
+			"NO_SUCH_USER", "No such user.",
+			"fcd2eef9-a9b2-4c4f-8624-038099e90aa5",
+		))
 	}
 	// root ユーザーは移行不可 (upstream move.ts: rootUserId === me.id)。
 	// meta.rootUserId と user.isRoot の両方を見る (role_service.isRootUser と同 doctrine)。
@@ -96,7 +110,7 @@ func (h *Handler) Move(c echo.Context) error {
 	}
 	// acct 形式 (@user@host) は canonical URI へ解決してから mover に渡す。
 	// URI 形式 (http/https) はそのまま渡す。
-	moveTo := req.MoveToAccount
+	moveTo := *req.MoveToAccount
 	if !strings.HasPrefix(moveTo, "http://") && !strings.HasPrefix(moveTo, "https://") {
 		u := h.lookupAlsoKnownAsTarget(moveTo)
 		if u == nil {
@@ -115,6 +129,12 @@ func (h *Handler) Move(c echo.Context) error {
 		moveTo = uri
 	}
 	err := h.mover.Move(me, moveTo)
+	// 移行は movedToUri を立て、以後の書き込み (RequireNotMoved) を止める。
+	// auth middleware の tokenCache は移行前の利用者を持っているので、全プロセスで
+	// 捨てる (#3664。本家の AccountMoveService も localUserUpdated を出す)。
+	// 途中で失敗しても movedToUri が書かれている場合があるので、成否を問わず
+	// 捨てる (捨てすぎても次の要求で DB を引き直すだけ)。
+	h.invalidateUserTokenCache(me.ID)
 	switch {
 	case err == nil:
 		return h.Me(c)
@@ -139,6 +159,11 @@ func (h *Handler) Move(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error(
 			"INVALID_PARAM", "Remote users cannot initiate account move.",
 			"3d81ceae-475f-4600-b2a8-2bc116157532",
+		))
+	case errors.Is(err, move.ErrFederationDisabled):
+		return c.JSON(http.StatusBadRequest, apierr.Error(
+			"FEDERATION_DISABLED", "Account migration is unavailable while federation is disabled for an account.",
+			"abdc2832-1f6d-4a33-8a10-b5731ca33884",
 		))
 	default:
 		return apierr.JSONInternalError(c)

@@ -3,8 +3,10 @@ package event
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/testutil"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -172,12 +175,12 @@ func TestPubSubService_Close_AlreadyClosed(t *testing.T) {
 	_ = svc.Subscribe(ctx, "doublecl", func(data []byte) {})
 	time.Sleep(100 * time.Millisecond)
 
-	// 内部のPubSubを手動で閉じてからCloseを呼ぶ→sub.Close()がエラーを返す
+	// 内部のPubSubを手動で閉じてからCloseを呼ぶ→ps.Close()がエラーを返す
 	svc.mu.Lock()
-	for _, ts := range svc.subs {
-		_ = ts.sub.Close()
-	}
+	ps := svc.ps
 	svc.mu.Unlock()
+	require.NotNil(t, ps)
+	_ = ps.Close()
 
 	// svc.Close()は内部でsub.Close()エラーをログに出すが、nilを返す
 	err := svc.Close()
@@ -297,7 +300,7 @@ func TestPubSubService_CancelDoesNotAffectOtherSubscribers(t *testing.T) {
 	assert.Equal(t, 3, gotB, "**B は受信し続けること** (他人の解除で止まらない)")
 }
 
-// 最後の購読者が外れたら Redis 購読も閉じること (接続を漏らさない)。
+// 最後の購読者が外れたらトピックを忘れること (枠を漏らさない)。
 func TestPubSubService_LastCancelClosesRedisSubscription(t *testing.T) {
 	svc := NewPubSubService(testRedis.Client, "test:")
 	ctx := context.Background()
@@ -316,17 +319,17 @@ func TestPubSubService_LastCancelClosesRedisSubscription(t *testing.T) {
 	svc.mu.Lock()
 	_, stillPresent := svc.subs[svc.channel("reap")]
 	svc.mu.Unlock()
-	require.True(t, stillPresent, "購読者が残っている間は Redis 購読を閉じないこと")
+	require.True(t, stillPresent, "購読者が残っている間はトピックを残すこと")
 
 	c2()
 	svc.mu.Lock()
 	_, goneNow := svc.subs[svc.channel("reap")]
 	svc.mu.Unlock()
-	assert.False(t, goneNow, "最後の購読者が外れたら Redis 購読を閉じること")
+	assert.False(t, goneNow, "最後の購読者が外れたらトピックを忘れること")
 	assert.Equal(t, 0, svc.SubscriberCount("reap"))
 }
 
-// 同じトピックに N 人が居ても Redis 購読は 1 本だけであること。
+// 同じトピックに N 人が居てもトピックの枠は 1 つだけであること。
 func TestPubSubService_SingleRedisSubscriptionPerTopic(t *testing.T) {
 	svc := NewPubSubService(testRedis.Client, "test:")
 	ctx := context.Background()
@@ -340,6 +343,388 @@ func TestPubSubService_SingleRedisSubscriptionPerTopic(t *testing.T) {
 	svc.mu.Lock()
 	n := len(svc.subs)
 	svc.mu.Unlock()
-	assert.Equal(t, 1, n, "トピックごとに Redis 購読は 1 本")
+	assert.Equal(t, 1, n, "トピックの枠は 1 つ")
 	assert.Equal(t, 5, svc.SubscriberCount("fanout"))
+}
+
+// pubsubClients returns how many pub/sub connections the test Redis holds.
+func pubsubClients(t *testing.T) int {
+	t.Helper()
+	out, err := testRedis.Client.Do(context.Background(), "CLIENT", "LIST", "TYPE", "pubsub").Text()
+	require.NoError(t, err)
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// トピックをいくつ購読しても Redis の接続は増えないこと。
+//
+// トピックごとに go-redis の PubSub (= 専用の TCP 接続) を張っていた頃は、
+// 購読するトピックの数だけ Redis の接続が増えた。
+func TestPubSubService_TopicsShareOneRedisConnection(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "conncount:")
+	ctx := context.Background()
+	defer svc.Close()
+
+	before := pubsubClients(t)
+	var got atomic.Int32
+	for i := 0; i < 50; i++ {
+		_ = svc.Subscribe(ctx, fmt.Sprintf("topic-%d", i), func([]byte) { got.Add(1) })
+	}
+	time.Sleep(200 * time.Millisecond)
+	after := pubsubClients(t)
+	assert.LessOrEqual(t, after-before, 1, "50 トピックの購読で Redis の pub/sub 接続が %d 本増えた", after-before)
+
+	// 1 本の購読でも、各トピックへは届く。
+	require.NoError(t, svc.Publish(ctx, "topic-7", map[string]int{"n": 1}))
+	require.NoError(t, svc.Publish(ctx, "topic-42", map[string]int{"n": 2}))
+	assert.Eventually(t, func() bool { return got.Load() == 2 }, 2*time.Second, 20*time.Millisecond)
+}
+
+// 遅いトピックが他のトピックの配信を止めないこと。
+//
+// 受信は全トピックで 1 本なので、受信の goroutine でハンドラを待つと、遅い
+// 購読者 1 人 (重いミュートの評価など) で全員の配信が止まる。
+func TestPubSubService_SlowTopicDoesNotBlockOthers(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "slow:")
+	ctx := context.Background()
+	defer svc.Close()
+
+	release := make(chan struct{})
+	defer close(release)
+	var slowEntered atomic.Bool
+	_ = svc.Subscribe(ctx, "slow", func([]byte) {
+		slowEntered.Store(true)
+		<-release
+	})
+	var fastGot atomic.Int32
+	_ = svc.Subscribe(ctx, "fast", func([]byte) { fastGot.Add(1) })
+	time.Sleep(100 * time.Millisecond)
+
+	require.NoError(t, svc.Publish(ctx, "slow", 1))
+	require.Eventually(t, slowEntered.Load, 2*time.Second, 10*time.Millisecond)
+	require.NoError(t, svc.Publish(ctx, "fast", 1))
+	assert.Eventually(t, func() bool { return fastGot.Load() == 1 }, 2*time.Second, 10*time.Millisecond,
+		"遅いトピックのハンドラが止まっている間も、別のトピックへは届くこと")
+}
+
+// 1 つのトピックの中では、届いた順に配ること。
+func TestPubSubService_PreservesOrderWithinTopic(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "order:")
+	ctx := context.Background()
+	defer svc.Close()
+
+	var mu sync.Mutex
+	var seen []int
+	_ = svc.Subscribe(ctx, "seq", func(data []byte) {
+		var n int
+		require.NoError(t, json.Unmarshal(data, &n))
+		mu.Lock()
+		seen = append(seen, n)
+		mu.Unlock()
+	})
+	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, svc.Publish(ctx, "seq", i))
+	}
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(seen) == 200
+	}, 3*time.Second, 20*time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	for i, n := range seen {
+		require.Equal(t, i, n, "順序が入れ替わった")
+	}
+}
+
+// prefix の glob の特殊文字を逃がし、別のサービスのチャネルを受けないこと。
+func TestPubSubService_PatternEscapesPrefix(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "a*[b]?\\:")
+	assert.Equal(t, "a\\*\\[b\\]\\?\\\\:*", svc.pattern())
+
+	ctx := context.Background()
+	defer svc.Close()
+	var got atomic.Int32
+	_ = svc.Subscribe(ctx, "x", func([]byte) { got.Add(1) })
+	time.Sleep(100 * time.Millisecond)
+	// prefix を glob として読むと一致してしまうチャネル。配る先はチャネル名の
+	// 完全一致で決まるので、受けたかどうかは Redis が数えた受け手の数で見る。
+	n, err := testRedis.Client.Publish(ctx, "aZZbQ:x", "1").Result()
+	require.NoError(t, err)
+	assert.Zero(t, n, "prefix を glob として読んだチャネルまで受けた")
+	require.NoError(t, svc.Publish(ctx, "x", 1))
+	assert.Eventually(t, func() bool { return got.Load() == 1 }, 2*time.Second, 20*time.Millisecond)
+}
+
+// 配り待ちが上限を超えたら捨て、受信は止めないこと。
+func TestPubSubService_FullTopicQueueDrops(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "full:")
+	ctx := context.Background()
+	defer svc.Close()
+
+	release := make(chan struct{})
+	var handled atomic.Int32
+	_ = svc.Subscribe(ctx, "q", func([]byte) {
+		<-release
+		handled.Add(1)
+	})
+	// drain を 1 件目で止めた状態で、上限を超えて積む。
+	for i := 0; i < topicQueueLimit+50; i++ {
+		svc.enqueue(svc.channel("q"), []byte("1"))
+	}
+	svc.mu.Lock()
+	pending := len(svc.subs[svc.channel("q")].pending)
+	dropped := svc.subs[svc.channel("q")].dropped
+	svc.mu.Unlock()
+	close(release)
+	// 配っている最中の 1 件を除き、上限を超えた分は捨てる (どの時点で drain が
+	// 1 件目を取り出しても、捨てるのは 49 件以上)。
+	assert.Equal(t, topicQueueLimit, pending)
+	assert.GreaterOrEqual(t, dropped, uint64(49))
+}
+
+// 解除や Close の後は、待ち行列に残っていた分を古いハンドラへ配らないこと。
+func TestPubSubService_NoDeliveryAfterUnsubscribeOrClose(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(svc *PubSubService, unsub func())
+	}{
+		{"unsubscribe", func(_ *PubSubService, unsub func()) { unsub() }},
+		{"close", func(svc *PubSubService, _ func()) { _ = svc.Close() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := NewPubSubService(testRedis.Client, "stale-"+tc.name+":")
+			ctx := context.Background()
+			defer svc.Close()
+
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			var handled atomic.Int32
+			unsub := svc.Subscribe(ctx, "q", func([]byte) {
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				<-release
+				handled.Add(1)
+			})
+			// 10 件が積まれた状態から drain を始める (取り出し方の違いを
+			// 時間の巡り合わせに左右されずに見る)。
+			key := svc.channel("q")
+			svc.mu.Lock()
+			ts := svc.subs[key]
+			for i := 0; i < 10; i++ {
+				ts.pending = append(ts.pending, []byte("1"))
+			}
+			ts.draining = true
+			svc.mu.Unlock()
+			go svc.drain(key, ts)
+
+			<-entered
+			tc.stop(svc, unsub)
+			close(release)
+			time.Sleep(100 * time.Millisecond)
+			assert.Equal(t, int32(1), handled.Load(), "止めた後も残りを配った")
+		})
+	}
+}
+
+func TestPubSubService_PublishMany(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "many:")
+	ctx := context.Background()
+	defer svc.Close()
+
+	var mu sync.Mutex
+	received := map[string][]string{}
+	for _, ch := range []string{"a", "b", "c"} {
+		svc.Subscribe(ctx, ch, func(data []byte) {
+			mu.Lock()
+			received[ch] = append(received[ch], string(data))
+			mu.Unlock()
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	assert.Nil(t, svc.PublishMany(ctx, []string{"a", "b"}, map[string]string{"n": "1"}))
+	assert.Nil(t, svc.PublishMany(ctx, []string{"a", "b"}, json.RawMessage(`{"n":"2"}`)))
+	assert.Nil(t, svc.PublishMany(ctx, nil, "ignored"))
+
+	assert.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(received["a"]) >= 2 && len(received["b"]) >= 2
+	}, 2*time.Second, 20*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{`{"n":"1"}`, `{"n":"2"}`}
+	assert.Equal(t, want, received["a"], "same payload as Publish, in order")
+	assert.Equal(t, want, received["b"])
+	assert.Empty(t, received["c"], "only the listed channels")
+}
+
+func TestPubSubService_PublishManyErrors(t *testing.T) {
+	ctx := context.Background()
+	svc := NewPubSubService(testRedis.Client, "many:")
+	errs := svc.PublishMany(ctx, []string{"a", "b"}, func() {})
+	require.Len(t, errs, 2)
+	assert.ErrorContains(t, errs[0], "pubsub marshal")
+	assert.ErrorContains(t, errs[1], "pubsub marshal")
+
+	// 接続できないときは、宛先ごとにエラーが返る。
+	client := redis.NewClient(&redis.Options{Addr: testRedis.Addr})
+	require.NoError(t, client.Close())
+	closed := NewPubSubService(client, "many:")
+	errs = closed.PublishMany(ctx, []string{"a", "b"}, "x")
+	require.Len(t, errs, 2)
+	assert.Error(t, errs[0])
+	assert.Error(t, errs[1])
+}
+
+// TestPubSubService_OverflowNotifiesSubscriber pins how a subscriber that
+// asked for it learns that messages of its topic were dropped (#3664): one
+// call at a time per topic however many messages are dropped, and drops made
+// while the function runs are covered by exactly one more call after it
+// returns. Plain subscribers and removed handlers are not called.
+func TestPubSubService_OverflowNotifiesSubscriber(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "overflow:")
+	ctx := context.Background()
+	defer svc.Close()
+
+	release := make(chan struct{})
+	defer close(release)
+	var calls, running, maxRunning atomic.Int32
+	proceed := make(chan struct{})
+	stop := svc.SubscribeWithOverflow(ctx, "q", func([]byte) { <-release }, func() {
+		n := running.Add(1)
+		for {
+			m := maxRunning.Load()
+			if n <= m || maxRunning.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		calls.Add(1)
+		<-proceed
+		running.Add(-1)
+	})
+	// 同じトピックの、溢れを知らせない購読者。
+	_ = svc.Subscribe(ctx, "q", func([]byte) {})
+
+	fill := func(n int) {
+		for range n {
+			svc.enqueue(svc.channel("q"), []byte("1"))
+		}
+	}
+	runnerDone := func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		return !svc.subs[svc.channel("q")].overflowRunning
+	}
+
+	// drain を 1 件目で止めた状態で、上限を超えて積む。関数は止めておく。
+	fill(topicQueueLimit + 50)
+	require.Eventually(t, func() bool { return calls.Load() == 1 }, 5*time.Second, time.Millisecond)
+	// 関数が止まっている間に何件捨てても、呼び出しは増えず、同時に走るのは 1 つ。
+	fill(200)
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(1), calls.Load(), "no further call while one is running")
+	assert.Equal(t, int32(1), maxRunning.Load())
+
+	// 戻すと、走っている間に捨てた分のためにもう 1 回だけ呼ぶ。
+	proceed <- struct{}{}
+	require.Eventually(t, func() bool { return calls.Load() == 2 }, 5*time.Second, time.Millisecond,
+		"drops during the call must be covered by one more call")
+	proceed <- struct{}{}
+	require.Eventually(t, runnerDone, 5*time.Second, time.Millisecond)
+	assert.Equal(t, int32(2), calls.Load(), "nothing was dropped during the second call")
+	assert.Equal(t, int32(1), maxRunning.Load())
+
+	// 呼び終えた後に捨てた分は、新しい 1 回で知らせる。1 件だけ捨てる (複数を
+	// 捨てると、呼び始めた後の分のためにもう一周しうる)。
+	fill(1)
+	require.Eventually(t, func() bool { return calls.Load() == 3 }, 5*time.Second, time.Millisecond)
+	proceed <- struct{}{}
+	require.Eventually(t, runnerDone, 5*time.Second, time.Millisecond)
+
+	// 外したハンドラには知らせない。
+	stop()
+	fill(10)
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(3), calls.Load())
+	assert.Equal(t, int32(1), maxRunning.Load())
+}
+
+// TestPubSubService_OverflowAfterCloseIsNotCalled pins that a pending
+// overflow call does nothing once the service is closed.
+func TestPubSubService_OverflowAfterCloseIsNotCalled(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "overflowclose:")
+	var called atomic.Bool
+	_ = svc.SubscribeWithOverflow(context.Background(), "q", func([]byte) {}, func() { called.Store(true) })
+	svc.mu.Lock()
+	ts := svc.subs[svc.channel("q")]
+	ts.overflowDirty = true
+	ts.overflowRunning = true
+	svc.mu.Unlock()
+	require.NoError(t, svc.Close())
+	svc.runOverflow(svc.channel("q"), ts)
+	assert.False(t, called.Load())
+	assert.False(t, ts.overflowRunning)
+}
+
+// TestPubSubService_OverflowCallsAreSpacedOut pins that while messages keep
+// being dropped, the overflow function runs at most once per minimum interval
+// instead of about once per dropped message, and that a drop after the last
+// call is still covered by one more call (#3664).
+func TestPubSubService_OverflowCallsAreSpacedOut(t *testing.T) {
+	svc := NewPubSubService(testRedis.Client, "overflowrate:")
+	const interval = 50 * time.Millisecond
+	svc.overflowMinInterval = interval
+	ctx := context.Background()
+	defer svc.Close()
+
+	release := make(chan struct{})
+	defer close(release)
+	var mu sync.Mutex
+	var calls []time.Time
+	_ = svc.SubscribeWithOverflow(ctx, "q", func([]byte) { <-release }, func() {
+		mu.Lock()
+		calls = append(calls, time.Now())
+		mu.Unlock()
+	})
+	drop := func() { svc.enqueue(svc.channel("q"), []byte("1")) }
+	for range topicQueueLimit + 1 {
+		drop()
+	}
+
+	// 1 ms ごとに 1 件ずつ、0.5 秒捨て続ける。
+	var lastDrop time.Time
+	for start := time.Now(); time.Since(start) < 500*time.Millisecond; {
+		drop()
+		lastDrop = time.Now()
+		time.Sleep(time.Millisecond)
+	}
+	// 最後に捨てた分も、その後の 1 回で埋まる。
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(calls) > 0 && calls[len(calls)-1].After(lastDrop)
+	}, 5*time.Second, time.Millisecond, "a drop after the last call must be covered")
+
+	mu.Lock()
+	defer mu.Unlock()
+	// 最初の呼び出しから最後に捨てるまでの実測の時間を間隔で割った回数と、最初と
+	// 最後の 1 回ずつ (負荷でループが延びても上限が一緒に延びる)。間隔が無ければ
+	// 捨てた件数とほぼ同じ回数 (数百回) になる。
+	limit := int(lastDrop.Sub(calls[0])/interval) + 2
+	assert.LessOrEqual(t, len(calls), limit, "calls: %d", len(calls))
+	for i := 1; i < len(calls); i++ {
+		assert.GreaterOrEqual(t, calls[i].Sub(calls[i-1]), interval-5*time.Millisecond, "call %d came too soon", i)
+	}
 }

@@ -32,7 +32,7 @@ func newHandler(t *testing.T) (
 	noteRepo := testutil.NewMockNoteRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, followRepo, noteRepo, idGen)
-	return NewHandler(svc, idGen), repo, followRepo, noteRepo
+	return NewHandler(svc, idGen, nil, nil, nil, nil), repo, followRepo, noteRepo
 }
 
 func newReq(t *testing.T, body string) (echo.Context, *httptest.ResponseRecorder) {
@@ -131,7 +131,7 @@ func TestCreate_RepoError(t *testing.T) {
 	repo := &failingChannelRepo{MockChannelRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, testutil.NewMockChannelFollowingRepository(), testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{"name":"alpha"}`)
 	setUser(c, "alice")
@@ -386,7 +386,7 @@ func newModeratorHandler(t *testing.T, moderators ...string) (*Handler, *testuti
 		mods[m] = true
 	}
 	svc.SetModeratorChecker(stubModerator{moderators: mods})
-	return NewHandler(svc, idGen), repo
+	return NewHandler(svc, idGen, nil, nil, nil, nil), repo
 }
 
 func TestUpdate_ModeratorBypass(t *testing.T) {
@@ -429,7 +429,7 @@ func TestUpdate_RepoError(t *testing.T) {
 	repo := &failingUpdateRepo{MockChannelRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, testutil.NewMockChannelFollowingRepository(), testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"channelId":"c1","name":"x"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Update(c))
@@ -494,7 +494,7 @@ func TestFollow_InternalError(t *testing.T) {
 	followRepo := &failingFollowRepo{MockChannelFollowingRepository: testutil.NewMockChannelFollowingRepository()}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, followRepo, testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{"channelId":"c1"}`)
 	setUser(c, "alice")
@@ -546,7 +546,7 @@ func TestUnfollow_InternalError(t *testing.T) {
 	followRepo := &failingUnfollowRepo{MockChannelFollowingRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, followRepo, testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{"channelId":"c1"}`)
 	setUser(c, "alice")
@@ -586,7 +586,7 @@ func TestFollowed_RepoError(t *testing.T) {
 	followRepo := &listFailFollowRepo{MockChannelFollowingRepository: testutil.NewMockChannelFollowingRepository()}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, followRepo, testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 	c, rec := newReq(t, `{}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Followed(c))
@@ -623,7 +623,7 @@ func TestOwned_RepoError(t *testing.T) {
 	repo := &listFailChannelRepo{MockChannelRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, testutil.NewMockChannelFollowingRepository(), testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 	c, rec := newReq(t, `{}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Owned(c))
@@ -649,7 +649,7 @@ func TestFeatured_RepoError(t *testing.T) {
 	repo := &listFailChannelRepo{MockChannelRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, testutil.NewMockChannelFollowingRepository(), testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 	c, rec := newReq(t, `{}`)
 	require.NoError(t, h.Featured(c))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -731,17 +731,49 @@ func TestSearch_ListIncludesIsMuting(t *testing.T) {
 	assert.Equal(t, true, resp[0]["isMuting"])
 }
 
-// 解除: bannerId:"" で既存 banner が null 化される。
+// bannerId: null removes the banner, which is what the bundled frontend's
+// "remove banner" sends; upstream ignores it (#3758). An absent bannerId keeps
+// the banner.
 func TestUpdate_BannerClear(t *testing.T) {
+	kept := "b0"
+	cases := []struct {
+		name string
+		body string
+		want *string
+	}{
+		{"null removes the banner", `{"channelId":"c1","bannerId":null}`, nil},
+		{"absent keeps the banner", `{"channelId":"c1","name":"renamed"}`, &kept},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, repo, _, _ := newHandler(t)
+			owner := "alice"
+			existing := "b0"
+			repo.Channels["c1"] = &model.Channel{ID: "c1", Name: "ch", UserID: &owner, BannerID: &existing}
+			c, rec := newReq(t, tc.body)
+			setUser(c, "alice")
+			require.NoError(t, h.Update(c))
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			assert.Equal(t, tc.want, repo.Channels["c1"].BannerID)
+		})
+	}
+}
+
+// bannerId: "" no longer removes the banner: it is not a misskey:id, which
+// the validator in front rejects (#3758). Should the validator be skipped, the
+// handler treats it as a file id it cannot find.
+func TestUpdate_EmptyBannerIDIsNotARemoval(t *testing.T) {
 	h, repo, _, _ := newHandler(t)
 	owner := "alice"
 	existing := "b0"
 	repo.Channels["c1"] = &model.Channel{ID: "c1", Name: "ch", UserID: &owner, BannerID: &existing}
+	h.SetDriveFileRepo(testutil.NewMockDriveFileRepository())
 	c, rec := newReq(t, `{"channelId":"c1","bannerId":""}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Update(c))
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Nil(t, repo.Channels["c1"].BannerID, `bannerId:"" は banner を解除する`)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "NO_SUCH_FILE")
+	assert.Equal(t, &existing, repo.Channels["c1"].BannerID)
 }
 
 // Update で他人所有 banner は NO_SUCH_FILE (update 固有 error id)。
@@ -839,7 +871,7 @@ func TestSearch_RepoError(t *testing.T) {
 	repo := &listFailChannelRepo{MockChannelRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, testutil.NewMockChannelFollowingRepository(), testutil.NewMockNoteRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"query":"x"}`)
 	require.NoError(t, h.Search(c))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -971,7 +1003,7 @@ func TestTimeline_RepoError(t *testing.T) {
 	noteRepo := &failingChannelNoteRepo{MockNoteRepository: testutil.NewMockNoteRepository()}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechannel.NewService(repo, testutil.NewMockChannelFollowingRepository(), noteRepo, idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"channelId":"c1"}`)
 	require.NoError(t, h.Timeline(c))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -1338,4 +1370,88 @@ func TestShow_PinnedNotesAreVisibilityGated(t *testing.T) {
 		require.NoError(t, h.Show(c))
 		assert.Equal(t, []string{"pub"}, pinnedIDs(t, rec))
 	})
+}
+
+// seedTwoOwnedFollowedChannels makes two channels that alice owns and follows,
+// both matching the search query "pg".
+func seedTwoOwnedFollowedChannels(t *testing.T, repo *testutil.MockChannelRepository, followRepo *testutil.MockChannelFollowingRepository) {
+	t.Helper()
+	owner := "alice"
+	for _, cid := range []string{"pg1", "pg2"} {
+		repo.Channels[cid] = &model.Channel{ID: cid, Name: "pg-" + cid, UserID: &owner}
+		require.NoError(t, followRepo.Create(&model.ChannelFollowing{ID: "f-" + cid, FolloweeID: cid, FollowerID: owner}))
+	}
+}
+
+func listCount(t *testing.T, rec *httptest.ResponseRecorder) int {
+	t.Helper()
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	return len(resp)
+}
+
+// The lists accept an integer-valued fraction for limit / sinceDate /
+// untilDate, as upstream's ajv does for an integer (#3758).
+func TestListsAcceptIntegerValuedFractions(t *testing.T) {
+	lists := []struct {
+		name string
+		call func(*Handler, echo.Context) error
+		body string
+	}{
+		{"followed", (*Handler).Followed, `{"limit":1.0,"untilDate":1e15}`},
+		{"owned", (*Handler).Owned, `{"limit":1.0,"untilDate":1e15}`},
+		{"search", (*Handler).Search, `{"query":"pg","limit":1.0,"untilDate":1e15}`},
+	}
+	for _, l := range lists {
+		t.Run(l.name, func(t *testing.T) {
+			h, repo, followRepo, _ := newHandler(t)
+			seedTwoOwnedFollowedChannels(t, repo, followRepo)
+			c, rec := newReq(t, l.body)
+			setUser(c, "alice")
+			require.NoError(t, l.call(h, c))
+			assert.Equal(t, 1, listCount(t, rec))
+		})
+	}
+	t.Run("timeline", func(t *testing.T) {
+		h, repo, _, _ := newHandler(t)
+		repo.Channels["pg1"] = &model.Channel{ID: "pg1", Name: "pg"}
+		c, rec := newReq(t, `{"channelId":"pg1","limit":1.0,"sinceDate":1e1}`)
+		require.NoError(t, h.Timeline(c))
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	})
+}
+
+// followed / owned / search do not read offset, which upstream's paramDef does
+// not have: upstream ignores it and answers from the top (#3758).
+func TestListsIgnoreOffset(t *testing.T) {
+	lists := []struct {
+		name string
+		call func(*Handler, echo.Context) error
+		body string
+	}{
+		{"followed", (*Handler).Followed, `{"offset":1}`},
+		{"owned", (*Handler).Owned, `{"offset":1}`},
+		{"search", (*Handler).Search, `{"query":"pg","offset":1}`},
+		{"followed with a mistyped offset", (*Handler).Followed, `{"offset":"x"}`},
+	}
+	for _, l := range lists {
+		t.Run(l.name, func(t *testing.T) {
+			h, repo, followRepo, _ := newHandler(t)
+			seedTwoOwnedFollowedChannels(t, repo, followRepo)
+			c, rec := newReq(t, l.body)
+			setUser(c, "alice")
+			require.NoError(t, l.call(h, c))
+			assert.Equal(t, 2, listCount(t, rec))
+		})
+	}
+}
+
+// featured takes no params; upstream's paramDef is {} and passes extra keys
+// of any type (#3758).
+func TestFeatured_AcceptsMistypedExtraKeys(t *testing.T) {
+	h, _, _, _ := newHandler(t)
+	c, rec := newReq(t, `{"limit":"x","sinceId":1}`)
+	require.NoError(t, h.Featured(c))
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }

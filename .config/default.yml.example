@@ -88,6 +88,17 @@ port: 3000
 # Disable HSTS header (default: false).
 #disableHsts: true
 
+# Run upstream Misskey's paramDef validation in front of the API handlers
+# without acting on it, and log how often its verdict and the handler's
+# answer disagree (default: enabled). The log holds endpoint names, schema
+# paths and counts, never a value. The endpoints aligned with upstream
+# (every endpoint with a paramDef, upstream's or Elythia's own, but the
+# test-only reset-db) are validated and rejected regardless of this setting.
+# See docs/param-shadow.md.
+#disableParamShadow: false
+# Interval of the summary written to the log, in seconds (default: 600).
+#paramShadowLogSeconds: 600
+
 # Enable internal IP-based rate limiting (default: true).
 # Required for unauthenticated endpoints (signup / signin / reset-password)
 # to be rate-limited at all — otherwise spam / brute-force protection only
@@ -266,9 +277,14 @@ db:
   # the connection to interception) use `ssl: { rejectUnauthorized: false }`
   # (or `ssl: no-verify`).
   # `sslmode` (libpq value) may be set instead of `ssl`. See docs/configuration.md.
+  # `connectionTimeoutMillis` (milliseconds, same key as upstream node-postgres)
+  # bounds how long one connection attempt waits for PostgreSQL to answer.
+  # Default 10000 (upstream waits forever); 0 waits forever. Rounded up to
+  # whole seconds. See docs/configuration.md.
   #extra:
   #  ssl: true
   #  sslrootcert: /etc/ssl/certs/pg-ca.pem
+  #  connectionTimeoutMillis: 10000
 
   # Connection pool tuning (mk-go specific; Misskey TS does not expose these)
   #maxOpenConns: 25       # default: GORM/database/sql の既定値
@@ -477,7 +493,6 @@ proxyBypassHosts:
 
 # Proxy for SMTP/SMTPS
 #proxySmtp: http://127.0.0.1:3128
-#proxySmtp: socks4://127.0.0.1:1080
 #proxySmtp: socks5://127.0.0.1:1080
 
 # Media Proxy URL (deliver a common cache between instances).
@@ -623,3 +638,137 @@ proxyBypassHosts:
 #    reconcileCron: "*/10 * * * *"
 #    orphanCron: "17 3 * * *"
 #    pruneCron: "43 4 * * *"
+
+# Key that encrypts server plugins' secret values (API keys and the like)
+# entered from the control panel (#3470). 32 random bytes in base64:
+#
+#   openssl rand -base64 32
+#
+# Without it, plugin secrets cannot be stored (the control panel says so).
+# A malformed or wrong-length value stops startup. Give every process the
+# same key when you split roles. Losing or replacing the key makes the
+# stored values unreadable; enter them again from the control panel (see
+# docs/plugins/operating.md). Keep it out of your database backups.
+# Can also be set with MK_PLUGINSECRETKEY.
+#pluginSecretKey: "<output of openssl rand -base64 32>"
+
+#   ┌────────────────────────┐
+#───┘ Database backup (#3457) └────────────────────────────────
+
+# Used by `elythia backup` (the "backup" and "backup-daemon" compose
+# services) and by the admin page of the server (backup.server). See
+# docs/backup.md.
+#
+# **A disk of the same host does not count as a backup**: it is lost together
+# with the database. Use S3-compatible storage or a directory on another
+# device mounted here (NAS and so on). The storage credentials live in this
+# file, not in the database, so that the backups can be read when the
+# database is gone.
+#backup:
+#  storage:
+#    # "s3" or "dir"
+#    type: s3
+#    s3:
+#      # Empty means AWS S3. For R2: https://<account>.r2.cloudflarestorage.com
+#      # Use https:// unless the storage is on a private network: with
+#      # http:// the dump (unless encrypted) and the signed requests travel
+#      # in plaintext.
+#      endpoint: https://s3.example.com
+#      region: us-east-1
+#      bucket: elythia-backup
+#      prefix: example-instance
+#      accessKey: "..."
+#      secretKey: "..."
+#      # true for MinIO and other services without virtual-hosted buckets
+#      forcePathStyle: false
+#    dir:
+#      # Must already exist and contain the marker file .elythia-backup,
+#      # created on the mounted device (touch /mnt/nas/.../.elythia-backup).
+#      # Neither is created, so an unmounted NAS fails instead of filling the
+#      # local disk.
+#      path: /backup
+#  # The dump contains users' private keys, tokens and password hashes.
+#  # With encryption enabled, the dump is encrypted with age
+#  # (https://age-encryption.org). Taking a backup needs only the public
+#  # keys; keep the private key (age-keygen output) off this host and give it
+#  # only to verify / restore.
+#  encryption:
+#    enabled: false
+#    recipients:
+#      - age1...
+#    # Keep the private key outside the repository and .config.
+#    identityFile: /run/secrets/backup-identity.txt
+#  # HMAC key that signs each generation (meta.json.sig) and the restore
+#  # records in Redis. When set, restore and verify refuse a generation that
+#  # is not signed with it. Keep it on the backup host only, never in the
+#  # storage. Create it with: openssl rand -hex 32 > backup-integrity.key
+#  integrityKeyFile: /run/secrets/backup-integrity.key
+#  # Paths of the PostgreSQL client programs. Empty means PATH. Their major
+#  # version must not be older than the server's.
+#  tools:
+#    pgDump: ""
+#    # pg_restore must not be newer than the server it restores into
+#    # (`elythia backup restore`). `elythia backup verify` restores into a
+#    # throwaway server with pgRestore, initdb and pgCtl.
+#    pgRestore: ""
+#    initdb: ""
+#    pgCtl: ""
+#  # `elythia backup daemon` (docs/backup.md): take, verify and prune on a
+#  # schedule, and report problems. Empty interval and listen: nothing to do.
+#  schedule:
+#    # Go duration. At least 1m.
+#    interval: 24h
+#    # HH:MM in the process time zone (TZ). Optional.
+#    at: "04:00"
+#    # Usable generations to keep. Older ones are deleted only after this
+#    # many newer ones exist. 0 keeps everything.
+#    keep: 7
+#    # Verify every new backup (recommended).
+#    verify: true
+#    # Report a delay when no usable generation is newer than this. Empty
+#    # means 1.5 times interval.
+#    delayAfter: 36h
+#    # Control API for the admin page (plain HTTP, no TLS). Requires
+#    # server.serviceToken. Running the binary directly, keep it on loopback
+#    # as below. In compose, ":3010" is fine because the backup-daemon
+#    # service publishes no port; never add one.
+#    listen: "127.0.0.1:3010"
+#  notify:
+#    # Empty: failures are only logged.
+#    webhookUrl: "https://hooks.example.com/..."
+#    # generic, discord or slack
+#    format: generic
+#  # What the server (the admin page, #3462) uses. The daemon reads
+#  # serviceToken too.
+#  server:
+#    # Empty type means backup.storage. Set it to give the server a key that
+#    # can only list, read and delete. With a "dir" storage, the server must
+#    # see the same directory and share its group (docs/backup.md).
+#    storage:
+#      type: ""
+#    # Price per GB-month (2^30 bytes) for the monthly estimate. 0 hides it.
+#    pricePerGbMonth: 0
+#    # Control API of `elythia backup daemon` (schedule.listen) for taking
+#    # and verifying from the admin page. Ignored while serviceToken is empty.
+#    serviceUrl: ""
+#    # Shared by the daemon's control API and the main server. Generate a
+#    # value (e.g. `openssl rand -hex 32`) and write the same one to both.
+#    # While empty, the daemon does not start with listen set, and the
+#    # server sends nothing.
+#    serviceToken: ""
+
+#   ┌──────────────────────────┐
+#───┘ Maintenance mode (#3463) └──────────────────────────────
+
+# Used by `elythia maintenance` and by every process while a maintenance
+# lets go of the database. See docs/deployment.md. Every key has a default;
+# the section may stay commented out.
+#maintenance:
+#  # The database the judge connects to while it counts the sessions on the
+#  # application database in pg_stat_activity. Must not be db.db.
+#  maintenanceDb: postgres
+#  # After this, the judge terminates the Elythia sessions that remain
+#  # for processes reporting they let go (drained, or still draining), as
+#  # the same database user. Other sessions (psql, processes that do not
+#  # report or still run) are never terminated; the maintenance waits.
+#  drainTimeout: 30s

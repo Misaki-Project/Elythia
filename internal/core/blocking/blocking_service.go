@@ -49,21 +49,18 @@ type Service struct {
 	// userListRepo は block で、ブロックされた側のリストからブロックした人を
 	// 外すのに使う (#3330)。nil なら外さない。
 	userListRepo repository.UserListRepository
+	// roomInvitations は block で、互いの持つチャットルームへの招待を消すのに
+	// 使う。nil なら消さない。
+	roomInvitations RoomInvitationRemover
 }
 
-// SetUserListRepo wires the user list repository used by Block to remove the
-// blocker from the blockee's lists (#3330).
-//
-// 本家 UserBlockingService.block は removeFromList(blockee, blocker) で、
-// ブロックされた側が持つ全てのリストからブロックした人を外す。外さないと、
-// ブロックされた側のリストのタイムラインにブロックした人の投稿が流れ続ける。
-func (s *Service) SetUserListRepo(r repository.UserListRepository) {
-	s.userListRepo = r
+// RoomInvitationRemover deletes chat room invitations on behalf of a block.
+// repository.ChatRepository implements it.
+type RoomInvitationRemover interface {
+	// DeleteInvitationsToOwnedRooms deletes the invitations of userID to every
+	// room owned by ownerID.
+	DeleteInvitationsToOwnedRooms(ownerID, userID string) error
 }
-
-// HasUserListRepo reports whether the user list repository was wired.
-// 起動時検査に使う。
-func (s *Service) HasUserListRepo() bool { return s.userListRepo != nil }
 
 // Unfollower removes a following on behalf of a block. 実装は
 // core/following.Service。
@@ -74,23 +71,6 @@ type Unfollower interface {
 	// delivery (Undo(Follow) / Reject(Follow)) still happen.
 	UnfollowForBlock(followerID, followeeID string, silent bool) error
 }
-
-// SetUnfollower wires the following removal used by Block (#3330).
-//
-// 本家 UserBlockingService.block は UserFollowingService.unfollow を双方向で
-// 呼ぶ。解除の本体 (行の削除、移行済みならカウントを触らない規則、利用者と
-// インスタンスのカウント、チャート、Undo(Follow) / Reject(Follow) の配送、
-// unfollow のイベント、following snapshot の再読込) を following.Service の
-// 1 か所に寄せるため、block 側では行を消さずにこれへ委ねる。以前は block 側で
-// 行とカウントだけを直接いじっていたので、配送もチャートも抜けていた。
-func (s *Service) SetUnfollower(u Unfollower) {
-	s.unfollower = u
-}
-
-// HasUnfollower reports whether the unfollower was wired.
-//
-// 未配線だと、ブロックしても既存のフォローが残る。起動時検査に使う。
-func (s *Service) HasUnfollower() bool { return s.unfollower != nil }
 
 // FederationHook delivers Block / Undo(Block) AP activities to a remote
 // blockee on local block / unblock (#1560)。実装は core/federation。
@@ -119,37 +99,41 @@ type FollowRequestCanceller interface {
 	CancelFollowRequestsBetween(a, b string, silent bool) error
 }
 
-// SetFollowRequestCanceller wires the pending-follow-request cleanup used by
-// Block. upstream UserBlockingService.block は cancelRequest を双方向で呼び、
-// 保留中の申請を削除する (相手が remote なら Undo(Follow) / Reject を配送)。
-// 未配線だと block しても申請が残り、block 中に承認されるとフォロー関係が
-// 成立してしまう。
-func (s *Service) SetFollowRequestCanceller(h FollowRequestCanceller) {
-	s.followRequestCanceller = h
-}
-
-// HasFollowRequestCanceller reports whether the canceller was wired.
-// 起動時検査 (criticalWiring) に使う。
-func (s *Service) HasFollowRequestCanceller() bool {
-	return s.followRequestCanceller != nil
-}
-
 // SetFederationHook wires the AP delivery hook used by Block / Unblock (#1560)。
 func (s *Service) SetFederationHook(h FederationHook) {
 	s.federationHook = h
 }
 
 // NewService constructs a UserBlockingService.
-// ブロック時の既存フォローの解除は SetUnfollower で配線する。
+//
+// unfollower removes the existing followings in both directions on block
+// (#3330). followRequestCanceller cancels the pending follow requests in both
+// directions. userListRepo removes the blocker from the blockee's lists
+// (#3330). roomInvitations deletes the invitations to the chat rooms either
+// side owns.
+//
+// 本家 UserBlockingService.block は、フォローの解除 (unfollow)・保留中の申請の
+// 取り消し (cancelRequest)・リストからの除去 (removeFromList)・チャットルームの
+// 招待の削除 (removeRoomInvitations) を行う。4 つとも無いと黙って劣化する
+// (ブロックしてもフォロー・申請・リスト・招待が残る) ので、構築子の必須の引数で
+// 受ける (#3825)。
 func NewService(
 	userRepo repository.UserRepository,
 	blockingRepo repository.BlockingRepository,
 	idGen id.Generator,
+	unfollower Unfollower,
+	followRequestCanceller FollowRequestCanceller,
+	userListRepo repository.UserListRepository,
+	roomInvitations RoomInvitationRemover,
 ) *Service {
 	return &Service{
-		userRepo:     userRepo,
-		blockingRepo: blockingRepo,
-		idGen:        idGen,
+		userRepo:               userRepo,
+		blockingRepo:           blockingRepo,
+		idGen:                  idGen,
+		unfollower:             unfollower,
+		followRequestCanceller: followRequestCanceller,
+		userListRepo:           userListRepo,
+		roomInvitations:        roomInvitations,
 	}
 }
 
@@ -235,6 +219,10 @@ func (s *Service) block(blockerID, blockeeID string, silent bool) (*model.Blocki
 	// ブロックされた側のリストからブロックした人を外す。本家 removeFromList と
 	// 同じく、向きはこの 1 方向だけで、silent でも外し、イベントは出さない。
 	s.removeFromLists(blockeeID, blockerID)
+	// 互いの持つチャットルームへの招待を消す (本家 removeRoomInvitations)。
+	// リストと同じく、失敗しても block 自体は成立させる。
+	s.removeRoomInvitations(blockerID, blockeeID)
+	s.removeRoomInvitations(blockeeID, blockerID)
 
 	// 保留中の follow request を双方向で取り消す。upstream
 	// UserBlockingService.block の cancelRequest 相当。
@@ -299,6 +287,18 @@ func (s *Service) removeFromLists(listOwnerID, userID string) {
 	}
 }
 
+// removeRoomInvitations deletes the invitations of userID to the chat rooms
+// owned by roomOwnerID.
+func (s *Service) removeRoomInvitations(roomOwnerID, userID string) {
+	if s.roomInvitations == nil {
+		return
+	}
+	if err := s.roomInvitations.DeleteInvitationsToOwnedRooms(roomOwnerID, userID); err != nil {
+		slog.Warn("block: remove chat room invitations failed",
+			"owner", roomOwnerID, "user", userID, "err", err)
+	}
+}
+
 // publishBlockReload notifies the blockee's streams of a block (#2400).
 //
 // **向きに注意。** MuteBlockSnapshot が持つのは `BlockingMe` (= 自分を block して
@@ -318,6 +318,24 @@ func (s *Service) publishBlockReload(blockeeID string) {
 	s.relationReload.PublishMuteBlockReload(blockeeID)
 }
 
+// notBlockingOrNoSuchUser tells why a pair to unblock was not found: the
+// blockee does not exist (ErrBlockeeNotFound) or is not blocked
+// (ErrNotBlocking).
+//
+// 本家の blocking/delete は、関係の有無より先に相手の有無を見て NO_SUCH_USER を
+// 返す (#3760)。関係の行は相手の行を外部キーで要るので、関係があれば相手は居る。
+// 相手を引くのは、関係が見つからなかったときだけでよい。
+func notBlockingOrNoSuchUser(users repository.UserRepository, blockeeID string) error {
+	if _, err := users.FindByID(blockeeID); err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
+		return ErrBlockeeNotFound
+	}
+	return ErrNotBlocking
+}
+
 // Unblock removes a blocking relationship.
 func (s *Service) Unblock(blockerID, blockeeID string) error {
 	if blockerID == blockeeID {
@@ -329,7 +347,7 @@ func (s *Service) Unblock(blockerID, blockeeID string) error {
 		if !repository.IsNotFound(err) {
 			return err
 		}
-		return ErrNotBlocking
+		return notBlockingOrNoSuchUser(s.userRepo, blockeeID)
 	}
 	if err := s.blockingRepo.Delete(b); err != nil {
 		return err
@@ -350,13 +368,13 @@ func (s *Service) IsBlocked(blockerID, blockeeID string) (bool, error) {
 	return s.blockingRepo.Exists(blockerID, blockeeID)
 }
 
-// List returns the user's blockings with cursor (sinceID/untilID) or offset
-// pagination. Cursor 指定時は offset 無視 (upstream makePaginationQuery と一致)。
-func (s *Service) List(blockerID, sinceID, untilID string, limit, offset int) ([]*model.Blocking, error) {
+// List returns the user's blockings with cursor (sinceID/untilID) pagination.
+// 本家の paramDef に offset は無いので受けない (#3760)。
+func (s *Service) List(blockerID, sinceID, untilID string, limit int) ([]*model.Blocking, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	return s.blockingRepo.ListByBlocker(blockerID, sinceID, untilID, limit, offset)
+	return s.blockingRepo.ListByBlocker(blockerID, sinceID, untilID, limit, 0)
 }
 
 // UserMaterializer promotes a relay-only author out of the ephemeral store

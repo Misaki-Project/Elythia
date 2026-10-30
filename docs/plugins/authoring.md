@@ -33,7 +33,7 @@ apiVersion: 1
 ```
 module github.com/you/elythia-plugin-myplugin
 
-go 1.27.1
+go 1.27.3
 
 require github.com/elythia-network/elythia v0.0.0
 
@@ -158,6 +158,7 @@ GORM を使いたければプラグイン側で包む（`postgres.New(postgres.C
 ### 守ること
 
 - **Elythia 本体のテーブルに触れない。** ノートの可視性判定はアプリケーション側にあり DB には無いので、`SELECT * FROM note` は非公開ノートを含む。本体のデータは API 経由で取る
+- 書き込みも同じ。たとえばミュート・ブロック・フォローの一覧は、本体がプロセス内に持っていて、本体の書き込みの経路で捨てている (#3607)。表へ直接書くと捨てられず、最大 1 分のあいだ反映されない。変更は API（`mute/create` など）で行う
 - **冪等に書く。** ストレージへの書き込みと API 呼び出しは同じトランザクションに入れられない
 - 一度適用した version の SQL を書き換えても再実行されない。変更は新しい version で
 
@@ -233,6 +234,141 @@ return res.Assigned, nil
 
 非公開ロールで `roles/assignment-show` を使うと、**付与されていない利用者には `NO_SUCH_ROLE`** が返る（存在の有無を漏らさないため）。条件つきかつ非公開のロールは、条件を満たす利用者にもこうなる。`admin/roles/assignment-show` にこの秘匿は無く、モデレーター以上なら非公開ロールも読める。
 
+## 管理するアカウント (bot)
+
+プラグインは、自分が管理するローカルのアカウントを作って動かせる (#3468)。bot のように、人が中に入らずプラグインが投稿や返事をするアカウントのための口。
+
+```go
+acc, err := ctx.Accounts().Create(c, "weatherbot")
+if errors.Is(err, plugin.ErrUsernameUnavailable) {
+	// 既に使われている・予約語・削除済みアカウントの名前
+}
+name, desc := "天気bot", "毎朝 7 時に天気を投稿します。"
+err = ctx.Accounts().UpdateProfile(c, acc.ID, plugin.ProfileUpdate{
+	Name:        &name,
+	Description: &desc,
+	Avatar:      &plugin.Image{Data: pngBytes, Filename: "avatar.png"},
+})
+
+// 動かすのは AsUser
+_, err = ctx.API().AsUser(acc.ID).Call(c, "notes/create", map[string]any{"text": "おはようございます"})
+```
+
+`c` は `context.Context` (ルートなら `req.Context()`、ジョブなら受け取ったもの)。
+
+**作ったアカウントには、本体がどの経路からもログインさせない。** パスワードを持たず、パスワード・パスキー・2FA・パスワードの再設定・MiAuth / OAuth のトークン発行・管理者によるパスワードのリセットは、どれも拒否される (居ない利用者と同じ応答か、`PLUGIN_MANAGED_ACCOUNT`)。普通の利用者として作ると、運営者が知らないうちに認証情報が残り、乗っ取りの入口になるため。
+
+**そのアカウントのトークンは、プロセス内の呼び出しでだけ通る。** `AsUser` はそのアカウントのネイティブトークンを載せて本体の API をプロセスの中から呼ぶ。外から届いた HTTP のリクエストと streaming の接続では、トークンが正しくても `401 AUTHENTICATION_FAILED` になる。トークンはどの API の応答にも出ない。誰もログインしないので、漏れても気付いて作り直す人がいないため。streaming は使えないが、メンションやフォローなどは[通知の handler](#管理するアカウントへの通知) で受け取れる。
+
+ほかに決まっていること:
+
+- **操作できるのは自分が作ったアカウントだけ。** 他のプラグインが管理するアカウントや普通の利用者の ID を `UpdateProfile` / `Delete` に渡すと `plugin.ErrAccountNotFound` になる (存在しないのと区別しない)。`List` も自分のアカウントだけを返す。`AsUser` はこの制限を受けない (どの利用者としても呼べる、今までどおりの口)
+- **必ず bot (`isBot: true`) になる。** `i/update` で `isBot: false` を送ると `400 PLUGIN_MANAGED_ACCOUNT_MUST_BE_BOT` で拒否される (黙って無視はしない)。`isBot: true` を含む更新や、`isBot` を含まない更新は通る
+- **名前の検査は管理者がアカウントを作るときと同じ。** 最小文字数は見ないが、予約語・禁止語・削除済みアカウントの名前は使えない。形式 (`^[a-zA-Z0-9_]{1,20}$`) が違えば `plugin.ErrInvalidUsername`、使えない名前なら `plugin.ErrUsernameUnavailable`
+- **`UpdateProfile` は `i/update` をそのアカウントとして呼ぶのと同じ。** 検査も連合への反映も普通のプロフィール変更と同じに効き、拒否されたら `*plugin.APIError` になる。画像はそのアカウントのドライブにファイルとして置かれ、容量や受け付ける種類の制限もそのアカウントのロールで決まる (画像でなければ `AVATAR_NOT_AN_IMAGE` などで拒否され、置いたファイルはドライブに残る)。文字列の `""` は、表示名なら未設定に、自己紹介なら空に戻す。名前・自己紹介・画像以外の項目は `AsUser(id).Call(c, "i/update", ...)` で変える
+- **`Delete` は管理画面から消すのと同じ流れ。** 投稿・ドライブ・フォローは後からジョブで消え、連合先へ `Delete` が届く。消したアカウントの名前は再利用できない
+- **凍結・サイレンスは普通のアカウントと同じく効く。** 凍結されると `AsUser` の呼び出しも `403 YOUR_ACCOUNT_SUSPENDED` になり、`UpdateProfile` は画像を置く前に `plugin.ErrAccountSuspended` で断る
+- **プラグインを外したり無効にしたりしても、アカウントは消えない。** 過去の投稿やフォロワーを残すため。プラグインが動いていないので、投稿や返事はしなくなる。要らなくなったら外す前に `Delete` すること
+- **プラグインの名前を変えると、それまでのアカウントは新しい名前から操作できない。** アカウントには作ったときの名前が記録されているので、新しい名前のプラグインの `List` には出ず、`UpdateProfile` / `Delete` は `ErrAccountNotFound` になる。アカウント自体は残る。要らなければ、名前を変える前に `Delete` するか、管理画面から削除する
+- 管理画面のユーザーの詳細 (`admin/show-user` の `managedByPlugin`) に、どのプラグインが管理しているかが出る
+- **初回セットアップを妨げない。** 新しいインスタンスでプラグインが起動時にアカウントを作っても、最初の管理者を作る画面 (`admin/accounts/create` の初回セットアップ) はそのまま使える。セットアップの判定は管理するアカウントを数えない。nodeinfo と `/api/stats` の利用者数にも数えない (#3881)
+
+テストでは `plugintest` のフェイクが既定で入っている。本番と同じ理由 (他のプラグインのアカウント・形式・重複) で拒否するので、`SeedAccount` で他のプラグインのアカウントを置き、触れないことを確かめられる。中身は `ManagedAccounts()` で読める。
+
+```go
+h := plugintest.New(t).WithName("weather")
+theirs := h.SeedAccount("other-plugin", "theirs")
+// ... プラグインのコードを動かす ...
+require.Len(t, h.ManagedAccounts(), 2)
+require.Equal(t, "theirs", theirs.Username) // 他のプラグインのアカウントは残っている
+```
+
+## 管理するアカウントへの通知
+
+管理するアカウント宛ての通知を、プラグインの handler で受け取れる (#3469)。bot がメンションに返事をするのに、`i/notifications` を定期的に読みに行かなくて済む。
+
+```go
+func notifications(ctx plugin.Context, n plugin.Notifications) error {
+	n.Handle(func(c context.Context, ev plugin.Notification) error {
+		switch ev.Type {
+		case plugin.NotificationMention, plugin.NotificationReply:
+			// ダイレクト (specified) に公開の返事をすると、宛先の外へ漏れる
+			if ev.NoteVisibility == "specified" {
+				return nil
+			}
+			// 同じ通知がもう一度届いても、返事を二重に投稿しない
+			if alreadyReplied(c, ev.ID) {
+				return nil
+			}
+			_, err := ctx.API().AsUser(ev.AccountID).Call(c, "notes/create", map[string]any{
+				"text":       "呼びましたか?",
+				"replyId":    ev.NoteID,
+				"visibility": ev.NoteVisibility, // 元の投稿の公開範囲に合わせる
+			})
+			if err != nil {
+				return retryUnlessClientError(err)
+			}
+			return markReplied(c, ev.ID)
+		case plugin.NotificationFollow:
+			// フォローし返す。同じ通知がもう一度届くと「既にフォローしている」の
+			// 4xx になるので、それも再試行しない
+			_, err := ctx.API().AsUser(ev.AccountID).Call(c, "following/create", map[string]any{"userId": ev.UserID})
+			return retryUnlessClientError(err)
+		}
+		return nil // 知らない種類は無視する
+	})
+	return nil
+}
+
+// retryUnlessClientError は 4xx (429 を除く) を再試行しない失敗にする。投稿が
+// 消えた・既にフォローしている、などは繰り返しても直らない。5xx と 429 は
+// そのまま返すので、後で再試行される。
+func retryUnlessClientError(err error) error {
+	var apiErr *plugin.APIError
+	if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 && apiErr.Status != 429 {
+		return plugin.NoRetry(err)
+	}
+	return err
+}
+```
+
+`Definition.Notifications` に渡す (`Notifications: notifications`)。`Jobs` と同じく、queue を担うプロセスでだけ呼ばれる。宣言したのに `Handle` を呼ばないと、起動に失敗する。
+
+届くもの:
+
+| `ev.Type` | いつ | `NoteID` |
+|---|---|---|
+| `NotificationMention` | メンションされた | メンションした投稿 |
+| `NotificationReply` | 投稿に返信された | 返信の投稿 |
+| `NotificationQuote` | 投稿を引用された | 引用した投稿 |
+| `NotificationFollow` | フォローされた | (空) |
+| `NotificationFollowRequest` | フォローリクエストが来た (承認制のとき) | (空) |
+| `NotificationReaction` | 投稿にリアクションされた (`Reaction` に絵文字) | リアクションされた投稿 |
+| `NotificationChatMessage` | 1:1 のチャットでメッセージが来た (`ChatMessageID`) | (空) |
+
+`UserID` は相手 (メンションした人・フォローした人・送った人。リモートの利用者のこともある)。`NoteVisibility` は mention / reply / quote のときだけ、通知を作った時点の投稿の公開範囲 (`public` / `home` / `followers` / `specified`) が入る (リアクションでは空)。**`specified` (ダイレクト) の投稿に公開の返事をしないこと** — 宛先の外へ本文が漏れる。本文などの中身は渡さないので、要るなら `AsUser(ev.AccountID)` で `notes/show` などを呼んで取る。その時点の可視性で判定されるので、消された投稿は取れない。
+
+決まっていること:
+
+- **届くのは自分が管理するアカウント宛てだけ。** 他のプラグインのアカウントや普通の利用者への通知は届かない。`Notifications` を宣言していないプラグインのアカウントへの通知は、キューに積まれない
+- **通知が作られなかったら届かない。** そのアカウントが相手をミュートしている、通知の受信設定 (`notificationRecieveConfig`) やロールで切っている、スレッドをミュートしている、などで通知が作られない場合は handler も呼ばれない。届くのは実際に作られた通知と同じ数で、1 つの投稿がメンションと返信の両方にあたるときは返信の 1 件だけ、引用しながらメンションした投稿は引用とメンションの 2 件になる (`ev.NoteID` は同じ)
+- **利用者に見えない相手からは届かない。** 次の相手からの通知とチャットは、プラグインには届けない。bot が、利用者からは見えないものに返事をしないようにするため
+  - ブロックしている相手。本体はブロックした相手からのメンションでも通知を作る (本家と同じで、ブロックでは通知は止まらない)
+  - ミュートしている相手。チャットは通知を作らないので、ここで落とす
+  - 凍結中の相手と、ミュートしたインスタンス (`mutedInstances`) の相手。本体は通知を作るが、`i/notifications` が読むときに落とす
+  - 相手が見つからないとき (連合の相手が手元に無いなど) と、確かめられなかったとき (DB の障害など) も届けない
+- **削除済み・凍結中のアカウント宛ては届かない。** 凍結中は `AsUser` の呼び出しが `403` になるので、届けても失敗するだけのため
+- **ここに無い種類 (リノート、フォローしている人の投稿、アンケートの終了など) は届かない。** 今後足すことがあるので、知らない `ev.Type` は無視すること
+- **ルームのチャットは届かない。** 1:1 のメッセージだけ
+- **handler は通知を作る処理から切り離して呼ぶ。** 本体は通知を作った後にプラグインの専用キュー `plugin:<name>` へ積むだけで、handler はキューの worker が呼ぶ。handler が遅くても失敗しても、投稿や通知の処理は待たないし失敗もしない。ただし**積む処理そのものは同期**で、リアクション・フォロー・チャットの API (と通知を作る処理) の中で行う。Redis が応答しないと、積むのに最大 5 秒待ってから諦める。諦めた通知は届かない (ログに残る)
+- **handler はプラグインのジョブと同じキューで動く。** キュー `plugin:<name>` は `Jobs` のジョブと共有で、同時に動くのはプロセスあたり 2 つまで (`unknownQueueConcurrency`)。時間のかかるジョブが 2 つ走っていると、その間は返事が遅れる。重い処理はジョブを短く分けるか、handler の中では受け付けだけをして後回しにする
+- **at-least-once で届く。** handler がエラーを返すと再試行する (初回を含めて 5 回まで、10 秒起点の指数バックオフ。最後まで失敗したら捨てる)。**繰り返しても直らない失敗は `plugin.NoRetry(err)` で包んで返す** と、そこで打ち切る (`errors.Is(err, plugin.ErrNoRetry)` で判定するので、`%w` で包んでもよい)。`Jobs` のジョブでも同じに効く。成功した後でも、worker の再起動などで同じ通知がもう一度届くことがある。**`ev.ID` を見て冪等に書くこと** (再試行しても `ev.ID` は変わらない)。返事を投稿するなら、投稿した `ev.ID` を自分の storage に記録しておく
+- **順序は保証しない。** 再試行や並行した worker で前後する
+- 1 回の実行の上限はジョブと同じ (既定 1 時間、[ジョブ](#ジョブ)を参照)。`c` を尊重すること
+- **bot 同士で返事をし合うと止まらない。** 相手も bot なら返事をしない (`users/show` の `isBot` を見る) など、プラグインの側で止めること
+
+テストは `plugintest` の `Notifications` と `Notify` で、handler へ直接届けられる ([テスト](#テスト))。
+
 ## ジョブ
 
 ```go
@@ -284,7 +420,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 |---|---|
 | 名前 | `Jobs.Handle` に登録したものと同じもの。登録が無い名前で積むと処理者なしとして失敗する (再試行はしない) |
 | `Definition.Jobs` | **宣言していないと積めない** (エラーになる)。専用キューを作らないので、積めても誰も処理しないため |
-| 再試行 | **既定は無し。** 冪等かどうかはプラグインしか知らないので、`WithMaxAttempts` で明示する。頼むと指数バックオフ (10 秒起点) が自動で付く — 付けないと落ちている取得先を遅延 0 で連打する |
+| 再試行 | **既定は無し。** 冪等かどうかはプラグインしか知らないので、`WithMaxAttempts` で明示する。頼むと指数バックオフ (10 秒起点) が自動で付く — 付けないと落ちている取得先を遅延 0 で連打する。handler が `plugin.NoRetry(err)` を返すと、残りの回数があっても打ち切る |
 | 重複排除 | `WithDedup` で抑制されたときも `Enqueue` は `nil` を返す。**積めたかどうかは区別できない** |
 | ロール | 積むのはどのプロセスからでもできる。処理するのは queue ロールのプロセスだけ |
 
@@ -304,7 +440,11 @@ handler 自体は止まらない** (Go では goroutine を殺せない) ので�
 
 キューに載せるほどでもない、プロセス内で完結する非同期処理は `ctx.Go()` を使う（recover 付き）。**再起動をまたがない**ので、跨いでほしい処理はキューへ。
 
-起動中に呼んだ`ctx.Go()`は、全pluginのstorage、migration、`EffectivePolicies`、`Routes`、`Jobs`とhost側のroute配線が成功するまで開始されない。起動に失敗した場合は保留した処理を破棄する。起動成功後の呼び出しは直ちに開始する。cancelやdrainは提供しないため、正常終了時の停止が必要な処理はplugin側で終了条件を持つこと。
+起動中に呼んだ`ctx.Go()`は、全pluginのstorage、migration、`EffectivePolicies`、`Routes`、`Jobs`とhost側のroute配線が成功するまで開始されない。起動に失敗した場合は保留した処理を破棄する。起動成功後の呼び出しは直ちに開始する。
+
+`ctx.Go()`で起動したgoroutineは、その`Context`を渡したサーバーの世代が止まるとき (プロセスの終了と、メンテナンスモードに入るとき) に待たれる (#3661)。待つ時間には上限があり (止める側の期限の残りの1/4、最大3秒。期限が切れていれば待たない。下限は無い)、過ぎたものは残したまま止める。長く走る処理は`ctx.GoContext(func(c context.Context) { ... })`を使い、`c`が切れたら戻ること。`c`は待ちの3/4を過ぎた時点で切れ、残りの1/4がその後の戻りのための時間になる。世代が止まった後に呼んだ`ctx.Go()` / `ctx.GoContext()`は走らない。
+
+**`Migrations`・`Peer`・`EffectivePolicies`・`Routes`・`Jobs`は、1つのプロセスの中で何度呼ばれてもよいように書く。** メンテナンスモード (#3463、[deployment.md](../deployment.md#メンテナンスモード)) を抜けるたびに、Elythiaはサーバーを作り直し、これらをもう一度呼ぶ。storageのpoolは古いものが閉じられ、新しいものが渡される。パッケージ変数に前回の`Context`やstorageを持ち続けると、閉じたpoolを使ってエラーになる。`ctx.Go()`で起動した長く走るgoroutineは、作り直しの前に待たれるが、待ちの上限を過ぎると古いものが残る。長く走るものは`ctx.GoContext()`で起動し、受け取った`context.Context`が切れたら戻ること (#3661)。
 
 > **プラグインが素の `go` を書くとプロセスごと落ちる。** Go は他 goroutine の panic を回収できず、Elythia 側の recover では止められない。
 
@@ -378,7 +518,7 @@ func effectivePolicies(ctx plugin.Context, inv plugin.EffectivePolicyInvalidator
 
 **置換が複数providerから重なったときはmalformedではない。** 上に挙げた失敗条件は「provider自身の出力が壊れている」場合で、置換の競合はそうではない。同じ`Key`と`ReplaceRoleID`を複数providerが置換した場合は**競合**になる。hostはそのpairを置換として受け入れず、ネイティブcontributionへ戻す — どちらの値も採らないので、管理者が設定したロールの値が残る。provider全体は失敗扱いにしないので、**ネイティブへ戻るのはそのpairだけで、他のkeyの追加contributionも他のロールの置換も通常どおり効く**。checked解決はこの結果を競合を表す固定errorと伴って返し、unchecked解決は同じ結果を返して競合errorだけを捨てる。provider失敗と併発した場合は両方のerrorが`errors.Is`で辿れる。provider失敗は宣言keyをネイティブへ戻すので、他のproviderの置換も同じkeyなら巻き戻る。
 
-instance/server capはplugin集約の後に適用する。`maxFileSizeMb`、`chunkedUploadMaxConcurrentSessions`、`chunkedUploadMaxPendingMb`へ`0`以下の無制限値を返しても、positiveなcapが設定されていればcap値になる。
+instance/server capはplugin集約の後に適用する。`chunkedUploadMaxConcurrentSessions`と`chunkedUploadMaxPendingMb`へ`0`以下の無制限値を返しても、positiveなcapが設定されていればcap値になる。`maxFileSizeMb`はserver capを超える値だけがcap値に下がり、`0`以下はそのまま残る (本家と同じく、`0`以下は「保存できない」の意味になる。`driveCapacityMb`も同じ)。
 
 `Resolve`は、明示的なinvalidationの間は`UserID`、sorted active `RoleIDs`、`ActiveAssignments`だけで結果が決まる純粋関数として実装する。時刻、request固有情報、未通知の外部状態へ依存してはならない。**同じ`RoleIDs`でも`ActiveAssignments`が違えば結果が違ってもよい**ので、hostはproviderごとの成功結果cache keyにassignment IDを含める（付け外し / 再割り当ての直後に前の結果を返さないため）。cacheはoperator設定`effectivePolicyProviderCacheEntries`（既定10000件、providerごと）のLRUであり、eviction時は同じ入力を再解決する。
 
@@ -400,6 +540,81 @@ if err := ctx.Config().Unmarshal(&c); err != nil {
 設定が書かれていなければ `v` は変更されないので、既定値がそのまま残る。
 
 **キーの大文字小文字に注意。** 読み込みに使っている Viper はキーを小文字化する（`apiKey` → `apikey`）。構造体のフィールドは `encoding/json` が大文字小文字を無視して照合するので camelCase のタグで問題ないが、**map で受ける設定はキーの大小が復元されない**。
+
+## 秘密の値
+
+API キーやトークンのように、設定ファイルに書きたくない値を**管理画面から入れてもらい、暗号化して DB に置く**仕組み (#3470)。
+
+```go
+var Plugin = plugin.Definition{
+	Name:       "mybot",
+	APIVersion: plugin.APIVersion,
+	Secrets: []plugin.SecretSpec{
+		{Name: "apiKey", Description: "外部サービスの API キー"},
+	},
+	Jobs: jobs,
+}
+```
+
+`Secrets` で宣言した名前ごとに、コントロールパネルの「サーバープラグイン」に入力欄が出る。値はサーバー側で読む。
+
+```go
+func jobs(pctx plugin.Context, j plugin.Jobs) error {
+	j.Handle("post", func(ctx context.Context, _ json.RawMessage) error {
+		key, err := pctx.Secrets().Get(ctx, "apiKey")
+		switch {
+		case errors.Is(err, plugin.ErrSecretNotSet):
+			// まだ入れられていない。止まらずに案内を出す
+			pctx.Logger().Warn("apiKey が未設定です (コントロールパネル > サーバープラグイン)")
+			return nil
+		case errors.Is(err, plugin.ErrSecretsUnavailable):
+			// 運営者が pluginSecretKey を設定していない
+			return nil
+		case errors.Is(err, plugin.ErrSecretUnreadable):
+			// 鍵が変わった。管理画面から入れ直してもらう
+			return nil
+		case err != nil:
+			return err
+		}
+		return callService(ctx, key)
+	})
+	return nil
+}
+```
+
+**呼ぶたびに DB から読んで復号する。** 管理画面で入れ替えた値は次の `Get` から使われ、再起動は要らない。
+
+**値は書き込み専用。** 保存した値は管理画面にも本体の API の応答にも出ず、出るのは「設定済みか」と、20 文字以上の値の末尾 4 文字だけ。**読んだ値を自分のルートの応答に入れないこと** — この約束をプラグインが自分で破ることになる。ログにも出さない。
+
+| | |
+|---|---|
+| 名前 | 英字で始まり、英数字と `_` `-` だけで 64 文字以内。宣言 (`Validate`) でも保存でも同じ規則で検査する |
+| 値 | 1 バイト以上 8 KiB 以下の UTF-8。**管理画面から入れた値は前後の空白・改行を落として保存する** (貼り付けた API キーに付いた改行で認証が失敗するのを防ぐ)。空白だけなら断る。`ctx.Secrets().Set` はバイト列をそのまま置く |
+| 範囲 | プラグインごとに分かれる。他のプラグインの同名の値は `ctx.Secrets()` からは見えない。**これは API の範囲であってセキュリティ境界ではない** (#2476、[最初に知っておくこと](#最初に知っておくこと)) — プラグインは本体と同じプロセス・同じ DB で動き、設定ファイルの鍵も読める |
+| 管理画面から入れられるもの | **宣言した名前だけ**。宣言していない名前は、プラグインが `Set` で置いたもの (OAuth で受け取ったトークンなど) として一覧に出て、管理画面からは削除だけができる |
+| 書き換えられる人 | 管理者だけ (モデレーターは不可)。ブラウザでログインした token に限り、アプリや API の token では一覧も見られない |
+
+`ctx.Secrets().Set` / `Delete` でプラグイン自身が値を置くこともできる。**鍵が設定されていなければ、どの操作も `ErrSecretsUnavailable` を返す** (平文で置く経路は無い)。鍵が無い環境でも起動を止めず、機能を止めて案内を出す作りにすること。
+
+暗号化の形と、鍵の入れ替え・紛失の手順は[運営者向け](operating.md#秘密の値)。
+
+### 独自の管理画面に入力欄を置く
+
+コントロールパネルの「サーバープラグイン」に入力欄が出るので、何もしなくても使える。自分の管理画面にも置きたいときは `MkPluginSecrets` を使う。
+
+```vue
+<script setup lang="ts">
+import { MkPluginSecrets } from '@/plugin-api.js';
+</script>
+
+<template>
+<MkPluginSecrets plugin="mybot"/>
+</template>
+```
+
+管理者でなければ「管理者だけが扱える」と出る。入力口は本体が張る予約パス (`/api/plugin/<name>/_secrets`、`/_secrets/set`、`/_secrets/delete`) で、プラグインが同じパスを登録することはできない。
+
+**入力口が無いと 200 + `{}` が返る。** `Secrets` を宣言していない・無効になっているプラグインには予約パスを張らないので、`POST /api/plugin/<name>/_secrets*` は本体の API の catchall に落ち、エラーではなく `200 {}` になる (GET 以外の未登録エンドポイントと同じ扱い)。スクリプトから叩くときは、一覧の応答に `secrets` 配列があるか、保存が 204 で返ったかを見ること。`MkPluginSecrets` はこの形を見分けてエラーとして出す。
 
 ## 外へ HTTP を出す
 
@@ -427,7 +642,21 @@ defer res.Body.Close() //nolint:errcheck // 読み捨て
 
 素の client を使うと、運営者が proxy を設定していても**そのプラグインだけがサーバーの素の IP で外へ出る**。リモートに「このインスタンスの所在」を渡すことになるので、匿名性を期待している運営者の前提が崩れる。
 
-**`Transport` を差し替えないこと。** 差し替えると上の 2 つが消える。もっと短い / 長い期限が要るなら `http.NewRequestWithContext` で per-request に付ける。
+**`Transport` を差し替えないこと。** 差し替えると上の 2 つが消える。
+
+**期限を延ばすときは、client の写しを作る。** `http.NewRequestWithContext` の context で期限を**縮める**ことはできるが、`Client.Timeout` (30 秒) は context とは別に効くので、context では**延ばせない**。長く待つ要求は、返ってきた client を書き換えずに写しを作り、写しの `Timeout` を変える (#3603)。
+
+```go
+hc := *ctx.HTTP()
+hc.Timeout = 2 * time.Minute
+res, err := hc.Do(hreq)
+if err != nil {
+	return err
+}
+defer res.Body.Close() //nolint:errcheck // 読み捨て
+```
+
+写しも同じ `Transport` を使うので、SSRF ガードと運営者の設定はそのまま効く。返ってきた client そのものの `Timeout` を書き換えると、そのプラグインの他の要求にも効き、並行に走る要求と data race になる。`Timeout` を 0 にすると期限が無くなるので、正の値を入れる (0 にするなら要求の context で必ず期限を付ける)。
 
 これは**セキュリティ境界ではない** — プラグインは `net/http` を直接使えるので、これは「間違えにくい既定」を配るもの。
 
@@ -533,13 +762,13 @@ r.POST("/admin/stats", func(req plugin.Request) (any, error) {
 
 `Request.IsModerator()` / `IsAdministrator()` が使える。**未認証・判定不能なときは false** を返す（判定できないときに通すと、権限の穴が「動いているように見える」形で残る）。
 
-### レート制限は掛からない
+### レート制限は一律の既定値
 
-本体の per-endpoint テーブルはプラグインのパスを持たないので、**登録したルートには上限が無い**。認証と body の上限（1 MiB）までは本体が見るが、呼び出し回数は見ない。
+本体の per-endpoint テーブルはプラグインのパスを持たないので、**登録したルートには一律の既定の上限が掛かる**（`internal/server/middleware/ratelimit_defs.go` の `PluginRouteDefaultLimit`、10 分に 600 回）。数えるのはルート（パスの型）ごとに、本体の endpoint と同じ単位（ログインしていれば利用者とIP、していなければIP）。超えると本体と同じ 429 `RATE_LIMIT_EXCEEDED` になる。`plugin.Router` には上限を宣言する口が無いので、ルートごとに値を変えることはできない。peer の受け口（`_peer`）には掛からない（専用の上限がある）。管理者が `disableEndpointRateLimits` で本体の上限を切ると、これも切れる。
 
-重い処理（画像の生成、外部への問い合わせ、集計クエリ）を含むなら自分で持つこと。素直なのは結果をキャッシュすることで、`Storage()` に置くか、プロセス内に持つ。
+この値は叩き続けるものを止めるためのもので、重い処理（画像の生成、外部への問い合わせ、集計クエリ）を守るには緩い。そういう処理は自分でも持つこと。素直なのは結果をキャッシュすることで、`Storage()` に置くか、プロセス内に持つ。
 
-`API().Anonymous()` / `AsUser()` 越しに本体のエンドポイントを呼ぶ分には、本体のレート制限がそのまま効く（`AsUser` ならその利用者の枠）。自前で DB や外部を叩く経路だけが素通しになる。
+`API().Anonymous()` / `AsUser()` 越しに本体のエンドポイントを呼ぶ分には、本体のレート制限がそのまま効く（`AsUser` ならその利用者の枠）。
 
 ### 2 つの形式
 
@@ -566,9 +795,44 @@ import { MkSelect, MkSwitch, MkAvatar, MkUserName, MkTime, PageWithHeader, useMk
 
 ```ts
 const res = await host.api<T>('plugin/myplugin/me', { ... });
+
+const controller = new AbortController();
+const abortable = host.api<T>('plugin/myplugin/preview', { url }, {
+	signal: controller.signal,
+});
 ```
 
-**POST 固定。** 利用者のセッションがそのまま使われる。
+**POST 固定。** 利用者のセッションがそのまま使われる。第3引数の`signal`へ
+`AbortSignal`を渡すと、画面の破棄などに合わせてリクエストを中止できる。
+
+### プレビュー provider
+
+ノート内のURLカードをプラグイン独自の表示へ差し替える場合は、`setup`で
+`host.preview.register`を呼ぶ。
+
+```ts
+host.preview.register({
+	id: 'post-card',
+	priority: 100,
+	requiresDetail: true,
+	match: input => input.kind === 'url' && new URL(input.href).hostname === 'example.com',
+	load: async (input, context, signal) => {
+		if (input.kind !== 'url') throw new Error('URL only');
+		return host.api('plugin/myplugin/preview', { url: input.href }, { signal });
+	},
+	component: MyCard,
+});
+```
+
+- `match`は同期かつI/Oなしで判定する。複数が一致した場合は`priority`の降順、同値なら名前空間付きIDの昇順で1つに決まる。
+- `id`はプラグイン内の名前で、hostが`<plugin名>:<id>`へ名前空間化する。同じ名前空間付きIDを二重登録すると例外になる。
+- `requiresDetail: true`に一致したURLは、タイムラインでは既存カードを取得せず元URLのリンクとして表示する。詳細画面かつCW展開済み・active・表示領域内になってから`load`を呼ぶ。
+- `load`には中止用の`AbortSignal`を渡す。取得中に非active・画面外・unmountになった場合は中止される。取得済みの表示は同じノートが所有する間、非activeや画面外になっても保持される。
+- `load`、読み込み表示、または本表示の描画に失敗した場合は元URLのリンクへ閉じ、別providerや既存URLカードへは戻らない。同じ所有キー（provider・URL・note source・detail）のままノートを表示している間は、viewport・タブ・KeepAliveへの復帰だけでは再試行しない。所有キーが変わる、CWを閉じて再展開する、または再mountされる（ノートを開き直す・ページを再読み込みする）場合は再試行する。
+
+現在providerを接続しているのは`MkNote` / `MkNoteDetailed`のURLだけで、チャット、
+URLプレビューポップアップ、ページ本文などは対象外。`PreviewInput`の`file`は将来の
+接続用に型だけを定義しており、現時点でfile入力を渡す画面は無い。
 
 ## 他のインスタンスとやりとりする
 
@@ -635,7 +899,13 @@ Elythia が面倒を見るもの:
 
 プラグインが面倒を見るもの:
 
-- **payload の中身と値域**。相手は同じプラグインを持っているだけで、善良とは限らない
+- **payload の中身と値域**。相手は同じプラグインを持っているだけで、善良とは限らない。
+  不正な payload は `fmt.Errorf("%w: user が空です", plugin.ErrBadPeerPayload)` のように
+  `plugin.ErrBadPeerPayload` を包んで返す。payload が JSON として読めないときも
+  `fmt.Errorf("%w: %w", plugin.ErrBadPeerPayload, err)` と包む。Elythia は `400` を返して
+  Debug で記録し、送信側は再送しない。包まないエラー (解読エラーをそのまま返したものも
+  含む) はこちらの障害として `500` + ERROR で記録し、送信側が再送する。HTTP ルートの
+  `plugin.Errorf` (StatusError) を返しても同じく `500` になる
 - **payload の版**。Elythia は中身を解釈しないので、形を変えたときの互換は自分で保つ
 - **`OnReply` の冪等性**。キューに載るので、worker が途中で落ちれば同じ交換が
   積み直される。**複数回呼ばれうる**ので、加算や追記はそのままでは二重になる
@@ -765,6 +1035,16 @@ err = h.DeliverPeerReply("other.example", sends[0].ID, map[string]any{"score": 1
 `WithPeers` に無いホストへの `Send` は本番と同じくエラーになる。宣言を忘れたテストが、
 本番では通らない経路を試していることに気付ける。
 
+## MFM を読む
+
+ノートの本文などの MFM を構文木にしたいときは、本体と同じ解析器 `github.com/elythia-network/mfm` (MIT、#3514) をプラグインの `go.mod` へ `go get` で足して、直接 import する。本体の `internal/` は import できないが、この解析器は独立したモジュールなので使える。`mfm.Parse` / `mfm.ParseSimple` が mfm-js と同じ形の構文木を返し、`mfm.CollectHashtags` / `mfm.CollectEmojiCodes` / `mfm.ExtractCustomEmojis` で、ハッシュタグ・カスタム絵文字を取り出せる。
+
+- **信頼できない入力は、長さを切ってから渡す。** 解析器のメモ表の上限は 16MiB と入力長の 64 倍の大きい方なので、長い入力ほど多く確保する。本体はリモートの本文からハッシュタグを拾うとき、断片ごとに先頭 256KiB だけを解析している (そのため、それより長い本文では本体の抽出結果と一致しない)
+
+- **このモジュールは「公開面の一覧」に入らない。** 版は Elythia-Network/mfm のリリースで決まり、`plugin` パッケージの互換の約束の外にある
+- ビルドで使われる版は、本体の `go.mod` と同じか新しい版になる (Go の版の選び方による)。本体と同じ木を得たいなら、本体の `go.mod` と同じ版を書く
+- 連合向けの HTML への変換 (`ToHTML`) と、HTML から MFM への変換 (`FromHTML`) は本体の `internal/activitypub/mfm` にあり、プラグインからは使えない
+
 ## テスト
 
 `plugin/plugintest` でルートとジョブを直接叩ける。
@@ -787,6 +1067,36 @@ require.NoError(t, jobs.Run(t, "prune", ""))
 ```
 
 **DB はフェイクにしない。** SQL の挙動を模した偽物は本物とずれ、通ったのに本番で落ちるテストになる。`plugintest` も migration の適用は Elythia 本体と同じ実装を使っている。
+
+秘密の値は `WithSecrets` で入れておく。置き場所はメモリだが、暗号化と検査 (名前の規則・値の長さ) は本番と同じ実装を通る。
+
+```go
+h := plugintest.New(t).WithName("mybot").WithSecrets(map[string]string{"apiKey": "test-key"})
+res, err := h.Routes(Plugin).Call(t, "POST /connect", plugintest.Request{Administrator: true})
+require.NoError(t, err)
+require.NotNil(t, res)
+
+// プラグインが Set したものを確かめる
+token, ok := h.Secret("oauthToken")
+require.True(t, ok)
+assert.NotEmpty(t, token)
+
+// pluginSecretKey の無いインスタンスでも、止まらずに案内を返せるか
+noKey := plugintest.New(t).WithName("mybot").WithoutSecretKey()
+_, err = noKey.Routes(Plugin).Call(t, "POST /connect", plugintest.Request{Administrator: true})
+require.NoError(t, err)
+```
+
+通知の handler (#3469) は `Notifications` で登録させ、`Notify` で届ける。宛先は本番と同じく確かめる — このプラグインが管理するアカウント (`ctx.Accounts().Create` で作ったか、`SeedAccount("<プラグイン名>", ...)` で置いたもの) でないとテストが落ちる。`ID` を省くと連番が入る。同じ `ID` で 2 回呼ぶと、再試行で同じ通知がもう一度届いた場合を試せる。
+
+```go
+h := plugintest.New(t).WithName("mybot").WithAPI(&stubAPI{})
+h.Notifications(Plugin)
+acc := h.SeedAccount("mybot", "mybot")
+n := plugin.Notification{ID: "n1", Type: plugin.NotificationMention, AccountID: acc.ID, UserID: "u1", NoteID: "note1", NoteVisibility: "public"}
+require.NoError(t, h.Notify(n))
+require.NoError(t, h.Notify(n)) // 2 回目は返事を二重にしないこと
+```
 
 ## 公開面の一覧
 
@@ -847,9 +1157,24 @@ type Definition struct
   Migrations []Migration
   Routes     func(Context, Router) error
   Jobs       func(Context, Jobs) error
+  Notifications func(Context, Notifications) error
   EffectivePolicies func(Context, EffectivePolicyInvalidator) (EffectivePolicyRegistration, error)
+  Secrets    []SecretSpec
 
 func (Definition) Validate() error
+
+type SecretSpec struct
+  Name        string
+  Description string
+
+type Secrets interface
+  Get(context.Context, string) (string, error)
+  Set(context.Context, string, string) error
+  Delete(context.Context, string) error
+
+var ErrSecretNotSet error
+var ErrSecretsUnavailable error
+var ErrSecretUnreadable error
 
 type ActiveRoleAssignment struct
   RoleID string
@@ -886,10 +1211,13 @@ type Context interface
   API() API
   Storage() Storage
   Config() Config
+  Accounts() Accounts
+  Secrets() Secrets
   Peer() Peer
   Queue() Queue
   HTTP() *http.Client
   Go(func())
+  GoContext(func(context.Context))
 
 type Peer interface
   Send(context.Context, string, any) (string, error)
@@ -899,6 +1227,7 @@ type Peer interface
 
 type PeerHandler func(context.Context, string, json.RawMessage) (any, error)
 type PeerReplyHandler func(context.Context, string, string, json.RawMessage) error
+var ErrBadPeerPayload error
 
 type Queue interface
   Enqueue(context.Context, string, any, ...EnqueueOption) error
@@ -939,12 +1268,56 @@ type API interface
 type Caller interface
   Call(context.Context, string, any) (json.RawMessage, error)
 
+type Accounts interface
+  Create(context.Context, string) (Account, error)
+  List(context.Context) ([]Account, error)
+  UpdateProfile(context.Context, string, ProfileUpdate) error
+  Delete(context.Context, string) error
+
+type Account struct { ID string; Username string }
+type ProfileUpdate struct { Name *string; Description *string; Avatar *Image; Banner *Image }
+type Image struct { Data []byte; Filename string }
+
+var ErrAccountNotFound
+var ErrInvalidUsername
+var ErrUsernameUnavailable
+var ErrAccountSuspended
+
 type Jobs interface
   Handle(string, JobHandler)
   Schedule(string, string, any)
 
+var ErrNoRetry error
+func NoRetry(error) error
+
 type Config interface
   Unmarshal(any) error
+
+type Notifications interface
+  Handle(NotificationHandler)
+
+type NotificationHandler func(context.Context, Notification) error
+
+type NotificationType string
+
+const NotificationMention
+const NotificationReply
+const NotificationQuote
+const NotificationFollow
+const NotificationFollowRequest
+const NotificationReaction
+const NotificationChatMessage
+
+type Notification struct
+  ID            string
+  Type          NotificationType
+  AccountID     string
+  UserID        string
+  NoteID        string
+  Reaction      string
+  NoteVisibility string
+  ChatMessageID string
+  CreatedAt     time.Time
 
 type Handler func(Request) (any, error)
 type JobHandler func(context.Context, json.RawMessage) error
@@ -971,16 +1344,19 @@ definePlugin(def)
 host.name / host.me
 definePlugin({ name, pages?, setup })
 host.slot(name, renderer)
-host.api<T>(endpoint, params)
+host.preview.register(provider)
+host.api<T>(endpoint, params, { signal? })
 
 PluginPage: { path, component, navTitle?, navIcon?, admin? }
 
 型: SlotName / SlotUser / SlotContext / SlotMount / SlotComponent / SlotRenderer
-    PluginPage / PageRegistration / PluginUser
+    PluginPage / PageRegistration / PluginUser / PreviewInput / PreviewContext
+    PreviewProvider / PreviewRegistration
 関数: getUsers(ids)
 再公開: MkInput / MkButton / MkFolder / MkLoading
         MkSelect / MkSwitch / MkAvatar / MkUserName / MkTime / PageWithHeader
         useMkSelect / definePage
+        MkPluginSecrets (秘密の値の入力欄。props: plugin)
 ```
 
 ## やってはいけないこと
@@ -993,9 +1369,13 @@ PluginPage: { path, component, navTitle?, navIcon?, admin? }
 | 取得元の `Content-Type` をそのまま `Blob` に流す | 本体が allowlist で矯正するので XSS にはならないが、画像のつもりが `application/octet-stream` になってダウンロードになる |
 | 素の `go` で goroutine を起動する | panic でプロセスごと落ちる。`ctx.Go()` を使う |
 | 管理用の API を `IsModerator()` で守らない | 画面を隠しても API は誰でも叩ける |
+| `ctx.Secrets()` で読んだ値を応答やログに出す | 値は書き込み専用という約束をプラグインが破ることになる |
+| API キーを自分の storage に平文で置く | DB のバックアップと一緒に漏れる。`ctx.Secrets()` を使う |
 
 ## 公開と互換性
 
 `plugin/` は semver に従う。破壊的変更では `APIVersion` が上がり、合わないプラグインは**ビルド時にエラーになる**（黙って動かない状態にはならない）。
+
+**interface への method の追加は `APIVersion` を上げない。** `plugin.Context` などは本体が実装してプラグインへ渡すもので、プラグインが呼ぶ側である限り追加で壊れることは無い。ただし**プラグインが自分で実装している場合 (テスト用のフェイクなど) は、method が足りずにコンパイルできなくなる** (例: #3468 で `Context.Accounts()` を足した)。**`Definition` への項目の追加 (例: #3469 の `Notifications`) も上げない** — 宣言しないプラグインには何も変わらない。フェイクを自分で書かず、`plugin/plugintest` の `Harness.Context()` を使うこと。こちらは本体と同じ版で追従する。
 
 詳細は[互換性ポリシー](compatibility.md)を参照。

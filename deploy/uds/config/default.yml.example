@@ -309,3 +309,115 @@ proxyBypassHosts:
 # Unauthenticated; restrict access via nginx / LB ACL if exposed outside
 # the cluster. See docs/design/auto-scale-job-workers.md §6.1.
 #enableMetrics: false
+
+#   ┌────────────────────────┐
+#───┘ Database backup (#3457) └────────────────────────────────
+
+# Used by `elythia backup` (the "backup" and "backup-daemon" compose
+# services) and by the admin page of the server (backup.server). See
+# docs/backup.md.
+#
+# **A disk of the same host does not count as a backup**: it is lost together
+# with the database. Use S3-compatible storage or a directory on another
+# device mounted here (NAS and so on). The storage credentials live in this
+# file, not in the database, so that the backups can be read when the
+# database is gone.
+#backup:
+#  storage:
+#    # "s3" or "dir"
+#    type: s3
+#    s3:
+#      # Empty means AWS S3. For R2: https://<account>.r2.cloudflarestorage.com
+#      # Use https:// unless the storage is on a private network: with
+#      # http:// the dump (unless encrypted) and the signed requests travel
+#      # in plaintext.
+#      endpoint: https://s3.example.com
+#      region: us-east-1
+#      bucket: elythia-backup
+#      prefix: example-instance
+#      accessKey: "..."
+#      secretKey: "..."
+#      # true for MinIO and other services without virtual-hosted buckets
+#      forcePathStyle: false
+#    dir:
+#      # Must already exist and contain the marker file .elythia-backup,
+#      # created on the mounted device (touch /mnt/nas/.../.elythia-backup).
+#      # Neither is created, so an unmounted NAS fails instead of filling the
+#      # local disk.
+#      path: /backup
+#  # The dump contains users' private keys, tokens and password hashes.
+#  # With encryption enabled, the dump is encrypted with age
+#  # (https://age-encryption.org). Taking a backup needs only the public
+#  # keys; keep the private key (age-keygen output) off this host and give it
+#  # only to verify / restore.
+#  encryption:
+#    enabled: false
+#    recipients:
+#      - age1...
+#    # Keep the private key outside the repository and .config.
+#    identityFile: /run/secrets/backup-identity.txt
+#  # HMAC key that signs each generation and the restore records. When set,
+#  # restore and verify refuse a generation not signed with it (docs/backup.md).
+#  # Keep it on the backup host only. openssl rand -hex 32 > backup-integrity.key
+#  integrityKeyFile: /run/secrets/backup-integrity.key
+#  # Paths of the PostgreSQL client programs. Empty means PATH. Their major
+#  # version must not be older than the server's.
+#  tools:
+#    pgDump: ""
+#    # pg_restore must not be newer than the server it restores into
+#    # (`elythia backup restore`). `elythia backup verify` restores into a
+#    # throwaway server with pgRestore, initdb and pgCtl.
+#    pgRestore: ""
+#    initdb: ""
+#    pgCtl: ""
+#  # The "backup-daemon" compose service (docs/backup.md): take, verify and
+#  # prune on a schedule, and report problems.
+#  schedule:
+#    interval: 24h
+#    # HH:MM in the process time zone (UTC unless TZ is set on the service).
+#    at: "04:00"
+#    keep: 7
+#    verify: true
+#    # Control API for the admin page (plain HTTP). backup-daemon publishes
+#    # no port, so only containers on the mkgo-uds network reach it (as
+#    # http://backup-daemon:3010); never add ports.
+#    listen: ":3010"
+#  notify:
+#    webhookUrl: "https://hooks.example.com/..."
+#    # generic, discord or slack
+#    format: generic
+#  # What the server (the admin page, #3462) uses. The daemon reads
+#  # serviceToken too.
+#  server:
+#    # Empty type means backup.storage. Set it to give the server a key that
+#    # can only list, read and delete. With a "dir" storage, the server must
+#    # see the same directory and share its group (docs/backup.md).
+#    storage:
+#      type: ""
+#    # Price per GB-month (2^30 bytes) for the monthly estimate. 0 hides it.
+#    pricePerGbMonth: 0
+#    # Control API of `elythia backup daemon` (schedule.listen) for taking
+#    # and verifying from the admin page, e.g. http://backup-daemon:3010.
+#    # Ignored while serviceToken is empty.
+#    serviceUrl: ""
+#    # Shared by the daemon's control API and the main server. Generate a
+#    # value (e.g. `openssl rand -hex 32`) and write the same one to both.
+#    # While empty, the daemon does not start with listen set, and the
+#    # server sends nothing.
+#    serviceToken: ""
+
+#   ┌──────────────────────────┐
+#───┘ Maintenance mode (#3463) └──────────────────────────────
+
+# Used by `elythia maintenance` and by every process while a maintenance
+# lets go of the database. See docs/deployment.md. Every key has a default;
+# the section may stay commented out.
+#maintenance:
+#  # The database the judge connects to while it counts the sessions on the
+#  # application database in pg_stat_activity. Must not be db.db.
+#  maintenanceDb: postgres
+#  # After this, the judge terminates the Elythia sessions that remain
+#  # for processes reporting they let go (drained, or still draining), as
+#  # the same database user. Other sessions (psql, processes that do not
+#  # report or still run) are never terminated; the maintenance waits.
+#  drainTimeout: 30s

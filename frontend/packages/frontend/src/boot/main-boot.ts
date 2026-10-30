@@ -3,15 +3,16 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import { createApp, defineAsyncComponent, markRaw } from 'vue';
+import { createApp, defineAsyncComponent, markRaw, watch } from 'vue';
 import { ui } from '@@/js/config.js';
 import * as Misskey from 'misskey-js';
 import { compareVersions } from 'compare-versions';
 import { common } from './common.js';
 import type { Component } from 'vue';
 import type { Keymap } from '@/utility/hotkey.js';
+import type { NightMeteorController } from '@/utility/night-meteor-effect.js';
 import { i18n } from '@/i18n.js';
-import { alert, confirm, popup, post } from '@/os.js';
+import { alert, confirm, popup, post, postFormComponent, preloadPostFormDialog } from '@/os.js';
 import { useStream } from '@/stream.js';
 import * as sound from '@/utility/sound.js';
 import { $i } from '@/i.js';
@@ -26,13 +27,22 @@ import { mainRouter } from '@/router.js';
 import { makeHotkey } from '@/utility/hotkey.js';
 import { addCustomEmoji, removeCustomEmojis, updateCustomEmojis } from '@/custom-emojis.js';
 import { prefer } from '@/preferences.js';
-import { updateCurrentAccountPartial } from '@/accounts.js';
+import { updateCurrentAccount } from '@/accounts.js';
 import { misskeyApi } from '@/utility/misskey-api.js';
 import { unisonReload } from '@/utility/unison-reload.js';
 import { isBirthday } from '@/utility/is-birthday.js';
+import { seasonalScreenEffectOf } from '@/utility/seasonal-screen-effect.js';
+import { themeManager } from '@/theme.js';
+import { runWhenIdle } from '@/utility/preloadable-component.js';
 
 export async function mainBoot() {
 	const { isClientUpdated, clientUpdate, lastVersion } = await common(async () => {
+		// Elythia: タイムラインに固定の投稿フォームを出している人は、UI と並べて先に読み始める。
+		// タイムラインより後に差し込まれて一覧がずれるのを避けるため (#3613、pages/timeline.vue)
+		if ($i && prefer.s.showFixedPostForm) {
+			postFormComponent.preload().catch(() => { /* タイムラインが読み込み直す */ });
+		}
+
 		let uiStyle = ui;
 		const searchParams = new URLSearchParams(window.location.search);
 
@@ -76,26 +86,17 @@ export async function mainBoot() {
 		});
 	}
 
+	// 季節の演出は起動時にだけ判定し、出したら止めない。流れ星はこれを見て重ねないようにする (#3530)。
+	let seasonalEffectShowing = false;
 	try {
 		if (prefer.s.enableSeasonalScreenEffect) {
-			const month = new Date().getMonth() + 1;
-			if (prefer.s.hemisphere === 'S') {
-				// ▼南半球
-				if (month === 7 || month === 8) {
-					const SnowfallEffect = (await import('@/utility/snowfall-effect.js')).SnowfallEffect;
-					new SnowfallEffect({}).render();
-				}
-			} else {
-				// ▼北半球
-				if (month === 12 || month === 1) {
-					const SnowfallEffect = (await import('@/utility/snowfall-effect.js')).SnowfallEffect;
-					new SnowfallEffect({}).render();
-				} else if (month === 3 || month === 4) {
-					const SakuraEffect = (await import('@/utility/snowfall-effect.js')).SnowfallEffect;
-					new SakuraEffect({
-						sakura: true,
-					}).render();
-				}
+			const effect = seasonalScreenEffectOf(new Date().getMonth() + 1, prefer.s.hemisphere);
+			if (effect != null) {
+				const SnowfallEffect = (await import('@/utility/snowfall-effect.js')).SnowfallEffect;
+				new SnowfallEffect({
+					sakura: effect === 'sakura',
+				}).render();
+				seasonalEffectShowing = true;
 			}
 		}
 	} catch (error) {
@@ -103,7 +104,46 @@ export async function mainBoot() {
 		console.error('Failed to initialise the seasonal screen effect canvas context:', error);
 	}
 
+	//#region Elythia: 夜空の流れ星 (#3530)
+	{
+		let nightMeteor: NightMeteorController | null = null;
+		// 読み込みの途中で設定を切り替えられたときに、古い読み込みの結果を捨てるための番号。
+		let generation = 0;
+		watch(prefer.r.enableNightMeteorEffect, async (enabled) => {
+			const current = ++generation;
+			nightMeteor?.stop();
+			nightMeteor = null;
+			if (!enabled) return;
+			try {
+				const { startNightMeteorEffect } = await import('@/utility/night-meteor-effect.js');
+				if (current !== generation) return;
+				nightMeteor = startNightMeteorEffect(() => ({
+					// store.s.darkMode はどちらの枠のテーマを使うかで、色そのものではない。テーマの
+					// プレビュー中などは食い違うので、themeManager が付ける data-color-scheme を見る。
+					darkMode: window.document.documentElement.dataset.colorScheme === 'dark',
+					animation: prefer.s.animation,
+					seasonalEffectShowing,
+				}));
+			} catch (error) {
+				console.error('Failed to start the night meteor effect:', error);
+			}
+		}, { immediate: true });
+		// テーマの切り替えは、色が当たった後の themeChanged で見直す。
+		themeManager.on('themeChanged', () => {
+			nightMeteor?.update();
+		});
+		watch(prefer.r.animation, () => {
+			nightMeteor?.update();
+		});
+	}
+	//#endregion
+
 	if ($i) {
+		// Elythia: 投稿フォームは起動時の JS に入れず、空き時間に先に読み込む (#3613、os.ts の post())
+		runWhenIdle(() => {
+			preloadPostFormDialog().catch(() => { /* post() で読み込み直す */ });
+		});
+
 		store.loaded.then(async () => {
 			if (store.s.accountSetupWizard !== -1) {
 				const { dispose } = popup(defineAsyncComponent(() => import('@/components/MkUserSetupDialog.vue')), {}, {
@@ -357,7 +397,7 @@ export async function mainBoot() {
 					const me = await misskeyApi('i');
 					// 飛行中に差分イベントが来ていたら、そちらのほうが新しい。
 					if (generation !== unreadCountGeneration) return;
-					updateCurrentAccountPartial({
+					updateCurrentAccount({
 						hasUnreadNotification: me.hasUnreadNotification,
 						unreadNotificationsCount: me.unreadNotificationsCount,
 					});
@@ -404,13 +444,13 @@ export async function mainBoot() {
 				// 捨てられたうえで誰も正しい値を書かないので、バッジが stale の
 				// まま次の再接続まで残る = 直しに来た症状そのものになる。
 				if ('unreadNotificationsCount' in i) unreadCountGeneration++;
-				updateCurrentAccountPartial(i);
+				updateCurrentAccount(i);
 			});
 
 			// generation は飛行中の resync が古いスナップショットで上書きするのを防ぐ。
 			main.on('readAllNotifications', () => {
 				unreadCountGeneration++;
-				updateCurrentAccountPartial({
+				updateCurrentAccount({
 					hasUnreadNotification: false,
 					unreadNotificationsCount: 0,
 				});
@@ -419,19 +459,19 @@ export async function mainBoot() {
 			main.on('unreadNotification', () => {
 				unreadCountGeneration++;
 				const unreadNotificationsCount = ($i?.unreadNotificationsCount ?? 0) + 1;
-				updateCurrentAccountPartial({
+				updateCurrentAccount({
 					hasUnreadNotification: true,
 					unreadNotificationsCount,
 				});
 			});
 
 			main.on('newChatMessage', () => {
-				updateCurrentAccountPartial({ hasUnreadChatMessages: true });
+				updateCurrentAccount({ hasUnreadChatMessages: true });
 				sound.playMisskeySfx('chatMessage');
 			});
 
 			main.on('readAllAnnouncements', () => {
-				updateCurrentAccountPartial({ hasUnreadAnnouncement: false });
+				updateCurrentAccount({ hasUnreadAnnouncement: false });
 			});
 
 			// 個人宛てお知らせが発行されたとき

@@ -58,7 +58,7 @@ jobs:
           package_json_file: frontend/package.json
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: frontend/.node-version
 
@@ -91,7 +91,7 @@ jobs:
         # 内の同 image pull は docker daemon の cache hit で 0s で済む方が
         # 確実。playwright.yml (#816) と同じ判断。2 image を順次 pull。
         run: |
-          docker pull misskey/misskey:2026.10.0
+          docker pull misskey/misskey:2026.10.1
           docker pull cypress/included:15.11.0
 
       - name: Run dropin frontend e2e
@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dropin-frontend-logs
           path: /tmp/dropin-frontend-logs/

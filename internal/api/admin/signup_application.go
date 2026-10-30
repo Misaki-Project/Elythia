@@ -5,6 +5,8 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/core/signupapplication"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
@@ -66,23 +68,23 @@ func (h *Handler) SignupApplicationList(c echo.Context) error {
 			apierr.Error("UNAVAILABLE", "Approval-based signup is not configured.", "0c5b7d0e-2b7e-4d0e-9f0e-6a3f4b1f5c21"))
 	}
 	var req struct {
-		Filter string `json:"filter"`
-		Limit  int    `json:"limit"`
-		Offset int    `json:"offset"`
+		Filter string    `json:"filter"`
+		Limit  jsnum.Int `json:"limit"`
+		Offset jsnum.Int `json:"offset"`
 	}
 	// body 無しでも既定値で応答する (管理画面が引数なしで叩く)。
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
 
-	limit := req.Limit
+	limit := int(req.Limit)
 	if limit <= 0 {
 		limit = defaultSignupApplicationLimit
 	}
 	if limit > maxSignupApplicationLimit {
 		limit = maxSignupApplicationLimit
 	}
-	offset := req.Offset
+	offset := int(req.Offset)
 	if offset < 0 {
 		offset = 0
 	}
@@ -124,21 +126,21 @@ func (h *Handler) SignupApplicationList(c echo.Context) error {
 //
 // 承認は状態を変えるだけで、registration_ticket はここでは発行しない (#2555)。
 func (h *Handler) SignupApplicationApprove(c echo.Context) error {
-	return h.reviewSignupApplication(c, func(id, moderatorID string) error {
+	return h.reviewSignupApplication(c, moderationlog.LogApproveSignupApplication, func(id, moderatorID string) error {
 		return h.signupApplications.Approve(id, moderatorID)
 	})
 }
 
 // SignupApplicationReject handles POST /api/admin/signup-application/reject.
 func (h *Handler) SignupApplicationReject(c echo.Context) error {
-	return h.reviewSignupApplication(c, func(id, moderatorID string) error {
+	return h.reviewSignupApplication(c, moderationlog.LogRejectSignupApplication, func(id, moderatorID string) error {
 		return h.signupApplications.Reject(id, moderatorID)
 	})
 }
 
 // reviewSignupApplication is shared by approve / reject: the parameter shape and
 // the error mapping are identical, so they are not duplicated.
-func (h *Handler) reviewSignupApplication(c echo.Context, act func(id, moderatorID string) error) error {
+func (h *Handler) reviewSignupApplication(c echo.Context, logType moderationlog.LogType, act func(id, moderatorID string) error) error {
 	if h.signupApplications == nil {
 		return c.JSON(http.StatusServiceUnavailable,
 			apierr.Error("UNAVAILABLE", "Approval-based signup is not configured.", "0c5b7d0e-2b7e-4d0e-9f0e-6a3f4b1f5c21"))
@@ -159,6 +161,7 @@ func (h *Handler) reviewSignupApplication(c echo.Context, act func(id, moderator
 
 	switch err := act(req.ApplicationID, actor.ID); {
 	case err == nil:
+		h.logModeration(c, logType, map[string]any{"applicationId": req.ApplicationID})
 		return c.JSON(http.StatusOK, map[string]any{"ok": true})
 	case errors.Is(err, signupapplication.ErrNotFound):
 		return c.JSON(http.StatusNotFound,

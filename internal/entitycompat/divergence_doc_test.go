@@ -3,10 +3,12 @@ package entitycompat
 import (
 	"bytes"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/printer"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -15,7 +17,7 @@ import (
 	"testing"
 )
 
-// docs/divergence.md は upstream との差分の一次資料で、diff-e2e の ignore-list を
+// docs/divergence.md (目次) と docs/divergence/ の領域ごとのファイル (#3414) は upstream との差分の一次資料で、diff-e2e の ignore-list を
 // 足すときに「対応する記述があるか」を確認する運用になっている (docs/ci.md の `diff-e2e` の節)。
 // 実態より少ない表を信じると、そこに載っていない差分を差分として認識しないまま
 // 調査が進む。
@@ -86,7 +88,7 @@ func TestDivergenceDoc_EndpointCountMatchesTable(t *testing.T) {
 	}
 
 	if sum != declared {
-		t.Errorf(`docs/divergence.md §1-1 の見出しは %d だが、表の件数列の合計は %d:
+		t.Errorf(`docs/divergence/api.md §1-1 の見出しは %d だが、表の件数列の合計は %d:
   %s
 
 見出しか表のどちらかが古い。endpoint を足したら**サマリだけでなく §1-1 の表にも
@@ -117,7 +119,7 @@ func TestDivergenceDoc_TableCountMatchesSchema(t *testing.T) {
 	lines := readDivergenceDoc(t)
 	start, declared := findDivergenceSection(t, lines, "2-1")
 	if len(own) != declared {
-		t.Errorf(`docs/divergence.md §2-1 の見出しは %d だが、migration が作る upstream 非存在テーブルは %d 件:
+		t.Errorf(`docs/divergence/db.md §2-1 の見出しは %d だが、migration が作る upstream 非存在テーブルは %d 件:
   %s
 
 表に無いテーブルがあるか、逆に消えたテーブルが残っている。`,
@@ -130,7 +132,7 @@ func TestDivergenceDoc_TableCountMatchesSchema(t *testing.T) {
 	// `user_keypair` を挙げる等) ので、行を消して散文で触れるだけで素通りする。
 	for _, table := range own {
 		if !divergenceRowNames(sectionLines(lines, start), table) {
-			t.Errorf("docs/divergence.md §2-1 に %q の行が無い", table)
+			t.Errorf("docs/divergence/db.md §2-1 に %q の行が無い", table)
 		}
 	}
 
@@ -160,7 +162,7 @@ func TestDivergenceDoc_ColumnCountMatchesSchema(t *testing.T) {
 	lines := readDivergenceDoc(t)
 	start, declared := findDivergenceSection(t, lines, "2-2")
 	if len(own) != declared {
-		t.Errorf(`docs/divergence.md §2-2 の見出しは %d だが、upstream 共有テーブルの mk-go 独自カラムは %d 件:
+		t.Errorf(`docs/divergence/db.md §2-2 の見出しは %d だが、upstream 共有テーブルの mk-go 独自カラムは %d 件:
   %s
 
 **見出しの内訳 (実使用 N + 未使用の残存 M) も直すこと。** #2634 では見出しと
@@ -175,7 +177,7 @@ func TestDivergenceDoc_ColumnCountMatchesSchema(t *testing.T) {
 		dot := strings.IndexByte(qualified, '.')
 		table, col := qualified[:dot], qualified[dot+1:]
 		if !divergenceRowMentions(sectionLines(lines, start), table, col) {
-			t.Errorf("docs/divergence.md §2-2 に %q の行が無い", qualified)
+			t.Errorf("docs/divergence/db.md §2-2 に %q の行が無い", qualified)
 		}
 	}
 
@@ -371,13 +373,89 @@ func summaryColumnCounts(lines []string) (mk, residual, cherrypick int, ok bool)
 	return 0, 0, 0, false
 }
 
+// divergenceAreaLinkRe matches the index's links to the per-area files
+// (`[...](divergence/<name>.md)`).
+var divergenceAreaLinkRe = regexp.MustCompile(`\]\(divergence/([a-z0-9-]+\.md)\)`)
+
+// divergenceAreaFiles returns the per-area files the index links to, in the
+// order they appear. #3414 で docs/divergence.md を目次にし、節を
+// docs/divergence/ の領域ごとのファイルへ分けた。
+func divergenceAreaFiles(t *testing.T, index string) []string {
+	t.Helper()
+	seen := map[string]bool{}
+	var files []string
+	for _, m := range divergenceAreaLinkRe.FindAllStringSubmatch(index, -1) {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			files = append(files, m[1])
+		}
+	}
+	// 目次の書式が変わってリンクを 1 つも拾えないと、どの節も見つからない
+	// まま「見出しが無い」と落ちるより先に、原因をここで示す。
+	if len(files) == 0 {
+		t.Fatal("docs/divergence.md の目次から docs/divergence/ のファイルへのリンクを読めない")
+	}
+	return files
+}
+
+// readDivergenceDoc returns the index (docs/divergence.md) followed by every
+// per-area file it links to, so that the summary in the index and the sections
+// in the area files can be checked against each other.
 func readDivergenceDoc(t *testing.T) []string {
 	t.Helper()
 	blob, err := os.ReadFile(filepath.Join("..", "..", "docs", "divergence.md"))
 	if err != nil {
 		t.Fatalf("read docs/divergence.md: %v", err)
 	}
-	return strings.Split(string(blob), "\n")
+	all := strings.Split(string(blob), "\n")
+	for _, name := range divergenceAreaFiles(t, string(blob)) {
+		area, err := os.ReadFile(filepath.Join("..", "..", "docs", "divergence", name))
+		if err != nil {
+			t.Fatalf("read docs/divergence/%s: %v", name, err)
+		}
+		all = append(all, strings.Split(string(area), "\n")...)
+	}
+	return all
+}
+
+// TestDivergenceDoc_IndexListsEveryAreaFile asserts that the index links to
+// every file under docs/divergence/ and to no file that does not exist.
+//
+// 目次に載らないファイルは、上のゲートからも読まれず、件数のずれを見逃す。
+// 逆に目次だけに残ったリンクは readDivergenceDoc が読めずに落ちる。ファイルは
+// ディスクでなく git ls-files で数える (add し忘れたファイルが手元でだけ通らないように)。
+func TestDivergenceDoc_IndexListsEveryAreaFile(t *testing.T) {
+	blob, err := os.ReadFile(filepath.Join("..", "..", "docs", "divergence.md"))
+	if err != nil {
+		t.Fatalf("read docs/divergence.md: %v", err)
+	}
+	linked := map[string]bool{}
+	for _, name := range divergenceAreaFiles(t, string(blob)) {
+		linked[name] = true
+	}
+	out, err := exec.Command("git", "-C", filepath.Join("..", ".."), "ls-files", "docs/divergence/").Output()
+	if err != nil {
+		t.Fatalf("git ls-files docs/divergence/: %v", err)
+	}
+	tracked := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasSuffix(line, ".md") {
+			tracked[filepath.Base(line)] = true
+		}
+	}
+	if len(tracked) == 0 {
+		t.Fatal("git ls-files が docs/divergence/ のファイルを 1 つも返さない")
+	}
+	for name := range tracked {
+		if !linked[name] {
+			t.Errorf("docs/divergence/%s が docs/divergence.md の目次に無い", name)
+		}
+	}
+	for name := range linked {
+		if !tracked[name] {
+			t.Errorf("docs/divergence.md の目次が、追跡されていない docs/divergence/%s を指している", name)
+		}
+	}
 }
 
 // findDivergenceSection returns the heading's line index and the count declared
@@ -391,7 +469,7 @@ func findDivergenceSection(t *testing.T, lines []string, section string) (int, i
 		}
 		return i, atoi(t, m[2])
 	}
-	t.Fatalf("docs/divergence.md に §%s の見出し (件数付き) が無い", section)
+	t.Fatalf("docs/divergence/ の領域ごとのファイルに §%s の見出し (件数付き) が無い", section)
 	return 0, 0
 }
 
@@ -477,10 +555,10 @@ func TestDivergenceDoc_EndpointCountMatchesAPICompat(t *testing.T) {
 
 	_, declared := findDivergenceSection(t, readDivergenceDoc(t), "1-1")
 	if declared != generated {
-		t.Errorf(`docs/divergence.md §1-1 の見出しは %d だが、docs/api-compat.md は %d と言っている。
+		t.Errorf(`docs/divergence/api.md §1-1 の見出しは %d だが、docs/api-compat.md は %d と言っている。
 
 **どちらが古いかは中身を見ないと決まらない。** api-compat.md 側が古いなら
-`+"`make apicompat`"+` で再生成する (route dump に stack が要る)。divergence.md 側が
+`+"`make apicompat`"+` で再生成する (route dump に stack が要る)。divergence/api.md 側が
 古いなら §1-1 の表・見出し・冒頭サマリの 3 箇所すべてを直す。`, declared, generated)
 	}
 }
@@ -522,7 +600,7 @@ func TestDivergenceDoc_ForkFrontendTagsMatchTable(t *testing.T) {
 		}
 	}
 	if len(tags) == 0 {
-		t.Fatal("docs/divergence.md §4-2 に `| `X.Y.Z-mk.N` |` 形式の行が無い")
+		t.Fatal("docs/divergence/frontend.md §4-2 に `| `X.Y.Z-mk.N` |` 形式の行が無い")
 	}
 
 	if len(tags) != declared {
@@ -551,12 +629,12 @@ tag を足したら**サマリの件数と範囲、§4-2 の表の両方**を直
 		}
 		base := rows[i].base
 		if seen[base] {
-			t.Errorf(`docs/divergence.md §4-2 の base %s の行が飛び飛びに現れている。
+			t.Errorf(`docs/divergence/frontend.md §4-2 の base %s の行が飛び飛びに現れている。
 同じ base の行はまとめて並べること。`, base)
 		}
 		seen[base] = true
 		if prevBase != "" && compareForkBase(prevBase, base) >= 0 {
-			t.Errorf(`docs/divergence.md §4-2 の base が昇順でない (%s の次が %s)。
+			t.Errorf(`docs/divergence/frontend.md §4-2 の base が昇順でない (%s の次が %s)。
 古い順に並べること。`, prevBase, base)
 		}
 		prevBase = base
@@ -598,7 +676,7 @@ func compareForkBase(a, b string) int {
 // **機能追加は N を進め、直前の数字タグの後追い修正はその N に英字を足す**
 // (`-mk.22` の修正が `-mk.22a`、次が `-mk.22b`)。**世代をまたぐ修正は新しい数字を
 // 取る** — 英字は列の順序を保つためのものなので、`-mk.24` の後に `-mk.12a` を打つと
-// `git describe --tags` が後戻りして見える (規則の全文は docs/divergence.md の
+// `git describe --tags` が後戻りして見える (規則の全文は docs/divergence/frontend.md の
 // 「fork frontend の変更」。先例は `-mk.23` / `-mk.25` / `-mk.28`)。
 // **英字を足す形があるので数字は重複しうる。** 単純な連番検査は使えないので、
 // 数字は 1 ずつ、同じ数字の中の英字は a から 1 文字ずつ進むこと
@@ -637,7 +715,7 @@ func assertForkTagSequence(t *testing.T, tags []string) {
 			if letter != "" || prevLetter != "" {
 				want += fmt.Sprintf(" か -mk.%d%s", prevNum, nextForkLetter(prevLetter))
 			}
-			t.Errorf(`docs/divergence.md §4-2 の tag が順に並んでいない (-mk.%d%s の次が -mk.%s、期待は %s)。
+			t.Errorf(`docs/divergence/frontend.md §4-2 の tag が順に並んでいない (-mk.%d%s の次が -mk.%s、期待は %s)。
 抜けているなら「載せない」判断の根拠を書くか、行を足すこと。`, prevNum, prevLetter, tag, want)
 			return
 		}
@@ -678,7 +756,7 @@ func findDivergenceHeading(t *testing.T, lines []string, section string) (int, b
 			return i, true
 		}
 	}
-	t.Fatalf("docs/divergence.md に §%s の見出しが無い", section)
+	t.Fatalf("docs/divergence/ の領域ごとのファイルに §%s の見出しが無い", section)
 	return 0, false
 }
 
@@ -687,7 +765,7 @@ func findDivergenceHeading(t *testing.T, lines []string, section string) (int, b
 var apiCompatRowRe = regexp.MustCompile("^\\| (GET|POST) \\| `(/api/[^`]*)` \\|")
 
 // routerPostRe / routerMatchRe extract the statically registered `/api/*`
-// routes from router.go. `api` is the echo group mounted at `/api`.
+// routes from internal/server. `api` is the echo group mounted at `/api`.
 var (
 	routerPostRe  = regexp.MustCompile(`\bapi\.POST\("([^"]+)"`)
 	routerGetRe   = regexp.MustCompile(`\bapi\.GET\("([^"]+)"`)
@@ -700,23 +778,23 @@ var (
 )
 
 // TestAPICompatDoc_MatchesRouter asserts that the committed
-// docs/api-compat.md still describes the routes router.go registers.
+// docs/api-compat.md still describes the routes internal/server registers.
 //
 // **生成物そのものが腐ると、それを錨にしている gate も一緒に無力化する。**
-// TestDivergenceDoc_EndpointCountMatchesAPICompat は divergence.md と
+// TestDivergenceDoc_EndpointCountMatchesAPICompat は divergence/api.md (§1-1) と
 // api-compat.md の一致しか見ないので、endpoint を足して**どちらも更新しない**と
 // 両方が古いまま緑になる。実際 develop では `mk-go version: 1.1.2` /
 // `mk-go only: 49` のまま腐っていた (#2640)。
 //
 // `make apicompat` の route dump には stack (DB / Redis) が要るのでテストからは
-// 呼べない。代わりに router.go の**静的な登録**と突き合わせる。
+// 呼べない。代わりに internal/server の**静的な登録**と突き合わせる。
 //
 // **POST と GET の両方を見る。** 「endpoint を足す操作は必ず POST を伴う」は
 // 成り立たない — `/api/v1/instance/peers` は upstream 側も fastify の
 // `get()` 直登録で、mk-go も `api.GET` 一本しか持たない。POST だけを母集団に
 // すると同種の GET-only endpoint がこの gate から見えなくなる。
 //
-// 同梱プラグインのルート (`/api/plugin/*`) は router.go に literal で現れず、
+// 同梱プラグインのルート (`/api/plugin/*`) は internal/server に literal で現れず、
 // 生成物にも (bundled のうち enabled なものだけが) 載る。母集団から外す。
 func TestAPICompatDoc_MatchesRouter(t *testing.T) {
 	blob, err := os.ReadFile(filepath.Join("..", "..", "docs", "api-compat.md"))
@@ -725,7 +803,7 @@ func TestAPICompatDoc_MatchesRouter(t *testing.T) {
 	}
 	// **セクションを見る。** 生成物は「TS 側に存在するが mk-go で未実装」も同じ
 	// 行書式で出す。全行を拾うと、upstream が endpoint を足した直後 (= 生成物が
-	// 正しい状態) に「api-compat.md にあって router.go に無い」で落ち、しかも
+	// 正しい状態) に「api-compat.md にあって internal/server に無い」で落ち、しかも
 	// 診断が逆を指す。本家の版を上げるたびに現実的に起きる。
 	doc := map[string]bool{}
 	inScope := false
@@ -745,10 +823,7 @@ func TestAPICompatDoc_MatchesRouter(t *testing.T) {
 		doc[m[1]+" "+strings.TrimPrefix(m[2], "/api")] = true
 	}
 
-	joined, err := serverPackageSource()
-	if err != nil {
-		t.Fatalf("read internal/server/*.go: %v", err)
-	}
+	joined := serverPackageSource(t)
 	router := map[string]bool{}
 	for _, m := range routerPostRe.FindAllStringSubmatch(joined, -1) {
 		router["POST "+m[1]] = true
@@ -767,7 +842,7 @@ func TestAPICompatDoc_MatchesRouter(t *testing.T) {
 		t.Fatal("docs/api-compat.md の endpoint セクションから行を 1 件も読めない (tools/apicompat の出力書式か見出しが変わった?)")
 	}
 	if len(router) == 0 {
-		t.Fatal("internal/server/router.go から api.POST/GET(...) を 1 件も読めない (登録の書き方が変わった?)")
+		t.Fatal("internal/server から api.POST/GET(...) を 1 件も読めない (登録の書き方が変わった?)")
 	}
 
 	// **0 件チェックだけでは足りない。** 部分的な取りこぼしは router 側の集合が
@@ -789,7 +864,7 @@ func TestAPICompatDoc_MatchesRouter(t *testing.T) {
 	} {
 		got, matched := len(c.loose.FindAllString(joined, -1)), len(c.strict.FindAllStringSubmatch(joined, -1))
 		if got != matched {
-			t.Fatalf(`router.go の %s は %d 件あるが、path を抽出できたのは %d 件。
+			t.Fatalf(`internal/server の %s は %d 件あるが、path を抽出できたのは %d 件。
 
 **取りこぼした分だけ gate が緩くなる。** path が literal でない (定数 / 変数経由) か、
 呼び出しが複数行に分かれている可能性がある。このテストの正規表現を実態に
@@ -823,7 +898,7 @@ func TestAPICompatDoc_MatchesRouter(t *testing.T) {
 			"group を通さず /api 配下へ直接登録すると、このテストから見えない"},
 	} {
 		if n := len(g.re.FindAllString(joined, -1)); n != g.want {
-			t.Fatalf(`router.go の %s が %d 件 (想定 %d)。
+			t.Fatalf(`internal/server の %s が %d 件 (想定 %d)。
 
 理由: %s。**そこに足した endpoint は生成物と照合されない**ので、抽出をその形に
 対応させてからこの固定を解除すること。`, g.name, n, g.want, g.why)
@@ -835,15 +910,15 @@ func TestAPICompatDoc_MatchesRouter(t *testing.T) {
 	if len(missing) == 0 && len(stale) == 0 {
 		return
 	}
-	t.Errorf(`docs/api-compat.md が internal/server/router.go と食い違っている。
+	t.Errorf(`docs/api-compat.md が internal/server の登録と食い違っている。
 
 **再生成が要る**: `+"`make apicompat`"+` (route dump に stack 起動が必要)。生成物が腐ると
 TestDivergenceDoc_EndpointCountMatchesAPICompat の錨も一緒に無力化する。
 
-router.go にあって api-compat.md に無い (%d 件、= endpoint を足したが再生成していない):
+internal/server にあって api-compat.md に無い (%d 件、= endpoint を足したが再生成していない):
   %s
 
-api-compat.md にあって router.go に無い (%d 件、= endpoint を消したか、登録の書き方が
+api-compat.md にあって internal/server に無い (%d 件、= endpoint を消したか、登録の書き方が
 regexp から外れた。後者ならこのテストの routerPostRe を直す):
   %s`,
 		len(missing), strings.Join(missing, "\n  "),
@@ -862,9 +937,77 @@ func diffKeys(a, b map[string]bool) []string {
 	return out
 }
 
+// streamChannelListFunc is the function of internal/server whose returned
+// list holds the built-in stream channels (#3692).
+const streamChannelListFunc = "builtinStreamChannels"
+
+// builtinStreamChannelNames reads the channel names of the entries
+// streamChannelListFunc returns, from the git-tracked sources of
+// internal/server.
+//
+// **登録は一覧に集めた (#3692)。** 前は setupRoutes に
+// `streamRegistry.Register("name", …)` が 22 行あったので、下の正規表現だけで
+// 名前を読めた。一覧の項目は `{"name", factory, credentialed}` の形なので、
+// 構文木から読む。**名前が文字列リテラルでない項目は落とす。** 定数や変数経由の
+// 名前を読み飛ばすと、その分だけ doc の照合が黙って緩くなる。
+func builtinStreamChannelNames(t *testing.T) []string {
+	t.Helper()
+	var names []string
+	found := 0
+	for _, src := range serverSources(t) {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, src.rel, src.src, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", src.rel, err)
+		}
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Recv != nil || fd.Name.Name != streamChannelListFunc || fd.Body == nil {
+				continue
+			}
+			found++
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				ret, ok := n.(*ast.ReturnStmt)
+				if !ok {
+					return true
+				}
+				for _, res := range ret.Results {
+					list, ok := res.(*ast.CompositeLit)
+					if !ok {
+						t.Fatalf("%s: %s が一覧のリテラルを返していない", fset.Position(res.Pos()), streamChannelListFunc)
+					}
+					for _, el := range list.Elts {
+						item, ok := el.(*ast.CompositeLit)
+						if !ok || len(item.Elts) == 0 {
+							t.Fatalf("%s: %s の項目が {\"name\", …} の形でない", fset.Position(el.Pos()), streamChannelListFunc)
+						}
+						lit, ok := item.Elts[0].(*ast.BasicLit)
+						if !ok || lit.Kind != token.STRING {
+							t.Fatalf("%s: %s の項目の名前が文字列リテラルでない。この検査は名前を評価しないので、リテラルで書くこと",
+								fset.Position(item.Pos()), streamChannelListFunc)
+						}
+						name, err := strconv.Unquote(lit.Value)
+						if err != nil {
+							t.Fatalf("%s: %v", fset.Position(lit.Pos()), err)
+						}
+						names = append(names, name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	if found != 1 {
+		t.Fatalf("internal/server に %s が %d 個ある (1 個のはず。rename した?)", streamChannelListFunc, found)
+	}
+	return names
+}
+
 // streamRegistryRe matches `streamRegistry.Register("name", …)` and its
 // Credentialed variant. streamRegistryCallRe counts the calls so a name the
-// strict form cannot read is detected instead of silently dropped.
+// strict form cannot read is detected instead of silently dropped. The
+// built-in channels are listed by builtinStreamChannels since #3692; these
+// still catch a direct registration added elsewhere.
 var (
 	streamRegistryRe     = regexp.MustCompile(`\bstreamRegistry\.Register(?:Credentialed)?\("([a-zA-Z]+)"`)
 	streamRegistryCallRe = regexp.MustCompile(`\bstreamRegistry\.Register(?:Credentialed)?\(`)
@@ -873,38 +1016,23 @@ var (
 // serverPackageSource concatenates internal/server's non-test sources with
 // comments removed. **package 全体を読む** — router.go だけを見ると別
 // ファイルからの登録を取りこぼす。実際 plugin_wiring.go は `api.Group(...)` で
-// `/api` 配下を生やしている。
+// `/api` 配下を生やしている。列挙は serverSources (`git ls-files`、#3672)。
 //
 // **コメントが落ちるのは `parser.ParseFile` の mode が 0 だから。**
 // `parser.ParseComments` に変えると `printer.Fprint` が `*ast.File` の
 // `Comments` を印字するので、`/* */` で囲んだ登録が黙って復活する。
-// `TestServerPackageSourceDropsBlockComments` がそれを固定している。
-func serverPackageSource() (string, error) {
-	files, err := filepath.Glob(filepath.Join("..", "..", "internal", "server", "*.go"))
-	if err != nil {
-		return "", err
-	}
+// `TestGoSourceWithoutComments` がそれを固定している。
+func serverPackageSource(t *testing.T) string {
+	t.Helper()
 	var body []string
-	read := 0
-	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		src, err := os.ReadFile(f)
+	for _, f := range serverSources(t) {
+		stripped, err := goSourceWithoutComments(f.rel, f.src)
 		if err != nil {
-			return "", err
-		}
-		read++
-		stripped, perr := goSourceWithoutComments(f, src)
-		if perr != nil {
-			return "", perr
+			t.Fatalf("read internal/server/*.go: %v", err)
 		}
 		body = append(body, stripped)
 	}
-	if read == 0 {
-		return "", fmt.Errorf("internal/server/*.go を 1 ファイルも読めない")
-	}
-	return strings.Join(body, "\n"), nil
+	return strings.Join(body, "\n")
 }
 
 // goSourceWithoutComments re-prints Go source with every comment dropped.
@@ -940,22 +1068,24 @@ var docChannelRowRe = regexp.MustCompile("^\\| `([a-zA-Z]+)` \\|")
 // 実在しない名前だった。人が目で照合すると通る類の誤り。
 //
 // **固定できるのは「doc の一覧 == mk-go の登録」だけ。** §4-1 のもう半分の主張
-// 「upstream は 18」「名前も upstream に揃えてある」は検証していない — test-shards は
+// 「upstream は 19」「名前も upstream に揃えてある」は検証していない — test-shards は
 // 本家のソースを取得しないため。doc と実装を同時に間違えれば通る。upstream 側の
 // 増減も検出できないので、本家の版を上げる PR で人が見る。
 func TestDivergenceDoc_StreamChannelsMatchRegistry(t *testing.T) {
 	// 走査は `TestAPICompatDoc_MatchesRouter` と揃えて package 全体。router.go
 	// だけを見ると別ファイルからの登録を取りこぼす。
-	joined, err := serverPackageSource()
-	if err != nil {
-		t.Fatalf("read internal/server/*.go: %v", err)
-	}
+	joined := serverPackageSource(t)
 	registry := map[string]bool{}
-	for _, m := range streamRegistryRe.FindAllStringSubmatch(joined, -1) {
-		registry[m[1]] = true
+	// 組み込みのチャンネルは builtinStreamChannels の一覧にある (#3692)。
+	for _, name := range builtinStreamChannelNames(t) {
+		registry[name] = true
 	}
 	if len(registry) == 0 {
-		t.Fatal("internal/server から streamRegistry.Register(...) を 1 件も読めない (登録の書き方が変わった?)")
+		t.Fatal("internal/server の builtinStreamChannels からチャンネル名を 1 件も読めない (一覧の書き方が変わった?)")
+	}
+	// 一覧の外で直接登録しているチャンネルも拾う。
+	for _, m := range streamRegistryRe.FindAllStringSubmatch(joined, -1) {
+		registry[m[1]] = true
 	}
 	// **抽出の取りこぼしを検出する。** 名前が定数 / 変数経由だったり、`[a-zA-Z]+`
 	// に収まらない文字 (数字・`_`・`-`) を含むと registry から丸ごと消え、doc に
@@ -997,7 +1127,7 @@ func TestDivergenceDoc_StreamChannelsMatchRegistry(t *testing.T) {
 		}
 	}
 	if len(doc) == 0 {
-		t.Fatal("docs/divergence.md §4-1 からチャンネル名を 1 件も読めない " +
+		t.Fatal("docs/divergence/config.md §4-1 からチャンネル名を 1 件も読めない " +
 			"(表の書式か ```text フェンスが変わった?)")
 	}
 
@@ -1006,7 +1136,7 @@ func TestDivergenceDoc_StreamChannelsMatchRegistry(t *testing.T) {
 	if len(missing) == 0 && len(stale) == 0 {
 		return
 	}
-	t.Errorf(`docs/divergence.md §4-1 のチャンネル一覧が internal/server の登録と食い違っている。
+	t.Errorf(`docs/divergence/config.md §4-1 のチャンネル一覧が internal/server の登録と食い違っている。
 
 実装にあって doc に無い (%d 件):
   %s

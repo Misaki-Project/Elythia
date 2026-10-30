@@ -70,6 +70,8 @@ func logDevModeBanner(cfg *config.Config) {
 // registerFrontendAssets serves prefix (`/vite` or `/embed_vite`) from the
 // built assets in dir, or proxies it to the Vite dev server at devServer when
 // cfg enables dev mode. Outside dev mode a missing build answers 404.
+// Built assets are served by serveFrontendBuild (long-lived Cache-Control on
+// hashed files and precompressed variants, #3593).
 //
 // **dev server への proxy は dev モードのときだけにする。** 以前は「ビルド成果物が
 // 無ければ proxy」だったので、本番でビルド出力が欠けている (bind-mount の
@@ -83,12 +85,14 @@ func logDevModeBanner(cfg *config.Config) {
 // 返し、「JS のはずが HTML」という原因から遠い壊れ方になる。
 func registerFrontendAssets(e *echo.Echo, cfg *config.Config, prefix, dir, devServer string) {
 	if isDev(cfg) {
-		e.Any(prefix+"/*", newViteProxy(devServer))
+		// 全体の gzip middleware は `<prefix>/*` を外している (selfEncodedRoutes)
+		// ので、dev server の応答はここで従来どおり圧縮する。
+		e.Any(prefix+"/*", newViteProxy(devServer), frontendDynamicGzip())
 		return
 	}
 	_, err := os.Stat(dir)
 	if err == nil {
-		e.Static(prefix, dir)
+		e.GET(prefix+"/*", serveFrontendBuild(dir))
 		return
 	}
 	slog.Warn("frontend のビルド成果物が見つからないので 404 を返します。開発中なら dev: true (MK_DEV=1) で Vite dev server を使ってください",
@@ -99,6 +103,11 @@ func registerFrontendAssets(e *echo.Echo, cfg *config.Config, prefix, dir, devSe
 }
 
 // loaderAssetsFor returns the bootloader assets to inline into the SPA shell.
+// It reads them from disk, so callers read it once at construction, like
+// clientEntryFor.
+//
+// **組み立てのときに読み、描画へ渡す (#3803)。** entry と loader を同じ時点で
+// 読むので、組み立て直した世代は両方とも作り直した frontend のものになる。
 //
 // **dev では埋め込まない (#2477 と同じ理由)。** ビルド成果物が残っているだけの
 // 状態で埋め込むと、dev server が返す新しい loader ではなく古い built を読んで
@@ -108,7 +117,7 @@ func loaderAssetsFor(cfg *config.Config) frontendutil.LoaderAssets {
 	if isDev(cfg) {
 		return frontendutil.LoaderAssets{}
 	}
-	return frontendutil.BootLoaderAssets()
+	return frontendutil.ReadBootLoaderAssets()
 }
 
 // embedLoaderAssetsFor is loaderAssetsFor for the embed bundle.
@@ -116,5 +125,5 @@ func embedLoaderAssetsFor(cfg *config.Config) frontendutil.LoaderAssets {
 	if isDev(cfg) {
 		return frontendutil.LoaderAssets{}
 	}
-	return frontendutil.EmbedLoaderAssets()
+	return frontendutil.ReadEmbedLoaderAssets()
 }

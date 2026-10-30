@@ -34,7 +34,7 @@ func avatarDecorationMigrationDB(t *testing.T) *gorm.DB {
 func avatarDecorationMigrationSQL(t *testing.T) string {
 	t.Helper()
 	avatarDecorationMigSQLOnce.Do(func() {
-		body, err := os.ReadFile(filepath.Join("..", "..", "migration", "000098_drop_remote_avatar_decorations.up.sql"))
+		body, err := os.ReadFile(filepath.Join("..", "..", "migration", "local", "000001_misaki_drop_remote_avatar_decorations.up.sql"))
 		avatarDecorationMigSQL, avatarDecorationMigSQLErr = string(body), err
 	})
 	require.NoError(t, avatarDecorationMigSQLErr)

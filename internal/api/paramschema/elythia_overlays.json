@@ -1,0 +1,607 @@
+{
+	"admin/accounts/create": {
+		"x-elythia-properties": {
+			"federationStatus": {
+				"description": "Federation state of the new account. Omitted, null, or the empty string defaults to on.",
+				"type": "string",
+				"enum": [
+					"on",
+					"off",
+					"pending",
+					"",
+					null
+				],
+				"nullable": true
+			}
+		}
+	},
+	"admin/queue/clear": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/jobs": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		},
+		"x-elythia-properties": {
+			"limit": {
+				"description": "The jobs of a page; giving limit or page pages the jobs instead of listing them like upstream (#3167).",
+				"type": "integer",
+				"minimum": 1,
+				"maximum": 100
+			},
+			"page": {
+				"description": "The page, from 1.",
+				"type": "integer",
+				"minimum": 1
+			}
+		}
+	},
+	"admin/queue/pause": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/promote-jobs": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/queue-stats": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/remove-job": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/resume": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/retry-job": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/show-job": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"admin/queue/show-job-logs": {
+		"properties": {
+			"queue": {
+				"description": "Elythia operates these queues besides upstream's (queue.AllQueueNames), and the queues of plugins (queue.PluginQueuePrefix), which admin/queue/queues lists and the job queue page opens.",
+				"enum": [
+					"push",
+					"export",
+					"webhook",
+					"maintenance"
+				],
+				"x-elythia-enumPattern": "^plugin:[a-z0-9][a-z0-9-]*$"
+			}
+		}
+	},
+	"i/notifications": {
+		"properties": {
+			"includeTypes": {
+				"items": {
+					"description": "Elythia's own notification types (notification.MkGoTypeNames).",
+					"enum": [
+						"importCompleted",
+						"abuseReport",
+						"emojiApplicationProcessed",
+						"emojiApplicationReceived",
+						"signupApplicationReceived"
+					]
+				}
+			},
+			"excludeTypes": {
+				"items": {
+					"description": "Elythia's own notification types (notification.MkGoTypeNames).",
+					"enum": [
+						"importCompleted",
+						"abuseReport",
+						"emojiApplicationProcessed",
+						"emojiApplicationReceived",
+						"signupApplicationReceived"
+					]
+				}
+			}
+		}
+	},
+	"i/notifications-grouped": {
+		"properties": {
+			"includeTypes": {
+				"items": {
+					"description": "Elythia's own notification types (notification.MkGoTypeNames).",
+					"enum": [
+						"importCompleted",
+						"abuseReport",
+						"emojiApplicationProcessed",
+						"emojiApplicationReceived",
+						"signupApplicationReceived"
+					]
+				}
+			},
+			"excludeTypes": {
+				"items": {
+					"description": "Elythia's own notification types (notification.MkGoTypeNames).",
+					"enum": [
+						"importCompleted",
+						"abuseReport",
+						"emojiApplicationProcessed",
+						"emojiApplicationReceived",
+						"signupApplicationReceived"
+					]
+				}
+			}
+		}
+	},
+	"federation/instances": {
+		"properties": {
+			"sort": {
+				"description": "Elythia also sorts by host (docs/divergence/operations.md).",
+				"enum": [
+					"+host",
+					"-host"
+				]
+			}
+		},
+		"x-elythia-properties": {
+			"sinceId": {
+				"description": "The cursor of the paginator (#493).",
+				"type": "string",
+				"format": "misskey:id"
+			},
+			"untilId": {
+				"description": "The cursor of the paginator (#493).",
+				"type": "string",
+				"format": "misskey:id"
+			},
+			"sinceDate": {
+				"description": "The cursor by date (#1173).",
+				"type": "integer"
+			},
+			"untilDate": {
+				"description": "The cursor by date (#1173).",
+				"type": "integer"
+			}
+		}
+	},
+	"reversi/match": {
+		"properties": {
+			"userId": {
+				"description": "An acct (@user or @user@host) names the opponent, for federated games.",
+				"x-elythia-formatAlso": {
+					"pattern": "^@[^@\\s]+(@[^@\\s]+)?$"
+				}
+			}
+		}
+	},
+	"admin/drive/files": {
+		"properties": {
+			"userId": {
+				"description": "@system lists the files the system owns (#686).",
+				"x-elythia-formatAlso": {
+					"values": [
+						"@system"
+					]
+				}
+			}
+		},
+		"x-elythia-properties": {
+			"host": {
+				"description": "The host of the files, preferred to hostname.",
+				"type": "string",
+				"nullable": true
+			}
+		}
+	},
+	"admin/abuse-user-reports": {
+		"x-elythia-properties": {
+			"resolved": {
+				"description": "Filters by whether the report is resolved, read when state is all, empty or null (before state existed).",
+				"type": "boolean",
+				"nullable": true
+			},
+			"reportId": {
+				"description": "Returns only this report, for the link of the abuse report notification (#2868).",
+				"type": "string",
+				"format": "misskey:id"
+			}
+		}
+	},
+	"admin/emoji/copy": {
+		"x-elythia-properties": {
+			"name": {
+				"description": "The name of the copy; null keeps the name of the source.",
+				"type": "string",
+				"nullable": true,
+				"pattern": "^[a-zA-Z0-9_]+$",
+				"maxLength": 128
+			},
+			"category": {
+				"description": "The category of the copy; null keeps the source's.",
+				"type": "string",
+				"nullable": true
+			},
+			"aliases": {
+				"description": "The aliases of the copy; null keeps the source's.",
+				"type": "array",
+				"nullable": true,
+				"items": {
+					"type": "string"
+				}
+			},
+			"license": {
+				"description": "The license of the copy; null keeps the source's.",
+				"type": "string",
+				"nullable": true
+			},
+			"isSensitive": {
+				"description": "Whether the copy is sensitive; null keeps the source's.",
+				"type": "boolean",
+				"nullable": true
+			}
+		}
+	},
+	"admin/emoji/list": {
+		"x-elythia-properties": {
+			"category": {
+				"description": "Filters by the exact category (#3857).",
+				"type": "string",
+				"nullable": true
+			}
+		}
+	},
+	"antennas/update": {
+		"x-elythia-properties": {
+			"isActive": {
+				"description": "Whether the antenna is active; null and absent make it active again, like upstream does on an edit.",
+				"type": "boolean",
+				"nullable": true
+			}
+		}
+	},
+	"chat/history": {
+		"x-elythia-properties": {
+			"untilId": {
+				"description": "The cursor of the next page.",
+				"type": "string",
+				"format": "misskey:id"
+			}
+		}
+	},
+	"pages/create": {
+		"x-elythia-properties": {
+			"visibility": {
+				"description": "Who can see the page (#3479).",
+				"type": "string",
+				"enum": [
+					"public",
+					"private"
+				]
+			}
+		}
+	},
+	"pages/update": {
+		"x-elythia-properties": {
+			"visibility": {
+				"description": "Who can see the page (#3479); null keeps it.",
+				"type": "string",
+				"nullable": true,
+				"enum": [
+					"public",
+					"private",
+					null
+				]
+			}
+		}
+	},
+	"i/regenerate-token": {
+		"x-elythia-properties": {
+			"token": {
+				"description": "The two-factor authentication code; the bundled frontend sends null when two-factor authentication is off.",
+				"type": "string",
+				"nullable": true
+			}
+		}
+	},
+	"admin/show-user": {
+		"x-elythia-properties": {
+			"withSignins": {
+				"description": "false leaves out the sign-in history; null and absent include it.",
+				"type": "boolean",
+				"nullable": true
+			}
+		}
+	},
+	"notes": {
+		"x-elythia-properties": {
+			"noteIds": {
+				"description": "Returns these notes instead of the public notes (up to 100, like notes/show-partial-bulk).",
+				"type": "array",
+				"maxItems": 100,
+				"items": {
+					"type": "string",
+					"format": "misskey:id"
+				}
+			}
+		}
+	},
+	"i/move": {
+		"x-elythia-properties": {
+			"password": {
+				"description": "The password of the account, checked when given (#1546).",
+				"type": "string",
+				"nullable": true
+			}
+		}
+	},
+	"notes/global-timeline": {
+		"x-elythia-properties": {
+			"allowPartial": {
+				"description": "Returns fewer notes than limit instead of reading on, like upstream does for the other timelines (the bundled frontend sends it to every timeline).",
+				"type": "boolean"
+			}
+		}
+	},
+	"i/update": {
+		"properties": {
+			"avatarDecorations": {
+				"items": {
+					"properties": {
+						"id": {
+							"description": "A decoration worn from a custom emoji has no id until it is saved: the bundled frontend sends an empty id with emojiName (#2975).",
+							"x-elythia-formatAlso": {
+								"values": [
+									""
+								]
+							}
+						}
+					},
+					"x-elythia-properties": {
+						"scale": {
+							"description": "The size of the decoration relative to upstream's; 1 when omitted (#2975).",
+							"type": "number",
+							"nullable": true,
+							"minimum": 0.1,
+							"maximum": 1
+						},
+						"emojiName": {
+							"description": "Wears the local custom emoji of this name instead of the decoration of id (#2975).",
+							"type": "string",
+							"nullable": true
+						}
+					}
+				}
+			}
+		},
+		"x-elythia-properties": {
+			"followApprovalAction": {
+				"description": "How a follow from an account younger than followApprovalLocalSeconds / followApprovalRemoteSeconds is handled (#3466); null leaves it as it is.",
+				"type": "string",
+				"nullable": true,
+				"enum": [
+					"request",
+					"silentRequest",
+					"silentFollow",
+					null
+				]
+			}
+		}
+	},
+	"admin/update-meta": {
+		"x-elythia-properties": {
+			"approvalRequiredForSignup": {
+				"description": "Accepts signups only through applications that a moderator approves (#2554); null leaves it as it is.",
+				"type": "boolean",
+				"nullable": true
+			},
+			"registrationClosed": {
+				"description": "Accepts no registrations at all, not even with an invitation code (#3186); null leaves it as it is.",
+				"type": "boolean",
+				"nullable": true
+			},
+			"signupApplicationForm": {
+				"description": "The questions of the signup application (#2570); null is the same as an empty array.",
+				"type": "array",
+				"nullable": true,
+				"maxItems": 10,
+				"items": {
+					"type": "object",
+					"properties": {
+						"label": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 100
+						},
+						"type": {
+							"type": "string",
+							"enum": [
+								"text",
+								"textarea"
+							]
+						},
+						"required": {
+							"type": "boolean",
+							"nullable": true
+						},
+						"maxLength": {
+							"description": "The longest answer; 0 and null are the default of 500.",
+							"type": "integer",
+							"nullable": true,
+							"minimum": 0,
+							"maximum": 2000
+						}
+					},
+					"required": [
+						"label",
+						"type"
+					]
+				}
+			},
+			"minimumUsernameLength": {
+				"description": "The minimum length of a local username (#3015).",
+				"type": "integer",
+				"minimum": 1,
+				"maximum": 20
+			},
+			"chunkedUploadEnabled": {
+				"description": "Enables the chunked upload of drive files (#2313).",
+				"type": "boolean"
+			},
+			"chunkedUploadChunkSizeMb": {
+				"description": "The size of one chunk in MiB.",
+				"type": "integer",
+				"minimum": 5,
+				"maximum": 32
+			},
+			"chunkedUploadSessionTtlMinutes": {
+				"description": "How long an unfinished chunked upload is kept.",
+				"type": "integer",
+				"minimum": 5,
+				"maximum": 1440
+			},
+			"chunkedUploadMaxSessionsPerUser": {
+				"description": "The unfinished chunked uploads a user may have at once; up to the range of the int4 column.",
+				"type": "integer",
+				"minimum": 1,
+				"maximum": 2147483647
+			},
+			"chunkedUploadMaxPendingMbPerUser": {
+				"description": "The MiB of unfinished chunked uploads a user may have at once; up to the range of the int4 column.",
+				"type": "integer",
+				"minimum": 1,
+				"maximum": 2147483647
+			},
+			"enableRelayOrphanUserCleanup": {
+				"description": "Periodically deletes remote users that only relays brought in (#2340).",
+				"type": "boolean"
+			},
+			"relayOrphanUserGraceDays": {
+				"description": "Such a user is deleted this many days after it was last seen (queue/processors.MinOrphanUserGraceDays); up to 10 years, so that now() - make_interval(days => n) stays a timestamp.",
+				"type": "integer",
+				"minimum": 7,
+				"maximum": 3650
+			},
+			"enableEphemeralRelayNotes": {
+				"description": "Keeps notes seen only through relays in Redis instead of the database (#2332).",
+				"type": "boolean"
+			},
+			"ephemeralRelayNoteTtlMinutes": {
+				"description": "How long such a note is kept; up to a year, so that time.Duration(n) * time.Minute does not overflow.",
+				"type": "integer",
+				"minimum": 1,
+				"maximum": 525600
+			},
+			"inboxSuspendedSoftware": {
+				"description": "Software whose activities the inbox refuses, matched like deliverSuspendedSoftware (#3362); null is the same as an empty array.",
+				"type": "array",
+				"nullable": true,
+				"items": {
+					"type": "object",
+					"properties": {
+						"software": {
+							"type": "string"
+						},
+						"versionRange": {
+							"type": "string"
+						}
+					},
+					"required": [
+						"software",
+						"versionRange"
+					]
+				}
+			}
+		}
+	}
+}

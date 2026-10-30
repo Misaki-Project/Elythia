@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/core/fedrule"
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/model"
@@ -32,30 +33,32 @@ func (h *Handler) SetFederationRuleManager(m FederationRuleManager) {
 }
 
 // federationRuleBody is the editable part of a rule.
+//
+// positionとnewWithinHoursは宣言でintegerなので、本家のajvと同じく10.0も受ける(#3877)。
 type federationRuleBody struct {
-	Name           string   `json:"name"`
-	Mode           string   `json:"mode"`
-	Target         string   `json:"target"`
-	Position       int      `json:"position"`
-	Hosts          []string `json:"hosts"`
-	ActivityTypes  []string `json:"activityTypes"`
-	IsBot          *bool    `json:"isBot"`
-	NewWithinHours *int     `json:"newWithinHours"`
-	Patterns       []string `json:"patterns"`
-	HasAttachment  *bool    `json:"hasAttachment"`
-	Tags           []string `json:"tags"`
-	Reject         bool     `json:"reject"`
-	StripMedia     bool     `json:"stripMedia"`
-	Sensitive      bool     `json:"sensitive"`
-	Unlist         bool     `json:"unlist"`
-	CW             *string  `json:"cw"`
+	Name           string     `json:"name"`
+	Mode           string     `json:"mode"`
+	Target         string     `json:"target"`
+	Position       jsnum.Int  `json:"position"`
+	Hosts          []string   `json:"hosts"`
+	ActivityTypes  []string   `json:"activityTypes"`
+	IsBot          *bool      `json:"isBot"`
+	NewWithinHours *jsnum.Int `json:"newWithinHours"`
+	Patterns       []string   `json:"patterns"`
+	HasAttachment  *bool      `json:"hasAttachment"`
+	Tags           []string   `json:"tags"`
+	Reject         bool       `json:"reject"`
+	StripMedia     bool       `json:"stripMedia"`
+	Sensitive      bool       `json:"sensitive"`
+	Unlist         bool       `json:"unlist"`
+	CW             *string    `json:"cw"`
 }
 
 func (b federationRuleBody) model(id string) *model.FederationRule {
 	return &model.FederationRule{
-		ID: id, Name: b.Name, Mode: b.Mode, Target: b.Target, Position: b.Position,
+		ID: id, Name: b.Name, Mode: b.Mode, Target: b.Target, Position: int(b.Position),
 		Hosts: model.StringArray(b.Hosts), ActivityTypes: model.StringArray(b.ActivityTypes),
-		IsBot: b.IsBot, NewWithinHours: b.NewWithinHours, Patterns: model.StringArray(b.Patterns),
+		IsBot: b.IsBot, NewWithinHours: b.NewWithinHours.IntPtr(), Patterns: model.StringArray(b.Patterns),
 		HasAttachment: b.HasAttachment, Tags: model.StringArray(b.Tags),
 		Reject: b.Reject, StripMedia: b.StripMedia, Sensitive: b.Sensitive, Unlist: b.Unlist, CW: b.CW,
 	}
@@ -80,13 +83,21 @@ func packFederationRule(r *model.FederationRule, hits int64) federationRuleRespo
 	return federationRuleResponse{
 		ID: r.ID, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, Hits: hits,
 		federationRuleBody: federationRuleBody{
-			Name: r.Name, Mode: r.Mode, Target: r.Target, Position: r.Position,
+			Name: r.Name, Mode: r.Mode, Target: r.Target, Position: jsnum.Int(r.Position),
 			Hosts: nonNil(r.Hosts), ActivityTypes: nonNil(r.ActivityTypes), IsBot: r.IsBot,
-			NewWithinHours: r.NewWithinHours, Patterns: nonNil(r.Patterns), HasAttachment: r.HasAttachment,
+			NewWithinHours: hoursOf(r.NewWithinHours), Patterns: nonNil(r.Patterns), HasAttachment: r.HasAttachment,
 			Tags: nonNil(r.Tags), Reject: r.Reject, StripMedia: r.StripMedia, Sensitive: r.Sensitive,
 			Unlist: r.Unlist, CW: r.CW,
 		},
 	}
+}
+
+func hoursOf(h *int) *jsnum.Int {
+	if h == nil {
+		return nil
+	}
+	v := jsnum.Int(*h)
+	return &v
 }
 
 func noSuchFederationRule(c echo.Context) error {
@@ -98,7 +109,8 @@ func federationRuleError(c echo.Context, err error) error {
 	var v *fedrule.ValidationError
 	switch {
 	case errors.As(err, &v):
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid rule: "+v.Error(), "8efb928f-23d5-4af2-8459-e0b2e6c72e3c"))
+		// 宣言の拒否(INVALID_PARAM)と見分けられるように、意味の誤りは別のcodeにする(#3877)。
+		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_RULE", "Invalid rule: "+v.Error(), "0bccabbe-44ed-4976-83dc-5867b317cb1e"))
 	case errors.Is(err, fedrule.ErrNotFound):
 		return noSuchFederationRule(c)
 	case errors.Is(err, fedrule.ErrTooManyRules):
@@ -143,8 +155,8 @@ func (h *Handler) FederationRules(c echo.Context) error {
 // 新しい順に返す。record のルールで誤爆していないかを確かめるためのもの。
 func (h *Handler) FederationRuleHits(c echo.Context) error {
 	var req struct {
-		RuleID string `json:"ruleId"`
-		Limit  int    `json:"limit"`
+		RuleID string    `json:"ruleId"`
+		Limit  jsnum.Int `json:"limit"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
@@ -155,7 +167,7 @@ func (h *Handler) FederationRuleHits(c echo.Context) error {
 	if h.fedRules == nil {
 		return noSuchFederationRule(c)
 	}
-	hits, err := h.fedRules.Samples(c.Request().Context(), req.RuleID, req.Limit)
+	hits, err := h.fedRules.Samples(c.Request().Context(), req.RuleID, int(req.Limit))
 	if err != nil {
 		return federationRuleError(c, err)
 	}

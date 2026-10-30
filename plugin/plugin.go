@@ -21,6 +21,7 @@
 package plugin
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -70,6 +71,15 @@ type Definition struct {
 	// job queue. May be nil.
 	Jobs func(Context, Jobs) error
 
+	// Notifications registers the handler for notifications addressed to the
+	// accounts this plugin manages (#3469). Called only in processes that run
+	// the job queue, like Jobs. May be nil.
+	//
+	// **宣言したプラグインにだけ届ける。** 宣言が無ければ、管理するアカウントに
+	// 通知が来てもキューに積まない (積んでも処理する handler が居ないため)。
+	// handler はプラグインの専用キューの worker から呼ばれる。
+	Notifications func(Context, Notifications) error
+
 	// Peered opts this plugin into [Peer] — the private channel to the same
 	// plugin on other mk-go instances.
 	//
@@ -113,6 +123,14 @@ type Definition struct {
 	// EffectivePolicies declares effective-policy contributions. The host calls
 	// it after Migrations and before any Routes or Jobs callback.
 	EffectivePolicies func(Context, EffectivePolicyInvalidator) (EffectivePolicyRegistration, error)
+
+	// Secrets declares the secret values the operator enters from the control
+	// panel (#3470). Read them with [Context.Secrets]. May be nil.
+	//
+	// **宣言は入力欄を出すためのもの。** 値の保存と読み出しは宣言の有無に
+	// 関係なく [Context.Secrets] でできるが、管理画面から入れられるのは
+	// ここに書いた名前だけになる。
+	Secrets []SecretSpec
 }
 
 // Validate reports whether the definition is usable.
@@ -138,8 +156,18 @@ func (d Definition) Validate() error {
 	if d.Peer != nil && !d.Peered {
 		return fmt.Errorf("plugin %q: Peer を指定するなら Peered も立てること", d.Name)
 	}
-	if d.Routes == nil && d.Jobs == nil && d.EffectivePolicies == nil && d.Peer == nil {
-		return fmt.Errorf("plugin %q: Routes も Jobs も EffectivePolicies も Peer も設定されていません", d.Name)
+	seen := make(map[string]struct{}, len(d.Secrets))
+	for _, sp := range d.Secrets {
+		if !validSecretName(sp.Name) {
+			return fmt.Errorf("plugin %q: Secrets の名前 %q が不正です (英字で始まり、英数字と _ - だけで 64 文字以内)", d.Name, sp.Name)
+		}
+		if _, dup := seen[sp.Name]; dup {
+			return fmt.Errorf("plugin %q: Secrets の名前 %q が重複しています", d.Name, sp.Name)
+		}
+		seen[sp.Name] = struct{}{}
+	}
+	if d.Routes == nil && d.Jobs == nil && d.EffectivePolicies == nil && d.Peer == nil && d.Notifications == nil {
+		return fmt.Errorf("plugin %q: Routes も Jobs も EffectivePolicies も Peer も Notifications も設定されていません", d.Name)
 	}
 	return nil
 }
@@ -219,6 +247,17 @@ type Context interface {
 	// Config returns this plugin's settings from the instance configuration.
 	Config() Config
 
+	// Accounts manages the local accounts this plugin owns — accounts that
+	// nobody can sign in to, such as bots (#3468).
+	//
+	// **常に非 nil。** 本体の配線が無い環境では、呼ぶとエラーを返す実装になる。
+	Accounts() Accounts
+	// Secrets returns this plugin's encrypted secret values (#3470).
+	//
+	// **自分の値しか見えない。** 名前はプラグインごとに分かれているので、
+	// 他のプラグインの同名の値とは混ざらない。nil は返さない。
+	Secrets() Secrets
+
 	// Queue enqueues jobs onto this plugin's own queue.
 	//
 	// [Jobs.Handle] で登録した名前を使う。**Routes からも Jobs からも呼べる**
@@ -243,7 +282,21 @@ type Context interface {
 	// **そのプラグインだけがサーバーの素の IP で外へ出る**。
 	//
 	// **Transport を差し替えないこと。** 差し替えると上の 2 つが消える。
-	// per-request の timeout は `http.NewRequestWithContext` で付ける。
+	//
+	// 1 要求の期限は 30 秒。`http.NewRequestWithContext` の context で
+	// **縮める**ことはできるが、`Client.Timeout` は context とは別に効くので
+	// 30 秒より**延ばす**ことはできない。長く待つ要求は、返ってきた client を
+	// 書き換えずに写しを作り、写しの Timeout を変える:
+	//
+	//	hc := *ctx.HTTP()
+	//	hc.Timeout = 2 * time.Minute
+	//	res, err := hc.Do(req)
+	//
+	// 写しも同じ Transport を使うので、SSRF ガードと運営者の proxy などの設定は
+	// そのまま効く。返ってきた client そのものの Timeout を書き換えると、
+	// そのプラグインの他の要求にも効き、並行に走る要求と data race になる。
+	// Timeout を 0 にすると期限が無くなるので、正の値を入れる (0 にするなら
+	// 要求の context で必ず期限を付ける)。
 	//
 	// これはセキュリティ境界ではない (パッケージの doc を参照) — プラグインは
 	// `net/http` を直接使えるので、これは「間違えにくい既定」を配るもの。
@@ -254,5 +307,19 @@ type Context interface {
 	// **プラグインが自分で `go` を書くとプロセスごと落ちる。** Go は他の
 	// goroutine の panic を回収できないため、mk-go 側の recover
 	// (echo の Recover middleware 等) では止められない。
+	//
+	// fn は、この Context を渡したサーバーの世代が止まるとき (メンテナンス、
+	// プロセスの終了) に待たれる。待つ時間には上限があるので、長く走る処理は
+	// GoContext を使い、ctx の終了で戻ること。世代が止まった後に呼ぶと fn は
+	// 走らない (#3661)。
 	Go(fn func())
+
+	// GoContext is Go with a context that is canceled when the server
+	// generation this Context belongs to stops (maintenance or process exit).
+	// fn should return soon after ctx is done.
+	//
+	// 世代を作り直すと、プラグインの storage の pool は閉じられ、新しい Context で
+	// もう一度 Routes などが呼ばれる。ctx を見ずに走り続ける goroutine は、閉じた
+	// pool を使ってエラーになる (#3661)。
+	GoContext(fn func(context.Context))
 }

@@ -49,6 +49,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 						<template #key>{{ i18n.ts.email }}</template>
 						<template #value><span class="_monospace">{{ info.email }}</span></template>
 					</MkKeyValue>
+					<!-- Elythia: プラグインが管理するアカウント (#3468) は、管理しているプラグインの名前を出す。誰もログインできないアカウントであることを、運営者がここで見分けられるようにする -->
+					<MkKeyValue v-if="info && info.managedByPlugin != null" oneline>
+						<template #key>{{ i18n.ts.plugins }}</template>
+						<template #value><span class="_monospace">{{ info.managedByPlugin }}</span></template>
+					</MkKeyValue>
 				</template>
 			</div>
 
@@ -271,7 +276,7 @@ import MkInfo from '@/components/MkInfo.vue';
 import MkPluginSlot from '@/components/MkPluginSlot.vue';
 import * as os from '@/os.js';
 import { misskeyApi } from '@/utility/misskey-api.js';
-import { acct } from '@/filters/user.js';
+import { acct } from '@@/js/user.js';
 import { definePage } from '@/page.js';
 import { i18n } from '@/i18n.js';
 import { useMkSelect } from '@/composables/use-mkselect.js';
@@ -296,7 +301,7 @@ const props = withDefaults(defineProps<{
 	initialTab: 'overview',
 });
 
-const mkGoVersion = (instance as typeof instance & { mkGoVersion?: string }).mkGoVersion ?? null;
+const mkGoVersion = instance.mkGoVersion ?? null;
 const ipLookup = createLazyUserIpLookup(props.userId, userId => misskeyApi('admin/get-user-ips', { userId }));
 
 const result = await _fetch_();
@@ -647,7 +652,7 @@ watch(user, () => {
 	}).then(res => {
 		ap.value = res;
 	});
-});
+}, { immediate: true });
 
 const headerActions = computed(() => []);
 

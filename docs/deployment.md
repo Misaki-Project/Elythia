@@ -2,40 +2,236 @@
 
 ## PostgreSQL 16 → 18 への移行 (既存環境)
 
-compose 群と CI は PostgreSQL 18 に統一した (#2513)。**既存の 16 の data volume はイメージを上げるだけでは開けない** — メジャーアップグレードには dump→restore (または pg_upgrade) が必要で、そのまま起動すると `database files are incompatible` で crash loop になる。
+compose群とCIはPostgreSQL 18に統一した(#2513)。**既存の16のdata volumeは、imageを上げるだけでは開けない。** メジャーバージョンを上げるには、古いサーバーから取ったdumpを新しいサーバーへ戻す(または`pg_upgrade`する)必要があり、そのまま起動すると`database files are incompatible`でcrash loopになる。
 
-さらに `postgres:18` イメージは **data layout が変わった** (default PGDATA が `/var/lib/postgresql/18/docker`、`VOLUME` 宣言が `/var/lib/postgresql` 親ディレクトリへ)。compose 群のマウント先はこれに合わせて `/var/lib/postgresql` に変更済み。旧パス (`/var/lib/postgresql/data`) のままイメージだけ上げると、**新規デプロイでは匿名 volume 側に initdb され、`down` で全データが静かに消える**。自前 compose を使っている場合はマウント先を確認すること。
+さらに`postgres:18`のimageは**data layoutが変わった**(既定のPGDATAが`/var/lib/postgresql/18/docker`、`VOLUME`の宣言が親の`/var/lib/postgresql`)。compose群のマウント先はこれに合わせて`/var/lib/postgresql`に変えてある。旧パス(`/var/lib/postgresql/data`)のままimageだけ上げると、**新規デプロイでは匿名volumeの側にinitdbされ、`down`で全データが静かに消える**。自前のcomposeを使っているなら、マウント先を確かめること。
 
-既存環境の移行手順 (ダウンタイム = dump + restore の時間)。サービス名は
-`docker-compose.yml` (TCP 構成) のもの (`app` / `db`)。UDS 構成は `mkgo` /
-`postgres` に読み替える (UDS は明示 `PGDATA` なのでマウント先は旧パスのまま
-変えなくてよい):
+この手順は、`elythia backup take`で取ったバックアップ([DBのバックアップ](backup.md))と`elythia backup restore`([バックアップから戻す](#バックアップから戻す-restore))を使う。18より後の版へ上げるときも、版の数字を読み替えれば同じ手順になる。
+
+- **上げる前に、新しい版で戻せることを確かめる。** バックアップ用のimageは`postgres:18-alpine`を元にしているので、`backup verify`([確かめる](backup.md#確かめる)、#3459)は18の`initdb`で立てた使い捨てのサーバーへ戻して確かめる
+- **古いvolumeは消さない。** 新しい版のサーバーは新しいvolumeで立てるので、composeを古い版に戻せば元に戻る
+- バックアップ用のimageの`pg_dump`は18で、16のサーバーから取れる(pg_dumpは自分より古いサーバーから取れる)。16のサーバーから18の`pg_dump`で取り、18の空のDBへ戻して`elythia doctor`の検査が通ることは、`internal/backup`のテスト(`TestRestoreEmptyFromPostgres16`)で確かめている
+- **逆に、18の`pg_restore`では16のサーバーへ戻せない。** 16が知らない設定(`transaction_timeout`)を流して落ちるので、`backup restore`は何も作る前に止まる。16のまま`-mode swap`で前の状態へ戻すことはできないので、先に18へ上げる
+
+**この手順は、`backup restore`(#3461)を持つ版のElythiaで動いていることが前提。** `backup`サービスや`backup restore`が無い古い版で16のまま動いているなら、まずDBを16のまま、[アップデート](#アップデート)の手順でElythiaをこの版以上へ上げ、起動して動くことを確かめてから、この手順を流す。このとき、`docker-compose.yml`の`db`の`image`と`volumes`は16のもの(`postgres:16-alpine`と`db_data:/var/lib/postgresql/data`)のまま残す。取ってきた版の`docker-compose.yml`の`db`は18を指しているので、そのまま`up`すると、16のvolumeを18で開こうとして起動しない(上の段落)。`db`を18に書き換えるのは手順4。
+
+止まる時間は、最後のバックアップを取り始めてから、戻し終わるまで。サービス名は`docker-compose.yml`(TCP構成)のもの(`app` / `db` / `backup`)。UDS構成の読み替えは、手順の後に書く。`backup`サービスの設定(保存先と、暗号化するなら鍵)は、先に[DBのバックアップ](backup.md)に従って済ませておく。
 
 ```bash
-# 0. 先に compose を 18 版 (イメージ + マウント先) へ更新しておく
-#    (git pull。ここを忘れて古い compose のまま進めると 16 で init し直すだけになる)
+# 0. バックアップ用の image を、動いている app と同じ版から作る。db はまだ 16 のまま
+#    動かしておく (db の image と volume は手順 4 で書き換える。backup は run --no-deps
+#    で呼ぶので、db を作り直さない)
+#    restore は同梱の migration を当てるので、app より新しい版の image で戻すと、
+#    app の起動時の migrate が知らない番号で止まる。今の版より新しい版へ上げるのは、
+#    この手順を終えてからにする (backup restore の無い版からは、上の段落のとおり
+#    先にこの版へ上げておく)
+MKGO_COMMIT=$(git rev-parse --short HEAD) docker compose build backup
 
-# 1. アプリを止めて書き込みを停止 (postgres は起動したまま)
-docker compose stop app
+# 1. 書き込みを止める (db と redis は動かしたまま)。backup-daemon (定期実行) も止める
+docker compose stop app backup-daemon
 
-# 2. dump を取る
-docker compose exec -T db pg_dumpall -U <user> > pg16-dump.sql
+# 2. 最後の世代を取る。出力の世代 ID (例: 20261010T030000Z) を控える
+docker compose run --rm --no-deps backup take
 
-# 3. 全体を止め、volume 自体もバックアップしてから作り直す
-#    (tar は postgres 停止後に取る。稼働中に取ると crash-consistent ですらない)
-docker compose down
-docker run --rm -v <pg-volume>:/from -v "$PWD":/to alpine tar czf /to/pg16-data.tar.gz -C /from .
-docker volume rm <pg-volume>
-docker compose up -d db          # ここで postgres:18 が新規 initdb する
+# 3. 新しい版 (18) で戻せることを確かめる。通らなければ、ここで止めて
+#    docker compose start app で再開する (backup-daemon を使っているなら、
+#    docker compose start backup-daemon も)
+docker compose run --rm --no-deps backup verify <世代ID>
 
-# 4. restore (init が作った空 DB を落としてから dump を流す)
-docker compose exec -T db psql -U <user> -d postgres -c 'DROP DATABASE <db>;'
-docker compose exec -T db psql -U <user> -d postgres < pg16-dump.sql
-docker compose exec -T db vacuumdb -U <user> --all --analyze-in-stages
+# 4. db を 18 の新しい volume で立てる。docker-compose.yml の db を
+#      image: postgres:18-alpine   (pg_bigm を使っているなら、その入った image)
+#      volumes: [db_data_pg18:/var/lib/postgresql]
+#    にし、末尾の volumes: に db_data_pg18: を足す。古い db_data は消さない
+docker compose stop db
+docker compose up -d db          # postgres:18 が新しい volume に initdb し、空の DB を作る
 
-# 5. アプリ再開・確認
+# 5. 空の DB へ戻す。-mode empty は既定で Redis を消さない (下の説明)
+docker compose run --rm --no-deps backup restore -id <世代ID> -mode empty -confirm <DB名>
+
+# 6. 統計を取り直す。pg_restore は表の統計を持ってこないので、取り直すまで
+#    planner が見当違いの plan を選ぶことがある
+docker compose exec db vacuumdb -U <DBのユーザー> -d <DB名> --analyze-in-stages
+
+# 7. 起動して確かめる
 docker compose up -d
+docker compose exec app /app/elythia doctor
+# backup-daemon を使っているなら再開する (.env の COMPOSE_PROFILES に backup-daemon を
+# 書いていれば、上の up -d で起動している)
+docker compose start backup-daemon
 ```
+
+**`backup-daemon`は手順1で止め、手順7まで動かさない。** 動かしたままだと、手順4で立てた空のDBの世代を定期実行で取り、`keep`を超えた古い世代を整理で消しうるため。
+
+**この手順では、Redisを消さない。** `-mode empty`は、`-redis`を渡さず(`auto`)、戻す世代が保存先の最新の世代(`meta.json`のある世代のうち最も新しいもの)のときは、Redisの後始末をしない。手順1で本体を止めてから手順2で取るので、戻すDBは止めた時点のDBそのもので、Redisの中身と食い違わない。消すと、届いていない配送(`Delete`の再試行を含む。消すと、こちらで消した投稿が相手に残る)や、DBへ未反映のリアクション数(`reaction-buffer:*`。本体を止めるときには反映しない)を失うだけになる。
+
+戻す世代が最新でないとき(`-id latest`が、検証していない新しい世代を飛ばして古い世代を選んだときや、古い世代を名指ししたとき)は、`-redis`を明示するよう表示して、何もせずに止まる。Redisの方がDBより新しいかもしれないため。DBを失って古い世代から作り直すときなど、Redisの方が新しいときは`-redis clean`を、Redisもその世代と同じ時点だと分かっているときは`-redis keep`を渡す。
+
+UDS構成(`compose.uds.yaml`)では、次のように読み替える。
+
+- `docker compose`に`-f compose.uds.yaml`を付け、`app`を`mkgo`に、`db`を`postgres`にする。`backup-daemon`は同じ名前のまま止めて、手順7の後で再開する
+- `postgres`は`build: deploy/postgres-bigm`(pg_bigm入り)で、`PGDATA`を`/var/lib/postgresql/data/pgdata`に明示し、volumeを`pg_data:/var/lib/postgresql/data`にmountしている。手順4では、`deploy/postgres-bigm/Dockerfile`の`FROM`が新しい版であることを確かめて`docker compose -f compose.uds.yaml build postgres`し、volumeを`pg_data_pg18:/var/lib/postgresql/data`に変えて、末尾の`volumes:`に`pg_data_pg18:`を足す。`PGDATA`はそのままでよい
+- 手順6は`docker compose -f compose.uds.yaml exec postgres vacuumdb -h /var/run/postgresql -U <DBのユーザー> -d <DB名> --analyze-in-stages`
+- 元に戻すときは、16で動いていたimage(ビルドしたものが手元に残っていればそのtag)と`pg_data`に戻す。`deploy/postgres-bigm/Dockerfile`は新しい版を指しているので、作り直すと16にはならない
+
+元に戻すには、`docker compose stop app db`の後、`docker-compose.yml`の`db`を16のimage(`postgres:16-alpine`)と元のマウント(`db_data:/var/lib/postgresql/data`)に戻して`docker compose up -d`する。戻した後は、上げようとしていた間に18の側で作られた投稿などは無い。
+
+**手順7で本体を18で動かした後に16へ戻すときは、本体を起動する前にRedisを片付ける。** Redisには18で動いていた間のタイムライン・配送待ちのjob・リアクション数の差分が残り、16のDBより新しくなっているため。戻すコマンドを通さないので、[Redisの後始末](#redisの後始末)の「消すもの」の表のkeyを手で消す(`bull:deliver:meta`と`bull:deliver:repeat`は残す)。例えばタイムラインは次の形で消す。`<prefix>`は表の説明のとおり。
+
+```bash
+docker compose exec -T redis sh -c "redis-cli --scan --pattern '<prefix>list:*' | xargs -r redis-cli del"
+```
+
+18で本体を起動していなければ(手順5か6で止めたなら)、Redisは16のDBと同じ時点のままなので、片付けは要らない。
+
+### DBが大きいとき(`pg_upgrade`)
+
+dumpから戻す方法は、DBの大きさに比例して止まる時間が延びる。止まる時間が長くなりすぎるサーバーでは、`pg_upgrade`で上げる方法がある。data volumeを新しい版の形式へその場で変換するので、表の中身を書き直さず、`--link`を付ければコピーもしない。ただし、両方の版のサーバーのプログラムが同じ場所に要り、`--link`で上げた後は古い版では開けなくなる。手順はPostgreSQLの文書(`pg_upgrade`)に従い、**上げる前に上の手順2・3でバックアップを取って確かめておく**。
+
+## バックアップから戻す (restore)
+
+`elythia backup restore`は、保存先の世代からDBを戻す(#3461)。同じサーバーで今のDBと入れ替える形は、管理画面からも行える([画面から戻す](backup.md#画面から戻す-3463)。本体を止めずに、バックアップ用のサービスがメンテナンスに入れて行う)。バックアップ用のimage(`pg_restore`を持つ)の中で動かす。戻す先によって2つの形がある。
+
+| 形 | 使う場面 | 何をするか |
+|---|---|---|
+| `-mode swap` | 同じサーバーで、今のDBを前の状態へ戻す | `<DB名>_restore_<日時>`へ戻し、確かめてから、今のDBを`<DB名>_before_restore_<日時>`へ、戻したDBを`<DB名>`へ名前を変える。今のDBは消さない |
+| `-mode empty` | PostgreSQLのメジャーバージョンを上げる、別のホストへ引っ越す | 表が1つも無い`<DB名>`へ戻す。DBは、設定ファイルのDBのユーザーを持ち主にして先に作っておく(`CREATE DATABASE <DB名> OWNER <DBのユーザー>`。postgresのimageなら、`POSTGRES_DB`が`POSTGRES_USER`の持ち物として作る) |
+
+`<DB名>`は設定ファイルの`db.db`。`<日時>`はUTCの`YYYYMMDDhhmmss`。戻す世代は`-id <世代ID>`で選ぶ。世代IDは`backup list`で見る。`-id latest`は、`meta.json`とdumpが揃っていて(`backup list`の`STATUS`が`complete`)、検証(`backup verify`、[確かめる](backup.md#確かめる))に通った世代(`verify.json`の`ok`が`true`で、その`id`と`dumpSha256`が今の`meta.json`と合うもの。`dumpSha256`を持たない古い`verify.json`は`id`だけで見る)のうち、最も新しいものを選ぶ。それより新しい世代の`meta.json`か`verify.json`が読めないときは、古い世代へ進まずに止まる(一時的に読めなかっただけで、意図より古い時点へ戻さないため)。そのときは`-id`で名指しする。検証していない世代を`-id`で名指ししたときは、警告を出して戻す。
+
+### 戻す前に止める条件
+
+次のどれかに当たると、DBに何もせずに止まる。
+
+- **`-confirm <DB名>`が無いか、`db.db`と違う。** 設定ファイルを取り違えたまま、別のインスタンスのDBを入れ替えないため
+- **戻す先のDBに、ほかの接続が残っている**(`pg_stat_activity`で見る)。本体・workerのプロセスを全て止めてから流す。配送を別ノードに分けている構成では、そちらも止める
+- **バックアップの管理表の番号が、バイナリの同梱の番号より新しい。** 管理表が進みすぎていると、戻した後に`elythia migrate`も本体の起動も通らない。バックアップを取った版以上のバイナリで戻す。管理表がdirtyのバックアップも戻さない
+- **`-mode swap`で、DBのユーザーにDBを作る権限が無い。** DBを作るには`CREATEDB`が、今のDBの名前を変えるにはそのDBの持ち主であることが要る(superuserはどちらも要らない)。足りなければ、管理者のユーザーで権限を足すか、`-mode empty`で管理者が作った空のDBへ戻す
+
+  ```bash
+  docker compose exec db psql -U <管理者のユーザー> -d postgres -c 'ALTER ROLE <DBのユーザー> CREATEDB;'
+  ```
+
+  composeの既定(`POSTGRES_USER`で作ったユーザー)はsuperuserなので、足さなくてよい
+
+- **`pg_restore`の版が、戻す先のサーバーより新しい。** 新しい`pg_restore`は、古いサーバーが知らない設定を流して落ちる(18の`pg_restore`から16のサーバーへ戻すと`transaction_timeout`で落ちる)
+- **バックアップのDBに入っていた拡張(メタ情報の`extensions`)が、戻す先のサーバーに無い**(`pg_available_extensions`で見る)。dumpは`CREATE EXTENSION`を含むので、無いと`pg_restore`が落ちる
+
+`-mode empty`では、ほかに次の3つを確かめる。
+
+- **戻す先のDBに表が1つも無いこと**
+- **DBのユーザーが`public` schemaに表を作れること。** PostgreSQL 15からは`public`の持ち主がDBの持ち主になったので、管理者の持ち物として作ったDBへは、アプリのユーザーでは戻せない
+- **戻す先のDBのencodingとlocale(`LC_COLLATE` / `LC_CTYPE` / locale provider / ICUかbuiltinのlocale)が、バックアップを取ったDB(メタ情報の`databaseLocale`)と同じこと。** 照合順序が違うと、戻した後の並び順や、一意制約の判定が変わる。違えば、作り直すための`CREATE DATABASE`の文を表示して止まる。16より前のサーバーで取ったバックアップは、locale providerを`libc`として比べる。postgresの公式imageの16と18(alpine)は既定の値が同じで、そのまま通る
+
+### 戻すときに行うこと
+
+1. `backup.integrityKeyFile`を設定していれば、メタ情報の署名を確かめる。署名の無い世代は`-allow-unsigned`を付けて`-id`で明示したときだけ戻し、署名の合わない世代は戻さない([署名](backup.md#署名))
+2. 保存先からdumpを一時ファイルへ落とし、大きさとsha256をメタ情報と突き合わせる。暗号化した世代は、`backup.encryption.identityFile`の鍵で復号する。**書き込む前に全部を確かめる**
+3. `pg_restore --exit-on-error --single-transaction --no-owner --no-privileges`で戻す。1つのトランザクションなので、途中で落ちたら何も残らない。`-mode swap`では、`<DB名>_restore_<日時>`を、バックアップに記録したencodingとlocale(メタ情報の`databaseLocale`)、今のDBの持ち主で作ってから戻す。記録が今のDBと違うとき(取った後にDBを作り直した、など)は、そのことを表示して、記録の値で作る
+4. 表ごとの行数を、メタ情報の行数(dumpと同じsnapshotで数えたもの)と突き合わせる
+5. `pg_dump`に入らないDB単位の設定(`ALTER DATABASE ... SET`)を、メタ情報の`databaseSettings`から入れ直す。取るときに`pg_db_role_setting`のうちDB単位のもの(ロール単位でないもの)を`名前=値`の形で記録しているので、`search_path`のような一覧の設定は要素ごとに分けて入れる。superuserにしか入れられない設定(`log_min_duration_statement`など)が付いていたら、superuserでないDBのユーザーではここで止まる
+6. `elythia migrate`と同じく、同梱のmigrationを当てる(本体の系列、forkの系列の順)。バイナリより古い版で取ったバックアップは、ここで追いつく
+7. `-mode swap`では、名前を1つのトランザクションで入れ替える。入れ替える直前に、今のDBと入れ替える側のDB(戻したDB。`-rollback`では退避したDB)の両方に、ほかの接続が無いことを確かめる。3〜7のどこかで落ちたら、作ったDBを消して止まる。今のDBには触らない。`-mode empty`で4〜6のどこかで落ちたら、戻した中身がDBに残るので、DBを作り直してから流し直す
+8. Redisの後始末(下の表)をし、`elythia doctor`のうち本体が動いていなくても回せる検査(DBの管理表、rootの利用者、Redis)を流す。後始末は、`-mode swap`と`-rollback`では既定で行う。`-mode empty`では、戻す世代が保存先の最新の世代なら既定で行わず、最新でなければ`-redis`の明示を求めて止まる(`-redis clean|keep`で変えられる。理由は[版を上げる手順](#postgresql-16--18-への移行-既存環境)の後の説明)
+9. 名前の入れ替えがサーバーの側で済んだ後に、接続が切れるなどしてエラーが返ったときは、`pg_database`を引き直して、入れ替わっていれば戻し終えたものとして8へ進む(`-rollback`の入れ替えも同じ)。どちらか分からなければ(繋がらない、両方の名前がある、など)、作ったDBを消さずに、確かめるべき2つのDBの名前を表示して終了コード1で止まる。そのときは、本体を起動する前に`pg_database`(`SELECT datname FROM pg_database`)を見て、次のどちらかを手で行う
+   - `<DB名>_before_restore_<日時>`があり、`<DB名>_restore_<日時>`が無い(入れ替わっている): [Redisの後始末](#redisの後始末)のkeyを消し、`vacuumdb --analyze-in-stages`を流してから起動する
+   - `<DB名>_restore_<日時>`があり、`<DB名>_before_restore_<日時>`が無い(入れ替わっていない): `DROP DATABASE <DB名>_restore_<日時>`で作ったDBを消す。今のDBはそのまま使える
+
+**[pg_bigm](#pg_bigm-日本語の部分一致検索を高速化)などの拡張を入れたDBは、戻す先のサーバーにも同じ拡張が要る。** dumpは`CREATE EXTENSION`を含むので、拡張の無いサーバー(素の`postgres:18-alpine`)へは戻らない。戻す前に止まる。バックアップ用のimageにpg_bigmが入っているのは`backup verify`のためで、戻す先はDBのサーバー(UDS構成なら`deploy/postgres-bigm`のimage)になる。拡張を作るにはsuperuserが要ることがある。
+
+dumpは、戻す前に一時ファイルへ落とす(暗号化した世代は復号したもの。持ち主だけが読める0600で作る)。`backup`サービスではコンテナの`/tmp`に置くので、dumpの大きさの空きが要る。別の場所に置くときは`-tmp-dir <ディレクトリ>`を渡す。一時ファイルは終わったときと中断(`SIGINT` / `SIGTERM`)のときに消すが、`SIGKILL`やOOMで落ちたときは残る。**バイナリを直接実行すると、ホストの`/tmp`に平文のdumpが残りうる。** 利用者のtokenや秘密鍵が入るので、暗号化したディスクの上のディレクトリを`-tmp-dir`で渡すか、落ちたときに`elythia-restore-*.pgc`を消す。
+
+**戻すのはDBだけで、ドライブのファイル(ローカルの`drive-files`とオブジェクトストレージ)は戻らない。** [DBのバックアップ](backup.md)はファイルを含まないため。バックアップより後に消したファイルは、戻したDBに行があるのに中身が無く、画像が切れる。バックアップより後に上げたファイルは、DBに行が無いまま保存先に残り、どこからも指されない。ファイルも同じ時点へ揃えたいときは、保存先の側(オブジェクトストレージのversioningやスナップショットなど)で戻す。
+
+`-mode swap`は、一時的にDBの約2倍のディスクを使う。退避した`<DB名>_before_restore_<日時>`は自動では消さない。戻した結果に問題が無いと確かめてから、`DROP DATABASE`で消す。
+
+### Redisの後始末
+
+DBを戻しても、Redisにはバックアップより後のDBの行を指すものが残る。`FLUSHDB`は使わない。既定の構成では5つの用途(`redis` / `redisForPubsub` / `redisForJobQueue` / `redisForTimelines` / `redisForReactions`)が同じRedisの同じDBを共有しているので、キューと、総当たりや再送を止める記録まで消えるため。消すkeyは名前で決めて、`SCAN`で探して消す。`<prefix>`は、そのクライアントの`prefix`(既定は`url`のホスト名)に`:`を付けたもの。
+
+| 消すもの | 理由 |
+|---|---|
+| `<prefix>list:*`(timelines) | タイムライン。戻したDBに無い投稿のIDが残る |
+| `<prefix>ephNote:*` / `ephNoteURI:*` / `ephUser:*` / `ephUserURI:*` / `ephFile:*`(timelines) | リレーだけの投稿。`ephFile:`はdrive_fileの行を掃除から守る印で、その行が戻したDBに無いか、別のものになっている |
+| `<prefix>cleanRemoteNotes:cursor` | リモートの投稿の掃除が次に読むnoteのID。戻したDBより先を指す |
+| `antennaTimeline:*` / `featuredGlobalNotesRanking:*` / `featuredInChannelNotesRanking:*` / `featuredPerUserNotesRanking:*` / `featuredGalleryPostsRanking:*` | noteのIDの集合 |
+| `reaction-buffer:*` | DBへ未反映のリアクション数の差分。反映すると、戻したnoteの数に後の差分が足される |
+| `userSwSubscriptions:*` | `sw_subscription`の行のキャッシュ |
+| `reversi:fed:*` / `reversi:game:*` / `reversi:matchAny` / `bubbleVersus:*` | 対局と利用者のIDを持つ途中の状態 |
+| `apFederationRule:*` | 連合のルールのIDごとの集計 |
+| `oauth:*` | 認可の途中の状態。発行したtokenのID(DBの行)を持つ |
+| `bull:deliver:*`(jobQueue。`bull:deliver:meta`と`bull:deliver:repeat`を除く) | 配送を待つjob。下の「連合への影響」 |
+
+| 消さないもの | 理由 |
+|---|---|
+| `<prefix>notificationTimeline:*` / `<prefix>latestReadNotification:*` | 通知はRedisにしか無い(本家と同じ)。消すと、バックアップより前の通知も失われる。noteや送り主がDBに無い通知は、読むときに落とすので、戻したDBに無い投稿は出ない |
+| `passwordguard:*` / `mk:2fa:totp:used:*` / `mk:ap:inbox:seen:*` / `mk:signupform:nonce:*` / `limit:*` | 総当たり・再利用・再送・連投を止める記録。消すと、その窓が開き直る |
+| `<prefix>elythia:maintenance*` | メンテナンスの状態(#3463) |
+| `apDelivery*` / `apInboxHealth:*` / `ed25519:*` / `reversi:federation:version:*` / `<prefix>url-preview:*` | 相手のサーバーや外部のURLについての記録で、DBから作ったものではない |
+| `bull:`の`deliver`以外のqueue、`bull:deliver:meta` / `bull:deliver:repeat` | バックアップより後に届いた連合のactivity(inbox)は、戻した後も当てる価値がある。`meta`には管理画面のキューの一時停止が入る。消えた行を指すjobは失敗して捨てられるが、**戻したDBにも行がある操作は成功する。** 例えば、待っていた相手からのフォロー解除(`Undo`)や、こちらの利用者がバックアップより後に行ったフォローの操作(relationship)が、戻したDBに当たる |
+
+ユーザーやmetaなどのメモリ上のキャッシュはRedisに無いので、本体を止めてから戻せば、起動し直したときに作り直される。
+
+Redisに繋がらずに後始末が失敗したときは、DBはもう切り替わった後なので、終了コード1で止まり、その旨を表示する。上の表のkeyを消すまで、本体を起動しない。
+
+### 連合への影響
+
+戻すのはこのサーバーのDBだけで、連合の相手が受け取ったものは戻らない。
+
+- バックアップより後の投稿・リアクション・フォローなどは、相手のサーバーに残る。こちらのDBには無いので、取り消しの`Delete`や`Undo`も出せない
+- 配送を待っていたjob(`bull:deliver:*`)は捨てる。ほとんどがバックアップより後の行のactivityで、配ると相手にだけ存在する投稿を増やすため。バックアップより前のactivityの再試行も一緒に消えるので、一部の相手には届かないままになる
+- 相手からのフォロー・フォロー解除・ブロックのうち、バックアップより後に届いて処理を終えたものは、こちらに無い。相手は、こちらが受け取ったと思っている。まだ処理を待っていたもの(inboxのjob)は、戻したDBに当たる
+- `-mode empty`で版を上げる・引っ越すときは、本体を止めてから取った世代を戻すので、上のことは起きない。配送を待つjobも既定で残すので、止める前に出した`Delete`なども、起動した後に届く
+
+### 手順
+
+compose(TCP)。`backup`はバックアップ用のサービスで、設定ファイルと保存先は取るときと同じものを使う([DBのバックアップ](backup.md))。暗号化した世代を戻すときは、`backup`サービスの`volumes`のコメントを外して秘密鍵を渡し、`backup.encryption.identityFile`にそのパスを書く。
+
+```bash
+# 1. 本体と worker、backup-daemon (定期実行) を止める (db と redis は動かしたまま)
+docker compose stop app backup-daemon
+
+# 2. 戻す (今の DB は <DB名>_before_restore_<日時> として残る)
+docker compose run --rm --no-deps backup restore -id latest -mode swap -confirm <DB名>
+
+# 3. 統計を取り直す (pg_restore は表の統計を持ってこない)
+docker compose exec db vacuumdb -U <DBのユーザー> -d <DB名> --analyze-in-stages
+
+# 4. 起動して確かめる。backup-daemon を使っているなら再開する
+docker compose up -d app
+docker compose exec app /app/elythia doctor
+docker compose start backup-daemon
+```
+
+**`backup-daemon`は、戻し終わって確かめるまで動かさない。** 動かしたままだと、戻している途中や戻したばかりのDBの世代を定期実行で取り、`keep`を超えた古い世代を整理で消しうるため。
+
+UDS構成は、`app`を`mkgo`に読み替え(`backup-daemon`はそのまま)、`docker compose`に`-f compose.uds.yaml`を付ける(`docker compose -f compose.uds.yaml run --rm --no-deps backup restore ...`)。`compose.uds.yaml.example`の`backup`サービスは、DBのソケット(`pg_sock`)と、Redisの後始末のためにvalkeyのソケット(`valkey_sock`)をmountしている。`compose.uds.yaml`に複製しているなら、`valkey_sock`の行も足す。`mkgo`は起動のたびに`elythia migrate`を流す(`deploy/uds/mkgo-entrypoint.sh`)が、戻すときに当て終えているので、何も起きない。
+
+バイナリ直接実行では、サーバーと、常駐させているなら`elythia backup daemon`を止めてから(daemonは確かめ終わってから再開する)、`pg_restore`があるホストで、本体と同じ設定ファイルを渡して流す。`pg_restore`の版は、バックアップを取った`pg_dump`以上で、DBのサーバー以下にする(バックアップを取った`pg_dump`も戻す先のサーバーも18なら、18の`pg_restore`)。`pg_restore`の場所は`backup.tools.pgRestore`で変えられる。
+
+```bash
+sudo systemctl stop elythia
+./elythia backup restore -config .config/default.yml -id latest -mode swap -confirm <DB名> -tmp-dir /var/lib/elythia/restore-tmp
+vacuumdb -h <DBのホスト> -U <DBのユーザー> -d <DB名> --analyze-in-stages
+sudo systemctl start elythia
+./elythia doctor
+```
+
+`migration/`があるディレクトリで流す(同梱の番号との比較とmigrationに使う)。別の場所にあるなら`-migrations <ディレクトリ>`で渡す。
+
+### 元に戻す(ロールバック)
+
+`-mode swap`で戻した後に元の状態へ戻すには、本体を止めてから、退避したDBの名前を渡す。
+
+```bash
+docker compose stop app backup-daemon
+docker compose run --rm --no-deps backup restore -rollback <DB名>_before_restore_<日時> -confirm <DB名>
+docker compose up -d app
+docker compose start backup-daemon   # backup-daemon を使っているなら
+```
+
+戻したDBは`<DB名>_rolled_back_<日時>`として残り、退避していたDBが`<DB名>`に戻る。Redisの後始末と検査は、戻すときと同じく流す。ロールバックを取り消すには、`-rollback <DB名>_rolled_back_<日時>`を渡す。
+
+管理画面からも、本体を止めずに同じことを行える([退避したDBへ戻す](backup.md#退避したdbへ戻すロールバック3463-6d))。ただし、再認証をその時点の`<DB名>`のDBで行うので、戻した後に設定したパスワードや二段階認証が今のDBに無いときは、このコマンドで戻す。
 
 ## pg_bigm (日本語の部分一致検索を高速化)
 
@@ -155,7 +351,7 @@ make image-build       # ghcr.io/elythia-network/elythia:bundled をローカル
 `bundled` / `latest` は develop の最新を指す **可変タグ**。本番ではバージョンを固定する。**古い版に固定するときは、その版の compose を使う** (compose は同じ版の image の呼び方に合わせてある。2.0.0 で実行バイナリを `elythia` にまとめた、#3394)。
 
 ```bash
-MK_IMAGE=ghcr.io/elythia-network/elythia:2.0.0-bundled docker compose up -d
+MK_IMAGE=ghcr.io/elythia-network/elythia:2.1.0-bundled docker compose up -d
 ```
 
 **2.0.0 より前の版は、以前の置き場所 `ghcr.io/shiroha-a/mk` にある** ([タグの一覧](https://github.com/users/shiroha-a/packages/container/package/mk)。リポジトリを `Elythia-Network/elythia` へ移した 2.0.0 から、イメージの置き場所も変わった。#3394)。
@@ -171,7 +367,7 @@ gh workflow run docker.yml -f tag=1.1.0
 > `1.0.0` に `-bundled` は存在しない。アセット同梱イメージは 1.1.0 で追加された機能で、
 > 1.0.0 のツリーには `Dockerfile.bundled` が無いため。
 
-同梱アセットは本体の `frontend/` を image の中でビルドしたもので (#3379)、**ElythiaとMisaki独自のフロントエンド変更を含む**。
+同梱アセットは本体の `frontend/` を image の中でビルドしたもので (#3379)、**ElythiaとMisaki独自のフロントエンド変更を含む**。Misakiのゲームプラグイン入りimageは[固定コミットとビルド手順](divergence/misaki.md#外部プラグインの固定コミット)を参照する。
 
 > **注意**: 下記のように upstream の `misskey/misskey` イメージからアセットをコピーする方法もあるが、その場合 **Elythia 独自のフロントエンド変更が失われる** (チャット・リバーシの連合が UI 上で「非対応」表示に戻る等)。drop-in 互換の検証目的でなければ `bundled` イメージを使うこと。
 
@@ -190,7 +386,7 @@ gh workflow run docker.yml -f tag=1.1.0
 TS版Misskeyのイメージからアセットをコピーすることも可能:
 
 ```dockerfile
-FROM misskey/misskey:2026.10.0 AS misskey-assets
+FROM misskey/misskey:2026.10.1 AS misskey-assets
 FROM ghcr.io/elythia-network/elythia:latest
 COPY --from=misskey-assets /misskey/built /frontend
 COPY --from=misskey-assets /misskey/packages/frontend/assets /client-assets
@@ -327,7 +523,7 @@ make migrate-up
 
 `note.clippedCount` は #1768 から、`note.pageCount` は #3293 から維持している。それより前に
 クリップした行はカウンタが 0 のまま残っているので、`-fix` で実件数に直せる。**リモートノートの
-掃除の保護条件に使われる** (0 だと期限を過ぎたときに消える)。`pageCount` は migration `000108` が
+掃除の保護条件に使われる** (0 だと期限を過ぎたときに消える)。`pageCount` は migration `000107` が
 増やす向きに埋めるので、`-fix` で直るのは参照が無いのに値が残っている行 (下げる向き) だけ。
 
 **クリップを消すと平常時にもずれが出る。** クリップの削除 (利用者の削除による削除を含む) では、
@@ -389,13 +585,13 @@ worker 数は既定値がキューごとに違い、`stuck 検出` は**キュ�
 
 ```
   ok    config.url   https://example.com
-  ok    database     接続 ok / migration version 117
-  ok    database-health dead tuple と VACUUM に問題なし (121 テーブル)
+  ok    database     接続 ok / migration version 138
+  ok    database-health dead tuple と VACUUM に問題なし (122 テーブル)
   ok    root user    meta.rootUserId 設定済み
   ok    redis        接続 ok
   FAIL  webfinger    status 403 (連合が無効)
         インスタンス設定の `federation` が `none` になっている。連合するなら管理画面で有効にする
-  ok    nodeinfo     elythia 2.0.0
+  ok    nodeinfo     elythia 2.1.0
   warn  actor        assertionMethod (Ed25519) が無い
         RSA だけでも連合できる。Ed25519 を公開すると対応実装との署名検証が軽くなる
   ok    tls          証明書の残り 68 日
@@ -409,7 +605,7 @@ warn は「見ておくべき」であって「壊れている」ではないた
 | 検査 | 内容 |
 |---|---|
 | `config.url` | 絶対 URL か、https か |
-| `database` | 接続と、`schema_migrations` が同梱マイグレーションに追いついているか |
+| `database` | 接続と、`schema_migrations` が同梱マイグレーションに追いついているか。fork の系列 (`migration/local/`) を同梱しているときは `schema_migrations_local` も見る ([fork の独自 migration](fork-migrations.md#doctor)) |
 | `root user` | `meta.rootUserId` が設定されているか。**未設定だと root 判定が効かず**、`admin/accounts/create` の初回セットアップ判定がローカル利用者数のガードだけに依存する状態になる。指名し直すには DB を直接更新する (`update-meta` は `rootUserId` を受け付けない) |
 | `redis` | 接続 |
 | `webfinger` | **公開 URL 経由**で `acct:instance.actor@<host>` が引けるか |
@@ -440,6 +636,43 @@ MK_ONLY_QUEUE=1 ./built/elythia serve -config .config/default.yml
 **設定ファイルは両ノードで同じものを使う。** 同じ DB・同じ Redis を向けていることが
 前提で、特に `redisForJobQueue` がずれていると Web が積んだジョブを配送ノードが永久に
 拾わない。
+
+**同じホストで複数のプロセスを動かすときは、listen の先をプロセスごとに分ける。**
+「同じ設定ファイル」は DB と Redis の向き先の話で、`port` / `socket` まで同じにすると
+2 つ目以降のプロセスが listen できない。配送ノードも `/healthz` のために listen する
+([下](#各ノードが担うもの)) ので、Web と配送を同じホストで動かす場合や、配送を 2 つ以上
+動かす場合も当たる。`port` / `socket` は、設定ファイルはそのままにして環境変数で上書きできる。
+
+```bash
+# 同じホストで Web と配送を動かす例 (配送側の port だけを変える)
+MK_ONLY_SERVER=1 ./built/elythia serve -config .config/default.yml
+MK_ONLY_QUEUE=1 MK_PORT=3001 ./built/elythia serve -config .config/default.yml
+```
+
+UNIX ソケットで待ち受けている (`socket`) なら、`MK_SOCKET` でプロセスごとに別の path に
+する。**同じ path のままだと、後から起動したプロセスが先のプロセスのソケットファイルを
+消して listen し直す** (古いソケットを消してから listen する作りのため。先のプロセスは
+動き続けるが、その path では受けなくなる)。帰結は次の 2 つで、どちらも終了コードには
+出ない。
+
+- Web と配送で path が同じだと、後から起動した方が path を持つ。配送ノードが持つと、
+  nginx からの要求は `/healthz` 以外すべて 404 (メンテナンス中は 503) になり、サイト全体が落ちて見える
+- 先のプロセスが止まると、そのときに path を名前で消すので、後のプロセスのソケット
+  ファイルも消える。後のプロセスは動いたまま、どこからも受けなくなる
+
+`pidFile` を設定しているなら、2 つ目以降のプロセスはそれも別の path にするか外す。同じ
+path だと、生きている先のプロセスを指しているので `another instance appears to be running`
+で起動を拒む (終了コード 1、#497)。設定ファイルに `pidFile` が書いてあれば `MK_PIDFILE` で
+別の path に上書きできる。空にしても外せないので、外すならプロセスごとの設定ファイルを分ける。
+
+**listen できないと `elythia serve` は終了コード 1 で終わる (#3633)。** 以前は
+listen に失敗してもログを出して動き続け、配送ノードなら配送も続けていた。今は
+`Restart=always` の systemd ([例](#systemdユニット例)) や、host network で
+`restart:` を付けたコンテナでは、listen の先が重なったまま再起動を繰り返し、その間の
+配送はほぼ止まる。ログの `server error` に listen の失敗 (`address already in use`
+など) が出ていたら、上のとおりプロセスごとに分ける。コンテナごとに network namespace が
+分かれる通常の compose では、TCP の port は重ならない (UNIX ソケットを置くディレクトリを
+複数のコンテナで共有しているなら、path は重なる)。
 
 `redisForPubsub` などの `redisFor*` は**役割の指定ではない**。あれは用途ごとの Redis
 接続先で、Web ノードも `redisForJobQueue` を読んで enqueue する。
@@ -481,6 +714,46 @@ MK_ONLY_QUEUE=1 ./built/elythia serve -config .config/default.yml
   無い」は 1 分残りうる。該当するのは、Redis の再接続中などで publish を取りこぼした
   場合、停止処理の 2 秒で送り切れなかった場合と送信側が止まった後の書き込み
   (停止中にまだ走っている受信ジョブなど)、DB を直接書く後始末バッチ
+- 同じ形で全プロセスへ伝えているキャッシュと、その event (`internal:` の後ろの名前) は次のとおり。
+  通知が届かない場合の上限は、どれもそれぞれのキャッシュの TTL になる。自分の通知の
+  扱いは 2 通りある。`metaUpdated`・`federationRulesUpdated`・`antennaUpdated` は送信元を
+  載せず、書いたプロセスも自分の通知を受けて捨て直す。それ以外 (`rolesUpdated`・
+  `relationCacheInvalidated`・`emojiCacheInvalidated` と #3664 の 5 つ) は送信元の id を
+  載せ、書いたプロセスは publish の前に自分のキャッシュを捨て、自分の通知は受け流す
+
+  | キャッシュ | event | 通知が届かないときの上限 (TTL) |
+  |---|---|---|
+  | meta (`/api/meta` の応答と captcha を含む) | `metaUpdated` | 5 分 |
+  | 連合のルール | `federationRulesUpdated` | 5 分 (読み直しの周期) |
+  | ロールとポリシー | `rolesUpdated` | 5 分 |
+  | アンテナ | `antennaUpdated` | 1 分 |
+  | ミュート・ブロック・フォローの一覧 | `relationCacheInvalidated` | 1 分 |
+  | 絵文字 | `emojiCacheInvalidated` | 上の項目 |
+  | 利用者 (user / profile / URI) | `userCacheInvalidated` | 5 分 |
+  | アバターのデコレーション (catalog と絵文字由来) | `avatarDecorationCacheInvalidated` | 30 秒 |
+  | インスタンスの停止判定 (配送の可否) | `instanceSuspendCacheInvalidated` | 5 分 |
+  | 承認済みの relay の一覧 | `relayCacheInvalidated` | 10 分 |
+  | 認証 (token から利用者を引いた結果) | `authCacheInvalidated` | 30 秒 |
+
+  下の 5 つは #3664 で足した。それまでは書いたプロセスでしか捨てず、例えば管理画面で
+  インスタンスを停止しても、配送ノードは最大 5 分その相手へ配送を続けていた。
+  この 5 つと `emojiCacheInvalidated` は、受け側の待ち行列 (トピックごとに 1024 通) が
+  溢れて通知を捨てたときも、そのキャッシュを丸ごと捨てて埋める (捨てる呼び出しは
+  トピックごとに同時に 1 つで、呼んでいる間や直後に捨てた分は、前の呼び出しから
+  200 ミリ秒以上空けてもう 1 回。溢れが続いても、捨てる回数は 1 秒に数回まで)。
+  絵文字由来のデコレーションは絵文字の一覧のキャッシュから作るので、
+  `emojiCacheInvalidated` を受けたプロセスは、ローカルの絵文字に関わる通知では絵文字の
+  キャッシュを捨てた後にデコレーションの map も捨てる (読めない通知・溢れでは両方)。
+  認証の event は捨てた利用者の ID だけを載せ (token も hash も載せない)、受けた
+  プロセスはその利用者の分を全部捨てる。
+  **利用者の event は書き込みの頻度が高い** (リモートの投稿を受けるたびに投稿者の
+  `notesCount` を数え直すなど、`CachedUserRepository` を通る書き込み 1 回で id を
+  1 つ捨てる)。そのため絵文字と同じく publish を別の goroutine から行い、送っている
+  間に溜まった id を 1 通 (最大 256 件) にまとめ、4096 件溜まったら「全体を捨てる」
+  1 通に畳む。まとめる間隔は置かないので、通数は捨てた回数 (書き込み 1 回につき
+  1 回、利用者を作るときは id と URI で 2 回) を超えず、Redis の 1 往復あたり 1 通を
+  超えない。1 通の本文は id 1 つなら 62 バイト (送信元の id と捨てる id がどちらも
+  16 文字のとき)
 - **更新は配送ノードを先に行う。** AP の配送ジョブは署名鍵を payload に載せず
   `signerUserId` から配送時に引く形になっている。Web ノードだけを新しくすると、
   新しい形のジョブを古い配送ノードが受け取り、鍵を取り出せない。**古いノードは
@@ -488,6 +761,221 @@ MK_ONLY_QUEUE=1 ./built/elythia serve -config .config/default.yml
   更新の間に積まれた配送は自動では戻らない。逆順 (配送ノードが新しく Web
   ノードが古い) は問題ない — 新しい配送ノードは payload に鍵があればそちらを
   使う。**単一プロセス構成では producer と worker が同じなので影響しない**
+
+## メンテナンスモード
+
+重い migration や DB の作業の間、**全プロセスに DB への接続を手放させる**モード (#3463)。
+プロセスは止めず、listener だけを残してメンテナンスの応答を返す。抜けると、各プロセスが
+DB に繋ぎ直し、サーバーの中身 (キャッシュ・購読・ジョブの worker など) を作り直す。
+**設定ファイルは読み直さない** (起動時に読んだものを使い回す。[configuration.md](configuration.md#設定ファイル))。
+
+状態は Redis (`redis` の接続先) のキー `elythia:maintenance` に置く (`redis.prefix` を設定していれば、その後ろに `:` を挟んで付く)。
+**Redis の `maxmemory-policy` は `noeviction` か `volatile-*` にする。** `allkeys-*` だとメモリが
+足りなくなったときに状態のキーが追い出され、メンテナンスが勝手に終わる。`allkeys-*` のときは
+`serve` の起動時と `maintenance enter` が警告を出す (CONFIG を受けない Redis では確かめない)。全プロセスが
+これを見る (pub/sub の通知と、周期の読み直し) ので、Web と配送を分けた構成
+([前節](#web-と配送を別ノードに分ける)) でも、複数の Web ノードでも、まとめて入って抜ける。
+
+読み直しの周期は、メンテナンス中 (状態がある間) と、プロセスが通常どおり動いていない間は 2 秒、
+それ以外は 10 秒 (#3592)。通知の購読が切れている間と、報告の書き込みに失敗した間も 2 秒になる。入るときは通知で即座に気付くので、10 秒は通知を取りこぼしたプロセスが
+気付くまでの上限になる。各プロセスの報告 (`status` に出るもの) は 30 秒で消えるので、落ちた
+プロセスの報告は最大 30 秒残り、その間は判定役がそのプロセスを待つ。版を上げた直後に旧版のプロセスが
+報告を消さずに落ちた (`SIGKILL` など) ときは、その間、バックアップから戻す操作が版の不一致で断られる。
+
+```bash
+# 入る。DB への接続が 0 になって held になるまで待つ (既定 2 分)
+./built/elythia maintenance enter -config .config/default.yml -reason "DB の作業"
+
+# 状態、DB に残っている接続、各プロセスの報告を見る
+./built/elythia maintenance status -config .config/default.yml
+
+# held になるまで (resuming なら抜け終わるまで) もう一度待つ
+./built/elythia maintenance wait -config .config/default.yml
+
+# 抜ける。全プロセスが元どおり動くのを確かめてから状態を消す (既定 2 分)
+./built/elythia maintenance exit -config .config/default.yml
+```
+
+判定に使う設定 (`maintenance.maintenanceDb` / `maintenance.drainTimeout`) は [configuration.md](configuration.md#メンテナンスモード-maintenance) にある。
+
+各プロセスのログには、止めるときと作り直すときの段ごとの時間が出る (#3802)。入るときは`maintenance: drained`の`drain` (処理中のリクエストを待った時間)・`stopBackground`・`closeDB`、抜けるときは`maintenance: serving again`の`openDB`・`construct` (組み立て)・`startBackground`。作り直しに失敗したときの`maintenance: failed to build a new server generation; will retry`にも`openDB`・`construct`・`startBackground`が出る (走らなかった段は0)。起動したときの組み立ては`server generation built`に出る (メンテナンス中に起動したときは、抜けるときに組み立てるので`maintenance: serving again`に出る)。
+
+### 入るときに起きること
+
+1. 新しいリクエストへの応答を、メンテナンスの応答に切り替える
+2. 処理中の HTTP リクエストが終わるのを待つ (上限 30 秒)
+3. streaming の接続を close code 1012 で閉じる。本家のクライアントは自分で繋ぎ直す
+4. ジョブの worker・cron・chart の保存の処理を止める (chart のメモリ上の集計は DB へ書いてから止まる)
+5. DB の接続を閉じる (read replica とプラグインのストレージの接続も含む)
+
+2・4・5 の待ちはそれぞれ最大 30 秒なので、1 つのプロセスが手放すまでに最大 90 秒ほど掛かる。
+`enter -wait` の既定 (2 分) はそれより長くしてある。
+
+### held になる条件
+
+**held にしてよいかは、PostgreSQL に問い合わせて決める。** 各プロセスの報告は「まだ待つ理由」を
+足すだけで、報告が消えても held の根拠にはしない。決めるのは「判定役」で、Redis のロック
+(`elythia:maintenance:judge`) を取った 1 つがなる。本体の各プロセスと、待っている間の
+`elythia maintenance enter|exit|wait` が候補になるので、受けたプロセスが落ちても、ほかのプロセスが
+引き継ぐ。
+
+判定役は、次の 2 つが同じ 1 回の判定の中で成り立ったときだけ、状態を `held` にする。
+
+1. 生きている報告に、`drained` でないもの (`starting`・`running`・`draining`・`resuming`・
+   `resume_failed`) が無い。起動の途中のプロセスは、状態を読む前に `starting` を報告するので、
+   DB を開く前でもここで待つ
+2. メンテナンス用の DB (`maintenance.maintenanceDb`、既定 `postgres`) から `pg_stat_activity` を
+   見て、対象の DB (`db.db`) に判定役以外の接続が 1 つも無い。autovacuum は数えない。
+   `dbReplications` を有効にしていれば、各 replica でも同じように数える
+
+```sql
+-- 判定役が数えているもの (メンテナンス用の DB から)
+SELECT pid, usename, application_name FROM pg_stat_activity
+WHERE datname = '<db.db>' AND pid <> pg_backend_pid() AND usesysid IS NOT NULL;
+```
+
+本体の接続には `application_name` (`elythia/<role>/<host>-<pid>-<乱数>`) が付いている。乱数は起動ごとに
+変わり、`host` は PostgreSQL が残す 63 バイトに pid と乱数が収まるよう切り詰める。
+
+- **`maintenance.drainTimeout` (既定 30 秒) を過ぎても接続が残っていたら、手放すと報告している
+  プロセスの接続だけを切る。** 時間はプロセスごとに、判定役がそのプロセスの `draining` / `drained` を
+  初めて見たときから数える (通知を取りこぼして手放し始めるのが遅れたプロセスも、猶予が縮まない。#3592)。切るのは、`application_name` の `<host>-<pid>-<乱数>` (起動ごとに乱数を付けたプロセスの ID) が報告と一致し、その
+  報告が `drained` (または上限を過ぎても `draining`) で、判定役と同じ DB のユーザーの接続。見捨てた
+  ジョブや、止める途中で上限に達したプロセスが掴んでいる接続にあたる。切った接続は `status` に出る。
+  手放す途中で落ちて報告が消えたプロセスも、判定役がそのメンテナンスの間に一度 `draining` /
+  `drained` と見ていれば、同じように切る (判定役が入れ替わると、この記憶は引き継がれない。数え始める
+  時刻も新しい判定役が見たときからになり、その分だけ切るのが遅れる (安全側))
+- **それ以外の接続は切らない。** 運営者の `psql` のほか、報告の無いプロセスや `running` のプロセスの
+  Elythia の接続も切らない (Redis に繋がらずメンテナンスに気付いていないプロセスは、切ってもすぐに
+  繋ぎ直す)。held にせず、残っている接続を `status` に出して待ち続ける。その接続を閉じるかプロセスを
+  止めれば、次の判定で held になる
+- 判定役が切らない接続を手で切るときは、`status` に出た `application_name` をそのまま使う。
+  落ちたノードの接続が残っている場合などにあたる。動いているプロセスの接続を切ると、すぐに
+  繋ぎ直されるので、先にそのプロセスを止める
+
+  ```sql
+  -- メンテナンス用の DB から。'<db.db>' と application_name は status の出力から写す
+  SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+  WHERE datname = '<db.db>' AND application_name = 'elythia/server/<host>-<pid>-<乱数>';
+  ```
+- `enter -wait` の上限を過ぎたら、状態は `entering` のまま 1 で終わる。判定は本体の各プロセスが
+  続けるので、後で `status` を見るか、`wait` で待ち直す
+- 判定役が 1 つもいない (本体が動いておらず、CLI も待っていない) と、`entering` のまま進まない。
+  `status` は `judge: none` と出す。`wait` を流せば CLI が判定する
+
+**held は「判定した時点で接続が 0 だった」という事実で、その後も 0 であることは保証しない。** 判定役は
+held の間も数え続け、後から繋いだ接続があれば `status` に警告を出す。Redis に繋がらないまま動いている
+プロセスは、メンテナンスに入ったことを知る手段が無いので、held の後に繋ぎ直しうる。**DB を触る作業の
+直前には `status` を見る。**
+
+DB のユーザーには、メンテナンス用の DB への `CONNECT` の権限が要る (`postgres` は既定で誰でも
+繋げる)。同じユーザーの接続を切るのに superuser は要らない。
+
+- **`maintenance.maintenanceDb` に `template1` を使わない。** `CREATE DATABASE` は既定で `template1`
+  を写すので、判定役が 2 秒ごとに繋いでいると、その瞬間に流れた `createdb` (や、`TEMPLATE` を
+  指定しない `CREATE DATABASE`) が「source database "template1" is being accessed by other users」で
+  失敗する。`postgres` か、そのために作った空の DB にする
+- **`dbReplications` を有効にしているなら、各 replica にも判定役が繋げる必要がある。** 1 台でも
+  繋がらないと判定は失敗し (`status` の `judge error` に出る)、メンテナンスは `entering` から進まない
+  (安全側)。replica を外す作業の前にメンテナンスに入るなら、先に設定から外しておく
+
+### メンテナンス中の応答
+
+| 経路 | 応答 |
+|---|---|
+| API (`/api/*`) | 503 と `Retry-After`、本文は JSON のエラー (`code: MAINTENANCE`) |
+| 連合の受信 (`/inbox`、`/users/:id/inbox`) | 本文の無い 503 と `Retry-After`。送り手は間隔を空けて再送する |
+| `/streaming` | 503 |
+| `/healthz` | **200** (`"maintenance": true` 付き)。compose の healthcheck と監視が止めない |
+| 画面 | 503 とメンテナンスの画面。終わると自動で再読み込みする |
+| 静的なファイル | 通常どおり |
+
+配送だけのノード (`MK_ONLY_QUEUE`) は、通常時と同じく `/healthz` だけを返し、それ以外は 503 にする。
+
+詳しい形は [divergence/operations.md §5.7](divergence/operations.md#57-メンテナンスモード-elythia-独自3463)。
+
+### メンテナンス中に起動したプロセス
+
+`elythia serve` は DB を開く前に Redis の状態を読む。メンテナンス中なら DB を開かずに
+メンテナンスの応答で起動し、抜けるのを待ってから DB を開く。
+
+`elythia migrate` は、メンテナンス中は何もせずに **3** で終わる (DB に触れない)。UDS の
+entrypoint (`deploy/uds/mkgo-entrypoint.sh`) は 3 を受けたら migration を飛ばして `serve` を
+起動する。メンテナンス中に migration を流したいときは、`elythia maintenance status` が出す
+opId を `-maintenance-op <opId>` で渡す。**メンテナンス中に版を上げたら、抜ける前にこれで
+migration を流す。** 飛ばしたまま抜けると、古い schema のまま新しい版が動く。
+
+- Redis に繋がらないときの `migrate` は、警告を出して普段どおり流す (Redis の起動を待たない
+  構成を壊さないため)
+- compose (TCP) の `migrate` サービスは 0 以外で終わると app を起動しない
+  (`service_completed_successfully`)。メンテナンス中に `docker compose up` し直すと app が
+  上がらないので、抜けてから行う
+
+### 抜けられないとき
+
+- `elythia maintenance exit` は状態を `resuming` にし、生きている報告が全部 `running` になったら
+  判定役が状態を消す。報告が消えたプロセス (落ちた場合など) は待たない。起動し直せば、そのまま
+  普段どおりに起動する。DB に繋ぎ直せないプロセスは `resume_failed` を報告し、メンテナンスの応答の
+  まま間隔を延ばしながら (最大 30 秒) 繋ぎ直しを繰り返す。`exit -wait` の上限を過ぎたら、状態は
+  `resuming` のまま 1 で終わる。DB が戻れば、各プロセスは自分で戻り、判定役が状態を消す
+- `resuming` の状態が残っている間は、次の `enter` は「既に入っている」で失敗する。判定役が
+  いなければ `wait` で消し終えるか、`-force` で消す
+- `-force` は待たずに状態を消す
+- **Redis が読めない間、プロセスは今の状態のまま動かない。** メンテナンス中に Redis が落ちても
+  勝手には抜けない
+
+### プロセスの停止 (SIGTERM) の時間の配分
+
+`elythia serve` は SIGTERM を受けてから 7 秒を予算にして止まる。その後に Sentry の送信待ち
+(最大 2 秒) が続いても、docker の既定の停止猶予 (10 秒) に届かず、SIGKILL の前に終われる。7 秒を
+次のように分ける。
+
+1. メンテナンスの監視と判定役を止め、新しいリクエストを 503 にする。処理中の HTTP リクエストと、
+   走っているメンテナンスの切り替えの終わりを待つ。**全体の 1/3 まで**
+2. streaming を 1012 で閉じる。残りの 1/3 (最大 3 秒) まで
+3. queue の worker と scheduler の停止、投げっぱなしの goroutine の回収、shutdown hook (バッファの
+   flush など)、chart の保存を、この順に行う。1 で処理中のリクエストの待ちが上限に達しても呼び、
+   全体の期限までの時間を渡す。queue を先に止めるのは、止まるまでに終わったジョブがバッファや
+   chart へ書いた分を、flush と保存に含めるため (#3662)。時間の配分は次のとおり
+   - queue の停止を待つのは残りの 1/3 (最大 3 秒) まで
+   - queue が止まったら、応答の後などに投げっぱなしで起動した goroutine (投稿後の hook、サインインの
+     記録、メール、遅らせて送る通知と Web Push など) の終わりを待つ。待つのは残りの 1/4 (最大 3 秒、
+     期限が切れていれば待たない) まで (#3661)。待ちの 3/4 を過ぎたら goroutine の ctx を切る。
+     遅らせて送る通知は待たずにすぐ送る。止まった後に起動しようとしたものと、枠を待ったまま ctx が
+     切れた投稿後の hook は走らせず、件数をログに出す
+   - 1 と 2 と 3 の待ちがどれも上限まで使っても、hook には全体の 2/9 以上 (7 秒なら約 1.56 秒) が
+     残る (queue の待ちの後の 8/27 から、goroutine の待ちの 1/4 を引いた分)
+   - それまでに止まらなかった worker は hook と並行して走り、chart の保存の後で止まるのを待つ。
+     この待ちの上限は queue の driver の側 (mkq は 30 秒) にあり、以前と同じ
+   - その worker が止まったら、投げっぱなしの goroutine をここで回収してから (worker が起動した
+     ものを捨てないため。停止の期限の残りの 1/4 で、最小 1 秒・最大 3 秒まで待つ)、chart をもう
+     一度保存する。保存の期限は箱を待った後に取り、停止の期限と「その時点から 2 秒」の遅い方
+     (停止の期限が切れていても 2 秒は使う)。ただし SIGTERM では、全体の期限で `Shutdown` が
+     返った後にプロセスが終われば、この保存は行われない
+   - 閉じた後のバッファへの書き込みは、積まずにその場で書く
+4. DB を閉じ、メンテナンスの報告を消す。処理中のリクエストが残っていたら、その数をログに出す
+
+この順序は「行儀よく止める」ためのもので、メンテナンスの判定はこれに依らない。判定役は
+`pg_stat_activity` を見るので、止める途中のプロセスの接続はそこに出て、閉じ終えるまで held に
+ならない。
+
+例外が 2 つある。
+
+- **メンテナンスの切り替えが 1 の上限を過ぎても終わらないとき**は、その世代を切り替えの側に任せ、
+  3 と 4 を行わない。切り替えが世代を止めている途中なら、hook はその停止の中で呼ばれる。作っている
+  途中なら、その世代の hook は呼ばれない。報告は消さず、プロセスが終わるまで書き続ける
+- `Shutdown` は 3 を始めた所で、予算が切れていれば返る。hook には全体の期限 (切れていれば
+  そこから 1 秒) までの ctx を渡すが、返った後に呼び出し元がプロセスを終えれば、hook は途中で
+  切られうる。このとき `serve` は Redis の接続を閉じず、プロセスの終了に任せる (裏で続く hook が
+  閉じた接続に当たらないようにするため)
+
+### 今できないこと
+
+- 管理画面からの手動の入る・抜ける。今は CLI だけ。管理画面から戻すとき ([画面から戻す](backup.md#画面から戻す-3463)) は、バックアップ用のサービスがメンテナンスに入れて抜ける
+- 外部のプラグインの初期化 (`Routes` / `Jobs` など) は、抜けるたびにもう一度呼ばれる。プラグインは
+  何度呼ばれてもよいように書く ([plugins/authoring.md](plugins/authoring.md) に書いた)。`ctx.Go` で
+  起動した goroutine は入るときに待たれるが、待ちには上限があり、`ctx.GoContext` の ctx を見ずに
+  走り続けるものは残る (#3661)
 
 ## systemdユニット例
 
@@ -507,6 +995,12 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+起動の途中で失敗すると (listen できない、ジョブキューの worker を始められない、など)、
+`elythia serve` は終了処理をしてから終了コード 1 で終わり、`Restart=always` で起動し
+直される (#3633)。同じホストで Web と配送を別のユニットにするなら、片方に
+`Environment=MK_PORT=3001` (UNIX ソケットなら `MK_SOCKET`) を足して listen の先を分ける
+([Web と配送を別ノードに分ける](#web-と配送を別ノードに分ける))。
 
 ## フロントエンド配信
 
@@ -554,6 +1048,19 @@ server {
         return 404;
     }
 
+    # 管理画面からのバックアップのダウンロード (ディレクトリの保存先)。数GBの
+    # dumpを返すので、bufferingを切る (下記の注意点を参照)。
+    location = /backup-download {
+        proxy_pass http://mkgo;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_redirect off;
+    }
+
     location / {
         proxy_pass http://mkgo;
         proxy_http_version 1.1;
@@ -583,6 +1090,7 @@ server {
   `/streaming?i=<トークン>` はそちらから出る。レベルを上げても消えない
   (実測では `[crit]`)。収集側でフィルタするか、診断性を捨てて
   `error_log /dev/null;` にすること
+- `/backup-download`(管理画面からバックアップをダウンロードする経路、[DBのバックアップ](backup.md#ダウンロード))は`proxy_buffering off`にする。既定のままだと、nginxが数GBのdumpを一時ファイルに書き出す。URLのquery`token`も`/streaming`の`i`と同じく、エラーになったときに`error_log`へ残る(有効なのは5分)
 - `location /debug`の404は**`location /`が全部を委譲する構成だから**要る。Elythiaは
   `enablePprof: true`のときだけ`/debug/pprof/*`を生やすが、有効化は運用者が診断のために
   行う判断であって公開してよいという意味ではない。ここで落としておかないと、
@@ -652,9 +1160,11 @@ upstream以外の設定はTCP構成と同じ。
 
 既存のMisskey (TypeScript版)からの移行手順は[TS版からの移行ガイド](migration-from-ts.md)を参照。
 
-ElythiaはTS版と同じPostgreSQL/Redisを共有できるため、バイナリの差し替えだけで移行可能。MisakiのマイグレーションはTS版テーブルに対して原則追加のみだが、例外が 19 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
+ElythiaはTS版のPostgreSQL/Redisをそのまま引き継いで起動できる。設定の`id`をTS版と揃えること、`migrate up`の前にバックアップを取ることなどの条件は移行ガイドにある。TS版へ戻すことは保証しない (#3191)。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 22 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
 
 ## アップデート
+
+旧Misaki版から更新するときは、通常の`migrate up`より先に[Misakiの移行履歴の照合](misaki-migration-reconciliation.md)を行う。旧系列の適用済み番号を新しい上流系列として扱わない。DBをバックアップし、本体の系列と`migration/local/`の系列を区別する。
 
 **1.5.0 から 2.0.0 へ上げるときは、[1.5.0 から 2.0.0 へ上げる](upgrade/2.0.0.md) の手順を構成ごとに上から順に流す。** 名前・配布イメージ・実行バイナリ・frontend の置き場所がまとめて変わる版で、下の各節 (#3379 / #3394 / #3400) の手順をまとめてある。
 
@@ -680,7 +1190,7 @@ AP の acct 解決が 404 になる)。メンションは WebFinger で既存の
 
 **#3379 より前の版から UDS 構成を上げるときは、先に[frontend を本体へ取り込んだ版へ上げる](#frontend-を本体へ取り込んだ版へ上げる-3379)の手順を踏む。** compose の bind mount の元と、frontend のビルドの出力先が変わるため。
 
-マイグレーションは構成によって適用方法が違う (下記参照)。golang-migrate が `schema_migrations` で適用済みバージョンを管理するため、何度流しても冪等。
+マイグレーションは構成によって適用方法が違う (下記参照)。golang-migrate が `schema_migrations` で適用済みバージョンを管理するため、何度流しても冪等。fork の系列 (`migration/local/`) は別の管理表 `schema_migrations_local` で管理する ([fork-migrations.md](fork-migrations.md))。
 
 ### Docker Compose (TCP / UDS 共通)
 
@@ -694,10 +1204,21 @@ make docker-update   # Docker Compose 構成
 段階的に実行したい場合は分解できる。
 
 ```bash
-make pull            # 本体 + プラグイン
-make uds-rebuild     # フロントエンド + イメージ (docker 構成では docker-rebuild)
-make uds-restart     # 再起動 + 配信アセットの検証 (同 docker-restart)
+make pull                  # 本体 + プラグイン
+make uds-rebuild           # フロントエンド + イメージ (docker 構成では docker-rebuild)
+make uds-restart           # 再起動 + 配信アセットの検証 (同 docker-restart)
+make uds-backup-refresh    # backup-daemon (と作ってあれば backup) の image を作り直す (UDS だけ、#3682)
+make frontend-precompress  # 事前圧縮 (.br / .gz) を足す。再起動の後でよい (#3593)
 ```
+
+`make frontend-precompress` は、`frontend/built` の JS / CSS などに brotli と gzip で圧縮したファイル (`.br` / `.gz`) を足す。Elythia は `Accept-Encoding` に応じてそれをそのまま返し、無いファイルはその場で gzip する。**ビルドの中では圧縮しない** — 圧縮には 8 コアで約 1 分かかり、ビルドの中に入れると下の 404 の窓がその分延びる。再起動の後に流せば、窓は今までと同じ長さで済み、圧縮が終わるまではその場の gzip で配信される。書き込みは一時ファイルからの rename なので、作りかけのファイルは配信されない。途中で止めても、もう一度流せば残りだけを作る。対象は名前に内容の hash が付いたファイルだけ (`manifest.json` や `loader/*` には作らず、作っても使わない)。
+
+- `make uds-update` は再起動の後にこれを呼ぶ。**圧縮が失敗しても `uds-update` は失敗にしない** (警告を出すだけ)。反映は済んでいて、配信はその場の gzip で続くので、原因を直して `make frontend-precompress` だけをやり直せばよい
+- `uds-rebuild` と `uds-restart` を分けて流すときは、`uds-restart` の後に `make frontend-precompress` も流す。流さなくても配信は壊れないが、新しいビルドのファイルはその場の gzip のままになる
+- 圧縮の間 (8 コアで約 1 分)、ホストの CPU をほぼ全コア使う。本番のサーバーと同じホストで流すなら、負荷の低い時間に流す
+- `docker-update` は呼ばない (使うなら手で流す)
+
+`make uds-update` は、`make pull` の後の段を `make uds-deploy` として、取ってきた Makefile で動かす (段を足した版を取り込んだ回にも新しい段が走るように)。その中で、再起動と配信の検証の後に `make uds-backup-refresh` を呼ぶ (前に置くと、frontend が 404 になる時間に Go のビルドが入って延びる)。`backup-daemon` は profile にあるので `uds-build` / `uds-restart` の対象に入らず、作り直さないと古い版のまま残る (定期の検証が「このバイナリより新しい migration」で落ち続ける)。コンテナがあれば作り直し、動いていれば `--no-deps` で入れ替え、使っていなければ何もしない。失敗しても `uds-update` は失敗にしない (警告を出す)。手順と注意は [backup.md](backup.md) の「UDS」。`docker-update` は呼ばない (Docker Compose 構成は `.env` の `COMPOSE_PROFILES=backup-daemon` で `up -d` に含める)
 
 **フロントエンドのビルドは配信中のディレクトリを直接作り直す** (`packages/frontend/build.ts` が出力先を消してから作る)。ビルド開始から再起動完了までフロントエンドは 404 になる。#2885 の事故では、ビルド完了 (13:02:52) から再起動 (13:12:36) まででも **9 分 44 秒**、ビルド開始からならさらに長い窓ができた。**ビルドが失敗した場合はその窓が閉じない** — 配信物が消えたまま残るので、成功するまで直すこと。無停止で入れ替えたい場合は別ディレクトリにビルドして差し替える構成が要る。
 
@@ -725,6 +1246,100 @@ make migrate-up
 # 再起動
 sudo systemctl restart misskey    # systemd の場合
 ```
+
+### マイグレーションが途中で止まったとき (dirty)
+
+migration が途中で失敗すると、golang-migrate は管理表に番号を `dirty = true` で記録して止まる。この状態では `elythia migrate` が `Dirty database version <記録された番号>. Fix and force version.` で止まり、`elythia doctor` も FAIL を返す。**原因を直してから、管理表を `elythia migrate -force` で、当たっている番号へ戻す** (#3455)。
+
+```sql
+-- fork の系列 (migration/local/) なら schema_migrations_local を見る
+SELECT version, dirty FROM schema_migrations;
+```
+
+**記録される番号は、失敗したのが up か down かで違う。** up で失敗すると、失敗したファイルの番号が記録される。down で失敗すると、戻す先 (失敗したファイルの 1 つ前) の番号が記録される。どちらだったかは、止まったときのログの `msg="migration failed"` の行の `direction=` で確かめる。compose の `migrate` サービスと UDS の entrypoint は up しか流さない。
+
+1. サーバーと、migrate を流すもの (compose の `migrate` サービス、UDS の entrypoint) を止める。`-force` は流れている migrate の完了を待ってから動くので、並べて打つと、当たった番号を巻き戻すおそれがある (`-force` は dirty でない管理表を書き換えずに止まるので、たいていはそこで気付ける)
+2. 失敗した理由をログで確かめて、原因を取り除く (例: 重複した行、足りない権限、`statement_timeout`)
+3. 失敗したファイルが、DB にどこまで当たっているかを確かめる。1 つのファイルの文は 1 つの transaction で流れるので、普通は何も当たっていない (失敗した up は当たっておらず、失敗した down は戻っていない)。例外は `CREATE INDEX CONCURRENTLY` で、使えない (INVALID の) index が残ることがある。残っていたら `DROP INDEX CONCURRENTLY` で消す (手順は該当する migration のファイルの冒頭に書いてある)
+
+   ```sql
+   SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
+     JOIN pg_namespace n ON n.oid = i.relnamespace
+    WHERE n.nspname = current_schema() AND NOT x.indisvalid;
+   ```
+
+   **`migration failed` の行が無いときは、migrate のプロセスが途中で殺された** (停止の猶予が切れた、接続が切れたなど)。このときは、PostgreSQL がファイルを最後まで流して commit していることがある。失敗したファイルの効果 (表・列・index、書き換えたデータ) が全て当たっている (down なら全て戻っている) なら、記録された番号が正しい。`-force` は記録された番号を受けないので、SQL で dirty だけを外す: `UPDATE schema_migrations SET dirty = false;` (fork の系列なら `schema_migrations_local`)。何も当たっていないなら、下の 4 に進む
+
+4. 管理表を、当たっている番号へ戻す
+   - **up で失敗したとき**: 記録された番号のファイルは当たっていない。その系列で、それより 1 つ前のファイルの番号へ戻す。次の `elythia migrate` が、失敗したファイルから流し直す
+   - **down で失敗したとき**: 失敗したファイルは戻っておらず、当たったまま。その系列で、記録された番号の次のファイルの番号へ戻す
+
+   ```bash
+   # バイナリ直接実行
+   elythia migrate -force <番号> -track core
+   # Docker Compose (TCP)。配布 image で動かしているなら -f docker-compose.image.yml を足す
+   docker compose run --rm --no-deps migrate migrate -config .config/default.yml -force <番号> -track core
+   # Docker Compose (UDS)
+   docker compose -f compose.uds.yaml run --rm --no-deps mkgo migrate -force <番号> -track core
+   ```
+
+5. `elythia migrate` を流し、`elythia doctor` が通ることを確かめてから、サーバーを起動する
+
+`-force` は migration を流さずに、`-track` で指定した系列の管理表だけを書き換え、書き換える前の値をログに出す。**dirty になっている管理表しか書き換えず、番号はその系列のファイルに実在するものしか受けない。** 違う番号を書くと、間の migration が黙って飛ばされるか、当たった migration が次の up でもう一度流れる。本体の migration は流し直してよいようには書かれておらず、例えば `000077` は未処理の登録申請を全て消す ([fork-migrations.md](fork-migrations.md#本体のmigrationに混ぜてしまった場合))。**推測で番号を決めない。** 失敗したファイルの効果が一部だけ残っていて、取り除くか最後まで当てるかを決められないときは、バックアップから戻す。
+
+**`-force` は、記録された番号そのものと、空の管理表を受けない。** 記録された番号への `-force` は、up の失敗では当たっていない migration を飛ばし、down の失敗では当たっている migration を流し直させる。失敗した up のファイルを手で最後まで当てた場合も、手で当てた分を取り除いてから 1 つ前へ戻し、`elythia migrate` に流させる。例外は、3 のプロセスが殺された場合だけ。
+
+その系列の最初のファイル (本体なら `000001`。fork の系列は `900001` などから始まることがある) で止まったときは、`-force` では戻せない。管理表 (`schema_migrations`、fork の系列なら `schema_migrations_local`) を SQL で直す。
+- up で失敗したとき: 管理表は最初のファイルの番号で dirty になっているが、そのファイルは当たっていない。原因を取り除いた後に、管理表を `DROP TABLE` する。次の `elythia migrate` が管理表を作り直し、最初のファイルから流す
+- down で失敗したとき: 管理表は `-1` で dirty になっているが、最初のファイルは当たったまま。`UPDATE schema_migrations SET version = 1, dirty = false;` (fork の系列なら `schema_migrations_local` と、その系列の最初の番号) で戻す
+
+### 大きな表に index を足す migration
+
+`note` などの大きな表への index は、`CREATE INDEX CONCURRENTLY` で 1 ファイルに 1 本ずつ作る (例: `000054`、`000091`)。`000123`〜`000131` (#3590) も、`000126` を除いてこの形にしている。`000132` (#3612、`note_reaction` の `IDX_note_reaction_userId_id`) も同じ形。`000126` (`user` の `avatarId` / `bannerId`) は、TS 版から移った DB では作らないための条件を `DO` ブロックで書いており、`DO` の中では `CONCURRENTLY` が使えないので、普通の `CREATE INDEX` で作る。
+
+`CONCURRENTLY` は書き込みを止めないが、次の点に注意する。
+
+- **migration を流しているあいだ、Elythia は起動しない。** UDS の entrypoint と compose の `migrate` サービスは、migration を流し終えてからサーバーを起動する。作る時間は表の行数に比例する。検証用の DB (ノート 60 万件、`note` の本体 257MB、`note_unread` 10 万行、PostgreSQL 18、キャッシュに載った状態) では、`000123` (チャンネルの部分 index) が 0.34 秒、`000124` (`visibleUserIds` の GIN) が 0.39 秒、`000127` (`note_unread`) が 0.20 秒だった。本番の行数では測っていないので、`SELECT count(*) FROM note;` で見積もる
+- **止めずに済ませたいときは、旧版を動かしたまま同じ SQL を先に流してよい。** どれも `IF NOT EXISTS` なので、後で migration が流れたときは名前で何もしない。index を足すだけの migration に限る (旧版のサーバーが、知らない index があっても動くため)
+- **`000126` は、作るあいだ `user` への書き込みを止める。** 止まる時間は `user` の行数に比例する (規模の例: 利用者 22,000 人の DB で 2 本合わせて 50ms)。先に流すなら、書き込みの少ない時間帯にする。**`user` に書き込み中の長い transaction があると、`000126` はその終わりを待ち、待っているあいだも後から来た `user` への書き込みが全て後ろに並ぶ。** 下の `lock_timeout` を 0 にして流すときは、待ちが切られずに続くので、この意味でも書き込みの少ない時間帯を選ぶ
+- **`CONCURRENTLY` は、始まる前からある transaction が全て終わるのを待つ。** 長い transaction (バックアップの `pg_dump` など) が走っていると、その終わりまで進まない。待っているあいだも書き込みは止めないが、migration は終わらない
+- **DB やロールに `statement_timeout` / `lock_timeout` を設定していると、`CONCURRENTLY` が途中で切られる。** `statement_timeout` は作る時間全体に、`lock_timeout` は古い transaction の終わりを待つ部分に効く。どちらで切られても使えない (INVALID の) index が残り、管理表は dirty になる (下の項目と [マイグレーションが途中で止まったとき (dirty)](#マイグレーションが途中で止まったとき-dirty) で戻す)。設定は、Elythia と同じユーザーで同じ DB に繋いで `SHOW statement_timeout;` と `SHOW lock_timeout;` で確かめる (どちらも `0` なら切られない)。migration のあいだだけ両方を 0 にするには、接続の `options` で上書きする (バックアップの取得が自分の transaction で同じ設定を 0 にしているのと同じ考え方。[backup.md](backup.md))。`elythia migrate` は環境変数 `PGOPTIONS` を読む
+
+  ```bash
+  # バイナリ直接実行
+  PGOPTIONS='-c statement_timeout=0 -c lock_timeout=0' elythia migrate -direction up
+  # Docker Compose (TCP)
+  docker compose run --rm --no-deps -e PGOPTIONS='-c statement_timeout=0 -c lock_timeout=0' migrate migrate -config .config/default.yml -direction up
+  # Docker Compose (UDS)
+  docker compose -f compose.uds.yaml run --rm --no-deps -e PGOPTIONS='-c statement_timeout=0 -c lock_timeout=0' mkgo migrate -direction up
+  # 先に psql で流すなら、同じ接続で先に SET する
+  psql ... -c 'SET statement_timeout = 0' -c 'SET lock_timeout = 0' -c 'CREATE INDEX CONCURRENTLY IF NOT EXISTS ...'
+  ```
+
+- **途中で失敗すると、使えない (INVALID の) index が名前ごと残る。** 次に流すと `IF NOT EXISTS` が名前で何もしないので、**使えない index が残ったまま migration が成功扱いになる**。流し直す前に、INVALID の index が無いかを見る
+
+  ```sql
+  -- 000123〜000132 (#3590 / #3612) の index に絞る。別の migration なら、その migration が作る名前に置き換える
+  SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
+    JOIN pg_namespace n ON n.oid = i.relnamespace
+   WHERE n.nspname = current_schema() AND NOT x.indisvalid
+     AND i.relname IN ('IDX_note_channelId_id_desc', 'IDX_NOTE_VISIBLE_USER_IDS', 'IDX_user_isSuspended_id',
+                       'IDX_user_avatarId', 'IDX_user_bannerId', 'IDX_e637cba4dc4410218c4251260e',
+                       'IDX_antenna_note_unread_noteId', 'IDX_channel_note_unread_noteId',
+                       'IDX_promo_read_noteId', 'IDX_following_followeeId_notify_normal',
+                       'IDX_note_reaction_userId_id');
+  ```
+
+  名前で絞るのは、別の作業の index を消さないため。例えば `REINDEX CONCURRENTLY` の途中には `<名前>_ccnew` という INVALID の index ができ、その `REINDEX` が失敗するとそのまま残る。失敗して残ったものは作っている最中ではないので、下の `pg_stat_progress_create_index` の確認をすり抜ける。migration の index と取り違えて消すと、その作業の後始末の手がかりを失う
+
+  **作っている最中の index も INVALID に見える。** 別の `elythia migrate` (別のコンテナや、先に流した psql) がまだ作っていないかを、次で確かめる。`index_relid` に同じ index が出ているあいだは消さない
+
+  ```sql
+  SELECT pid, relid::regclass AS "table", index_relid::regclass AS "index", phase
+    FROM pg_stat_progress_create_index;
+  ```
+
+  作っているものが無ければ、`DROP INDEX CONCURRENTLY IF EXISTS "<名前>";` で消す。管理表の戻し方は [マイグレーションが途中で止まったとき (dirty)](#マイグレーションが途中で止まったとき-dirty) にある
 
 ### frontend を本体へ取り込んだ版へ上げる (#3379)
 
@@ -900,7 +1515,7 @@ pluginbuild: plugins/foo: go.mod が以前のモジュールパス github.com/sh
 
 **旧版の `migrate` は、自分の知らない版まで進んだ DB に当たると止まる** (`no migration found for version N`)。compose の `migrate` サービスと UDS の image は起動の前に migration を流すので、追加のみの版でも、**新しい版のまま migration を旧版の最後の版まで戻してから**旧版へ切り替える。2.0.0 から 1.5.0 へ戻す手順は [1.5.0 から 2.0.0 へ上げる](upgrade/2.0.0.md#150-へ戻す)。
 
-> **`elythia migrate -direction down` を本番で叩かないこと。** `-steps` を省くと「全部」の意味になり、全 down マイグレーションが走って 全テーブルが消える。
+> **`elythia migrate -direction down -track core` を `-steps` 無しで本番で叩かないこと。** `-steps` を省くと「全部」の意味になり、全 down マイグレーションが走って 全テーブルが消える。down には `-track core` (本体) か `-track local` (fork の系列、[fork の独自 migration](fork-migrations.md)) の指定が必須で、省くと何もせずに終了コード 2 で止まる。
 >
 > **down が用意されていても戻せない migration がある。** `000081` は孤児行を、`000082` は chat room の owner が持つ membership / 招待行を DELETE するが、どちらも削除した行の内容を保存していないので down は no-op。詳細は [TS版からの移行](migration-from-ts.md#破壊的なマイグレーション)。
 
@@ -913,6 +1528,27 @@ SQL migration として書けない一回限りの正規化は、`elythia backfi
 
 **稼働中の本体プロセスに影響しない使い捨てコンテナ**で流す。entrypoint を `/app/elythia` に
 差し替えて、サブコマンドを渡す。`docker-compose.yml` の `migrate` サービスと同じ手法。
+
+### `backfill chat-reads` — 移行元のチャット(DM)の既読を引き継ぐ (#3653)
+
+Misskey TS / CherryPick から移行したサーバーで、移行の前に受け取った DM がすべて未読になり、
+チャットの未読バッジが消えない問題を直す。本家は DM の既読を Redis にだけ持ち、
+`chat_message.reads` を書かないため。**`-before` (移行した時点) は必須**で、指定が無いと
+何もせずに止まる。手順・判定の仕方・Redis の記録が無いときの `-assume-read` は
+[TS版からの移行](migration-from-ts.md#55-チャットdmの既読を引き継ぐ)にまとめてある。
+
+```bash
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill chat-reads \
+  -config /app/.config/default.yml -before 2026-10-01T00:00:00+09:00 -dry-run
+```
+
+**無指定で書き込み、`-dry-run` で抑止する**側の作法 (`backfill instance-counts` と同じ)。
+冪等で、`-from <message id>` で途中から再開できる。**`--no-deps` は db / redis を起動しない**ので、
+stack を止めているなら先に `docker compose up -d db redis` で起こしておく (配布の image の構成は
+`-f docker-compose.image.yml` を付ける。UDS 構成は `-f compose.uds.yaml` を付け、`app` を `mkgo` に、
+`db redis` を `postgres valkey` にする)。`-before` が移行より
+遅いことが分かったとき (本家の記録より `-too-late-margin` (既定 5 分) を越えて新しい DM がある) は、
+何も書かずに止まる。今より後の `-before` は受け付けない。
 
 ### `backfill instance-counts` — instance の `notesCount` / `usersCount` を数え直す (#3330)
 
@@ -1007,6 +1643,31 @@ Elythia の `000001` も作るので、TS から引き継いだ DB でも Elythi
 deadlock で片方が失敗する (バッチ側は id の順に渡しているが、行を取る順は planner
 次第)。バッチが落ちたら `-from` で流し直せばよい。
 
+### `backfill hashtag-mentions` — 公開範囲を限ったノートだけで使われたタグの利用者を外す
+
+ハッシュタグの利用者 (`hashtag` の `mentioned{,Local,Remote}UserIds` と各数) は、本家と同じく
+public / home のノートだけから積む。それより前の版は、フォロワー限定・宛先指定のノートからも積んでいた。
+このバッチは、フォロワー限定・宛先指定でタグの付いたノートを id の順に読み、「作者 × タグ」の組ごとに、
+その作者に同じタグの public / home のノートが無ければ、利用者の配列と数から外す。利用者が誰も残らず、
+プロフィールのタグ (`attached*`) にも使われていない行は、名前ごと消す。
+
+本家は利用者を足すだけで、ノートを消しても引かない。このため、いまあるノートから全体を作り直すことは
+しない (消したノートの分まで落ちてしまう)。public / home のノートを消していて、公開範囲を限ったノートだけが
+残っている利用者は、外れる側に倒れる。
+
+```bash
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill hashtag-mentions \
+  -config /app/.config/default.yml -dry-run
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill hashtag-mentions \
+  -config /app/.config/default.yml -batch 1000 -sleep-ms 100
+```
+
+冪等で、`-from <note id>` で途中から再開できる。`--no-deps` と UDS 構成のサービス名は `backfill instance-counts` と同じ。
+
+サーバーを動かしたまま流せるが、判定は更新の文が始まった時点のノートで行う。このため、文の実行中に同じ利用者が
+public / home のノートで同じタグを使うと、その利用者が外れることがある (次にそのタグを public / home のノートで
+使えば、また数えられる)。文が始まる前に投稿された public / home のノートがある利用者は外さない。
+
 ### `backfill avatar-public-url` — アイコン / バナーの URL を公開用へ寄せ直す
 
 `user.avatarUrl` / `user.bannerUrl` は drive ファイルの**原本**を指していた。原本は
@@ -1055,7 +1716,7 @@ AVIF は、設定し直すと静止画になる** (書き込み経路のアニ�
 ローカル利用者がその値を持っている。このバッチはそれを「原本と違う」と判定して
 公開用 (最大 2048px) へ書き換えるため、48px 表示のアイコンに大きな画像が流れる。
 Elythia 生まれの DB では逆に原本 → 公開用なので改善になる。**構成によって向きが
-反転する**ので、移行済みなら流す前に `docs/divergence.md` の `user.avatarUrl` の行を
+反転する**ので、移行済みなら流す前に `docs/divergence/operations.md` の `user.avatarUrl` の行を
 読むこと。
 
 **アイコンとバナーは 1 本の UPDATE にまとまる。** 条件は AND で積まれるので、片方の
@@ -1138,7 +1799,7 @@ compose の `run` はサービスの volume をそのまま引き継ぐ。別の
 
 **既定は dry-run で、書き込みには `-apply` が要る。** 姉妹バッチ
 (`backfill remote-host` / `backfill note-tags` / `backfill avatar-public-url` /
-`backfill instance-counts`) は
+`backfill instance-counts` / `backfill hashtag-mentions` / `backfill chat-reads`) は
 **逆** (無指定で書き込み、`-dry-run` で抑止) なので、手が覚えているほうで打たないこと。`-dry-run` と `-apply`
 を両方渡すと落ちる。
 
@@ -1214,10 +1875,10 @@ drive にあるファイルはそのまま残る (バッチと同じ判断)。�
 
 **このバッチが直すのは申請経由の絵文字だけ。** `admin/emoji/add` は #2999、
 `admin/emoji/update` は #3014 で system 所有へ複製するようになったが、**それ以前に登録・
-差し替えた絵文字は対象外のまま**。**管理画面が使う経路 (`fileId`) からはもう増えない**が、
-`admin/emoji/add` の **`url` 直接指定** (Elythia 独自の escape hatch。「この URL を指す」が
-意味なので取り込まない。`docs/divergence.md` §7) に利用者のファイルの URL を渡せば、
-同じ形は今でも作れる。該当するかは以下で分かる (読み取りのみ)。
+差し替えた絵文字は対象外のまま**。**新しくは増えない** — 管理画面が使う経路 (`fileId`) は
+複製し、#3865 より前にあった `admin/emoji/add` の **`url` 直接指定** (Elythia 独自の
+escape hatch。利用者のファイルの URL を渡すと同じ形を作れた) は #3865 で消した。
+該当するかは以下で分かる (読み取りのみ)。
 
 ```sql
 SELECT DISTINCT e.id, e.name, e."originalUrl"
@@ -1477,7 +2138,7 @@ policy さえあればログイン IP が読める。**
   `ip lookup audit: record failed` が Error で出る
 - **`user_ip` 自体が記録していない範囲は引けない。** `meta.enableIpLogging` が
   無効だった期間、凍結済みアカウントの接続、rate limit で 429 になった
-  リクエストは観測が残らない (詳細は [divergence.md](divergence.md) の
+  リクエストは観測が残らない (詳細は [divergence/security.md](divergence/security.md) の
   「IP 履歴の記録契機」)
 - **記録の一覧は最新 10,100 件までしか遡れない** (`offset` の上限 10000 + 1 ページ
   100 件)。保持期間が 90 日なので、**1 日 113 件以上**の照会がある運用では
@@ -1544,6 +2205,6 @@ drift は起動時の `RecomputeFollowCounts` で完全に再計算されるた�
 
 列の意味は本家と同じで、どちらも**その host の側から見た**数 (#3330)。`followingCount` はその host の利用者がローカルの利用者をフォローしている数 (federation/instances の `publishing`)、`followersCount` はローカルの利用者がその host の利用者をフォローしている数 (`subscribing`)。#3330 より前の Elythia は incremental 更新・起動時の再計算ともに**逆向きに数えていた**ので、それまでに Elythia を起動したことのある DB では 2 列の値が入れ替わっている (TS 版が正しく積んだ値も、Elythia の起動時の再計算で入れ替わる)。#3330 を含む版に上げて**一度起動すれば、再計算で正しい向きに戻る**。一方、instance chart (`__chart__instance` の `following` / `followers`) の過去の行は作り直さないので、更新前の期間は 2 系列が入れ替わったまま残る。
 
-`meta.enableStatsForFederatedInstances` を false にすると、本家と同じく Follow / Unfollow はこの 2 列も instance chart の following / followers も動かさない (リモートの投稿・利用者の取り込みで動く `notesCount` / `usersCount` と、instance chart の notes / users も同じく止まる)。ただし**起動時の `RecomputeFollowCounts` はこの設定に関係なく走る** (本家には起動時の再計算そのものが無い。docs/divergence.md の 5 節)。chart と集計列の判定は、どちらも次のイベントから効く (meta はキャッシュ越しに読むので、キャッシュの TTL ぶん遅れうる。#3330 より前は chart 側だけ起動時の値に固定されていて、再起動が要った)。
+`meta.enableStatsForFederatedInstances` を false にすると、本家と同じく Follow / Unfollow はこの 2 列も instance chart の following / followers も動かさない (リモートの投稿・利用者の取り込みで動く `notesCount` / `usersCount` と、instance chart の notes / users も同じく止まる)。ただし**起動時の `RecomputeFollowCounts` はこの設定に関係なく走る** (本家には起動時の再計算そのものが無い。docs/divergence/operations.md の 5 節)。chart と集計列の判定は、どちらも次のイベントから効く (meta はキャッシュ越しに読むので、キャッシュの TTL ぶん遅れうる。#3330 より前は chart 側だけ起動時の値に固定されていて、再起動が要った)。
 
-再計算は**移行済みのアカウントが絡むフォロー行を数えない**。本家の値と一致するのは、移行済みのリモートアカウントをローカルの利用者がフォローしている分の `followersCount` だけで、移行したアカウント側のフォローやローカルのアカウントの移行、proxy アカウントの行は本家では数えたまま残る。そのため移行が絡む instance では、Elythia の値が本家より小さくなりうる (詳細は docs/divergence.md の 5 節、#3330)。
+再計算は**移行済みのアカウントが絡むフォロー行を数えない**。本家の値と一致するのは、移行済みのリモートアカウントをローカルの利用者がフォローしている分の `followersCount` だけで、移行したアカウント側のフォローやローカルのアカウントの移行、proxy アカウントの行は本家では数えたまま残る。そのため移行が絡む instance では、Elythia の値が本家より小さくなりうる (詳細は docs/divergence/operations.md の 5 節、#3330)。

@@ -657,6 +657,10 @@ export interface Locale extends ILocale {
      */
     "selectAntenna": string;
     /**
+     * クリップを選択
+     */
+    "selectClip": string;
+    /**
      * アンテナを編集
      */
     "editAntenna": string;
@@ -4341,6 +4345,14 @@ export interface Locale extends ILocale {
      */
     "invalidParamErrorDescription": string;
     /**
+     * 秘密の値を入力し直してください
+     */
+    "secretReentryRequired": string;
+    /**
+     * 送り先(ホストやURLなど)を変えるときは、それと組になっているパスワードやキーも入力し直してください。保存済みの値は、新しい送り先には使いません。
+     */
+    "secretReentryRequiredDescription": string;
+    /**
      * 操作が拒否されました
      */
     "permissionDeniedError": string;
@@ -5169,6 +5181,14 @@ export interface Locale extends ILocale {
      */
     "seasonalScreenEffect": string;
     /**
+     * 夜空の流れ星
+     */
+    "nightMeteorEffect": string;
+    /**
+     * 夜（20時〜翌4時）にダークテーマを使っているとき、ときどき画面に流れ星が流れます。季節に応じた画面の演出が出ている間は流れません。
+     */
+    "nightMeteorEffectDescription": string;
+    /**
      * デコる
      */
     "decorate": string;
@@ -5280,6 +5300,15 @@ export interface Locale extends ILocale {
      * この設定をオフにすると、アップロード時にファイル名が自動でランダム文字列に置き換えられます。
      */
     "keepOriginalFilenameDescription": string;
+    /**
+     * センシティブなメディアは選択できません
+     */
+    "cannotSelectSensitiveMedia": string;
+    /**
+     * 自分でセンシティブ設定を行っていないのにこのエラーが出ている場合、自動判定によりセンシティブなメディアとされている可能性があります。
+     * サーバーの規則に照らして不要な場合は、ファイルのセンシティブ設定を解除してもう一度お試しください。
+     */
+    "cannotSelectSensitiveMediaDescription": string;
     /**
      * 説明文はありません
      */
@@ -6424,6 +6453,100 @@ export interface Locale extends ILocale {
          */
         "forceBackup": string;
     };
+    "_followApproval": {
+        /**
+         * フォロー承認
+         */
+        "groupTitle": string;
+        /**
+         * すべてのフォローが承認制になるため、期間による設定は適用されません。フォローの承認制を解除すると、以下の設定が再び適用されます。
+         */
+        "inactiveDescription": string;
+        /**
+         * 新しいアカウントからのフォローを制限する
+         */
+        "title": string;
+        /**
+         * フォローを承認制にしている場合や、新しいアカウントからのフォローを制限する場合にも、あなたがフォローしている相手は自動承認します。
+         */
+        "autoAcceptDescription": string;
+        /**
+         * 指定した期間が経過していない相手からのフォローを、下で選んだ方法で扱います。既存のフォロワーには影響しません。フォローしている相手の自動承認が有効な場合、その相手は通常どおりフォローできます。
+         */
+        "description": string;
+        /**
+         * ローカルユーザーからのフォロー
+         */
+        "local": string;
+        /**
+         * このサーバーでのアカウント作成からの期間で判定します。
+         */
+        "localDescription": string;
+        /**
+         * リモートユーザーからのフォロー
+         */
+        "remote": string;
+        /**
+         * 相手のサーバーが公開しているアカウントの作成日時からの期間で判定します。作成日時を公開していない相手は、このサーバーが初めてそのアカウントを認識してからの期間で判定します。
+         */
+        "remoteDescription": string;
+        /**
+         * 既定値を使う（現在は無効）
+         */
+        "useDefault": string;
+        /**
+         * 期間を指定する
+         */
+        "custom": string;
+        /**
+         * 承認が必要な期間
+         */
+        "period": string;
+        /**
+         * 単位
+         */
+        "unit": string;
+        /**
+         * 期間が正しくありません。1秒以上の期間を、指定できる範囲内で入力してください。
+         */
+        "invalidPeriod": string;
+        /**
+         * 期間に満たない相手からのフォローの扱い
+         */
+        "action": string;
+        /**
+         * 通知しない方法を選ぶと、短い間に大量のフォローが来ても通知が埋まりません。
+         */
+        "actionDescription": string;
+        /**
+         * フォローリクエストにする
+         */
+        "actionRequest": string;
+        /**
+         * 通知せずにフォローリクエストにする
+         */
+        "actionSilentRequest": string;
+        /**
+         * 通知せずにフォローを受け入れる
+         */
+        "actionSilentFollow": string;
+        /**
+         * 通知せずに受け入れたフォロー
+         */
+        "silentFollows": string;
+        /**
+         * 期間に満たない相手から、通知せずに受け入れたフォローの一覧です。同じ相手から何度フォローされても1件にまとめ、最後にフォローされた日時を表示します。
+         */
+        "silentFollowsDescription": string;
+        /**
+         * 通知せずに受け入れたフォローはありません
+         */
+        "noSilentFollows": string;
+        /**
+         * フォロワーではありません
+         */
+        "notFollower": string;
+    };
     "_accountSettings": {
         /**
          * コンテンツの表示にログインを必須にする
@@ -6730,6 +6853,18 @@ export interface Locale extends ILocale {
          * 有効にすると、このお知らせを既読にする際に確認ダイアログが表示されます。また、一括既読操作の対象になりません。
          */
         "needConfirmationToReadDescription": string;
+        /**
+         * 自動アーカイブ日時
+         */
+        "autoArchiveAt": string;
+        /**
+         * 指定した日時を過ぎると、このお知らせは自動的にアーカイブされます。空欄の場合は自動的にアーカイブされません。
+         */
+        "autoArchiveAtDescription": string;
+        /**
+         * 自動アーカイブ日時には現在より後の日時を指定してください。
+         */
+        "autoArchiveAtMustBeInFuture": string;
         /**
          * お知らせを終了
          */
@@ -8165,6 +8300,216 @@ export interface Locale extends ILocale {
             };
         };
     };
+    "_roleLevel": {
+        /**
+         * レベルロール
+         */
+        "title": string;
+        /**
+         * ここではレベルロールの経験値曲線を設定します。レベル別ポリシーは、下にある各ポリシーの編集欄で設定できます。
+         */
+        "editorDescription": string;
+        /**
+         * 開始レベル
+         */
+        "baseLevel": string;
+        /**
+         * 経験値曲線
+         */
+        "experienceCurve": string;
+        /**
+         * 区間 {n}
+         */
+        "segment": ParameterizedString<"n">;
+        /**
+         * 計算方法
+         */
+        "calculation": string;
+        /**
+         * 上昇レベル数
+         */
+        "levelUps": string;
+        /**
+         * 基本必要経験値
+         */
+        "baseExperience": string;
+        /**
+         * 段階ごとの加算値
+         */
+        "additionalExperience": string;
+        /**
+         * 指数
+         */
+        "exponential": string;
+        /**
+         * 経験値区間を追加
+         */
+        "addSegment": string;
+        /**
+         * レベル別ポリシー
+         */
+        "policyRanges": string;
+        /**
+         * レベルごとに適用するポリシーを設定します。
+         */
+        "policyRangesDescription": string;
+        /**
+         * このポリシーに適用するレベル範囲を設定します。範囲は連続し、開始レベルと最大レベルまでを常に覆います。
+         */
+        "perPolicyRangesDescription": string;
+        /**
+         * {count} 件のレベルポリシー
+         */
+        "policyRangeCount": ParameterizedString<"count">;
+        /**
+         * ポリシー範囲 {n}
+         */
+        "range": ParameterizedString<"n">;
+        /**
+         * 適用方法
+         */
+        "rangeType": string;
+        /**
+         * 開始段階
+         */
+        "startStage": string;
+        /**
+         * 終了段階
+         */
+        "endStage": string;
+        /**
+         * 開始レベル
+         */
+        "startPolicyLevel": string;
+        /**
+         * 終了レベル
+         */
+        "endPolicyLevel": string;
+        /**
+         * ポリシーキー
+         */
+        "policyKey": string;
+        /**
+         * 固定値
+         */
+        "constantValue": string;
+        /**
+         * 基準値
+         */
+        "multiplierBase": string;
+        /**
+         * 段階ごとの加算値
+         */
+        "multiplierAdditional": string;
+        /**
+         * ポリシー範囲を追加
+         */
+        "addRange": string;
+        /**
+         * このポリシーに範囲を追加
+         */
+        "addPolicyRange": string;
+        /**
+         * 固定
+         */
+        "constant": string;
+        /**
+         * 線形
+         */
+        "linear": string;
+        /**
+         * 段階加算
+         */
+        "multiplier": string;
+        /**
+         * 変更なし
+         */
+        "noPolicyChange": string;
+        /**
+         * 他のポリシーに影響されません
+         */
+        "noPolicyChangeDescription": string;
+        /**
+         * 影響情報
+         */
+        "impactInformation": string;
+        /**
+         * 計算式:
+         */
+        "formula": string;
+        /**
+         * Lv.{level}: {value}
+         */
+        "policySimulation": ParameterizedString<"level" | "value">;
+        /**
+         * Lv.{level}: {cost} XP ({from} ～ {to} XP)
+         */
+        "experienceSimulation": ParameterizedString<"level" | "cost" | "from" | "to">;
+        /**
+         * Lv.{level}: MAX ({from} ～ XP)
+         */
+        "experienceSimulationMax": ParameterizedString<"level" | "from">;
+        /**
+         * 通常値を使用
+         */
+        "useBasePolicy": string;
+        /**
+         * レベル {level}
+         */
+        "level": ParameterizedString<"level">;
+        /**
+         * 経験値 {current} / {next}
+         */
+        "experience": ParameterizedString<"current" | "next">;
+        /**
+         * 最大レベル
+         */
+        "maxLevel": string;
+        /**
+         * 経験値を編集
+         */
+        "editExperience": string;
+        /**
+         * 経験値を設定
+         */
+        "setExperience": string;
+        /**
+         * 経験値を加算
+         */
+        "addExperience": string;
+        /**
+         * 経験値を加減算
+         */
+        "adjustExperience": string;
+        /**
+         * 経験値を減算
+         */
+        "subtractExperience": string;
+        /**
+         * 経験値を乗算
+         */
+        "multiplyExperience": string;
+        /**
+         * 表示する
+         */
+        "showOnProfile": string;
+        /**
+         * 非表示にする
+         */
+        "hideOnProfile": string;
+        /**
+         * レベル設定を削除
+         */
+        "removeConfiguration": string;
+        /**
+         * 旧形式のレベルロールです。保存するとプラグイン形式へ移行します。
+         */
+        "legacyRoleNotice": string;
+        /**
+         * レベル情報を取得できませんでした。サーバーのrole-level設定を確認してください。
+         */
+        "unavailable": string;
+    };
     "_role": {
         /**
          * ロールの作成
@@ -9256,6 +9601,449 @@ export interface Locale extends ILocale {
          * このサーバーの片付けは別の操作で実行中です。終わってから一覧を読み直してください。
          */
         "inProgress": string;
+    };
+    "_backups": {
+        /**
+         * バックアップ
+         */
+        "title": string;
+        /**
+         * データベースのバックアップの世代と、保存先の使用量を表示し、取得・検証・削除・ダウンロードを行います。バックアップには利用者の秘密鍵・トークン・パスワードのハッシュが含まれるため、表示を含む全ての操作で、その都度パスワードと二段階認証（またはパスキー）による認証を求めます。
+         */
+        "description": string;
+        /**
+         * この機能を使うには、二段階認証（TOTP）かパスキーを登録してください。
+         */
+        "twoFactorRequired": string;
+        /**
+         * セキュリティの設定を開く
+         */
+        "openSecuritySettings": string;
+        /**
+         * 認証して表示
+         */
+        "show": string;
+        /**
+         * 認証して再読み込み
+         */
+        "reload": string;
+        /**
+         * パスキーで認証する
+         */
+        "usePasskey": string;
+        /**
+         * バックアップの保存先が設定されていません。設定ファイルの「backup:」を確認してください。
+         */
+        "notConfigured": string;
+        /**
+         * バックアップ用のサービスが設定されていないため、ここからは取得・検証できません（backup.server.serviceUrl）。
+         */
+        "serviceNotConfigured": string;
+        /**
+         * バックアップ用のサービスに接続できません。
+         */
+        "serviceUnreachable": string;
+        /**
+         * バックアップ用のサービスが別の処理を実行中です。しばらくしてから再度お試しください。
+         */
+        "serviceBusy": string;
+        /**
+         * バックアップ用のサービスが処理を実行中です。
+         */
+        "serviceRunning": string;
+        /**
+         * パスワードまたは二段階認証のコードが正しくありません。
+         */
+        "reauthFailed": string;
+        /**
+         * パスワードと、二段階認証のコードかパスキーを入力してください。
+         */
+        "reauthRequired": string;
+        /**
+         * この二段階認証のコードは使用済みです。次のコードに切り替わるまで待つか、パスキーを使ってください。
+         */
+        "codeAlreadyUsed": string;
+        /**
+         * パスキーが登録されていないか、このサーバーではパスキーを使えません。
+         */
+        "passkeyUnavailable": string;
+        /**
+         * 認証の失敗が続いたため、しばらく操作できません。
+         */
+        "rateLimited": string;
+        /**
+         * 保存先
+         */
+        "storage": string;
+        /**
+         * 合計の容量
+         */
+        "totalSize": string;
+        /**
+         * 世代の数
+         */
+        "generationCount": string;
+        /**
+         * ファイルの数
+         */
+        "objectCount": string;
+        /**
+         * 月額の目安
+         */
+        "monthlyCost": string;
+        /**
+         * 1GBあたり{price}で計算
+         */
+        "monthlyCostDescription": ParameterizedString<"price">;
+        /**
+         * 次の定期実行
+         */
+        "nextRun": string;
+        /**
+         * 前回の取得
+         */
+        "lastTake": string;
+        /**
+         * 前回の検証
+         */
+        "lastVerify": string;
+        /**
+         * 使える最新の世代
+         */
+        "latestUsable": string;
+        /**
+         * 決められた間隔を過ぎても、使える新しい世代ができていません。
+         */
+        "overdue": string;
+        /**
+         * 通知を送れませんでした
+         */
+        "lastNotifyError": string;
+        /**
+         * なし
+         */
+        "none": string;
+        /**
+         * 今すぐ取得
+         */
+        "takeNow": string;
+        /**
+         * 今すぐバックアップを取得しますか？
+         */
+        "takeConfirm": string;
+        /**
+         * バックアップの取得を依頼しました。完了すると一覧に表示されます。
+         */
+        "takeAccepted": string;
+        /**
+         * 検証
+         */
+        "verifyNow": string;
+        /**
+         * 検証を依頼しました。完了すると結果が表示されます。
+         */
+        "verifyAccepted": string;
+        /**
+         * ダウンロード
+         */
+        "download": string;
+        /**
+         * ダウンロード用のURLは{minutes}分間だけ有効です。
+         */
+        "downloadDescription": ParameterizedString<"minutes">;
+        /**
+         * この世代は暗号化されています。復号にはageの秘密鍵が必要です。
+         */
+        "encryptedDownload": string;
+        /**
+         * {id} を削除しますか？この操作は取り消せません。
+         */
+        "deleteConfirm": ParameterizedString<"id">;
+        /**
+         * 削除しました（{size}）。
+         */
+        "deleted": ParameterizedString<"size">;
+        /**
+         * バックアップの世代はありません。
+         */
+        "empty": string;
+        /**
+         * 未完成
+         */
+        "incomplete": string;
+        /**
+         * 送信が途中で止まった世代です。容量を使っているので、不要なら削除してください。
+         */
+        "incompleteDescription": string;
+        /**
+         * 暗号化
+         */
+        "encrypted": string;
+        /**
+         * 暗号化なし
+         */
+        "notEncrypted": string;
+        /**
+         * 検証済み
+         */
+        "verified": string;
+        /**
+         * 検証に失敗
+         */
+        "verifyFailed": string;
+        /**
+         * 未検証
+         */
+        "notVerified": string;
+        /**
+         * 取得した日時
+         */
+        "createdAt": string;
+        /**
+         * 大きさ
+         */
+        "size": string;
+        /**
+         * Elythiaの版
+         */
+        "elythiaVersion": string;
+        /**
+         * PostgreSQLの版
+         */
+        "postgresVersion": string;
+        /**
+         * 管理表の番号
+         */
+        "migrations": string;
+        /**
+         * 検証した日時
+         */
+        "verifiedAt": string;
+        /**
+         * この世代へ戻す
+         */
+        "restore": string;
+        /**
+         * バックアップから戻す
+         */
+        "restoreTitle": string;
+        /**
+         * 世代 {id} を別の名前のデータベースへ戻して、切り替える準備をします。準備の間もサーバーは動いたままです。準備ができたら、切り替えるかどうかをもう一度確かめます。
+         */
+        "restoreConfirm": ParameterizedString<"id">;
+        /**
+         * 切り替える
+         */
+        "restoreSwitch": string;
+        /**
+         * メンテナンスに入り、データベースを切り替えます。切り替えが終わるまで、利用者はサーバーを使えません。今のデータベースは {before} という名前で残ります。続けますか？
+         */
+        "restoreSwitchConfirm": ParameterizedString<"before">;
+        /**
+         * 中止
+         */
+        "restoreAbort": string;
+        /**
+         * 準備したデータベースを削除して、中止しますか？
+         */
+        "restoreAbortConfirm": string;
+        /**
+         * 閉じる
+         */
+        "restoreClose": string;
+        /**
+         * 切り替えの間は、この画面を開いたままにしてください。再読み込みするとメンテナンスの画面になり、終わると戻ります。
+         */
+        "restoreKeepOpen": string;
+        /**
+         * データベースを切り替えたかどうか分からなくなったため、メンテナンスのまま止めています。サーバーの管理者がpg_databaseを確かめ、elythia backup restore -rollbackとelythia maintenance exitで戻してください。
+         */
+        "restoreUnknownHelp": string;
+        /**
+         * データベースへの接続が残っています
+         */
+        "restoreWaiting": string;
+        /**
+         * 進み具合を読めません。しばらくしてから自動で読み直します。
+         */
+        "restoreStatusUnavailable": string;
+        /**
+         * 戻したデータベースにこのセッションが無いときは、ほかの画面を開くとサインインし直すよう求められます。
+         */
+        "restoreSessionMayBeGone": string;
+        /**
+         * このセッションでは進み具合を読めなくなりました。戻したデータベースにこのセッションが無い可能性があります。サインインし直してください。サインインし直した後は、この戻す操作の進み具合をここでは読めないので、サーバーのログで確かめてください。
+         */
+        "restoreSessionGone": string;
+        /**
+         * 検証に通っていない世代は、ここからは戻せません。先に検証してください。
+         */
+        "restoreNotVerified": string;
+        /**
+         * すでにメンテナンス中です。
+         */
+        "maintenanceActive": string;
+        /**
+         * バックアップ用のサービスと、サーバーのプロセスの版が違います。版を揃えてから戻してください。
+         */
+        "versionMismatch": string;
+        /**
+         * 読み取りレプリカを使う構成では、ここからは戻せません。elythia backup restoreを使ってください。
+         */
+        "restoreNotSupported": string;
+        /**
+         * 今の段階では、この操作はできません。
+         */
+        "restoreStepMismatch": string;
+        /**
+         * この戻す操作は、別のセッションから始められたものです。
+         */
+        "restoreTicketInvalid": string;
+        /**
+         * バックアップ用のサービスでは、ここからの戻す操作を使えません。
+         */
+        "restoreUnavailable": string;
+        /**
+         * 退避したデータベース
+         */
+        "keptTitle": string;
+        /**
+         * バックアップから戻したときやロールバックしたときに、それまでのデータベースを消さずに残したものです。選んだものへ戻せます（ロールバック）。そのときも、今のデータベースは消さずに別の名前で残します。
+         */
+        "keptDescription": string;
+        /**
+         * 認証して表示
+         */
+        "keptShow": string;
+        /**
+         * 退避したデータベースはありません。
+         */
+        "keptEmpty": string;
+        /**
+         * バックアップから戻す前のデータベース
+         */
+        "keptBeforeRestore": string;
+        /**
+         * ロールバックで退避したデータベース
+         */
+        "keptRolledBack": string;
+        /**
+         * 退避した日時
+         */
+        "keptAt": string;
+        /**
+         * 今の版より古いデータベースです。戻す前に、管理表の番号を今の版まで進めます（migrate）。
+         */
+        "keptNeedsMigration": string;
+        /**
+         * 戻す先のデータベースに接続が残っています。接続を切ってから、もう一度お試しください。
+         */
+        "keptInUse": string;
+        /**
+         * 退避したデータベースの一覧を読めませんでした。バックアップ用のサービスのログを確かめてください。
+         */
+        "keptUnreadable": string;
+        /**
+         * その退避したデータベースはありません。
+         */
+        "noSuchKept": string;
+        "_keptProblems": {
+            /**
+             * 今のElythiaより新しい版のデータベースなので、戻せません。Elythiaをその版以上に上げてください。
+             */
+            "migrationTooNew": string;
+            /**
+             * 管理表の更新が途中で止まっている（dirty）ので、戻せません。サーバーの管理者が、このデータベースの管理表を直してから戻してください（手順はドキュメントの「退避したDBへ戻す」）。
+             */
+            "migrationDirty": string;
+            /**
+             * Elythiaのデータベースではないので、戻せません。
+             */
+            "notElythia": string;
+            /**
+             * このデータベースを読めませんでした。
+             */
+            "unreadable": string;
+        };
+        /**
+         * このデータベースへ戻す
+         */
+        "rollback": string;
+        /**
+         * 退避したデータベースへ戻す
+         */
+        "rollbackTitle": string;
+        /**
+         * {name}へ戻す準備をします。準備の間もサーバーは動いたままです。準備ができたら、切り替えるかどうかをもう一度確かめます。認証は今のデータベース（{database}）に登録されているパスワードと二段階認証で行います。
+         */
+        "rollbackConfirm": ParameterizedString<"name" | "database">;
+        /**
+         * ロールバックを中止しますか？戻す先のデータベースは、そのまま残ります。
+         */
+        "rollbackAbortConfirm": string;
+        /**
+         * 今のデータベースに、あなたのパスワードや二段階認証、管理者の役割が無い可能性があります（戻したバックアップより後に設定した場合など）。そのときは、この画面からは戻せません。サーバーの管理者が本体を止めてから、次のコマンドで戻してください。
+         * {command}
+         */
+        "rollbackCli": ParameterizedString<"command">;
+        /**
+         * バックアップから戻した直後で、今のデータベースに二段階認証が登録されていないときは、退避したデータベースへ戻す操作をelythia backup restore -rollbackで行ってください。
+         */
+        "rollbackCliHint": string;
+        "_restoreSteps": {
+            /**
+             * 準備中
+             */
+            "preparing": string;
+            /**
+             * 切り替えの準備ができました
+             */
+            "ready": string;
+            /**
+             * メンテナンスに入っています
+             */
+            "entering": string;
+            /**
+             * 切り替えました
+             */
+            "switched": string;
+            /**
+             * サーバーが戻るのを待っています
+             */
+            "resuming": string;
+            /**
+             * 元のデータベースへ戻しています
+             */
+            "reverting": string;
+            /**
+             * 中止しています
+             */
+            "aborting": string;
+            /**
+             * 戻しました
+             */
+            "done": string;
+            /**
+             * 準備に失敗しました
+             */
+            "failed": string;
+            /**
+             * 期限までに切り替えなかったため、中止しました
+             */
+            "expired": string;
+            /**
+             * 中止しました（今のデータベースは変わっていません）
+             */
+            "aborted": string;
+            /**
+             * 元のデータベースへ戻しました
+             */
+            "reverted": string;
+            /**
+             * 止まりました（確認が必要です）
+             */
+            "unknown": string;
+        };
     };
     "_databaseHealth": {
         /**
@@ -10593,6 +11381,10 @@ export interface Locale extends ILocale {
          */
         "write:admin:roles": string;
         /**
+         * ロールの経験値を変更する
+         */
+        "write:admin:role-level-experience": string;
+        /**
          * ロールを見る
          */
         "read:admin:roles": string;
@@ -11635,6 +12427,10 @@ export interface Locale extends ILocale {
          */
         "pageSetting": string;
         /**
+         * 非公開にすると、自分以外の人は、URLを知っていても見られません。
+         */
+        "visibilityDescription": string;
+        /**
          * 指定されたページURLは既に存在しています
          */
         "nameAlreadyExists": string;
@@ -12200,6 +12996,10 @@ export interface Locale extends ILocale {
              */
             "channel": string;
             /**
+             * クリップ
+             */
+            "clip": string;
+            /**
              * メンション
              */
             "mentions": string;
@@ -12387,6 +13187,38 @@ export interface Locale extends ILocale {
     };
     "_moderationLogTypes": {
         /**
+         * バックアップの一覧を表示
+         */
+        "listBackups": string;
+        /**
+         * バックアップを取得
+         */
+        "takeBackup": string;
+        /**
+         * バックアップを検証
+         */
+        "verifyBackup": string;
+        /**
+         * バックアップを削除
+         */
+        "deleteBackup": string;
+        /**
+         * バックアップをダウンロード
+         */
+        "downloadBackup": string;
+        /**
+         * バックアップから戻す
+         */
+        "restoreBackup": string;
+        /**
+         * 退避したデータベースへ戻す
+         */
+        "rollbackBackup": string;
+        /**
+         * 退避したデータベースの一覧を表示
+         */
+        "listKeptDatabases": string;
+        /**
          * 絵文字申請枠をリセット
          */
         "resetEmojiApplicationQuota": string;
@@ -12394,6 +13226,18 @@ export interface Locale extends ILocale {
          * 消えたサーバーとのフォロー関係を片付け
          */
         "cleanGoneInstance": string;
+        /**
+         * 配送の停止を解除
+         */
+        "closeDeliveryBreaker": string;
+        /**
+         * 登録の申請を承認
+         */
+        "approveSignupApplication": string;
+        /**
+         * 登録の申請を却下
+         */
+        "rejectSignupApplication": string;
         /**
          * 連合のルールを作成
          */
@@ -14422,6 +15266,18 @@ export interface Locale extends ILocale {
     };
     "_mkgoRolePolicy": {
         /**
+         * 範囲やレベル数の変更で取得間隔が1〜1440分を超える場合、範囲先頭の値を1〜1440分の整数に補正し、倍率の加算値を0に戻します。保存前にプレビューを確認してください。
+         */
+        "genshinRefreshRange_caption": string;
+        /**
+         * 原神の自動取得間隔（分）
+         */
+        "genshinRefreshIntervalMinutes": string;
+        /**
+         * 所有確認済みの原神UIDを自動更新する最短間隔です。1〜1440分の整数で指定します（既定10分）。EnkaのTTLが長い場合はTTLを優先し、更新確認は1分ごとに行います。同じ優先度のロールでは短い間隔を採用するため、個別ロールで長い間隔を指定する場合は優先度を上げてください。UID所有確認の有効期限や再確認待機は変更しません。
+         */
+        "genshinRefreshIntervalMinutes_caption": string;
+        /**
          * カスタム絵文字の登録を申請できる
          */
         "canRequestCustomEmojis": string;
@@ -15867,5 +16723,167 @@ export interface Locale extends ILocale {
          * 承認制と招待制が同時に有効になっていて、どこからも登録できない状態です。受け付け方を選び直してください。
          */
         "inconsistent": string;
+    };
+    "_mkgoSuspendedSoftware": {
+        /**
+         * バージョンを/で囲むと、バージョンの文字列に正規表現を当てます（例：/-cherrypick-4\.1[0-3]\./）。閉じる/の後にiを付けると、大文字と小文字を区別しません。ソフトウェアの名前は、大文字と小文字を区別せずに比べます。
+         */
+        "versionRegexHint": string;
+        /**
+         * 受信を拒否するソフトウェア
+         */
+        "inboxSuspendedSoftware": string;
+        /**
+         * 指定したソフトウェアで動いているサーバーから届くアクティビティを、受信の時点で拒否します（相手には受け取ったと返したうえで捨て、拒否したことは伝えません）。削除や取り消しも受け付けません。ほかのサーバーがリノートしたときや、返信や引用をたどってこちらから取りに行くときも、そのサーバーの投稿を取り込みません（まだ取り込んでいない投稿のリノートは、リノートごと捨てます。すでに取り込んだ投稿は残り、そのリノートは受け付けます）。そのサーバーの、まだ知らないユーザーは解決できません（メンションや指名の投稿は届かず、フォローや引っ越し先の解決などもできません）。ソフトウェアの名前とバージョンの範囲の書き方は、配信停止中のソフトウェアと同じです。バージョンを/で囲むと、バージョンの文字列に正規表現を当てます（例：/-cherrypick-4\.1[0-3]\./、閉じる/の後にiを付けると大文字と小文字を区別しません）。ソフトウェアが分からないサーバーからの受信は拒否しません。
+         */
+        "inboxSuspendedSoftwareDescription": string;
+        /**
+         * ソフトウェアによる受信の拒否
+         */
+        "inboxStatus": string;
+        /**
+         * 拒否中
+         */
+        "inboxSuspended": string;
+        /**
+         * 対象外
+         */
+        "inboxNotSuspended": string;
+    };
+    "_mkgoDrive": {
+        /**
+         * このファイルは、サーバーのファイル（絵文字の画像など）か、カスタム絵文字の画像として使われているため、ここからは削除できません。絵文字の画像なら、絵文字の管理から絵文字を削除してください。
+         */
+        "cannotDeleteProtectedFile": string;
+    };
+    "_localOnlyAccount": {
+        /**
+         * 連合の設定
+         */
+        "setupTitle": string;
+        /**
+         * このアカウントを他のサーバーとつなぐか選べます。
+         */
+        "setupDescription": string;
+        /**
+         * 他のサーバーと連合する
+         */
+        "enableFederation": string;
+        /**
+         * 連合を有効にすると、これからの投稿やプロフィールは他のサーバーへ送られ、外部で保存・再配布されることがあります。このアカウントが外部から照会されるだけでなく、他のアカウントからメンションされた場合も無効に戻せません。参照の検知はこのサーバーで観測できた範囲に限られます。
+         */
+        "enableWarning": string;
+        /**
+         * 連合を有効にすると、これからの投稿やプロフィールは他のサーバーへ送られ、外部で保存・再配布されることがあります。外部から参照された後は無効に戻せません。過去のローカル専用投稿はローカルに残り、連合後も取得・配信されません。相手が連合を無効にしている場合、その人へのメンションも相手のサーバーには届きません。
+         */
+        "setupOnWarning": string;
+        /**
+         * 無効にするとローカル専用アカウントになり、投稿はこのサーバー内だけに公開されます。過去の投稿もローカルに残ります。
+         */
+        "offDescription": string;
+        /**
+         * 連合を無効にすると、このアカウントの投稿は他のサーバーへ送られず、このサーバー内だけに公開されます。後から有効にしても、ローカル専用の間に作成した投稿は外部へ配信されません。
+         */
+        "setupOffDescription": string;
+        /**
+         * このアカウントの連合設定はすでに確定しています。変更する場合は設定画面を開いてください。
+         */
+        "alreadyConfigured": string;
+        /**
+         * アカウントの連合
+         */
+        "settingsTitle": string;
+        /**
+         * 連合中
+         */
+        "statusOn": string;
+        /**
+         * ローカル専用
+         */
+        "statusOff": string;
+        /**
+         * 未確定
+         */
+        "statusPending": string;
+        /**
+         * 連合を有効にすると、これからの投稿やプロフィールは他のサーバーへ送られ、外部で保存・再配布されることがあります。ローカル専用の間に作成した投稿は、後から連合を有効にしても外部へ配信されません。
+         */
+        "settingsDescription": string;
+        /**
+         * 連合を有効にする
+         */
+        "turnOn": string;
+        /**
+         * 連合を無効にする
+         */
+        "turnOff": string;
+        /**
+         * これからの投稿やプロフィールは他のサーバーへ送られ、外部で保存・再配布されることがあります。外部から参照されたり、他のアカウントにメンションされたりすると無効に戻せません。ローカル専用の間に作成した投稿は外部へ配信されません。続けますか？
+         */
+        "confirmTurnOn": string;
+        /**
+         * 連合を無効にすると、既存の投稿と予約済み投稿もローカル専用に変換されます。連合を再度有効にしても、これらは外部へ公開・配送されません。通常の未予約下書きは変換されません。この変更は元に戻せません。続けますか？
+         */
+        "confirmTurnOff": string;
+        /**
+         * このアカウントは外部から参照されたため、連合を無効にできません。最初の参照: {reason} {host} ({time})
+         */
+        "firstReference": ParameterizedString<"reason" | "host" | "time">;
+        /**
+         * 機能導入時の移行
+         */
+        "reasonMigration": string;
+        /**
+         * WebFingerの照会
+         */
+        "reasonWebFinger": string;
+        /**
+         * Actorの取得
+         */
+        "reasonActor": string;
+        /**
+         * コレクションの取得
+         */
+        "reasonCollection": string;
+        /**
+         * 投稿の取得
+         */
+        "reasonNote": string;
+        /**
+         * 受信
+         */
+        "reasonInbox": string;
+        /**
+         * 配送
+         */
+        "reasonDelivery": string;
+        /**
+         * その他の外部参照
+         */
+        "reasonUnknown": string;
+        /**
+         * システムアカウントの連合設定は変更できません。
+         */
+        "systemAccount": string;
+        /**
+         * 連合が有効になるまで、アカウント移行と別名の登録はできません。
+         */
+        "migrationBlocked": string;
+        /**
+         * ローカル専用アカウントの投稿は、このサーバー内だけに公開されます。
+         */
+        "offPostForced": string;
+        /**
+         * リモートユーザーへのメンションを含んでいます。あなたのアカウントでは連合が有効でないため、この投稿は相手のサーバーには届きません。
+         */
+        "remoteMentionWarning": string;
+        /**
+         * ローカル専用アカウントでは、リモートアカウントへの操作はできません。
+         */
+        "remoteActionBlocked": string;
+        /**
+         * このユーザーはローカル専用アカウントです。
+         */
+        "publicProfile": string;
     };
 }

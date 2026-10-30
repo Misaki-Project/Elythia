@@ -49,13 +49,15 @@ func (m *mockUserRepo) SearchUsers(string, string, int, int, string) ([]*model.U
 func (m *mockUserRepo) SearchByUsernameAndHost(string, *string, bool, int) ([]*model.User, error) {
 	return nil, nil
 }
-func (m *mockUserRepo) UpdateUser(string, map[string]any) error               { return nil }
-func (m *mockUserRepo) CreateProfile(*model.UserProfile) error                { return nil }
-func (m *mockUserRepo) ListUsers(model.UserListFilter) ([]*model.User, error) { return nil, nil }
-func (m *mockUserRepo) ListRemoteInboxes() ([]model.RemoteInbox, error)       { return nil, nil }
-func (m *mockUserRepo) CountOnlineUsers() (int64, error)                      { return 0, nil }
-func (m *mockUserRepo) CountLocalUsers() (int64, error)                       { return 0, nil }
-func (m *mockUserRepo) CountLocalUsersActiveSince(time.Time) (int64, error)   { return 0, nil }
+func (m *mockUserRepo) UpdateUser(string, map[string]any) error                   { return nil }
+func (m *mockUserRepo) SetAccountCreatedAtIfNull(string, time.Time) (bool, error) { return false, nil }
+func (m *mockUserRepo) CreateProfile(*model.UserProfile) error                    { return nil }
+func (m *mockUserRepo) ListUsers(model.UserListFilter) ([]*model.User, error)     { return nil, nil }
+func (m *mockUserRepo) ListRemoteInboxes() ([]model.RemoteInbox, error)           { return nil, nil }
+func (m *mockUserRepo) CountOnlineUsers() (int64, error)                          { return 0, nil }
+func (m *mockUserRepo) CountLocalUsers() (int64, error)                           { return 0, nil }
+func (m *mockUserRepo) CountLocalUsersForSetup() (int64, error)                   { return 0, nil }
+func (m *mockUserRepo) CountLocalUsersActiveSince(time.Time) (int64, error)       { return 0, nil }
 func (m *mockUserRepo) ListLocalUserIDsRegisteredAfter(string) ([]string, error) {
 	return nil, nil
 }
@@ -171,7 +173,7 @@ func newTestHandler() (*Handler, *mockUserRepo, *mockResetRepo) {
 	idGen, _ := id.NewGenerator("aidx")
 	userRepo := newMockUserRepo()
 	resetRepo := newMockResetRepo()
-	h := NewHandler(userRepo, resetRepo, idGen)
+	h := NewHandler(userRepo, resetRepo, idGen, nil, nil)
 	h.SetServerURL("https://example.com")
 	return h, userRepo, resetRepo
 }
@@ -229,7 +231,7 @@ func TestRequestReset_SendsJapaneseEmailFromMetaLangsWhenProfileLangUnset(t *tes
 	h, userRepo, resetRepo := newTestHandler()
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x", Langs: []string{"ja-JP"}}
-	h.SetMetaRepo(metaRepo)
+	h.metaRepo = metaRepo
 
 	email := "test@example.com"
 	userRepo.users["u1"] = &model.User{ID: "u1", Username: "testuser", UsernameLower: "testuser"}
@@ -257,7 +259,7 @@ func TestRequestReset_SendsJapaneseEmailWhenProfileLangIsJa(t *testing.T) {
 	h, userRepo, resetRepo := newTestHandler()
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x", Langs: []string{"en-US", "ja-JP"}}
-	h.SetMetaRepo(metaRepo)
+	h.metaRepo = metaRepo
 
 	email := "test@example.com"
 	ja := "ja-JP"
@@ -336,6 +338,29 @@ func TestRequestReset_InvalidParam(t *testing.T) {
 
 // --- Reset ---
 
+// 新しいパスワードは配線したHasherのcostでハッシュする(#3780)。
+func TestReset_UsesWiredHasher(t *testing.T) {
+	const configured = bcrypt.MinCost + 1
+	hasher, err := password.NewHasher(configured)
+	require.NoError(t, err)
+	h, userRepo, resetRepo := newTestHandler()
+	h.SetPasswordHasher(hasher)
+	oldPw := "$2a$04$unused"
+	userRepo.profiles["u1"] = &model.UserProfile{UserID: "u1", Password: &oldPw}
+	idGen, _ := id.NewGenerator("aidx")
+	resetID := idGen.Generate(time.Now())
+	resetRepo.requests[resetID] = &model.PasswordResetRequest{ID: resetID, Token: "valid-token", UserID: "u1"}
+
+	rec := post(h.Reset, `{"token":"valid-token","password":"newpassword"}`)
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+
+	newPw := *userRepo.profiles["u1"].Password
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(newPw), []byte("newpassword")))
+	cost, err := bcrypt.Cost([]byte(newPw))
+	require.NoError(t, err)
+	assert.Equal(t, configured, cost)
+}
+
 func TestReset_Success(t *testing.T) {
 	h, userRepo, resetRepo := newTestHandler()
 
@@ -361,7 +386,7 @@ func TestReset_Success(t *testing.T) {
 	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(newPw), []byte("newpassword")))
 	cost, err := bcrypt.Cost([]byte(newPw))
 	require.NoError(t, err)
-	assert.Equal(t, password.Cost(), cost)
+	assert.Equal(t, password.DefaultCost, cost)
 
 	// トークンが削除されている
 	assert.Len(t, resetRepo.requests, 0)
@@ -447,7 +472,7 @@ func TestReset_DBFailureIsNot4xx(t *testing.T) {
 	h := NewHandler(newMockUserRepo(), &failingResetRepo{
 		mockResetRepo: newMockResetRepo(),
 		err:           errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"),
-	}, idGen)
+	}, idGen, nil, nil)
 
 	rec := post(h.Reset, `{"token":"t","password":"newpassword"}`)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)

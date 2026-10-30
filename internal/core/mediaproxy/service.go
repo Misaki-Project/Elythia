@@ -325,6 +325,16 @@ func NewService(instanceURL, userAgent string, driveStorage coredrive.Storage, a
 	return s
 }
 
+// SetTransport replaces the transport used to fetch remote media, keeping
+// the client timeout. The transport must apply the same SSRF guard
+// (safehttp.NewSSRFSafeTransport).
+//
+// サーバーは外向き全体で 1 つの Transport を共有して、同じ相手 (リモートの
+// 添付は actor と同じホストにあることが多い) への接続を使い回す (#3591)。
+func (s *Service) SetTransport(rt http.RoundTripper) {
+	s.httpClient = &http.Client{Timeout: s.httpClient.Timeout, Transport: rt}
+}
+
 // SetDriveLookup attaches a DriveFileLookup so the proxy can substitute the
 // cached thumbnail / webpublic variant for `?preview` and `?static` requests
 // against local files (#637 M1)。
@@ -547,6 +557,14 @@ func (s *Service) resolveLocal(ctx context.Context, rawURL, filesPrefix string, 
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("mediaproxy: local file access: %w", err)
+	}
+
+	// 大きさが分かるなら、上限を超えるものは読む前に断る (リモートの
+	// Content-Length が上限を超えたときと同じ)。上限の手前まで読んでから
+	// 捨てる分のメモリと転送を省く。
+	if size, ok := coredrive.ObjectSize(body); ok && size > maxDownload {
+		body.Close()
+		return nil, ErrTooLarge
 	}
 
 	// ローカルファイルの場合はMIME判定して画像処理

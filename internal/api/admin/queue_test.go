@@ -1,8 +1,10 @@
 package admin_test
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -81,6 +83,13 @@ type stubQueueInspector struct {
 	queuesErr     error
 	runErr        error
 	deleteErr     error
+	// filteredCalls / delayedCalls count ListScheduled+RetryTasks and
+	// ListDelayedTasks calls.
+	filteredCalls int
+	delayedCalls  int
+	// deleteFailIDs makes DeleteTask fail for these ids only (cron repeat
+	// jobs that RemoveJob refuses).
+	deleteFailIDs map[string]bool
 }
 
 func (s *stubQueueInspector) PauseQueue(q string) error {
@@ -109,6 +118,9 @@ func (s *stubQueueInspector) GetQueueInfo(q string) (*apiadmin.QueueInfoResult, 
 func (s *stubQueueInspector) DeleteTask(q, id string) error {
 	if s.deleteErr != nil {
 		return s.deleteErr
+	}
+	if s.deleteFailIDs[id] {
+		return errors.New("cannot remove repeat job")
 	}
 	s.deleted = append(s.deleted, id)
 	// 実 inspector 同様、削除した task を各 state list から除く (clearQueueState
@@ -147,28 +159,50 @@ func (s *stubQueueInspector) RunTask(_, id string) error {
 	s.runCalls = append(s.runCalls, id)
 	return nil
 }
-func (s *stubQueueInspector) ListPendingTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	return s.pending[q], nil
+
+// stubPage slices rows like the real inspector does: 1-indexed page, newest
+// first as stored. 実 inspector と同じくページで切らないと、先頭ページより
+// 後ろを扱う経路 (#3169) を試せない。
+func stubPage(rows []*apiadmin.QueueTaskSummary, page, pageSize int) []*apiadmin.QueueTaskSummary {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 30
+	}
+	start := (page - 1) * pageSize
+	if start >= len(rows) {
+		return nil
+	}
+	return rows[start:min(start+pageSize, len(rows))]
 }
-func (s *stubQueueInspector) ListActiveTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	return s.active[q], nil
+
+func (s *stubQueueInspector) ListPendingTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	return stubPage(s.pending[q], page, pageSize), nil
 }
-func (s *stubQueueInspector) ListScheduledTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	return s.scheduled[q], nil
+func (s *stubQueueInspector) ListActiveTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	return stubPage(s.active[q], page, pageSize), nil
 }
-func (s *stubQueueInspector) ListRetryTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	return s.retry[q], nil
+func (s *stubQueueInspector) ListScheduledTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	s.filteredCalls++
+	return stubPage(s.scheduled[q], page, pageSize), nil
+}
+func (s *stubQueueInspector) ListRetryTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	s.filteredCalls++
+	return stubPage(s.retry[q], page, pageSize), nil
 }
 
 // ListDelayedTasks は delayed バケット全体 = scheduled + retry を返す。
-func (s *stubQueueInspector) ListDelayedTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	return append(append([]*apiadmin.QueueTaskSummary{}, s.scheduled[q]...), s.retry[q]...), nil
+func (s *stubQueueInspector) ListDelayedTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	s.delayedCalls++
+	all := append(append([]*apiadmin.QueueTaskSummary{}, s.scheduled[q]...), s.retry[q]...)
+	return stubPage(all, page, pageSize), nil
 }
-func (s *stubQueueInspector) ListCompletedTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	return s.completed[q], nil
+func (s *stubQueueInspector) ListCompletedTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	return stubPage(s.completed[q], page, pageSize), nil
 }
-func (s *stubQueueInspector) ListFailedTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	return s.failed[q], nil
+func (s *stubQueueInspector) ListFailedTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	return stubPage(s.failed[q], page, pageSize), nil
 }
 func (s *stubQueueInspector) GetTaskInfo(_, id string) (*apiadmin.QueueTaskSummary, error) {
 	if t, ok := s.task[id]; ok {
@@ -263,7 +297,7 @@ func TestQueueShowJob_Found(t *testing.T) {
 	}
 	h.SetQueueInspector(insp)
 
-	rec := doPost(h.QueueShowJob, `{"queue":"deliver","id":"tid1"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"deliver","jobId":"tid1"}`, adminUser)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -294,14 +328,14 @@ func TestQueueShowJob_ProcessedBy(t *testing.T) {
 		},
 	})
 
-	rec := doPost(h.QueueShowJob, `{"queue":"deliver","id":"withpb"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"deliver","jobId":"withpb"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	shapetest.AssertExcept(t, "QueueJob", got, "failedReason", "returnValue")
 	assert.Equal(t, "worker-host-1", got["processedBy"], "non-empty ProcessedBy must be output")
 
-	rec2 := doPost(h.QueueShowJob, `{"queue":"deliver","id":"nopb"}`, adminUser)
+	rec2 := doPost(h.QueueShowJob, `{"queue":"deliver","jobId":"nopb"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec2.Code)
 	var got2 map[string]any
 	require.NoError(t, json.Unmarshal(rec2.Body.Bytes(), &got2))
@@ -313,7 +347,7 @@ func TestQueueShowJob_NotFoundWithInspector(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	insp := &stubQueueInspector{}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueShowJob, `{"queue":"deliver","id":"ghost"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"deliver","jobId":"ghost"}`, adminUser)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
@@ -328,7 +362,7 @@ func TestQueueRemoveJob_Success(t *testing.T) {
 		},
 	}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","id":"tid1"}`, adminUser)
+	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","jobId":"tid1"}`, adminUser)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 	assert.Equal(t, []string{"tid1"}, insp.deleted)
 }
@@ -339,7 +373,7 @@ func TestQueueRemoveJob_NotFound(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	insp := &stubQueueInspector{}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","id":"x"}`, adminUser)
+	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","jobId":"x"}`, adminUser)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
@@ -354,7 +388,7 @@ func TestQueueRemoveJob_DeleteTaskError(t *testing.T) {
 		deleteErr: errors.New("not found"),
 	}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","id":"tid1"}`, adminUser)
+	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","jobId":"tid1"}`, adminUser)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
@@ -366,7 +400,7 @@ func TestQueueRetryJob_Success(t *testing.T) {
 		},
 	}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueRetryJob, `{"queue":"deliver","id":"tid1"}`, adminUser)
+	rec := doPost(h.QueueRetryJob, `{"queue":"deliver","jobId":"tid1"}`, adminUser)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 	assert.Equal(t, []string{"tid1"}, insp.runCalls)
 }
@@ -376,7 +410,7 @@ func TestQueueRetryJob_NotFound(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	insp := &stubQueueInspector{}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueRetryJob, `{"queue":"deliver","id":"x"}`, adminUser)
+	rec := doPost(h.QueueRetryJob, `{"queue":"deliver","jobId":"x"}`, adminUser)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
@@ -391,7 +425,7 @@ func TestQueueRetryJob_RunTaskError(t *testing.T) {
 		runErr: errors.New("not found"),
 	}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueRetryJob, `{"queue":"deliver","id":"tid1"}`, adminUser)
+	rec := doPost(h.QueueRetryJob, `{"queue":"deliver","jobId":"tid1"}`, adminUser)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
@@ -614,25 +648,21 @@ func TestQueueInboxDelayed_AggregatesByHostFromSignature(t *testing.T) {
 //
 // 他の QueueInspector method は embedded stubQueueInspector の zero-value に
 // fall through する (空 map / 空 slice 返却)。cap test では fetchAllDelayedTasks
-// 経由の Scheduled/Retry list call しか走らないので問題なし。
+// 経由の delayed list call しか走らないので問題なし。
 type pagedInspector struct {
 	stubQueueInspector
 	payload []byte
 	calls   int
 }
 
-func (p *pagedInspector) ListScheduledTasks(_ string, _, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+func (p *pagedInspector) ListDelayedTasks(_ string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
 	p.calls++
 	rows := make([]*apiadmin.QueueTaskSummary, 0, pageSize)
 	for i := 0; i < pageSize; i++ {
-		rows = append(rows, &apiadmin.QueueTaskSummary{Payload: p.payload})
+		// ID は重複除去に掛からないよう、ページごとに変える。
+		rows = append(rows, &apiadmin.QueueTaskSummary{ID: fmt.Sprintf("%d-%d", page, i), Payload: p.payload})
 	}
 	return rows, nil
-}
-
-func (p *pagedInspector) ListRetryTasks(_ string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
-	// retry list は常に空 = scheduled の cap だけを test 対象にする。
-	return nil, nil
 }
 
 // TestQueueDeliverDelayed_PageCapBoundsRunaway: inspector が常に full page を
@@ -660,7 +690,7 @@ func TestQueueDeliverDelayed_PageCapBoundsRunaway(t *testing.T) {
 	// 打ち切られる。
 	require.Len(t, got, 1)
 	assertHostCount(t, got, 0, "always.example", pageCap*apiadmin.DelayedTasksFetchPageSize)
-	// inspector への ListScheduledTasks 呼び出しは cap 回数で打ち切られる。
+	// inspector への ListDelayedTasks 呼び出しは cap 回数で打ち切られる。
 	assert.Equal(t, pageCap, insp.calls,
 		"page iteration must stop at delayedTasksMaxPages")
 }
@@ -843,20 +873,20 @@ func TestQueueRemoveJob(t *testing.T) {
 	// queue/id 欠落は 400
 	assert.Equal(t, http.StatusBadRequest, doPost(h.QueueRemoveJob, `{}`, adminUser).Code)
 	// inspector 未注入は 204
-	assert.Equal(t, http.StatusNoContent, doPost(h.QueueRemoveJob, `{"queue":"deliver","id":"x"}`, adminUser).Code)
+	assert.Equal(t, http.StatusNoContent, doPost(h.QueueRemoveJob, `{"queue":"deliver","jobId":"x"}`, adminUser).Code)
 }
 
 func TestQueueRetryJob(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	assert.Equal(t, http.StatusBadRequest, doPost(h.QueueRetryJob, `{}`, adminUser).Code)
-	assert.Equal(t, http.StatusNoContent, doPost(h.QueueRetryJob, `{"queue":"deliver","id":"x"}`, adminUser).Code)
+	assert.Equal(t, http.StatusNoContent, doPost(h.QueueRetryJob, `{"queue":"deliver","jobId":"x"}`, adminUser).Code)
 }
 
 func TestQueueShowJob(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	// queue/id 欠落は 400、inspector 未注入 + 正規 bind は 404
 	assert.Equal(t, http.StatusBadRequest, doPost(h.QueueShowJob, `{}`, adminUser).Code)
-	assert.Equal(t, http.StatusNotFound, doPost(h.QueueShowJob, `{"queue":"deliver","id":"x"}`, adminUser).Code)
+	assert.Equal(t, http.StatusNotFound, doPost(h.QueueShowJob, `{"queue":"deliver","jobId":"x"}`, adminUser).Code)
 }
 
 func TestQueueShowJobLogs(t *testing.T) {
@@ -1131,17 +1161,36 @@ func TestQueueJobs_SearchFilter(t *testing.T) {
 	assert.Equal(t, "p1", rows[0]["id"])
 }
 
-// jobId と id を両方送ると jobId が優先される (後方互換の優先順位)。
-func TestQueueRemoveJob_JobIdWinsOverId(t *testing.T) {
+// jobId の代わりの id は読まない (#3865)。本家の paramDef と同じく jobId が要る。
+func TestQueueJobOps_IDIsNotRead(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	insp := &stubQueueInspector{task: map[string]*apiadmin.QueueTaskSummary{
 		"j1": {ID: "j1", Queue: "deliver"},
 	}}
 	h.SetQueueInspector(insp)
-	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","jobId":"j1","id":"OTHER"}`, adminUser)
-	require.Equal(t, http.StatusNoContent, rec.Code)
-	assert.Contains(t, insp.deleted, "j1")
-	assert.NotContains(t, insp.deleted, "OTHER")
+	rec := doPost(h.QueueRemoveJob, `{"queue":"deliver","id":"j1"}`, adminUser)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.NotContains(t, insp.deleted, "j1")
+}
+
+// 空の jobId は、本家と同じく INVALID_PARAM にせず、見つからない job として扱う
+// (#3865。本家は getJob("") で見つからない)。見つからない job への応答 (404) は
+// 本家 (remove-job・retry-job は 204、show-job は 500) と違う
+// (docs/divergence/approximations.md)。
+func TestQueueJobOps_EmptyJobIDIsNotFound(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	insp := &stubQueueInspector{task: map[string]*apiadmin.QueueTaskSummary{
+		"": {ID: "", Queue: "deliver"},
+	}}
+	h.SetQueueInspector(insp)
+	body := `{"queue":"deliver","jobId":""}`
+	assert.Equal(t, http.StatusNotFound, doPost(h.QueueRemoveJob, body, adminUser).Code)
+	assert.Equal(t, http.StatusNotFound, doPost(h.QueueRetryJob, body, adminUser).Code)
+	assert.Equal(t, http.StatusNotFound, doPost(h.QueueShowJob, body, adminUser).Code)
+	rec := doPost(h.QueueShowJobLogs, body, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.JSONEq(t, `[]`, rec.Body.String())
+	assert.Empty(t, insp.deleted)
 }
 
 // clear state=delayed は scheduled + retry の両方を消す。
@@ -1416,7 +1465,7 @@ func TestQueueShowJob_PassesThroughBullFields(t *testing.T) {
 		},
 	})
 
-	rec := doPost(h.QueueShowJob, `{"queue":"inbox","id":"failed"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"failed"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -1449,7 +1498,7 @@ func TestQueueShowJob_IsFailedFromStacktraceAlone(t *testing.T) {
 			"st": {ID: "st", Queue: "inbox", Type: "ap:inbox", State: "failed", Stacktrace: []string{"boom"}},
 		},
 	})
-	rec := doPost(h.QueueShowJob, `{"queue":"inbox","id":"st"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"st"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -1467,7 +1516,7 @@ func TestQueueShowJob_DataKeepsTaskType(t *testing.T) {
 			"d": {ID: "d", Queue: "inbox", Type: "ap:inbox", State: "wait", Payload: []byte(`{"path":"/inbox"}`)},
 		},
 	})
-	rec := doPost(h.QueueShowJob, `{"queue":"inbox","id":"d"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"d"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -1512,7 +1561,7 @@ func TestQueueShowJob_ReturnValueNullIsOmitted(t *testing.T) {
 		},
 	})
 
-	rec := doPost(h.QueueShowJob, `{"queue":"inbox","id":"done"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"done"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -1522,7 +1571,7 @@ func TestQueueShowJob_ReturnValueNullIsOmitted(t *testing.T) {
 
 	rec2 := doPost(h.QueueShowJobLogs, `{"queue":"inbox","jobId":"broken"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec2.Code)
-	rec3 := doPost(h.QueueShowJob, `{"queue":"inbox","id":"broken"}`, adminUser)
+	rec3 := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"broken"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec3.Code)
 	var got3 map[string]any
 	require.NoError(t, json.Unmarshal(rec3.Body.Bytes(), &got3))
@@ -1545,7 +1594,7 @@ func TestQueueShowJob_MaxRetryFromOpts(t *testing.T) {
 		},
 	})
 	for id, want := range map[string]int{"a": 8, "b": 3} {
-		rec := doPost(h.QueueShowJob, `{"queue":"inbox","id":"`+id+`"}`, adminUser)
+		rec := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"`+id+`"}`, adminUser)
 		require.Equal(t, http.StatusOK, rec.Code)
 		var got map[string]any
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -1642,7 +1691,7 @@ func TestQueueShowJob_AttemptsAt(t *testing.T) {
 		},
 	})
 
-	rec := doPost(h.QueueShowJob, `{"queue":"inbox","id":"retried"}`, adminUser)
+	rec := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"retried"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -1650,7 +1699,7 @@ func TestQueueShowJob_AttemptsAt(t *testing.T) {
 
 	// **記録が無くても null にしない。** 配列を期待する frontend が
 	// `job.attemptsAt.length` で落ちる。
-	rec2 := doPost(h.QueueShowJob, `{"queue":"inbox","id":"legacy"}`, adminUser)
+	rec2 := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"legacy"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec2.Code)
 	var got2 map[string]any
 	require.NoError(t, json.Unmarshal(rec2.Body.Bytes(), &got2))
@@ -1769,4 +1818,412 @@ func TestQueueClear_ProtectionOnlyAppliesToPendingBuckets(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stubTasks returns n tasks of typ with ids prefix-0 .. prefix-(n-1).
+func stubTasks(prefix, typ string, n int) []*apiadmin.QueueTaskSummary {
+	out := make([]*apiadmin.QueueTaskSummary, n)
+	for i := range out {
+		out[i] = &apiadmin.QueueTaskSummary{ID: fmt.Sprintf("%s-%d", prefix, i), Type: typ}
+	}
+	return out
+}
+
+func idsOf(tasks []*apiadmin.QueueTaskSummary) []string {
+	out := make([]string, len(tasks))
+	for i, t := range tasks {
+		out[i] = t.ID
+	}
+	return out
+}
+
+// **先頭ページが保護対象で埋まっていても、その後ろを消すこと (#3169)。**
+//
+// 以前は先頭ページ (100 件) を引いては消し、全部が保護対象なら打ち切ったので、
+// 予約投稿が 100 件を超えて先頭にあると、後ろの配送を 1 件も消さなかった。
+func TestQueueClear_ReachesPastProtectedFirstPage(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		fill  func(*stubQueueInspector, []*apiadmin.QueueTaskSummary)
+	}{
+		{"delayed", func(s *stubQueueInspector, rows []*apiadmin.QueueTaskSummary) {
+			s.scheduled = map[string][]*apiadmin.QueueTaskSummary{"deliver": rows}
+		}},
+		{"wait", func(s *stubQueueInspector, rows []*apiadmin.QueueTaskSummary) {
+			s.pending = map[string][]*apiadmin.QueueTaskSummary{"deliver": rows}
+		}},
+		{"*", func(s *stubQueueInspector, rows []*apiadmin.QueueTaskSummary) {
+			s.retry = map[string][]*apiadmin.QueueTaskSummary{"deliver": rows}
+		}},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			h, _, _, _ := newTestHandler(t)
+			protected := stubTasks("note", queue.TaskTypePostScheduledNote, 150)
+			deliver := stubTasks("deliver", queue.TaskTypeDeliver, 30)
+			insp := &stubQueueInspector{}
+			tc.fill(insp, append(append([]*apiadmin.QueueTaskSummary{}, protected...), deliver...))
+			h.SetQueueInspector(insp)
+
+			rec := doPost(h.QueueClear, `{"queue":"deliver","state":"`+tc.state+`"}`, adminUser)
+			require.Equal(t, http.StatusNoContent, rec.Code)
+			assert.ElementsMatch(t, idsOf(deliver), insp.deleted,
+				"保護対象の後ろにある配送を消し、保護対象は消さないこと")
+		})
+	}
+}
+
+// **消せない task があっても、その後ろを消し続けること (#3169)。** cron 由来の
+// repeat job は RemoveJob が拒否する。先頭がそれで埋まっていても止めない。
+func TestQueueClear_ContinuesPastUndeletableTasks(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	stuck := stubTasks("repeat", queue.TaskTypeDeliver, 150)
+	deliver := stubTasks("deliver", queue.TaskTypeDeliver, 30)
+	insp := &stubQueueInspector{
+		scheduled:     map[string][]*apiadmin.QueueTaskSummary{"deliver": append(append([]*apiadmin.QueueTaskSummary{}, stuck...), deliver...)},
+		deleteFailIDs: map[string]bool{},
+	}
+	for _, t := range stuck {
+		insp.deleteFailIDs[t.ID] = true
+	}
+	h.SetQueueInspector(insp)
+
+	rec := doPost(h.QueueClear, `{"queue":"deliver","state":"delayed"}`, adminUser)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	assert.ElementsMatch(t, idsOf(deliver), insp.deleted)
+}
+
+// **promote は先頭の 100 件だけでなく全件を対象にすること (#3169)。** upstream の
+// `queue.promoteJobs()` は全件が対象。
+func TestQueuePromoteJobs_PromotesBeyondFirstPage(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	protected := stubTasks("note", queue.TaskTypePostScheduledNote, 150)
+	retry := stubTasks("retry", queue.TaskTypeDeliver, 120)
+	insp := &stubQueueInspector{
+		scheduled: map[string][]*apiadmin.QueueTaskSummary{"deliver": protected},
+		retry:     map[string][]*apiadmin.QueueTaskSummary{"deliver": retry},
+	}
+	h.SetQueueInspector(insp)
+
+	rec := doPost(h.QueuePromoteJobs, `{"queue":"deliver"}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.EqualValues(t, 120, got["promoted"])
+	assert.ElementsMatch(t, idsOf(retry), insp.runCalls)
+}
+
+// **delayed は振り分けた一覧ではなく、delayed 全体の一覧でたどること (#3169)。**
+//
+// mkq の scheduled / retry の一覧は、atm で振り分けてからページを切るので、
+// 1 ページ読むたびに delayed の全件を Redis から読み直す。それでページを
+// 進めると、retry が 5 万件あるときに約 2,500 万回の読み出しになる。delayed
+// 全体の一覧は添字の範囲だけを読むので、たどり切っても N 回で済む
+// (mkqdriver の TestInspector_ListDelayedTasks_WalkReadsEachJobOnce)。
+func TestQueueBulkOps_WalkDelayedOnce(t *testing.T) {
+	const n = 5000
+	for _, tc := range []struct {
+		name string
+		call func(h *apiadmin.Handler) int
+	}{
+		{"clear delayed", func(h *apiadmin.Handler) int {
+			return doPost(h.QueueClear, `{"queue":"deliver","state":"delayed"}`, adminUser).Code
+		}},
+		{"clear all", func(h *apiadmin.Handler) int {
+			return doPost(h.QueueClear, `{"queue":"deliver","state":"*"}`, adminUser).Code
+		}},
+		{"promote", func(h *apiadmin.Handler) int {
+			return doPost(h.QueuePromoteJobs, `{"queue":"deliver"}`, adminUser).Code
+		}},
+		{"deliver-delayed", func(h *apiadmin.Handler) int {
+			return doPost(h.QueueDeliverDelayed, `{}`, adminUser).Code
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, _, _ := newTestHandler(t)
+			insp := &stubQueueInspector{
+				retry: map[string][]*apiadmin.QueueTaskSummary{"deliver": stubTasks("retry", queue.TaskTypeDeliver, n)},
+			}
+			h.SetQueueInspector(insp)
+
+			code := tc.call(h)
+			require.Less(t, code, 300)
+			assert.Zero(t, insp.filteredCalls, "振り分けた一覧を使わないこと")
+			// 5000 件 = 満杯の 50 ページ + 空の 1 ページ。
+			assert.Equal(t, n/apiadmin.DelayedTasksFetchPageSize+1, insp.delayedCalls)
+		})
+	}
+}
+
+// churnInspector wraps stubQueueInspector and simulates a delayed bucket that
+// changes while it is walked: each ListDelayedTasks call first pushes a new
+// job to the head (newest first), and the first page loses one entry whose
+// HASH vanished (mkq skips it).
+type churnInspector struct {
+	stubQueueInspector
+	pushed int
+}
+
+func (c *churnInspector) ListDelayedTasks(q string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	c.pushed++
+	head := &apiadmin.QueueTaskSummary{ID: fmt.Sprintf("new-%d", c.pushed), Type: queue.TaskTypeDeliver}
+	c.retry[q] = append([]*apiadmin.QueueTaskSummary{head}, c.retry[q]...)
+	rows, err := c.stubQueueInspector.ListDelayedTasks(q, page, pageSize)
+	if page == 1 && len(rows) > 0 {
+		rows = rows[1:]
+	}
+	return rows, err
+}
+
+// **走査中に一覧が動いても、読み飛ばさず、同じ job を二度扱わないこと (#3169)。**
+//
+// 新しい job が先頭に入ると、既に読んだ job が後ろへずれて次のページにもう一度
+// 出る。重複を除かないと promote が同じ job を二度促進し、件数も水増しされる。
+// また mkq は HASH が既に無い job を飛ばすので、途中のページが 100 件に満たない
+// ことがある。そこで止まると後ろを取りこぼす。
+func TestQueuePromoteJobs_WalkSurvivesChurn(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	insp := &churnInspector{}
+	insp.retry = map[string][]*apiadmin.QueueTaskSummary{"deliver": stubTasks("retry", queue.TaskTypeDeliver, 250)}
+	h.SetQueueInspector(insp)
+
+	rec := doPost(h.QueuePromoteJobs, `{"queue":"deliver"}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	counts := map[string]int{}
+	for _, id := range insp.runCalls {
+		counts[id]++
+	}
+	for id, n := range counts {
+		assert.Equal(t, 1, n, "%s を二度促進しないこと", id)
+	}
+	// 1 ページ目で欠けた 1 件 (走査の最初に先頭へ入った new-1) 以外は、
+	// 元からある 250 件すべてに届くこと。
+	for i := 0; i < 250; i++ {
+		assert.Contains(t, counts, fmt.Sprintf("retry-%d", i))
+	}
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.EqualValues(t, len(insp.runCalls), got["promoted"])
+}
+
+// legacyActivityPayload marshals a deliver / inbox payload the way it was
+// stored before #3614: the activity as a base64 string under "body".
+func legacyActivityPayload(t *testing.T, fields map[string]any, body []byte) []byte {
+	t.Helper()
+	m := map[string]any{"body": body}
+	for k, v := range fields {
+		m[k] = v
+	}
+	out, err := json.Marshal(m)
+	require.NoError(t, err)
+	return out
+}
+
+// activityPayloadEncodings returns the two stored shapes of an inbox payload
+// carrying body: the pre-#3614 base64 one ("legacy", also what 2.1.0
+// writes) and the #3614 one written while driver.CompactJobPayloads is
+// enabled ("compact").
+func activityPayloadEncodings(t *testing.T, body []byte) map[string][]byte {
+	t.Helper()
+	compact, err := queue.InboxPayload{Body: body, Path: "/inbox"}.MarshalCompactJSON()
+	require.NoError(t, err)
+	return map[string][]byte{
+		"legacy":  legacyActivityPayload(t, map[string]any{"path": "/inbox"}, body),
+		"compact": compact,
+	}
+}
+
+// **配送と受信の本文を、base64 の 1 行ではなくオブジェクトで返すこと (#3550)。**
+//
+// payload は本文を []byte で持つので、#3614 より前の job では Data タブに base64 の
+// 長い 1 行が出て、ハイライトで画面が数秒固まる。#3614 以降の job は本文を
+// オブジェクトか文字列で持つ。どちらの形の job も同じ見え方にすること。
+func TestQueueShowJob_DataExpandsActivityBody(t *testing.T) {
+	activity := map[string]any{"type": "Create", "id": "https://local.example/notes/1/activity"}
+	rawActivity, err := json.Marshal(activity)
+	require.NoError(t, err)
+	// Misskey の JSON.stringify は < をエスケープしないので、受信の本文には生の <
+	// が入る。#3614 の形では、< などをエスケープしたオブジェクト (bodyEscaped)
+	// で載る。
+	htmlContent := "<p>" + strings.Repeat("今日はいい天気でした。", 10) + "</p>"
+	rawHTML := []byte(`{"type":"Create","object":{"content":"` + htmlContent + `"}}`)
+	deliverCompact, err := queue.DeliverPayload{Inbox: "https://remote.example/inbox", Body: rawActivity, KeyPEM: "secret"}.MarshalCompactJSON()
+	require.NoError(t, err)
+	deliverLegacy := legacyActivityPayload(t, map[string]any{"inbox": "https://remote.example/inbox", "keyPem": "secret"}, rawActivity)
+
+	type tcase struct {
+		name    string
+		task    *apiadmin.QueueTaskSummary
+		want    any
+		checkFn func(t *testing.T, body map[string]any)
+	}
+	noSecret := func(t *testing.T, body map[string]any) {
+		assert.NotEqual(t, "secret", body["keyPem"], "鍵は伏せたままにすること")
+		assert.NotContains(t, body, "bodyText")
+	}
+	cases := []tcase{
+		{name: "deliver/legacy", task: &apiadmin.QueueTaskSummary{ID: "d", Type: queue.TaskTypeDeliver, Payload: deliverLegacy}, want: activity, checkFn: noSecret},
+		{name: "deliver/compact", task: &apiadmin.QueueTaskSummary{ID: "d", Type: queue.TaskTypeDeliver, Payload: deliverCompact}, want: activity, checkFn: noSecret},
+		// 配送と受信以外の job は触らない。
+		{name: "other type", task: &apiadmin.QueueTaskSummary{ID: "d", Type: "ap:other", Payload: legacyActivityPayload(t, nil, rawActivity)},
+			want: base64.StdEncoding.EncodeToString(rawActivity)},
+	}
+	for enc, payload := range activityPayloadEncodings(t, rawActivity) {
+		cases = append(cases, tcase{name: "inbox/" + enc, task: &apiadmin.QueueTaskSummary{ID: "d", Type: queue.TaskTypeInbox, Payload: payload}, want: activity})
+	}
+	htmlEncodings := activityPayloadEncodings(t, rawHTML)
+	require.Contains(t, string(htmlEncodings["compact"]), `"bodyEscaped":{`)
+	for enc, payload := range htmlEncodings {
+		cases = append(cases, tcase{name: "inbox html/" + enc, task: &apiadmin.QueueTaskSummary{ID: "d", Type: queue.TaskTypeInbox, Payload: payload},
+			want:    map[string]any{"type": "Create", "object": map[string]any{"content": htmlContent}},
+			checkFn: func(t *testing.T, body map[string]any) { assert.NotContains(t, body, "bodyEscaped") }})
+	}
+	// JSON として読めない本文と、JSON の文字列 (オブジェクトでも配列でもない) は
+	// 埋め込まない。以前の形は base64 のまま、#3614 の形は文字列のまま返す。
+	for _, raw := range []string{"not json", `"abc"`} {
+		encs := activityPayloadEncodings(t, []byte(raw))
+		cases = append(cases,
+			tcase{name: raw + "/legacy", task: &apiadmin.QueueTaskSummary{ID: "d", Type: queue.TaskTypeInbox, Payload: encs["legacy"]},
+				want: base64.StdEncoding.EncodeToString([]byte(raw))},
+			tcase{name: raw + "/compact", task: &apiadmin.QueueTaskSummary{ID: "d", Type: queue.TaskTypeInbox, Payload: encs["compact"]},
+				want: raw})
+	}
+	// bodyEscaped と bodyText が両方あるときは、worker と同じく bodyEscaped を
+	// 見る (書く側は 1 つしか出さないが、優先の順を揃えておく)。
+	cases = append(cases, tcase{name: "bodyEscaped wins over bodyText",
+		task: &apiadmin.QueueTaskSummary{ID: "d", Type: queue.TaskTypeInbox, Payload: []byte(`{"path":"/inbox","bodyText":"not json","bodyEscaped":{"type":"Create"}}`)},
+		want: map[string]any{"type": "Create"},
+		checkFn: func(t *testing.T, body map[string]any) {
+			assert.NotContains(t, body, "bodyText")
+			assert.NotContains(t, body, "bodyEscaped")
+		}})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, _, _ := newTestHandler(t)
+			h.SetQueueInspector(&stubQueueInspector{task: map[string]*apiadmin.QueueTaskSummary{"d": tc.task}})
+			rec := doPost(h.QueueShowJob, `{"queue":"deliver","jobId":"d"}`, adminUser)
+			require.Equal(t, http.StatusOK, rec.Code)
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+			data, ok := got["data"].(map[string]any)
+			require.True(t, ok)
+			body, ok := data["body"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, tc.want, body["body"])
+			if tc.checkFn != nil {
+				tc.checkFn(t, body)
+			}
+		})
+	}
+}
+
+// **入れ子の深い本文を埋め込まないこと (#3550)。** encoding/json は埋め込んだ
+// 本文を書き出すときに、外側の入れ子と合わせて深さを数える。深い受信の本文が
+// 1 件あるだけで、一覧の書き出しが失敗し、ほかの job も含めて空のレスポンスに
+// なった。受信の本文は署名を検証する前に積まれるので、外から送り込める。
+func TestQueueJobs_DeepActivityBodyDoesNotBreakList(t *testing.T) {
+	deep := `{"actor":"https://remote.example/u","a":` + strings.Repeat("[", 9997) + strings.Repeat("]", 9997) + `}`
+	// 文字列の中の括弧 (エスケープした引用符の後ろ) は深さに数えない。
+	inString := `\"` + strings.Repeat("[", 100)
+	shallowBody := []byte(`{"a":[[{"b":"` + inString + `"}]]}`)
+	for enc, want := range map[string]string{
+		"legacy":  base64.StdEncoding.EncodeToString([]byte(deep)),
+		"compact": deep,
+	} {
+		t.Run(enc, func(t *testing.T) {
+			h, _, _, _ := newTestHandler(t)
+			h.SetQueueInspector(&stubQueueInspector{
+				failed: map[string][]*apiadmin.QueueTaskSummary{"inbox": {
+					{ID: "deep", Type: queue.TaskTypeInbox, Payload: activityPayloadEncodings(t, []byte(deep))[enc]},
+					{ID: "shallow", Type: queue.TaskTypeInbox, Payload: activityPayloadEncodings(t, shallowBody)[enc]},
+				}},
+			})
+			rec := doPost(h.QueueJobs, `{"queue":"inbox","state":["failed"]}`, adminUser)
+			require.Equal(t, http.StatusOK, rec.Code)
+			var got []map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got), "一覧が壊れないこと")
+			require.Len(t, got, 2)
+			bodies := map[string]any{}
+			for _, job := range got {
+				bodies[job["id"].(string)] = job["data"].(map[string]any)["body"].(map[string]any)["body"]
+			}
+			assert.Equal(t, want, bodies["deep"], "深い本文は埋め込まずに文字列で返す")
+			assert.Equal(t, map[string]any{"a": []any{[]any{map[string]any{"b": `"` + strings.Repeat("[", 100)}}}}, bodies["shallow"])
+		})
+	}
+}
+
+// 深さの上限は 64 段で、数えるのは入れ子の深さであって括弧の総数ではない。
+// JSON として読めない本文と不正な UTF-8 の本文は、埋め込むと一覧の書き出しを
+// 壊すので埋め込まない (#3550)。以前の形の job は base64 のまま、#3614 の形の
+// job は文字列のまま返す (不正な UTF-8 は #3614 の形でも base64 で載る)。
+func TestQueueShowJob_ActivityBodyEmbeddingLimits(t *testing.T) {
+	nested := func(n int) string { return strings.Repeat("[", n) + strings.Repeat("]", n) }
+	manyTags := `{"tag":[` + strings.TrimSuffix(strings.Repeat(`{"type":"Emoji"},`, 70), ",") + `]}`
+	for _, tc := range []struct {
+		name        string
+		body        string
+		embedded    bool
+		compactText bool
+	}{
+		{"depth 64", nested(64), true, false},
+		{"depth 65", nested(65), false, true},
+		// 浅いが括弧が多い (絵文字の多いノート)。
+		{"many brackets", manyTags, true, false},
+		{"truncated object", `{"a":`, false, true},
+		{"invalid utf-8", "{\"a\":\"\xff\"}", false, false},
+	} {
+		for enc, payload := range activityPayloadEncodings(t, []byte(tc.body)) {
+			t.Run(tc.name+"/"+enc, func(t *testing.T) {
+				h, _, _, _ := newTestHandler(t)
+				h.SetQueueInspector(&stubQueueInspector{task: map[string]*apiadmin.QueueTaskSummary{
+					"d": {ID: "d", Type: queue.TaskTypeInbox, Payload: payload},
+				}})
+				rec := doPost(h.QueueShowJob, `{"queue":"inbox","jobId":"d"}`, adminUser)
+				require.Equal(t, http.StatusOK, rec.Code)
+				var got map[string]any
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+				body := got["data"].(map[string]any)["body"].(map[string]any)["body"]
+				switch {
+				case tc.embedded:
+					_, isString := body.(string)
+					assert.False(t, isString, "文字列ではなく JSON として埋め込むこと")
+				case enc == "compact" && tc.compactText:
+					assert.Equal(t, tc.body, body, "読める文字列のまま返すこと")
+				default:
+					assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(tc.body)), body, "base64 のまま返すこと")
+				}
+			})
+		}
+	}
+}
+
+// admin/queue/jobs の独自の limit・page は integer として宣言した (#3867)。
+// 本家の ajv と同じく、整数を小数の形で書いた値も受け、その整数として読む。
+func TestQueueJobs_LimitAndPageAcceptFractionForms(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	insp := &stubQueueInspector{
+		pending: map[string][]*apiadmin.QueueTaskSummary{
+			"deliver": {{ID: "d1"}, {ID: "d2"}, {ID: "d3"}},
+		},
+	}
+	h.SetQueueInspector(insp)
+
+	rec := doPost(h.QueueJobs, `{"queue":"deliver","state":"wait","limit":2.0,"page":1e0}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var rows []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &rows))
+	assert.Len(t, rows, 2)
+}
+
+// limit・page を指定してjobが1件も無いときも、null ではなく [] を返す。同梱の
+// frontend は配列として読む (CodeQL のために容量の指定をやめたので、nil の
+// slice に戻さないことをここで守る)。
+func TestQueueJobs_PagedEmptyIsArray(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	h.SetQueueInspector(&stubQueueInspector{})
+
+	rec := doPost(h.QueueJobs, `{"queue":"deliver","state":"wait","limit":5}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.JSONEq(t, `[]`, rec.Body.String())
 }

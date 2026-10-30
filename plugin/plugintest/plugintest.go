@@ -1,6 +1,7 @@
 // Package plugintest provides fakes for testing mk-go plugins.
 //
-// プラグインのルートやジョブを、mk-go を起動せずに直接呼べるようにする。
+// プラグインのルートやジョブ、通知の handler を、mk-go を起動せずに直接
+// 呼べるようにする。
 //
 //	func TestMyRoute(t *testing.T) {
 //	    h := plugintest.New(t).
@@ -39,6 +40,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/elythia-network/elythia/internal/core/pluginsecret"
 	"github.com/elythia-network/elythia/internal/effectivepolicy"
 	"github.com/elythia-network/elythia/internal/pluginstore"
 	"github.com/elythia-network/elythia/plugin"
@@ -69,12 +71,25 @@ type Harness struct {
 	// hasJobs は Definition.Jobs を宣言しているか。**本番と同じ理由で
 	// Enqueue を拒否する**ため、Routes / Jobs を呼んだ時点で記録する。
 	hasJobs bool
+
+	// 管理するアカウント (#3468)。accounts が nil ならメモリ上のフェイク
+	// (accountStore) を使う。
+	accounts     plugin.Accounts
+	accountStore *fakeAccountStore
+	// 秘密の値 (#3470)。本番と同じ service をメモリ上の置き場所で動かす。
+	secrets            *pluginsecret.Service
+	secretRepo         *memSecretRepo
+	secretsUnavailable bool
+
+	// 通知の handler (#3469)。Notifications が記録し、Notify から叩く。
+	notificationHandler plugin.NotificationHandler
+	notifySeq           int
 }
 
 // New starts a harness. The plugin name defaults to "test".
 func New(t *testing.T) *Harness {
 	t.Helper()
-	return &Harness{t: t, name: "test", config: map[string]any{}}
+	return &Harness{t: t, name: "test", config: map[string]any{}, accountStore: &fakeAccountStore{}}
 }
 
 // WithName sets the plugin name reported by Context.Name.
@@ -548,6 +563,10 @@ func (q *fakeQueue) Enqueue(_ context.Context, name string, payload any, opts ..
 // Go runs fn synchronously. テストで非同期にすると、検証の前に終わっていない
 // 競合が入る。
 func (c *fakeContext) Go(fn func()) { fn() }
+
+// GoContext runs fn synchronously with a context that is never canceled, for
+// the same reason as Go.
+func (c *fakeContext) GoContext(fn func(context.Context)) { fn(context.Background()) }
 
 type fakeStorage struct{ db *sql.DB }
 

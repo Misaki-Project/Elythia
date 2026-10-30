@@ -6,6 +6,21 @@ import (
 	"github.com/elythia-network/elythia/internal/api/apierr"
 )
 
+// PluginRouteDefaultLimit is applied, per route and per actor, to plugin
+// routes (`plugin/<name>/...`) that have no entry in DefaultEndpointLimits.
+//
+// 画面はプロフィールを開くたびに画像の口を何十回も叩きうるので、窓を長めに
+// して瞬間の多さは許し、叩き続けるものだけを止める。
+var PluginRouteDefaultLimit = EndpointLimit{Duration: 10 * time.Minute, Max: 600}
+
+// URLPreviewRateLimitKey is the DefaultEndpointLimits entry of `GET /url`.
+// `/api` の endpoint 名と衝突しない名前にする。
+const URLPreviewRateLimitKey = "@url-preview"
+
+// OAuthAuthorizeRateLimitKey is the DefaultEndpointLimits entry of
+// `GET /oauth/authorize`.
+const OAuthAuthorizeRateLimitKey = "@oauth-authorize"
+
 // DefaultEndpointLimits defines per-endpoint rate limits matching
 // Misskey TS upstream. Endpoints not listed here have no rate limit.
 //
@@ -21,6 +36,26 @@ var DefaultEndpointLimits = map[string]*EndpointLimit{
 	// ── Blocking ───────────────────────────────────────
 	"blocking/create": {Duration: time.Hour, Max: 20},
 	"blocking/delete": {Duration: time.Hour, Max: 100},
+
+	// ── Backup (Elythia 独自) ──────────────────────────
+	// 画面からのリストアの進み具合 (#3463 (6c))。本体では認証しない (戻した DB に
+	// セッションが無くても読めるように) ので、誰でもバックアップ用のサービスまで
+	// 届く。画面は 2 秒に 1 回読むので、タブ 2 つぶんを上限にする。
+	"admin/backup/restore/status": {Duration: time.Minute, Max: 60},
+
+	// ── URL preview (Elythia 独自) ─────────────────────
+	// `GET /url` (summaly 互換)。`/api` の外なので RequireIPRateLimit で掛ける。
+	// 認証不要で、1 回ごとにサーバーから外向きの取得を 1 本起こすので、接続元
+	// ごとに絞る。画面はノートに出た URL ごとに 1 回読む (結果は 1 時間覚える)
+	// ので、タイムラインを流し読みしても届かない量にする。upstream に上限は無い。
+	URLPreviewRateLimitKey: {Duration: 10 * time.Minute, Max: 300},
+
+	// ── OAuth (Elythia 独自) ───────────────────────────
+	// `GET /oauth/authorize` (`/api` の外なので RequireIPRateLimit で掛ける)。
+	// 1 回ごとに client_id の文書をサーバーから取りに行き、承認の待ちを Redis に
+	// 置く。正規の利用は連携のたびに 1 回なので、同じ接続元から 10 分に 60 回は
+	// 普通は起きない。
+	OAuthAuthorizeRateLimitKey: {Duration: 10 * time.Minute, Max: 60},
 
 	// ── Bubble Game ────────────────────────────────────
 	"bubble-game/register": {Duration: time.Hour, Max: 120, MinInterval: 30 * time.Second},
@@ -185,6 +220,14 @@ var DefaultEndpointLimits = map[string]*EndpointLimit{
 	// 問題にならないが、参照そのものの上限として signup-pending と同格を置く。
 	"signup-application/status": {Duration: time.Hour, Max: 30},
 
+	// ── App / 旧来の認可 (Elythia 独自の上限) ──────────
+	// どちらも 1 回ごとに `app` / `auth_session` の行を 1 つ作るので、回数に上限を
+	// 置く (本家は上限なし。意図的な乖離)。正規のクライアントはログインのたびに
+	// app/create と session/generate を 1 回ずつ呼ぶだけなので、同じ接続元から
+	// 1 時間に数十回の登録は普通は起きない。
+	"app/create":            {Duration: time.Hour, Max: 30},
+	"auth/session/generate": {Duration: time.Hour, Max: 60},
+
 	// ── Admin ──────────────────────────────────────────
 	"admin/system-webhook/test":   {Duration: 15 * time.Minute, Max: 60},
 	"admin/roles/assignment-show": {Duration: time.Minute, Max: 120},
@@ -199,7 +242,7 @@ var DefaultEndpointLimits = map[string]*EndpointLimit{
 	"admin/ip/lookup-log":       {Duration: time.Hour, Max: 120, UserBucketOnly: true},
 	// **upstream の口も同じ扱いにする** (#3106)。返すのは同じ「利用者 ↔ IP の
 	// 対応」なので、ここだけ無制限だと mk-go 側に上限を置いた意味が無い。
-	// upstream にこの制限は無いので意図的な divergence (docs/divergence.md §7)。
+	// upstream にこの制限は無いので意図的な divergence (docs/divergence/security.md §7)。
 	"admin/get-user-ips": {Duration: time.Hour, Max: 120, UserBucketOnly: true},
 	// 連合先との疎通の診断 (#3055)。1 回で相手へ最大 8 本程度のリクエストを飛ばすので、
 	// mk-go を任意の外部ホストへの踏み台にさせない上限を置く。宛先は SSRF-safe

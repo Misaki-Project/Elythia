@@ -1,18 +1,19 @@
 module github.com/elythia-network/elythia-plugin-trustlevel
 
-go 1.27.1
+go 1.27.3
 
 require (
-	github.com/jackc/pgx/v5 v5.9.2
 	github.com/elythia-network/elythia v0.0.0
+	github.com/jackc/pgx/v5 v5.9.2
 )
 
 require (
+	github.com/elythia-network/mfm v0.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 )
 
 replace github.com/elythia-network/elythia => ../..

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/meself"
 	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/core/notesfilter"
@@ -25,14 +26,17 @@ type RoleNotesQuery interface {
 
 // Handler handles public role API endpoints.
 type Handler struct {
-	roleService  *role.Service
-	notesQuery   RoleNotesQuery
-	noteRepo     repository.NoteRepository
-	idGen        id.Generator
-	instanceRepo repository.InstanceRepository
-	emojiRepo    repository.EmojiRepository
-	bufReader    entity.BufferedReactionsReader
-	fieldRes     *entity.NoteFieldResolver
+	// relationCache は閲覧者のミュート・ブロックの一覧を要求をまたいで持つ
+	// (#3607)。nil なら repository から読む。
+	relationCache *repository.RelationCache
+	roleService   *role.Service
+	notesQuery    RoleNotesQuery
+	noteRepo      repository.NoteRepository
+	idGen         id.Generator
+	instanceRepo  repository.InstanceRepository
+	emojiRepo     repository.EmojiRepository
+	bufReader     entity.BufferedReactionsReader
+	fieldRes      *entity.NoteFieldResolver
 	// userRepo は roles/notes の hardMutedWords filter (#787)。
 	userRepo repository.UserRepository
 	// mutingRepo / blockingRepo / channelMutingRepo は roles/notes で viewer が
@@ -49,33 +53,21 @@ type Handler struct {
 	// metaRepo は roles/notes の blocked-host filter で meta.blockedHosts を
 	// 引く (upstream generateBlockedHostQueryForNote)。
 	metaRepo repository.MetaRepository
+	// selfPacker は閲覧者自身を MeDetailed へ昇格させ、/api/i の handler で未読・
+	// role・ピン留めを埋める (#3784)。未配線なら補完せずに昇格だけする。
+	selfPacker *meself.Packer
+	// noteHider は閲覧者が見てはいけない投稿の中身を隠す (#3786)。未配線だと
+	// 匿名の閲覧者への ugcVisibilityForVisitor が効かないので、NewHandler の
+	// 必須の引数で受ける (#3817)。
+	noteHider *notehide.Hider
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3790、#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// HasMetaRepo reports whether the blocked-host filter can read meta.
-//
-// 未配線だと `blockedHosts` の除外が黙って no-op になる (ブロックしたはずの
-// インスタンスのノートが一覧に出続ける)。起動時の critical wiring 検査で落とす。
-func (h *Handler) HasMetaRepo() bool {
-	return h != nil && h.metaRepo != nil
-}
-
-// SetMetaRepo wires a MetaRepository used for the blocked-host filter on
-// roles/notes (upstream generateBlockedHostQueryForNote)。
-func (h *Handler) SetMetaRepo(r repository.MetaRepository) {
-	h.metaRepo = r
-}
-
-// SetListPacker wires the packer of the users embedded in roles/users
-// (#1973, #3330).
-func (h *Handler) SetListPacker(p userpack.ListPacker) {
-	h.packer = p
-}
-
-// HasListPacker reports whether the list packer was wired.
-//
-// 未配線だと roles/users の利用者に関係・ピン留め・移行先・instance・絵文字が
-// 載らない。起動時検査に使う。
-func (h *Handler) HasListPacker() bool { return h.packer != nil }
+// SetSelfPacker wires the Packer that promotes the viewer's own entry into
+// MeDetailed. Unset promotes without the handler-only fields.
+func (h *Handler) SetSelfPacker(p *meself.Packer) { h.selfPacker = p }
 
 // SetUserRepo wires a UserRepository so roles/notes filters out notes that
 // match the viewer's hardMutedWords (#787).
@@ -105,8 +97,27 @@ func (h *Handler) SetNoteFieldResolver(r *entity.NoteFieldResolver) {
 
 // NewHandler creates a new roles Handler. idGen is required for note packing
 // under /api/roles/notes.
-func NewHandler(roleService *role.Service, idGen id.Generator) *Handler {
-	return &Handler{roleService: roleService, idGen: idGen}
+// noteHider applies the per-viewer hideNote gate to the notes this handler
+// packs (#3786) and entityPacker is the Packer it packs entities with (#3790).
+// metaRepo backs the blocked-host filter on roles/notes (upstream
+// generateBlockedHostQueryForNote). packer packs the users embedded in
+// roles/users (#1973, #3330).
+func NewHandler(
+	roleService *role.Service,
+	idGen id.Generator,
+	noteHider *notehide.Hider,
+	entityPacker *entity.Packer,
+	metaRepo repository.MetaRepository,
+	packer userpack.ListPacker,
+) *Handler {
+	return &Handler{
+		roleService:  roleService,
+		idGen:        idGen,
+		noteHider:    noteHider,
+		entityPacker: entityPacker,
+		metaRepo:     metaRepo,
+		packer:       packer,
+	}
 }
 
 // SetNotesQuery attaches a RoleNotesQuery for the roles/notes endpoint.
@@ -203,12 +214,14 @@ func (h *Handler) Show(c echo.Context) error {
 // 返す。!isPublic / !isExplorable は NO_SUCH_ROLE 扱い (#1544)。
 func (h *Handler) Users(c echo.Context) error {
 	var req struct {
-		RoleID    string `json:"roleId"`
-		Limit     int    `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		RoleID string `json:"roleId"`
+		// limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が
+		// 整数の小数(10.0)を受ける (#3762)。
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil || req.RoleID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "roleId is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
@@ -226,7 +239,10 @@ func (h *Handler) Users(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROLE", "No such role.", "30aaaee3-4792-48dc-ab0d-cf501a575ac5"))
 	}
 
-	limit := req.Limit
+	limit := 0
+	if l := req.Limit.IntPtr(); l != nil {
+		limit = *l
+	}
 	if limit <= 0 {
 		limit = 10
 	}
@@ -234,7 +250,7 @@ func (h *Handler) Users(c echo.Context) error {
 		limit = 100
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (Notes と同 pattern、#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -272,7 +288,7 @@ func (h *Handler) Users(c echo.Context) error {
 		// 配線が外れた構成では素の UserDetailed (packer の既定で非公開のカウントは伏せる)。
 		packed = make([]entity.UserDetailed, len(users))
 		for i, u := range users {
-			packed[i] = entity.PackUserDetailed(u, profByID[u.ID], h.idGen)
+			packed[i] = h.entityPacker.PackUserDetailed(u, profByID[u.ID], h.idGen)
 		}
 	}
 	out := make([]any, 0, len(kept))
@@ -280,7 +296,7 @@ func (h *Handler) Users(c echo.Context) error {
 		out = append(out, map[string]any{
 			"id": a.ID,
 			// 本家の pack は isMe なら MeDetailed を返す。
-			"user": meself.Pack(ctx, packed[i], a.User, profByID[a.UserID], viewer),
+			"user": h.selfPacker.Pack(ctx, packed[i], a.User, profByID[a.UserID], viewer),
 		})
 	}
 	return c.JSON(http.StatusOK, out)
@@ -321,12 +337,14 @@ func (h *Handler) assignmentProfiles(assigns []*model.RoleAssignment) map[string
 // Notes handles POST /api/roles/notes.
 func (h *Handler) Notes(c echo.Context) error {
 	var req struct {
-		RoleID    string `json:"roleId"`
-		Limit     int    `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		RoleID string `json:"roleId"`
+		// limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が
+		// 整数の小数(10.0)を受ける (#3762)。
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil || req.RoleID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "roleId is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
@@ -353,7 +371,10 @@ func (h *Handler) Notes(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 
-	limit := req.Limit
+	limit := 0
+	if l := req.Limit.IntPtr(); l != nil {
+		limit = *l
+	}
 	if limit <= 0 {
 		limit = 10
 	}
@@ -362,7 +383,7 @@ func (h *Handler) Notes(c echo.Context) error {
 	}
 
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -376,7 +397,7 @@ func (h *Handler) Notes(c echo.Context) error {
 	// notes.ts の generateBaseNoteFilteringQuery + channelMuting に相当。set の
 	// ロードに失敗したら fail-closed で 500 を返す (security 項目なので
 	// silently leak しない)。
-	mbSets, err := notesfilter.LoadMuteBlockSets(viewer, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
+	mbSets, err := notesfilter.LoadMuteBlockSetsCached(h.relationCache, viewer, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
@@ -384,7 +405,7 @@ func (h *Handler) Notes(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
-	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes)
+	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes, h.idGen)
 	// **ブロック済みインスタンスのノートを落とす** (upstream
 	// generateBlockedHostQueryForNote)。`ListByRole` には入っていないので
 	// post-fetch で落とす。
@@ -393,9 +414,9 @@ func (h *Handler) Notes(c echo.Context) error {
 		return apierr.JSONInternalError(c)
 	}
 	notes = notesfilter.ApplyBlockedHosts(notes, blockedHosts)
-	entities := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	entities := h.entityPacker.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(entities, viewer)
-	notehide.HideEmbeds(viewer, entities)
+	h.noteHider.HideEmbeds(viewer, entities)
 	out := make([]any, 0, len(entities))
 	for _, pn := range entities {
 		out = append(out, pn)
@@ -415,4 +436,10 @@ func (h *Handler) Notes(c echo.Context) error {
 // usersCount は active assignment 数 (role は少数なので per-role count)。
 func (h *Handler) packRole(r *model.Role) map[string]any {
 	return entity.PackRole(r, h.roleService.CountAssignedUsers(r.ID), h.idGen, role.DefaultPolicies())
+}
+
+// SetRelationCache wires the per-user relation cache used by the mute / block
+// filter (#3607). nil keeps reading the repositories.
+func (h *Handler) SetRelationCache(rc *repository.RelationCache) {
+	h.relationCache = rc
 }

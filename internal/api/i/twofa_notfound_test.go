@@ -68,7 +68,7 @@ func TestPasswordGate_DBFailureIsNot4xx(t *testing.T) {
 		noteRepo := testutil.NewMockNoteRepository()
 		piningRepo := testutil.NewMockUserNotePiningRepository()
 		idGen, _ := id.NewGenerator("aidx")
-		h := NewHandler(coreuser.NewService(userRepo, noteRepo, piningRepo, idGen), idGen)
+		h := NewHandler(coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil), idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 		u := &model.User{ID: "u1", Username: "u1", UsernameLower: "u1",
 			AvatarDecorations: datatypes.JSON([]byte("[]"))}
 		require.NoError(t, userRepo.Create(u))
@@ -95,7 +95,7 @@ func TestPasswordGate_DBFailureIsNot4xx(t *testing.T) {
 			return postRegistryWithScope(h.ChangePassword, `{"currentPassword":"a","newPassword":"bbbbbbbb"}`, u, nil).Code
 		}},
 		{"i/delete-account", func(h *Handler, u *model.User) int {
-			h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}})
+			h.roleProvider = &stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}}
 			return postRegistryWithScope(h.DeleteAccount, `{"password":"p"}`, u, nil).Code
 		}},
 		{"i/regenerate-token", func(h *Handler, u *model.User) int {

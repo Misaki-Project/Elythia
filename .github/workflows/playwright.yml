@@ -82,8 +82,11 @@ jobs:
         # backend 固有の make target / compose 引数 / prepull / timeout を
         # ここで一元定義する (= matrix.include の単一の情報源)。
         run: |
+          # label は check の一覧に出る名前。backend は step の条件と artifact の
+          # 名前に使う内部の値なので、改名 (#3180) の後も据え置く (#3556)。
           mkgo='{
             "backend": "mk-go",
+            "label": "Elythia",
             "up_target": "playwright-up",
             "test_target": "playwright-test",
             "down_target": "playwright-down",
@@ -104,11 +107,12 @@ jobs:
           # 失敗内容は artifact (trace / screenshot) から読む。
           ts='{
             "backend": "ts",
+            "label": "ts",
             "up_target": "playwright-ts-up",
             "test_target": "playwright-ts-test",
             "down_target": "playwright-ts-down",
             "compose_args": "-f tests/playwright/compose.yml -f tests/playwright/compose.ts.yml",
-            "prepull": "docker pull misskey/misskey:2026.10.0",
+            "prepull": "docker pull misskey/misskey:2026.10.1",
             "timeout_minutes": 45,
             "continue_on_error": true
           }'
@@ -132,7 +136,7 @@ jobs:
           echo "$matrix" | jq .
 
   spec:
-    name: spec (${{ matrix.backend }} ${{ matrix.shard }}/${{ matrix.shard_total }})
+    name: spec (${{ matrix.label }} ${{ matrix.shard }}/${{ matrix.shard_total }})
     needs: plan
     runs-on: ubuntu-latest
     # backend ごとに枠を変える。mk-go は hang を早く検出したいので短め。
@@ -227,7 +231,7 @@ jobs:
 
       - name: Set up Node.js
         if: matrix.backend == 'mk-go' && steps.cache-misskey.outputs.cache-hit != 'true'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: frontend/.node-version
 
@@ -260,7 +264,7 @@ jobs:
 
       - name: Run Playwright
         # spec は 1 スタックあたり直列でしか回せない。共有の root アカウント
-        # を 298 ファイル中 179 がブラウザからサインインして使い (数え方は
+        # を 299 ファイル中 179 がブラウザからサインインして使い (数え方は
         # `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`)、
         # さらに 32 がサインインせず root の token で API を叩く
         # (`root.json` を読むのが 211 で、その差分)。このアカウントと instance meta を全 spec が
@@ -304,7 +308,7 @@ jobs:
       # 45 min timeout した TS job の失敗内容を追えなかった (#2289)。
       - name: Upload test-results on failure
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: playwright-results-${{ matrix.backend }}-${{ matrix.shard }}
           path: tests/playwright/test-results/
@@ -322,7 +326,7 @@ jobs:
 
       - name: Upload logs artifact on failure
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: playwright-logs-${{ matrix.backend }}-${{ matrix.shard }}
           path: /tmp/playwright-logs/

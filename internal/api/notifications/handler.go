@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
@@ -74,6 +75,13 @@ type Handler struct {
 	// token.iconUrl) + appAccessTokenId を埋めるために使う (#1557)。未配線なら
 	// fallback 無し。
 	accessTokenRepo repository.AccessTokenRepository
+	// noteHider は閲覧者が見てはいけない投稿の中身を隠す (#3786)。未配線だと
+	// 匿名の閲覧者への ugcVisibilityForVisitor が効かないので、NewHandler の
+	// 必須の引数で受ける (#3817)。
+	noteHider *notehide.Hider
+	// entityPacker は entity を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3796)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // SetAccessTokenRepo wires the access token repo used by notifications/create
@@ -86,26 +94,9 @@ func (h *Handler) SetAccessTokenRepo(r repository.AccessTokenRepository) {
 // embedded role (#1559)。
 func (h *Handler) SetRoleLookup(fn entity.RoleLookup) { h.roleLookup = fn }
 
-// SetModeratorChecker wires the moderation check used to re-verify who may
-// read abuseReport notifications (#2868).
-//
-// **未配線なら abuseReport を返さない (fail-closed)。** 対象ユーザー ID が Extra に入り通報の存在自体が機微なので、判定できないまま出すより出さないほうが安全側。
-func (h *Handler) SetModeratorChecker(c ModeratorChecker) { h.moderatorChecker = c }
-
 // AbuseReportStateLookup resolves the resolution state of several reports at
 // once (#2868)。実装は repository.AbuseReportRepository.FindStatesByIDs。
 type AbuseReportStateLookup func(ids []string) (map[string]model.AbuseReportState, error)
-
-// SetAbuseReportLookup wires the read-time state lookup for abuseReport
-// notifications (#2868)。未配線なら abuseReport 通知を返さない (fail-closed)。
-func (h *Handler) SetAbuseReportLookup(fn AbuseReportStateLookup) { h.abuseReportStates = fn }
-
-// SetAbuseReportUnresolvedCounter wires the count of unresolved reports shown
-// on abuseReport notifications (#3200)。実装は
-// repository.AbuseReportRepository.CountUnresolved。未配線なら件数を出さない。
-func (h *Handler) SetAbuseReportUnresolvedCounter(fn func() (int64, error)) {
-	h.abuseUnresolvedCount = fn
-}
 
 // SetEmojiApplicationLookup wires the read-time state lookup for
 // emojiApplicationProcessed notifications (#2934)。未配線なら返さない
@@ -116,13 +107,6 @@ func (h *Handler) SetAbuseReportUnresolvedCounter(fn func() (int64, error)) {
 // 並ぶ形にならない。N+1 を避けるための複雑さに見合わない。
 func (h *Handler) SetEmojiApplicationLookup(fn entity.EmojiApplicationLookup) {
 	h.emojiApplicationLookup = fn
-}
-
-// SetSignupApplicationLookup wires the read-time state lookup for
-// signupApplicationReceived notifications (#2987)。未配線なら通知ごと返さない
-// (fail-closed。状態を引けないまま出すと、処理済みの申請に二重で当たる)。
-func (h *Handler) SetSignupApplicationLookup(fn entity.SignupApplicationLookup) {
-	h.signupApplicationLookup = fn
 }
 
 // SetChatInvitationLookup wires the lookup used to pack
@@ -232,8 +216,37 @@ func (h *Handler) batchAbuseReportLookup(rows []entity.NotificationItem) (entity
 }
 
 // NewHandler creates a new notifications Handler.
-func NewHandler(svc *notification.Service, idGen id.Generator) *Handler {
-	return &Handler{svc: svc, idGen: idGen}
+//
+// entityPacker is the Packer this Handler packs entities with (#3796) and
+// noteHider applies the per-viewer hideNote gate to the notes it packs (#3786).
+// moderatorChecker re-verifies who may read abuseReport notifications (#2868)
+// and abuseReportStates looks up their state at read time (#2868); without
+// either, abuseReport notifications are not returned (fail-closed).
+// abuseUnresolvedCount is the count of unresolved reports shown on them
+// (#3200, repository.AbuseReportRepository.CountUnresolved); without it the
+// count is left out. signupApplicationLookup looks up the state of
+// signupApplicationReceived notifications at read time (#2987); without it
+// those notifications are not returned (fail-closed).
+func NewHandler(
+	svc *notification.Service,
+	idGen id.Generator,
+	entityPacker *entity.Packer,
+	noteHider *notehide.Hider,
+	moderatorChecker ModeratorChecker,
+	abuseReportStates AbuseReportStateLookup,
+	abuseUnresolvedCount func() (int64, error),
+	signupApplicationLookup entity.SignupApplicationLookup,
+) *Handler {
+	return &Handler{
+		svc:                     svc,
+		idGen:                   idGen,
+		entityPacker:            entityPacker,
+		noteHider:               noteHider,
+		moderatorChecker:        moderatorChecker,
+		abuseReportStates:       abuseReportStates,
+		abuseUnresolvedCount:    abuseUnresolvedCount,
+		signupApplicationLookup: signupApplicationLookup,
+	}
 }
 
 // TestNotifier creates a 'test' notification on the caller's own stream so the
@@ -303,13 +316,13 @@ func (h *Handler) SetFollowRequestRepo(r repository.FollowRequestRepository) {
 
 // ListRequest is the request body for notifications.
 type ListRequest struct {
-	Limit        *int     `json:"limit"`
-	IncludeTypes []string `json:"includeTypes"`
-	ExcludeTypes []string `json:"excludeTypes"`
-	SinceID      string   `json:"sinceId"`
-	UntilID      string   `json:"untilId"`
-	SinceDate    *int64   `json:"sinceDate"`
-	UntilDate    *int64   `json:"untilDate"`
+	Limit        *jsnum.Int `json:"limit"`
+	IncludeTypes []string   `json:"includeTypes"`
+	ExcludeTypes []string   `json:"excludeTypes"`
+	SinceID      string     `json:"sinceId"`
+	UntilID      string     `json:"untilId"`
+	SinceDate    *jsnum.Int `json:"sinceDate"`
+	UntilDate    *jsnum.Int `json:"untilDate"`
 	// MarkAsRead controls whether fetching the notification list implicitly
 	// marks all notifications as read. nil / true means "mark as read"
 	// (default), explicit false leaves the read state untouched.
@@ -356,12 +369,12 @@ func (h *Handler) Show(c echo.Context) error {
 		slog.Error("notifications: resolve abuse report states failed", "err", err)
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
-	out := entity.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), opts...)
+	out := h.entityPacker.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), opts...)
 	// depth-2 embed hide (#1570): collectNotifications の #1444 CanSeeNote gate は
 	// 見えない note を丸ごと落とすが embed (renote/reply) には再帰しない。通知 note の
 	// embed と著者設定ゲートを viewer 可視性で適用する。これを欠くと #1570 で塞いだ
 	// i/notifications の depth-2 embed IDOR が再オープンする。
-	notehide.HideNotificationNotes(user, out)
+	h.noteHider.HideNotificationNotes(user, out)
 	h.maybeMarkAsRead(c, user, req)
 	return c.JSON(http.StatusOK, out)
 }
@@ -519,16 +532,17 @@ func (h *Handler) bindListRequest(c echo.Context) (ListRequest, bool) {
 	// (= aidx) で判定する設計なので adapter pattern で完結する。
 	// **列に入らないカーソルもここで ok=false にする (#3025)。** そのまま渡すと
 	// `id < ?` の bind parameter で落ちて 500 になる。
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return req, false
 	}
 	req.SinceID, req.UntilID = cursorSince, cursorUntil
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return req, false
 	}
-	req.Limit = &limit
+	resolved := jsnum.Int(limit)
+	req.Limit = &resolved
 	return req, true
 }
 
@@ -595,13 +609,41 @@ func (h *Handler) collectNotificationsWithDropped(c echo.Context, user *model.Us
 	// 返す (#1953)。ここではその後段の drop (解決済み follow request / invalid
 	// notifier / 削除済 note) を適用する。**不可視 note の drop は mk-go 独自**で、
 	// upstream は hideNote で blank するだけで行を残す (下の #1953 ブロック参照)。
-	rows, err := h.svc.List(c.Request().Context(), user.ID, req.SinceID, req.UntilID, (*req.Limit), req.IncludeTypes, req.ExcludeTypes)
+	rows, err := h.svc.List(c.Request().Context(), user.ID, req.SinceID, req.UntilID, int(*req.Limit), req.IncludeTypes, req.ExcludeTypes)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	// **drop は列から抜かずに id 集合へ記録する** (#2739)。grouped は全列を
 	// 走査して畳んでから、この集合でグループの中身を引く。
 	dropped := make(map[string]struct{})
+
+	// 現在のページに含まれるフォローリクエストだけを一括で確認する。
+	// List が返した行だけを絞り込むため、ページの順序と上限は維持される。
+	var followRequestCandidates []string
+	var pendingFollowRequestIDs map[string]struct{}
+	followRequestLookupOK := false
+	if h.followReqRepo != nil {
+		seenFollowRequestIDs := make(map[string]struct{})
+		for _, n := range rows {
+			if n.Type != notification.TypeReceiveFollowReq || n.NotifierID == "" {
+				continue
+			}
+			if _, seen := seenFollowRequestIDs[n.NotifierID]; seen {
+				continue
+			}
+			seenFollowRequestIDs[n.NotifierID] = struct{}{}
+			followRequestCandidates = append(followRequestCandidates, n.NotifierID)
+		}
+		if len(followRequestCandidates) > 0 {
+			if pendingIDs, err := h.followReqRepo.FilterPendingToAnchor(user.ID, followRequestCandidates); err == nil {
+				followRequestLookupOK = true
+				pendingFollowRequestIDs = make(map[string]struct{}, len(pendingIDs))
+				for _, id := range pendingIDs {
+					pendingFollowRequestIDs[id] = struct{}{}
+				}
+			}
+		}
+	}
 
 	// 2-pass で組み立てる:
 	//   pass 1: followReq filter を通して残った rows と notifierID を集約
@@ -615,8 +657,8 @@ func (h *Handler) collectNotificationsWithDropped(c echo.Context, user *model.Us
 		// 既に解決された follow request (accept / reject で消えた) に対応する
 		// receiveFollowRequest 通知はユーザー視点で既に古く「残り続ける」ので
 		// 除外する (#349 コメント対応、本家 NotificationEntityService 互換)。
-		if n.Type == notification.TypeReceiveFollowReq && h.followReqRepo != nil && n.NotifierID != "" {
-			if exists, err := h.followReqRepo.Exists(n.NotifierID, user.ID); err == nil && !exists {
+		if n.Type == notification.TypeReceiveFollowReq && followRequestLookupOK && n.NotifierID != "" {
+			if _, pending := pendingFollowRequestIDs[n.NotifierID]; !pending {
 				dropped[n.ID] = struct{}{}
 				continue
 			}

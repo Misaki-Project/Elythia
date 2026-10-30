@@ -5,6 +5,7 @@ import (
 
 	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 )
 
 // ExtractEmojiTags exposes the unexported extractEmojiTags for external tests.
@@ -105,3 +106,27 @@ const InboundMentionFetchSlots = inboundMentionFetchSlots
 
 // InboundMentionFailureTTL exposes inboundMentionFailureTTL for external tests.
 const InboundMentionFailureTTL = inboundMentionFailureTTL
+
+// NewRemoteStatsFetcherRedirectingTo returns a RemoteStatsFetcher whose
+// requests to https://<any host>/... go to target (an httptest server URL),
+// for external tests (#3465).
+func NewRemoteStatsFetcherRedirectingTo(target string) *RemoteStatsFetcher {
+	return newRemoteStatsFetcherWithTransport(redirectTransport{target: target})
+}
+
+// SetSoftwareSuspensionCheckerForTest replaces the software suspension checker.
+//
+// 構築子の必須の引数にした依存 (#3823) を、補助関数が作った resolver へ後から
+// 入れるための seam。同じパッケージのテストならフィールドへ直接代入するところを、
+// 外部パッケージ (federation_test) のテストから行う。
+func (r *RemoteUserResolver) SetSoftwareSuspensionCheckerForTest(c SoftwareSuspensionChecker) {
+	r.softwareBlocker = c
+}
+
+// WithRepos returns a hook built by NewNoteDeleteDeliveryHook from h's other
+// arguments and the given repositories (#3833).
+//
+// 外部テストは作った後でフィールドへ代入できないので、構築子で作り直す。
+func (h *NoteDeleteDeliveryHook) WithRepos(userRepo repository.UserRepository, noteRepo repository.NoteRepository) *NoteDeleteDeliveryHook {
+	return NewNoteDeleteDeliveryHook(h.deliver, h.renderer, h.urls, userRepo, noteRepo)
+}

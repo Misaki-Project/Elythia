@@ -11,8 +11,8 @@ import (
 // `/api` の 1 MiB に戻り、**宣言した上限が黙って無意味になる** — 署名を検証する前に
 // 読める本文が 16 倍になるので、気付ける症状は出ない。
 //
-// 判定は `wiringNodes` の AST 照合で、#2812 の `TestInviteModeratorCheckerIsWired`
-// と同じ形。**コメント行は数えない** — `//` でも `/* */` でも落ちる (#2856)。
+// 判定は `wiringNodes` の AST 照合 (`assertWired` と同じ形)。**コメント行は
+// 数えない** — `//` でも `/* */` でも落ちる (#2856)。
 //
 // **引数まで含めて照合する。** 関数名だけを見ると `BodyLimitByPath(x, nil)` が
 // 通り抜けて、上限が死んだまま緑になる。
@@ -35,14 +35,21 @@ func TestPluginPeerBodyLimitIsWired(t *testing.T) {
 // nil 許容にしてあり、落としても build もテストも通る。落ちるのは
 // 「認証を通った相手 (と署名を持たない相手) が受け口を無制限に叩ける」状態で、
 // 症状が出るのは攻撃を受けたときだけ。
-// **これは呼び出しではなく struct literal のフィールド。** `wiringNodes` は
-// KeyValueExpr も集めるので同じ形で書ける。空白は正規化されるので、gofmt の
-// 整列が変わっても落ちない (実際に変わって落ちたことがある)。
+// #3827 から deps は構築子 (newPluginPeerDeps) で組むので、構築子の呼び出しを引数まで
+// 含めて照合する。limiter は 9 番目の引数。nil を渡す形は
+// TestBuiltHandlersHaveNoNilDependencies も落とすが、引数の順を取り違えたり、
+// 別の limiter を渡したりする形はここで見る。空白は正規化されるので、引数の折り方が
+// 変わっても落ちない。
 func TestPluginPeerRateLimiterIsWired(t *testing.T) {
-	assertWired(t, routerGo,
-		"limiter: newPeerRateLimiter()",
+	assertWired(t, serverPkg, pluginPeerDepsWiring,
 		"pluginPeerDeps の limiter が nil になり、peer の受け口が無制限になる")
 }
+
+// pluginPeerDepsWiring is how setupRoutes builds the peer channel's
+// dependencies (#3827).
+const pluginPeerDepsWiring = "s.peerDeps = newPluginPeerDeps(s.config.Host, s.outboundClient(peerTimeout), " +
+	"federationResolver, activitypub.NewPublicKeyCache(256), instanceService, instanceSigner, pluginPeers, " +
+	"idGen, newPeerRateLimiter(), s.queueClient)"
 
 // catchall は名前付き関数を router から参照していないと効かない。
 //
@@ -51,7 +58,7 @@ func TestPluginPeerRateLimiterIsWired(t *testing.T) {
 // 「受け口の無いプラグインへの POST が 200 + {} に戻る」ところで、症状は
 // 相手側にしか出ない (#2822)。
 func TestAPICatchallIsWired(t *testing.T) {
-	assertWired(t, routerGo,
+	assertWired(t, serverPkg,
 		`api.Any("/*", apiCatchall)`,
 		"peer の受け口が無いプラグインへの POST が 200 + {} に戻る")
 }
@@ -75,8 +82,9 @@ func TestPluginJobQueuesAreWired(t *testing.T) {
 // **落としても build もテストも通る。** pluginPeer は enqueuer が nil のとき
 // warn を出して捨てるので、落ちるのは「送信が全部消える」ところ。相手側にしか
 // 症状が出ないうえ、こちらのログを見ないと気付けない。
+//
+// #3827 から構築子の最後の引数 (TestPluginPeerRateLimiterIsWired と同じ呼び出しを照合する)。
 func TestPluginPeerEnqueuerIsWired(t *testing.T) {
-	assertWired(t, routerGo,
-		"enqueuer: s.queueClient",
+	assertWired(t, serverPkg, pluginPeerDepsWiring,
 		"pluginPeerDeps の enqueuer が nil になり、peer の送信が全部捨てられる")
 }

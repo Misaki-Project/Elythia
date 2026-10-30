@@ -39,6 +39,10 @@ type MockChatRepository struct {
 	// AddReaction / RemoveReaction so tests can assert canonicalisation (#2106 N4).
 	AddedReactions   []string
 	RemovedReactions []string
+	// ReadAllCalls records MarkAllReadFromUser ("user:<reader>:<other>") and
+	// MarkAllReadInRoom ("room:<reader>:<room>") calls so stream tests can
+	// assert whether a read was performed.
+	ReadAllCalls []string
 
 	// CreateErr forces Create* to return this error without persisting.
 	CreateErr error
@@ -249,6 +253,12 @@ func (m *MockChatRepository) FindMessageByID(id string) (*model.ChatMessage, err
 		return &clone, nil
 	}
 	return nil, ErrNotFound
+}
+
+// FindMessageDetailedByID returns the stored row as FindMessageByID does; the
+// mock keeps whatever relations the test stored.
+func (m *MockChatRepository) FindMessageDetailedByID(id string) (*model.ChatMessage, error) {
+	return m.FindMessageByID(id)
 }
 
 func (m *MockChatRepository) FindMessageByURI(uri string) (*model.ChatMessage, error) {
@@ -505,6 +515,20 @@ func (m *MockChatRepository) DeleteInvitation(id string) error {
 	return nil
 }
 
+func (m *MockChatRepository) DeleteInvitationsToOwnedRooms(ownerID, userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, inv := range m.Invitations {
+		if inv.UserID != userID {
+			continue
+		}
+		if room, ok := m.Rooms[inv.RoomID]; ok && room.OwnerID == ownerID {
+			delete(m.Invitations, id)
+		}
+	}
+	return nil
+}
+
 func (m *MockChatRepository) UpdateInvitation(inv *model.ChatRoomInvitation) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -608,9 +632,20 @@ func (m *MockChatRepository) MarkRead(userID, messageID string) error {
 	return nil
 }
 
-func (m *MockChatRepository) MarkAllRead(_ string) error            { return nil }
-func (m *MockChatRepository) MarkAllReadFromUser(_, _ string) error { return nil }
-func (m *MockChatRepository) MarkAllReadInRoom(_, _ string) error   { return nil }
+func (m *MockChatRepository) MarkAllRead(_ string) error { return nil }
+func (m *MockChatRepository) MarkAllReadFromUser(readerID, otherID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReadAllCalls = append(m.ReadAllCalls, "user:"+readerID+":"+otherID)
+	return nil
+}
+
+func (m *MockChatRepository) MarkAllReadInRoom(readerID, roomID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReadAllCalls = append(m.ReadAllCalls, "room:"+readerID+":"+roomID)
+	return nil
+}
 
 // --- Delivery status / history ---
 
@@ -620,11 +655,11 @@ func (m *MockChatRepository) ListHistory(_ string, _ int) ([]*model.ChatMessage,
 	return nil, nil
 }
 
-func (m *MockChatRepository) ListUserHistory(_ string, _ int) ([]*model.ChatMessage, error) {
+func (m *MockChatRepository) ListUserHistory(_ string, _ int, _ string) ([]*model.ChatMessage, error) {
 	return nil, nil
 }
 
-func (m *MockChatRepository) ListRoomHistory(_ string, _ int) ([]*model.ChatMessage, error) {
+func (m *MockChatRepository) ListRoomHistory(_ string, _ int, _ string) ([]*model.ChatMessage, error) {
 	return nil, nil
 }
 

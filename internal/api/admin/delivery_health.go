@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/core/deliveryhealth"
 	"github.com/elythia-network/elythia/internal/core/federation"
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/labstack/echo/v4"
 )
 
@@ -91,6 +93,7 @@ func (h *Handler) FederationCloseDeliveryBreaker(c echo.Context) error {
 		// 再開したと読む。
 		return apierr.JSONInternalError(c)
 	}
+	h.logModeration(c, moderationlog.LogCloseDeliveryBreaker, map[string]any{"host": host})
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -118,7 +121,7 @@ func (h *Handler) federationHealth(c echo.Context, provider DeliveryHealthProvid
 	}
 	var req struct {
 		// WindowSeconds は遡る秒数。上限は deliveryhealth.MaxWindow。
-		WindowSeconds int `json:"windowSeconds"`
+		WindowSeconds jsnum.Int `json:"windowSeconds"`
 	}
 	// windowSeconds 省略 (`{}`) は既定値で応答する (管理画面が引数なしで叩く)。
 	// object でない body は本家の endpoint と同じく 400 にする (#3330)。
@@ -126,12 +129,15 @@ func (h *Handler) federationHealth(c echo.Context, provider DeliveryHealthProvid
 		return apierr.JSONInvalidParam(c)
 	}
 
+	// 上限との比較は秒のまま行い、範囲内と分かってから time.Duration へ掛ける。
+	// 先に掛けると、windowSeconds が約 9.2e9 を超えたところで int64 が溢れて
+	// 負の値などに化け、上限の比較をすり抜ける (#3440)。
 	window := defaultDeliveryHealthWindow
-	if req.WindowSeconds > 0 {
-		window = time.Duration(req.WindowSeconds) * time.Second
-	}
-	if window > deliveryhealth.MaxWindow {
+	switch {
+	case req.WindowSeconds > jsnum.Int(deliveryhealth.MaxWindow/time.Second):
 		window = deliveryhealth.MaxWindow
+	case req.WindowSeconds > 0:
+		window = time.Duration(req.WindowSeconds) * time.Second
 	}
 
 	hosts, err := provider.Query(c.Request().Context(), window)

@@ -1,16 +1,20 @@
 package admin
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/labstack/echo/v4"
@@ -71,8 +75,8 @@ func (h *Handler) QueueClear(c echo.Context) error {
 
 // clearQueueState removes jobs of the given Bull state from queue, mirroring
 // upstream queue.clean(0,0,state). state '*' clears all clearable states.
-// mkq には state 単位の bulk-delete API が無いため、pending は DrainPending、
-// それ以外は state 別の list → DeleteTask で消す (best-effort)。
+// mkq には state 単位の bulk-delete API が無いため、state 別の一覧を最後まで
+// たどってから DeleteTask で消す (best-effort)。
 //
 // 注意点 (mkq 制約 / upstream との差):
 //
@@ -89,64 +93,97 @@ func (h *Handler) QueueClear(c echo.Context) error {
 // bulk-clear 経路が無いため no-op。
 //
 // (3) cron (repeat) 由来の delayed job は RemoveJob が拒否するため
-// clear('delayed') で消えない。
+// clear('delayed') で消えない。消せない job は飛ばして、後ろを消し続ける。
 //
-// (4) **1 リクエストで消し切らないことがある** (再実行で継続)。上限 1000 反復 ×
-// 100 件で約 100k。(1) の変更で wait もこの制限に入った (`DrainPending` は
-// 1 回で全部消していた)。
+// (4) **1 リクエストで消し切らないことがある** (再実行で継続)。1 バケットで
+// たどるのは delayedTasksMaxPages × delayedTasksFetchPageSize (約 100k) 件まで。
 func (h *Handler) clearQueueState(queue, state string) {
-	// deleteAll はリストが空になるまで先頭ページを引いて消す。削除で件数が
-	// 減るため page=1 を繰り返す。delete が 1 件も進まなければ無限ループを
-	// 避けて打ち切る。上限 1000 反復 (= 約 100k tasks) の安全弁付き。
 	// **保護を掛けるのは「これから動く」バケットだけ。** completed / failed は
 	// 既に終わった記録なので、消せなくすると**終了済みの予約投稿 /
 	// アカウント削除が永久に残る** (掃除の目的そのものが果たせない)。
-	deleteAll := func(lister func(string, int, int) ([]*QueueTaskSummary, error), protect bool) {
-		for i := 0; i < 1000; i++ {
-			rows, err := lister(queue, 1, 100)
-			if err != nil || len(rows) == 0 {
+	//
+	// **先頭ページだけを見て止めない (#3169)。** 以前は先頭ページを消しては
+	// 引き直し、ページが保護対象で埋まると打ち切っていたので、100 件を超える
+	// 予約投稿が先頭にあると、その後ろを 1 件も消さなかった。
+	clear := func(state string, list queueTaskLister, protect bool) {
+		var ids []string
+		walkQueueTasks(queue, state, list, func(t *QueueTaskSummary) {
+			if protect && isOperatorProtectedTask(t) {
 				return
 			}
-			progressed := false
-			skipped := 0
-			for _, t := range rows {
-				if protect && isOperatorProtectedTask(t) {
-					skipped++
-					continue
-				}
-				if h.queueInspector.DeleteTask(queue, t.ID) == nil {
-					progressed = true
-				}
-			}
-			// **保護対象しか残っていなければ打ち切る。** 進捗ゼロで回り続けない。
-			if !progressed || skipped == len(rows) {
-				return
-			}
+			ids = append(ids, t.ID)
+		})
+		for _, id := range ids {
+			_ = h.queueInspector.DeleteTask(queue, id)
 		}
 	}
 	// **pending も一括削除ではなく個別に消す。** `DeleteAllPendingTasks` は
 	// job type を見ないので、wait へ昇格した予約投稿やアカウント削除まで
 	// 巻き込む。保護対象を除いて消すために列挙経路を通す。
+	//
+	// delayed は scheduled と retry を分けずに `ListDelayedTasks` でたどる。
+	// 分けた一覧は atm で振り分けた後にページを切るので、1 ページ読むたびに
+	// delayed の全件を読み直す (#3169)。
 	switch state {
 	case "*":
-		deleteAll(h.queueInspector.ListPendingTasks, true)
-		deleteAll(h.queueInspector.ListScheduledTasks, true)
-		deleteAll(h.queueInspector.ListRetryTasks, true)
-		deleteAll(h.queueInspector.ListFailedTasks, false)
-		deleteAll(h.queueInspector.ListCompletedTasks, false)
+		clear("pending", h.queueInspector.ListPendingTasks, true)
+		clear("delayed", h.queueInspector.ListDelayedTasks, true)
+		clear("failed", h.queueInspector.ListFailedTasks, false)
+		clear("completed", h.queueInspector.ListCompletedTasks, false)
 	case "wait", "waiting", "pending":
-		deleteAll(h.queueInspector.ListPendingTasks, true)
+		clear("pending", h.queueInspector.ListPendingTasks, true)
 	case "delayed":
-		deleteAll(h.queueInspector.ListScheduledTasks, true)
-		deleteAll(h.queueInspector.ListRetryTasks, true)
+		clear("delayed", h.queueInspector.ListDelayedTasks, true)
 	case "failed":
-		deleteAll(h.queueInspector.ListFailedTasks, false)
+		clear("failed", h.queueInspector.ListFailedTasks, false)
 	case "completed":
-		deleteAll(h.queueInspector.ListCompletedTasks, false)
+		clear("completed", h.queueInspector.ListCompletedTasks, false)
 	default:
 		// active / paused / prioritized は単独 state での bulk-clear 経路が
 		// 無いため no-op。pause 中のジョブは wait にあるので "wait" で掃ける
 		// (上の注意点 (1))。
+	}
+}
+
+// queueTaskLister is one of the paged QueueInspector.List*Tasks methods.
+type queueTaskLister func(qname string, page, pageSize int) ([]*QueueTaskSummary, error)
+
+// walkQueueTasks calls fn for every task list returns, page by page, until an
+// empty page or delayedTasksMaxPages.
+//
+// **たどる間は消さない。** 一覧は添字の範囲で切るので、たどりながら消すと
+// 後ろの task が前へ詰まり、次のページで読み飛ばす。消すのは呼び出し側が
+// たどり終えてから行う。走査中に新しい job が先頭に入ると、既に読んだ task が
+// 後ろへずれて次のページにもう一度出るので、ID で重複を除く。
+func walkQueueTasks(queue, state string, list queueTaskLister, fn func(*QueueTaskSummary)) {
+	seen := make(map[string]struct{})
+	for page := 1; page <= delayedTasksMaxPages; page++ {
+		rows, err := list(queue, page, delayedTasksFetchPageSize)
+		if err != nil || len(rows) == 0 {
+			return
+		}
+		for _, t := range rows {
+			if t == nil {
+				continue
+			}
+			if _, dup := seen[t.ID]; dup {
+				continue
+			}
+			seen[t.ID] = struct{}{}
+			fn(t)
+		}
+		// **短いページでは止めず、空のページまで進む。** mkq は範囲で取った
+		// ID のうち、HASH が既に無いもの (読む間に消された job など) を飛ばす
+		// ので、途中のページが 100 件に満たないことがある。full page が続いた
+		// まま cap に到達した時だけ warn する (= データがまだ残っている可能性が
+		// 高い異常状態)。
+		if page == delayedTasksMaxPages && len(rows) == delayedTasksFetchPageSize {
+			slog.Warn("admin/queue: page cap reached, truncating",
+				"queue", queue, "state", state,
+				"maxPages", delayedTasksMaxPages,
+				"pageSize", delayedTasksFetchPageSize,
+				"collected", len(seen))
+		}
 	}
 }
 
@@ -175,30 +212,30 @@ func (h *Handler) QueueInboxDelayed(c echo.Context) error {
 	return c.JSON(http.StatusOK, aggregateByHost(tasks, inboxHostFromPayload))
 }
 
-// delayedTasksFetchPageSize は scheduled / retry を page 走査する際の 1 page
-// 当たり件数。100 は driver 側の page size 上限 (mkq は 100 超を 30 に丸める)
+// delayedTasksFetchPageSize は queue の一覧を page 走査する際 (walkQueueTasks) の
+// 1 page 当たり件数。100 は driver 側の page size 上限 (mkq は 100 超を 30 に丸める)
 // に収まる大きさ。
 const delayedTasksFetchPageSize = 100
 
-// delayedTasksMaxPages は scheduled / retry それぞれの page 走査の上限。
-// = 100K tasks per state, 200K total。これは defense-in-depth の二重目的:
+// delayedTasksMaxPages は 1 つの一覧 (バケット) を page 走査する際の上限。
+// = 100K tasks per bucket。これは defense-in-depth の二重目的:
 //
 //   - inspector が常に full page を返すような misbehavior 時の無限ループ防御
 //   - 連合先長期 down 等の pathological case で、admin panel が backend
 //     memory を食い潰さない soft cap
 //
 // 通常の運用では数千件で頭打ちになるはずなので、この上限を踏むのは異常状態。
-// 到達時は slog.Warn で diag を残し、収集できた分だけで集計を進める
-// (= panel に top hosts は出るので、admin はその情報を元に対処できる)。
+// 到達時は slog.Warn で diag を残し、収集できた分だけで集計・clear・promote を
+// 進める (= panel に top hosts は出るので、admin はその情報を元に対処できる)。
 //
 // var にしているのは test seam: cap 防御の挙動を確認する test が小さい
 // cap を一時設定するため。production code から書き換えてはならない。
 var delayedTasksMaxPages = 1000
 
-// fetchAllDelayedTasks fetches every scheduled+retry task for the queue by
-// iterating pages of size delayedTasksFetchPageSize until each list is
+// fetchAllDelayedTasks fetches every delayed (scheduled+retry) task for the
+// queue by iterating pages of size delayedTasksFetchPageSize until the list is
 // exhausted or delayedTasksMaxPages の上限に達するまで。結果は downstream の
-// host aggregation の union として返す。
+// host aggregation に渡す。
 //
 // Misskey TS の BullMQ getJobs(['delayed']) は全件取得が前提なので、通常
 // page が空になるまで走査するが、defense-in-depth として上限を設けている
@@ -207,35 +244,12 @@ func (h *Handler) fetchAllDelayedTasks(queueName string) []*QueueTaskSummary {
 	if h.queueInspector == nil {
 		return nil
 	}
+	// scheduled と retry を分けずにたどる。分けた一覧は 1 ページ読むたびに
+	// delayed の全件を読み直す (#3169)。
 	var all []*QueueTaskSummary
-	for _, spec := range []struct {
-		state string
-		fetch func(string, int, int) ([]*QueueTaskSummary, error)
-	}{
-		{"scheduled", h.queueInspector.ListScheduledTasks},
-		{"retry", h.queueInspector.ListRetryTasks},
-	} {
-		for page := 1; page <= delayedTasksMaxPages; page++ {
-			rows, err := spec.fetch(queueName, page, delayedTasksFetchPageSize)
-			if err != nil || len(rows) == 0 {
-				break
-			}
-			all = append(all, rows...)
-			// partial page を取った時点で正常にデータ尽きと判断、warn せず
-			// 抜ける。full page が続いたまま cap に到達した時だけ warn する
-			// (= データがまだ残っている可能性が高い異常状態)。
-			if len(rows) < delayedTasksFetchPageSize {
-				break
-			}
-			if page == delayedTasksMaxPages {
-				slog.Warn("admin/queue/delayed: page cap reached, truncating aggregation",
-					"queue", queueName, "state", spec.state,
-					"maxPages", delayedTasksMaxPages,
-					"pageSize", delayedTasksFetchPageSize,
-					"collected", len(all))
-			}
-		}
-	}
+	walkQueueTasks(queueName, "delayed", h.queueInspector.ListDelayedTasks, func(t *QueueTaskSummary) {
+		all = append(all, t)
+	})
 	return all
 }
 
@@ -336,8 +350,8 @@ func (h *Handler) QueueJobs(c echo.Context) error {
 	var req struct {
 		Queue  string          `json:"queue"`
 		State  json.RawMessage `json:"state"`
-		Limit  int             `json:"limit"`
-		Page   int             `json:"page"`
+		Limit  jsnum.Int       `json:"limit"`
+		Page   jsnum.Int       `json:"page"`
 		Search string          `json:"search"`
 	}
 	if err := c.Bind(&req); err != nil || req.Queue == "" || len(req.State) == 0 {
@@ -358,26 +372,34 @@ func (h *Handler) QueueJobs(c echo.Context) error {
 	// フロントは渡さないので、未指定のときは upstream と同じ形で返す (#3167)。
 	// 以前は既定の 30 件が全 state 合計に効き、state を順に詰めるので「すべて」
 	// タブが完了済みだけで埋まって失敗が 1 件も見えなかった。
-	if req.Limit == 0 && req.Page == 0 {
+	// 本家の慣習どおり limit は 1〜100、page は 1 以上として宣言している
+	// (elythia_overlays.json、#3867)。整数を小数の形で書いた値 (5.0) も受ける。
+	// 宣言の外の値は検証が先に拒否するが、検証しない入力 (上限を超えた body
+	// など) のために丸めは残す。
+	limit, page := int(req.Limit), int(req.Page)
+	if limit == 0 && page == 0 {
 		return c.JSON(http.StatusOK, h.upstreamQueueJobs(req.Queue, states))
 	}
-	if req.Limit <= 0 || req.Limit > 100 {
-		req.Limit = 30
+	if limit <= 0 || limit > 100 {
+		limit = 30
 	}
-	if req.Page < 1 {
-		req.Page = 1
+	if page < 1 {
+		page = 1
 	}
 
-	seen := make(map[string]struct{}, req.Limit)
-	out := make([]map[string]any, 0, req.Limit)
+	// limit は 1〜100 に丸めてあるが、CodeQL (go/uncontrolled-allocation-size) は
+	// jsnum.Int からの変換を経た丸めを追えないので、容量を指定せずに確保する。
+	// out は空でも [] で返すため nil にしない。
+	seen := map[string]struct{}{}
+	out := []map[string]any{}
 outer:
 	for _, state := range states {
-		rows, err := h.listTasksForState(req.Queue, state, req.Page, req.Limit)
+		rows, err := h.listTasksForState(req.Queue, state, page, limit)
 		if err != nil {
 			continue
 		}
 		for _, t := range rows {
-			if len(out) >= req.Limit {
+			if len(out) >= limit {
 				break outer
 			}
 			// state指定が複数重なる (例: all タブ) とき同じ task が
@@ -543,9 +565,9 @@ func (h *Handler) listTasksForState(queue, state string, page, limit int) ([]*Qu
 
 // QueuePromoteJobs handles POST /api/admin/queue/promote-jobs.
 func (h *Handler) QueuePromoteJobs(c echo.Context) error {
-	// driver に bulk promote API が無いため、対象 queue の scheduled/retry を
-	// 1 ページずつ拾って RunTask で逐次 promote する。大量投入時は後続の
-	// ページを クライアント側で再呼び出しする運用。
+	// driver に bulk promote API が無いため、対象 queue の delayed を最後まで
+	// たどってから RunTask で逐次 promote する。upstream の `queue.promoteJobs()`
+	// と同じく全件が対象 (#3169。以前は先頭の 100 件だけだった)。
 	// upstream Misskey TS は paramDef で queue を required にしている (#929)。
 	var req struct {
 		Queue string `json:"queue"`
@@ -556,23 +578,19 @@ func (h *Handler) QueuePromoteJobs(c echo.Context) error {
 	if h.queueInspector == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
-	promoted := 0
-	for _, state := range []string{"scheduled", "retry"} {
-		var rows []*QueueTaskSummary
-		if state == "scheduled" {
-			rows, _ = h.queueInspector.ListScheduledTasks(req.Queue, 1, 100)
-		} else {
-			rows, _ = h.queueInspector.ListRetryTasks(req.Queue, 1, 100)
+	var ids []string
+	walkQueueTasks(req.Queue, "delayed", h.queueInspector.ListDelayedTasks, func(t *QueueTaskSummary) {
+		// **利用者の予定は促進しない。** 促進は「詰まった配送を流す」操作で、
+		// 予約投稿を前倒しで公開する操作ではない。
+		if isOperatorProtectedTask(t) {
+			return
 		}
-		for _, t := range rows {
-			// **利用者の予定は促進しない。** 促進は「詰まった配送を流す」操作で、
-			// 予約投稿を前倒しで公開する操作ではない。
-			if isOperatorProtectedTask(t) {
-				continue
-			}
-			if err := h.queueInspector.RunTask(req.Queue, t.ID); err == nil {
-				promoted++
-			}
+		ids = append(ids, t.ID)
+	})
+	promoted := 0
+	for _, id := range ids {
+		if err := h.queueInspector.RunTask(req.Queue, id); err == nil {
+			promoted++
 		}
 	}
 	h.logModeration(c, moderationlog.LogPromoteQueue, map[string]any{
@@ -858,8 +876,12 @@ func (h *Handler) QueueRemoveJob(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	// driver の DeleteTask は不明 task id でも nil error を返しうる
-	// (= idempotent) が、upstream Misskey TS は 4xx を返す。drop-in 互換の
-	// ため事前に GetTaskInfo で存在確認して、無ければ 404 を返す (#929)。
+	// (= idempotent)。事前に GetTaskInfo で存在確認して、無ければ 404 を返す
+	// (#929)。本家は見つからない job を何もせずに 204 で返すので、ここは本家と
+	// 違う (docs/divergence/approximations.md)。
+	if id == "" {
+		return c.JSON(http.StatusNotFound, apierr.NotFound())
+	}
 	if _, err := h.queueInspector.GetTaskInfo(queue, id); err != nil {
 		return c.JSON(http.StatusNotFound, apierr.NotFound())
 	}
@@ -871,25 +893,19 @@ func (h *Handler) QueueRemoveJob(c echo.Context) error {
 
 // bindQueueJobReq binds the shared {queue, jobId} param of remove-job /
 // retry-job / show-job / show-job-logs. upstream の required は (queue, jobId)。
-// 旧 mk-go の `id` キーも後方互換で受ける (jobId 優先)。queue と job id が
-// 揃わなければ ok=false。
+// queue が空か、jobId が無ければ ok=false。空の jobId は ok=true で返し、
+// 呼び出し側が見つからない job として扱う (本家は getJob("") で見つからない。
+// #3865)。以前は jobId の代わりに `id` も受けていたが、同梱の frontend は送らず、
+// #3865 で消した。
 func bindQueueJobReq(c echo.Context) (queue, id string, ok bool) {
 	var req struct {
-		Queue string `json:"queue"`
-		JobID string `json:"jobId"`
-		ID    string `json:"id"`
+		Queue string  `json:"queue"`
+		JobID *string `json:"jobId"`
 	}
-	if err := c.Bind(&req); err != nil {
+	if err := c.Bind(&req); err != nil || req.Queue == "" || req.JobID == nil {
 		return "", "", false
 	}
-	id = req.JobID
-	if id == "" {
-		id = req.ID
-	}
-	if req.Queue == "" || id == "" {
-		return "", "", false
-	}
-	return req.Queue, id, true
+	return req.Queue, *req.JobID, true
 }
 
 // QueueRetryJob handles POST /api/admin/queue/retry-job.
@@ -901,8 +917,11 @@ func (h *Handler) QueueRetryJob(c echo.Context) error {
 	if h.queueInspector == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
-	// RunTask も不明 id で nil を返しうる idempotent 挙動。drop-in 互換の
-	// ため事前に GetTaskInfo で存在確認 (#929)。
+	// RunTask も不明 id で nil を返しうる idempotent 挙動。事前に GetTaskInfo で
+	// 存在確認して 404 を返す (#929。本家は 204、remove-job と同じく本家と違う)。
+	if id == "" {
+		return c.JSON(http.StatusNotFound, apierr.NotFound())
+	}
 	if _, err := h.queueInspector.GetTaskInfo(queue, id); err != nil {
 		return c.JSON(http.StatusNotFound, apierr.NotFound())
 	}
@@ -919,6 +938,9 @@ func (h *Handler) QueueShowJob(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("queue and jobId are required."))
 	}
 	if h.queueInspector == nil {
+		return c.JSON(http.StatusNotFound, apierr.NotFound())
+	}
+	if id == "" {
 		return c.JSON(http.StatusNotFound, apierr.NotFound())
 	}
 	t, err := h.queueInspector.GetTaskInfo(queue, id)
@@ -939,7 +961,7 @@ func (h *Handler) QueueShowJobLogs(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("queue and jobId are required."))
 	}
-	if h.queueInspector == nil {
+	if h.queueInspector == nil || id == "" {
 		return c.JSON(http.StatusOK, []string{})
 	}
 	logs, _, err := h.queueInspector.GetTaskLogs(queue, id, 0, -1)
@@ -983,7 +1005,7 @@ func packTaskSummary(t *QueueTaskSummary) map[string]any {
 	stacktrace := make([]string, 0, len(t.Stacktrace))
 	for i := len(t.Stacktrace) - 1; i >= 0; i-- {
 		if t.Stacktrace[i] != "" {
-			stacktrace = append(stacktrace, t.Stacktrace[i])
+			stacktrace = append(stacktrace, redactJobErrorURL(t.Type, t.Stacktrace[i]))
 		}
 	}
 	// upstream: isFailed = !!failedReason || stacktrace.length > 0。
@@ -1013,7 +1035,7 @@ func packTaskSummary(t *QueueTaskSummary) map[string]any {
 		"queue":   t.Queue,
 		"type":    t.Type,
 		"state":   t.State,
-		"payload": redactPayloadSecrets(t.Payload),
+		"payload": redactPayloadSecrets(t.Type, t.Payload),
 		"retried": t.Retried,
 		// maxRetry は mk-go 独自 field。mkq driver は TaskSummary.MaxRetry を
 		// 埋めないので、opts.attempts から拾えるならそちらを使う (0 のまま出すと
@@ -1024,8 +1046,9 @@ func packTaskSummary(t *QueueTaskSummary) map[string]any {
 	// **失敗していない job には出さない。** 空文字を出すと frontend の
 	// `!= null` 判定を通ってしまう (上の doc 参照)。
 	if t.LastErr != "" {
-		pack["failedReason"] = t.LastErr
-		pack["lastErr"] = t.LastErr
+		lastErr := redactJobErrorURL(t.Type, t.LastErr)
+		pack["failedReason"] = lastErr
+		pack["lastErr"] = lastErr
 	}
 	// returnValue も同じ。値が無いときに {} を出すと "Return value" タブが
 	// 常に表示される。upstream は Bull の null をそのまま渡してタブを消す。
@@ -1063,20 +1086,168 @@ func packTaskSummary(t *QueueTaskSummary) map[string]any {
 // packJobData renders the job payload for the admin Data tab.
 //
 // **upstream と 1 点だけ意図的に違う。** upstream は Bull の `job.data` を
-// そのまま返すが、mk-go は payload を `{"type": …, "body": <base64>}` で包んで
-// 保存しているので、そのまま返すと Data タブが base64 の塊になって読めない。
-// 包みの形は保ったまま body だけ decode して返す (docs/divergence.md)。
+// そのまま返すが、mk-go は payload を `{"type": …, "bodyJson": <JSON>}`
+// (#3614。2.1.0 までと、JSON として埋め込めない payload は
+// `{"type": …, "body": <base64>}`) で包んで保存しているので、そのまま返すと
+// Data タブが包みの形で見える (base64 なら読めない塊になる)。包みの形は `{"type": …, "body": <payload>}` に揃えて返す
+// (docs/divergence.md)。
 //
 // 以前は body だけを返していたため **type が落ちていた** (#2689)。
 func packJobData(t *QueueTaskSummary) map[string]any {
+	if m, ok := activityPayloadFields(t); ok {
+		return map[string]any{"type": t.Type, "body": m}
+	}
 	body := rawJSONOrString(t.Payload)
 	if body == nil {
 		body = map[string]any{}
 	}
-	body = redactJobSecrets(body)
+	body = redactJobSecrets(t.Type, body)
 	// Type が空になることは無い。mkq driver は framing が無ければ BullMQ の
 	// job.name に落とし、その既定は queue 名。
 	return map[string]any{"type": t.Type, "body": body}
+}
+
+// activityPayloadFields decodes a deliver / inbox payload for the Data tab,
+// with the activity embedded as JSON (see embedActivityBody).
+//
+// **値を木に展開しない** (`map[string]json.RawMessage`)。#3614 から本文は
+// オブジェクトのまま payload に載るので、`map[string]any` に読むと本文ごと
+// 展開され、一覧 (最大 505 件) の 1 回でメモリが約 15 倍になる (#3550)。
+// 元のバイト列なら、キーの順序や大きな整数も変わらない。
+func activityPayloadFields(t *QueueTaskSummary) (map[string]json.RawMessage, bool) {
+	if t.Type != queue.TaskTypeDeliver && t.Type != queue.TaskTypeInbox {
+		return nil, false
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(t.Payload, &m); err != nil || m == nil {
+		return nil, false
+	}
+	for k := range m {
+		if isJobSecretKey(t.Type, k) {
+			m[k] = json.RawMessage(`"` + redactedPlaceholder + `"`)
+		}
+	}
+	embedActivityBody(m)
+	return m, true
+}
+
+// embedActivityBody puts the activity carried by a deliver / inbox payload
+// into m["body"] as JSON, so the Data tab shows it as an object.
+//
+// 本文は 4 つの形で payload に載る (`internal/queue/activity_body.go`)。
+// オブジェクト (#3614 以降の既定)、< などをエスケープしたオブジェクト
+// (`bodyEscaped`、Misskey からの受信の本文)、文字列 (`bodyText`、詰まって
+// いない本文など)、base64 (#3614 より前と、どれにも当てはまらないもの)。base64 のままだと
+// Data タブのハイライトがそこで数秒固まった (#3550。同じノートの配送で、base64
+// のままだと 3,886ms、展開すると 760ms)。upstream は受信の job data に activity
+// をオブジェクトで持つ (配送は JSON 文字列)。
+//
+// オブジェクトか配列として読めるときだけ置き換え、それ以外 (壊れた本文や JSON の
+// 文字列) は元の形 (base64 か、読める文字列) のまま返す。**不正な UTF-8 も
+// 埋め込まない。** RawMessage は書き直さずに出すので、UTF-8 を厳密に読む
+// クライアントで一覧全体が読めなくなる (受信の本文は受付で UTF-8 を検査しない)。
+func embedActivityBody(m map[string]json.RawMessage) {
+	// 優先の順は worker (`queue` の activityBodyWire.decode) と同じく
+	// bodyEscaped > bodyText > body。書く側は 1 つしか出さないが、揃えておく。
+	if escaped, ok := m["bodyEscaped"]; ok {
+		// < などをエスケープしたままのオブジェクト。JSON としては元の本文と同じ
+		// 値なので、そのまま `body` に置けばよい (バイト列まで戻すのは worker だけ
+		// でよい)。
+		m["body"] = escaped
+		delete(m, "bodyEscaped")
+		delete(m, "bodyText")
+	} else if rawText, ok := m["bodyText"]; ok {
+		// 文字列の形は、Data タブでは `body` に置く (形を base64 のときと揃える)。
+		// 埋め込めない本文 (壊れた JSON や深すぎる本文) は文字列のまま出す。
+		// base64 と違って読めるので、そのまま見せてよい。
+		var text string
+		if json.Unmarshal(rawText, &text) != nil {
+			return
+		}
+		if raw, ok := embeddableActivity([]byte(text)); ok {
+			m["body"] = raw
+		} else {
+			m["body"] = rawText
+		}
+		delete(m, "bodyText")
+		return
+	}
+	body := m["body"]
+	if len(body) == 0 {
+		return
+	}
+	switch body[0] {
+	case '"':
+		var raw []byte
+		if json.Unmarshal(body, &raw) != nil {
+			return
+		}
+		if emb, ok := embeddableActivity(raw); ok {
+			m["body"] = emb
+		}
+	case '{', '[':
+		// 載せる側 (`driver.IsVerbatimJSON`) が深さを抑えているが、読む側でも
+		// 確かめる。深すぎると一覧の書き出しが失敗する (maxEmbeddedActivityDepth)。
+		if !jsonNestingWithin(body, maxEmbeddedActivityDepth) {
+			if s, err := json.Marshal(string(body)); err == nil {
+				m["body"] = s
+			}
+		}
+	}
+}
+
+// embeddableActivity returns raw trimmed for embedding when it is a JSON
+// object or array that nests at most maxEmbeddedActivityDepth levels and is
+// valid UTF-8.
+func embeddableActivity(raw []byte) (json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') ||
+		!jsonNestingWithin(trimmed, maxEmbeddedActivityDepth) || !json.Valid(trimmed) || !utf8.Valid(trimmed) {
+		return nil, false
+	}
+	return json.RawMessage(trimmed), true
+}
+
+// maxEmbeddedActivityDepth bounds the nesting of an activity embedded by
+// expandActivityBody.
+//
+// **深い本文は埋め込まない。** encoding/json は RawMessage を書き出すときに
+// 外側の入れ子と合わせて深さ (上限 10000) を数え直す。`json.Valid` は本文だけを
+// 見るので、9997 段の本文が通り、一覧 (`[{data:{body:{body: …}}}]`) の書き出しが
+// 失敗して、200 のまま本文の空なレスポンスになった (#3550 のレビュー)。受信の
+// 本文は署名を検証する前に積まれるので、外から 1 件で一覧全体を潰せる。
+// ActivityPub の activity は普通 10 段にも届かないので、64 段で十分。
+const maxEmbeddedActivityDepth = 64
+
+// jsonNestingWithin reports whether the arrays and objects in raw nest at most
+// max levels deep. raw must be JSON (strings are skipped by their quotes).
+func jsonNestingWithin(raw []byte, max int) bool {
+	depth := 0
+	inString := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if inString {
+			switch c {
+			case '\\':
+				i++
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+			if depth > max {
+				return false
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return true
 }
 
 // attemptsAtOrEmpty normalises the attempt-start list for JSON.
@@ -1222,6 +1393,10 @@ var jobSecretKeys = map[string]struct{}{
 	// allowlist が無い)。upstream も job data に secret を入れているので
 	// parity ではあるが、読める必要は無い。
 	"overrideSecret": {},
+	// 同じくテスト送信の送信先。Discord や Slack の webhook は URL そのものが
+	// 資格情報なので、secret と同じ扱いにする。mk-go は保存済みの webhook を
+	// webhookId で引くので、URL が job に載るのはテスト送信だけ。
+	"overrideUrl": {},
 	// プラグイン peer の送信本文 (`peerJob.Envelope`、#3037)。**中身を決めるのは
 	// プラグイン**で、本体はそれが何かを知らない。実際の同梱プラグインは
 	// 利用者のノートや外部サービスの応答を載せうるし、peer は本来「その
@@ -1235,16 +1410,52 @@ var jobSecretKeys = map[string]struct{}{
 	"envelope": {},
 }
 
+// jobSecretKeysByType are payload fields hidden only for one task type,
+// because the same key means something else in other payloads.
+var jobSecretKeysByType = map[string]map[string]struct{}{
+	// Web Push の通知の中身 (`queue.WebPushPayload.Body`)。チャットのメッセージや
+	// フォロワー限定・ダイレクトのノートの本文が入り、**宛先の本人にしか見せない
+	// もの**。upstream は push を queue に積まないので、モデレーターの queue 画面に
+	// 出るのは mk-go だけ。宛先 (`userId`) と種類 (`type`) は追跡に要るので残す。
+	// `body` は webhook の job では upstream も見せている送信本文なので、型を
+	// 限って伏せる。
+	queue.TaskTypeWebPush: {"body": {}},
+}
+
+// isJobSecretKey reports whether key must be redacted in a payload of taskType.
+func isJobSecretKey(taskType, key string) bool {
+	if _, ok := jobSecretKeys[key]; ok {
+		return true
+	}
+	_, ok := jobSecretKeysByType[taskType][key]
+	return ok
+}
+
 const redactedPlaceholder = "[redacted]"
 
+// urlErrorPrefix matches the `<Op> "<URL>": ` part of a *url.Error message.
+var urlErrorPrefix = regexp.MustCompile(`([A-Za-z]+) "(?:[^"\\]|\\.)*": `)
+
+// redactJobErrorURL removes request URLs from a webhook job's failure text.
+//
+// processor は失敗の文面から URL を落とすようにした (webhook の URL は資格情報に
+// なりうる) が、それより前に失敗した job は URL 入りの文面を Redis に持っている。
+// 表示の側でも伏せる。検索はこの結果に対して行うので、URL で当てることもできない。
+func redactJobErrorURL(taskType, s string) string {
+	if taskType != queue.TaskTypeUserWebhook && taskType != queue.TaskTypeSystemWebhook {
+		return s
+	}
+	return urlErrorPrefix.ReplaceAllString(s, "$1 "+redactedPlaceholder+": ")
+}
+
 // redactJobSecrets replaces secret-bearing fields in a decoded job body.
-func redactJobSecrets(body any) any {
+func redactJobSecrets(taskType string, body any) any {
 	m, ok := body.(map[string]any)
 	if !ok {
 		return body
 	}
 	for k := range m {
-		if _, secret := jobSecretKeys[k]; secret {
+		if isJobSecretKey(taskType, k) {
 			m[k] = redactedPlaceholder
 		}
 	}
@@ -1256,18 +1467,21 @@ func redactJobSecrets(body any) any {
 // JSON として読めないものはそのまま返す (非 JSON payload の job がありうる)。
 // 伏せ損ねるより読めるほうを優先する形だが、この経路は `data` 側の redact と
 // 二重になっており、かつ producer は既に鍵を載せていないので実害は無い。
-func redactPayloadSecrets(raw []byte) string {
+func redactPayloadSecrets(taskType string, raw []byte) string {
 	if len(raw) == 0 {
 		return string(raw)
 	}
-	var m map[string]any
+	// 値は木に展開しない。配送と受信の payload は本文をオブジェクトのまま持つ
+	// (#3614) ので、`map[string]any` に読むと一覧の 1 回でメモリが膨らむ
+	// (activityPayloadFields と同じ理由)。
+	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return string(raw)
 	}
 	var found bool
 	for k := range m {
-		if _, secret := jobSecretKeys[k]; secret {
-			m[k] = redactedPlaceholder
+		if isJobSecretKey(taskType, k) {
+			m[k] = json.RawMessage(`"` + redactedPlaceholder + `"`)
 			found = true
 		}
 	}

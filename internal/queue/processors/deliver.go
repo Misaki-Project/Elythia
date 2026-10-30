@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
@@ -106,14 +107,26 @@ type Ed25519AcceptanceRecorder interface {
 // DeliverProcessor handles ap:deliver tasks by posting the activity body to
 // the recipient inbox with an HTTP signature.
 type DeliverProcessor struct {
-	signer           HTTPSigner
-	responseHook     ResponseHook
-	chartHook        ChartHook
-	telemetry        DeliveryTelemetry
-	breaker          DeliveryBreaker
+	signer       HTTPSigner
+	responseHook ResponseHook
+	chartHook    ChartHook
+	telemetry    DeliveryTelemetry
+	breaker      DeliveryBreaker
+	// suspendedChecker は deliverSuspendedSoftware の判定。設定は判定のたびに読むので、
+	// 設定が空でも常に渡す (#3558)。deliveryGate とは別の関門。enqueue 側にはこの検査が
+	// 無いので、無いと管理画面で配送停止にしたソフトウェアへ新しいジョブごと配送し続ける
+	// (画面には配送停止と出る)。
 	suspendedChecker SuspendedChecker
-	deliveryGate     DeliveryGate
-	capabilities     Ed25519AcceptanceRecorder
+	// deliveryGate は enqueue 時のチェックを通り抜けたジョブ (ブロック前に積まれたもの・
+	// retry-backoff 中のもの) を弾く第 2 の関門 (#1404)。enqueue 時のチェック
+	// (core/federation.DeliverService の hostBlocker) では代替できない。
+	deliveryGate DeliveryGate
+	capabilities Ed25519AcceptanceRecorder
+	// metadataRefresher は配送に成功した相手の nodeinfo を取り直す (#3564)。
+	// statsEnabled は meta.enableStatsForFederatedInstances を判定のたびに読む。
+	// nil なら有効として扱う。
+	metadataRefresher InstanceMetadataRefresher
+	statsEnabled      func() bool
 	// redis is used for the per-host Ed25519 degrade flag (#1067 / #1071).
 	// 未配線時は capability gate なしの楽観動作 (= payload に Ed25519 鍵が
 	// あれば必ず Ed25519 sign を試す) になるが、production では必須。
@@ -123,13 +136,33 @@ type DeliverProcessor struct {
 	// 毎 job で PEM->x509 を再パースしていた。worker 間共有の単一 processor
 	// にここを持たせて job 横断でメモ化する (#1425)。nil の場合は都度パース。
 	keyCache *lru.Cache[string, *activitypub.PrivateKey]
-	// keySource は payload に鍵が無いとき (= 新しい job) に引く先。
+	// keyMu / keyGen は DropLocal (#3732) のための世代。署名者の利用者で引く entry は
+	// DB の秘密鍵の写しなので、DB から読んでいる間に捨てられたら、読んだ鍵を積まない。
+	// (kind, keyID, PEM) で引く entry は解析の結果だけで古くならないので守らない。
+	keyMu  sync.Mutex
+	keyGen uint64
+	// keySource は payload に鍵が無いとき (= 新しい job) に引く先。鍵を payload に
+	// 載せなくなったので、無いと全ての AP 配送が POST されないまま失敗する。
 	keySource SigningKeySource
 }
 
 // NewDeliverProcessor constructs a DeliverProcessor.
-func NewDeliverProcessor(signer HTTPSigner) *DeliverProcessor {
-	p := &DeliverProcessor{signer: signer}
+//
+// deliveryGate is consulted at dispatch time to skip delivery to blocked /
+// suspended instances (#1404). keySource resolves the signing keys when a
+// payload carries none. suspendedChecker skips hosts running software listed
+// in deliverSuspendedSoftware (#3558). metadataRefresher refreshes the nodeinfo
+// of hosts that accepted a delivery (#3564); statsEnabled gates it like
+// upstream's enableStatsForFederatedInstances, and nil means always enabled.
+func NewDeliverProcessor(signer HTTPSigner, deliveryGate DeliveryGate, keySource SigningKeySource, suspendedChecker SuspendedChecker, metadataRefresher InstanceMetadataRefresher, statsEnabled func() bool) *DeliverProcessor {
+	p := &DeliverProcessor{
+		signer:            signer,
+		deliveryGate:      deliveryGate,
+		keySource:         keySource,
+		suspendedChecker:  suspendedChecker,
+		metadataRefresher: metadataRefresher,
+		statsEnabled:      statsEnabled,
+	}
 	// lru.New は size>0 で error を返さない実装だが、防御的に握って nil
 	// fallback (= 都度パース) に倒す。
 	if c, err := lru.New[string, *activitypub.PrivateKey](deliverKeyCacheSize); err == nil {
@@ -180,15 +213,6 @@ type SigningKeySource interface {
 	SigningKeyPEM(userID, kind string) (string, error)
 }
 
-// SetSigningKeySource attaches the resolver used when a payload carries no key.
-func (p *DeliverProcessor) SetSigningKeySource(s SigningKeySource) {
-	p.keySource = s
-}
-
-// HasSigningKeySource reports whether the resolver is wired.
-// **未配線だと全ての AP 配送が失敗する**ので criticalWiring 表で見る。
-func (p *DeliverProcessor) HasSigningKeySource() bool { return p.keySource != nil }
-
 // resolveSigningKey returns the parsed key for kind, preferring the payload's
 // inline PEM when present.
 //
@@ -210,7 +234,8 @@ func (p *DeliverProcessor) resolveSigningKey(kind string, payload queue.DeliverP
 	}
 	if p.keySource == nil {
 		// **恒久扱いにしない。** 配線漏れは再起動で直るので、job を捨てるより
-		// retry させて運用者が気付ける形にする (criticalWiring 表でも見る)。
+		// retry させて運用者が気付ける形にする。構築子の必須の引数で、本番の組み立てで
+		// nil でないことは TestBuiltHandlersHaveNoNilDependencies が見る (#3829)。
 		return nil, fmt.Errorf("no signing key source configured for %s", kind)
 	}
 	// **fetch に使う値 (SignerUserID) でメモ化する。** keyID を使うと、
@@ -230,6 +255,9 @@ func (p *DeliverProcessor) resolveSigningKey(kind string, payload queue.DeliverP
 			return k, nil
 		}
 	}
+	p.keyMu.Lock()
+	gen := p.keyGen
+	p.keyMu.Unlock()
 	pem, err := p.keySource.SigningKeyPEM(payload.SignerUserID, kind)
 	if err != nil {
 		return nil, fmt.Errorf("load %s signing key: %w", kind, err)
@@ -243,9 +271,29 @@ func (p *DeliverProcessor) resolveSigningKey(kind string, payload queue.DeliverP
 		return nil, fmt.Errorf("%w: %w", errSigningKeyInvalid, err)
 	}
 	if p.keyCache != nil {
-		p.keyCache.Add(ck, k)
+		p.keyMu.Lock()
+		if p.keyGen == gen {
+			p.keyCache.Add(ck, k)
+		}
+		p.keyMu.Unlock()
 	}
 	return k, nil
+}
+
+// DropLocal drops every parsed signing key this processor holds (#3732). It is
+// what the cache list of internal/server calls (docs/architecture.md 4.4).
+//
+// 署名者の利用者で引く entry は DB の秘密鍵の写しで、DB を戻すと古くなりうる。
+// (kind, keyID, PEM) で引く entry は解析の結果だけだが、同じ LRU に入っているので
+// 一緒に捨てる (読み直すのは解析の分だけ)。
+func (p *DeliverProcessor) DropLocal() {
+	if p.keyCache == nil {
+		return
+	}
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
+	p.keyGen++
+	p.keyCache.Purge()
 }
 
 // errSigningKeyInvalid marks a key that will never parse (retry は無意味)。
@@ -387,18 +435,6 @@ func (p *DeliverProcessor) recordEd25519Failure(host string) {
 	}
 }
 
-// SetSuspendedChecker attaches a checker for deliverSuspendedSoftware.
-func (p *DeliverProcessor) SetSuspendedChecker(c SuspendedChecker) {
-	p.suspendedChecker = c
-}
-
-// SetDeliveryGate attaches a gate consulted at dispatch time to skip delivery
-// to blocked / suspended instances. 未配線なら従来どおりゲート無しで配送する
-// (#1404)。
-func (p *DeliverProcessor) SetDeliveryGate(g DeliveryGate) {
-	p.deliveryGate = g
-}
-
 // SetResponseHook attaches a ResponseHook used to update instance health flags.
 func (p *DeliverProcessor) SetResponseHook(h ResponseHook) {
 	p.responseHook = h
@@ -445,6 +481,22 @@ func (p *DeliverProcessor) recordSuccess(inbox string) {
 	if p.chartHook != nil {
 		p.chartHook.OnDelivered(host, true)
 	}
+}
+
+// refreshMetadata schedules a background nodeinfo refetch after a 2xx delivery
+// (#3564).
+//
+// 本家と同じく 2xx のときだけ、enableStatsForFederatedInstances が有効なときだけ
+// 取りに行く (DeliverProcessorService は 4xx を catch 側で扱い、そこでは呼ばない)。
+// 配送停止中の相手へは送らないのでここに来ないが、その相手は受信の側で取り直す。
+func (p *DeliverProcessor) refreshMetadata(host string) {
+	if p.metadataRefresher == nil || host == "" {
+		return
+	}
+	if p.statsEnabled != nil && !p.statsEnabled() {
+		return
+	}
+	p.metadataRefresher.MaybeRefresh(host)
 }
 
 // recordGoneSuspended is a best-effort wrapper that suspends the instance whose
@@ -645,6 +697,7 @@ func (p *DeliverProcessor) Handle(ctx context.Context, t driver.Task) error {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		p.recordSuccess(payload.Inbox)
 		_, _ = p.recordAttempt(a, deliveryhealth.ClassSuccess, resp.StatusCode, "")
+		p.refreshMetadata(host)
 		if signedWithEd25519 {
 			// Ed25519 で送って同期的に拒否されなかったことを記録する (#2393)。
 			// 「相手が検証できた」までは言えない (verify-in-worker な実装は検証前に
@@ -751,16 +804,6 @@ func (p *DeliverProcessor) sendOnce(payload queue.DeliverPayload, useEd25519 boo
 	}
 	return resp, false, nil
 }
-
-// HasDeliveryGate reports whether the dispatch-time delivery gate was wired.
-//
-// **enqueue 時のチェックを通り抜けたジョブを弾く第 2 の関門**なので、
-// `deliver.hostBlockChecker` では代替できない。ブロック前に積まれたジョブや
-// retry-backoff 中のジョブが該当する (#1404)。起動時検査に使う (#2708)。
-//
-// `SetSuspendedChecker` は operator が `deliverSuspendedSoftware` を設定した
-// ときだけ配線されるので対象外。
-func (p *DeliverProcessor) HasDeliveryGate() bool { return p.deliveryGate != nil }
 
 // parseRetryAfter reads an HTTP Retry-After value (delay-seconds or an
 // HTTP-date). It returns 0 when the header is absent or unusable; the

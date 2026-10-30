@@ -7,7 +7,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
@@ -53,7 +55,7 @@ func (h *Handler) ListsCreateFromPublic(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// upstream paramDef: name minLength:1 (=空チェック) / maxLength:100。
-	if utf8.RuneCountInString(req.Name) > 100 {
+	if !colfit.Fits(req.Name, 100) {
 		return apierr.JSONInvalidParam(c)
 	}
 	if h.userListRepo == nil {
@@ -69,7 +71,8 @@ func (h *Handler) ListsCreateFromPublic(c echo.Context) error {
 	}
 	// userListLimit gate (TOO_MANY_USERLISTS)。
 	if h.rolePolicyProvider != nil {
-		if limit, ok := role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(viewer.ID)["userListLimit"]); ok && limit >= 0 {
+		// 負の値は upstream と同じく「1 件も作れない」になる (`count >= limit` が常に真)。
+		if limit, ok := role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(viewer.ID)["userListLimit"]); ok {
 			count, cerr := h.userListRepo.CountByUser(viewer.ID)
 			if cerr != nil {
 				return apierr.JSONInternalError(c)
@@ -94,12 +97,11 @@ func (h *Handler) ListsCreateFromPublic(c echo.Context) error {
 		// list 自体は既に作成済みなので、メンバーコピー失敗時も新 list を返す。
 		return c.JSON(http.StatusOK, entity.PackUserList(newList, nil, h.idGen))
 	}
-	// member 上限 (userEachUserListsLimit)。-1 は無制限扱い。
-	memberLimit := -1.0
+	// member 上限 (userEachUserListsLimit)。ポリシーが無いときだけ上限なし。
+	// 負の値は upstream (addMember の `count >= limit`) と同じく 1 人も足せない。
+	memberLimit, hasMemberLimit := 0.0, false
 	if h.rolePolicyProvider != nil {
-		if l, ok := role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(viewer.ID)["userEachUserListsLimit"]); ok {
-			memberLimit = l
-		}
+		memberLimit, hasMemberLimit = role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(viewer.ID)["userEachUserListsLimit"])
 	}
 	memberIDs := make([]string, 0, len(members))
 	var remoteMembers []string
@@ -125,7 +127,7 @@ func (h *Handler) ListsCreateFromPublic(c echo.Context) error {
 			}
 		}
 		// TOO_MANY_USERS: member 上限に達したら中断 (upstream addMember の TooManyUsersError)。
-		if memberLimit >= 0 && float64(len(memberIDs)) >= memberLimit {
+		if hasMemberLimit && float64(len(memberIDs)) >= memberLimit {
 			return c.JSON(http.StatusBadRequest, apierr.Error("TOO_MANY_USERS", "You can not push users any more.", "1845ea77-38d1-426e-8e4e-8b83b24f5bd7"))
 		}
 		mb := &model.UserListMembership{
@@ -258,7 +260,7 @@ func (h *Handler) ListsUpdate(c echo.Context) error {
 	// upstream update.ts は name を minLength:1/maxLength:100 で validate する。
 	// name は optional だが、渡されたら検証する (空文字や 100 超は INVALID_PARAM、#1550)。
 	if req.Name != nil {
-		if rc := utf8.RuneCountInString(*req.Name); rc < 1 || rc > 100 {
+		if rc := utf8.RuneCountInString(*req.Name); rc < 1 || rc > 100 || !colfit.Storable(*req.Name) {
 			return apierr.JSONInvalidParam(c)
 		}
 	}
@@ -372,13 +374,13 @@ func (h *Handler) ListsUpdateMembership(c echo.Context) error {
 func (h *Handler) ListsGetMemberships(c echo.Context) error {
 	viewer := middleware.GetUser(c)
 	var req struct {
-		ListID    string `json:"listId"`
-		ForPublic bool   `json:"forPublic"`
-		Limit     int    `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		ListID    string     `json:"listId"`
+		ForPublic bool       `json:"forPublic"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil || req.ListID == "" {
 		return apierr.JSONInvalidParam(c)
@@ -386,9 +388,9 @@ func (h *Handler) ListsGetMemberships(c echo.Context) error {
 	if h.userListRepo == nil {
 		return apierr.JSONInternalError(c)
 	}
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 30
+	limit := 30
+	if p := req.Limit.IntPtr(); p != nil && *p > 0 {
+		limit = *p
 	}
 	if limit > 100 {
 		limit = 100
@@ -412,7 +414,7 @@ func (h *Handler) ListsGetMemberships(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_LIST", "No such list.", noSuchList))
 	}
 
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}

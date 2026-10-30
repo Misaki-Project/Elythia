@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: mk-go project
+ * SPDX-FileCopyrightText: Elythia-Network
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -39,7 +39,7 @@ describe('registration mode (#3186)', () => {
 	test('each patch reads back as the chosen mode', () => {
 		for (const mode of ['open', 'invite', 'approval'] as const satisfies RegistrationMode[]) {
 			const p = registrationModePatch[mode];
-			expect(registrationModeOf({ closed: p.registrationClosed, approval: p.approvalRequiredForSignup, disableRegistration: p.disableRegistration })).toBe(mode);
+			expect(registrationModeOf({ closed: p.registrationClosed, approval: p.approvalRequiredForSignup === true, disableRegistration: p.disableRegistration === true })).toBe(mode);
 		}
 	});
 

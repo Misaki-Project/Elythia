@@ -52,13 +52,12 @@ func TestCleanProcessorReceivesThePendingPruner(t *testing.T) {
 		"NewCleanProcessor に %s の引数が無い (rename した?)", pendingPrunerParamType)
 
 	// (b) 呼び出し側がその位置に constructor を渡していること。
-	f, err := parser.ParseFile(fset,
-		filepath.Join("..", "server", "router.go"), nil, parser.ParseComments)
-	require.NoError(t, err)
+	// internal/server の全ファイルを読む (#3672)。
+	_, files := parseServerFiles(t, parser.ParseComments)
 
 	found := false
 	wired := false
-	ast.Inspect(f, func(n ast.Node) bool {
+	inspectServerFiles(files, func(n ast.Node) bool {
 		call, isCall := n.(*ast.CallExpr)
 		if !isCall {
 			return true
@@ -80,11 +79,30 @@ func TestCleanProcessorReceivesThePendingPruner(t *testing.T) {
 		return true
 	})
 
-	require.True(t, found, "router.go に NewCleanProcessor の呼び出しが無い (rename した?)")
+	require.True(t, found, "internal/server に NewCleanProcessor の呼び出しが無い (rename した?)")
 	assert.True(t, wired,
 		"NewCleanProcessor の %d 番目の引数に %s(...) を渡していない。"+
 			"渡さないと期限切れの登録 (メールアドレスとパスワードハッシュ) が無期限に貯まる",
 		idx, pendingPrunerConstructor)
+
+	// 上の構築の行は buildQueue の中にある (#3690)。setupRoutes が setter を呼び、
+	// handler として登録するのは別名なので、構築から登録までの段も照合する。上の行
+	// だけだと、setupRoutes の別名を別の processor に書き換えても緑のまま通る
+	// (docs/architecture.md 4.2)。別名は buildQueue の戻り値を受けた変数 queueSvcs から
+	// 取る形にしてあり、別名を buildQueue の呼び出しより前に書くとコンパイルが通らない。
+	// 照合もその形で行う。
+	assertWired(t, serverPkg, "cleanGenericProcessor: cleanGenericProcessor",
+		"buildQueue が作った日次の clean の processor を queue に入れていない。")
+	assertWired(t, serverPkg, "queueSvcs := s.buildQueue(w, coreSvcs, idGen)",
+		"setupRoutes が buildQueue の processor を使っていない。")
+	assertWired(t, serverPkg, "w.queue = queueSvcs",
+		"buildQueue の processor を wiring に入れていない。")
+	assertWired(t, serverPkg, "cleanGenericProcessor := queueSvcs.cleanGenericProcessor",
+		"setupRoutes の日次の clean の processor が buildQueue で作ったものでなくなる。")
+	// 登録する processor は、setter を呼んだ別名と同じ値であること。一覧の欄名は
+	// 別名と違う名前にしてあるので、上の "cleanGenericProcessor: …" とは重ならない。
+	assertWired(t, serverPkg, "clean: cleanGenericProcessor",
+		"日次の clean の job を、setter を呼んだのと別の processor が受ける。")
 }
 
 // pendingPrunerParamIndex returns the flattened index of the pruner parameter

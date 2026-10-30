@@ -4,10 +4,10 @@ name: Upstream backend e2e
 # API 互換性の regression を検知する。
 #
 # 本家は UPSTREAM_MISSKEY_VERSION の版を .cache/misskey/<版> に checkout する
-# (#3378)。テスト本体には一切手を入れず、
-# tests/upstream-e2e/harness/ の vitest 設定 (globalSetup = mk-go バイナリの
-# 起動、setupFiles = /api/reset-db) を本家の packages/backend/ へコピーして
-# 差し替える。上流でテストが増えれば自動的に検証対象も増える。
+# (#3378)。tests/upstream-e2e/harness/ の vitest 設定 (globalSetup = mk-go バイナリの
+# 起動、setupFiles = /api/reset-db) を本家の packages/backend/ へコピーして差し替え、
+# Elythia 独自の additive API field がある UserLite の期待 DTO だけを runtime patch で
+# 拡張する。上流でテストが増えれば自動的に検証対象も増える。
 #
 # 『通らないことが正しい』テストは tests/upstream-e2e/known-divergences.json に
 # 根拠付きで登録し、vitest の expected-failure (task.fails) として扱う。skip では
@@ -135,7 +135,7 @@ jobs:
           package_json_file: .cache/misskey/${{ steps.upstream.outputs.version }}/package.json
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .cache/misskey/${{ steps.upstream.outputs.version }}/.node-version
           cache: pnpm
@@ -157,7 +157,7 @@ jobs:
       # 「サーバーが何を返したか」が分からないことが多い。
       - name: Upload mk-go log on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: upstream-e2e-mkgo-log-${{ matrix.shard }}
           path: /tmp/mkgo-upstream-e2e.log

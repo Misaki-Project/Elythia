@@ -59,7 +59,13 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<span v-else-if="(log.type as string) === 'resetEmojiApplicationQuota'">: {{ mkgoTargetAcct(log.info) }}</span>
 		<!-- mk-go 独自 (#3067)。どのホストとの関係を片付けたかを見出しに出す。 -->
 		<span v-else-if="(log.type as string) === 'cleanGoneInstance'">: {{ (log.info as { host?: string }).host }}</span>
+		<!-- Elythia 独自: 配送のブレーカーを手で閉じたホストと、審査した登録の申請。 -->
+		<span v-else-if="(log.type as string) === 'closeDeliveryBreaker'">: {{ (log.info as { host?: string }).host }}</span>
+		<span v-else-if="(log.type as string) === 'approveSignupApplication' || (log.type as string) === 'rejectSignupApplication'">: <span class="_monospace">{{ (log.info as { applicationId?: string }).applicationId }}</span></span>
 		<span v-else-if="(log.type as string) === 'createFederationRule' || (log.type as string) === 'updateFederationRule' || (log.type as string) === 'deleteFederationRule'">: {{ (log.info as { ruleName?: string }).ruleName || (log.info as { ruleId?: string }).ruleId }}</span>
+		<!-- mk-go: DB のバックアップの管理画面 (#3462)。世代を対象にする操作は世代の ID を出す。 -->
+		<span v-else-if="(log.type as string) === 'verifyBackup' || (log.type as string) === 'deleteBackup' || (log.type as string) === 'downloadBackup' || (log.type as string) === 'restoreBackup'">: <span class="_monospace">{{ (log.info as { generationId?: string }).generationId }}</span></span>
+		<span v-else-if="(log.type as string) === 'rollbackBackup'">: <span class="_monospace">{{ (log.info as { from?: string }).from }}</span></span>
 		<span v-else-if="log.type === 'assignRole'">: @{{ log.info.userUsername }}{{ log.info.userHost ? '@' + log.info.userHost : '' }} <i class="ti ti-arrow-right"></i> {{ log.info.roleName }}</span>
 		<span v-else-if="log.type === 'unassignRole'">: @{{ log.info.userUsername }}{{ log.info.userHost ? '@' + log.info.userHost : '' }} <i class="ti ti-equal-not"></i> {{ log.info.roleName }}</span>
 		<span v-else-if="log.type === 'createRole'">: {{ roleLogName(log.info) }}</span>
@@ -104,9 +110,20 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<i v-else-if="log.type === 'resetPassword'" class="ti ti-key"></i>
 		<i v-else-if="(log.type as string) === 'resetEmojiApplicationQuota'" class="ti ti-icons"></i>
 		<i v-else-if="(log.type as string) === 'cleanGoneInstance'" class="ti ti-unlink"></i>
+		<i v-else-if="(log.type as string) === 'closeDeliveryBreaker'" class="ti ti-player-play"></i>
+		<i v-else-if="(log.type as string) === 'approveSignupApplication'" class="ti ti-user-check"></i>
+		<i v-else-if="(log.type as string) === 'rejectSignupApplication'" class="ti ti-user-x"></i>
 		<i v-else-if="(log.type as string) === 'createFederationRule'" class="ti ti-plus"></i>
 		<i v-else-if="(log.type as string) === 'updateFederationRule'" class="ti ti-pencil"></i>
 		<i v-else-if="(log.type as string) === 'deleteFederationRule'" class="ti ti-trash"></i>
+		<i v-else-if="(log.type as string) === 'listBackups'" class="ti ti-list"></i>
+		<i v-else-if="(log.type as string) === 'listKeptDatabases'" class="ti ti-list"></i>
+		<i v-else-if="(log.type as string) === 'takeBackup'" class="ti ti-database-export"></i>
+		<i v-else-if="(log.type as string) === 'verifyBackup'" class="ti ti-checkup-list"></i>
+		<i v-else-if="(log.type as string) === 'deleteBackup'" class="ti ti-trash"></i>
+		<i v-else-if="(log.type as string) === 'downloadBackup'" class="ti ti-download"></i>
+		<i v-else-if="(log.type as string) === 'restoreBackup'" class="ti ti-database-import"></i>
+		<i v-else-if="(log.type as string) === 'rollbackBackup'" class="ti ti-arrow-back-up"></i>
 		<i v-else-if="log.type === 'assignRole'" class="ti ti-user-plus"></i>
 		<i v-else-if="log.type === 'unassignRole'" class="ti ti-user-minus"></i>
 		<i v-else-if="log.type === 'createRole'" class="ti ti-plus"></i>

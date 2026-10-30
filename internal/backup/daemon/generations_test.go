@@ -1,0 +1,252 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/elythia-network/elythia/internal/backup"
+	"github.com/elythia-network/elythia/internal/config"
+)
+
+var t0 = time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
+
+func dayN(n int) time.Time { return t0.AddDate(0, 0, n) }
+
+func TestScanClassifiesGenerations(t *testing.T) {
+	st := newMemStorage()
+	ok := st.addGeneration(dayN(0), true, "ok")
+	failed := st.addGeneration(dayN(1), true, "failed")
+	garbage := st.addGeneration(dayN(2), true, "garbage")
+	unverified := st.addGeneration(dayN(3), true, "")
+	partial := st.addGeneration(dayN(4), false, "")
+	st.set("generations/latest/meta.json", []byte("{}"))
+	st.set("generations/"+ok, []byte("not inside a directory"))
+
+	gens, err := Scan(context.Background(), st, nil)
+	require.NoError(t, err)
+	require.Len(t, gens, 5)
+	want := []struct {
+		id       string
+		complete bool
+		verify   VerifyState
+	}{
+		{ok, true, VerifyOK}, {failed, true, VerifyFailed}, {garbage, true, VerifyUnreadable},
+		{unverified, true, VerifyNone}, {partial, false, VerifyNone},
+	}
+	for i, w := range want {
+		assert.Equal(t, w.id, gens[i].ID)
+		assert.Equal(t, w.complete, gens[i].Complete, w.id)
+		assert.Equal(t, w.verify, gens[i].Verify, w.id)
+		assert.True(t, gens[i].Time.Equal(dayN(i)), w.id)
+	}
+	assert.Equal(t, int64(len("dump-"+ok))+int64(len(mustGet(t, st, backup.Key(ok, backup.MetaFile))))+int64(len(mustGet(t, st, backup.Key(ok, backup.VerifyFile)))), gens[0].Size)
+}
+
+func mustGet(t *testing.T, st *memStorage, key string) []byte {
+	t.Helper()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	b, ok := st.objects[key]
+	require.True(t, ok, key)
+	return b
+}
+
+// verify.json の ok が true でも、restore と同じ基準 (backup.VerifyPassed) で通って
+// いなければ使える世代に数えない。数えると、restore が選ばない世代を残して古い世代を
+// 消しうる。
+func TestScanUsesVerifyPassed(t *testing.T) {
+	st := newMemStorage()
+	stale := st.addGeneration(dayN(0), true, "")
+	b, err := json.Marshal(backup.VerifyResult{ID: stale, OK: true, DumpSHA256: "0000"})
+	require.NoError(t, err)
+	st.set(backup.Key(stale, backup.VerifyFile), b)
+	other := st.addGeneration(dayN(1), true, "")
+	b, err = json.Marshal(backup.VerifyResult{ID: stale, OK: true})
+	require.NoError(t, err)
+	st.set(backup.Key(other, backup.VerifyFile), b)
+	gens, err := Scan(context.Background(), st, nil)
+	require.NoError(t, err)
+	require.Len(t, gens, 2)
+	assert.Equal(t, VerifyFailed, gens[0].Verify, "dumpSha256 differs from meta.json")
+	assert.Equal(t, VerifyFailed, gens[1].Verify, "verify.json of another generation")
+}
+
+func TestScanErrors(t *testing.T) {
+	st := newMemStorage()
+	st.addGeneration(dayN(0), true, "ok")
+	st.listErr = errBoom
+	_, err := Scan(context.Background(), st, nil)
+	require.ErrorIs(t, err, errBoom)
+}
+
+// 読めない meta.json / verify.json は、理由に関わらず使えない世代に倒す。
+func TestScanTreatsUnreadableFilesAsUnusable(t *testing.T) {
+	st := newMemStorage()
+	id := st.addGeneration(dayN(0), true, "ok")
+	st.getErr = errBoom
+	gens, err := Scan(context.Background(), st, nil)
+	require.NoError(t, err)
+	require.Len(t, gens, 1)
+	assert.False(t, gens[0].Complete, "meta.json that cannot be read")
+	assert.Equal(t, VerifyUnreadable, gens[0].Verify)
+	assert.False(t, gens[0].Usable(false))
+
+	// meta.json はあるが、名指しする dump が無い世代は揃っていない。
+	st.getErr = nil
+	require.NoError(t, st.Delete(context.Background(), backup.Key(id, backup.DumpFile)))
+	gens, err = Scan(context.Background(), st, nil)
+	require.NoError(t, err)
+	assert.False(t, gens[0].Complete, "meta.json without its dump")
+	assert.Equal(t, VerifyOK, gens[0].Verify)
+}
+
+func TestUsable(t *testing.T) {
+	for _, tc := range []struct {
+		g             Generation
+		strict, loose bool
+	}{
+		{Generation{Complete: true, Verify: VerifyOK}, true, true},
+		{Generation{Complete: true, Verify: VerifyNone}, false, true},
+		{Generation{Complete: true, Verify: VerifyFailed}, false, false},
+		{Generation{Complete: true, Verify: VerifyUnreadable}, false, false},
+		{Generation{Complete: false, Verify: VerifyOK}, false, false},
+	} {
+		assert.Equal(t, tc.strict, tc.g.Usable(true), "%+v", tc.g)
+		assert.Equal(t, tc.loose, tc.g.Usable(false), "%+v", tc.g)
+	}
+}
+
+func ids(gens []Generation) []string {
+	out := []string{}
+	for _, g := range gens {
+		out = append(out, g.ID)
+	}
+	return out
+}
+
+func gen(n int, complete bool, v VerifyState) Generation {
+	return Generation{ID: backup.NewID(dayN(n)), Time: dayN(n), Complete: complete, Verify: v}
+}
+
+func TestPlanPrune(t *testing.T) {
+	ok0, ok1, ok2, ok3 := gen(0, true, VerifyOK), gen(1, true, VerifyOK), gen(2, true, VerifyOK), gen(3, true, VerifyOK)
+	failed := gen(4, true, VerifyFailed)
+	partial := gen(5, false, VerifyNone)
+	unverified := gen(6, true, VerifyNone)
+
+	assert.Empty(t, PlanPrune([]Generation{ok0, ok1, ok2, ok3}, 0, true), "keep 0 keeps everything")
+	assert.Empty(t, PlanPrune([]Generation{ok0, ok1}, 2, true), "exactly keep usable generations")
+	assert.Empty(t, PlanPrune(nil, 2, true))
+	assert.Equal(t, ids([]Generation{ok0, ok1}), ids(PlanPrune([]Generation{ok0, ok1, ok2, ok3}, 2, true)))
+
+	// 新しい側の検証に落ちた世代・半端な世代・未検証の世代は数えない。
+	// 使える世代が 2 個しかないので、何も消さない。
+	gens := []Generation{ok0, ok1, failed, partial, unverified}
+	assert.Empty(t, PlanPrune(gens, 3, true), "only broken generations newer: the old verified ones stay")
+	assert.Equal(t, ids([]Generation{ok0}), ids(PlanPrune(gens, 1, true)), "window starts at the newest usable; newer broken ones stay")
+
+	// 窓より古い壊れた世代は消す。
+	old := []Generation{gen(0, false, VerifyNone), gen(1, true, VerifyFailed), ok2, ok3}
+	assert.Equal(t, ids(old[:2]), ids(PlanPrune(old, 2, true)))
+
+	// 検証を回さない設定では、未検証でも揃っていれば数える。
+	assert.Equal(t, ids([]Generation{ok0, ok1, failed, partial}), ids(PlanPrune(gens, 1, false)))
+	assert.Equal(t, ids([]Generation{ok0}), ids(PlanPrune(gens, 2, false)))
+}
+
+func TestLatest(t *testing.T) {
+	gens := []Generation{gen(0, true, VerifyOK), gen(1, true, VerifyFailed), gen(2, false, VerifyNone)}
+	assert.Equal(t, gens[0].ID, Latest(gens, func(g Generation) bool { return g.Usable(true) }).ID)
+	assert.Equal(t, gens[1].ID, Latest(gens, func(g Generation) bool { return g.Complete }).ID)
+	assert.Nil(t, Latest(gens, func(Generation) bool { return false }))
+}
+
+// pruneDaemon is a daemon that keeps keep generations, for calling prune
+// directly.
+func pruneDaemon(t *testing.T, st backup.Storage, keep int) *Daemon {
+	s := mustSchedule(t, config.BackupScheduleOptions{Interval: "24h", Keep: keep}, time.UTC)
+	return New(Options{Schedule: s, Storage: st, Logger: discardLogger(), Clock: utcClock{}})
+}
+
+func TestPruneDeletesMetaFirst(t *testing.T) {
+	st := newMemStorage()
+	old := st.addGeneration(dayN(0), true, "ok")
+	newer := st.addGeneration(dayN(1), true, "ok")
+	deleted, err := pruneDaemon(t, st, 1).prune(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{old}, deleted)
+	require.NotEmpty(t, st.deleted)
+	assert.Equal(t, backup.Key(old, backup.MetaFile), st.deleted[0], "meta.json goes first")
+	assert.Len(t, st.deleted, 3)
+	assert.Equal(t, []string{newer}, st.ids())
+}
+
+func TestPruneReturnsDeleteErrors(t *testing.T) {
+	st := newMemStorage()
+	st.addGeneration(dayN(0), true, "ok")
+	st.addGeneration(dayN(1), true, "ok")
+	st.deleteErr = errBoom
+	deleted, err := pruneDaemon(t, st, 1).prune(context.Background())
+	require.ErrorIs(t, err, errBoom)
+	assert.Empty(t, deleted)
+}
+
+// goneStorage hides the objects of one generation from a listing of that
+// generation alone, as if the admin page deleted it after the daemon listed
+// every generation.
+type goneStorage struct {
+	*memStorage
+	gone string
+}
+
+func (g goneStorage) List(ctx context.Context, prefix string) ([]backup.ObjectInfo, error) {
+	if prefix == backup.Key(g.gone, "") {
+		return nil, nil
+	}
+	return g.memStorage.List(ctx, prefix)
+}
+
+// 一覧を取った後に管理画面から消された世代は、消す段の失敗にしない。
+func TestPruneSkipsGenerationAlreadyGone(t *testing.T) {
+	st := newMemStorage()
+	gone := st.addGeneration(dayN(0), true, "ok")
+	old := st.addGeneration(dayN(1), true, "ok")
+	newer := st.addGeneration(dayN(2), true, "ok")
+	deleted, err := pruneDaemon(t, goneStorage{memStorage: st, gone: gone}, 1).prune(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{old}, deleted, "the generation already gone is not reported as deleted")
+	assert.Equal(t, []string{gone, newer}, st.ids())
+}
+
+// 鍵があれば、署名の合う世代だけを揃った世代として数えること。保存先に書ける者が
+// 置いた偽の世代 (ok の verify.json 付き) で、整理の窓を埋めたり遅れの通知を
+// 止めたりさせない。
+func TestScanCountsOnlySignedGenerationsWithKey(t *testing.T) {
+	key := []byte(strings.Repeat("k", 32))
+	st := newMemStorage()
+	signed := st.addGeneration(dayN(0), true, "ok")
+	st.set(backup.Key(signed, backup.MetaSigFile), []byte(backup.SignMeta(key, signed, mustGet(t, st, backup.Key(signed, backup.MetaFile)))))
+	unsigned := st.addGeneration(dayN(1), true, "ok")
+	forged := st.addGeneration(dayN(2), true, "ok")
+	st.set(backup.Key(forged, backup.MetaSigFile), []byte(backup.SignMeta([]byte(strings.Repeat("x", 32)), forged, mustGet(t, st, backup.Key(forged, backup.MetaFile)))))
+
+	gens, err := Scan(context.Background(), st, key)
+	require.NoError(t, err)
+	require.Len(t, gens, 3)
+	assert.True(t, gens[0].Usable(true), signed)
+	assert.False(t, gens[1].Usable(true), "署名の無い世代を使える世代に数えた: %s", unsigned)
+	assert.False(t, gens[2].Usable(true), "署名の合わない世代を使える世代に数えた")
+
+	// 鍵が無ければ従来どおり。
+	gens, err = Scan(context.Background(), st, nil)
+	require.NoError(t, err)
+	for _, g := range gens {
+		assert.True(t, g.Usable(true), g.ID)
+	}
+}

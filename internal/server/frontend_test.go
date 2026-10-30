@@ -34,7 +34,7 @@ func TestFrontendHTML_SplashStructure(t *testing.T) {
 
 	t.Run("default fallback to /static-assets/splash.png", func(t *testing.T) {
 		repo := testutil.NewMockMetaRepository()
-		handler := frontendHTML(cfg, repo, nil, nil)
+		handler := frontendHTML(cfg, repo, nil, nil, nil)
 
 		e := echo.New()
 		rec := httptest.NewRecorder()
@@ -67,7 +67,7 @@ func TestFrontendHTML_SplashStructure(t *testing.T) {
 		customIcon := "https://example.test/files/server-icon.png"
 		repo.Meta = &model.Meta{ID: "x", IconURL: &customIcon}
 
-		handler := frontendHTML(cfg, repo, nil, nil)
+		handler := frontendHTML(cfg, repo, nil, nil, nil)
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -85,7 +85,7 @@ func TestFrontendHTML_SplashStructure(t *testing.T) {
 		mascot := "https://example.test/custom-mascot.png"
 		repo.Meta = &model.Meta{ID: "x", MascotImageURL: &mascot}
 
-		handler := frontendHTML(cfg, repo, nil, nil)
+		handler := frontendHTML(cfg, repo, nil, nil, nil)
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -123,7 +123,7 @@ func TestFrontendHTML_IconLinks(t *testing.T) {
 		if m != nil {
 			repo.Meta = m
 		}
-		handler := frontendHTML(cfg, repo, nil, nil)
+		handler := frontendHTML(cfg, repo, nil, nil, nil)
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -194,7 +194,7 @@ func TestFrontendHTML_EmbeddedMetaPolicies(t *testing.T) {
 		t.Helper()
 		repo := testutil.NewMockMetaRepository()
 		repo.Meta = m
-		handler := frontendHTML(cfg, repo, nil, nil)
+		handler := frontendHTML(cfg, repo, nil, nil, nil)
 
 		e := echo.New()
 		rec := httptest.NewRecorder()
@@ -270,17 +270,17 @@ func TestFrontendHTML_EmbedsChunkedUploadCapability(t *testing.T) {
 	}
 
 	// 未対応構成では field ごと出さない (純正 Misskey と同じ undefined)。
-	got := extract(t, frontendHTML(cfg, repo, nil, func() (int64, bool) { return 0, false }))
+	got := extract(t, frontendHTML(cfg, repo, nil, func() (int64, bool) { return 0, false }, nil))
 	_, present := got["chunkedUpload"]
 	assert.False(t, present)
 
 	// 未配線でも落ちない。
-	got = extract(t, frontendHTML(cfg, repo, nil, nil))
+	got = extract(t, frontendHTML(cfg, repo, nil, nil, nil))
 	_, present = got["chunkedUpload"]
 	assert.False(t, present)
 
 	// 利用可能なら /api/meta と同じ shape で出す。
-	got = extract(t, frontendHTML(cfg, repo, nil, func() (int64, bool) { return 10 * 1024 * 1024, true }))
+	got = extract(t, frontendHTML(cfg, repo, nil, func() (int64, bool) { return 10 * 1024 * 1024, true }, nil))
 	require.NotNil(t, got["chunkedUpload"])
 	assert.Equal(t, float64(10*1024*1024), got["chunkedUpload"].(map[string]any)["chunkSize"])
 }
@@ -291,7 +291,7 @@ func TestFrontendHTML_EmbedsChunkedUploadCapability(t *testing.T) {
 func TestFrontendHTML_ExternalMediaProxyOriginInCSP(t *testing.T) {
 	serve := func(cfg *config.Config) string {
 		t.Helper()
-		handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
+		handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil)
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -343,7 +343,7 @@ func TestFrontendHTML_CaptchaOriginsInCSP(t *testing.T) {
 		if meta != nil {
 			repo.Meta = meta
 		}
-		handler := frontendHTML(cfg, repo, nil, nil)
+		handler := frontendHTML(cfg, repo, nil, nil, nil)
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -527,7 +527,7 @@ func TestFrontendHTML_OpenGraph(t *testing.T) {
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
-		require.NoError(t, frontendHTML(cfg, repo, nil, nil)(c))
+		require.NoError(t, frontendHTML(cfg, repo, nil, nil, nil)(c))
 		return rec.Body.String()
 	}
 
@@ -576,12 +576,30 @@ func TestFrontendHTML_OpenGraph(t *testing.T) {
 		// 管理者が `"` を入れると属性が閉じて head が壊れる。upstream は
 		// kitajs/html が属性値を自動エスケープするので同じ挙動に揃える。
 		name := `Evil" onload="alert(1)`
-		desc := "<script>alert(1)</script>"
+		// description は平文にしてから入れる (upstream #18013) ので、文字参照で書いた
+		// `<` `"` が平文に残ったときにエスケープされることを見る。
+		desc := `x&quot; onload=&quot;alert(1) &lt;script&gt;`
 		body := render(t, &model.Meta{ID: "x", Name: &name, Description: &desc})
 
 		assert.NotContains(t, body, `onload="alert(1)`)
-		assert.NotContains(t, body, "<script>alert(1)</script>")
-		assert.Contains(t, body, `&lt;script&gt;alert(1)&lt;/script&gt;`)
+		assert.Contains(t, body, `<meta name="description" content="x&#34; onload=&#34;alert(1) &lt;script&gt;">`)
+	})
+
+	t.Run("HTML in the description is turned into plain text", func(t *testing.T) {
+		// upstream 2026.10.1 (#18013): サーバーの紹介は HTML を書けるので、
+		// タグを除いて平文にする。区切りのタグは空白になる。
+		desc := `<p>Welcome to <b>Example</b></p><p>Be nice.</p><script>x()</script>`
+		body := render(t, &model.Meta{ID: "x", Description: &desc})
+
+		assert.Contains(t, body, `<meta name="description" content="Welcome to Example Be nice.">`)
+		assert.Contains(t, body, `<meta property="og:description" content="Welcome to Example Be nice.">`)
+	})
+
+	t.Run("a description with only tags uses the default text", func(t *testing.T) {
+		desc := `<p></p><br>`
+		body := render(t, &model.Meta{ID: "x", Description: &desc})
+
+		assert.Contains(t, body, `<meta name="description" content="`+defaultInstanceDescription+`">`)
 	})
 }
 
@@ -598,7 +616,7 @@ func TestFrontendHTML_UpstreamHeadTags(t *testing.T) {
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
-		require.NoError(t, frontendHTML(cfg, repo, nil, nil)(c))
+		require.NoError(t, frontendHTML(cfg, repo, nil, nil, nil)(c))
 		return rec.Body.String()
 	}
 
@@ -620,7 +638,7 @@ func TestFrontendHTML_UpstreamHeadTags(t *testing.T) {
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
-		require.NoError(t, frontendHTML(trailing, repo, nil, nil)(c))
+		require.NoError(t, frontendHTML(trailing, repo, nil, nil, nil)(c))
 
 		assert.Contains(t, rec.Body.String(), `href="https://example.test/opensearch.xml"`)
 		assert.NotContains(t, rec.Body.String(), "//opensearch.xml")
@@ -692,7 +710,7 @@ func TestRenderFrontendShell_Overrides(t *testing.T) {
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
-		require.NoError(t, renderFrontendShell(c, cfg, repo, nil, nil, frontendutil.ClientEntryInfo{}, ov))
+		require.NoError(t, renderFrontendShell(c, cfg, repo, nil, nil, nil, frontendutil.ClientEntryInfo{}, frontendutil.LoaderAssets{}, ov))
 		return rec.Body.String()
 	}
 
@@ -757,7 +775,7 @@ func TestRenderFrontendShell_CacheControl(t *testing.T) {
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
-		require.NoError(t, renderFrontendShell(c, cfg, repo, nil, nil, frontendutil.ClientEntryInfo{}, ov))
+		require.NoError(t, renderFrontendShell(c, cfg, repo, nil, nil, nil, frontendutil.ClientEntryInfo{}, frontendutil.LoaderAssets{}, ov))
 		return rec
 	}
 
@@ -792,7 +810,7 @@ func TestFrontendConsentHTML_IsNotCacheable(t *testing.T) {
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/oauth/authorize", nil), rec)
-	require.NoError(t, frontendConsentHTML(cfg, repo, nil, nil)(c, oauth.ConsentMeta{
+	require.NoError(t, frontendConsentHTML(cfg, repo, nil, nil, nil)(c, oauth.ConsentMeta{
 		TransactionID: "tx-secret",
 		ClientName:    "Test App",
 		Scope:         "read:account",
@@ -825,7 +843,7 @@ func TestFrontendHTML_SplashIgnoresThemeColor(t *testing.T) {
 	evil := "red}body{display:none"
 	repo.Meta = &model.Meta{ID: "x", ThemeColor: &evil}
 
-	handler := frontendHTML(cfg, repo, nil, nil)
+	handler := frontendHTML(cfg, repo, nil, nil, nil)
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -852,11 +870,9 @@ func TestFrontendHTML_InlinesLoaderAssets(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "boot.js"),
 		[]byte("window.__markerInlinedJs = 1;"), 0o644))
 	t.Setenv("MISSKEY_FRONTEND_DIR", dir)
-	frontendutil.ResetLoaderCacheForTest()
-	t.Cleanup(frontendutil.ResetLoaderCacheForTest)
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
-	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -875,11 +891,9 @@ func TestFrontendHTML_InlinesLoaderAssets(t *testing.T) {
 // シェルになり、スプラッシュどころか起動しない。**
 func TestFrontendHTML_FallsBackToLoaderReferences(t *testing.T) {
 	t.Setenv("MISSKEY_FRONTEND_DIR", t.TempDir())
-	frontendutil.ResetLoaderCacheForTest()
-	t.Cleanup(frontendutil.ResetLoaderCacheForTest)
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
-	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -891,6 +905,76 @@ func TestFrontendHTML_FallsBackToLoaderReferences(t *testing.T) {
 	assert.Contains(t, body, `<script src="/vite/loader/boot.js"></script>`)
 }
 
+// **loader は組み立てのときに読み、組み立て直した世代は読み直す (#3803)。**
+//
+// 以前はプロセスで 1 回だけ読んでいたので、メンテナンスの間に frontend を作り
+// 直すと、組み立て直した世代は新しい entry (組み立てのたびに読む) と古い loader を
+// 組み合わせた。#2551 と同じ形で表示が崩れる。逆に、リクエストのたびに読むと、
+// 同じ世代の中で entry と loader の読んだ時点がずれる。shell を描画する 4 つの
+// 経路 (通常・OAuth の同意画面・permalink の SSR・埋め込み) それぞれで、
+// (a) 組み立てた後にファイルを変えても同じ世代は組み立てのときの loader のまま、
+// (b) 組み立て直すと新しい loader を読む、を見る。
+func TestShells_ReadLoaderAtConstruction(t *testing.T) {
+	spa := t.TempDir()
+	embedDir := t.TempDir()
+	t.Setenv("MISSKEY_FRONTEND_DIR", spa)
+	t.Setenv("MISSKEY_FRONTEND_EMBED_DIR", embedDir)
+	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
+	repo := testutil.NewMockMetaRepository()
+
+	writeLoader := func(t *testing.T, dir, css string) {
+		t.Helper()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "loader"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "style.css"), []byte(css), 0o644))
+	}
+
+	for _, tt := range []struct {
+		name  string
+		dir   string
+		build func() echo.HandlerFunc
+	}{
+		{name: "SPA shell", dir: spa, build: func() echo.HandlerFunc {
+			return frontendHTML(cfg, repo, nil, nil, nil)
+		}},
+		{name: "OAuth consent", dir: spa, build: func() echo.HandlerFunc {
+			render := frontendConsentHTML(cfg, repo, nil, nil, nil)
+			return func(c echo.Context) error {
+				return render(c, oauth.ConsentMeta{TransactionID: "tx", ClientName: "client", Scope: "read:account"})
+			}
+		}},
+		{name: "permalink SSR", dir: spa, build: func() echo.HandlerFunc {
+			h := newSSRMetaHandler(cfg, repo, nil, nil, nil, ssrMetaDeps{}, nil)
+			return func(c echo.Context) error { return h.render(c, shellOverrides{}) }
+		}},
+		{name: "embed", dir: embedDir, build: func() echo.HandlerFunc {
+			h := newEmbedHandlers(cfg, repo, nil, nil, nil, EmbedDeps{})
+			return func(c echo.Context) error { return h.render(c, nil) }
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := func(h echo.HandlerFunc) string {
+				t.Helper()
+				rec := httptest.NewRecorder()
+				c := echo.New().NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
+				require.NoError(t, h(c))
+				return rec.Body.String()
+			}
+
+			writeLoader(t, tt.dir, "#splash{--marker:generation-1}")
+			first := tt.build()
+			writeLoader(t, tt.dir, "#splash{--marker:generation-2}")
+
+			got := body(first)
+			assert.Contains(t, got, "--marker:generation-1", "同じ世代の中で、組み立てのときの loader から変わった")
+			assert.NotContains(t, got, "--marker:generation-2")
+
+			got = body(tt.build())
+			assert.Contains(t, got, "--marker:generation-2", "組み立て直した世代が loader を読み直していない")
+			assert.NotContains(t, got, "--marker:generation-1")
+		})
+	}
+}
+
 // **dev では埋め込まない (#2477 と同じ理由)。** ビルド成果物が残っているだけの
 // 状態で埋め込むと、dev server が返す新しい loader ではなく古い built を読む。
 func TestFrontendHTML_DevModeKeepsReferences(t *testing.T) {
@@ -899,11 +983,9 @@ func TestFrontendHTML_DevModeKeepsReferences(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "style.css"),
 		[]byte("#splash{--marker:stale}"), 0o644))
 	t.Setenv("MISSKEY_FRONTEND_DIR", dir)
-	frontendutil.ResetLoaderCacheForTest()
-	t.Cleanup(frontendutil.ResetLoaderCacheForTest)
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test", Dev: true}
-	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -924,7 +1006,7 @@ func TestFrontendHTML_PacksThemeAsJSON(t *testing.T) {
 	repo.Meta = &model.Meta{ID: "x", DefaultDarkTheme: &theme}
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
-	handler := frontendHTML(cfg, repo, nil, nil)
+	handler := frontendHTML(cfg, repo, nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -947,7 +1029,7 @@ func TestFrontendHTML_BrokenThemeBecomesNull(t *testing.T) {
 	repo.Meta = &model.Meta{ID: "x", DefaultDarkTheme: &broken}
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
-	handler := frontendHTML(cfg, repo, nil, nil)
+	handler := frontendHTML(cfg, repo, nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -986,7 +1068,7 @@ func TestFrontendHTML_EmbedsBuildRevision(t *testing.T) {
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
 	repo := testutil.NewMockMetaRepository()
 	repo.Meta = &model.Meta{ID: "x"}
-	handler := frontendHTML(cfg, repo, nil, nil)
+	handler := frontendHTML(cfg, repo, nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -1014,7 +1096,7 @@ func TestFrontendHTML_ProvidesTarballIgnoresConfigFlag(t *testing.T) {
 
 	repo := testutil.NewMockMetaRepository()
 	repo.Meta = &model.Meta{ID: "x"}
-	handler := frontendHTML(cfg, repo, nil, nil)
+	handler := frontendHTML(cfg, repo, nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -1037,7 +1119,7 @@ func TestFrontendHTML_CreditImageOriginsInCSP(t *testing.T) {
 		URL: "https://example.test", Version: "0.0.1-test",
 		FrontendContentSecurityPolicy: CSPModeEnforce,
 	}
-	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil)
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -1077,4 +1159,44 @@ func TestFrontendHTML_CreditImageOriginsInCSP(t *testing.T) {
 				"%s に画像用の origin が漏れている", name)
 		}
 	}
+}
+
+// 起動の HTML は、entry が静的に import する chunk の一覧を CLIENT_PRELOADS として
+// boot.js に渡す (#3613)。boot.js はこれを modulepreload で並べる。一覧の入った inline
+// script も CSP の hash に載ること (載らないと enforce で起動しない)。
+func TestRenderFrontendShell_ClientPreloads(t *testing.T) {
+	render := func(t *testing.T, entry frontendutil.ClientEntryInfo) (string, string) {
+		t.Helper()
+		cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test", FrontendContentSecurityPolicy: CSPModeEnforce}
+		e := echo.New()
+		rec := httptest.NewRecorder()
+		c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
+		require.NoError(t, renderFrontendShell(c, cfg, testutil.NewMockMetaRepository(), nil, nil, nil, entry, frontendutil.LoaderAssets{}, shellOverrides{}))
+		return rec.Body.String(), rec.Header().Get("Content-Security-Policy")
+	}
+	scriptHash := func(t *testing.T, body string) string {
+		t.Helper()
+		m := regexp.MustCompile(`<script>(const VERSION = [^<]*)</script>`).FindStringSubmatch(body)
+		require.NotNil(t, m, "boot globals script not found")
+		return cspScriptHashes(m[1])[0]
+	}
+
+	t.Run("lists the preloads of a built entry", func(t *testing.T) {
+		body, csp := render(t, frontendutil.ClientEntryInfo{
+			Script:   "scripts/entry-AAAAAAAA.js",
+			Preloads: []string{"scripts/a-BBBBBBBB.js", "scripts/b-CCCCCCCC.js"},
+		})
+		assert.Contains(t, body, `const CLIENT_PRELOADS = ["scripts/a-BBBBBBBB.js","scripts/b-CCCCCCCC.js"];`)
+		assert.Contains(t, csp, scriptHash(t, body))
+	})
+
+	t.Run("empty without a built entry", func(t *testing.T) {
+		body, _ := render(t, frontendutil.ClientEntryInfo{Preloads: []string{"scripts/a-BBBBBBBB.js"}})
+		assert.Contains(t, body, `const CLIENT_PRELOADS = [];`)
+	})
+
+	t.Run("empty without preloads.json", func(t *testing.T) {
+		body, _ := render(t, frontendutil.ClientEntryInfo{Script: "scripts/entry-AAAAAAAA.js"})
+		assert.Contains(t, body, `const CLIENT_PRELOADS = [];`)
+	})
 }

@@ -32,11 +32,15 @@ type NoteCreateHook struct {
 	// 可視性で gate するために使う。未配線なら fail-closed (followers/specified
 	// embed を隠す)。
 	followingRepo repository.FollowingRepository
+	// entityPacker は payload の投稿を包む依存を持つ (#3790)。
+	entityPacker *entity.Packer
 }
 
-// NewNoteCreateHook constructs a NoteCreateHook.
-func NewNoteCreateHook(svc *Service, idGen id.Generator) *NoteCreateHook {
-	return &NoteCreateHook{svc: svc, idGen: idGen}
+// NewNoteCreateHook constructs a NoteCreateHook. entityPacker packs the note
+// payload (#3790). 無いとメディアの URL を media proxy を通さずに送り、しかも
+// 黙って劣化するので、構築子の必須の引数で受ける (#3825)。
+func NewNoteCreateHook(svc *Service, idGen id.Generator, entityPacker *entity.Packer) *NoteCreateHook {
+	return &NoteCreateHook{svc: svc, idGen: idGen, entityPacker: entityPacker}
 }
 
 // SetThreadMutingRepo attaches a NoteThreadMutingRepository so reply/mention
@@ -109,7 +113,7 @@ func (h *NoteCreateHook) OnNoteCreated(note *model.Note, author *model.User, rep
 
 // packNoteFor packs note for a single webhook recipient and applies the
 // per-recipient embed visibility gate (renote/reply/引用先) with recipientID as
-// the viewer. entity.PackNote produces fresh embed pointers each call, so the
+// the viewer. (*entity.Packer).PackNote produces fresh embed pointers each call, so the
 // per-recipient blank never mutates another recipient's payload.
 func (h *NoteCreateHook) packNoteFor(note *model.Note, author *model.User, recipientID string) map[string]any {
 	if note.User == nil && author != nil {
@@ -117,7 +121,7 @@ func (h *NoteCreateHook) packNoteFor(note *model.Note, author *model.User, recip
 		clone.User = author
 		note = &clone
 	}
-	packed := entity.PackNote(note, h.idGen)
+	packed := h.entityPacker.PackNote(note, h.idGen)
 	recipient := &model.User{ID: recipientID}
 	// **top-level の可視性ゲート。** `gateNoteEmbeds` が見るのは embed だけなので、
 	// これが無いと note 本体が受信者の可視性を無視して届く。
@@ -147,11 +151,15 @@ type ReactionCreateHook struct {
 	svc           *Service
 	idGen         id.Generator
 	followingRepo repository.FollowingRepository
+	// entityPacker は payload の投稿を包む依存を持つ (#3790)。
+	entityPacker *entity.Packer
 }
 
-// NewReactionCreateHook constructs a ReactionCreateHook.
-func NewReactionCreateHook(svc *Service, idGen id.Generator) *ReactionCreateHook {
-	return &ReactionCreateHook{svc: svc, idGen: idGen}
+// NewReactionCreateHook constructs a ReactionCreateHook. entityPacker packs
+// the note payload (#3790). 無いとメディアの URL を media proxy を通さずに送り、
+// しかも黙って劣化するので、構築子の必須の引数で受ける (#3825)。
+func NewReactionCreateHook(svc *Service, idGen id.Generator, entityPacker *entity.Packer) *ReactionCreateHook {
+	return &ReactionCreateHook{svc: svc, idGen: idGen, entityPacker: entityPacker}
 }
 
 // SetFollowingRepo attaches a FollowingRepository used to gate the embed
@@ -180,7 +188,7 @@ func (h *ReactionCreateHook) OnReactionCreated(note *model.Note, reactor *model.
 		clone.User = &model.User{ID: note.UserID}
 		noteForPack = &clone
 	}
-	packed := entity.PackNote(noteForPack, h.idGen)
+	packed := h.entityPacker.PackNote(noteForPack, h.idGen)
 	gateNoteEmbeds(&model.User{ID: note.UserID}, &packed, h.followingRepo, time.Now().UnixMilli())
 	body := map[string]any{
 		"note":     noteEntityToMap(packed),
@@ -211,21 +219,20 @@ type FollowingHook struct {
 	packer *userpack.Packer
 }
 
-// NewFollowingHook constructs a FollowingHook.
-func NewFollowingHook(svc *Service) *FollowingHook {
-	return &FollowingHook{svc: svc}
+// NewFollowingHook constructs a FollowingHook. packer is shared with the main
+// stream publisher, so the webhook and the stream carry the same shape.
+//
+// 無いと follow / unfollow の Webhook は profile を確かめられないので送られず、
+// followed は instance と絵文字を解決しない形になる。しかも黙って劣化するので、
+// 構築子の必須の引数で受ける (#3825)。
+func NewFollowingHook(svc *Service, packer *userpack.Packer) *FollowingHook {
+	return &FollowingHook{svc: svc, packer: packer}
 }
 
 // SetUserLookups wires the lookups used to pack the `user` of follow /
-// followed / unfollow bodies, and idGen to derive createdAt.
-func (h *FollowingHook) SetUserLookups(l UserLookups, idGen id.Generator) {
-	h.packer = userpack.New(l, idGen)
-}
-
-// SetUserPacker wires a packer shared with the main stream publisher, so the
-// webhook and the stream carry the same shape.
-func (h *FollowingHook) SetUserPacker(p *userpack.Packer) {
-	h.packer = p
+// followed / unfollow bodies with pk, and idGen to derive createdAt.
+func (h *FollowingHook) SetUserLookups(pk *entity.Packer, l UserLookups, idGen id.Generator) {
+	h.packer = userpack.New(pk, l, idGen)
 }
 
 // OnFollow fires the `follow` event on the follower's webhooks.
@@ -283,17 +290,15 @@ func (h *FollowingHook) OnFollowed(follower, followee *model.User) {
 	})
 }
 
-// HasUserPacker reports whether the user packer was wired.
-//
-// 未配線だと follow / unfollow の Webhook は profile を確かめられないので送られず、
-// followed は instance と絵文字を解決しない形になる。起動時検査に使う。
-func (h *FollowingHook) HasUserPacker() bool { return h.packer != nil }
-
 // userPacker returns the wired packer, or one without lookups when unwired
 // (which drops the detailed bodies, see userpack.Packer.DetailedNotMe).
+//
+// 未配線のときの Packer は nil の entity.Packer なので、followed の avatarUrl は
+// 生のリモートの URL になる (#3792)。本番は NewFollowingHook の必須の引数で
+// 共有の packer を渡す (#3825) ので、ここへは来ない。
 func (h *FollowingHook) userPacker() *userpack.Packer {
 	if h.packer == nil {
-		return userpack.New(userpack.Lookups{}, nil)
+		return userpack.New(nil, userpack.Lookups{}, nil)
 	}
 	return h.packer
 }
@@ -302,11 +307,17 @@ func (h *FollowingHook) userPacker() *userpack.Packer {
 // `userCreated` system webhook event on new user creation.
 type SignupHook struct {
 	svc *Service
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// NewSignupHook constructs a SignupHook.
-func NewSignupHook(svc *Service) *SignupHook {
-	return &SignupHook{svc: svc}
+// NewSignupHook constructs a SignupHook. entityPacker is the Packer this
+// SignupHook packs entities with (#3794); 無いと webhook の本文の avatarUrl が
+// リモートの生の URL になり、ほかの経路 (media proxy を通す) と形が変わるので、
+// 構築子の必須の引数で受ける (#3823)。
+func NewSignupHook(svc *Service, entityPacker *entity.Packer) *SignupHook {
+	return &SignupHook{svc: svc, entityPacker: entityPacker}
 }
 
 // OnUserCreated fires the `userCreated` system webhook event.
@@ -314,7 +325,7 @@ func (h *SignupHook) OnUserCreated(user *model.User) {
 	if h == nil || h.svc == nil || user == nil {
 		return
 	}
-	h.svc.DispatchSystem(SystemEventUserCreated, packUser(user))
+	h.svc.DispatchSystem(SystemEventUserCreated, packUser(h.entityPacker, user))
 }
 
 // noteEntityToMap converts a packed NoteEntity into the generic map[string]any
@@ -329,8 +340,8 @@ func noteEntityToMap(packed entity.NoteEntity) map[string]any {
 
 // packUser turns a model.User into a generic map matching entity.UserLite.
 // 呼び出し元で u != nil は保証済み。
-func packUser(u *model.User) map[string]any {
-	return toMap(entity.PackUserLite(u))
+func packUser(pk *entity.Packer, u *model.User) map[string]any {
+	return toMap(pk.PackUserLite(u))
 }
 
 // toMap converts a packed entity into the generic map the webhook envelope

@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"gorm.io/datatypes"
 
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/core/role"
 )
 
@@ -77,7 +78,7 @@ var (
 	// **これは未実装ではなく意図的**。mk-go はリモートメディアの実体を持たず
 	// link 行 (`isLink=true` / `size=0`) しか作らないため、退去すべき実体が
 	// 存在せず使用量にも乗らない。gate も LRU 退去も対象が無い
-	// (docs/divergence.md §5.5、#2411)。
+	// (docs/divergence/operations.md §5.5、#2411)。
 	ErrNoFreeSpace = errors.New("no free space")
 	// ErrInvalidFileName is returned when a file rename fails
 	// ValidateFileName. Handler maps this to upstream's INVALID_FILE_NAME
@@ -94,13 +95,36 @@ var (
 func policyNumber(v any) (float64, bool) { return role.PolicyNumber(v) }
 
 // policyMegabytesは数値policyを飽和byte数へ変換する。boolは値の存在ではなく、
-// gateに使える正の上限であることを表す。
+// gateに使える正の上限であることを表す。0以下を「上限なし」と読むのは、
+// Elythia独自の分割アップロードの保留容量 (chunkedUploadMaxPendingMb) だけに使う。
 func policyMegabytes(v any) (int64, bool) {
 	mb, ok := policyNumber(v)
 	if !ok {
 		return 0, false
 	}
 	return safemath.MulFloat64(mb, 1024*1024), mb > 0
+}
+
+// policyLimitBytes converts the upstream size policies (maxFileSizeMb,
+// driveCapacityMb) to a byte limit. ok is false only when the policy is
+// absent or not a number. 0 is a limit of 0 bytes and a negative value
+// returns -1, which every size (including 0) exceeds.
+//
+// 本家 DriveService は `1024 * 1024 * policies.X` をそのまま比べるので、0 は
+// 空でない本体を、負の値は 0 バイトの本体も拒む。上限なしになるのは policy が
+// 無いときだけ。
+func policyLimitBytes(v any) (int64, bool) {
+	mb, ok := policyNumber(v)
+	if !ok {
+		return 0, false
+	}
+	if mb < 0 {
+		return -1, true
+	}
+	if mb == 0 {
+		return 0, true
+	}
+	return safemath.MulFloat64(mb, 1024*1024), true
 }
 
 // MaxUploadBytes reports the `maxFileSizeMb` role policy for a user, in bytes.
@@ -111,9 +135,9 @@ func policyMegabytes(v any) (int64, bool) {
 // 「30MB しか保存できない利用者が 250MB を送り付けてメモリを確保させる」
 // ことができた。handler が先にこれを引いて、超える分は読まずに落とす。
 //
-// ok=false は「上限なし」(policy 未設定 / 0 以下 / system file / role が
-// 未配線)。判定できないときに勝手な上限を作らないための形で、`Upload` 側の
-// `policyMegabytes` の ok と同じ意味。
+// ok=false は「上限なし」(policy 未設定 / system file / role が未配線)。
+// 判定できないときに勝手な上限を作らないための形で、`Upload` 側の
+// `policyLimitBytes` の ok と同じ意味。0 は ok=true で 0、負の値は -1 を返す。
 func (s *Service) MaxUploadBytes(user *model.User) (int64, bool) {
 	// system file (user == nil) と remote user は `Upload` 側でも gate の
 	// 対象外なので、ここでも上限を作らない。
@@ -124,13 +148,14 @@ func (s *Service) MaxUploadBytes(user *model.User) (int64, bool) {
 	if policies == nil {
 		return 0, false
 	}
-	return policyMegabytes(policies["maxFileSizeMb"])
+	return policyLimitBytes(policies["maxFileSizeMb"])
 }
 
 // ValidateFileName mirrors upstream DriveFileEntityService.validateFileName:
 // the trimmed name must be non-empty, at most 200 characters, and must not
 // contain a backslash, a slash, or "..". 長さは JS の String.length (UTF-16)
-// に対し rune 数で近似する (upload-from-url の comment 512 判定と同方針)。
+// に対し rune 数で近似する。ajv の maxLength (code point で数える) と違い、
+// サロゲートペアの文字を含む名前では本家より緩い (#3369)。
 //
 // **NUL と不正な UTF-8 もここで落とす (#3037)。** `drive_file.name` は
 // varchar なので、そのまま INSERT / UPDATE すると PostgreSQL が SQLSTATE 22021
@@ -197,6 +222,18 @@ type RoleChecker interface {
 	GetUserPolicies(userID string) map[string]any
 }
 
+// ModerationLogger records a moderator's action on another user's file.
+// Satisfied by *core/moderationlog.Service.
+type ModerationLogger interface {
+	Log(ctx context.Context, moderatorID string, t moderationlog.LogType, info map[string]any)
+}
+
+// ModerationLogUserLookup resolves the owner of a file for the moderation
+// log entry. Satisfied by repository.UserRepository.
+type ModerationLogUserLookup interface {
+	FindByID(id string) (*model.User, error)
+}
+
 // Service manages drive files and folders.
 type Service struct {
 	fileRepo            repository.DriveFileRepository
@@ -216,9 +253,14 @@ type Service struct {
 	officialSensitiveDetector *OfficialDetector
 	// sensitiveSettingsProvider は meta を都度参照する live settings 源。
 	sensitiveSettingsProvider func() SensitiveSettings
-	// Optional moderator bypass for Show. Nil keeps the default "owner-only"
-	// guard.
+	// Optional moderator bypass for Show, and for the sensitive flag and
+	// deletion of other users' files (#3678). Nil keeps the default
+	// "owner-only" guard.
 	roleChecker RoleChecker
+	// modLog / modLogUsers は moderator が他人のファイルを操作したときの
+	// モデレーションログ (#3678)。どちらかが nil ならログを残さない。
+	modLog      ModerationLogger
+	modLogUsers ModerationLogUserLookup
 	// folderPublisher emits folderCreated/folderUpdated/folderDeleted to the
 	// drive channel (#1564)。nil disables folder events.
 	folderPublisher FolderStreamingPublisher
@@ -239,23 +281,30 @@ type Service struct {
 	// mediaSlotCap は mediaSlots の容量。semaphore.Weighted は容量を公開
 	// しないので、テストと自己検査のために持っておく。
 	mediaSlotCap int
+	// entityPacker は entity を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3796)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // defaultMediaProcessingConcurrency is how many uploads may decode at once.
 //
 // **枠が無いと確保量を掛け算できた。** `processImage` は寸法 / blurhash /
-// サムネイル / webpublic で**順に 4 回デコードする**ため、GC が前の 1 枚を
-// 返す前に次を確保しうる。認証済みの利用者が並行アップロードを投げるだけで
-// それを人数分重ねられた (`semaphore` / `Acquire(` の grep が 0 件だった)。
+// サムネイル / webpublic で**順に 4 回デコードしていた**ため、GC が前の 1 枚を
+// 返す前に次を確保しえた (#3609 で 1 回にした)。認証済みの利用者が並行
+// アップロードを投げるだけでそれを人数分重ねられた (`semaphore` / `Acquire(`
+// の grep が 0 件だった)。
 //
 // **1 枠あたりの最悪値は 1GB 級 (#3037 レビュー 2 周目で実測)。**
 // drive が渡すのは `imagedecode.MaxPixels` (64MP) ではなく
 // `UpstreamMaxPixels` (0x3FFF^2 = 268MP) — upstream に揃える判断で、
 // 厳しくすると 102MP の実写真が webpublic を失い EXIF の GPS が公開側へ
 // 出るため (`imagedecode.go` 参照)。16383x16383 の全画素ゼロ PNG は
-// **764 KiB** で作れて `UpstreamMaxPixels` にちょうど一致するので上限を
-// 通り抜け、8 core / 32GB の実測で `processImage` の 4 段を通すと
-// **ピーク RSS 2.23 GiB / 13.6 秒**だった (デコード単体で TotalAlloc 768MiB)。
+// 数 MB 以下 (#3037 の計測では **764 KiB**。圧縮の設定で変わる) で作れて
+// `UpstreamMaxPixels` にちょうど一致するので上限を通り抜ける。16383x16383 の入力 1 本の最大 RSS は、RGBA 8bit の全画素ゼロ
+// PNG で、4 段がそれぞれデコードしていたころ **2.2〜3.0 GiB** (GC の時機で
+// 揺れる。#3037 で 2.23 GiB、#3609 で 2.67〜2.99 GiB)、#3609 で 1 回にした後
+// **1.09 GiB**。EXIF の向きを持つ JPEG は回転前と回転後の像を同時に持つので
+// 後でも **1.40 GiB** (前は 2.35 GiB)。測り方は `docs/divergence/security.md`。
 //
 // **バイト予算はこの帯を縛らない。** 確保量の判定は
 // `画素数 x 1 画素あたりのバイト数 > 上限画素数 x 4` なので、8bit 画像には
@@ -263,8 +312,8 @@ type Service struct {
 //
 // **枠の本数はこの最悪値を前提にしていない。** 値と根拠は media proxy の枠
 // (#3032) から採っており、あちらは 64MP の cap で測っている。2GB の VPS は
-// `GOMAXPROCS / 2 = 1` なので、764 KiB のアップロード 1 本で RAM を使い切り
-// うる。`GOMEMLIMIT` の設定はリポジトリに無い (grep 0 件)。**残存リスクとして
+// `GOMAXPROCS / 2 = 1` なので、数 MB 以下のアップロード 1 本で RAM を使い
+// 切りうる。`GOMEMLIMIT` の設定はリポジトリに無い (grep 0 件)。**残存リスクとして
 // `docs/divergence.md` に記録してある。**
 //
 // **値と根拠は media proxy の枠 (#3032) と同じ。** 同じデコーダで同じ中間
@@ -353,11 +402,6 @@ func (s *Service) publishFolderEvent(userID, eventType string, body any) {
 	}
 	s.folderPublisher.PublishDriveFolderEvent(userID, eventType, body)
 }
-
-// SetRoleChecker wires a moderator role lookup so Show allows moderators to
-// inspect any file (matching upstream Misskey's drive/files/show behaviour).
-// Nil keeps the existing owner-only check.
-func (s *Service) SetRoleChecker(rc RoleChecker) { s.roleChecker = rc }
 
 // SetLocalStorage wires the always-local backend used to reach rows whose
 // `storedInternal` is true while object storage is the active backend (#1414 /
@@ -540,17 +584,39 @@ func (s *Service) SetOfficialSensitiveDetector(d *OfficialDetector) {
 }
 
 // NewService constructs a DriveService.
+//
+// entityPacker packs the files published to the drive and main streams
+// (#3796). roleChecker supplies the role policies (MIME allowlist, forced
+// NSFW, file size and capacity limits) and the moderator check that lets
+// moderators inspect any file, matching upstream drive/files/show; nil keeps
+// the owner-only check and no policy limits. modLog and modLogUsers write the
+// moderation log when a moderator changes the sensitive flag of, or deletes,
+// another user's file (#3678); modLogUsers resolves the owner's username and
+// host. A nil logger skips the entry.
+//
+// どれも無いと黙って劣化する (ファイルの url などを media proxy を通さずに返す /
+// 1 つの nil で MIME 許可リスト・NSFW 強制・ファイルサイズ上限・容量上限が同時に
+// 外れる / モデレーターが他人のファイルを変えても消してもログに残らない) ので、
+// 構築子の必須の引数で受ける (#3825)。
 func NewService(
 	fileRepo repository.DriveFileRepository,
 	folderRepo repository.DriveFolderRepository,
 	storage Storage,
 	idGen id.Generator,
+	entityPacker *entity.Packer,
+	roleChecker RoleChecker,
+	modLog ModerationLogger,
+	modLogUsers ModerationLogUserLookup,
 ) *Service {
 	return &Service{
 		fileRepo:     fileRepo,
 		folderRepo:   folderRepo,
 		storage:      storage,
 		idGen:        idGen,
+		entityPacker: entityPacker,
+		roleChecker:  roleChecker,
+		modLog:       modLog,
+		modLogUsers:  modLogUsers,
 		mediaSlots:   semaphore.NewWeighted(int64(defaultMediaProcessingConcurrency())),
 		mediaSlotCap: defaultMediaProcessingConcurrency(),
 	}
@@ -689,14 +755,14 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (*model.DriveFile,
 		// 強制し、remote user は expireOldFile で逃げ道を作る。mk-go も remote は
 		// skip するが、理由が違う: リモートメディアの実体を持たない設計なので
 		// gate すべき容量そのものが発生しない (link 行は `size=0`)。expireOldFile
-		// 相当を足さないのも同じ理由で、意図的な差分 (docs/divergence.md §5.5)。
+		// 相当を足さないのも同じ理由で、意図的な差分 (docs/divergence/operations.md §5.5)。
 		if in.User.IsLocal() && policies != nil {
-			if maxBytes, ok := policyMegabytes(policies["maxFileSizeMb"]); ok {
+			if maxBytes, ok := policyLimitBytes(policies["maxFileSizeMb"]); ok {
 				if int64(len(info.Body)) > maxBytes {
 					return nil, ErrMaxFileSizeExceeded
 				}
 			}
-			if capacityBytes, ok := policyMegabytes(policies["driveCapacityMb"]); ok {
+			if capacityBytes, ok := policyLimitBytes(policies["driveCapacityMb"]); ok {
 				// UsageByUser の DB error を握り潰すと usage=0 として gate を
 				// pass してしまい driveCapacityMb 制限が事実上効かなくなる。
 				// production の transient DB error 時に黙って upload を許可する
@@ -898,12 +964,12 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (*model.DriveFile,
 	// それぞれ userID を必要とする。
 	if in.User != nil {
 		// upstream は packedFile (self) を drive channel に送る (#2002)。
-		s.publishEvent(in.User.ID, "fileCreated", entity.PackDriveFileSelf(f, s.idGen))
+		s.publishEvent(in.User.ID, "fileCreated", s.entityPacker.PackDriveFileSelf(f, s.idGen))
 		// Misskey本家DriveService.addFileはdrive topicに加えてmainにも
 		// driveFileCreatedをemitしてUploader自身のUI(ドロップアップロード等)
 		// を即時反映させる(TS: DriveService.ts:665)。
 		if s.mainStreamPublisher != nil {
-			s.mainStreamPublisher.PublishMainEvent(in.User.ID, "driveFileCreated", entity.PackDriveFileSelf(f, s.idGen))
+			s.mainStreamPublisher.PublishMainEvent(in.User.ID, "driveFileCreated", s.entityPacker.PackDriveFileSelf(f, s.idGen))
 		}
 	}
 	// chartHook は user nil でも発火させる: bytes / count は instance-wide
@@ -1124,6 +1190,9 @@ func (s *Service) acquireMediaSlot(ctx context.Context) (func(), bool) {
 
 // processImage runs all image processing steps (best-effort).
 func (s *Service) processImage(body []byte, mimeType string) *generateAltsResult {
+	if bp, ok := s.imageProcessor.(BatchImageProcessor); ok {
+		return processImageOnce(bp, body, mimeType)
+	}
 	result := &generateAltsResult{}
 
 	// 寸法取得
@@ -1149,17 +1218,40 @@ func (s *Service) processImage(body []byte, mimeType string) *generateAltsResult
 	return result
 }
 
+// processImageOnce is processImage for processors that decode once (#3609).
+// 読めない画像は代替画像なしで続行する (アップロードは拒否しない)。
+func processImageOnce(bp BatchImageProcessor, body []byte, mimeType string) *generateAltsResult {
+	result := &generateAltsResult{}
+	alts := bp.ProcessAll(body, mimeType)
+	if alts == nil {
+		return result
+	}
+	if alts.Width > 0 || alts.Height > 0 {
+		props := map[string]int{"width": alts.Width, "height": alts.Height}
+		if data, err := json.Marshal(props); err == nil {
+			result.properties = datatypes.JSON(data)
+		}
+	}
+	if alts.Blurhash != "" {
+		result.blurhash = &alts.Blurhash
+	}
+	result.thumbnail = alts.Thumbnail
+	result.webpublic = alts.Webpublic
+	return result
+}
+
 // Show returns the file with id. Owners can read their own files; moderators
 // (when a roleChecker is wired) can read any file. Matches upstream Misskey
 // drive/files/show.ts semantics so admin moderation surfaces and remote-media
 // detail views work without 403.
 //
-// 注意: write 経路 (Update / Delete) では moderator bypass を意図的に
-// 適用しない。他ユーザーの file への moderator 経由の write/delete を
-// 許してしまう privilege escalation を避けるため、それらは
-// findOwnedFile() を使って owner-only ガードする (#499)。moderator が
-// 他ユーザーの file を編集 / 削除する正規経路は admin/drive/* 側に
-// 別途存在する。
+// 注意: write 経路 (Update / Delete) の moderator bypass は限定してある
+// (findWritableFile)。moderator が他人のファイルにできるのは、センシティブの
+// 付け外しと削除だけ (#3678。system 所有のファイルは削除もできない)。名前・
+// フォルダ・説明文は所有者だけが変えられる。
+// #499 で write 経路を所有者だけに絞ったが、admin/drive/* にはセンシティブを
+// 付ける口も削除する口も無く、本家の frontend はどちらも drive/files/* を呼ぶ
+// ので、moderation の操作ができなくなっていた。
 func (s *Service) Show(user *model.User, id string) (*model.DriveFile, error) {
 	if user == nil {
 		return nil, errors.New("user is required")
@@ -1214,25 +1306,68 @@ func (s *Service) IsModerator(userID string) bool {
 	return s.roleChecker != nil && s.roleChecker.IsModerator(userID)
 }
 
-// findOwnedFile is the strict owner-only equivalent of Show, used by write
-// paths (Update / Delete). It never honours the moderator bypass so that
-// drive write/delete operations can never escalate via moderator role.
-func (s *Service) findOwnedFile(user *model.User, id string) (*model.DriveFile, error) {
+// findWritableFile loads the file for the write paths (Update / Delete).
+// The owner may write; otherwise a moderator may, and byModerator is true so
+// the caller can restrict what the moderator changes and write the
+// moderation log. Anyone else gets ErrAccessDenied.
+//
+// 本家 drive/files/update.ts / delete.ts と同じく、所有者が居ないファイル
+// (system のファイル、著者を materialize していないリモートの添付) も
+// moderator は操作できる。ただし system 所有のファイルの削除は Delete が拒む。
+func (s *Service) findWritableFile(user *model.User, id string) (f *model.DriveFile, byModerator bool, err error) {
 	if user == nil {
-		return nil, errors.New("user is required")
+		return nil, false, errors.New("user is required")
 	}
-	f, err := s.fileRepo.FindByID(id)
+	f, err = s.fileRepo.FindByID(id)
 	if err != nil {
 		// **DB 障害を not-found に丸めない** (#2799)。
 		if !repository.IsNotFound(err) {
-			return nil, err
+			return nil, false, err
 		}
-		return nil, ErrFileNotFound
+		return nil, false, ErrFileNotFound
 	}
-	if f.UserID == nil || *f.UserID != user.ID {
-		return nil, ErrAccessDenied
+	if f.UserID != nil && *f.UserID == user.ID {
+		return f, false, nil
 	}
-	return f, nil
+	if s.IsModerator(user.ID) {
+		return f, true, nil
+	}
+	return nil, false, ErrAccessDenied
+}
+
+// fileOwnerID returns the owner's id of f, or "" for a file without one.
+func fileOwnerID(f *model.DriveFile) string {
+	if f.UserID == nil {
+		return ""
+	}
+	return *f.UserID
+}
+
+// logModeratorAction writes a moderation log entry for a moderator's action
+// on another user's file. info は本家 DriveService の
+// {fileId, fileUserId, fileUserUsername, fileUserHost} と同じ形。
+func (s *Service) logModeratorAction(moderator *model.User, t moderationlog.LogType, f *model.DriveFile) {
+	if !s.hasModerationLog() {
+		return
+	}
+	info := map[string]any{
+		"fileId":           f.ID,
+		"fileUserId":       f.UserID,
+		"fileUserUsername": nil,
+		"fileUserHost":     nil,
+	}
+	if f.UserID != nil {
+		// 本家は findOneByOrFail で引き、引けなければ例外になる。ここでは操作は
+		// 済んでいるので、名前が引けなくてもログ自体は残す。
+		owner, err := s.modLogUsers.FindByID(*f.UserID)
+		if err != nil {
+			slog.Warn("drive: moderation log owner lookup failed", "fileId", f.ID, "err", err)
+		} else {
+			info["fileUserUsername"] = owner.Username
+			info["fileUserHost"] = owner.Host
+		}
+	}
+	s.modLog.Log(context.Background(), moderator.ID, t, info)
 }
 
 // FindByHash returns every file of the user with the given md5 hash.
@@ -1270,21 +1405,29 @@ type UpdateInput struct {
 	IsSensitive *bool
 }
 
-// Update applies the non-nil fields to a drive file owned by the user.
-// Owner-only: moderator が他ユーザーの file を編集できないよう
-// findOwnedFile() を使う (#499)。
+// Update applies the non-nil fields to a drive file. The owner may change
+// every field. A moderator may change only IsSensitive of another user's
+// file; any other field returns ErrAccessDenied (#3678).
 //
-// upstream drive/files/update.ts は `!isModerator && file.userId !== me.id` の
-// ときのみ ACCESS_DENIED とし、moderator は他人の file を編集できる (markSensitive
-// の moderationLog も残す)。mk-go はこの moderator write bypass を**意図的に
-// 排除**している (#499 で privilege-escalation として hardening 済)。moderator が
-// 他ユーザーの file を moderation する正規経路は /admin/drive/* で、本 endpoint は
-// owner-only を維持する。これは upstream からの deliberate deviation (#1948-16)。
+// 本家 drive/files/update.ts は `!isModerator && file.userId !== me.id` の
+// ときだけ ACCESS_DENIED とし、moderator は他人のファイルの名前・フォルダ・
+// 説明文も変えられる。Elythia は moderator にセンシティブの付け外しだけを
+// 許す。モデレーションに要らない書き換えの権限を閉じるため
+// (docs/divergence/security.md §6)。#499 で write 経路を所有者だけに絞り、
+// #1948-16 でそれを本家との差として記録したが、センシティブの付け外しまで
+// 閉じてしまっていたので #3678 で戻した。
 func (s *Service) Update(user *model.User, id string, in UpdateInput) (*model.DriveFile, error) {
-	f, err := s.findOwnedFile(user, id)
+	f, byModerator, err := s.findWritableFile(user, id)
 	if err != nil {
 		return nil, err
 	}
+	if byModerator && (in.Name != nil || in.Comment != nil || in.FolderID != nil) {
+		return nil, ErrAccessDenied
+	}
+	// mock の repository は保持している行をそのまま書き換えるので、比べる値は
+	// 更新の前に取っておく。
+	wasSensitive := f.IsSensitive
+	ownerID := fileOwnerID(f)
 	fields := map[string]any{}
 	if in.Name != nil {
 		// upstream DriveService.updateFile は values.name に validateFileName
@@ -1311,27 +1454,29 @@ func (s *Service) Update(user *model.User, id string, in UpdateInput) (*model.Dr
 				}
 				return nil, ErrFolderNotFound
 			}
-			if folder.UserID == nil || *folder.UserID != user.ID {
+			if folder.UserID == nil || *folder.UserID != ownerID {
 				return nil, ErrFolderNotFound
 			}
 		}
 		fields["folderId"] = *in.FolderID
 	}
 	if in.IsSensitive != nil {
-		// alwaysMarkNsfw role policy が true の user は isSensitive を false
-		// に変更できない (upstream DriveService.updateFile と同 logic、#1028)。
-		// 自分自身の policy なので file.userId == user.ID 前提で role を見る。
+		// alwaysMarkNsfw role policy が true の user のファイルは isSensitive を
+		// false に変更できない (upstream DriveService.updateFile と同 logic、#1028)。
 		//
-		// moderator bypass はしない (= 上の findOwnedFile() が moderator にも
-		// owner-only を強制する設計と整合)。admin が自分にも alwaysMarkNsfw を
-		// 持つ場合、自分の file も例外なく sensitive 維持する (= self-restriction、
-		// upstream は file.userId 起点で policies を見る semantics で同挙動)。
-		// 「自分の role を override したい admin は role 編集経由で剥がす」が
-		// 公式の脱出経路。i/update の admin bypass とは目的が異なる: i/update
-		// は profile field 設定の意思表明への gate、drive Update は実 file 属性
-		// の操作。
-		if !*in.IsSensitive && f.IsSensitive && s.roleChecker != nil {
-			policies := s.roleChecker.GetUserPolicies(user.ID)
+		// 見るのは操作した人ではなく**ファイルの所有者**の policy (本家も
+		// file.userId で引く、#3678)。moderator が他人のファイルを外そうとしても、
+		// 所有者が alwaysMarkNsfw なら RESTRICTED_BY_ROLE になる。所有者の
+		// 居ないファイルは本家の getUserPolicies(null) と同じく base の policy
+		// (GetUserPolicies("")) で判定する。
+		//
+		// 所有者が admin で自分にも alwaysMarkNsfw を持つ場合も例外にしない
+		// (= self-restriction)。「自分の role を override したい admin は role
+		// 編集経由で剥がす」が公式の脱出経路。i/update の admin bypass とは目的が
+		// 異なる: i/update は profile field 設定の意思表明への gate、drive Update
+		// は実 file 属性の操作。
+		if !*in.IsSensitive && wasSensitive && s.roleChecker != nil {
+			policies := s.roleChecker.GetUserPolicies(ownerID)
 			if policies != nil {
 				if v, ok := policies["alwaysMarkNsfw"].(bool); ok && v {
 					return nil, ErrCannotUnmarkSensitive
@@ -1347,17 +1492,60 @@ func (s *Service) Update(user *model.User, id string, in UpdateInput) (*model.Dr
 	if err != nil {
 		return nil, err
 	}
-	s.publishEvent(user.ID, "fileUpdated", entity.PackDriveFileSelf(updated, s.idGen))
+	// イベントは操作した人ではなく所有者の drive stream へ送る (本家
+	// publishDriveStream(file.userId, ...))。所有者が居なければ送らない。
+	s.publishEvent(ownerID, "fileUpdated", s.entityPacker.PackDriveFileSelf(updated, s.idGen))
+	// 本家と同じく、値が実際に変わったときだけ残す。
+	if byModerator && in.IsSensitive != nil && *in.IsSensitive != wasSensitive {
+		t := moderationlog.LogUnmarkSensitiveDriveFile
+		if *in.IsSensitive {
+			t = moderationlog.LogMarkSensitiveDriveFile
+		}
+		s.logModeratorAction(user, t, f)
+	}
 	return updated, nil
 }
 
-// Delete removes a file from storage and the database.
-// Owner-only: moderator が他ユーザーの file を削除できないよう
-// findOwnedFile() を使う (#499)。
+// Delete removes a file from storage and the database. The owner or a
+// moderator may delete it; a moderator deleting another user's file leaves a
+// deleteDriveFile moderation log entry (#3678). A moderator cannot delete,
+// even here, a system-owned file (IsSystemOwned) or a file a custom emoji
+// uses as its image; the owner still can delete their own file.
 func (s *Service) Delete(user *model.User, id string) error {
-	f, err := s.findOwnedFile(user, id)
+	f, byModerator, err := s.findWritableFile(user, id)
 	if err != nil {
 		return err
+	}
+	// **system 所有のファイルは moderator でも消させない (#3678)。** 本家は
+	// moderator なら消せる。system 所有のファイルは、絵文字の画像 (#2999 /
+	// #3014 / #2966 / #670 で複製したもの) などで、どの利用者の
+	// drive 操作でも壊れないことを前提にしている。所有者の居ないリモートの添付
+	// (userHost 付き) は system 所有ではないので、本家と同じく消せる。
+	// センシティブの付け外しは system 所有でも許す (Update は見ない)。
+	// 所有者の経路に system 所有のファイルは来ないので、byModerator は見ない。
+	if IsSystemOwned(f) {
+		return ErrAccessDenied
+	}
+	// **絵文字が画像として使っているファイルも、moderator には消させない
+	// (#3678)。** system 所有でなくても、TS 版から移行した絵文字・#2999 /
+	// #3014 より前に登録した絵文字・#3865 より前に `admin/emoji/add` の `url`
+	// 直接指定で登録した絵文字は、
+	// 利用者 (多くは管理者やモデレーター) のファイルを指したまま残っている。
+	// それを絵文字の管理権限を持たない moderator がここから消すと、絵文字の
+	// 画像が 404 になる。絵文字は絵文字の管理から消す。数えるのはローカルの
+	// 絵文字だけで、URL の照合は孤児 cleanup の guard と同じ (repository の
+	// IsReferencedByEmoji)。リモートの絵文字を数えると、リモートのアカウントが
+	// Emoji タグの icon.url にこちらのファイルの URL を入れるだけで、そのファイルを
+	// moderator の削除から守れてしまう。所有者本人の削除は今までどおり止めない
+	// (本人が消せば壊れるのは #3678 より前から同じ)。
+	if byModerator {
+		referenced, err := s.fileRepo.IsReferencedByEmoji(f.ID)
+		if err != nil {
+			return err
+		}
+		if referenced {
+			return ErrAccessDenied
+		}
 	}
 	if err := s.deleteFileObjects(f); err != nil {
 		return err
@@ -1365,10 +1553,14 @@ func (s *Service) Delete(user *model.User, id string) error {
 	if err := s.fileRepo.Delete(f); err != nil {
 		return err
 	}
-	// upstream は fileDeleted に file.id (文字列) だけを送る (#2002)。
-	s.publishEvent(user.ID, "fileDeleted", f.ID)
+	// upstream は fileDeleted に file.id (文字列) だけを、所有者の drive stream
+	// へ送る (#2002)。
+	s.publishEvent(fileOwnerID(f), "fileDeleted", f.ID)
 	if s.chartHook != nil {
 		s.chartHook.OnFileDeleted(f)
+	}
+	if byModerator {
+		s.logModeratorAction(user, moderationlog.LogDeleteDriveFile, f)
 	}
 	return nil
 }
@@ -1376,7 +1568,7 @@ func (s *Service) Delete(user *model.User, id string) error {
 // DeleteSystemFile removes a system-owned file (userId IS NULL) by id (#2966).
 //
 // **所有者チェックを通せないので別の口にする。** `Delete` は
-// `findOwnedFile` が user を要求するが、絵文字の実体として作るファイルは
+// `findWritableFile` が user を要求するが、絵文字の実体として作るファイルは
 // 誰のものでもない。代わりに**「利用者のファイルではないこと」を確かめる** —
 // id を取り違えたときに利用者のファイルを消さないため。
 //
@@ -1699,8 +1891,6 @@ func normalizeMimePatterns(raw any) []string {
 	}
 }
 
-// HasRoleChecker reports whether the role checker was wired.
-//
-// **1 つの nil で 4 つの制限が同時に外れる** — MIME 許可リスト、NSFW 強制、
-// ファイルサイズ上限、容量上限。起動時検査に使う (#2683)。
-func (s *Service) HasRoleChecker() bool { return s.roleChecker != nil }
+// hasModerationLog reports whether NewService received both moderation log
+// dependencies.
+func (s *Service) hasModerationLog() bool { return s.modLog != nil && s.modLogUsers != nil }

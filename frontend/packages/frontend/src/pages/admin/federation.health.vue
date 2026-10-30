@@ -41,26 +41,32 @@ SPDX-License-Identifier: AGPL-3.0-only
 			mk-go: 配送を止めている相手 (#3048)。**「開いたまま戻らない」が最悪の
 			失敗形**なので、見えて手で再開できるようにする。受信側には無い。
 		-->
-		<div v-if="direction === 'deliver' && breakers.length > 0" class="_gaps_s">
-			<div :class="$style.breakersHead">{{ i18n.ts._federationHealth.breakersTitle }}</div>
-			<div v-for="b in breakers" :key="b.host" :class="[$style.breaker, b.open ? $style.error : $style.warn]">
-				<div :class="$style.breakerHead">
-					<span class="_monospace">{{ b.host }}</span>
-					<span :class="$style.breakerState">{{ stateLabel(b) }}</span>
+		<MkFolder v-if="direction === 'deliver' && breakers.length > 0" :defaultOpen="true">
+			<template #label>{{ i18n.ts._federationHealth.breakersTitle }}</template>
+			<template #suffix>{{ number(breakers.length) }}</template>
+			<div class="_gaps_s">
+				<div v-for="b in visibleBreakers" :key="b.host" :class="[$style.breaker, b.open ? $style.error : $style.warn]">
+					<div :class="$style.breakerHead">
+						<span class="_monospace">{{ b.host }}</span>
+						<span :class="$style.breakerState">{{ stateLabel(b) }}</span>
+					</div>
+					<div :class="$style.breakerBody">
+						<template v-if="b.open">
+							<div v-if="b.openedAt">{{ i18n.ts._federationHealth.breakerOpenedAt }}: <MkTime :time="b.openedAt"/></div>
+							<div v-if="b.nextProbeAt">{{ i18n.ts._federationHealth.breakerNextProbe }}: <MkTime :time="b.nextProbeAt" mode="absolute"/></div>
+							<div>{{ i18n.tsx._federationHealth.breakerDetail({ failures: number(b.consecutiveFailures), interval: intervalLabel(b.probeIntervalSeconds) }) }}</div>
+						</template>
+						<div v-if="b.throttledUntil">{{ i18n.ts._federationHealth.breakerThrottledUntil }}: <MkTime :time="b.throttledUntil" mode="absolute"/></div>
+						<div v-if="b.reservedUntil">{{ i18n.ts._federationHealth.breakerReservedUntil }}: <MkTime :time="b.reservedUntil" mode="absolute"/></div>
+					</div>
+					<MkButton small :disabled="closing === b.host" @click="closeBreaker(b.host)"><i class="ti ti-player-play"></i> {{ i18n.ts._federationHealth.breakerClose }}</MkButton>
 				</div>
-				<div :class="$style.breakerBody">
-					<template v-if="b.open">
-						<div v-if="b.openedAt">{{ i18n.ts._federationHealth.breakerOpenedAt }}: <MkTime :time="b.openedAt"/></div>
-						<div v-if="b.nextProbeAt">{{ i18n.ts._federationHealth.breakerNextProbe }}: <MkTime :time="b.nextProbeAt" mode="absolute"/></div>
-						<div>{{ i18n.tsx._federationHealth.breakerDetail({ failures: number(b.consecutiveFailures), interval: intervalLabel(b.probeIntervalSeconds) }) }}</div>
-					</template>
-					<div v-if="b.throttledUntil">{{ i18n.ts._federationHealth.breakerThrottledUntil }}: <MkTime :time="b.throttledUntil" mode="absolute"/></div>
-					<div v-if="b.reservedUntil">{{ i18n.ts._federationHealth.breakerReservedUntil }}: <MkTime :time="b.reservedUntil" mode="absolute"/></div>
-				</div>
-				<MkButton small :disabled="closing === b.host" @click="closeBreaker(b.host)"><i class="ti ti-player-play"></i> {{ i18n.ts._federationHealth.breakerClose }}</MkButton>
+				<MkButton v-if="visibleBreakers.length < breakers.length" :class="$style.loadMore" @click="showMoreBreakers">
+					{{ i18n.ts.loadMore }}
+				</MkButton>
+				<div :class="$style.hint">{{ i18n.ts._federationHealth.breakersNote }}</div>
 			</div>
-			<div :class="$style.hint">{{ i18n.ts._federationHealth.breakersNote }}</div>
-		</div>
+		</MkFolder>
 
 		<div>
 			<MkInput v-model="hostQuery" :debounce="true">
@@ -90,7 +96,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				効かないので、key が host だけだと窓や並び替えを変えたときに同じ要素が
 				再利用され、error に転落しても開かない。
 			-->
-			<MkFolder v-for="h in visibleHosts" :key="`${h.host}:${severityOf(h)}`" :defaultOpen="severityOf(h) === 'error'">
+			<MkFolder v-for="h in pagedHosts" :key="`${h.host}:${severityOf(h)}`" :defaultOpen="severityOf(h) === 'error'">
 				<template #label>
 					<span :class="[$style.dot, $style[severityOf(h)]]" :title="rateLabel(h)"></span>
 					<span class="_monospace">{{ h.host }}</span>
@@ -142,6 +148,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 					</div>
 				</div>
 			</MkFolder>
+			<MkButton v-if="pagedHosts.length < visibleHosts.length" :class="$style.loadMore" @click="showMoreHosts">
+				{{ i18n.ts.loadMore }}
+			</MkButton>
 		</div>
 
 		<MkInfo>{{ direction === 'deliver' ? i18n.ts._federationHealth.deliverNote : i18n.ts._federationHealth.inboxNote }}</MkInfo>
@@ -151,6 +160,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <script lang="ts" setup>
 import { computed, ref, watch } from 'vue';
+import type * as Elythia from 'elythia-js';
 import MkInput from '@/components/MkInput.vue';
 import MkSelect from '@/components/MkSelect.vue';
 import MkFolder from '@/components/MkFolder.vue';
@@ -167,10 +177,7 @@ import { useMkSelect } from '@/composables/use-mkselect.js';
 // **送信側と受信側で class は完全に別物。** 重なるものは 1 つも無い。
 // 送信は internal/core/deliveryhealth/outcome.go の 6 種、受信は
 // inbound.go の 8 種で、後者は inbox processor の分岐をそのまま写している。
-type DeliverClass = 'success' | 'gone' | 'rateLimited' | 'clientError' | 'serverError' | 'transport';
-type InboxClass = 'accepted' | 'unsupported' | 'signatureFailed' | 'blocked'
-	| 'actorUnauthorized' | 'ldSignatureFailed' | 'processingError' | 'duplicate';
-type OutcomeClass = DeliverClass | InboxClass;
+type OutcomeClass = Elythia.DeliveryOutcomeClass | Elythia.InboxOutcomeClass;
 
 // **「失敗 = 赤」ではない。** backend が success 側に数えるかどうかと、
 // 運営者が対処すべきかどうかは別。unsupported / duplicate は相手が正しく
@@ -196,44 +203,14 @@ const TONE: Record<OutcomeClass, 'ok' | 'warn' | 'error'> = {
 	processingError: 'error',
 };
 
-type HostHealth = {
-	host: string;
-	success: number;
-	failure: number;
-	byClass: Partial<Record<OutcomeClass, number>>;
-	// ヒストグラムの近似。該当バケットの上限を返し、最上位 (+Inf) は -1。
-	latencyP50Ms: number;
-	latencyP95Ms: number;
-	lastError?: {
-		at: string;
-		class: OutcomeClass;
-		status: number;
-		message: string;
-	};
-};
+// 遅延の p50 / p95 はヒストグラムの近似。該当バケットの上限を返し、最上位 (+Inf) は -1。
+type HostHealth = Elythia.FederationHostHealth;
 
-// mk-go: 配送を止めている相手 (#3048)。internal/core/deliveryhealth/breaker.go の
-// BreakerState。
-type BreakerState = {
-	host: string;
-	// 開いている (配送を止めている) か。false なら 429 で間隔を空けているか、待たせた分を送っているだけ。
-	open: boolean;
-	consecutiveFailures: number;
-	openedAt: string | null;
-	nextProbeAt: string | null;
-	probeIntervalSeconds: number;
-	throttledUntil: string | null;
-	// 429 で待たせた配送の最後の予約時刻 (送り終わる見込み)。
-	reservedUntil: string | null;
-};
+// mk-go: 配送を止めている相手 (#3048)。受信側 (inbox-health) では常に空。
+type BreakerState = Elythia.DeliveryBreakerState;
 
-type HealthResponse = {
-	windowSeconds: number;
-	hosts: HostHealth[];
-	evictedHosts: number;
-	// 古い backend (#3048 より前) と受信側には無いか空。
-	breakers?: BreakerState[];
-};
+const HOST_PAGE_SIZE = 50;
+const BREAKER_PAGE_SIZE = 10;
 
 const props = defineProps<{
 	direction: 'deliver' | 'inbox';
@@ -249,6 +226,8 @@ const breakers = ref<BreakerState[]>([]);
 const closing = ref<string | null>(null);
 const fetching = ref(true);
 const unavailable = ref(false);
+const visibleHostLimit = ref(HOST_PAGE_SIZE);
+const visibleBreakerLimit = ref(BREAKER_PAGE_SIZE);
 
 const { model: windowSeconds, def: windowDef } = useMkSelect({
 	// **1 時間より長い窓は出さない。** deliveryhealth.MaxWindow が 1 時間で、
@@ -341,8 +320,21 @@ const visibleHosts = computed(() => {
 	});
 });
 
+const pagedHosts = computed(() => visibleHosts.value.slice(0, visibleHostLimit.value));
+const visibleBreakers = computed(() => breakers.value.slice(0, visibleBreakerLimit.value));
+
+function showMoreHosts() {
+	visibleHostLimit.value += HOST_PAGE_SIZE;
+}
+
+function showMoreBreakers() {
+	visibleBreakerLimit.value += BREAKER_PAGE_SIZE;
+}
+
 async function fetchHealth() {
 	fetching.value = true;
+	visibleHostLimit.value = HOST_PAGE_SIZE;
+	visibleBreakerLimit.value = BREAKER_PAGE_SIZE;
 	// **毎回戻す。** 立てたままだと v-else 側 (窓・状態・並び替えの全セレクタ) が
 	// 消えるので、一度でも失敗するとその場から再試行できなくなる。
 	unavailable.value = false;
@@ -350,12 +342,10 @@ async function fetchHealth() {
 		? 'admin/federation/delivery-health'
 		: 'admin/federation/inbox-health';
 	try {
-		// endpoint 名の cast は misskey-js の型に存在しないため。mk-go 独自
-		// endpoint を呼ぶ以上避けられない (overview.mkgo.vue と同じ扱い)。
-		const res = await misskeyApi(endpoint as never, { windowSeconds: windowSeconds.value } as never) as unknown as HealthResponse;
-		hosts.value = res.hosts ?? [];
-		evictedHosts.value = res.evictedHosts ?? 0;
-		breakers.value = res.breakers ?? [];
+		const res = await misskeyApi(endpoint, { windowSeconds: windowSeconds.value });
+		hosts.value = res.hosts;
+		evictedHosts.value = res.evictedHosts;
+		breakers.value = res.breakers;
 		unavailable.value = false;
 	} catch {
 		hosts.value = [];
@@ -391,7 +381,7 @@ async function closeBreaker(host: string) {
 	if (canceled) return;
 	closing.value = host;
 	try {
-		await os.apiWithDialog('admin/federation/close-delivery-breaker' as never, { host } as never);
+		await os.apiWithDialog('admin/federation/close-delivery-breaker', { host });
 		await fetchHealth();
 	} finally {
 		closing.value = null;
@@ -399,13 +389,12 @@ async function closeBreaker(host: string) {
 }
 
 watch([windowSeconds, () => props.direction], fetchHealth, { immediate: true });
+watch([hostQuery, state, sort], () => {
+	visibleHostLimit.value = HOST_PAGE_SIZE;
+});
 </script>
 
 <style lang="scss" module>
-.breakersHead {
-	font-weight: bold;
-}
-
 .breaker {
 	display: flex;
 	flex-direction: column;
@@ -550,5 +539,9 @@ watch([windowSeconds, () => props.direction], fetchHealth, { immediate: true });
 	text-align: center;
 	padding: 32px 16px;
 	opacity: 0.7;
+}
+
+.loadMore {
+	margin: 0 auto;
 }
 </style>

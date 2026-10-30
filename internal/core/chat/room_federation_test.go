@@ -3,6 +3,7 @@ package chat_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	corechat "github.com/elythia-network/elythia/internal/core/chat"
@@ -17,7 +18,7 @@ func newRoomFedService(t *testing.T) (*corechat.Service, *testutil.MockChatRepos
 	t.Helper()
 	repo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	return corechat.NewService(repo, idGen), repo
+	return corechat.NewService(repo, idGen, nil, nil, nil), repo
 }
 
 func TestEnsureRoomViaAP_CreatesCopy(t *testing.T) {
@@ -160,6 +161,68 @@ func TestAddMemberViaAP_CreatesMembershipAndConsumesInvitation(t *testing.T) {
 	assert.Error(t, err, "invitation should be consumed")
 }
 
+// 満員の room への Accept は参加させず、招待を残すこと (再送もさせない)。
+// 招待を作った時点では空きがあっても、承諾までに埋まりうる。
+func TestAddMemberViaAP_RoomFullKeepsInvitation(t *testing.T) {
+	svc, repo := newRoomFedService(t)
+	seedRemoteRoom(t, repo, "room1", "remoteOwner")
+	require.NoError(t, svc.CreateInvitationViaAP(remoteRoomURI("room1"), "remoteUser"))
+	for i := 0; i < 50; i++ {
+		require.NoError(t, repo.CreateMembership(&model.ChatRoomMembership{
+			ID: fmt.Sprintf("m%02d", i), UserID: fmt.Sprintf("member%02d", i), RoomID: "room1",
+		}))
+	}
+	err := svc.AddMemberViaAP(remoteRoomURI("room1"), "remoteUser")
+	require.ErrorIs(t, err, corechat.ErrRoomFull)
+	_, err = repo.FindMembership("remoteUser", "room1")
+	assert.Error(t, err, "満員の room に参加させた")
+	_, err = repo.FindInvitation("remoteUser", "room1")
+	assert.NoError(t, err, "招待を消した")
+}
+
+// owner とのあいだにどちらかの向きのブロックがあれば、Accept でも参加させず、
+// 招待を残す (ローカルの invitations/accept・rooms/join と同じ)。判定が引けない
+// ときも参加させず、ErrChatBlocked ではない (再送させる) エラーで返す。
+func TestAddMemberViaAP_BlockedEitherWayKeepsInvitation(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		blocker, blockee string
+	}{
+		{name: "member blocks owner", blocker: "remoteUser", blockee: "remoteOwner"},
+		{name: "owner blocks member", blocker: "remoteOwner", blockee: "remoteUser"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, repo := newRoomFedService(t)
+			seedRemoteRoom(t, repo, "room1", "remoteOwner")
+			require.NoError(t, repo.CreateInvitation(&model.ChatRoomInvitation{ID: "inv1", UserID: "remoteUser", RoomID: "room1"}))
+			blocks := testutil.NewMockBlockingRepository()
+			require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: tc.blocker, BlockeeID: tc.blockee}))
+			svc.SetBlockingRepoForTest(blocks)
+
+			err := svc.AddMemberViaAP(remoteRoomURI("room1"), "remoteUser")
+			require.ErrorIs(t, err, corechat.ErrChatBlocked)
+			_, err = repo.FindMembership("remoteUser", "room1")
+			assert.Error(t, err, "ブロックの間柄で参加させた")
+			_, err = repo.FindInvitation("remoteUser", "room1")
+			assert.NoError(t, err, "招待を消した")
+		})
+	}
+	t.Run("lookup error", func(t *testing.T) {
+		svc, repo := newRoomFedService(t)
+		seedRemoteRoom(t, repo, "room1", "remoteOwner")
+		require.NoError(t, repo.CreateInvitation(&model.ChatRoomInvitation{ID: "inv1", UserID: "remoteUser", RoomID: "room1"}))
+		blocks := testutil.NewMockBlockingRepository()
+		blocks.ExistsErr = errors.New("db down")
+		svc.SetBlockingRepoForTest(blocks)
+
+		err := svc.AddMemberViaAP(remoteRoomURI("room1"), "remoteUser")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, corechat.ErrChatBlocked, "一過性エラーを block 判定に丸めない")
+		_, err = repo.FindMembership("remoteUser", "room1")
+		assert.Error(t, err)
+	})
+}
+
 // owner 宛の Accept は membership 行を作らない (#2858)。owner は暗黙のメンバー
 // なので行を持たず、譲渡で招待が残っていた場合にここで実体化させない。
 func TestAddMemberViaAP_OwnerDoesNotCreateMembership(t *testing.T) {
@@ -291,7 +354,7 @@ func TestCreateMessageToRoom_DeliversToRemoteMembers(t *testing.T) {
 	svc, chatRepo, userRepo, deliverer := newInvitationService(t)
 	remoteHost := "remote.example"
 	bobURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &bobURI}
 	// alice (local owner) の room に remote member bob。**ローカル room なので
 	// host / uri は NULL** (#2994)。
@@ -310,7 +373,7 @@ func TestCreateMessageToRoom_DeliversToRemoteMembers(t *testing.T) {
 
 func TestCreateMessageToRoom_LocalOnlyRoomNoFederation(t *testing.T) {
 	svc, chatRepo, userRepo, deliverer := newInvitationService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["carol"] = &model.User{ID: "carol", Username: "carol"}
 	require.NoError(t, chatRepo.CreateRoom(remoteRoomRow("room1", "General", "alice")))
 	require.NoError(t, chatRepo.CreateMembership(&model.ChatRoomMembership{ID: "mem1", UserID: "carol", RoomID: "room1"}))
@@ -326,7 +389,7 @@ func TestCreateMessageToRoom_RemoteRoomUsesStoredURI(t *testing.T) {
 	remoteHost := "remote.example"
 	ownerURI := "https://remote.example/users/owner"
 	userRepo.Users["owner"] = &model.User{ID: "owner", Username: "owner", Host: &remoteHost, URI: &ownerURI}
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	// remote owner の room copy に local member alice が投稿する。
 	require.NoError(t, chatRepo.CreateRoom(remoteRoomRow("room1", "General", "owner")))
 	require.NoError(t, chatRepo.CreateMembership(&model.ChatRoomMembership{ID: "mem1", UserID: "alice", RoomID: "room1"}))
@@ -343,7 +406,7 @@ func TestCreateMessageToRoom_DeliveryFailureSwallowed(t *testing.T) {
 	deliverer.returnErr = assert.AnError
 	remoteHost := "remote.example"
 	bobURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &bobURI}
 	require.NoError(t, chatRepo.CreateRoom(remoteRoomRow("room1", "General", "alice")))
 	require.NoError(t, chatRepo.CreateMembership(&model.ChatRoomMembership{ID: "mem1", UserID: "bob", RoomID: "room1"}))
@@ -436,7 +499,7 @@ func TestLeaveRoom_NonMemberDoesNotFederate(t *testing.T) {
 	svc, chatRepo, userRepo, deliverer := newInvitationService(t)
 	remoteHost := "remote.example"
 	bobURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &bobURI}
 	userRepo.Users["mallory"] = &model.User{ID: "mallory", Username: "mallory"}
 	// ローカル room (alice が owner) なので host / uri は NULL。
@@ -455,7 +518,7 @@ func TestLeaveRoom_NonMemberDoesNotFederate(t *testing.T) {
 // 見える。
 func TestLeaveRoom_MembershipLookupFailureIsError(t *testing.T) {
 	svc, chatRepo, userRepo, deliverer := newInvitationService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
 	// ローカル room (alice が owner) なので host / uri は NULL。
 	require.NoError(t, chatRepo.CreateRoom(&model.ChatRoom{ID: "room1", Name: "G", OwnerID: "alice"}))
@@ -745,8 +808,8 @@ func TestCreateMessageToRoom_NoDeliveryWhenRoomURIUnknown(t *testing.T) {
 	remoteHost := "remote.example"
 	bobURI := "https://remote.example/users/bob"
 	badOwnerURI := "not-a-url"
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["remoteOwner"] = &model.User{ID: "remoteOwner", Username: "owner", Host: &remoteHost, URI: &badOwnerURI}
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &bobURI}
 	// `uri` を持たないのに owner がリモート、という身元の分からない行。
 	require.NoError(t, chatRepo.CreateRoom(&model.ChatRoom{ID: "room1", Name: "G", OwnerID: "remoteOwner"}))
@@ -784,7 +847,7 @@ func TestResolveRoom_IDLookupFailureIsError(t *testing.T) {
 		err:                errors.New("dial tcp: connection refused"),
 	}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(repo, idGen)
+	svc := corechat.NewService(repo, idGen, nil, nil, nil)
 
 	err := svc.RemoveMemberViaAP("https://remote.example/chat/rooms/room1", "rmt")
 	require.Error(t, err)
@@ -800,3 +863,20 @@ type roomIDLookupFailingRepo struct {
 }
 
 func (r *roomIDLookupFailingRepo) FindRoomByID(string) (*model.ChatRoom, error) { return nil, r.err }
+
+// 参加済みかの確認が DB 障害で失敗したら、まだメンバーでないと見なさずに
+// error を返すこと (#2792)。招待は残す。
+func TestAddMemberViaAP_MembershipLookupFailureIsError(t *testing.T) {
+	svc, repo := newRoomFedService(t)
+	seedRemoteRoom(t, repo, "room1", "remoteOwner")
+	require.NoError(t, svc.CreateInvitationViaAP(remoteRoomURI("room1"), "remoteUser"))
+	repo.FindMembershipErr = errors.New("db down")
+
+	err := svc.AddMemberViaAP(remoteRoomURI("room1"), "remoteUser")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, corechat.ErrRoomFull)
+
+	repo.FindMembershipErr = nil
+	_, err = repo.FindInvitation("remoteUser", "room1")
+	assert.NoError(t, err, "失敗時に招待を消した")
+}

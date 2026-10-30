@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/api/optional"
 	"github.com/elythia-network/elythia/internal/api/pagination"
@@ -24,6 +25,9 @@ import (
 
 // Handler handles channel-related API endpoints.
 type Handler struct {
+	// relationCache は閲覧者のミュート・ブロックの一覧を要求をまたいで持つ
+	// (#3607)。nil なら repository から読む。
+	relationCache *repository.RelationCache
 	svc           *corechannel.Service
 	idGen         id.Generator
 	favoriteRepo  ChannelFavoriteRepository
@@ -63,14 +67,13 @@ type Handler struct {
 	// ugcVisibilityFn は meta.ugcVisibilityForVisitor の live lookup。
 	// channels/timeline の匿名 visitor への gate に使う。
 	ugcVisibilityFn func() string
-}
-
-// SetUGCVisibilityLookup wires a live lookup of meta.ugcVisibilityForVisitor.
-//
-// **毎回読む。** 起動時に焼き込むと、運営者が管理画面で締めても
-// プロセスを再起動するまで反映されない。
-func (h *Handler) SetUGCVisibilityLookup(fn func() string) {
-	h.ugcVisibilityFn = fn
+	// noteHider は閲覧者が見てはいけない投稿の中身を隠す (#3786)。未配線だと
+	// 匿名の閲覧者への ugcVisibilityForVisitor が効かないので、NewHandler の
+	// 必須の引数で受ける (#3817)。
+	noteHider *notehide.Hider
+	// entityPacker は投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3790)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // ugcVisibilityNow resolves the current policy ("" when unwired, which the
@@ -80,25 +83,6 @@ func (h *Handler) ugcVisibilityNow() string {
 		return ""
 	}
 	return h.ugcVisibilityFn()
-}
-
-// HasUGCVisibility reports whether the visitor content visibility lookup was
-// wired. 未配線だと channels/timeline の匿名 visitor への gate が素通しになる。
-// 起動時検査に使う。
-func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibilityFn != nil }
-
-// HasMetaRepo reports whether the blocked-host filter can read meta.
-//
-// 未配線だと `blockedHosts` の除外が黙って no-op になる (ブロックしたはずの
-// インスタンスのノートが一覧に出続ける)。起動時の critical wiring 検査で落とす。
-func (h *Handler) HasMetaRepo() bool {
-	return h != nil && h.metaRepo != nil
-}
-
-// SetMetaRepo wires a MetaRepository used for the blocked-host filter on
-// channels/timeline (upstream generateBlockedHostQueryForNote)。
-func (h *Handler) SetMetaRepo(r repository.MetaRepository) {
-	h.metaRepo = r
 }
 
 // SetUserFollowingRepo wires the user-following lookup used by the pinnedNotes
@@ -229,8 +213,28 @@ type ChannelMutingRepository interface {
 }
 
 // NewHandler creates a new channels Handler.
-func NewHandler(svc *corechannel.Service, idGen id.Generator) *Handler {
-	return &Handler{svc: svc, idGen: idGen}
+// noteHider applies the per-viewer hideNote gate to the notes this handler
+// packs (#3786) and entityPacker is the Packer it packs entities with (#3790).
+// metaRepo backs the blocked-host filter on channels/timeline (upstream
+// generateBlockedHostQueryForNote). ugcVisibilityFn is a live lookup of
+// meta.ugcVisibilityForVisitor, read on every request so that changing the
+// setting takes effect without a restart.
+func NewHandler(
+	svc *corechannel.Service,
+	idGen id.Generator,
+	noteHider *notehide.Hider,
+	entityPacker *entity.Packer,
+	metaRepo repository.MetaRepository,
+	ugcVisibilityFn func() string,
+) *Handler {
+	return &Handler{
+		svc:             svc,
+		idGen:           idGen,
+		noteHider:       noteHider,
+		entityPacker:    entityPacker,
+		metaRepo:        metaRepo,
+		ugcVisibilityFn: ugcVisibilityFn,
+	}
 }
 
 // CreateRequest is the request body for channels/create.
@@ -355,11 +359,11 @@ func (h *Handler) packPinnedNotes(ctx context.Context, ch *model.Channel, viewer
 	if len(notes) == 0 {
 		return out
 	}
-	entities := entity.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	entities := h.entityPacker.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	if h.fieldRes != nil {
 		h.fieldRes.Apply(entities, viewer)
 	}
-	notehide.HideEmbeds(viewer, entities)
+	h.noteHider.HideEmbeds(viewer, entities)
 	for _, pn := range entities {
 		out = append(out, pn)
 	}
@@ -374,7 +378,7 @@ type UpdateRequest struct {
 	Color                 *string                   `json:"color"`
 	IsArchived            *bool                     `json:"isArchived"`
 	IsSensitive           *bool                     `json:"isSensitive"`
-	BannerID              *string                   `json:"bannerId"`
+	BannerID              optional.Nullable[string] `json:"bannerId"`
 	PinnedNoteIDs         *[]string                 `json:"pinnedNoteIds"`
 	AllowRenoteToExternal *bool                     `json:"allowRenoteToExternal"`
 }
@@ -407,7 +411,6 @@ func (h *Handler) Update(c echo.Context) error {
 		Color:                 req.Color,
 		IsArchived:            req.IsArchived,
 		IsSensitive:           req.IsSensitive,
-		BannerID:              req.BannerID,
 		PinnedNoteIDs:         req.PinnedNoteIDs,
 		AllowRenoteToExternal: req.AllowRenoteToExternal,
 	}
@@ -418,10 +421,18 @@ func (h *Handler) Update(c echo.Context) error {
 		desc := req.Description.Value // *string (nil for explicit null)
 		in.Description = &desc
 	}
-	// bannerId 設定時 (空文字 = 解除は検証不要) は所有権を検証する
+	// bannerId: null はバナーを外す。本家は null を受けても外さない
+	// (`banner ? { bannerId } : {}`) が、同梱の frontend の「バナーを削除」は null を
+	// 送るので、外せるようにする (#3758、docs/divergence/)。以前の bannerId: "" で
+	// 外す独自の慣習は、本家と同じく misskey:id の形でないとして 400 になる。
+	if req.BannerID.Present {
+		banner := req.BannerID.Value // *string (nil for explicit null)
+		in.BannerID = &banner
+	}
+	// bannerId 設定時は所有権を検証する
 	// (upstream channels/update: bannerId != null → findOneBy({id, userId}) → NO_SUCH_FILE)。
-	if req.BannerID != nil && *req.BannerID != "" {
-		if !h.bannerOwnedBy(*req.BannerID, user.ID) {
+	if req.BannerID.Value != nil {
+		if !h.bannerOwnedBy(*req.BannerID.Value, user.ID) {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "e86c14a4-0da2-4032-8df3-e737a04c7f3b"))
 		}
 	}
@@ -480,16 +491,18 @@ func (h *Handler) Unfollow(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// PaginatedListRequest is shared by followed / owned / featured / search /
-// timeline endpoints. frontend Paginator は cursor mode で sinceId / untilId
-// を投げてくる (#493)。
+// PaginatedListRequest is shared by the followed / owned endpoints. frontend
+// Paginator は cursor mode で sinceId / untilId を投げてくる (#493)。
+//
+// 本家の paramDef に offset は無く、送られても無視して先頭から返すので読まない。
+// limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が整数の
+// 小数(10.0)を受ける。search・timeline も同じ (#3758)。
 type PaginatedListRequest struct {
-	Limit     *int   `json:"limit"`
-	Offset    int    `json:"offset"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // Followed handles POST /api/channels/followed.
@@ -505,15 +518,15 @@ func (h *Handler) Followed(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 5, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 5, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	rows, err := h.svc.ListFollowed(user.ID, sinceID, untilID, limit, req.Offset)
+	rows, err := h.svc.ListFollowed(user.ID, sinceID, untilID, limit)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -528,15 +541,15 @@ func (h *Handler) Owned(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 5, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 5, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	rows, err := h.svc.ListOwned(user.ID, sinceID, untilID, limit, req.Offset)
+	rows, err := h.svc.ListOwned(user.ID, sinceID, untilID, limit)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -548,9 +561,10 @@ func (h *Handler) Owned(c echo.Context) error {
 // upstream featured.ts は pagination param を持たず、lastNotedAt IS NOT NULL かつ
 // isArchived=FALSE の channel を lastNotedAt DESC で固定 10 件返す (#1540)。
 // cursor / limit は無視する (service が固定条件で返す) が、malformed JSON は
-// upstream のフレームワーク同様 400 で弾くため bind 検証だけ残す。
+// upstream のフレームワーク同様 400 で弾くため bind 検証だけ残す。本家の paramDef
+// は {} で、型の違う余分な鍵(limit: "x")も通すので、鍵を持たない型で受ける (#3758)。
 func (h *Handler) Featured(c echo.Context) error {
-	var req PaginatedListRequest
+	var req struct{}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -563,14 +577,13 @@ func (h *Handler) Featured(c echo.Context) error {
 
 // SearchRequest carries the query string for channels/search.
 type SearchRequest struct {
-	Query     string `json:"query"`
-	Type      string `json:"type"`
-	Limit     *int   `json:"limit"`
-	Offset    int    `json:"offset"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	Query     string     `json:"query"`
+	Type      string     `json:"type"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // Search handles POST /api/channels/search.
@@ -585,15 +598,15 @@ func (h *Handler) Search(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 5, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 5, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	rows, err := h.svc.Search(req.Query, req.Type, sinceID, untilID, limit, req.Offset)
+	rows, err := h.svc.Search(req.Query, req.Type, sinceID, untilID, limit)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -617,12 +630,12 @@ func (h *Handler) bannerOwnedBy(bannerID, userID string) bool {
 
 // TimelineRequest is the request body for channels/timeline.
 type TimelineRequest struct {
-	ChannelID string `json:"channelId"`
-	UntilID   string `json:"untilId"`
-	SinceID   string `json:"sinceId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
-	Limit     *int   `json:"limit"`
+	ChannelID string     `json:"channelId"`
+	UntilID   string     `json:"untilId"`
+	SinceID   string     `json:"sinceId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
+	Limit     *jsnum.Int `json:"limit"`
 }
 
 // Timeline handles POST /api/channels/timeline.
@@ -631,12 +644,12 @@ func (h *Handler) Timeline(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.ChannelID == "" {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -691,7 +704,7 @@ func (h *Handler) Timeline(c echo.Context) error {
 	// チャンネルミュート自体は上の ApplyRenoteChannelMute が担うので、ここでは
 	// channelMutingRepo を渡さない (閲覧中チャンネルを巻き込まないため)。
 	if viewer != nil && h.blockingRepo != nil {
-		sets, err := notesfilter.LoadMuteBlockSets(viewer, h.userMutingRepo, h.blockingRepo, nil, h.userRepo)
+		sets, err := notesfilter.LoadMuteBlockSetsCached(h.relationCache, viewer, h.userMutingRepo, h.blockingRepo, nil, h.userRepo)
 		if err != nil {
 			return apierr.JSONInternalError(c)
 		}
@@ -699,7 +712,7 @@ func (h *Handler) Timeline(c echo.Context) error {
 			return apierr.JSONInternalError(c)
 		}
 	}
-	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes)
+	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes, h.idGen)
 	// **ブロック済みインスタンスのノートを落とす** (upstream
 	// generateBlockedHostQueryForNote)。チャンネルは連合先からも投稿されるので、
 	// ブロック後も既存のノートがタイムラインに出続けていた。
@@ -708,9 +721,9 @@ func (h *Handler) Timeline(c echo.Context) error {
 		return apierr.JSONInternalError(c)
 	}
 	notes = notesfilter.ApplyBlockedHosts(notes, blockedHosts)
-	entities := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	entities := h.entityPacker.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(entities, viewer)
-	notehide.HideEmbeds(viewer, entities)
+	h.noteHider.HideEmbeds(viewer, entities)
 	out := make([]any, 0, len(entities))
 	for _, pn := range entities {
 		out = append(out, pn)
@@ -769,14 +782,14 @@ func (h *Handler) channelToMap(ch *model.Channel, bannerURL any) map[string]any 
 // channelBannerPublicURL mirrors upstream DriveFileEntityService.getPublicUrl
 // for the non-proxy path (webpublicUrl ?? url, #1280), then wraps a remote
 // origin through the media proxy to prevent viewer IP leakage (#1529).
-// entity.ProxyMediaURL は context 未配線時 / local URL では raw を返すので
+// (*entity.Packer).ProxyMediaURL は context 未配線時 / local URL では raw を返すので
 // 従来挙動を維持する。
-func channelBannerPublicURL(f *model.DriveFile) string {
+func channelBannerPublicURL(pk *entity.Packer, f *model.DriveFile) string {
 	raw := f.URL
 	if f.WebpublicURL != nil && *f.WebpublicURL != "" {
 		raw = *f.WebpublicURL
 	}
-	return entity.ProxyMediaURL(raw)
+	return pk.ProxyMediaURL(raw)
 }
 
 // resolveBannerURL resolves a single channel's bannerId to its public URL.
@@ -789,7 +802,7 @@ func (h *Handler) resolveBannerURL(bannerID *string) any {
 	if err != nil || f == nil {
 		return nil
 	}
-	return channelBannerPublicURL(f)
+	return channelBannerPublicURL(h.entityPacker, f)
 }
 
 // resolveBannerURLs batch-resolves bannerUrl for a slice of channels in a
@@ -819,7 +832,7 @@ func (h *Handler) resolveBannerURLs(rows []*model.Channel) map[string]any {
 	for _, ch := range rows {
 		if ch.BannerID != nil {
 			if f := byID[*ch.BannerID]; f != nil {
-				res[ch.ID] = channelBannerPublicURL(f)
+				res[ch.ID] = channelBannerPublicURL(h.entityPacker, f)
 			}
 		}
 	}
@@ -919,4 +932,10 @@ func alreadyFollowing(c echo.Context) error {
 
 func notFollowing(c echo.Context) error {
 	return c.JSON(http.StatusBadRequest, apierr.Error("NOT_FOLLOWING", "You are not following that channel.", "1f87a25b-7c72-4ed1-b3c3-bcaf57636a64"))
+}
+
+// SetRelationCache wires the per-user relation cache used by the mute / block
+// filter (#3607). nil keeps reading the repositories.
+func (h *Handler) SetRelationCache(rc *repository.RelationCache) {
+	h.relationCache = rc
 }

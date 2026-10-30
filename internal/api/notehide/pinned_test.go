@@ -29,7 +29,7 @@ func TestPinnedPublicNotesBypassOnlyTopLevelTimeLockdown(t *testing.T) {
 					return entity.NoteEntity{ID: "pin", UserID: "author", User: user, Visibility: visibility, CreatedAt: "2020-01-01T00:00:00.000Z", Text: heStr("pinned public"), Renote: embed}
 				}
 				pinned := []entity.NoteEntity{makeNote()}
-				hidePinnedNotesAt(nil, pinned, nil, heNowMs)
+				NewHider(nil, nil).hidePinnedNotesAt(nil, pinned, heNowMs)
 				if pref == "signin" {
 					require.True(t, pinned[0].IsHidden, "current pins still require sign-in")
 					require.Nil(t, pinned[0].Text)
@@ -41,7 +41,7 @@ func TestPinnedPublicNotesBypassOnlyTopLevelTimeLockdown(t *testing.T) {
 				require.True(t, pinned[0].Renote.IsHidden, "pin exception must not reach quoted notes")
 				require.Nil(t, pinned[0].Renote.Text)
 				ordinary := []entity.NoteEntity{makeNote()}
-				hideEmbedsAt(nil, ordinary, nil, heNowMs)
+				NewHider(nil, nil).hideEmbedsAt(nil, ordinary, heNowMs)
 				require.True(t, ordinary[0].IsHidden, "non-profile paths must retain lockdown")
 			})
 		}
@@ -76,7 +76,7 @@ func TestPinnedNotesKeepIntrinsicAccessAndNestedEmbeds(t *testing.T) {
 			for _, note := range visible {
 				packed = append(packed, byID[note.ID])
 			}
-			hidePinnedNotesAt(viewer, packed, repo, heNowMs)
+			NewHider(repo, nil).hidePinnedNotesAt(viewer, packed, heNowMs)
 			got := make(map[string]entity.NoteEntity, len(packed))
 			for _, note := range packed {
 				got[note.ID] = note
@@ -97,7 +97,7 @@ func TestPinnedNotesKeepIntrinsicAccessAndNestedEmbeds(t *testing.T) {
 func TestHidePinnedNotesPublicEntryPoint(t *testing.T) {
 	signin := true
 	packed := []entity.NoteEntity{{ID: "pin", UserID: "author", User: entity.UserLite{ID: "author", RequireSigninToViewContents: &signin}, Visibility: "public", Text: heStr("public pin")}}
-	HidePinnedNotes(nil, packed)
+	NewHider(nil, nil).HidePinnedNotes(nil, packed)
 	require.True(t, packed[0].IsHidden)
 	require.Nil(t, packed[0].Text)
 }

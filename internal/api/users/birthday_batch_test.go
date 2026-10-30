@@ -59,9 +59,9 @@ func TestGetFollowingUsersByBirthday_FetchesUsersInOneBatch(t *testing.T) {
 	fRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	h := users.NewHandler(
-		coreuser.NewService(repo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen),
-		corefollowing.NewService(repo, fRepo, testutil.NewMockFollowRequestRepository(), idGen),
-		testutil.NewMockNoteRepository(), idGen)
+		coreuser.NewService(repo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen, nil),
+		corefollowing.NewService(repo, fRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil),
+		testutil.NewMockNoteRepository(), idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	h.SetFollowingRepo(fRepo)
 	mock.Users["me"] = &model.User{ID: "me"}
 	for fe, bd := range map[string]string{"fe1": "1990-05-12", "fe2": "1991-05-10", "fe3": "1992-05-11"} {

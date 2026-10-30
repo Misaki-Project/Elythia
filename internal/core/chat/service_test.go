@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -91,14 +92,14 @@ func newSvc(t *testing.T) (*corechat.Service, *testutil.MockChatRepository, *cap
 	repo := newFakeRepo()
 	pub := &capturePublisher{}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(repo, idGen)
+	svc := corechat.NewService(repo, idGen, nil, nil, nil)
 	svc.SetStreamingPublisher(pub)
 	// push の body に fromUser を載せるため (#2840)。production は router が
 	// 同じものを配線する。
 	users := testutil.NewMockUserRepository()
 	for _, u := range []string{"alice", "bob", "carol"} {
 		name := u
-		users.Users[u] = &model.User{ID: u, Username: u, Name: &name}
+		users.Users[u] = &model.User{ID: u, Username: u, Name: &name, FederationStatus: model.FederationStatusOn}
 	}
 	svc.SetUserRepo(users)
 	return svc, repo, pub
@@ -153,7 +154,7 @@ func TestCreateMessageToUser_BlockedByRecipient(t *testing.T) {
 	blocks := testutil.NewMockBlockingRepository()
 	// blocker=bob, blockee=alice。
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "bob", BlockeeID: "alice"}))
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
 	assert.ErrorIs(t, err, corechat.ErrChatBlocked)
@@ -166,7 +167,7 @@ func TestCreateMessageToUser_NotBlockedPasses(t *testing.T) {
 	blocks := testutil.NewMockBlockingRepository()
 	// alice が bob を block していても、bob→alice は送れる(逆方向 block は無関係)。
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "alice", BlockeeID: "bob"}))
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
 	require.NoError(t, err)
@@ -177,7 +178,7 @@ func TestCreateMessageToUser_BlockCheckFailClosed(t *testing.T) {
 	svc, _, pub := newSvc(t)
 	blocks := testutil.NewMockBlockingRepository()
 	blocks.ExistsErr = errors.New("db down")
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
 	require.Error(t, err)
@@ -191,7 +192,7 @@ func TestCreateMessageViaAP_BlockedByRecipient(t *testing.T) {
 	blocks := testutil.NewMockBlockingRepository()
 	// blocker=bob (local recipient), blockee=alice (remote sender)。
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "bob", BlockeeID: "alice"}))
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
 	remoteSender := &model.User{ID: "alice"}
 	_, err := svc.CreateMessageViaAP(context.Background(), "https://remote/notes/1", remoteSender, "bob", "hi", "")
@@ -231,7 +232,7 @@ func TestCreateMessageToRoom_BlockDoesNotAffectRoom(t *testing.T) {
 	// alice と bob が相互 block していても room メッセージは通る。
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "alice", BlockeeID: "bob"}))
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b2", BlockerID: "bob", BlockeeID: "alice"}))
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
 	_, err := svc.CreateMessageToRoom(context.Background(), "bob", "r1", "hi room", "")
 	require.NoError(t, err, "room message must not be blocked by 1-on-1 block")
@@ -552,6 +553,26 @@ func TestIsRoomMember_Owner(t *testing.T) {
 	assert.True(t, ok, "owner should implicitly be a member")
 }
 
+func TestIsRoomMember_DBErrorIsNotNonMember(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(repo *testutil.MockChatRepository)
+	}{
+		{name: "room lookup fails", setup: func(repo *testutil.MockChatRepository) { repo.FindRoomErr = errors.New("db down") }},
+		{name: "membership lookup fails", setup: func(repo *testutil.MockChatRepository) { repo.FindMembershipErr = errors.New("db down") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, repo, _ := newSvc(t)
+			seedRoom(t, repo, "r1", "alice", "bob")
+			tc.setup(repo)
+			ok, err := svc.IsRoomMember("bob", "r1")
+			require.Error(t, err)
+			assert.False(t, ok)
+		})
+	}
+}
+
 func TestIsRoomMember_NonMember(t *testing.T) {
 	svc, repo, _ := newSvc(t)
 	seedRoom(t, repo, "r1", "alice")
@@ -564,7 +585,7 @@ func TestIsRoomMember_NonMember(t *testing.T) {
 
 func TestService_NilPublisherStillWorks(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(newFakeRepo(), idGen)
+	svc := corechat.NewService(newFakeRepo(), idGen, nil, nil, nil)
 	// No publisher set; operations should still succeed (no panic)
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
 	assert.NoError(t, err)
@@ -1063,7 +1084,7 @@ func TestCreateMessageToUser_PushesNewChatMessage(t *testing.T) {
 	// `fromUser.name` / `fromUser.avatarUrl` を読む。無いと TypeError で
 	// **通知が 1 件も出ない** (publish 側は body を読まないので気付けない)。
 	require.Len(t, push.calls, 1)
-	from, ok := push.calls[0].body["fromUser"].(map[string]any)
+	from, ok := jsonObject3438(t, push.calls[0].body)["fromUser"].(map[string]any)
 	require.True(t, ok, "fromUser が無い: %v", push.calls[0].body)
 	assert.Equal(t, "alice", from["id"])
 	assert.Contains(t, from, "name")
@@ -1138,7 +1159,7 @@ func TestCreateMessageViaAP_PushesNewChatMessage(t *testing.T) {
 	assert.Equal(t, []string{"local1"}, push.recipients())
 	assert.Equal(t, main.mainRecipients(), push.recipients())
 	require.Len(t, push.calls, 1)
-	from, ok := push.calls[0].body["fromUser"].(map[string]any)
+	from, ok := jsonObject3438(t, push.calls[0].body)["fromUser"].(map[string]any)
 	require.True(t, ok, "fromUser が無い: %v", push.calls[0].body)
 	assert.Equal(t, "remote1", from["id"])
 }
@@ -1223,7 +1244,7 @@ func TestCreateRoomMessageViaAP_PushesNewChatMessage(t *testing.T) {
 
 	assert.ElementsMatch(t, []string{"alice", "carol"}, push.recipients())
 	require.NotEmpty(t, push.calls)
-	from, ok := push.calls[0].body["fromUser"].(map[string]any)
+	from, ok := jsonObject3438(t, push.calls[0].body)["fromUser"].(map[string]any)
 	require.True(t, ok, "fromUser が無い: %v", push.calls[0].body)
 	assert.Equal(t, "remote1", from["id"])
 }
@@ -1259,6 +1280,21 @@ func TestCreateMessageToUser_UnresolvedSenderSkipsPush(t *testing.T) {
 	}
 }
 
+func TestCreateMessageToUser_RejectsRemoteRecipientWhenSenderIsMissing(t *testing.T) {
+	svc, repo, _ := newSvc(t)
+	users := testutil.NewMockUserRepository()
+	remoteHost := "remote.example"
+	users.Users["remote"] = &model.User{
+		ID: "remote", Username: "remote", Host: &remoteHost,
+		FederationStatus: model.FederationStatusOn,
+	}
+	svc.SetUserRepo(users)
+
+	_, err := svc.CreateMessageToUser(context.Background(), "missing", "remote", "hi", "")
+	require.Error(t, err)
+	assert.Empty(t, repo.Messages, "a remote interaction cannot be persisted when the sender is unresolved")
+}
+
 // 添付のみのメッセージでも text キーを落とさない (#2840)。
 //
 // SW は `${name}: ${body.text}` を無条件に組むので、キーが無いと通知本文が
@@ -1285,4 +1321,65 @@ type failingUserRepo struct {
 
 func (f *failingUserRepo) FindByID(string) (*model.User, error) {
 	return nil, errors.New("db down")
+}
+
+// 絵文字でないリアクションは保存しないこと (upstream も 'invalid emoji' で拒否する)。
+//
+// 確かめないと、会話の相手のメッセージに任意の文字列をリアクションとして保存し、
+// 相手と room の全員へ配れた。
+func TestReact_RejectsNonEmoji(t *testing.T) {
+	cases := []string{
+		"",
+		"not-an-emoji",
+		"<b>bold</b>",
+	}
+	for _, raw := range cases {
+		svc, repo, pub := newSvc(t)
+		to := "bob"
+		repo.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "carol", ToUserID: &to}
+		err := svc.React(context.Background(), "m1", &model.User{ID: "bob", Username: "bob"}, raw)
+		assert.ErrorIs(t, err, corechat.ErrInvalidReaction, "%q", raw)
+		assert.Empty(t, repo.Messages["m1"].Reactions, "%q を保存した", raw)
+		assert.Empty(t, pub.userCalls, "%q を配った", raw)
+	}
+	// 最初の絵文字 1 つだけを保存する (upstream normalizeEmojiString)。前後の文字や
+	// 2 つ目以降は捨てる。ZWJ の合字は 1 つとして扱い、異体字セレクタは落とす。
+	for raw, want := range map[string]string{
+		"👍text":                               "👍",
+		"text👍":                               "👍",
+		strings.Repeat("👍", 33):               "👍",
+		"👨\u200d👩\u200d👧":                     "👨\u200d👩\u200d👧",
+		"❤\ufe0f":                             "❤",
+		"<b>🎉</b>" + strings.Repeat("x", 900): "🎉",
+	} {
+		svc, repo, _ := newSvc(t)
+		to := "bob"
+		repo.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "carol", ToUserID: &to}
+		require.NoError(t, svc.React(context.Background(), "m1", &model.User{ID: "bob", Username: "bob"}, raw), "%q", raw)
+		require.Len(t, repo.Messages["m1"].Reactions, 1, "%q", raw)
+		assert.Equal(t, "bob/"+want, repo.Messages["m1"].Reactions[0], "%q", raw)
+	}
+}
+
+// 最初の絵文字だけを保存するようになる前の行 (入力から FE0F を落としただけの
+// 形) も、付けた本人が外せること。ZWJ を含む絵文字は upstream と同じく FE0F を
+// 残して保存し、以前の FE0F の無い行も外せること。
+func TestUnreact_LegacyStoredForms(t *testing.T) {
+	for _, tc := range []struct{ stored, input string }{
+		{"bob/abc👍", "abc👍"},
+		{"bob/👍👍", "👍👍"},
+		{"bob/🏳‍🌈", "🏳️‍🌈"},
+	} {
+		svc, repo, pub := newSvc(t)
+		to := "bob"
+		repo.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "carol", ToUserID: &to, Reactions: []string{tc.stored}}
+		require.NoError(t, svc.Unreact(context.Background(), "m1", &model.User{ID: "bob"}, tc.input), tc.input)
+		assert.Empty(t, repo.Messages["m1"].Reactions, "%q を外せない", tc.stored)
+		assert.Len(t, pub.userCalls, 1, tc.input)
+	}
+	svc, repo, _ := newSvc(t)
+	to := "bob"
+	repo.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "carol", ToUserID: &to}
+	require.NoError(t, svc.React(context.Background(), "m1", &model.User{ID: "bob", Username: "bob"}, "🏳️‍🌈"))
+	assert.Equal(t, []string{"bob/🏳️‍🌈"}, []string(repo.Messages["m1"].Reactions), "ZWJ の絵文字の FE0F を落とした")
 }

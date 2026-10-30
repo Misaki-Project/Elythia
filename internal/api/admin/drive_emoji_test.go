@@ -305,7 +305,7 @@ func TestDriveShowFile_HidesRequestHeadersWhenRoleLookupFails(t *testing.T) {
 	require.NoError(t, err)
 	flaky := &failingAssignmentRepo{MockRoleAssignmentRepository: assignRepo}
 	roleSvc := corerole.NewService(roleRepo, flaky, metaRepo, idGen)
-	h := apiadmin.NewHandler(signup.NewService(userRepo, metaRepo, idGen), roleSvc, metaRepo, userRepo, idGen)
+	h := apiadmin.NewHandler(signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil), roleSvc, metaRepo, userRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	repo := testutil.NewMockDriveFileRepository()
 	owner := "admin2"
@@ -608,7 +608,7 @@ func TestEmojiCopy_StoresInDrive(t *testing.T) {
 			Type:          "image/png",
 		},
 	}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -657,7 +657,7 @@ func TestEmojiCopy_StoresInDrive_NoWebpublic(t *testing.T) {
 			Type: "image/png",
 		},
 	}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -684,7 +684,7 @@ func TestEmojiCopy_FetcherErrorReturns500(t *testing.T) {
 	)
 
 	fetcher := &fakeEmojiImageFetcher{returnErr: assert.AnError}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -840,6 +840,60 @@ func TestEmojiListV2_Basic(t *testing.T) {
 		em := raw.(map[string]any)
 		_, hasPublicURL := em["publicUrl"]
 		assert.True(t, hasPublicURL, "v2 emoji should have publicUrl field")
+	}
+}
+
+// 本家の paramDef は整数の値を持つ小数 (10.0、1e1) を integer として通す。limit と
+// page の値もそのまま効く (#3845)。
+func TestEmojiListV2_AcceptsIntegerValuedFractions(t *testing.T) {
+	h, _ := setupEmojiHandler(t,
+		&model.Emoji{ID: "e1", Name: "a", PublicURL: "https://example.com/a.png"},
+		&model.Emoji{ID: "e2", Name: "b", PublicURL: "https://example.com/b.png"},
+		&model.Emoji{ID: "e3", Name: "c", PublicURL: "https://example.com/c.png"},
+	)
+	rec := doPost(h.EmojiListV2, `{"limit":2.0,"page":1e0,"sinceDate":1e1,"untilDate":4102444800000.0}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Len(t, resp["emojis"], 2)
+	assert.EqualValues(t, 2, resp["allPages"])
+}
+
+// updatedAtFrom / updatedAtTo は日付として読める値だけを通す (#3518)。
+//
+// **通すと 500 になる。** 値は `CAST("updatedAt" AS DATE)` との比較にそのまま
+// バインドされ、PostgreSQL の型変換で落ちる。mock の repository は落ちないので、
+// 検査を外すとここが 200 になる。
+func TestEmojiListV2_RejectsUnparsableUpdatedAt(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"from_garbage", `{"query":{"updatedAtFrom":"bogus"}}`},
+		{"to_garbage", `{"query":{"updatedAtTo":"2026-13-01"}}`},
+		{"from_out_of_range_day", `{"query":{"updatedAtFrom":"2026-02-30"}}`},
+		{"from_year_zero", `{"query":{"updatedAtFrom":"0000-01-01"}}`},
+		{"to_offset_beyond_postgres", `{"query":{"updatedAtTo":"2026-10-12T00:00:00+16:00"}}`},
+		{"to_only_bad_with_good_from", `{"query":{"updatedAtFrom":"2026-10-01","updatedAtTo":"x"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := setupEmojiHandler(t, &model.Emoji{ID: "e1", Name: "smile"})
+			rec := doPost(h.EmojiListV2, tc.body, adminUser)
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+		})
+	}
+}
+
+// 管理画面が送る YYYY-MM-DD と RFC 3339 の日時、空文字 (未指定) は通す (#3518)。
+// 本家は PostgreSQL が date として読める形を受け付けるので、狭めすぎない。
+func TestEmojiListV2_AcceptsUpdatedAtDates(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"date_only", `{"query":{"updatedAtFrom":"2026-10-01","updatedAtTo":"2026-10-12"}}`},
+		{"rfc3339", `{"query":{"updatedAtFrom":"2026-10-01T00:00:00Z","updatedAtTo":"2026-10-12T23:59:59.5+09:00"}}`},
+		{"empty", `{"query":{"updatedAtFrom":"","updatedAtTo":""}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := setupEmojiHandler(t, &model.Emoji{ID: "e1", Name: "smile"})
+			rec := doPost(h.EmojiListV2, tc.body, adminUser)
+			assert.Equal(t, http.StatusOK, rec.Code)
+		})
 	}
 }
 
@@ -1286,8 +1340,9 @@ func TestEmojiImportZip_EnqueueFailure(t *testing.T) {
 func TestEmojiAdd_WritesModerationLog(t *testing.T) {
 	h, _ := setupEmojiHandler(t)
 	repo := attachModLog(t, h)
+	systemEmojiFile(t, h, "https://example/smile.png")
 
-	rec := doPost(h.EmojiAdd, `{"name":"smile","url":"https://example/smile.png"}`, adminUser)
+	rec := doPost(h.EmojiAdd, `{"name":"smile","fileId":"f_sys_emoji"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 
 	require.Eventually(t, func() bool { return len(repo.Snapshot()) == 1 }, 500*time.Millisecond, 5*time.Millisecond)
@@ -1301,7 +1356,8 @@ func TestEmojiAdd_WritesModerationLog(t *testing.T) {
 
 func TestEmojiAdd_PersistsParamsAndReturnsDetailed(t *testing.T) {
 	h, repo := setupEmojiHandler(t)
-	body := `{"name":"happy","url":"https://example/happy.png","category":"face","aliases":["joy","glad"],"license":"CC0","isSensitive":true,"localOnly":true,"roleIdsThatCanBeUsedThisEmojiAsReaction":["r1","r2"]}`
+	systemEmojiFile(t, h, "https://example/happy.png")
+	body := `{"name":"happy","fileId":"f_sys_emoji","category":"face","aliases":["joy","glad"],"license":"CC0","isSensitive":true,"localOnly":true,"roleIdsThatCanBeUsedThisEmojiAsReaction":["r1","r2"]}`
 	rec := doPost(h.EmojiAdd, body, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
 
@@ -1328,14 +1384,16 @@ func TestEmojiAdd_PersistsParamsAndReturnsDetailed(t *testing.T) {
 
 func TestEmojiAdd_DuplicateName(t *testing.T) {
 	h, _ := setupEmojiHandler(t, &model.Emoji{ID: "e1", Name: "dup"})
-	rec := doPost(h.EmojiAdd, `{"name":"dup","url":"https://example/x.png"}`, adminUser)
+	systemEmojiFile(t, h, "https://example/x.png")
+	rec := doPost(h.EmojiAdd, `{"name":"dup","fileId":"f_sys_emoji"}`, adminUser)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "DUPLICATE_NAME")
 }
 
 func TestEmojiAdd_InvalidNamePattern(t *testing.T) {
 	h, _ := setupEmojiHandler(t)
-	rec := doPost(h.EmojiAdd, `{"name":"bad name!","url":"https://example/x.png"}`, adminUser)
+	systemEmojiFile(t, h, "https://example/x.png")
+	rec := doPost(h.EmojiAdd, `{"name":"bad name!","fileId":"f_sys_emoji"}`, adminUser)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
@@ -1384,22 +1442,33 @@ func TestEmojiAdd_FileIdImagePersistsWebpublic(t *testing.T) {
 	assert.Equal(t, wpType, *got.Type, "type は webpublicType を優先")
 }
 
-// url + 非画像 fileId 併用時は url が勝ち、filetype 検証は走らない (legacy 挙動)。
-func TestEmojiAdd_UrlWinsOverFileId(t *testing.T) {
-	h, _ := setupEmojiHandler(t)
+// url は読まない (#3865)。fileId 無しで url だけを送っても作らず、fileId と一緒に
+// 送っても fileId のファイルを検査する (以前は url が勝ち、MIME の検査を飛ばした)。
+func TestEmojiAdd_URLIsNotRead(t *testing.T) {
+	h, repo := setupEmojiHandler(t)
 	dr := testutil.NewMockDriveFileRepository()
 	owner := "u1"
 	require.NoError(t, dr.Create(&model.DriveFile{ID: "f_txt", UserID: &owner, Type: "text/plain", URL: "https://example/x.txt"}))
 	h.SetDriveFileRepo(dr)
-	rec := doPost(h.EmojiAdd, `{"name":"x","url":"https://example/y.png","fileId":"f_txt"}`, adminUser)
-	assert.Equal(t, http.StatusOK, rec.Code, "url 指定時は fileId 経路を通らず filetype 検証もしない")
+
+	rec := doPost(h.EmojiAdd, `{"name":"x","url":"https://example/y.png"}`, adminUser)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	code, _ := errorID(t, rec.Body.Bytes())
+	assert.Equal(t, "INVALID_PARAM", code)
+
+	rec = doPost(h.EmojiAdd, `{"name":"x","url":"https://example/y.png","fileId":"f_txt"}`, adminUser)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "UNSUPPORTED_FILE_TYPE")
+	_, err := repo.FindByNameAndHost("x", nil)
+	assert.Error(t, err, "url だけで絵文字が作られている")
 }
 
 // DUPLICATE_NAME は local (host=nil) のみ対象。remote 同名は衝突扱いしない。
 func TestEmojiAdd_RemoteSameNameAllowed(t *testing.T) {
 	remote := "remote.example"
 	h, _ := setupEmojiHandler(t, &model.Emoji{ID: "er", Name: "dup", Host: &remote})
-	rec := doPost(h.EmojiAdd, `{"name":"dup","url":"https://example/x.png"}`, adminUser)
+	systemEmojiFile(t, h, "https://example/x.png")
+	rec := doPost(h.EmojiAdd, `{"name":"dup","fileId":"f_sys_emoji"}`, adminUser)
 	assert.Equal(t, http.StatusOK, rec.Code, "remote 同名 emoji があっても local add は通る")
 }
 
@@ -1947,7 +2016,7 @@ func TestEmojiCopy_RejectsInvalidRemoteName(t *testing.T) {
 			fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
 				ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
 			}}
-			h.SetEmojiImageFetcher(fetcher)
+			h.SetEmojiImageFetcherForTest(fetcher)
 
 			rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
 			require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -1974,7 +2043,7 @@ func TestEmojiCopy_NameOverrideAllowsInvalidRemoteName(t *testing.T) {
 	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
 		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
 	}}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiCopy, `{"emojiId":"src1","name":"plus_eyes"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -1997,7 +2066,7 @@ func TestEmojiCopy_RejectsInvalidNameOverride(t *testing.T) {
 	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
 		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
 	}}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiCopy, `{"emojiId":"src1","name":"bad-name"}`, adminUser)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -2020,7 +2089,7 @@ func TestEmojiCopy_DuplicateCheckUsesOverriddenName(t *testing.T) {
 	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
 		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
 	}}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiCopy, `{"emojiId":"src1","name":"taken"}`, adminUser)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -2043,7 +2112,7 @@ func TestEmojiCopy_CleansUpDriveFileWhenCreateFails(t *testing.T) {
 	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
 		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
 	}}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -2074,7 +2143,7 @@ func TestEmojiCopy_RejectsUnsupportedFileType(t *testing.T) {
 			fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
 				ID: "df1", URL: "https://local.example/files/x.bin", Type: tc.mime,
 			}}
-			h.SetEmojiImageFetcher(fetcher)
+			h.SetEmojiImageFetcherForTest(fetcher)
 
 			rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
 			require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -2110,7 +2179,7 @@ func TestEmojiCopy_RejectsNameOverrideByLength(t *testing.T) {
 			fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
 				ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
 			}}
-			h.SetEmojiImageFetcher(fetcher)
+			h.SetEmojiImageFetcherForTest(fetcher)
 
 			body, err := json.Marshal(map[string]any{"emojiId": "src1", "name": tc.override})
 			require.NoError(t, err)
@@ -2133,13 +2202,14 @@ func TestEmojiCopy_RejectsNameOverrideByLength(t *testing.T) {
 // 分かれる**のは筋が通らない。
 func TestEmojiAdd_RejectsOverlongName(t *testing.T) {
 	h, _ := setupEmojiHandler(t)
-	body, err := json.Marshal(map[string]any{"name": strings.Repeat("a", 129), "url": "https://local.example/x.png"})
+	systemEmojiFile(t, h, "https://local.example/x.png")
+	body, err := json.Marshal(map[string]any{"name": strings.Repeat("a", 129), "fileId": "f_sys_emoji"})
 	require.NoError(t, err)
 	rec := doPost(h.EmojiAdd, string(body), adminUser)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
 
-	ok, err := json.Marshal(map[string]any{"name": strings.Repeat("a", 128), "url": "https://local.example/x.png"})
+	ok, err := json.Marshal(map[string]any{"name": strings.Repeat("a", 128), "fileId": "f_sys_emoji"})
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, doPost(h.EmojiAdd, string(ok), adminUser).Code, "128 文字ちょうどは通ること")
 }

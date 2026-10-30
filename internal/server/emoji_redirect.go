@@ -8,6 +8,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/remoteurl"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 )
@@ -53,7 +54,7 @@ type emojiLookup interface {
 //
 // Cache-Control header mirrors upstream so the browser stops
 // re-fetching reaction images on every notification render.
-func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
+func emojiRedirectHandler(pk *entity.Packer, repo emojiLookup) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		path := c.Param("path")
 
@@ -106,7 +107,17 @@ func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
 		if target == "" {
 			target = emoji.OriginalURL
 		}
+		// リモートの絵文字の URL は相手が決めた文字列。プロキシで包めない形の
+		// もの (取り込みで確かめる前に保存された行) へは飛ばさず、絵文字が
+		// 無いときと同じに扱う。包まれずに閲覧者のブラウザが相手へ直接取りに行く。
+		// hostPtr を引いたときは、host が一致する行だけが返る。
+		if target != "" && hostPtr != nil {
+			target, _ = remoteurl.Media(target)
+		}
 		if target == "" {
+			if _, hasFallback := c.QueryParams()["fallback"]; hasFallback {
+				return c.Redirect(http.StatusFound, emojiRedirectFallback)
+			}
 			return c.NoContent(http.StatusNotFound)
 		}
 		// **`?badge=1` は badge モードへ回す (#2909)。** Service Worker の
@@ -123,7 +134,7 @@ func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
 		if _, wantsBadge := c.QueryParams()["badge"]; wantsBadge {
 			// static と同じく entity 側で組む。`/proxy` を手で組むと sig が付かず、
 			// Authorize が HMAC ではなく DB allowlist に落ちる (#2905)。
-			if proxied := entity.BadgeEmojiProxyURL(target); proxied != "" {
+			if proxied := pk.BadgeEmojiProxyURL(target); proxied != "" {
 				c.Response().Header().Set("Content-Security-Policy", assetCSP)
 				return c.Redirect(http.StatusFound, proxied)
 			}
@@ -144,7 +155,7 @@ func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
 			// 引くことになる (#3036 で DB 障害は 403 + 1 日ではなく
 			// 503 + `no-store` になったが、引く回数そのものは減らない)。
 			// media proxy の設定 (external / proxyRemoteFiles) にも従う。
-			if proxied := entity.StaticEmojiProxyURL(target); proxied != "" {
+			if proxied := pk.StaticEmojiProxyURL(target); proxied != "" {
 				c.Response().Header().Set("Content-Security-Policy", assetCSP)
 				return c.Redirect(http.StatusFound, proxied)
 			}
@@ -168,6 +179,6 @@ func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
 		//
 		// API 応答の `emojis` field を server-proxy してはいけない (frontend が
 		// client 側で包むので二重になる) のとは別経路。こちらは frontend が包まない。
-		return c.Redirect(http.StatusFound, entity.ProxyEmojiURLString(target))
+		return c.Redirect(http.StatusFound, pk.ProxyEmojiURLString(target))
 	}
 }

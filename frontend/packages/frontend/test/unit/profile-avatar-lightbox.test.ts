@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: mk-go project
+ * SPDX-FileCopyrightText: Elythia-Network
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -10,7 +10,7 @@
 // たびに競合させる意味が無い。
 //
 // 見るのは配線だけで、実際に拡大された絵が出るかは Playwright 側
-// (`specs/mkgo/ui/profile_avatar_lightbox.spec.ts`) が実ブラウザで見る。
+// (`specs/elythia/ui/profile_avatar_lightbox.spec.ts`) が実ブラウザで見る。
 
 import { afterAll, afterEach, assert, beforeAll, describe, expect, test, vi } from 'vitest';
 import { cleanup, fireEvent, render, type RenderResult } from '@testing-library/vue';
@@ -60,6 +60,8 @@ const AVATAR_URL = 'https://example.com/avatar.png';
 // 下の `settleLightboxImport` で await を挟むとその rejection がテスト実行中に
 // 着地して vitest の unhandled error (exit 1) になる。**空配列で答えて黙らせる** —
 // ここで見ているのはライトボックスの配線であって API ではない。
+// (今は `test/setup-network.unit.ts` が答えの無い API の要求を待たせるので、
+// stub が無くても reject はしない (#3369)。ノートの一覧に依存しない形として残す)
 //
 // **`vi.unstubAllGlobals()` は使わない。** あれは `setup.unit.ts` が張った stub
 // (`localStorage` / `AudioContext` など) まで巻き戻すので、この後ろに hook を足した
@@ -82,7 +84,11 @@ afterAll(() => {
 // `renderHome()` のたびに読み込みが始まる。テストの await の間に読み込みが終わると
 // `MkChart` の setup で `initChart` がテーマ未用意のまま
 // `currentCompiledTheme!.fg` を読み、unhandled error (exit 1) になる (#3366。CI で
-// 不定期に落ち、手元でも 15 回中 1 回再現した)。ここで見ているのはライトボックスの
+// 不定期に落ち、手元でも 15 回中 1 回再現した)。テーマは今は
+// `test/setup-theme.unit.ts` が当てる (#3369) が、読み込みが着地すると `MkChart` が
+// チャートの API を叩き、上の fetch の stub の応答 (`[]`) を統計として読んで
+// `raw.diffs.withFile` で落ちうる (このテストでは再現していないが、
+// `MkChart.vue` のコードの上では起こりうる)。ここで見ているのはライトボックスの
 // 配線なので、チャートは空の部品に差し替える。
 //
 // **`__esModule: true` を付ける。** 付けないと `defineAsyncComponent` がモジュールの

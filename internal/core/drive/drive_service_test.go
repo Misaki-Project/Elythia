@@ -49,7 +49,7 @@ func newSvc(t *testing.T) (*drive.Service, *testutil.MockDriveFileRepository, *t
 	folderRepo.FilesRef = fileRepo
 	storage := drive.NewLocalStorage(t.TempDir(), "https://example.com/files")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(fileRepo, folderRepo, storage, idGen)
+	svc := drive.NewService(fileRepo, folderRepo, storage, idGen, nil, nil, nil, nil)
 	return svc, fileRepo, folderRepo
 }
 
@@ -168,7 +168,7 @@ func (f *failingFileRepo) Create(_ *model.DriveFile) error {
 func TestUpload_RepoCreateError(t *testing.T) {
 	repo := &failingFileRepo{MockDriveFileRepository: testutil.NewMockDriveFileRepository()}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
+	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
 	_, err := svc.Upload(context.Background(), drive.UploadInput{User: &model.User{ID: "u1"}, Body: []byte("x")})
 	assert.ErrorIs(t, err, errStub)
 }
@@ -176,7 +176,7 @@ func TestUpload_RepoCreateError(t *testing.T) {
 func TestUpload_StoragePutError(t *testing.T) {
 	storage := brokenStorage(t)
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(testutil.NewMockDriveFileRepository(), testutil.NewMockDriveFolderRepository(), storage, idGen)
+	svc := drive.NewService(testutil.NewMockDriveFileRepository(), testutil.NewMockDriveFolderRepository(), storage, idGen, nil, nil, nil, nil)
 	_, err := svc.Upload(context.Background(), drive.UploadInput{User: &model.User{ID: "u1"}, Body: []byte("x")})
 	assert.Error(t, err)
 }
@@ -241,20 +241,20 @@ func TestCapacity_FromPolicy(t *testing.T) {
 	// roleChecker 未配線 → default 100 MiB。
 	assert.Equal(t, int64(100*1024*1024), svc.Capacity("u1"))
 	// policy override は反映される。
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{"u1": {"driveCapacityMb": 500}}})
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{"u1": {"driveCapacityMb": 500}}})
 	assert.Equal(t, int64(500*1024*1024), svc.Capacity("u1"))
 	// override の無い user は default 100 MiB に fallback。
 	assert.Equal(t, int64(100*1024*1024), svc.Capacity("u2"))
 	// **小数の policy でも gate と同じ値を返す。** 素の `.(int)` だと型
 	// アサーションに失敗して既定の 100MB を返し、実際の上限 (gate 側は
 	// 小数を尊重する) と表示がずれる (#2611)。
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{"u1": {"driveCapacityMb": 1.5}}})
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{"u1": {"driveCapacityMb": 1.5}}})
 	assert.Equal(t, int64(1.5*1024*1024), svc.Capacity("u1"))
 }
 
 func TestCapacity_MaxPolicySaturatesPositive(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"driveCapacityMb": math.MaxFloat64},
 	}})
 	assert.Equal(t, int64(math.MaxInt64), svc.Capacity("u1"))
@@ -264,7 +264,7 @@ func TestShow_ModeratorBypass(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	other := "other"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &other}
-	svc.SetRoleChecker(&fakeMod{moderators: map[string]bool{"u1": true}})
+	svc.SetRoleCheckerForTest(&fakeMod{moderators: map[string]bool{"u1": true}})
 	got, err := svc.Show(&model.User{ID: "u1"}, "f1")
 	require.NoError(t, err)
 	assert.Equal(t, "f1", got.ID)
@@ -276,7 +276,7 @@ func TestShow_NonModeratorStillDenied(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	other := "other"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &other}
-	svc.SetRoleChecker(&fakeMod{moderators: map[string]bool{}})
+	svc.SetRoleCheckerForTest(&fakeMod{moderators: map[string]bool{}})
 	_, err := svc.Show(&model.User{ID: "u1"}, "f1")
 	require.ErrorIs(t, err, drive.ErrAccessDenied)
 }
@@ -335,29 +335,30 @@ func TestUpdate_NotFound(t *testing.T) {
 	require.ErrorIs(t, err, drive.ErrFileNotFound)
 }
 
-// moderator は他ユーザーの file を Update できない (#499 privilege
-// escalation 回帰防止)。Show() は moderator bypass を許す一方で、
-// write 経路は owner-only に保たれていることを保証する。
+// moderator でも他ユーザーの file の名前は変えられない (#499 / #3678)。
+// moderator に許すのはセンシティブの付け外しと削除だけ。残りの組み合わせは
+// moderator_write_test.go にある。
 func TestUpdate_ModeratorCannotEditOthersFile(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	other := "other"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &other}
-	svc.SetRoleChecker(&fakeMod{moderators: map[string]bool{"u1": true}})
+	svc.SetRoleCheckerForTest(&fakeMod{moderators: map[string]bool{"u1": true}})
 
 	newName := "renamed.png"
 	_, err := svc.Update(&model.User{ID: "u1"}, "f1", drive.UpdateInput{Name: &newName})
 	require.ErrorIs(t, err, drive.ErrAccessDenied)
 }
 
-// 同様に Delete も moderator bypass の対象外。
-func TestDelete_ModeratorCannotDeleteOthersFile(t *testing.T) {
+// moderator でない利用者は他ユーザーの file を削除できない (#499)。
+func TestDelete_NonModeratorCannotDeleteOthersFile(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	other := "other"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &other}
-	svc.SetRoleChecker(&fakeMod{moderators: map[string]bool{"u1": true}})
+	svc.SetRoleCheckerForTest(&fakeMod{})
 
 	err := svc.Delete(&model.User{ID: "u1"}, "f1")
 	require.ErrorIs(t, err, drive.ErrAccessDenied)
+	assert.Contains(t, fileRepo.Files, "f1")
 }
 
 // --- #1028: role policy gate (alwaysMarkNsfw / uploadableFileTypes) ---
@@ -365,7 +366,7 @@ func TestDelete_ModeratorCannotDeleteOthersFile(t *testing.T) {
 // alwaysMarkNsfw=true の user の upload は IsSensitive=true で保存される。
 func TestUpload_AlwaysMarkNsfwForcesSensitive(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"alwaysMarkNsfw": true},
 		},
@@ -383,7 +384,7 @@ func TestUpload_AlwaysMarkNsfwForcesSensitive(t *testing.T) {
 // uploadableFileTypes allowlist に match しない mime は ErrUnallowedFileType。
 func TestUpload_UploadableFileTypesRejectsMismatch(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"uploadableFileTypes": []string{"image/*"}},
 		},
@@ -400,7 +401,7 @@ func TestUpload_UploadableFileTypesRejectsMismatch(t *testing.T) {
 // uploadableFileTypes に wildcard ("*") があれば全許可。
 func TestUpload_UploadableFileTypesWildcardAllows(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"uploadableFileTypes": []string{"*"}},
 		},
@@ -415,7 +416,7 @@ func TestUpload_UploadableFileTypesWildcardAllows(t *testing.T) {
 // moderator は uploadableFileTypes allowlist を bypass する。
 func TestUpload_ModeratorBypassesUploadableFileTypes(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		moderators: map[string]bool{"u1": true},
 		policies: map[string]map[string]any{
 			"u1": {"uploadableFileTypes": []string{"image/*"}},
@@ -431,7 +432,7 @@ func TestUpload_ModeratorBypassesUploadableFileTypes(t *testing.T) {
 // policies map が nil (= test fixture / wire 未配線) のときは gate skip。
 func TestUpload_RoleCheckerNoPoliciesSkipsGate(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{}) // policies nil
+	svc.SetRoleCheckerForTest(&fakeMod{}) // policies nil
 	user := &model.User{ID: "u1"}
 	_, err := svc.Upload(context.Background(), drive.UploadInput{
 		User: user, Body: []byte("anything"), Name: "x.txt",
@@ -444,7 +445,7 @@ func TestUpload_RoleCheckerNoPoliciesSkipsGate(t *testing.T) {
 // maxFileSizeMb 超過の upload は ErrMaxFileSizeExceeded で reject される。
 func TestUpload_MaxFileSizeExceeded(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"maxFileSizeMb": 1}, // = 1MB cap
 		},
@@ -458,7 +459,7 @@ func TestUpload_MaxFileSizeExceeded(t *testing.T) {
 
 func TestUpload_MaxFileSizePolicySaturatesPositive(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": math.MaxFloat64},
 	}})
 	_, err := svc.Upload(context.Background(), drive.UploadInput{
@@ -473,7 +474,7 @@ func TestUpload_NoFreeSpace(t *testing.T) {
 	owner := "u1"
 	// 既に 1MB 使用中、capacity 1MB → 新規 upload はサイズ不問で reject。
 	fileRepo.Files["existing"] = &model.DriveFile{ID: "existing", UserID: &owner, Size: 1024 * 1024}
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"driveCapacityMb": 1, "maxFileSizeMb": 100}, // size gate は余裕、capacity が tight
 		},
@@ -489,7 +490,7 @@ func TestUpload_UsageAdditionCannotOverflowCapacityGate(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	owner := "u1"
 	fileRepo.Files["existing"] = &model.DriveFile{ID: "existing", UserID: &owner, Size: math.MaxInt}
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"driveCapacityMb": 1},
 	}})
 	_, err := svc.Upload(context.Background(), drive.UploadInput{
@@ -501,7 +502,7 @@ func TestUpload_UsageAdditionCannotOverflowCapacityGate(t *testing.T) {
 // remote user は本 gate を skip する (= mk-go に expireOldFile が未実装な為)。
 func TestUpload_RemoteUserBypassesCapacityGates(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"maxFileSizeMb": 1, "driveCapacityMb": 1},
 		},
@@ -517,7 +518,7 @@ func TestUpload_RemoteUserBypassesCapacityGates(t *testing.T) {
 // limit 内 (= size <= maxFileSizeMb かつ usage+size <= driveCapacityMb) なら通る。
 func TestUpload_DriveLimitsPassUnderThreshold(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"maxFileSizeMb": 1, "driveCapacityMb": 1},
 		},
@@ -529,20 +530,93 @@ func TestUpload_DriveLimitsPassUnderThreshold(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// maxFileSizeMb / driveCapacityMb が 0 (= unset) なら gate skip。upstream
-// `if (policies.maxFileSizeMb)` で 0 falsy = 無制限。
-func TestUpload_DriveLimitsZeroSkipsGate(t *testing.T) {
+// maxFileSizeMb / driveCapacityMb の 0 以下は「保存できない」。本家
+// DriveService は `1024 * 1024 * policies.maxFileSizeMb < info.size` を
+// そのまま比べ、0 を飛ばす経路は無い。上限なしにするのはキーが無いときだけ。
+func TestUpload_DriveLimitsZeroOrNegativeRejects(t *testing.T) {
+	cases := []struct {
+		name     string
+		policies map[string]any
+		want     error
+	}{
+		{"maxFileSizeMb 0", map[string]any{"maxFileSizeMb": 0}, drive.ErrMaxFileSizeExceeded},
+		{"maxFileSizeMb negative", map[string]any{"maxFileSizeMb": -1.0}, drive.ErrMaxFileSizeExceeded},
+		{"driveCapacityMb 0", map[string]any{"driveCapacityMb": 0}, drive.ErrNoFreeSpace},
+		{"driveCapacityMb negative", map[string]any{"driveCapacityMb": -5}, drive.ErrNoFreeSpace},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := newSvc(t)
+			svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{"u1": tc.policies}})
+			_, err := svc.Upload(context.Background(), drive.UploadInput{
+				User: &model.User{ID: "u1"}, Body: []byte("x"), Name: "x.bin",
+			})
+			require.ErrorIs(t, err, tc.want)
+		})
+	}
+}
+
+// 負の値は 0 バイトの本体も拒む (本家 `1024 * 1024 * -1 < 0` が真)。0 は
+// 空の本体を通す (本家 `0 < 0` が偽)。
+func TestUpload_DriveLimitsNegativeRejectsEmptyBody(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		policies map[string]any
+		want     error
+	}{
+		{"maxFileSizeMb negative", map[string]any{"maxFileSizeMb": -1}, drive.ErrMaxFileSizeExceeded},
+		{"driveCapacityMb negative", map[string]any{"driveCapacityMb": -1}, drive.ErrNoFreeSpace},
+		{"maxFileSizeMb 0", map[string]any{"maxFileSizeMb": 0}, nil},
+		{"driveCapacityMb 0", map[string]any{"driveCapacityMb": 0}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := newSvc(t)
+			svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{"u1": tc.policies}})
+			_, err := svc.Upload(context.Background(), drive.UploadInput{
+				User: &model.User{ID: "u1"}, Body: []byte{}, Name: "empty.txt",
+			})
+			if tc.want == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, tc.want)
+		})
+	}
+}
+
+// drive は小数の policy をその大きさで扱う (本家と同じ)。0.5MB なら 512KiB まで
+// 保存でき、それを超えると拒否する。role の解決は通らない (基本ポリシーの小数を
+// 残すことは role のテストで見る、#3489)。
+func TestUpload_FractionalSizePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		size int
+		want error
+	}{
+		{512 * 1024, nil},
+		{512*1024 + 1, drive.ErrMaxFileSizeExceeded},
+	} {
+		svc, _, _ := newSvc(t)
+		svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{"u1": {"maxFileSizeMb": 0.5}}})
+		_, err := svc.Upload(context.Background(), drive.UploadInput{
+			User: &model.User{ID: "u1"}, Body: make([]byte, tc.size), Name: "x.bin",
+		})
+		if tc.want == nil {
+			require.NoError(t, err, "size %d", tc.size)
+		} else {
+			require.ErrorIs(t, err, tc.want, "size %d", tc.size)
+		}
+	}
+}
+
+// キーが無いときは上限なし (本家にはこの状態が無い。policy の provider が
+// 宣言しないなど Elythia 側の都合)。
+func TestUpload_DriveLimitsAbsentSkipsGate(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
-		policies: map[string]map[string]any{
-			"u1": {"maxFileSizeMb": 0, "driveCapacityMb": 0},
-		},
-	})
-	user := &model.User{ID: "u1"}
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{"u1": {}}})
 	_, err := svc.Upload(context.Background(), drive.UploadInput{
-		User: user, Body: make([]byte, 2*1024*1024), Name: "x.bin",
+		User: &model.User{ID: "u1"}, Body: make([]byte, 2*1024*1024), Name: "x.bin",
 	})
-	require.NoError(t, err, "policy 0 は upstream falsy 相当で gate skip")
+	require.NoError(t, err)
 }
 
 // usageErrRepo は UsageByUser だけ error を返す stub。driveCapacityMb gate
@@ -560,8 +634,8 @@ func TestUpload_DriveCapacityUsageErrorPropagates(t *testing.T) {
 	fileRepo := &usageErrRepo{MockDriveFileRepository: testutil.NewMockDriveFileRepository()}
 	storage := drive.NewLocalStorage(t.TempDir(), "")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(fileRepo, testutil.NewMockDriveFolderRepository(), storage, idGen)
-	svc.SetRoleChecker(&fakeMod{
+	svc := drive.NewService(fileRepo, testutil.NewMockDriveFolderRepository(), storage, idGen, nil, nil, nil, nil)
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"driveCapacityMb": 1},
 		},
@@ -580,7 +654,7 @@ func TestUpload_DriveCapacityUsageErrorPropagates(t *testing.T) {
 // system file (User == nil) は role policy gate の対象外 (= emoji copy 等)。
 func TestUpload_SystemFileBypassesPolicy(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"uploadableFileTypes": []string{"image/*"}},
 		},
@@ -597,7 +671,7 @@ func TestUpdate_AlwaysMarkNsfwBlocksUnsensitive(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	owner := "u1"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner, IsSensitive: true}
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"alwaysMarkNsfw": true},
 		},
@@ -616,7 +690,7 @@ func TestUpdate_AlwaysMarkNsfwAllowsSettingSensitive(t *testing.T) {
 	owner := "u1"
 	// sensitive=false の file を sensitive=true に上げる経路 (= NSFW 強化)。
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner, IsSensitive: false}
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"alwaysMarkNsfw": true},
 		},
@@ -634,7 +708,7 @@ func TestUpdate_AlwaysMarkNsfwAllowsKeepingSensitive(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	owner := "u1"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner, IsSensitive: true}
-	svc.SetRoleChecker(&fakeMod{
+	svc.SetRoleCheckerForTest(&fakeMod{
 		policies: map[string]map[string]any{
 			"u1": {"alwaysMarkNsfw": true},
 		},
@@ -650,7 +724,7 @@ func TestUpdate_NoAlwaysMarkNsfwAllowsUnsensitive(t *testing.T) {
 	svc, fileRepo, _ := newSvc(t)
 	owner := "u1"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner, IsSensitive: true}
-	svc.SetRoleChecker(&fakeMod{}) // policies nil = gate skip
+	svc.SetRoleCheckerForTest(&fakeMod{}) // policies nil = gate skip
 
 	notSensitive := false
 	_, err := svc.Update(&model.User{ID: "u1"}, "f1", drive.UpdateInput{IsSensitive: &notSensitive})
@@ -737,7 +811,7 @@ func TestUpdate_RepoUpdateError(t *testing.T) {
 	mock.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &uid}
 	repo := &failingUpdateFileRepo{MockDriveFileRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
+	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
 	newName := "x"
 	_, err := svc.Update(&model.User{ID: "u1"}, "f1", drive.UpdateInput{Name: &newName})
 	assert.ErrorIs(t, err, errStub)
@@ -767,7 +841,7 @@ func TestDelete_StorageError(t *testing.T) {
 	key := "abc"
 	mock.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &uid, AccessKey: &key}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(mock, testutil.NewMockDriveFolderRepository(), storage, idGen)
+	svc := drive.NewService(mock, testutil.NewMockDriveFolderRepository(), storage, idGen, nil, nil, nil, nil)
 	err := svc.Delete(&model.User{ID: "u1"}, "f1")
 	assert.Error(t, err)
 }
@@ -819,7 +893,7 @@ func TestCreateFolder_RepoError(t *testing.T) {
 	mock := testutil.NewMockDriveFolderRepository()
 	repo := &failingCreateFolderRepo{MockDriveFolderRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen)
+	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
 	_, err := svc.CreateFolder(&model.User{ID: "u1"}, "x", nil)
 	assert.ErrorIs(t, err, errStub)
 }
@@ -915,7 +989,7 @@ func TestUpdateFolder_RepoError(t *testing.T) {
 	mock.Folders["c"] = &model.DriveFolder{ID: "c", UserID: &uid}
 	repo := &failingUpdateFolderRepo{MockDriveFolderRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen)
+	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
 	newName := "x"
 	_, err := svc.UpdateFolder(&model.User{ID: "u1"}, "c", drive.UpdateFolderInput{Name: &newName})
 	assert.ErrorIs(t, err, errStub)
@@ -959,7 +1033,7 @@ func TestDeleteFolder_HasChildrenError(t *testing.T) {
 	mock.Folders["p"] = &model.DriveFolder{ID: "p", UserID: &uid}
 	repo := &failingHasChildrenRepo{MockDriveFolderRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen)
+	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
 	err := svc.DeleteFolder(&model.User{ID: "u1"}, "p")
 	assert.ErrorIs(t, err, errStub)
 }
@@ -1057,8 +1131,7 @@ func TestDelete_FiresChartHook(t *testing.T) {
 
 // failingFindByIDRepo wraps the mock to make FindByID fail when called the
 // second time (after the initial create succeeds in Update). 1 回目の
-// findOwnedFile() (#499 で Show() から差し替え済) は成功させ、2 回目
-// (Update 後の reload) で失敗させる。
+// findWritableFile() は成功させ、2 回目 (Update 後の reload) で失敗させる。
 type failingFindByIDRepo struct {
 	*testutil.MockDriveFileRepository
 	calls int
@@ -1078,7 +1151,7 @@ func TestUpdate_FindByIDReloadError(t *testing.T) {
 	mock.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &uid, Name: "x"}
 	repo := &failingFindByIDRepo{MockDriveFileRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
+	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
 	name := "renamed"
 	_, err := svc.Update(&model.User{ID: "u1"}, "f1", drive.UpdateInput{Name: &name})
 	assert.ErrorIs(t, err, errStub)
@@ -1097,7 +1170,7 @@ func TestDelete_FileRepoDeleteError(t *testing.T) {
 	mock.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &uid, Name: "x"}
 	repo := &failingDeleteFileRepo{MockDriveFileRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
+	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
 	err := svc.Delete(&model.User{ID: "u1"}, "f1")
 	assert.ErrorIs(t, err, errStub)
 }
@@ -1307,7 +1380,7 @@ func TestUpload_ImageProcessor_RepoCreateErrorRollback(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	tmpDir := t.TempDir()
 	storage := drive.NewLocalStorage(tmpDir, "https://example.com/files")
-	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), storage, idGen)
+	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), storage, idGen, nil, nil, nil, nil)
 	svc.SetImageProcessor(drive.NewDefaultImageProcessor())
 
 	user := &model.User{ID: "u1"}
@@ -1393,7 +1466,7 @@ func newSvcWithStorage(t *testing.T, st drive.Storage) (*drive.Service, *testuti
 	folderRepo.FilesRef = fileRepo
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	return drive.NewService(fileRepo, folderRepo, st, idGen), fileRepo
+	return drive.NewService(fileRepo, folderRepo, st, idGen, nil, nil, nil, nil), fileRepo
 }
 
 // #2315: storedInternal は「実際にローカルへ書いたか」を反映する。true 固定
@@ -1479,7 +1552,7 @@ func TestDelete_WithoutLocalStorageFallsBackToPrimary(t *testing.T) {
 // blockingImageProcessor reports the peak number of concurrent calls.
 //
 // **画像で測る。** 枠が守っているのは「同時に確保される中間バッファの本数」で、
-// その根拠 (`imagedecode` の pixel cap / `processImage` の 4 回デコード) は
+// その根拠 (`imagedecode` の pixel cap / `processImage` のデコード) は
 // すべて画像の話。動画で測っていた 1 稿目は、**画像だけ枠を外す変異が素通り
 // する**ことを敵対的レビューで実測された。
 type blockingImageProcessor struct {
@@ -1825,7 +1898,7 @@ func TestMaxUploadBytes(t *testing.T) {
 	_, ok := svc.MaxUploadBytes(local)
 	assert.False(t, ok, "role が未配線なのに上限を作っている")
 
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": 30},
 		"u2": {"maxFileSizeMb": 30},
 		"u3": {"maxFileSizeMb": 0},
@@ -1841,6 +1914,11 @@ func TestMaxUploadBytes(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, int64(1.5*1024*1024), got)
 
+	// 0 は「保存できない」上限で、上限なしではない (Upload の gate と同じ)。
+	got, ok = svc.MaxUploadBytes(&model.User{ID: "u3"})
+	require.True(t, ok, "policy 0 を上限なしとして扱っている")
+	assert.Equal(t, int64(0), got)
+
 	// 上限を作らない側。**`Upload` の gate と対象を揃える** — あちらも
 	// system file と remote user は見ない。
 	for _, tt := range []struct {
@@ -1849,7 +1927,6 @@ func TestMaxUploadBytes(t *testing.T) {
 	}{
 		{"system file (user なし)", nil},
 		{"remote user", remote},
-		{"policy が 0", &model.User{ID: "u3"}},
 		{"policy の無い user", &model.User{ID: "u9"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1897,7 +1974,7 @@ func webpWithExif(size int) []byte {
 // 発火するのは `maxFileSizeMb >= 33` の構成だけ (既定は 30)。
 func TestUpload_RejectsImagesWhoseMetadataCannotBeStripped(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": 64},
 	}})
 	body := webpWithExif(33 << 20)
@@ -1920,7 +1997,7 @@ func TestUpload_RejectedImageLeavesNothingInStorage(t *testing.T) {
 	dir := t.TempDir()
 	storage := drive.NewLocalStorage(dir, "https://example.com/files")
 	svc, fileRepo := newSvcWithStorage(t, storage)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": 64},
 	}})
 
@@ -1947,7 +2024,7 @@ func TestUpload_RejectedImageLeavesNothingInStorage(t *testing.T) {
 // 実装でも上のテストが通る。
 func TestUpload_AcceptsImagesUnderTheDecoderSizeCap(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": 64},
 	}})
 	body := webpWithExif(1 << 20)
@@ -1963,7 +2040,7 @@ func TestUpload_AcceptsImagesUnderTheDecoderSizeCap(t *testing.T) {
 // だけで拒否すると受け取れるものを不必要に減らす。
 func TestUpload_AcceptsLargeImagesWithoutMetadata(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": 64},
 	}})
 	// EXIF チャンクを持たない WebP。
@@ -1991,7 +2068,7 @@ func TestUpload_AcceptsLargeImagesWithoutMetadata(t *testing.T) {
 // **条件を消しても緑のままだった**。
 func TestUpload_RejectsOversizedAVIFEvenWithoutMetadata(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": 64},
 	}})
 
@@ -2007,7 +2084,7 @@ func TestUpload_RejectsOversizedAVIFEvenWithoutMetadata(t *testing.T) {
 // 上のテストが通る。
 func TestUpload_AcceptsAVIFUnderTheDecoderSizeCap(t *testing.T) {
 	svc, _, _ := newSvc(t)
-	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+	svc.SetRoleCheckerForTest(&fakeMod{policies: map[string]map[string]any{
 		"u1": {"maxFileSizeMb": 64},
 	}})
 

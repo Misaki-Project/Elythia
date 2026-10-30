@@ -15,8 +15,9 @@
 | 連合テスト (Mastodon) | Elythia ↔ 本物の Mastodon の引用の承認 (FEP-044f) | Docker Compose多段 | `make federation-mastodon-e2e` (起動から撤去まで通し) |
 | Drop-in e2e (pytest) | TS-A backend を mk-A に差し替えて state preservation 検証 | TS 2 instance + mk overlay | `make dropin-swap-test` (#365 / #367 / #372 / #374、詳細は[dropin-e2e.md](dropin-e2e.md)) |
 | Drop-in frontend e2e (cypress) | 3 TS instance + mk overlay swap で frontend 視点の互換 | cypress + 3 TS + mk-A | `make dropin-frontend-swap-test` (#380 / #381 / #387 / #394、詳細は[dropin-frontend-e2e.md](dropin-frontend-e2e.md)) |
-| Playwright e2e | Elythia と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、298 spec ファイル。PR ごとに Elythia、upstream 追従時に TS backend) |
-| 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体無改変で Elythia に向けて実行 | PostgreSQL / Redis + Elythia バイナリ | `make upstream-e2e` (#2347、25 ファイル 1256 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
+| Playwright e2e | Elythia と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、299 spec ファイル。PR ごとに Elythia、upstream 追従時に TS backend) |
+| fuzz (画像デコーダ) | `internal/misc/imagedecode` のデコーダと判定関数 | 不要 | `make fuzz-imagedecode` (詳細は[画像デコーダの fuzz](#画像デコーダの-fuzz-3480)) |
+| 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体正本のまま Elythia に向けて実行 (UserLite の期待DTOにローカル連合状態を追加) | PostgreSQL / Redis + Elythia バイナリ | `make upstream-e2e` (#2347、25 ファイル 1256 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
 
 ## 手元の準備
 
@@ -81,7 +82,7 @@ CI は **`-shuffle=3` を全 shard 共通の固定値として**回す。`on` (�
 
 **カバレッジは順序に依存しうる。** 実測で 173 パッケージ中 3 つ (`internal/core/reversi` / `internal/core/role` / `internal/testutil`) が seed によって 0.1-0.5pt 動いた。いずれも閾値まで 2pt 以上あるので現状は落ちないが、閾値ぎりぎりのパッケージを 90.0% 台で放置すると seed 変更で落ちうる。
 
-**プロセス共有の状態を張り替えるテストは必ず戻すこと。** `internal/server` の `newServer` / `New` はグローバルを 12 個 (`entity` の 7 つ: `SetMediaURLContext` / `SetAvatarDecorationLookup` / `SetCanChatLookup` / `SetUserRolesLookup` / `SetShowRemoteBadgesLookup` / `SetInstanceIconURLLookup` / `SetSilencedLookup`、加えて `notehide.SetFollowingRepo` / `coretwofactor.SetTestMode` / `meself.SetEnricher` / `password.SetCost` / `corenote.SetHookConcurrency`) 差し替える。1 度きりの起動を模したテストが戻さなかったため、後続の `avatar` / `emoji_redirect` が素の URL ではなく署名付きプロキシURL を受け取って落ちていた (5 seed すべてで失敗)。`internal/server/global_state_test.go` の `restoreProcessGlobals` を使う。`frontendutil` の loader キャッシュも同様で、fixture は `t.TempDir()` に置くので**ディレクトリが消えた後もキャッシュに内容が残る**。
+**プロセス共有の状態を張り替えるテストは必ず戻すこと。** `internal/server`の`newServer` / `New`は、以前は起動時にグローバルを張り替えていた。設定だけで決まっていた3つ(bcryptのcost・投稿後のフックの同時実行数・2FAのtestMode)は#3780で、初回セットアップの判定に使う利用者の数え方(`meta.SetLocalUserCounter`)は#3782で、自分自身をMeDetailedへ昇格させるときの補完役(`meself.SetEnricher`)は#3784で、投稿を隠す判定の2つ(`notehide.SetFollowingRepo` / `notehide.SetUGCVisibilityLookup`)は#3786で、最後まで残った`entity`の8つの`Set*`は#3800で、使う部品へ依存として渡す形にして無くした(`entity`のテストだけが、既定のPackerと`Set*`をテスト用の補助として持つ)。組み立ての外で書かれていた2つ(利用者を一度見たという印と、frontendのloaderのキャッシュ)も、#3803で組み立てごとの値にした。印は`meta.SetupDetector`のフィールドに、loaderは`clientEntryFor`と同じく組み立てのときに読んで描画へ渡す形にしたので、組み立て直した世代は数え直し、loaderを読み直す。戻すものが無くなったので、テストが戻すのに使っていた`restoreProcessGlobals`も消した。`TestConstructionSetsNoProcessGlobals`(`internal/server/global_state_test.go`。#3803より前の名前は`TestProcessGlobalsAreRestored`)は、`internal/server`の非テストの`.go`全部から、importしたパッケージへの`pkg.SetXxx(...)`の呼び出しと、importしたパッケージの変数(そのフィールドや要素を含む)への代入・`++`・`--`を数え、1つも無いことを確かめる(どのファイルで呼ぶかは見ない。#3672。代入は#3803で足した)。自分のパッケージの変数への代入は数えない。期待値が空なので、検出の仕組みは`TestProcessGlobalSettersReadEveryFile`がfixtureで確かめる。組み立てを直列にしていた`constructionMu`も#3800で外し、`TestNewServer_ConstructionsMayOverlap`が2つの構築を同時に走らせて`-race`で見る。#2795では、1度きりの起動を模したテストが戻さなかったため、後続の`avatar` / `emoji_redirect`が素のURLではなく署名付きプロキシURLを受け取って落ちていた(5 seedすべてで失敗)。新しくプロセス共有の状態を足すテスト(パッケージの変数を差し替えるなど)は、`t.Cleanup`で戻す。
 
 ## DB を使うテストの分離 (#2450)
 
@@ -96,8 +97,10 @@ CI は **`-shuffle=3` を全 shard 共通の固定値として**回す。`on` (�
 - **DB を読み書きするテストで `OpenSharedTestDB` を使わない。** これは `internal/db` のように接続処理そのものを試すテスト専用
 - schema が分かれているので `DELETE FROM "user"` のような無条件の削除は書いてよい。ただし**それは自分の schema に閉じている前提**に依存するので、`search_path` を跨ぐ生 SQL (`public.` 明示など) を書かない
 - **システムカタログも `search_path` に従わない (#2777)。** 参照は `pg_catalog` で解決されるが、**返る行は全 schema 分**。必ず自分の schema に絞る: `pg_indexes` は `schemaname = current_schema()`、`information_schema.columns` / `.tables` は `table_schema = current_schema()` (このリポジトリで最も多いのはこちら)、`pg_class` は `pg_namespace` を join して `n.nspname = current_schema()` (`pg_class` は schema を oid で持ち `schemaname` 列が無い。`pg_attribute` は relation の oid しか持たないので `pg_class` 経由の 2 段 join になる)。**`information_schema.schemata` は対象外** — schema の一覧そのものなので絞る概念が無い。絞らないと 2 つ壊れる — (a) 他 schema の同名オブジェクトを自分のものと取り違えて regression guard が空振りし、(b) 他パッケージの `ApplyMigrations` が DDL 中だと `could not open relation with OID (SQLSTATE XX000)` で落ちる。**CI でも起きる** — shard は PostgreSQL を 1 つしか立てないので手元と同じ条件が揃い、required check の `test` が不定期に赤くなる
+- **schema で絞るだけでは (b) を防げない。`indexdef` / `pg_get_indexdef` を WHERE に書かない (#3365)。** `indexdef` の条件は index の pg_class だけを参照するので、plan によってはその scan まで押し下げられ、`schemaname = current_schema()` で絞る前に全 schema の index で `pg_get_indexdef` が評価される。他パッケージの DDL がその index を消していると、絞っていても `could not open relation with OID` で落ちる。SELECT の列は絞り込みの後に評価されるので、定義は SELECT で取って Go の側で見る (`internal/repository/user_uri_index_test.go` が例)。`make catalog-check` はこの形も落とす。`-- unscoped:` を書いても通らない。**migration の SQL も同じ** (`make catalog-check` が `migration/` も見る。#3369)。migration では Go の側が無いので、定義を SELECT で配列に読み切ってから比べる (`migration/000068_drop_redundant_indexes.up.sql` が例)。**CTE や副問い合わせの中で読んだ定義を、外側の WHERE で比べても安全にはならない。** PG18 の実測では、`MATERIALIZED` でない CTE と副問い合わせはインライン化され、`pg_get_indexdef(i.oid) ~~ ...` が index の pg_class の scan の Filter に押し下げられる。CTE で分けるなら `MATERIALIZED` を付ける。`make catalog-check` は、別名を付けた定義 (`indexdef AS d`) を外側で比べる形を拾わず、`MATERIALIZED` の有無も見ない (別名を付ければどちらも通り、`indexdef` のまま外側の WHERE で比べればどちらも落ちる)。**migration の SQL は、ゲートが自前の字句解析で文に分ける。** CLAUDE.md Section 4「自前でパースしない」の例外で、PostgreSQL には SQL の字句や文の境界を返す関数が無く、Go のパーサ (`pg_query_go`) は cgo が要り、テストのためだけに重い依存を足すことになるため。読むのはコメント・引用符・ドル引用・`;` の字句だけにし、閉じていない引用符などで読み切れないファイルは、推測で続けずに違反として落とす
 - **複数行が返りうるクエリを `Scan(&string)` で受けない (#2777)。** GORM は `*string` に対し**全行を走査して dest を上書きし続ける**ので、複数行が返ると**最後の 1 行**が残る。実測では `pg_indexes` の絞りを外すと 17 件中 17 番目 (`internal_repository_ts`) の定義が返り、**それでもテストが緑のまま通っていた** — 上の (a) の実例。slice で受けて件数と schema 名を確かめる (`internal/repository/index_lookup_test.go` の `indexDef` が例)
 - 行の投入は**戻り値を検査する** (`require.NoError(t, db.Create(x).Error)`)。捨てると FK 違反が黙って流れ、「200 のはずが 400」のような原因から遠い症状に化ける
+- **同じパッケージのテストを、同じ DB に向けて 2 本同時に流さない (#3369)。** schema はパッケージ単位なので、2 本が互いの行を見て一覧の比較などが無関係な形で落ちる (worktree を並べた検証や、複数のエージェントが既定の `misskey_test` を共有したときに起きた)。並べるときは `TEST_DB_NAME` を分ける (`testutil` は database を作らないので、先に `CREATE DATABASE` しておく。手元の `mk` は CREATEDB を持たないことがあるので、作れないときは別の PostgreSQL を立てて `TEST_DB_PORT` で指す)。`testutil` は schema を開くときにその schema の advisory lock (`pg_try_advisory_lock`) を取り、プロセスが終わるまで持つ (鍵はプロセスで 1 本の接続に載せる。その接続が切れると鍵は外れ、次に schema を開くときに張り直して取り直す)。取れなければ `test schema "..." on database "..." is in use by another test process` で **panic する** (error で返すと、呼び出し側の多くが「DB が無い」として skip し、2 本目が黙って緑になるため)。**`-run` で DB を使わないテストだけを選んでも落ちる。** `TestMain` / `init` で DB を開くパッケージは、どのテストを選んでも schema を開くため (例: `make frontend-check` が回す `internal/server` のゲートは、同じ DB で `make test` が `internal/server` を流している間は panic する)。CI は shard ごとに DB を持ち、1 つの shard に各パッケージは 1 回しか入らないので、ここでは落ちない
 
 migration で enum を作るときは `EXCEPTION WHEN duplicate_object THEN NULL` を使う。`pg_type WHERE typname = ...` は **schema を見ない**ため、別 schema に同名の型があるだけで作成を飛ばし、直後の `CREATE TABLE` が落ちる。
 
@@ -228,7 +231,17 @@ func newSvc(t *testing.T) *Service {
 
 | ファイル | 内容 |
 |---|---|
-| `mock_repository.go` | User, Note, Following, Reaction, Meta, Role, Channel, Chat等 (~20種) |
+| `mock_repository.go` | UserRepository と、列の検査など複数のモックが使う補助 |
+| `mock_user.go` | UserKeypair, UserPublickey, UserPending, UserMemo など、User に付く小さなもの |
+| `mock_auth.go` | AccessToken, Signin, AuthSession, PasswordResetRequest, RegistrationTicket |
+| `mock_note.go` | Note, NoteFavorite, NoteReaction, Poll, PollVote, NoteUnread など |
+| `mock_following.go` | Following, FollowRequest, UserList, UserListFavorite |
+| `mock_antenna_channel.go` | Antenna, Channel と、その既読・お気に入り・ミュート |
+| `mock_clip.go` / `mock_page_flash.go` | Clip / Page, Flash, Gallery |
+| `mock_emoji.go` / `mock_instance.go` | Emoji, AvatarDecoration / Instance |
+| `mock_moderation.go` | AbuseReport, ModerationLog, Role, RoleAssignment など |
+| `mock_meta.go` | Meta, Announcement, Registry, Relay, SystemWebhook, Ad など |
+| `mock_chat.go` | Chat |
 | `mock_drive.go` | DriveFileRepository, DriveFolderRepository |
 | `mock_block_mute.go` | BlockingRepository, MutingRepository, RenoteMutingRepository |
 | `mock_allowlist.go` | AllowlistChecker (mediaproxy用) |
@@ -260,11 +273,11 @@ make federation-misskey-down
 
 `tests/playwright/` 配下の spec を Elythia と Misskey TS の **両 backend** で並列実行し、drop-in 互換 regression を PR ごとに検出する基盤。
 
-- 範囲: 298 spec ファイル (upstream 290 = ui 194 / api 96、mkgo 8) / 40 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
+- 範囲: 299 spec ファイル (upstream 290 = ui 194 / api 96、elythia 9) / 40 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
 - トリガー: `pull_request` (paths フィルタ) + `workflow_dispatch`。**nightly ではない** (#2291 で移行)。`.github/workflows/playwright.yml`
 - **4 シャード並列** (`--shard=i/4`、`fail-fast: false`)。1 スタックに対しては直列でしか回せない (共有の root と instance meta を spec が取り合う) ので、並列度はシャードごとに独立した stack を立てて稼ぐ (#2609)
 - **TS backend は `workflow_dispatch` 専用**で PR では回らない。upstream が変わらない限り答えも変わらないため、追従する本家の版を上げたタイミングだけ回す
-- spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/mkgo/` の 8 件 (Elythia 独自機能を見るので公式 image では通らない)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している
+- spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/elythia/` の 9 件 (Elythia 独自機能を見るので公式 image では通らない)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している
 
 ### spec を書くときの注意: root の per-user quota
 
@@ -381,12 +394,12 @@ PR ごとに `.github/workflows/dropin-e2e.yml` が **5 シナリオ**を並列�
 | check 名 | make target | 見ているもの |
 |---|---|---|
 | `swap-test` | `dropin-swap-test` | TS→mk 切替で state が保たれるか (#374)。TS へ戻す stage 6b-9 は測る対象 (#3191) |
-| `mkgo-born` | `dropin-mkgo-born-test` | **Elythia 生まれの DB を TS に引き渡せるか** (#2383。測る対象で、保証はしない、#3191) |
+| `elythia-born` | `dropin-elythia-born-test` | **Elythia 生まれの DB を TS に引き渡せるか** (#2383。測る対象で、保証はしない、#3191) |
 | `ed25519-verify` | `dropin-fedibird-test` | Fedibird-like mock との Ed25519 双方向 verify (#1083) |
 | `federation` | `federation-misskey-e2e` | 本物の Misskey TS を相手にした実連合 (#2362) |
 | `federation-mastodon` | `federation-mastodon-e2e` | 本物の Mastodon を相手にした引用の承認 (FEP-044f、#3234) |
 
-`swap-test` と `mkgo-born` は似て見えるが **DB を作った側が違う** (前者は TypeORM、
+`swap-test` と `elythia-born` は似て見えるが **DB を作った側が違う** (前者は TypeORM、
 後者は Elythia の migration)。TS が一度も触っていない schema を受け取るのは後者だけ。
 
 `make dropin-fedibird-test` は Fedibird-like な AP mock を立てて **Ed25519 署名の
@@ -404,6 +417,35 @@ make dropin-frontend-swap-test     # TS-A → mk-A 切替まで含む end-to-end
 ```
 
 nightly 19:00 UTC で `dropin-frontend-e2e` を実行 (`.github/workflows/dropin-frontend-e2e.yml`)。
+
+## 画像デコーダの fuzz (#3480)
+
+`internal/misc/imagedecode` には fuzz 関数が 4 つある。`fuzz_test.go` の 3 つ (drive が使う入口 `DecodeWithPixelCap` / `DecodeTGAWithPixelCap` と、デコードの前に走る判定関数と metadata の検査 `FuzzProbes`) と、`webp_test.go` の `FuzzDecodeWebP` (WebP の container の解析だけ。外部の種は読まない)。Go の fuzz は panic や `t.Fatal` は拾うが 1 入力あたりの時間の上限は持たないので、`fuzz_test.go` の 2 つのデコードは `-fuzz` で回しているとき (と `IMAGEDECODE_FUZZ_TIMECHECK=1` のとき) に限って 5 秒を超えたら失敗にしている (種だけを走らせる `make test` では見ない。`-race` 付きだと AVIF / JPEG XL の WASM デコーダの初回が 2〜4 秒かかり、誤検知になるため)。
+
+- **普通の `go test` では種だけが走る。** 種は `testdata/fuzz-seeds/` にコミットした 4x4 の画像 (PNG / GIF / JPEG は stdlib、BMP / TIFF は `x/image`、WebP / AVIF / JPEG XL は `gen2brain/*`、TGA は `blezek/tga` のエンコーダで作ったもの) と、`testdata/` の PNG。テストのたびに作らないのは、WASM のエンコーダが `-race` 付きだと 3 つで 16 秒かかるため。作り直すときは `IMAGEDECODE_WRITE_FUZZ_SEEDS=1 go test ./internal/misc/imagedecode -run '^TestWriteFuzzSeeds$'` (無いときはこのテストが、種が揃っているかだけ検査する)。HEIC と netpbm は Go のエンコーダが無いか使っていないので、外部の種を渡したときだけ通る
+- **変異させて回すのは `make fuzz-imagedecode`。** `FUZZTIME` (既定 2m) で時間、`FUZZ` で対象 (正規表現。既定は 4 つ全部 = 8 分)、`FUZZPARALLEL` (既定 2) で worker 数を変える。種は module cache にある各ライブラリの testdata を `IMAGEDECODE_FUZZ_SEEDS` (ディレクトリを `:` 区切り) で渡す。target が組み立てて `seeds:` に出すので、手で渡すのは別の種を足すときだけ。渡したディレクトリが無ければテストが落ちる
+- **デコーダの依存 (`gen2brain/*`、`golang.org/x/image`、`kovidgoyal/imaging`、`blezek/tga`) を上げたら回す。** 落ちた入力は `testdata/fuzz/<Fuzz 関数名>/` に書かれる。panic したものは以後の普通のテストで毎回落ちる。5 秒を超えたものは、Go が表示する `go test -run=<Fuzz 関数名>/<名前>` では時間を見ないので通ってしまう。再現するときは `-fuzz` を付けるか、`IMAGEDECODE_FUZZ_TIMECHECK=1` を付けて実行する
+
+- **画素数の上限は既定で `MaxPixels` (8192²)。** drive がアップロードに使う上限は `UpstreamMaxPixels` (0x3FFF²) で、その間の寸法を宣言するヘッダは既定では `DecodeConfig` の段で弾かれて先に進まない。本番と同じ上限で回すときは `IMAGEDECODE_FUZZ_PIXELCAP=upstream` を付ける。raster 1 枚は 16 bit でもバイト予算 (`imagedecode.go` の `px*bpp > maxPixels*4`) で 1GiB に収まるが、色の変換や向きの補正で 2 枚目を持つので、worker 1 つに 2GiB 以上を見込む
+
+```sh
+make fuzz-imagedecode                                   # 4 つの対象を 2 分ずつ
+make fuzz-imagedecode FUZZ=FuzzDecodeWithPixelCap FUZZTIME=10m
+IMAGEDECODE_FUZZ_PIXELCAP=upstream make fuzz-imagedecode FUZZ=FuzzDecodeWithPixelCap FUZZPARALLEL=1
+```
+
+**メモリに上限を付けて回す。** デコーダは宣言した寸法ぶんの raster を先に確保し (`MaxPixels` × 4 bytes = 256MB)、色の変換や向きの補正、アニメーションの canvas で 2 枚目を持つ経路があるので、worker 1 つに 512MB 以上を見込む (WASM のデコーダは linear memory を別に持つ)。本番と同居するホストでは、コンテナで上限を付けて回す。`make` が入っている bookworm 系の image を使い (`go.mod` の版以上の Go のもの)、module cache は読み取り専用で mount する (ダウンロードが無ければ `go` は書かない)。fuzz が見つけた入力の蓄積 (corpus) は `$GOCACHE/fuzz` に書くので、`GOCACHE` はホスト側の gitignore 済みのディレクトリ (`.cache/` の下) に向けて次の実行に引き継ぐ。`--user` を付けるのは、落ちた入力が `testdata/fuzz/` に root 所有で書かれないようにするため。`IMAGEDECODE_FUZZ_PIXELCAP` と `IMAGEDECODE_FUZZ_TIMECHECK` は `docker run` に継承されないので、使うときは `-e` で渡す (target が `pixel cap` に実効の値を出す)。手元に古い同名の image が残っていると `go.mod` の版より古い Go で止まるので、先に `docker pull` する。
+
+```sh
+mkdir -p .cache/fuzz-gocache
+docker run --rm --memory=4g --memory-swap=4g --cpus=3 --user "$(id -u):$(id -g)" \
+  -v "$(go env GOMODCACHE):/go/pkg/mod:ro" -v "$PWD:/src" -w /src \
+  -e HOME=/tmp -e GOCACHE=/src/.cache/fuzz-gocache -e CGO_ENABLED=0 \
+  golang:1.27-bookworm make fuzz-imagedecode FUZZTIME=5m FUZZPARALLEL=3
+# drive と同じ上限で回すときは -e IMAGEDECODE_FUZZ_PIXELCAP=upstream を足し、FUZZPARALLEL=1 にする
+```
+
+2026-10-09 の監査では、この条件 (`--memory=4g --cpus=3`、worker 3、種は module cache の testdata で 96KiB 以下のもの) で `FuzzDecodeWithPixelCap` を 8 分回し、`go test` が最後に表示した `execs` は 820,709、panic / 5 秒超 / OOM は無かった。
 
 ## 変更の経緯 (旧 CLAUDE.md の更新記録)
 
@@ -454,7 +496,7 @@ CLAUDE.md の「更新記録」に書かれていた本文を、#3248 でここ�
 - **2026-09-01**: Section 8 の `test-shards` に `-shuffle` を追加 (#2795)。**`internal/server` は `-shuffle` を有効にすると 5 seed すべてで落ちていた** (落ちるテストは seed ごとに違う)。原因は 2 系統で、どちらも**プロセス共有の状態を張り替えて戻していない**もの。(a) `newServer` / `New` が起動時にグローバルを **12 個** 差し替えるが、テストは同じプロセスで何度も呼ぶので、後続の `avatar` / `emoji_redirect` が素の URL ではなく署名付きプロキシURLを受け取る。(b) `frontendutil` の loader キャッシュはプロセスに 1 つで、fixture は `t.TempDir()` に置くため**ディレクトリが消えた後も内容がキャッシュに残る**。
   seed は **全 shard 共通の固定値**にした。`on` (毎回ランダム) は失敗を手元で再現できず、required check が不定期に赤くなる。**shard 番号も使わない** — shard 配属は `NR % 4` なので、テストパッケージが 1 つ増えるだけで既存パッケージの seed が変わり順序が丸ごと入れ替わる (無関係な PR が未実行の順序を引いて赤くなり、ランダム seed と同じ問題を別経路で持ち込む)。
   **seed は実測で選ぶこと。** 覚えやすい値 (issue 番号など) を置くと検出力を持たない値を引く — 実際 `2795` を置いたが、restore を無効化した変異で落ちる seed は 12 個中 7 個だけで、`2795` は落ちない側だった (= 直したバグを CI が検出しない)。採用した `3` は 6 テストが落ちる。
-  **cleanup の登録も一覧も、手で書くと変異検証が効かない形になる。** `TestFrontendHTML_SplashColor` (現 `TestFrontendHTML_SplashIgnoresThemeColor`) の `<style>` 抽出を splash 名指しに直した時点で、loader cleanup を全部外しても 40 seed で落ちなくなった。restore の一覧も初版は `entity` の 7 つだけで 5 つ落としていた。どちらも AST の gate で形を強制してある (`internal/server/global_state_test.go`)。
+  **cleanup の登録も一覧も、手で書くと変異検証が効かない形になる。** `TestFrontendHTML_SplashColor` (現 `TestFrontendHTML_SplashIgnoresThemeColor`) の `<style>` 抽出を splash 名指しに直した時点で、loader cleanup を全部外しても 40 seed で落ちなくなった。restore の一覧も初版は `entity` の 7 つだけで 5 つ落としていた。どちらも AST の gate で形を強制してあった (`internal/server/global_state_test.go`。#3803で戻す状態が無くなり、両方とも消した)。
 - **2026-08-31**: Section 4 の「DB を使うテストの分離」に、システムカタログを schema で絞る規則と `Scan(&string)` の罠を追記 (#2777)。あわせて `make catalog-check` を新設し `make gates` に入れた (`make help` の target は 112 → 113)。doc だけだと再発する — schema が 17-19 ある条件は残ったままなので。`pg_indexes` を schema 非限定で引くテストが 3 本あり、**required check の `test` を不定期に落としていた** (PR #2778 の `test-shards (1)` が実際に赤くなった)。#2450 で schema を分けた結果、同名テーブルが 17-19 schema に同時に存在し、他パッケージの `ApplyMigrations` が DDL 中だと `could not open relation with OID (SQLSTATE XX000)` になる。**害はそれだけではない** — 絞らないと他 schema の同名 index を自分のものと取り違えるので、migration が適用されていなくても regression guard が緑になる。実測で `internal_repository_ts` の定義が返っており、3 本とも空振りしていた。`Scan(&string)` は複数行でも**最後の 1 行**を黙って取る (GORM は `*string` に対し全行を走査して dest を上書きする) ので、この取り違えは値が正しく見えて気付けない。
 - **2026-08-30**: Section 4 の「DB を使うテストの分離」に列枠の話を追記 (#2756)。PostgreSQL は `DROP COLUMN` した列も 1600 の上限に数えるので、実行のたびに列を落とすテスト構造だと手元でだけ枠が減り続け、最後に落ちる (実測で `clip` / `auth_session` / `app` が 1593 列まで到達した)。原因は 2 つで、`ApplyMigrations` が毎回全 migration を流し直すこと (再適用で実際に枠を食うのは migration が作る 120 テーブル中 `note` の 1 つだけ — `000033` が ADD し `000036` が DROP するため) と、TS 形状を作るテストが列を落として戻していたこと。前者は適用済みを skip する台帳、後者は専用の兄弟 schema を一度だけその形に作る方式で解消した。復旧手順も併記。
 - **2026-08-10**: Section 4 に「DB を使うテストの分離」を追記 (#2450)。`testutil.OpenTestDB` が呼び出し元パッケージ専用の PostgreSQL schema に接続するようになった。`go test` はパッケージを並行実行し CI の shard は DB を 1 つしか持たないため、共有すると一方の後片付けが他方を壊す (実際に Go を触っていない PR で CI が落ちた)。削除範囲を絞るだけでは解けない (干渉が双方向) 点と、migration の enum guard に `pg_type WHERE typname` を使わない旨も明記。

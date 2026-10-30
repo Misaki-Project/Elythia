@@ -14,11 +14,13 @@ import (
 // countingPacker counts DetailedNotMe calls and returns a marker body.
 type countingPacker struct{ detailed int }
 
-func (c *countingPacker) Lite(u *model.User) entity.UserLite { return entity.PackUserLite(u) }
+func (c *countingPacker) Lite(u *model.User) entity.UserLite {
+	return (*entity.Packer)(nil).PackUserLite(u)
+}
 
 func (c *countingPacker) DetailedNotMe(_ context.Context, target, _ *model.User) (entity.UserDetailed, bool) {
 	c.detailed++
-	d := entity.PackUserDetailed(target, &model.UserProfile{UserID: target.ID})
+	d := (*entity.Packer)(nil).PackUserDetailed(target, &model.UserProfile{UserID: target.ID})
 	d.Description = new("packed")
 	return d, true
 }
@@ -47,7 +49,7 @@ func TestFollowEvents_PackFolloweeOnce(t *testing.T) {
 	addUser(t, userRepo, "alice", false)
 	addUser(t, userRepo, "bob", true)
 	packer := &countingPacker{}
-	svc.SetUserPacker(packer)
+	svc.SetUserPackerForTest(packer)
 	hook := &packedHook{}
 	svc.SetWebhookHook(hook)
 	pub := &stubMainStreamPublisher{}
@@ -88,7 +90,7 @@ func TestFollow_PublicPacksOnce(t *testing.T) {
 	addUser(t, userRepo, "alice", false)
 	addUser(t, userRepo, "bob", false)
 	packer := &countingPacker{}
-	svc.SetUserPacker(packer)
+	svc.SetUserPackerForTest(packer)
 	hook := &packedHook{}
 	svc.SetWebhookHook(hook)
 	svc.SetMainStreamPublisher(&stubMainStreamPublisher{})
@@ -114,11 +116,4 @@ func TestFollowEvents_UnwiredPackerUsesPlainHook(t *testing.T) {
 	assert.Empty(t, hook.bodies)
 	assert.Equal(t, 1, hook.follows)
 	assert.Equal(t, 1, hook.unfollows)
-}
-
-func TestService_HasUserPacker(t *testing.T) {
-	svc, _, _, _ := newSvc(t)
-	assert.False(t, svc.HasUserPacker())
-	svc.SetUserPacker(&countingPacker{})
-	assert.True(t, svc.HasUserPacker())
 }

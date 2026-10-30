@@ -6,6 +6,7 @@ import (
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/core/captcha"
+	"github.com/elythia-network/elythia/internal/metasecret"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/labstack/echo/v4"
 )
@@ -49,25 +50,32 @@ func (h *Handler) CaptchaCurrent(c echo.Context) error {
 
 // captchaCurrentShape builds the nested captcha/current response (upstream
 // CaptchaService.get). nil *string fields serialize to JSON null (nullable:true).
+//
+// secretKey は admin/meta と同じく値を返さず、設定済みなら伏せ字を返す。
+// hasSecretKey は追加の欄。
 func captchaCurrentShape(provider string, meta *model.Meta) map[string]any {
 	return map[string]any{
 		"provider": provider,
 		"hcaptcha": map[string]any{
-			"siteKey":   meta.HcaptchaSiteKey,
-			"secretKey": meta.HcaptchaSecretKey,
+			"siteKey":      meta.HcaptchaSiteKey,
+			"secretKey":    metasecret.Mask(meta.HcaptchaSecretKey),
+			"hasSecretKey": metasecret.IsSet(meta.HcaptchaSecretKey),
 		},
 		"mcaptcha": map[string]any{
-			"siteKey":     meta.McaptchaSiteKey,
-			"secretKey":   meta.McaptchaSecretKey,
-			"instanceUrl": meta.McaptchaInstanceURL,
+			"siteKey":      meta.McaptchaSiteKey,
+			"secretKey":    metasecret.Mask(meta.McaptchaSecretKey),
+			"hasSecretKey": metasecret.IsSet(meta.McaptchaSecretKey),
+			"instanceUrl":  meta.McaptchaInstanceURL,
 		},
 		"recaptcha": map[string]any{
-			"siteKey":   meta.RecaptchaSiteKey,
-			"secretKey": meta.RecaptchaSecretKey,
+			"siteKey":      meta.RecaptchaSiteKey,
+			"secretKey":    metasecret.Mask(meta.RecaptchaSecretKey),
+			"hasSecretKey": metasecret.IsSet(meta.RecaptchaSecretKey),
 		},
 		"turnstile": map[string]any{
-			"siteKey":   meta.TurnstileSiteKey,
-			"secretKey": meta.TurnstileSecretKey,
+			"siteKey":      meta.TurnstileSiteKey,
+			"secretKey":    metasecret.Mask(meta.TurnstileSecretKey),
+			"hasSecretKey": metasecret.IsSet(meta.TurnstileSecretKey),
 		},
 	}
 }
@@ -93,8 +101,32 @@ func (h *Handler) CaptchaSave(c echo.Context) error {
 	if _, ok := supportedCaptchaProviders[req.Provider]; !ok {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PROVIDER", "Invalid provider.", "14bf7ae1-80cc-4363-acb2-4fd61d086af0"))
 	}
+	var verifySecret *string
 
-	secret := strDeref(req.Secret)
+	// 伏せ字のまま送り返された secret は「変えない」。検証には保存済みの値を使い、
+	// 保存では書き換えない (captcha/current は秘密の値を返さない)。
+	if req.Secret != nil && metasecret.IsPlaceholder(*req.Secret) {
+		// secret と instanceUrl は同じ 1 回の読み取りから取る (別々に読むと、間に
+		// 入った更新で組み合わせが崩れる)。
+		stored, storedURL, err := h.storedCaptchaSecret(req.Provider)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+		}
+		// 保存済みの secret は、保存済みの送り先へだけ送る。mcaptcha は検証を
+		// instanceUrl へ送るので、送り先を変えるなら secret も入力し直させる。
+		// 保存するときも、update-meta と同じ判定を transaction の中でもう一度行う。
+		if req.Provider == "mcaptcha" && stored != "" &&
+			normalizeDestination(strDeref(req.InstanceURL)) != normalizeDestination(storedURL) {
+			return secretReentryRequired(c, "secret")
+		}
+		req.Secret = nil
+		if stored != "" {
+			verifySecret = &stored
+		}
+	} else {
+		verifySecret = req.Secret
+	}
+	secret := strDeref(verifySecret)
 	sitekey := strDeref(req.Sitekey)
 	instanceURL := strDeref(req.InstanceURL)
 	captchaResult := strDeref(req.CaptchaResult)
@@ -159,8 +191,8 @@ func (h *Handler) CaptchaSave(c echo.Context) error {
 		setIfProvided(fields, "turnstileSiteKey", req.Sitekey)
 		setIfProvided(fields, "turnstileSecretKey", req.Secret)
 	}
-	if err := h.metaRepo.Update(fields); err != nil {
-		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	if err := h.updateMetaChecked(fields); err != nil {
+		return h.writeCheckedUpdateError(c, fields, err)
 	}
 	return c.NoContent(http.StatusNoContent)
 }
@@ -211,4 +243,28 @@ func setIfProvided(fields map[string]any, col string, p *string) {
 	if p != nil {
 		fields[col] = *p
 	}
+}
+
+// storedCaptchaSecret returns the saved secret of provider and the saved
+// mCaptcha instance URL ("" when unset), from one read.
+func (h *Handler) storedCaptchaSecret(provider string) (string, string, error) {
+	if h.metaRepo == nil {
+		return "", "", nil
+	}
+	m, err := h.metaRepo.Fetch()
+	if err != nil {
+		return "", "", err
+	}
+	var v *string
+	switch provider {
+	case "hcaptcha":
+		v = m.HcaptchaSecretKey
+	case "mcaptcha":
+		v = m.McaptchaSecretKey
+	case "recaptcha":
+		v = m.RecaptchaSecretKey
+	case "turnstile":
+		v = m.TurnstileSecretKey
+	}
+	return strDeref(v), strDeref(m.McaptchaInstanceURL), nil
 }

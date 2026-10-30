@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -587,7 +588,7 @@ func TestPackGame_EmbedsUserLiteMaps(t *testing.T) {
 		User1: &model.User{ID: "alice", Username: "alice", Name: &name, Host: &remoteHost},
 		User2: &model.User{ID: "bob", Username: "bob"},
 	}
-	out := packGame(g)
+	out := (&Service{}).packGame(g)
 	u1, ok := out["user1"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "alice", u1["id"])
@@ -616,7 +617,7 @@ func TestPackGame_WinnerField(t *testing.T) {
 			User1: user1, User2: user2,
 			WinnerID: &winnerID,
 		}
-		out := packGame(g)
+		out := (&Service{}).packGame(g)
 		w, ok := out["winner"].(map[string]any)
 		require.True(t, ok, "winner must be present")
 		assert.Equal(t, "alice", w["id"])
@@ -629,7 +630,7 @@ func TestPackGame_WinnerField(t *testing.T) {
 			User1: user1, User2: user2,
 			WinnerID: &bobID,
 		}
-		out := packGame(g)
+		out := (&Service{}).packGame(g)
 		w, ok := out["winner"].(map[string]any)
 		require.True(t, ok)
 		assert.Equal(t, "bob", w["id"])
@@ -640,7 +641,7 @@ func TestPackGame_WinnerField(t *testing.T) {
 			ID: "g1", User1ID: "alice", User2ID: "bob",
 			User1: user1, User2: user2,
 		}
-		out := packGame(g)
+		out := (&Service{}).packGame(g)
 		_, has := out["winner"]
 		assert.False(t, has, "winner must be omitted when WinnerID is nil")
 	})
@@ -652,7 +653,7 @@ func TestPackGame_WinnerField(t *testing.T) {
 			ID: "g1", User1ID: "alice", User2ID: "bob",
 			WinnerID: &winnerID,
 		}
-		out := packGame(g)
+		out := (&Service{}).packGame(g)
 		_, has := out["winner"]
 		assert.False(t, has)
 		assert.Equal(t, &winnerID, out["winnerId"])
@@ -837,4 +838,66 @@ func TestService_Finalize_NoWinnerDraw(t *testing.T) {
 	// Sanity on generated CRC32
 	require.NotNil(t, game.CRC32)
 	_ = time.Now
+}
+
+// 行の長さが揃わない盤面は受け取らないこと。
+//
+// 揃わない盤面は、座標の検査を通った位置が盤面の外を指し、開始のときに engine が
+// index out of range で panic していた (対局者の WebSocket が切れる)。
+func TestService_UpdateSettings_RejectsInvalidMap(t *testing.T) {
+	cases := map[string][]string{
+		"ragged":        {"--------", "-"},
+		"empty":         {},
+		"empty row":     {""},
+		"unknown cell":  {"-x", "--"},
+		"multibyte":     {"-あ", "---"},
+		"too wide (65)": {strings.Repeat("-", 65)},
+		"too tall (65)": func() []string {
+			rows := make([]string, 65)
+			for i := range rows {
+				rows[i] = "--"
+			}
+			return rows
+		}(),
+	}
+	for name, m := range cases {
+		t.Run(name, func(t *testing.T) {
+			game, repo, _, svc := newPendingGame(t)
+			before := []string(game.Map)
+			raw, _ := json.Marshal(m)
+			err := svc.UpdateSettings(context.Background(), game.ID, "alice", "map", raw)
+			require.ErrorIs(t, err, ErrInvalidSetting)
+			got, _ := repo.FindByID(game.ID)
+			assert.Equal(t, before, []string(got.Map), "拒否した盤面を保存した")
+		})
+	}
+}
+
+// 受け付ける盤面: upstream の組み込み盤面の文字 (' ' を含む) と、上限ちょうど。
+func TestValidMap_Accepts(t *testing.T) {
+	assert.True(t, ValidMap([]string{" -b ", " w- "}))
+	rows := make([]string, 64)
+	for i := range rows {
+		rows[i] = strings.Repeat("-", 64)
+	}
+	assert.True(t, ValidMap(rows))
+}
+
+// 検査より前に保存された壊れた盤面からは engine を作らず、panic もしないこと。
+func TestEngineFromGame_InvalidStoredMap(t *testing.T) {
+	game := &model.ReversiGame{Map: model.StringArray{"--------", "-"}}
+	assert.NotPanics(t, func() {
+		_, err := EngineFromGame(game)
+		assert.ErrorIs(t, err, ErrInvalidMap)
+	})
+}
+
+// 盤面の外を指す手 (壊れた記録の再生) で panic しないこと。
+func TestGame_PutStoneOutOfRange(t *testing.T) {
+	g := NewGame(nil, Options{})
+	assert.NotPanics(t, func() {
+		g.PutStone(-1)
+		g.PutStone(len(g.Board))
+	})
+	assert.Equal(t, -1, g.PrevPos, "盤面の外の手を記録した")
 }

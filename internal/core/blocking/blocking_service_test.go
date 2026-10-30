@@ -30,9 +30,8 @@ func newSvcWithFollowing(t *testing.T) (*blocking.Service, *testutil.MockUserRep
 	blockingRepo := testutil.NewMockBlockingRepository()
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	followingSvc := following.NewService(userRepo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	svc := blocking.NewService(userRepo, blockingRepo, idGen)
-	svc.SetUnfollower(followingSvc)
+	followingSvc := following.NewService(userRepo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	svc := blocking.NewService(userRepo, blockingRepo, idGen, followingSvc, nil, nil, nil)
 	return svc, userRepo, blockingRepo, followingRepo, followingSvc
 }
 
@@ -89,7 +88,7 @@ func TestBlock_NoUnfollower(t *testing.T) {
 	addUser(userRepo, "a")
 	addUser(userRepo, "b")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := blocking.NewService(userRepo, testutil.NewMockBlockingRepository(), idGen)
+	svc := blocking.NewService(userRepo, testutil.NewMockBlockingRepository(), idGen, nil, nil, nil, nil)
 	_, err := svc.Block("a", "b")
 	require.NoError(t, err)
 }
@@ -128,7 +127,7 @@ func TestBlock_ExistsError(t *testing.T) {
 	addUser(userRepo, "a")
 	addUser(userRepo, "b")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := blocking.NewService(userRepo, &failingBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository(), failExists: true}, idGen)
+	svc := blocking.NewService(userRepo, &failingBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository(), failExists: true}, idGen, nil, nil, nil, nil)
 	_, err := svc.Block("a", "b")
 	assert.ErrorIs(t, err, errStub)
 }
@@ -138,7 +137,7 @@ func TestBlock_CreateError(t *testing.T) {
 	addUser(userRepo, "a")
 	addUser(userRepo, "b")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := blocking.NewService(userRepo, &failingBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository(), failCreate: true}, idGen)
+	svc := blocking.NewService(userRepo, &failingBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository(), failCreate: true}, idGen, nil, nil, nil, nil)
 	_, err := svc.Block("a", "b")
 	assert.ErrorIs(t, err, errStub)
 }
@@ -150,9 +149,19 @@ func TestUnblock_Self(t *testing.T) {
 }
 
 func TestUnblock_NotBlocking(t *testing.T) {
-	svc, _, _, _ := newSvc(t)
+	svc, ur, _, _ := newSvc(t)
+	addUser(ur, "a")
+	addUser(ur, "b")
 	err := svc.Unblock("a", "b")
 	require.ErrorIs(t, err, blocking.ErrNotBlocking)
+}
+
+// A blockee that does not exist is ErrBlockeeNotFound, which the handler
+// answers with NO_SUCH_USER as upstream does (#3760).
+func TestUnblock_NoSuchBlockee(t *testing.T) {
+	svc, ur, _, _ := newSvc(t)
+	addUser(ur, "a")
+	require.ErrorIs(t, svc.Unblock("a", "b"), blocking.ErrBlockeeNotFound)
 }
 
 func TestUnblock_Success(t *testing.T) {
@@ -175,11 +184,11 @@ func TestIsBlockedAndList(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, yes)
 
-	rows, err := svc.List("a", "", "", 0, 0)
+	rows, err := svc.List("a", "", "", 0)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
 
-	rows, err = svc.List("a", "", "", 5, 0)
+	rows, err = svc.List("a", "", "", 5)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
 }
@@ -201,9 +210,8 @@ func TestBlock_RemoveFollowingDeleteError(t *testing.T) {
 	mock.Followings["f1"] = &model.Following{ID: "f1", FollowerID: "a", FolloweeID: "b"}
 	idGen, _ := id.NewGenerator("aidx")
 	followingSvc := following.NewService(userRepo, &failingFollowingRepo{MockFollowingRepository: mock},
-		testutil.NewMockFollowRequestRepository(), idGen)
-	svc := blocking.NewService(userRepo, testutil.NewMockBlockingRepository(), idGen)
-	svc.SetUnfollower(followingSvc)
+		testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	svc := blocking.NewService(userRepo, testutil.NewMockBlockingRepository(), idGen, followingSvc, nil, nil, nil)
 	hook := &recordingFederationHook{}
 	svc.SetFederationHook(hook)
 	_, err := svc.Block("a", "b")
@@ -281,7 +289,7 @@ func TestUnblock_DeleteError(t *testing.T) {
 	addUser(userRepo, "b")
 	idGen, _ := id.NewGenerator("aidx")
 	repo := &failingBlockingRepo{MockBlockingRepository: testutil.NewMockBlockingRepository()}
-	svc := blocking.NewService(userRepo, repo, idGen)
+	svc := blocking.NewService(userRepo, repo, idGen, nil, nil, nil, nil)
 	hook := &recordingFederationHook{}
 	svc.SetFederationHook(hook)
 
@@ -308,35 +316,13 @@ func (c *recordingFollowRequestCanceller) CancelFollowRequestsBetween(a, b strin
 	return c.err
 }
 
-// HasFollowRequestCanceller は配線の有無を返す (criticalWiring 用)。
-// **別の依存だけを配線しても false のままであること**も見る (述語を
-// `A != nil || B != nil` に広げる変異は false→true だけでは捕まらない)。
-func TestHasFollowRequestCanceller(t *testing.T) {
-	var empty blocking.Service
-	assert.False(t, empty.HasFollowRequestCanceller(), "未配線なら false")
-
-	svc, _, _, _ := newSvc(t)
-	svc.SetFollowRequestCanceller(&recordingFollowRequestCanceller{})
-	assert.True(t, svc.HasFollowRequestCanceller(), "配線したら true")
-
-	other, _, _, _ := newSvc(t)
-	other.SetFederationHook(stubWiringFederation{})
-	assert.False(t, other.HasFollowRequestCanceller(),
-		"federationHook だけを配線しても false のままであること")
-}
-
-type stubWiringFederation struct{}
-
-func (stubWiringFederation) OnBlocked(string, string)   {}
-func (stubWiringFederation) OnUnblocked(string, string) {}
-
 // Block は配線された canceller に (blocker, blockee) を 1 回渡す。
 func TestBlock_CancelsPendingFollowRequests(t *testing.T) {
 	svc, ur, _, _ := newSvc(t)
 	addUser(ur, "a")
 	addUser(ur, "b")
 	canceller := &recordingFollowRequestCanceller{}
-	svc.SetFollowRequestCanceller(canceller)
+	svc.SetFollowRequestCancellerForTest(canceller)
 
 	_, err := svc.Block("a", "b")
 	require.NoError(t, err)
@@ -349,7 +335,7 @@ func TestBlock_FollowRequestCancelErrorIsBestEffort(t *testing.T) {
 	svc, ur, _, _ := newSvc(t)
 	addUser(ur, "a")
 	addUser(ur, "b")
-	svc.SetFollowRequestCanceller(&recordingFollowRequestCanceller{err: errStub})
+	svc.SetFollowRequestCancellerForTest(&recordingFollowRequestCanceller{err: errStub})
 
 	_, err := svc.Block("a", "b")
 	require.NoError(t, err)
@@ -375,10 +361,8 @@ func TestBlock_CancelledRequestCannotBeAccepted(t *testing.T) {
 	followRequestRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
 
-	followingSvc := following.NewService(userRepo, followingRepo, followRequestRepo, idGen)
-	blockingSvc := blocking.NewService(userRepo, testutil.NewMockBlockingRepository(), idGen)
-	blockingSvc.SetUnfollower(followingSvc)
-	blockingSvc.SetFollowRequestCanceller(followingSvc)
+	followingSvc := following.NewService(userRepo, followingRepo, followRequestRepo, idGen, nil, nil, nil, nil)
+	blockingSvc := blocking.NewService(userRepo, testutil.NewMockBlockingRepository(), idGen, followingSvc, followingSvc, nil, nil)
 
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", IsLocked: true}
 	userRepo.Users["dave"] = &model.User{ID: "dave", Username: "dave"}

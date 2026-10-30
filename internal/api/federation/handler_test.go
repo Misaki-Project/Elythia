@@ -35,7 +35,7 @@ func newHandlerWithMeta(t *testing.T) (*Handler, *testutil.MockInstanceRepositor
 	metaRepo.Meta = &model.Meta{}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coreinstance.NewService(repo, metaRepo, idGen)
-	return NewHandler(svc), repo, metaRepo
+	return NewHandler(svc, nil, nil), repo, metaRepo
 }
 
 func newReq(t *testing.T, body string) (echo.Context, *httptest.ResponseRecorder) {
@@ -384,7 +384,7 @@ func TestInstances_RepoError(t *testing.T) {
 	metaRepo.Meta = &model.Meta{}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coreinstance.NewService(repo, metaRepo, idGen)
-	h := NewHandler(svc)
+	h := NewHandler(svc, nil, nil)
 	c, rec := newReq(t, `{}`)
 	require.NoError(t, h.Instances(c))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -410,11 +410,19 @@ func TestShowInstance_BadJSON(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-func TestShowInstance_EmptyHost(t *testing.T) {
+func TestShowInstance_MissingHost(t *testing.T) {
 	h, _ := newHandler(t)
 	c, rec := newReq(t, `{}`)
 	require.NoError(t, h.ShowInstance(c))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// 本家は空の host を paramDef で通し、該当の instance が無いので 204 を返す (#3770)。
+func TestShowInstance_EmptyHostIsNotFound(t *testing.T) {
+	h, _ := newHandler(t)
+	c, rec := newReq(t, `{"host":""}`)
+	require.NoError(t, h.ShowInstance(c))
+	assert.Equal(t, http.StatusNoContent, rec.Code)
 }
 
 // TestShowInstance_NotFound: upstream Misskey TS と同じく未知 host は
@@ -493,4 +501,61 @@ func TestInstances_GETBindsQueryParams(t *testing.T) {
 	var resp []any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Len(t, resp, 1, "GET ?limit=1 must bind the query param (else default 30 returns all 3)")
+}
+
+// **受信を拒否するソフトウェアに当たるかを isInboxSuspended で返す (Elythia 独自、
+// #3362)。** isSuspended / suspensionState は配送の停止だけを表す本家の意味のまま。
+func TestShowInstance_InboxSuspended(t *testing.T) {
+	h, repo, metaRepo := newHandlerWithMeta(t)
+	metaRepo.Meta = &model.Meta{
+		InboxSuspendedSoftware: datatypes.JSON([]byte(`[{"software":"mastodon","versionRange":"<=4.2.0"}]`)),
+	}
+	name := "mastodon"
+	old, newer := "4.1.0", "4.3.0"
+	inst := seedInstance(t, repo, "old.example")
+	inst.SoftwareName, inst.SoftwareVersion = &name, &old
+	inst2 := seedInstance(t, repo, "new.example")
+	inst2.SoftwareName, inst2.SoftwareVersion = &name, &newer
+
+	for host, want := range map[string]bool{"old.example": true, "new.example": false} {
+		c, rec := newReq(t, `{"host":"`+host+`"}`)
+		require.NoError(t, h.ShowInstance(c))
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		assert.Equal(t, want, resp["isInboxSuspended"], host)
+		assert.Equal(t, false, resp["isSuspended"], "配送の停止とは別に表す")
+		assert.Equal(t, "none", resp["suspensionState"])
+	}
+}
+
+// 本家 federation/instances の limit・offset は ajv の "type": "integer" なので、
+// 整数を小数の形で書いた値を受け、その整数として読む (#3865)。
+func TestInstances_IntegerParamsAcceptFractionForms(t *testing.T) {
+	h, repo := newHandler(t)
+	for _, host := range []string{"a.example", "b.example", "c.example", "d.example"} {
+		seedInstance(t, repo, host)
+	}
+	count := func(t *testing.T, body string) int {
+		t.Helper()
+		c, rec := newReq(t, body)
+		require.NoError(t, h.Instances(c))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		var rows []map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &rows))
+		return len(rows)
+	}
+	// 4 件のうち offset (3) を飛ばせば、limit (2) に届かず 1 件だけが返る。
+	assert.Equal(t, 1, count(t, `{"limit":2.0,"offset":3e0}`))
+	// limit だけなら、既定の 30 ではなく 1 件だけが返る。
+	assert.Equal(t, 1, count(t, `{"limit":1.0}`))
+}
+
+// federation/instances の独自の sinceDate・untilDate も integer として宣言した
+// (#3867)。整数を小数の形で書いた値を受ける。
+func TestInstances_DateCursorAcceptsFractionForms(t *testing.T) {
+	h, _ := newHandler(t)
+	c, rec := newReq(t, `{"sinceDate":1.0,"untilDate":4102444800000.0}`)
+	require.NoError(t, h.Instances(c))
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }

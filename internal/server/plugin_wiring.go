@@ -20,6 +20,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	apiadmin "github.com/elythia-network/elythia/internal/api/admin"
+	"github.com/elythia-network/elythia/internal/bgwork"
 	coredrive "github.com/elythia-network/elythia/internal/core/drive"
 	corerole "github.com/elythia-network/elythia/internal/core/role"
 	"github.com/elythia-network/elythia/internal/pluginstore"
@@ -84,16 +85,25 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			name:    def.Name,
 			goGate:  goGate,
 			goStart: s.pluginGoStarter,
+			// ctx.Go() / GoContext() は世代の箱から起動する (#3661)。世代を止めると
+			// 上限付きで待たれ、待ちの 3/4 で ctx が切れる。
+			background: s.background,
 			logger: slog.With(
 				slog.String("plugin", def.Name),
 				slog.String("pluginVersion", def.Version),
 			),
 			api:    &pluginAPI{echo: s.echo, userRepo: s.userRepo, host: requestHostFor(s.config.URL)},
 			config: pluginConfig(settings),
+			// **名前はここで固定する (#3468)。** 他のプラグインのアカウントを
+			// 操作できないようにする。
+			accounts: newPluginAccounts(def.Name, s.pluginAccounts),
 			// **共通の outbound 設定を通す (#3037)。** プラグインが自分で
 			// `&http.Client{}` を作ると SSRF ガードも運営者の proxy 設定も
 			// 効かず、そのプラグインだけがサーバーの素の IP で外へ出る。
-			httpClient: s.outboundClient(pluginHTTPTimeout),
+			httpClient: s.isolatedOutboundClient(pluginHTTPTimeout),
+			// **プラグイン名で絞った口だけを渡す (#3470)。** 名前を受け取る
+			// 口を渡すと、他のプラグインの値を名指しで読めてしまう。
+			secrets: s.pluginSecretService().ForPlugin(def.Name),
 		}
 
 		// ストレージはロールに関係なく渡す。Routes からも Jobs からも使うため。
@@ -163,6 +173,12 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 		prepared = append(prepared, preparedPlugin{def: def, ctx: pctx, peer: peer})
 	}
 
+	secretPlugins := make([]plugin.Definition, 0, len(prepared))
+	for _, p := range prepared {
+		secretPlugins = append(secretPlugins, p.def)
+	}
+	warnPluginSecretsWithoutKey(secretPlugins, s.pluginSecretService().Available())
+
 	for _, p := range prepared {
 		def := p.def
 		pctx := p.ctx
@@ -177,7 +193,9 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 		// 登録は生成物との照合から見えないため)。
 		needsRoutes := def.Routes != nil
 		needsPeer := def.Peered && s.peerDeps != nil
-		if s.role.RunsServer() && (needsRoutes || needsPeer) {
+		// 秘密の値の入力口 (#3470) は、宣言したプラグインにだけ張る。
+		needsSecrets := len(def.Secrets) > 0 && s.pluginSecrets != nil
+		if s.role.RunsServer() && (needsRoutes || needsPeer || needsSecrets) {
 			// **第三者アプリのトークンを入れない (#3037)。** プラグインの
 			// ルートには upstream の `kind` にあたる宣言が無く、本体は
 			// `RequireScope` を配線できない。gate を置かないと
@@ -203,6 +221,9 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			if needsPeer {
 				group.POST(peerPath, peer.echoHandler())
 			}
+			if needsSecrets {
+				s.registerPluginSecretRoutes(group, def)
+			}
 		}
 		// peer の送信を処理するのは queue ロール (#2819)。**Peered だけで
 		// 登録する** — Jobs を持たないプラグインでも送信はするため。
@@ -219,6 +240,13 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			}
 			if err := j.err; err != nil {
 				return fmt.Errorf("plugin %q: ジョブ登録に失敗しました: %w", def.Name, err)
+			}
+		}
+		// 通知の handler (#3469) もジョブと同じく queue ロールでだけ登録する。
+		// 積むのはどのロールでも行う (router の pluginnotify.Dispatcher)。
+		if def.Notifications != nil && s.role.RunsQueue() {
+			if err := s.registerPluginNotifications(def, pctx); err != nil {
+				return fmt.Errorf("plugin %q: 通知の handler の登録に失敗しました: %w", def.Name, err)
 			}
 		}
 
@@ -250,7 +278,9 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			"name", def.Name, "version", def.Version,
 			"routes", def.Routes != nil && s.role.RunsServer(),
 			"peer", needsPeer,
+			"secrets", len(def.Secrets),
 			"jobs", def.Jobs != nil && s.role.RunsQueue(),
+			"notifications", def.Notifications != nil && s.role.RunsQueue(),
 			"migrations", len(def.Migrations),
 			"schema", schema)
 	}
@@ -304,6 +334,7 @@ func serverPluginInfos(plugins []plugin.Definition, settings map[string]map[stri
 			Migrations:        len(def.Migrations),
 			Schema:            schema,
 			ConfigKeys:        keys,
+			Secrets:           secretNames(def.Secrets),
 		})
 	}
 	return infos
@@ -372,11 +403,14 @@ type pluginContext struct {
 	api        plugin.API
 	storage    plugin.Storage
 	config     plugin.Config
+	secrets    plugin.Secrets
 	peer       plugin.Peer
 	queue      plugin.Queue
+	accounts   plugin.Accounts
 	httpClient *http.Client
 	goGate     *pluginGoGate
 	goStart    func(func())
+	background *bgwork.Group
 }
 
 func (c *pluginContext) Name() string            { return c.name }
@@ -385,7 +419,26 @@ func (c *pluginContext) API() plugin.API         { return c.api }
 func (c *pluginContext) Storage() plugin.Storage { return c.storage }
 func (c *pluginContext) Config() plugin.Config   { return c.config }
 
-// HTTP returns the outbound client shared with the rest of mk-go.
+// Accounts は **常に非 nil** (Peer / Queue と同じ理由)。テストなどで
+// pluginContext を直接組んだときも、呼ぶとエラーを返す実装に倒す。
+func (c *pluginContext) Accounts() plugin.Accounts {
+	if c.accounts == nil {
+		return newPluginAccounts(c.name, nil)
+	}
+	return c.accounts
+}
+
+// Secrets は **常に非 nil** を返す (Peer / Queue と同じ理由)。未配線なら
+// 鍵の無い service の口を渡すので、呼ぶと ErrSecretsUnavailable になる。
+func (c *pluginContext) Secrets() plugin.Secrets {
+	if c.secrets == nil {
+		return unconfiguredPluginSecrets().ForPlugin(c.name)
+	}
+	return c.secrets
+}
+
+// HTTP returns the plugin's own outbound client. It has its own transport
+// (isolatedOutboundClient), not the one the rest of Elythia shares.
 //
 // **未配線でも nil を返さない (#3037)。** nil を返すと、プラグイン側の
 // `ctx.HTTP().Do(...)` がそのまま nil 参照 panic になる。素の client は
@@ -417,9 +470,17 @@ func (c *pluginContext) Queue() plugin.Queue { return c.queue }
 
 // pluginHTTPTimeout bounds one request made through ctx.HTTP().
 //
-// **プラグインの主な用途はリモートからの取り寄せ**なので、AP の配送
-// (10 秒) より長めに取る。足りないものは
-// `http.NewRequestWithContext` で per-request に伸ばせる。
+// **プラグインの主な用途はリモートからの取り寄せ**なので、webfinger や
+// 添付の確認 (10 秒) より長めに取る。
+//
+// **要求の context では延ばせない。** `http.Client.Timeout` は context とは
+// 別に効くので、context で縮めることはできても、この値より長くはできない。
+// 長く待つ要求は、プラグインの側で client の写しを作って Timeout を変える
+// (`hc := *ctx.HTTP(); hc.Timeout = 2 * time.Minute`)。写しも同じ Transport を
+// 使うので、proxy と SSRF のガードはそのまま効く (#3603)。
+//
+// 値を変えたら、`plugin/plugin.go` の `HTTP()` の GoDoc と
+// `docs/plugins/authoring.md` に書いた 30 秒も直す。
 const pluginHTTPTimeout = 30 * time.Second
 
 // pluginRetryBackoffBase is the exponential backoff base applied whenever a
@@ -489,7 +550,7 @@ type pluginGoGate struct {
 
 type queuedPluginGo struct {
 	ctx *pluginContext
-	fn  func()
+	fn  func(context.Context)
 }
 
 const (
@@ -498,7 +559,7 @@ const (
 	pluginGoDiscarded
 )
 
-func (g *pluginGoGate) enqueue(ctx *pluginContext, fn func()) {
+func (g *pluginGoGate) enqueue(ctx *pluginContext, fn func(context.Context)) {
 	g.mu.Lock()
 	switch g.state {
 	case pluginGoPending:
@@ -638,7 +699,9 @@ func (s *Server) dbBackedStorage() pluginStorageOpener {
 		if err != nil {
 			return nil, err
 		}
-		s.registerShutdownHook(func(context.Context) { _ = store.Close() })
+		// プラグインごとに1つ開くので、名前にプラグイン名を入れる(#3699)。
+		// 同じ名前のプラグインはplugin.Registerがpanicで落とすので、本番では重複しない。
+		s.addErrCloser("pluginStorage:"+name, store)
 		return &pluginStorage{store: store}, nil
 	}
 }
@@ -667,6 +730,10 @@ func (s *pluginStorage) Migrate(ctx context.Context, migrations []plugin.Migrati
 // **プラグインが素の `go` を書くとプロセスごと落ちる。** Go は他 goroutine の
 // panic を回収できず、echo の Recover middleware では止められない。
 func (c *pluginContext) Go(fn func()) {
+	c.GoContext(func(context.Context) { fn() })
+}
+
+func (c *pluginContext) GoContext(fn func(context.Context)) {
 	if c.goGate != nil {
 		c.goGate.enqueue(c, fn)
 		return
@@ -674,20 +741,23 @@ func (c *pluginContext) Go(fn func()) {
 	c.startGo(fn)
 }
 
-func (c *pluginContext) startGo(fn func()) {
-	run := func() {
+func (c *pluginContext) startGo(fn func(context.Context)) {
+	run := func(ctx context.Context) {
 		defer func() {
 			if r := recover(); r != nil {
 				c.logger.Error("plugin の goroutine が panic しました", "panic", r)
 			}
 		}()
-		fn()
+		fn(ctx)
 	}
 	if c.goStart != nil {
-		c.goStart(run)
+		ctx := c.background.Context()
+		c.goStart(func() { run(ctx) })
 		return
 	}
-	go run()
+	// 世代が止まった後に呼ばれたら走らせない。storage の pool はもう閉じている。
+	// 捨てたことは箱がプラグイン名付きで 1 行ログに出す。
+	c.background.GoAs("plugin "+c.name, run)
 }
 
 // --- Router ---
@@ -996,6 +1066,18 @@ func validateEndpoint(endpoint string) error {
 
 // --- Jobs ---
 
+// pluginJobError maps plugin.ErrNoRetry onto the driver's skip-retry sentinel.
+//
+// プラグインは driver を import できない (internal) ので、公開面の sentinel を
+// ここで写す。写さないと、4xx のように何度やっても直らない失敗を、残りの回数
+// だけ繰り返す。
+func pluginJobError(err error) error {
+	if err == nil || !errors.Is(err, plugin.ErrNoRetry) || errors.Is(err, driver.ErrSkipRetry) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", driver.ErrSkipRetry, err)
+}
+
 type pluginJobs struct {
 	name      string
 	server    *queue.Server
@@ -1026,7 +1108,7 @@ func (j *pluginJobs) Handle(name string, h plugin.JobHandler) {
 		return
 	}
 	j.server.Handle(j.taskType(name), func(ctx context.Context, t driver.Task) error {
-		return h(ctx, t.Payload())
+		return pluginJobError(h(ctx, t.Payload()))
 	})
 }
 

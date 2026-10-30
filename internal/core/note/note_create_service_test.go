@@ -1,12 +1,14 @@
 package note_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/bgwork"
 	corechannel "github.com/elythia-network/elythia/internal/core/channel"
 	"github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/core/role"
@@ -61,7 +63,7 @@ func newCreateService(t *testing.T) (*note.CreateService, *testutil.MockNoteRepo
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	return svc, noteRepo, pollRepo
 }
 
@@ -74,7 +76,7 @@ func newCreateServiceWithFollowing(t *testing.T) (*note.CreateService, *testutil
 	pollRepo := testutil.NewMockPollRepository()
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := note.NewCreateService(noteRepo, pollRepo, idGen, followingRepo)
+	svc := note.NewCreateService(noteRepo, pollRepo, idGen, followingRepo, nil, nil, nil, nil, nil, nil)
 	return svc, noteRepo, followingRepo
 }
 
@@ -143,7 +145,7 @@ func (s *silencingStub) IsSilenced(_ string) bool { return s.silenced }
 
 func TestCreateService_SilencedPublicNoteDemotedToHome(t *testing.T) {
 	svc, _, _ := newCreateService(t)
-	svc.SetSilencingProvider(&silencingStub{silenced: true})
+	svc.SetSilencingProviderForTest(&silencingStub{silenced: true})
 
 	user := &model.User{ID: "user1"}
 	text := "hello"
@@ -157,7 +159,7 @@ func TestCreateService_SilencedPublicNoteDemotedToHome(t *testing.T) {
 
 func TestCreateService_NonSilencedPublicNoteUnchanged(t *testing.T) {
 	svc, _, _ := newCreateService(t)
-	svc.SetSilencingProvider(&silencingStub{silenced: false})
+	svc.SetSilencingProviderForTest(&silencingStub{silenced: false})
 
 	user := &model.User{ID: "user1"}
 	text := "hello"
@@ -172,7 +174,7 @@ func TestCreateService_NonSilencedPublicNoteUnchanged(t *testing.T) {
 func TestCreateService_SilencedHomeNoteUnchanged(t *testing.T) {
 	// 既に home / followers / specified の note は降格対象外 (= base 維持)。
 	svc, _, _ := newCreateService(t)
-	svc.SetSilencingProvider(&silencingStub{silenced: true})
+	svc.SetSilencingProviderForTest(&silencingStub{silenced: true})
 
 	user := &model.User{ID: "user1"}
 	text := "hello"
@@ -200,7 +202,7 @@ func (h *stubChannelHook) OnNotePosted(_, _, _ string) {}
 
 func TestCreateService_SilencedChannelNoteNotDemoted(t *testing.T) {
 	svc, _, _ := newCreateService(t)
-	svc.SetSilencingProvider(&silencingStub{silenced: true})
+	svc.SetSilencingProviderForTest(&silencingStub{silenced: true})
 	svc.SetChannelHook(&stubChannelHook{exists: true})
 
 	user := &model.User{ID: "user1"}
@@ -493,7 +495,7 @@ func TestCreateService_NoteRepoCreateError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	noteRepo := &failingNoteRepoCreate{MockNoteRepository: testutil.NewMockNoteRepository()}
 	pollRepo := testutil.NewMockPollRepository()
-	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 
 	user := &model.User{ID: "u1"}
 	text := "x"
@@ -505,7 +507,7 @@ func TestCreateService_PollRepoCreateError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := &failingPollRepo{}
-	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 
 	user := &model.User{ID: "u1"}
 	text := "x"
@@ -521,7 +523,7 @@ func TestCreateService_NoteRepoUpdateError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	noteRepo := &failingNoteRepoUpdate{MockNoteRepository: testutil.NewMockNoteRepository()}
 	pollRepo := testutil.NewMockPollRepository()
-	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 
 	user := &model.User{ID: "u1"}
 	text := "x"
@@ -537,7 +539,7 @@ func TestCreateService_FindByIDWithRelationsFails(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	noteRepo := &findFailNoteRepo{MockNoteRepository: testutil.NewMockNoteRepository()}
 	pollRepo := testutil.NewMockPollRepository()
-	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 
 	user := &model.User{ID: "u1"}
 	text := "x"
@@ -1076,7 +1078,7 @@ func TestCreateService_FanoutHookCalledOnFallbackPath(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	noteRepo := &findFailNoteRepo{MockNoteRepository: testutil.NewMockNoteRepository()}
 	pollRepo := testutil.NewMockPollRepository()
-	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	svc := note.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	hook := newRecordingHook()
 	svc.SetFanoutHook(hook)
 
@@ -1446,7 +1448,7 @@ func TestCreateService_CannotReplyToSpecifiedVisibility(t *testing.T) {
 func TestCreateService_YouHaveBeenBlocked_Renote(t *testing.T) {
 	svc, noteRepo, _ := newCreateService(t)
 	blockRepo := testutil.NewMockBlockingRepository()
-	svc.SetBlockingRepo(blockRepo)
+	svc.SetBlockingRepoForTest(blockRepo)
 
 	// block: target user が actor を block している
 	require.NoError(t, blockRepo.Create(&model.Blocking{ID: "b1", BlockerID: "target_user", BlockeeID: "u1"}))
@@ -1465,7 +1467,7 @@ func TestCreateService_YouHaveBeenBlocked_Renote(t *testing.T) {
 func TestCreateService_YouHaveBeenBlocked_Reply(t *testing.T) {
 	svc, noteRepo, _ := newCreateService(t)
 	blockRepo := testutil.NewMockBlockingRepository()
-	svc.SetBlockingRepo(blockRepo)
+	svc.SetBlockingRepoForTest(blockRepo)
 
 	require.NoError(t, blockRepo.Create(&model.Blocking{ID: "b1", BlockerID: "target_user", BlockeeID: "u1"}))
 
@@ -1485,7 +1487,7 @@ func TestCreateService_YouHaveBeenBlocked_Reply(t *testing.T) {
 func TestCreateService_NoSuchFile(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	fileRepo := testutil.NewMockDriveFileRepository()
-	svc.SetDriveFileRepo(fileRepo)
+	svc.SetDriveFileRepoForTest(fileRepo)
 
 	text := "hello"
 	_, err := svc.Create(note.CreateInput{
@@ -1500,7 +1502,7 @@ func TestCreateService_ContainsProhibitedWords(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", ProhibitedWords: []string{"badword"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "contains badword here"
 	_, err := svc.Create(note.CreateInput{
@@ -1523,7 +1525,7 @@ func TestCreateService_MetaFetchOnlyOncePerCreate(t *testing.T) {
 		SensitiveWords:  []string{"spoiler"},
 		ProhibitedWords: []string{"badword"},
 	}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "hello world"
 	_, err := svc.Create(note.CreateInput{
@@ -1542,7 +1544,7 @@ func TestCreateService_SensitiveWordsDemotesPublicToHome(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"spoiler"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "this contains a spoiler about the ending"
 	created, err := svc.Create(note.CreateInput{
@@ -1561,7 +1563,7 @@ func TestCreateService_SensitiveWordsCWHarmlessTextMatch_StrictDemotes(t *testin
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"spoiler"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	cw := "harmless cw"
 	text := "this body contains a spoiler"
@@ -1580,7 +1582,7 @@ func TestCreateService_SensitiveWordsEmptyCWTextMatch_StrictDemotes(t *testing.T
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"spoiler"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	empty := ""
 	text := "this body contains a spoiler"
@@ -1598,7 +1600,7 @@ func TestCreateService_SensitiveWordsBothCWAndTextMatch_Demotes(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"spoiler"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	cw := "spoiler tag"
 	text := "this body also contains a spoiler"
@@ -1614,7 +1616,7 @@ func TestCreateService_SensitiveWordsNeitherMatch_NotDemoted(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"spoiler"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	cw := "harmless"
 	text := "clean body"
@@ -1631,7 +1633,7 @@ func TestCreateService_SensitiveWordsMatchesCWAlone(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"nsfw"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	cw := "nsfw content warning"
 	text := "innocent body text"
@@ -1647,7 +1649,7 @@ func TestCreateService_SensitiveWordsRegexFilter(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{`/SPOIL.*/i`}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "this is a spoiler"
 	created, err := svc.Create(note.CreateInput{
@@ -1663,7 +1665,7 @@ func TestCreateService_SensitiveWordsHomeNoteUnchanged(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"spoiler"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "spoiler in home post"
 	created, err := svc.Create(note.CreateInput{
@@ -1680,7 +1682,7 @@ func TestCreateService_SensitiveWordsChannelNoteNotDemoted(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"spoiler"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	channelID := "ch1"
 	text := "spoiler in channel post"
@@ -1697,7 +1699,7 @@ func TestCreateService_SensitiveWordsEmptyMetaUnchanged(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: nil}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "regular content"
 	created, err := svc.Create(note.CreateInput{
@@ -1789,7 +1791,7 @@ func TestCreateService_InvisiblePureRenote_NoLeak_Renote(t *testing.T) {
 func TestCreateService_DuplicateFileIDs_Accepted(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	fileRepo := testutil.NewMockDriveFileRepository()
-	svc.SetDriveFileRepo(fileRepo)
+	svc.SetDriveFileRepoForTest(fileRepo)
 
 	uid := "u1"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &uid}
@@ -1807,7 +1809,7 @@ func TestCreateService_DuplicateFileIDs_Accepted(t *testing.T) {
 func TestCreateService_NoSuchFile_WrongOwner(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	fileRepo := testutil.NewMockDriveFileRepository()
-	svc.SetDriveFileRepo(fileRepo)
+	svc.SetDriveFileRepoForTest(fileRepo)
 
 	otherUID := "other_user"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &otherUID}
@@ -2278,7 +2280,7 @@ func TestCreateService_ProhibitedWords_PollChoice(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", ProhibitedWords: []string{"badword"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "clean text"
 	_, err := svc.Create(note.CreateInput{
@@ -2294,7 +2296,7 @@ func TestCreateService_ProhibitedWords_Regex(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", ProhibitedWords: []string{"/b[a4]dword/i"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "this is a b4dword test"
 	_, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text})
@@ -2307,7 +2309,7 @@ func TestCreateService_ProhibitedWords_CaseSensitive(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "m1", ProhibitedWords: []string{"badword"}}
-	svc.SetMetaRepo(metaRepo)
+	svc.SetMetaRepoForTest(metaRepo)
 
 	text := "this has BADWORD in caps"
 	_, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text})
@@ -2329,6 +2331,27 @@ func TestCreate_WhitespaceOnlyTextRejected(t *testing.T) {
 	svc, _, _ := newCreateService(t)
 	text := "   "
 	_, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text, Visibility: model.NoteVisibilityPublic})
+	require.ErrorIs(t, err, note.ErrNoteContentRequired)
+}
+
+// #3884: 削る空白は JavaScript の trim と同じ。U+0085 は削らず (それだけの本文も
+// 投稿になる)、U+FEFF は削る。
+func TestCreate_TrimsTextLikeJavaScript(t *testing.T) {
+	svc, _, _ := newCreateService(t)
+	text := "\ufeff hello\u0085\ufeff"
+	n, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text, Visibility: model.NoteVisibilityPublic})
+	require.NoError(t, err)
+	require.NotNil(t, n.Text)
+	assert.Equal(t, "hello\u0085", *n.Text)
+
+	nel := "\u0085"
+	n, err = svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &nel, Visibility: model.NoteVisibilityPublic})
+	require.NoError(t, err)
+	require.NotNil(t, n.Text)
+	assert.Equal(t, "\u0085", *n.Text)
+
+	bom := "\ufeff\u3000"
+	_, err = svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &bom, Visibility: model.NoteVisibilityPublic})
 	require.ErrorIs(t, err, note.ErrNoteContentRequired)
 }
 
@@ -2434,6 +2457,183 @@ func TestCreateService_MentionLimitFallsBackToDefault(t *testing.T) {
 
 			_, err = svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &under})
 			assert.NoError(t, err, "既定 20 ちょうどは通ること")
+		})
+	}
+}
+
+// archivedChannelHook reports the channels in `archived` as not found (the
+// production hook maps archived channels to ErrChannelNotFound) and records
+// every checked channel ID.
+type archivedChannelHook struct {
+	archived map[string]bool
+	checked  []string
+}
+
+func (h *archivedChannelHook) EnsureChannelExists(channelID string) error {
+	h.checked = append(h.checked, channelID)
+	if h.archived[channelID] {
+		return note.ErrChannelNotFound
+	}
+	return nil
+}
+
+func (h *archivedChannelHook) OnNotePosted(string, string, string) {}
+
+// アーカイブ済みの channel の note に返信して、その channel に投稿できないこと。
+// reply は返信先の channel を継承するので、継承した channel も検証する。
+func TestCreateService_ReplyIntoArchivedChannelRejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		specified *string
+		wantCheck []string
+	}{
+		{"no channel specified", nil, []string{"chArchived"}},
+		{"same channel specified", ptrString("chArchived"), []string{"chArchived"}},
+		{"other live channel specified", ptrString("chLive"), []string{"chLive", "chArchived"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, noteRepo, _ := newCreateService(t)
+			hook := &archivedChannelHook{archived: map[string]bool{"chArchived": true}}
+			svc.SetChannelHook(hook)
+			chA := "chArchived"
+			noteRepo.Notes["cn"] = &model.Note{ID: "cn", UserID: "other", Visibility: model.NoteVisibilityPublic, ChannelID: &chA}
+			text := "re"
+			rid := "cn"
+			before := len(noteRepo.Notes)
+			_, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text, ReplyID: &rid, ChannelID: tc.specified})
+			require.ErrorIs(t, err, note.ErrChannelNotFound)
+			assert.Len(t, noteRepo.Notes, before, "no note must be created")
+			assert.Equal(t, tc.wantCheck, hook.checked)
+		})
+	}
+}
+
+// アーカイブされていない channel の note への返信は、従来どおり同じ channel に入る。
+// 同じ channel を指定しても検証は 1 回で済ませる。
+func TestCreateService_ReplyIntoLiveChannelAllowed(t *testing.T) {
+	for name, specified := range map[string]*string{"no channel specified": nil, "same channel specified": ptrString("chLive")} {
+		t.Run(name, func(t *testing.T) {
+			svc, noteRepo, _ := newCreateService(t)
+			hook := &archivedChannelHook{archived: map[string]bool{}}
+			svc.SetChannelHook(hook)
+			chL := "chLive"
+			noteRepo.Notes["cn"] = &model.Note{ID: "cn", UserID: "other", Visibility: model.NoteVisibilityPublic, ChannelID: &chL}
+			text := "re"
+			rid := "cn"
+			created, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text, ReplyID: &rid, ChannelID: specified})
+			require.NoError(t, err)
+			require.NotNil(t, created.ChannelID)
+			assert.Equal(t, "chLive", *created.ChannelID)
+			assert.Equal(t, []string{"chLive"}, hook.checked)
+		})
+	}
+}
+
+// TestCreateService_HooksRunInTheBackgroundGroup checks that every
+// best-effort hook starts in the group of the server generation (#3661): once
+// the group has stopped, creating a note starts none of them.
+func TestCreateService_HooksRunInTheBackgroundGroup(t *testing.T) {
+	svc, _, _ := newCreateService(t)
+	fanout := newRecordingHook()
+	svc.SetFanoutHook(fanout)
+	notification := newRecordingNotificationHook()
+	svc.SetNotificationHook(notification)
+	federation := newRecordingFederationHook()
+	svc.SetFederationHook(federation)
+	channel := newRecordingChannelHook()
+	svc.SetChannelHook(channel)
+	index := newRecordingIndexHook()
+	svc.SetIndexHook(index)
+	chart := newRecordingChartHook()
+	svc.SetChartHook(chart)
+	webhook := newRecordingNotificationHook()
+	svc.SetWebhookHook(webhook)
+	g := bgwork.New()
+	svc.SetBackgroundForTest(g)
+	require.Zero(t, g.Stop(context.Background()))
+
+	text := "hello"
+	channelID := "ch1"
+	_, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text, ChannelID: &channelID})
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+	assert.False(t, fanout.called.Load(), "世代を止めた後に fanout のフックが走った")
+	assert.False(t, notification.called.Load(), "世代を止めた後に通知のフックが走った")
+	assert.False(t, channel.postedCalled.Load(), "世代を止めた後にチャンネルのフックが走った")
+	assert.False(t, webhook.called.Load(), "世代を止めた後に webhook のフックが走った")
+	// fanout・通知・連合・チャンネル・索引・chart・webhook・notesCount の 8 つ。
+	// 1 つでも素の goroutine に戻ると数が減る。
+	assert.EqualValues(t, 8, g.Dropped())
+}
+
+// 禁止語は、本文の URL を表示される形に直したものにも掛かること
+// (本家 extractUrlsForKeyWordCheck)。ホストのパーセントエンコードと全角表記の両方。
+func TestCreateService_ProhibitedWords_NormalizedURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		words    []string
+		text, cw string
+	}{
+		{name: "percent-encoded host in text", words: []string{"banned.example"}, text: "hoge https://%62anned.example/ huge"},
+		{name: "fullwidth host in text", words: []string{"banned.example"}, text: "hoge <https://ｂａｎｎｅｄ．example/> huge"},
+		{name: "percent-encoded path in text", words: []string{"/forbidden-path"}, text: "https://ok.example/%66orbidden-path"},
+		{name: "link node in cw", words: []string{"banned.example"}, text: "clean", cw: "[label](https://%62anned.example/)"},
+		{name: "AND filter across the field and its URL", words: []string{"spam banned.example"}, text: "spam https://%62anned.example/"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := newCreateService(t)
+			metaRepo := testutil.NewMockMetaRepository()
+			metaRepo.Meta = &model.Meta{ID: "m1", ProhibitedWords: tc.words}
+			svc.SetMetaRepoForTest(metaRepo)
+
+			in := note.CreateInput{User: &model.User{ID: "u1"}, Text: &tc.text}
+			if tc.cw != "" {
+				in.CW = &tc.cw
+			}
+			_, err := svc.Create(in)
+			assert.ErrorIs(t, err, note.ErrContainsProhibitedWords)
+		})
+	}
+}
+
+// 禁止語に当たらない URL は、正規化しても通ること (境界の反対側)。
+func TestCreateService_ProhibitedWords_NormalizedURLNoMatch(t *testing.T) {
+	svc, _, _ := newCreateService(t)
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "m1", ProhibitedWords: []string{"banned.example"}}
+	svc.SetMetaRepoForTest(metaRepo)
+
+	text := "hoge https://%6Fk.example/ huge"
+	_, err := svc.Create(note.CreateInput{User: &model.User{ID: "u1"}, Text: &text})
+	require.NoError(t, err)
+}
+
+// センシティブワードも、本文と CW の URL を表示される形に直したものに掛かり、
+// public の投稿を home にすること (本家と同じ)。
+func TestCreateService_SensitiveWords_NormalizedURLDemotes(t *testing.T) {
+	tests := []struct {
+		name     string
+		text, cw string
+	}{
+		{name: "percent-encoded host in text", text: "hoge https://%73ensitive.example/ huge"},
+		{name: "percent-encoded host in cw", text: "clean", cw: "https://%73ensitive.example/"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := newCreateService(t)
+			metaRepo := testutil.NewMockMetaRepository()
+			metaRepo.Meta = &model.Meta{ID: "m1", SensitiveWords: []string{"sensitive.example"}}
+			svc.SetMetaRepoForTest(metaRepo)
+
+			in := note.CreateInput{User: &model.User{ID: "u1"}, Text: &tc.text, Visibility: model.NoteVisibilityPublic}
+			if tc.cw != "" {
+				in.CW = &tc.cw
+			}
+			created, err := svc.Create(in)
+			require.NoError(t, err)
+			assert.Equal(t, model.NoteVisibilityHome, created.Visibility)
 		})
 	}
 }

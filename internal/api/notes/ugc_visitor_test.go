@@ -108,16 +108,16 @@ func newUGCFixture(t *testing.T) *ugcFixture {
 	repo.Notes[ugcQuoteID] = quote
 
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(repo, testutil.NewMockPollRepository(), idGen, nil)
+	createSvc := corenote.NewCreateService(repo, testutil.NewMockPollRepository(), idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(repo)
 	querySvc := corenote.NewQueryService(repo, nil)
 	tl := coretimeline.NewService(nil, repo, testutil.NewMockFollowingRepository())
 	tl.SetFanoutToggle(fttOff{})
 	provider := &countingProvider{Provider: search.NewSQLLikeProvider(repo, nil)}
-	h := NewHandler(repo, createSvc, deleteSvc, querySvc, tl, nil, nil, search.NewService(provider), idGen)
+	h := newHandlerNilDeps(repo, createSvc, deleteSvc, querySvc, tl, nil, nil, search.NewService(provider), idGen)
 
 	f := &ugcFixture{h: h, repo: repo, provider: provider, policy: ugcvisibility.All}
-	h.SetUGCVisibilityLookup(func() string { return f.policy })
+	h.ugcVisibilityFn = func() string { return f.policy }
 	return f
 }
 
@@ -257,6 +257,11 @@ func TestUGCVisitor_LocalHidesRemoteAuthors(t *testing.T) {
 		}
 		t.Run(ep.name, func(t *testing.T) {
 			f := newUGCFixture(t)
+			if ep.name == "featured" {
+				// featured の SQL の fallback は本家の全体ランキングと同じく返信と
+				// リモートの投稿を候補にしない (#3369) ので、ランキングの経路で見る。
+				f.h.SetFeaturedRanking(&fakeFeaturedReader{global: []string{ugcRootID, ugcLocalID, ugcRemoteID, ugcQuoteID}})
+			}
 
 			f.policy = ugcvisibility.Local
 			anon := f.call(t, ep.method, ep.body, nil)

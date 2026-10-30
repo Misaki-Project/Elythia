@@ -1,7 +1,7 @@
 .PHONY: help check gates version plugin-test frontend-check diff-check playwright-check e2e-down-all \
-	update pull pull-plugins docker-update docker-rebuild docker-restart uds-update \
+	update pull pull-plugins docker-update docker-rebuild docker-restart uds-update uds-deploy uds-backup-refresh \
 	image-up image-down image-down-v image-logs image-build \
-	build run dev clean tidy test fmt lint plugin-doc-check migrate-up migrate-down migrate-create \
+	build run dev clean tidy test fmt lint plugin-doc-check migrate-up migrate-down migrate-down-local migrate-create migrate-create-local \
 	plugins plugins-all plugin-dev plugin-vet \
 	federation-misskey-build federation-misskey-up federation-misskey-test \
 	federation-misskey-e2e \
@@ -9,14 +9,14 @@
 	federation-mastodon-e2e federation-mastodon-down \
 	dropin-up dropin-down dropin-test dropin-logs \
 	dropin-mk-up dropin-mk-test dropin-mk-down dropin-mk-logs dropin-swap-test dropin-fedibird-test \
-	dropin-mkgo-born-test \
+	dropin-elythia-born-test \
 	dropin-frontend-up dropin-frontend-down dropin-frontend-baseline dropin-frontend-logs \
 	dropin-frontend-mk-up dropin-frontend-mk-down dropin-frontend-swap-test \
 	e2e-frontend-build \
 	uds-init uds-layout-check uds-frontend-build uds-build uds-rebuild uds-restart uds-up uds-down uds-down-v uds-logs uds-ps \
-	bench-up bench-run bench-down bench-logs \
+	bench-up bench-run bench-down bench-logs bench-compare bench-compare-down bench-upstream \
 	apicompat apicompat-routes apicompat-render \
-	test-fast shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check \
+	test-fast fuzz-imagedecode shapecheck shapecheck-gen shapecheck-report errorid-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check \
 	diff-up diff-test diff-down diff-logs \
 	upstream-e2e upstream-e2e-deps upstream-e2e-up upstream-e2e-down upstream-e2e-migrate upstream-e2e-test
 
@@ -42,7 +42,7 @@ check: fmt lint actionlint golangci-lint test ## コミット前に必須 (lint 
 	# `make plugins-all && go build ./cmd/elythia`)、`lint` job の重複 fixture ID 検査、
 	# `test` のカバレッジ閾値は再現しない。
 
-gates: shapecheck errorid-check limitspec-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check migrationdoc-check mdtable-check notiftype-check pluginembed-check dockerignore-check secretfield-check ipshape-check iprecord-check sqlbind-check gaterun-check ## 静的 parity ゲートを一括実行
+gates: shapecheck errorid-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check migrationdoc-check mdtable-check notiftype-check pluginembed-check dockerignore-check secretfield-check ipshape-check iprecord-check sqlbind-check cachelist-check gaterun-check ## 静的 parity ゲートを一括実行
 
 version: ## Elythia / 互換 Misskey / 追従している本家のバージョンを表示
 	@printf "Elythia          : %s\n" "$$(sed -n 's/^var MkGoVersion = "\(.*\)"/\1/p' internal/config/config.go)"
@@ -70,8 +70,8 @@ frontend-check: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ を型チェック�
 	# まとめて回せるよう、ここにも残す。
 	go test ./internal/server/ \
 		-run 'TestCreditImageOriginsCoverAboutMisskey|TestMkGoRolePolicyKeysAreListedInFrontend|TestCanDeleteAccountIsWiredInSettings|TestReactionLongPressIsWired|TestReactableRemoteReactionIsWired|TestMkGoUpdatedDialogIsWired|TestEmojiApplicationIsWired|TestEveryPluginSlotHasAMountPoint|TestAutoLoadingComponentsShowRateLimit|TestRemoteImagesGoThroughMediaProxy|TestRemoteImageProxyGateClassifiesSources|TestEmojiDecorationErrorIDsMatchFrontend|TestStaffNotificationTypesAreOptOutable|TestNotificationBadgeClassesHaveNoPadding|TestEmojiRequestEntriesUseTheSharedHelper|TestCSSModulesHaveNoDuplicateClasses|TestCleanRemoteFilesButtonIsConditional|TestStreamResyncIsWiredInTimelines' -count=1
-	# MFM の Unicode 絵文字の正規表現と記録した版が、frontend の mfm-js / emoji-data と一致するか
-	# (#3324)。node_modules が無いと落ちる (skip しない)。
+	# MFM の Unicode 絵文字の正規表現と記録した版が、frontend の MFM の解析器
+	# (@elythia-network/mfm) が持つものと一致するか (#3324)。node_modules が無いと落ちる (skip しない)。
 	$(MAKE) emoji-regex-check
 	# **eslint も回す (#2906)。** CI は別 step で `pnpm eslint` を回しており、
 	# ここに無いと**手元で緑でも CI が落ちる**。#2903 で実際に踏んだ (デッドコードを
@@ -131,12 +131,13 @@ E2E_COMPOSE_FILES = \
 	tests/federation/compose.misskey.yml \
 	tests/federation/compose.mastodon.yml \
 	tests/bench/http/compose.yml \
+	tests/bench/ab/compose.yml \
 	tests/bench/queue/compose.yml
 
 # 使われている profile を全部渡す。**`down` は有効な profile の container しか
 # 消さない**ので、付けないと seed / runner 系が残る。存在しない profile 名を
 # 渡してもエラーにはならないので、ファイルごとに出し分けず全部並べる。
-E2E_PROFILES = --profile test --profile bench --profile outbound --profile inbound --profile report
+E2E_PROFILES = --profile test --profile bench --profile outbound --profile inbound --profile report --profile tools
 
 e2e-down-all: ## 検証用スタックを一括撤去 (本番 project mk は対象外)
 	@for f in $(E2E_COMPOSE_FILES); do \
@@ -241,10 +242,29 @@ docker-update: ## pull → ビルド → 再起動 → 検証 (Docker Compose �
 	$(MAKE) docker-rebuild
 	$(MAKE) docker-restart
 
-uds-update: ## pull → ビルド → 再起動 → 検証 (UDS 本番構成)
+uds-update: ## pull → ビルド → 再起動 → 検証 → バックアップの image → 事前圧縮 (UDS 本番構成)
 	$(MAKE) pull
+	@# pull の後の段は、pull で取ってきた Makefile で動かす。make は動いている
+	@# レシピを読み直さないので、ここに段を並べると、段を足した版を取り込んだ回
+	@# だけ古い段のまま走る (#3682)
+	$(MAKE) uds-deploy
+
+uds-deploy: ## uds-update の pull より後 (ビルド → 再起動 → 検証 → バックアップの image → 事前圧縮)
 	$(MAKE) uds-rebuild
 	$(MAKE) uds-restart
+	@# バックアップの image の失敗は本体の反映の失敗ではない。古い版のまま残ると
+	@# 定期の検証が落ち続けるので、警告ははっきり出す (#3682)。**再起動の後に
+	@# 流す** — 前に置くと、frontend/built を消してから再起動するまでの 404 の
+	@# 時間に Go のビルドが入って延びる (事前圧縮を後ろに置くのと同じ理由)。
+	@# 新しい daemon が起動してすぐ取り始めて、本体の migration を待たせることも
+	@# 無くなる。入れ替えまでの数分は新しい本体と古い daemon が並び、その間に
+	@# 定期の検証が走ると落ちて通知が来ることがある
+	@$(MAKE) uds-backup-refresh || \
+		echo "==> 警告: バックアップの image の作り直し (make uds-backup-refresh) に失敗した。本体の反映は済んでいる。backup-daemon は古い版のままなので、原因を直して make uds-backup-refresh だけをやり直す" >&2
+	@# 圧縮の失敗は反映の失敗ではない (無ければその場で gzip する)。警告にとどめ、
+	@# uds-update の終了コードは反映の成否だけで決める。
+	@$(MAKE) frontend-precompress || \
+		echo "==> 警告: 事前圧縮 (make frontend-precompress) に失敗した。反映は済んでいて、配信はその場の gzip で続く。原因を直して make frontend-precompress だけをやり直す" >&2
 
 
 # Binary output
@@ -355,18 +375,19 @@ test-fast: ## 全テストを -race 抜きで実行 (反復用。コミット前
 	go test ./... -count=1 -shuffle=3
 
 .PHONY: emoji-regex emoji-regex-check
-emoji-regex: ## MFM の Unicode 絵文字の正規表現を mfm-js の emoji-data から生成 (#3324)
-	# 生成物 (internal/activitypub/mfm/emoji_regex_gen.go) を手で直さない。
-	# frontend/ に pnpm install 済みであること。mfm-js か emoji-data の版が
-	# 変わったら、mfm-js の期待値 (internal/activitypub/mfm/testdata/emoji_mfmjs.json) も
-	# testdata/emoji_mfmjs.mjs で作り直す (どちらかの版がずれるとテストが落ちる)。
+emoji-regex: ## frontend の MFM の解析器が持つ絵文字の正規表現を snapshot に書き写す (#3324)
+	# frontend/ に pnpm install 済みであること。正規表現は @elythia-network/mfm の
+	# built/emoji-regex.gen.js から読む (#3515)。サーバーの解析器 (Go のモジュール
+	# github.com/elythia-network/mfm、#3514) の emoji_regex_gen.go と一致しなければ、
+	# snapshot を書かずに落ちる。生成物はモジュールの側にあり、ここでは作らない。
 	GOWORK=off go run ./tools/emojiregex
 
-emoji-regex-check: ## 生成した絵文字の正規表現が frontend/ の mfm-js / emoji-data と一致するか検査
+emoji-regex-check: ## サーバーの MFM の解析器 (Go のモジュール) の絵文字の正規表現が frontend/ の解析器と一致するか検査
 	# **`make gates` には入れない** — node_modules が要る。frontend-check から呼ぶ。
-	# 生成物と snapshot の突き合わせは node_modules 無しで `go test ./tools/emojiregex/`
-	# が見る。こちらは snapshot (正規表現と、mfm-js / emoji-data の版) が frontend/ に
-	# pnpm install したものと一致しているかを見る。
+	# Go のモジュールの生成物と snapshot の突き合わせは、node_modules 無しで
+	# `go test ./tools/emojiregex/` が見る。こちらは加えて、snapshot (正規表現と、
+	# mfm-js / emoji-data の版) が frontend/ に pnpm install した @elythia-network/mfm と
+	# 一致しているかを見る。
 	GOWORK=off go run ./tools/emojiregex -check
 
 plugin-doc-check: ## authoring.md の Go スニペットがコンパイルできるか検査
@@ -403,6 +424,30 @@ plugin-vet: ## 同梱プラグインの既定無効を検査 + go vet (CI の bu
 		dir=$$(dirname "$$mod"); \
 		echo "==> $$dir"; \
 		(cd "$$dir" && GOWORK=off go vet ./...); \
+	done
+
+FUZZTIME ?= 2m
+FUZZPARALLEL ?= 2
+FUZZ ?= Fuzz
+
+fuzz-imagedecode: ## 画像デコーダの fuzz を回す (FUZZTIME= 時間、FUZZ= 対象の正規表現、FUZZPARALLEL= worker 数)
+	# 種は module cache にある各ライブラリの testdata を IMAGEDECODE_FUZZ_SEEDS で
+	# 渡す (#3480)。無いライブラリは飛ばす。
+	# worker は既定 2。デコーダは宣言した寸法ぶんの raster を先に確保し (MaxPixels x
+	# 4 bytes = 256MB)、色の変換や向きの補正で 2 枚目を持つ経路があるので、worker 1 つ
+	# に 512MB 以上を見込む。本番と同居するホストではメモリに上限を付けたコンテナで
+	# 回す (docs/testing.md)。
+	@seeds=""; \
+	for m in golang.org/x/image github.com/kovidgoyal/imaging github.com/gen2brain/avif github.com/gen2brain/webp github.com/gen2brain/heic github.com/gen2brain/jpegxl github.com/blezek/tga; do \
+		d=$$(go list -m -f '{{.Dir}}' $$m 2>/dev/null) || continue; \
+		[ -d "$$d/testdata" ] && seeds="$$seeds:$$d/testdata"; \
+	done; \
+	targets=$$(go test ./internal/misc/imagedecode -run '^$$' -list '^$(FUZZ)' | grep '^Fuzz' || true); \
+	[ -n "$$targets" ] || { echo "no fuzz target matches FUZZ=$(FUZZ)"; exit 1; }; \
+	echo "seeds: $${seeds#:}"; \
+	for fz in $$targets; do \
+		echo "==> $$fz ($(FUZZTIME), parallel $(FUZZPARALLEL), pixel cap $${IMAGEDECODE_FUZZ_PIXELCAP:-default})"; \
+		IMAGEDECODE_FUZZ_SEEDS="$${seeds#:}" go test ./internal/misc/imagedecode -run '^$$' -fuzz="^$$fz$$" -fuzztime=$(FUZZTIME) -parallel=$(FUZZPARALLEL) || exit 1; \
 	done
 
 plugin-test: ## 同梱プラグインのテストを実行 (PostgreSQL が要る)
@@ -461,7 +506,7 @@ golangci-lint: ## golangci-lint (errcheck / govet / ineffassign / staticcheck)
 	if [ -f "$$gen" ]; then bak=$$(mktemp); cp -p "$$gen" "$$bak"; rm -f "$$gen"; fi; \
 	trap 'if [ -n "$$bak" ]; then cp -p "$$bak" "$$gen"; rm -f "$$bak"; fi' EXIT INT TERM; \
 	gover=$$(awk '/^go [0-9]/ {print $$2; exit}' go.mod); \
-	GOWORK=off GOTOOLCHAIN=go$$gover go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout 10m
+	GOWORK=off GOTOOLCHAIN=go$$gover go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run --timeout 10m
 
 .PHONY: actionlint
 actionlint: ## GitHub Actions の workflow を検査
@@ -491,20 +536,36 @@ actionlint: ## GitHub Actions の workflow を検査
 # 接続先は -config (既定 .config/default.yml) から決まる。DATABASE_URL は読まない。
 # 別の DB へ流すなら -config を渡すか MK_DB_* で上書きする。
 ##@ マイグレーション
-migrate-up: ## マイグレーションを最新まで適用
+# 本体の系列 (migration/) を流した後に、fork の系列 (migration/local/) があれば流す (#3428)。
+migrate-up: ## マイグレーションを最新まで適用 (本体 → fork の系列の順)
 	go run ./cmd/elythia migrate -direction up
 
 # **-steps 1 は必須。** `elythia migrate` は steps 未指定 (0) を「全部」と解釈するので、
 # 付け忘れると 1 段のつもりで全 down が走り 全テーブルが消える。
 # 適用済みが 0 件のときは golang-migrate が "file does not exist" で exit 1 する
 # (steps 指定時は ErrNoChange に落ちないため)。冪等に叩くなら呼び出し側で吸収する。
-migrate-down: ## マイグレーションを 1 段階ロールバック
-	go run ./cmd/elythia migrate -direction down -steps 1
+# down は系列の指定が必須 (#3428)。このターゲットは本体の系列だけを戻す。
+migrate-down: ## 本体のマイグレーションを 1 段階ロールバック
+	go run ./cmd/elythia migrate -direction down -track core -steps 1
+
+migrate-down-local: ## fork の系列 (migration/local/) を 1 段階ロールバック
+	go run ./cmd/elythia migrate -direction down -track local -steps 1
 
 migrate-create: ## 新規マイグレーションファイルを作成
 	@read -p "Migration name: " name; \
 	touch migration/$$(printf "%06d" $$(($$(ls migration/*.up.sql 2>/dev/null | wc -l) + 1)))_$${name}.up.sql; \
 	touch migration/$$(printf "%06d" $$(($$(ls migration/*.down.sql 2>/dev/null | wc -l) + 1)))_$${name}.down.sql
+
+# 番号は本数ではなく**最大の番号 + 1** にする。fork の系列は 900001 のように飛んだ
+# 番号から始めてもよいので、本数から決めると既存の番号と重なる。先頭の 0 は
+# 落としてから足す (sh の算術式は 0 始まりを 8 進数として読み、000008 で落ちる)。
+migrate-create-local: ## fork の系列 (migration/local/) に新規マイグレーションファイルを作成
+	@read -p "Migration name: " name; \
+	mkdir -p migration/local; \
+	last=$$(ls migration/local/*.up.sql 2>/dev/null | sed 's|.*/||; s|_.*||' | sort -n | tail -n 1 | sed 's/^0*//'); \
+	next=$$(printf "%06d" $$(( $${last:-0} + 1 ))); \
+	touch migration/local/$${next}_$${name}.up.sql migration/local/$${next}_$${name}.down.sql; \
+	echo "created migration/local/$${next}_$${name}.{up,down}.sql"
 
 # Docker
 ##@ Docker
@@ -633,10 +694,10 @@ dropin-swap-test: ## TS → Elythia 切替の state preservation を通しで検
 # Fedibird-like ActivityPub mock を立てて、mk-A との Ed25519 双方向 verify を
 # walks through する。ed25519 P2-P5 が実 federation 経路で動くことを担保する
 # nightly 用 e2e。
-# mk-go 生まれの DB を TS に引き渡す経路 (#2379)。swap test (TS→mk-go→TS) とは
-# 別物で、TS が一度も触っていない schema を受け取る。mk-go で始めた人が Misskey に
-# どこまで移れるかを測る (保証はしない、#3191)。
-dropin-mkgo-born-test: ## Elythia 生まれの DB を TS に引き渡せるか検証
+# Elythia 生まれの DB を TS に引き渡す経路 (#2379)。swap test (TS→Elythia→TS) とは
+# 別物で、TS が一度も触っていない schema を受け取る。Elythia で始めた人が Misskey に
+# どこまで移れるかを測る (保証はしない、#3191)。旧名 dropin-mkgo-born-test (#3556)。
+dropin-elythia-born-test: ## Elythia 生まれの DB を TS に引き渡せるか検証
 	./tests/dropin/run-mkgo-born-test.sh
 
 dropin-fedibird-test: ## Fedibird-like AP mock との Ed25519 双方向 verify
@@ -745,11 +806,85 @@ e2e-frontend-build: plugins ## フロントエンドをビルド (本番の bind
 		"node:$$node_tag" \
 		bash -lc "npm i -g pnpm@$$pnpm_ver && pnpm install --frozen-lockfile && pnpm build"
 
+.PHONY: frontend-precompress
+# frontend/built に .br / .gz を足す (#3593)。サーバーは Accept-Encoding に応じて
+# それをそのまま返し、無ければその場で gzip するので、**再起動の後に流してよい**。
+# ビルド (pnpm build) の中で圧縮しないのは、uds-rebuild が出力先を消してから
+# 再起動するまでの区間 (本番の frontend が 404 になる区間) を延ばさないため。
+# 書き込みは一時ファイルからの rename で、途中のファイルは配信されない。作り済みで
+# 元より新しいものは飛ばすので、もう一度流しても残りだけを作る。
+# frontend/built はビルドのコンテナ (root) が作るので、同じ node のコンテナで流す。
+frontend-precompress: ## frontend/built に事前圧縮 (.br / .gz) を足す (再起動の後でよい)
+	@node_ver=$$(tr -d '[:space:]' < frontend/.node-version); \
+	if [ -z "$$node_ver" ]; then echo "frontend/.node-version を読めない" >&2; exit 1; fi; \
+	docker run --rm -v $(CURDIR)/frontend:$(E2E_WORKDIR)/frontend -w $(E2E_WORKDIR)/frontend \
+		"node:$$node_ver-$(FRONTEND_NODE_DISTRO)" \
+		node scripts/precompress.mjs built/_frontend_vite_ built/_frontend_embed_vite_
+
 # UDS-only compose stack (Phase 12-2)。Phase 12-1 で入った UNIX domain socket
 # 対応を使って nginx → mk-go → postgres / valkey をすべて UDS で繋ぐ。
 # 詳細は docs/docker-uds.md を参照。
 UDS_COMPOSE=compose.uds.yaml
 UDS_CONFIG=deploy/uds/config/default.yml
+
+# UDS の mkgo のイメージは、dockerd の外のビルダー (BuildKit を動かすコンテナ) で
+# ビルドし、終わったらビルダーを止める (#3477)。
+#
+# **既定のビルダーは BuildKit を dockerd の中で動かす。** ビルドで使ったメモリの大半が
+# dockerd に残り、時間をおいても戻らない (実測: Dockerfile.bundled を 1 回ビルドすると
+# dockerd の匿名メモリが 242MB → 587MB、3 分後も 507MB)。本番を動かすホストでは、
+# ビルドのたびに積み上がって数 GB になり swap にも出ていた。戻すには dockerd の
+# 再起動が要り、本番のコンテナも止まる。
+#
+# 専用のビルダーなら重さはそのコンテナに乗り、dockerd の増加はイメージの取り込み分
+# だけになる (同じ Dockerfile.bundled で +35MB、ビルダーは最大 4.7GiB。mkgo の
+# deploy/uds/Dockerfile.mkgo では +17MB、ビルダーは最大 2.37GiB)。**消さずに
+# 止める。** 止めればメモリは全部戻り、キャッシュは volume に残る (`docker buildx rm`
+# は volume ごと消す)。止めずに置くと、使っていない間もメモリを抱えたままになる
+# (Dockerfile.bundled の後で 1.4GiB、Dockerfile.mkgo の後で 405MiB)。
+#
+# **専用のビルダーでビルドするのは mkgo だけ。** postgres (deploy/postgres-bigm) など
+# 他のサービスは既定のビルダーのまま。専用のビルダーは dockerd の image store を
+# 見ずに FROM をレジストリから引き直すので、base を digest で固定していない
+# postgres:18-alpine だと最初のビルドで新しい base を取りに行き、image が変わる。
+# 次の `up -d` で本番の PostgreSQL のコンテナが作り直される。既定のビルダーは
+# 手元の base とキャッシュを使うので、従来どおり image は変わらない。
+#
+# - 初回だけ作る。最初のビルドはキャッシュが空なので時間がかかる
+# - 同じビルダーで別のビルドが走っているときに止めると、そちらも止まる
+# - 空にすると既定のビルダーで従来どおりビルドする (`make uds-build UDS_BUILDER=`)
+#
+# 変数名に DOCKER_ を付けない。docker CLI が読む環境変数と衝突しうる。
+UDS_BUILDER ?= elythia-builder
+# ビルダーのコンテナの image。特権で動くので tag を付け替えられない digest で固定する。
+# 変えたときは、既にあるビルダーは古い image のままなので、`docker buildx rm
+# --keep-state $(UDS_BUILDER)` で消してから作り直す (キャッシュは残る)。
+UDS_BUILDER_IMAGE ?= moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+
+# $(call uds_with_builder,<コマンド>) は <コマンド> を BUILDX_BUILDER=$(UDS_BUILDER) で
+# 実行し、成否にかかわらず最後にビルダーを止める。<コマンド> の終了コードを返す。
+# docker compose は BUILDX_BUILDER を読み、そのビルダーでビルドして dockerd へ取り込む。
+#
+# - **シグナルでも止める。** dash は EXIT の trap を、シグナルで終わったときには
+#   走らせない。Ctrl-C やプロセスグループへの kill で中断するとビルダーがビルド途中の
+#   メモリを抱えたまま残るので、INT / TERM / HUP で exit させて EXIT の trap を通す。
+#   make の PID だけに TERM を送っても compose は止まらず、ビルドは最後まで進む
+#   (以前の uds-build でも同じ。こちらは終了コード 143 で失敗を返す)
+# - 作成が別の make と競合して失敗したときは、相手が作ったものを使う
+define uds_with_builder
+if [ -z "$(UDS_BUILDER)" ]; then \
+	ctx=$$(docker context show) && [ -n "$$ctx" ] || exit 1; \
+	BUILDX_BUILDER=$$ctx $(1); exit $$?; \
+fi; \
+echo "==> ビルダー $(UDS_BUILDER) でビルドし、終わったら止める (UDS_BUILDER= で既定のビルダー)"; \
+docker buildx inspect $(UDS_BUILDER) >/dev/null 2>&1 || \
+	docker buildx create --name $(UDS_BUILDER) --driver docker-container \
+		--driver-opt image=$(UDS_BUILDER_IMAGE) >/dev/null || \
+	docker buildx inspect $(UDS_BUILDER) >/dev/null 2>&1 || exit 1; \
+trap 'docker buildx stop $(UDS_BUILDER) >/dev/null 2>&1' EXIT; \
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
+BUILDX_BUILDER=$(UDS_BUILDER) $(1)
+endef
 
 # compose / config の実ファイルはデプロイ先ごとに書き換えるため gitignore 済み。
 # 初回起動時のみ .example からコピーする (order-only prerequisite なので、
@@ -786,12 +921,33 @@ uds-layout-check:
 
 # revision は build-arg で渡す。**Dockerfile の中では git を呼べない** —
 # `.dockerignore` が `.git` を落とすので、コンテキストにリポジトリが入らない。
-uds-build: uds-layout-check | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックのイメージをビルド
-	MKGO_COMMIT=$$(git rev-parse --short HEAD 2>/dev/null) \
-	docker compose -f $(UDS_COMPOSE) build
+#
+# mkgo 以外 (postgres など) を dockerd の中のビルダーで先にビルドし、mkgo を専用の
+# ビルダーでビルドする。理由は UDS_BUILDER の説明。ビルドするものが無いサービス
+# (nginx など) は compose が飛ばす。
+#
+# - **dockerd のビルダーは名前で指定する。** 指定しないと「今選ばれているビルダー」に
+#   なり、`docker buildx use` や BUILDX_BUILDER の export で専用のビルダーが選ばれて
+#   いると postgres もそちらでビルドされ、本番の PostgreSQL が作り直される。docker
+#   ドライバのビルダーの名前は context の名前と同じ (`docker context show`)。取れなければ
+#   止める (空のまま渡すと「今選ばれているビルダー」に戻る)
+# - サービス名が mkgo であることを前提にする (uds-restart も同じ)。mkgo の image を
+#   使う別のサービスを足すと、そちらが先にビルドされて古い mkgo を見る。そういう構成に
+#   するときは、この順序を見直す
+uds-build: uds-layout-check | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックのイメージをビルド (mkgo は専用ビルダーで。UDS_BUILDER= で既定のビルダー)
+	@services=$$(docker compose -f $(UDS_COMPOSE) config --services) || exit 1; \
+	others=$$(printf '%s\n' "$$services" | grep -vx mkgo); \
+	if [ -n "$$others" ]; then \
+		ctx=$$(docker context show) && [ -n "$$ctx" ] || exit 1; \
+		BUILDX_BUILDER=$$ctx docker compose -f $(UDS_COMPOSE) build $$others || exit 1; \
+	fi
+	@$(call uds_with_builder,MKGO_COMMIT=$$(git rev-parse --short HEAD 2>/dev/null) docker compose -f $(UDS_COMPOSE) build mkgo)
 
-uds-up: uds-layout-check | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックを起動
-	docker compose -f $(UDS_COMPOSE) up -d --build
+# ビルドは uds-build に任せる (`up -d --build` にすると、全サービスが同じビルダーで
+# ビルドされる)。以前の `up -d --build` は MKGO_COMMIT を渡しておらず、
+# /api/meta の mkGoCommit が空の image ができていた。
+uds-up: uds-build | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックをビルドして起動
+	docker compose -f $(UDS_COMPOSE) up -d
 
 uds-rebuild: ## frontend と image をまとめてビルド (本番の配信物を差し替える)
 	$(MAKE) uds-frontend-build
@@ -811,6 +967,50 @@ uds-restart: uds-layout-check | $(UDS_COMPOSE) $(UDS_CONFIG) ## mkgo を再起�
 		printf "==> up -d が起動し直したので restart は省略\n"; \
 	fi
 	@./deploy/check-frontend-entry.sh $(UDS_CONFIG)
+
+# backup / backup-daemon は profile にあるので、uds-build (config --services) にも
+# uds-restart (up -d) にも入らない。入れないと本体だけが新しい版になり、
+# backup-daemon は前に手で作った版のまま、新しい migration の世代を「この
+# バイナリより新しい」として検証で落とし続ける (#3682)。
+# - backup-daemon のコンテナがあれば (止めてあっても) image を作り直す。入れ替え
+#   (up -d --no-deps) は動いているときだけ。止めてあるものは起動しない。再開は
+#   `start` ではなく `up -d --no-deps backup-daemon` で (start は古い image のまま動く)
+# - 1 回きりの backup は、image を作ってあるときだけ作り直す (使っていない
+#   運営者に image を増やさない)
+# - どちらも無い (節が無い古い compose を含む) なら何もしない。compose 自体が
+#   読めないときは落とす (「使っていない」に見せない)
+# - backup の image はプラグインを含めた Go のビルドで重いので、mkgo と同じ専用の
+#   ビルダーでビルドする (uds_with_builder。dockerd にメモリを残さない、#3477)
+# - 入れ替えは走っている取得・検証を止める (停止の猶予は compose の既定)
+uds-backup-refresh: uds-layout-check | $(UDS_COMPOSE) ## backup-daemon (と作ってあれば backup) の image を本体と同じ版に作り直す (UDS)
+	@all=$$(docker compose -f $(UDS_COMPOSE) --profile backup --profile backup-daemon config --services) || { \
+		echo "==> $(UDS_COMPOSE) を読めない" >&2; exit 1; }; \
+	services=""; running=""; \
+	if printf '%s\n' "$$all" | grep -qx backup-daemon; then \
+		ids=$$(docker compose -f $(UDS_COMPOSE) --profile backup-daemon ps -a -q backup-daemon) || { \
+			echo "==> backup-daemon のコンテナを調べられない" >&2; exit 1; }; \
+		if [ -n "$$ids" ]; then \
+			services="backup-daemon"; \
+			running=$$(docker compose -f $(UDS_COMPOSE) --profile backup-daemon ps -q backup-daemon) || { \
+				echo "==> backup-daemon が動いているかを調べられない" >&2; exit 1; }; \
+		fi; \
+	fi; \
+	if printf '%s\n' "$$all" | grep -qx backup; then \
+		img=$$(docker compose -f $(UDS_COMPOSE) --profile backup config --images backup) || { \
+			echo "==> backup の image の名前を調べられない" >&2; exit 1; }; \
+		if [ -n "$$img" ] && docker image inspect "$$img" >/dev/null 2>&1; then services="$$services backup"; fi; \
+	fi; \
+	services=$${services# }; \
+	if [ -z "$$services" ]; then \
+		echo "==> backup-daemon のコンテナも backup の image も無いので作り直さない"; exit 0; \
+	fi; \
+	echo "==> バックアップの image を作り直す: $$services"; \
+	( $(call uds_with_builder,MKGO_COMMIT=$$(git rev-parse --short HEAD 2>/dev/null) docker compose -f $(UDS_COMPOSE) --profile backup --profile backup-daemon build $$services) ) || exit 1; \
+	if [ -n "$$running" ]; then \
+		docker compose -f $(UDS_COMPOSE) --profile backup-daemon up -d --no-deps backup-daemon || exit 1; \
+	elif printf '%s\n' "$$services" | grep -q backup-daemon; then \
+		echo "==> backup-daemon は止めてあるので起動しない。再開は docker compose -f $(UDS_COMPOSE) --profile backup-daemon up -d --no-deps backup-daemon で (start だと古い image のまま動く)"; \
+	fi
 
 uds-down: | $(UDS_COMPOSE) ## UDS スタックを停止
 	docker compose -f $(UDS_COMPOSE) down
@@ -849,9 +1049,35 @@ bench-down: ## k6 ベンチのスタックを撤去
 bench-logs: ## k6 ベンチのログを表示
 	docker compose -f $(BENCH_COMPOSE) logs -f
 
+# base と head の 2 つの commit を、同じスタックで交互に流して比べる (#3544)。
+# 結果は tests/bench/ab/results/<日時>-<シナリオ>/report.md に出力される。
+# 負荷をかけるので、本番が動いているホストでは SMOKE=1 の動作確認だけにする。
+# BASE / HEAD は commit に解決できる ref。worktree の未コミットの変更は測らない。
+BENCH_AB_COMPOSE=tests/bench/ab/compose.yml
+BASE ?= develop
+HEAD ?= HEAD
+ROUNDS ?= 2
+SCENARIO ?= prod-like
+
+bench-compare: ## base と head の commit の性能を比べる (BASE= HEAD= ROUNDS= SCENARIO= BENCH_OUT= SMOKE=1)
+	tests/bench/ab/run.sh --base '$(BASE)' --head '$(HEAD)' --rounds '$(ROUNDS)' --scenario '$(SCENARIO)' $(if $(BENCH_OUT),--out '$(BENCH_OUT)') $(if $(filter 1,$(SMOKE)),--smoke)
+
+bench-compare-down: ## bench-compare / bench-upstream のスタックを撤去
+	docker compose -f $(BENCH_AB_COMPOSE) --profile tools down -v --remove-orphans
+
+# 本家 Misskey の公式 image と HEAD の Elythia を、bench-compare と同じスタックで比べる
+# (#3654)。UPSTREAM_VERSION=default は UPSTREAM_MISSKEY_VERSION の版。片付けは
+# bench-compare-down。負荷をかけるので、本番が動いているホストでは SMOKE=1 だけにする。
+UPSTREAM_VERSION ?= default
+
+bench-upstream: ## 本家 Misskey と Elythia の性能を比べる (UPSTREAM_VERSION= HEAD= ROUNDS= SCENARIO= BENCH_OUT= SMOKE=1)
+	tests/bench/ab/run.sh --upstream '$(UPSTREAM_VERSION)' --head '$(HEAD)' --rounds '$(ROUNDS)' --scenario '$(SCENARIO)' $(if $(BENCH_OUT),--out '$(BENCH_OUT)') $(if $(filter 1,$(SMOKE)),--smoke)
+
 # Queue bench (#563): deliver/inbox throughput comparison between
 # Misskey TS (BullMQ) and mk-go (mkq). asynq driver は #2985 で削除。
 QUEUE_BENCH_COMPOSE=tests/bench/queue/compose.yml
+QUEUE_BENCH_DELIVERY ?= 0
+export QUEUE_BENCH_DELIVERY
 
 queue-bench-up: ## queue-bench スタックを起動
 	docker compose -f $(QUEUE_BENCH_COMPOSE) up -d --build
@@ -924,6 +1150,14 @@ queue-bench-seed: ## queue-bench 用のデータを投入
 	echo "nginx fronts are not wired to their own apps:$$bad" >&2; \
 	echo "hint: nginx resolves its upstream once at startup (#2917)" >&2; exit 1
 
+queue-bench-delivery-seed: export QUEUE_BENCH_DELIVERY = 1
+queue-bench-delivery-seed: queue-bench-seed ## 隔離 receiver 用の synthetic 配送 fixture を seed
+
+queue-bench-delivery-outbound: export QUEUE_BENCH_DELIVERY = 1
+queue-bench-delivery-outbound: queue-bench-delivery-seed ## 署名検証と配送 tuple 照合を記録
+	QUEUE_BENCH_DELIVERY=1 docker compose -f $(QUEUE_BENCH_COMPOSE) --profile delivery up -d --build deliveryreceiver-mkq deliveryreceiver-ts
+	QUEUE_BENCH_DELIVERY=1 docker compose -f $(QUEUE_BENCH_COMPOSE) --profile outbound up --abort-on-container-exit --force-recreate --no-deps driver-outbound
+
 queue-bench-outbound: ## queue-bench の outbound 計測
 	# queue-bench-seed と同じ理由で `--force-recreate` (#1163)。
 	docker compose -f $(QUEUE_BENCH_COMPOSE) --profile outbound up --abort-on-container-exit --force-recreate --no-deps driver-outbound
@@ -943,7 +1177,7 @@ queue-bench-down: ## queue-bench スタックを撤去
 	# compose ファイルに定義が無い container で、profile 付きは「定義はあるが
 	# 有効でない」だけなので対象外 (実測で確認)。profile を明示する必要がある。
 	docker compose -f $(QUEUE_BENCH_COMPOSE) \
-		--profile bench --profile outbound --profile inbound --profile report \
+		--profile bench --profile outbound --profile inbound --profile report --profile delivery \
 		down -v --remove-orphans
 
 queue-bench-logs: ## queue-bench のログを表示
@@ -1009,9 +1243,9 @@ playwright-ts-up: ## Playwright スタック (Misskey TS backend) を起動
 playwright-ts-test: ## Playwright spec を実行 (TS backend、upstream 追従時のみ)
 	# `playwright-test` と同じく `--build` で runner image を最新化する。
 	#
-	# **`specs/upstream` に絞る。** `specs/mkgo` は mk-go 独自機能の spec で、
+	# **`specs/upstream` に絞る。** `specs/elythia` は Elythia 独自機能の spec で、
 	# 公式 image に対しては通らない (README の「境界」を参照)。絞らないと
-	# TS backend 実行が mkgo 側の spec で落ちる。
+	# TS backend 実行が elythia 側の spec で落ちる。
 	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test run --rm --build playwright-runner test specs/upstream $(PLAYWRIGHT_ARGS)
 
 playwright-ts-down: ## Playwright TS スタックを撤去
@@ -1037,9 +1271,10 @@ diff-logs: ## 差分比較ハーネスのログを表示
 	docker compose -f $(DIFF_COMPOSE) logs -f
 
 # Misskey 本家の backend e2e (test/e2e/**) を mk-go に向けて実行する。
-# テスト本体には手を入れず、本家の取得先 (.cache/misskey) の vitest 設定 2 ファイル
-# (globalSetup / setupFiles) だけを差し替えている。上流でテストが増えれば
-# 自動的にこちらの検証対象も増える。詳細は docs/upstream-backend-e2e.md。
+# 本家の取得先 (.cache/misskey) へ vitest 設定 (globalSetup / setupFiles) をコピーし、
+# Elythia 独自の additive API field がある UserLite の期待 DTO だけは、実行時に
+# drift-checked patch で拡張する。テスト本体の正本は本家のまま保つ。詳細は
+# docs/upstream-backend-e2e.md。
 #
 # 『通らないことが正しい』テストは tests/upstream-e2e/known-divergences.json に
 # 根拠付きで登録し、vitest の expected-failure として扱う。乖離が解消して通る
@@ -1049,7 +1284,7 @@ diff-logs: ## 差分比較ハーネスのログを表示
 UPSTREAM_E2E_COMPOSE=tests/upstream-e2e/compose.yml
 UPSTREAM_E2E_CONFIG=tests/upstream-e2e/mkgo.yml
 # 本家そのもの (`make upstream-fetch` の取得先) で走らせる (#3378)。mk-go へ向ける
-# ための 3 ファイルは tests/upstream-e2e/harness/ に置き、upstream-e2e-test が
+# ためのファイルは tests/upstream-e2e/harness/ に置き、upstream-e2e-test が
 # 実行のたびに本家の packages/backend/ へコピーする (編集がすぐ効くように deps
 # ではなく test の側で写す)。vitest の設定を本家の外に置いたまま本家のテストを
 # 走らせる形は採らない — 設定ファイルの import (`vitest/config`、本家の
@@ -1098,10 +1333,74 @@ upstream-fetch: ## UPSTREAM_MISSKEY_VERSION の本家を .cache/misskey/<版> �
 # golden が本家の版に追いついているか。本家から作り直して差分が無いことと、
 # 本家を読むテストが skip されずに通ることを見る。本家を取得する
 # apicompat.yml が回す (本家を読まない `make gates` には入れない)。
+# paramdef-genはnodeとfrontend/node_modules (TypeScriptとajv)も使う。
 upstream-check: ## golden と本家を読むテストが UPSTREAM_MISSKEY_VERSION の本家と一致するか検査
 	$(MAKE) shapecheck-gen
 	git diff --exit-code -- internal/entitycompat/testdata
+	$(MAKE) paramdef-gen
+	git diff --exit-code -- $(PARAMDEF_GOLDEN)
+	MK_UPSTREAM_REQUIRE=1 go test ./internal/api/paramschema/ -run 'TestGoldenMatchesPinnedUpstream|TestResponseMatchesUpstreamEndpointBase' -count=1 -v
 	MK_UPSTREAM_REQUIRE=1 go test ./internal/misc/achievement/... -run 'TestTypes_MatchUpstream' -count=1 -v
+
+# 本家のparamDef (引数のschema)のgoldenを作り直す(#3673)。本家のendpointの
+# .tsを、frontend/に入っているTypeScriptのパーサーで読んでJSONにする。
+# 手順の全体はdocs/upstream-catch-up.mdの「引数のschema」。
+#
+# **nodeの道具をtools/paramdefspecに置き、Goの道具と同じくmakeから呼ぶ。**
+# TypeScriptのASTを読むのでGoでは書けない。依存はfrontend/node_modulesを
+# 読むだけで、pnpm installはしない(無ければ落ちる)。
+#
+# 続けて、そのgoldenの全endpointについて、本家と同じ版・同じ設定のajvで判定
+# した照合のcorpusを作る。internal/api/paramschemaの検証器は、このcorpusの
+# 全件と判定・最初のエラー・defaultを入れた後の値が一致することをテストで守る。
+# ajvはfrontend/に推移的に入っている、本家のpackage.jsonと同じ版を使う。
+#
+# Elythia独自のendpointの宣言(elythia_paramdefs.json、#3869)のcorpusは、本家の
+# 分とは別のファイルに作る(elythia-paramdef-gen)。宣言を書き換えるたびに、本家の
+# ソースを要らずに作り直せるようにするため。ajvの版と設定は本家のgoldenから読む
+# ので、本家のgoldenを作り直したら、こちらも作り直す(paramdef-genが続けて回す)。
+PARAMDEF_JSON = internal/api/paramschema/upstream_paramdefs.json
+PARAMDEF_CORPUS = internal/api/paramschema/testdata/ajv_corpus.jsonl
+ELYTHIA_PARAMDEF_JSON = internal/api/paramschema/elythia_paramdefs.json
+ELYTHIA_PARAMDEF_CORPUS = internal/api/paramschema/testdata/ajv_corpus_elythia.jsonl
+PARAMDEF_GOLDEN = $(PARAMDEF_JSON) $(PARAMDEF_CORPUS) $(ELYTHIA_PARAMDEF_CORPUS)
+PARAMDEF_NODE_MODULES ?= frontend/node_modules
+.PHONY: paramdef-gen elythia-paramdef-gen elythia-js-paramdefs
+paramdef-gen: ## 本家のparamDefのgoldenと、ajvの照合corpusを作り直す(nodeとfrontend/node_modulesが要る)
+	@test -d "$(PARAMDEF_NODE_MODULES)/typescript" || { echo "$(PARAMDEF_NODE_MODULES)/typescript が無い。frontend/ で pnpm install する" >&2; exit 1; }
+	node tools/paramdefspec/extract.mjs --typescript "$(PARAMDEF_NODE_MODULES)/typescript" --upstream "$(UPSTREAM_DIR)" --out $(PARAMDEF_JSON)
+	node tools/paramdefspec/corpus.mjs --paramdefs $(PARAMDEF_JSON) --synthetic tools/paramdefspec/synthetic.json --node-modules "$(PARAMDEF_NODE_MODULES)" --out $(PARAMDEF_CORPUS)
+	$(MAKE) elythia-paramdef-gen
+
+elythia-paramdef-gen: ## Elythia独自のendpointのparamDef(elythia_paramdefs.json)から、ajvの照合corpusとelythia-jsの型の検査を作り直す(nodeとfrontend/node_modulesが要る)
+	node tools/paramdefspec/corpus.mjs --paramdefs $(PARAMDEF_JSON) --elythia $(ELYTHIA_PARAMDEF_JSON) --node-modules "$(PARAMDEF_NODE_MODULES)" --out $(ELYTHIA_PARAMDEF_CORPUS)
+	$(MAKE) elythia-js-paramdefs
+
+# 宣言の項目名と必須の項目が、elythia-jsのリクエストの型と一致するかの検査を、
+# 宣言から生成する(internal/api/paramschema/elythiajs)。検査そのものはelythia-js
+# の型検査(frontendのcheck)が回し、生成物が宣言に追いついているかはGoのテストが見る。
+elythia-js-paramdefs: ## elythia_paramdefs.jsonから、elythia-jsの型と突き合わせる型の検査を作り直す
+	go run ./tools/elythiajsparamdefs
+
+# /api.json(internal/api/openapi)の本家互換の部分が、本家の/api.jsonと項目の
+# 順まで一致するかを見る(#3810)。本家の公式imageの中で本家のgenOpenapiSpecを
+# 呼んで/api.jsonを書き出し、Goのテストがそれと突き合わせる。goldenの抽出
+# (paramdef-gen)とGoへの移植のどちらがずれても落ちる。
+#
+# **本家の版を上げたら、paramdef-genの後に回す。** imageをpullするので
+# `make gates`にもCIにも入れていない。imageは`--network none`で動かし、
+# 書き出し先だけを書き込み可能にして渡す(imageのnodeはrootでない)。
+OPENAPI_UPSTREAM_IMAGE ?= misskey/misskey:$(UPSTREAM_MISSKEY_VERSION)
+OPENAPI_UPSTREAM_OUT = $(BUILD_DIR)/openapi-upstream
+.PHONY: openapi-upstream-check
+openapi-upstream-check: ## /api.jsonの本家互換の部分が、本家の公式imageで作った/api.jsonと一致するか検査(Dockerが要る)
+	mkdir -p $(OPENAPI_UPSTREAM_OUT)
+	chmod 777 $(OPENAPI_UPSTREAM_OUT)
+	docker run --rm --network none --entrypoint node \
+		-v $(CURDIR)/tools/paramdefspec/upstream-apijson.mjs:/tool/upstream-apijson.mjs:ro \
+		-v $(abspath $(OPENAPI_UPSTREAM_OUT)):/out \
+		$(OPENAPI_UPSTREAM_IMAGE) /tool/upstream-apijson.mjs /out/api.json
+	MK_UPSTREAM_API_JSON=$(abspath $(OPENAPI_UPSTREAM_OUT))/api.json go test ./internal/api/openapi/ -run TestSpecMatchesUpstreamAPIJSON -count=1 -v
 
 # 本家の新しい版 (TO=<版>) の差分のうち、frontend/ が取り込むパスだけを 3-way で当てる
 # (設計 D4、#3379)。手順の全体は docs/upstream-catch-up.md。
@@ -1190,6 +1489,7 @@ UPSTREAM_E2E_ASSETS_ENV = \
 
 upstream-e2e-test: build ## 本家 backend e2e を Elythia に対して実行 (VITEST_ARGS で引数追加)
 	cp -R $(UPSTREAM_E2E_HARNESS)/. $(UPSTREAM_E2E_BACKEND)/
+	node $(UPSTREAM_E2E_HARNESS)/extend-user-lite-dto.mjs $(UPSTREAM_E2E_BACKEND)/test/e2e/users.ts
 	cd $(UPSTREAM_E2E_BACKEND) && \
 		$(UPSTREAM_E2E_ASSETS_ENV) \
 		MKGO_BIN=$(CURDIR)/built/$(BINARY) \
@@ -1256,7 +1556,6 @@ apicompat: apicompat-routes apicompat-render ## API 互換性マトリクス doc
 shapecheck-gen: ## shape drift の golden snapshot を再生成
 	go run ./tools/shapediff
 	go run ./tools/erroriddiff
-	go run ./tools/limitspec
 	go run ./tools/permspec
 	go run ./tools/securespec
 	go run ./tools/schemadrift
@@ -1275,24 +1574,19 @@ shapecheck: ## レスポンス形状の drift を検査
 # wrapper) と、Misskey が明示する HTTP status / kind discriminator を router
 # 経由で endpoint に解決して突合する静的 gate。詳細は docs/shape-drift.md。
 errorid-check: ## error id / HTTP status / kind の drift を検査
-	go test ./internal/entitycompat/... -run 'TestErrorIDDrift|TestErrorHTTPStatusDrift|TestErrorKindDrift' -count=1 -v
-
-# pagination limit-spec drift gate をローカルで実行する。handler が
-# pagination.ClampLimit(limit, def, max) で渡す default/max literal を router
-# 経由で endpoint に解決し、Misskey paramDef の default/maximum と突合する。
-limitspec-check: ## ページネーションの default / max の drift を検査
-	go test ./internal/entitycompat/... -run TestLimitSpecDrift -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestErrorIDDrift|TestErrorHTTPStatusDrift|TestErrorKindDrift|TestAPIRouteHandlersResolve' -count=1 -v
 
 # permission drift gate をローカルで実行する。mk-go の router middleware が
 # Misskey の requireAdmin/requireModerator/requireCredential より緩くないか検証。
 # TestOAuthKindDrift は別軸で、meta.kind (OAuth scope) の一致を見る。
+# TestCacheSecDrift は allowGet の GET route と cacheSec の Cache-Control の表を見る (#3593)。
 # **アクセス階層の gate では scope の取り違えを検出できない** (#2877)。
 perm-check: ## router middleware の権限が upstream より緩くないか検査
-	go test ./internal/entitycompat/... -run 'TestPermissionDrift|TestSecureDrift|TestOAuthKindDrift' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestPermissionDrift|TestSecureDrift|TestOAuthKindDrift|TestCacheSecDrift' -count=1 -v
 
 .PHONY: wiring-check
 wiring-check: ## router で配線が必要なものが外れていないか検査
-	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestInviteModeratorCheckerIsWired|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestAbuseReportNotifierIsWired|TestNotificationModeratorCheckerIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestPasswordChecksAreFailureLimited|TestPasswordFailureGuardIsWired|TestRemoteStatsGateUsesFailClosedPredicate|TestStreamRevokeIsWired|TestAvatarDecorationRoleSetsAreWired|TestPushSubscriptionCacheIsShared|TestInstanceStatsGateIsWired' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestPluginNotificationDispatcherIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestAbuseReportNotifierIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestClipsNoteRepoIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestPasswordChecksAreFailureLimited|TestPasswordFailureGuardIsWired|TestRemoteStatsGateUsesFailClosedPredicate|TestStreamRevokeIsWired|TestAvatarDecorationRoleSetsAreWired|TestPushSubscriptionCacheIsShared|TestInstanceStatsGateIsWired|TestQueueProcessorSoftwareCheckersAreWired|TestFederationHostValuesAreWired|TestAccountCreatedAtIsWired|TestReversiAvatarURLIsWired|TestHideAppUserWithoutReadIsWired|TestRevokeTokenAdmitsAppUser|TestServerStatsGateIsWired|TestOutboundTransportIsShared|TestRelationSingleStatementReadersAreWired|TestEveryRouterRelationReposHasRelation|TestServerSourcesListsPackageFilesOnly|TestServerPkgReadersCoverEveryFile|TestRouteParsersReadEveryFile|TestCollectRoutesResolvesHandlerTypes|TestCountCriticalWiringEntriesReadsEveryFile|TestAPIRouteHandlersResolve|TestAPIRouteProblemsFlagsUncheckableHandlers|TestRouteRegistrationsAcrossFiles|TestCountCriticalWiringInRejectsTwoCalls|TestPushSubscriptionCacheProblemsRequireOneFile|TestHideAppUserOrderErrorRequiresOneFile|TestAPICacheControlMountedReadsEveryFile|TestCollectRoutesHandlesBlocksAndShapes|TestAllowlistDiffReportsBothWays|TestCollectRoutesScopeRules' -count=1 -v
 
 .PHONY: notiftype-check
 notiftype-check: ## 通知タイプの一覧が 1 箇所から導出されているか検査
@@ -1301,7 +1595,7 @@ notiftype-check: ## 通知タイプの一覧が 1 箇所から導出されてい
 
 .PHONY: migrationdoc-check
 migrationdoc-check: ## migration の本数を述べた doc が実態と合っているか検査
-	go test ./internal/entitycompat/... -run 'TestMigrationCountsInDocsMatchReality|TestMigrationCountClaimsDoNotPointIntoHistory|TestClaimPointsIntoHistory|TestNoopDownMigrationListMatchesReality|TestDestructiveMigrationTableRowsAreUnique' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestMigrationCountsInDocsMatchReality|TestMigrationCountClaimsDoNotPointIntoHistory|TestClaimPointsIntoHistory|TestNoopDownMigrationListMatchesReality|TestDestructiveMigrationTableRowsAreUnique|TestTrackedMigrationFiles_IgnoresLocalTrack' -count=1 -v
 
 .PHONY: mdtable-check
 mdtable-check: ## md の表の各行がヘッダと同じ列数か検査 (溢れたセルは描画時に捨てられる)
@@ -1352,6 +1646,16 @@ sqlbind-check: ## 値をクォート内へ差し込まずバインドしてい�
 	# そのまま pin する** — 「プレースホルダが在るか」はダミーの ? 1 つで満たせる。
 	go test ./internal/entitycompat/... -run 'TestSQLBindVerbDetectionShapes|TestSQLBindFoldsConcatenatedFormats|TestSQLBindNoVerbInsideQuotedLiteral|TestSQLBindChartUniqueArrayIsParameterised' -count=1 -v
 
+.PHONY: cachelist-check
+cachelist-check: ## 同期の部品を持つ型と変数が、キャッシュの一覧への登録か理由付きの除外に分類されているか検査
+	# 一覧(internal/serverのaddCache)への登録を忘れても、何も落ちなかった(#3777)。
+	# 並行で共有するメモリには同期が要るので、同期の部品(sync.Mutexなど)を持つstructと
+	# パッケージの変数を全部数え、表(cacheEntries)で種類と理由を書かせる。表は全部の
+	# フィールドの名前を持つので、どのフィールドを足しても分類し直すまで落ちる。
+	# 一覧に実際に登録したことは、internal/serverのTestCaches_ListMatchesTheDropLocalTypesが
+	# 同じ走査の結果と比べる(make testで回る)。
+	go test ./internal/entitycompat/... -run 'TestCacheTypesAreClassified|TestCacheEntriesHaveNoDeadRows|TestCacheTypeScanFindsEveryBranch|TestCacheScanExclusionsAreUsed|TestScanCacheTypesShapes' -count=1 -v
+
 .PHONY: dockerignore-check
 dockerignore-check: ## .dockerignore がシークレットと利用者データを除外しているか検査
 	# .dockerignore は全 build context 共通なので、1 行落ちると全経路に同時に効く。
@@ -1380,12 +1684,12 @@ testflags-check: ## make test が CI と同じテスト条件で走るか検査
 	go test ./internal/entitycompat/... -run 'TestMakeTestMatchesCIConditions|TestDocsQuoteTheCIShuffleSeed' -count=1 -v
 
 .PHONY: compose-check
-compose-check: ## 配布する compose のログの上限と、検証用 compose の置き場所・相対パス・name: を検査
-	go test ./internal/entitycompat/... -run 'TestComposeServicesHaveLogLimits|TestRootComposeFilesAreOperatorOnly|TestTestComposeFilesAreSelfContained|TestTestComposeUntrackedSourcesAreUsed' -count=1 -v
+compose-check: ## 配布する compose のログの上限と、検証用 compose の置き場所・相対パス・name:、ベンチの postgres の設定を検査
+	go test ./internal/entitycompat/... -run 'TestComposeServicesHaveLogLimits|TestRootComposeFilesAreOperatorOnly|TestTestComposeFilesAreSelfContained|TestTestComposeUntrackedSourcesAreUsed|TestBenchPostgresSkipsDiskWaits' -count=1 -v
 
 .PHONY: catalog-check
-catalog-check: ## システムカタログのクエリが schema で絞られているか検査
-	go test ./internal/entitycompat/... -run 'TestCatalogQueriesAreSchemaScoped|TestCatalogQueryGate_Predicates' -count=1 -v
+catalog-check: ## システムカタログのクエリが schema で絞られ、indexdef を WHERE に書いていないか検査
+	go test ./internal/entitycompat/... -run 'TestCatalogQueriesAreSchemaScoped|TestCatalogQueryGate_' -count=1 -v
 
 .PHONY: notfound-check
 notfound-check: ## repository の lookup error を種別を見ずに 4xx にしていないか検査

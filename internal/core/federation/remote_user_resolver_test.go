@@ -61,7 +61,7 @@ func TestRemoteUserResolver_ResolveByUsernameHost_Success(t *testing.T) {
 	ar := &fakeActorResolver{user: &model.User{ID: "uR", Username: "alice", Host: &host}}
 	userRepo := testutil.NewMockUserRepository()
 
-	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example")
+	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example", nil)
 	got, err := r.ResolveByUsernameHost("alice", "remote.example")
 	require.NoError(t, err)
 	assert.Equal(t, "uR", got.ID)
@@ -75,7 +75,7 @@ func TestRemoteUserResolver_ResolveByUsernameHost_WebFingerError(t *testing.T) {
 	ar := &fakeActorResolver{}
 	userRepo := testutil.NewMockUserRepository()
 
-	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example")
+	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example", nil)
 	_, err := r.ResolveByUsernameHost("alice", "remote.example")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "webfinger lookup")
@@ -87,7 +87,7 @@ func TestRemoteUserResolver_ResolveByUsernameHost_ResolverError(t *testing.T) {
 	ar := &fakeActorResolver{err: errors.New("bad actor doc")}
 	userRepo := testutil.NewMockUserRepository()
 
-	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example")
+	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example", nil)
 	_, err := r.ResolveByUsernameHost("alice", "remote.example")
 	require.Error(t, err)
 }
@@ -98,7 +98,7 @@ func TestRemoteUserResolver_ResolveByUsernameHost_LocalHostShortCircuits(t *test
 	userRepo := testutil.NewMockUserRepository()
 	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", UsernameLower: "alice"}
 
-	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example")
+	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example", nil)
 	// 大文字でも EqualFold で短絡する。
 	got, err := r.ResolveByUsernameHost("alice", "LOCAL.EXAMPLE")
 	require.NoError(t, err)
@@ -113,13 +113,13 @@ func TestRemoteUserResolver_ResolveByUsernameHost_LocalHostWithMiss(t *testing.T
 	ar := &fakeActorResolver{}
 	userRepo := testutil.NewMockUserRepository()
 
-	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example")
+	r := corefederation.NewRemoteUserResolver(wf, ar, userRepo, "local.example", nil)
 	_, err := r.ResolveByUsernameHost("ghost", "local.example")
 	require.Error(t, err)
 }
 
 func TestRemoteUserResolver_ResolveByUsernameHost_EmptyArgs(t *testing.T) {
-	r := corefederation.NewRemoteUserResolver(&fakeWebFinger{}, &fakeActorResolver{}, nil, "")
+	r := corefederation.NewRemoteUserResolver(&fakeWebFinger{}, &fakeActorResolver{}, nil, "", nil)
 	_, err := r.ResolveByUsernameHost("", "remote.example")
 	require.Error(t, err)
 	_, err = r.ResolveByUsernameHost("alice", "")
@@ -127,14 +127,14 @@ func TestRemoteUserResolver_ResolveByUsernameHost_EmptyArgs(t *testing.T) {
 }
 
 func TestRemoteUserResolver_ResolveByUsernameHost_NilWebFinger(t *testing.T) {
-	r := corefederation.NewRemoteUserResolver(nil, &fakeActorResolver{}, nil, "")
+	r := corefederation.NewRemoteUserResolver(nil, &fakeActorResolver{}, nil, "", nil)
 	_, err := r.ResolveByUsernameHost("alice", "remote.example")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not configured")
 }
 
 func TestRemoteUserResolver_ResolveByUsernameHost_LocalHostWithoutUserRepo(t *testing.T) {
-	r := corefederation.NewRemoteUserResolver(&fakeWebFinger{}, &fakeActorResolver{}, nil, "local.example")
+	r := corefederation.NewRemoteUserResolver(&fakeWebFinger{}, &fakeActorResolver{}, nil, "local.example", nil)
 	_, err := r.ResolveByUsernameHost("alice", "local.example")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "userRepo")
@@ -147,6 +147,11 @@ type stubRemoteUserHostBlocker struct {
 
 func (s stubRemoteUserHostBlocker) IsBlocked(host string) bool { return s.blocked[host] }
 func (s stubRemoteUserHostBlocker) IsAllowed(host string) bool { return !s.notAllowed[host] }
+
+// ProhibitedWords and SensitiveWords let the stub be the resolver's host
+// blocker too (federation.ResolverHostBlocker). 語は持たない (判定を skip する)。
+func (s stubRemoteUserHostBlocker) ProhibitedWords() []string { return nil }
+func (s stubRemoteUserHostBlocker) SensitiveWords() []string  { return nil }
 
 // A host the instance does not federate with is skipped before the WebFinger
 // request (#3330); other hosts still go through.
@@ -163,7 +168,7 @@ func TestRemoteUserResolver_ResolveByUsernameHost_SkipsBlockedHost(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			wf := &fakeWebFinger{uri: "https://ok.example/users/alice"}
 			ar := &fakeActorResolver{user: &model.User{ID: "uR", Host: &host}}
-			r := corefederation.NewRemoteUserResolver(wf, ar, testutil.NewMockUserRepository(), "local.example")
+			r := corefederation.NewRemoteUserResolver(wf, ar, testutil.NewMockUserRepository(), "local.example", nil)
 			r.SetHostBlockChecker(stubRemoteUserHostBlocker{
 				blocked:    map[string]bool{"blocked.example": true},
 				notAllowed: map[string]bool{"outside.example": true},

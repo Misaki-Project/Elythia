@@ -10,7 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/elythia-network/elythia/internal/cli/backfill"
+	clibackup "github.com/elythia-network/elythia/internal/cli/backup"
 	"github.com/elythia-network/elythia/internal/cli/diag"
+	"github.com/elythia-network/elythia/internal/cli/maintenance"
 	"github.com/elythia-network/elythia/internal/cli/migrate"
 	"github.com/elythia-network/elythia/internal/cli/serve"
 )
@@ -154,10 +156,21 @@ func TestCommands_WiresEveryNameToItsRunner(t *testing.T) {
 		"healthcheck":                diag.Healthcheck,
 		"dump-routes":                serve.DumpRoutes,
 		"backfill avatar-public-url": backfill.AvatarPublicURL,
+		"backfill chat-reads":        backfill.ChatReads,
 		"backfill emoji-system-file": backfill.EmojiSystemFile,
+		"backfill hashtag-mentions":  backfill.HashtagMentions,
 		"backfill instance-counts":   backfill.InstanceCounts,
 		"backfill note-tags":         backfill.NoteTags,
 		"backfill remote-host":       backfill.RemoteHost,
+		"backup take":                clibackup.Take,
+		"backup list":                clibackup.List,
+		"backup verify":              clibackup.Verify,
+		"backup restore":             clibackup.Restore,
+		"backup daemon":              clibackup.Daemon,
+		"maintenance enter":          maintenance.Enter,
+		"maintenance exit":           maintenance.Exit,
+		"maintenance status":         maintenance.Status,
+		"maintenance wait":           maintenance.Wait,
 	}
 	got := map[string]uintptr{}
 	for _, c := range Commands() {

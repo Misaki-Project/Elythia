@@ -3,8 +3,6 @@ package entitycompat
 import (
 	_ "embed"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -22,8 +20,6 @@ var embeddedSecureEndpointsJSON []byte
 // reachable only via the native session token; without RequireSecure a
 // third-party OAuth app holding a valid access token could drive them.
 func TestSecureDrift(t *testing.T) {
-	root := repoRoot(t)
-
 	var golden []string
 	if err := json.Unmarshal(embeddedSecureEndpointsJSON, &golden); err != nil {
 		t.Fatalf("parse golden_secure_endpoints.json: %v", err)
@@ -36,7 +32,7 @@ func TestSecureDrift(t *testing.T) {
 		secure[ep] = true
 	}
 
-	regs := parseRouteRegistrations(t, filepath.Join(root, "internal/server/router.go"))
+	regs := parseRouteRegistrations(t, serverSourcePaths(t)...)
 
 	var missing []string
 	for ep, reg := range regs {
@@ -66,7 +62,7 @@ func TestSecureDrift(t *testing.T) {
 	// 検出できない。
 	//
 	// mk-go が意図的に upstream より厳しくする場合は、理由を添えて
-	// secureStricterThanUpstream に登録すること (現在は空 = 全件 upstream 一致)。
+	// secureStricterThanUpstream に登録すること。
 	var extra []string
 	for ep, reg := range regs {
 		if secure[ep] || excludedEndpoint(ep) || secureStricterThanUpstream[ep] != "" {
@@ -90,9 +86,31 @@ func TestSecureDrift(t *testing.T) {
 
 // secureStricterThanUpstream lists endpoints where mk-go deliberately requires a
 // native session token even though Misskey does not mark them `secure: true`.
-// The value is the reason; an empty map means every RequireSecure matches
-// upstream. Keep it empty unless there is a documented reason (docs/divergence.md).
-var secureStricterThanUpstream = map[string]string{}
+// The value is the reason. Add an entry only with a documented reason
+// (docs/divergence.md).
+var secureStricterThanUpstream = map[string]string{
+	// DB のバックアップの管理画面 (#3462、Elythia 独自で本家に無い)。バックアップには
+	// 利用者の秘密鍵・token・パスワードの hash が入るので、アプリの token では
+	// 使えないようにする (docs/divergence/api.md)。
+	"admin/backup/delete":           backupSecureReason,
+	"admin/backup/download":         backupSecureReason,
+	"admin/backup/list":             backupSecureReason,
+	"admin/backup/reauth-challenge": backupSecureReason,
+	"admin/backup/take":             backupSecureReason,
+	"admin/backup/verify":           backupSecureReason,
+	// 画面からのリストア (#3463 (6c))。DB を入れ替える操作なので同じ扱い。
+	"admin/backup/restore/abort":   backupSecureReason,
+	"admin/backup/restore/confirm": backupSecureReason,
+	"admin/backup/restore/prepare": backupSecureReason,
+	// 退避した DB の一覧 (#3463 (6d))。一覧 (admin/backup/list) と同じ扱い。
+	"admin/backup/restore/candidates": backupSecureReason,
+	// 外部公開や既存投稿のlocalOnly化を伴うアカウント自身の連合状態変更。
+	"i/update-federation": federationStateSecureReason,
+}
+
+const backupSecureReason = "Elythia-only backup admin (#3462): backups hold private keys, tokens and password hashes, so app tokens must not reach them"
+
+const federationStateSecureReason = "Elythia-only federation state change (#3852): publishing an account or making its existing posts local-only is consequential and can be irreversible, so only the owner's native session may change it (docs/divergence/api.md)"
 
 // parseRouteRegistrations returns endpoint path -> the full router registration
 // text (balanced parens), so middleware on a multi-line inline handler's closing
@@ -112,27 +130,10 @@ var secureStricterThanUpstream = map[string]string{}
 // 文字列・コメントを数えない」と書いて採用したが、事実と逆だった。**
 // `stripGoComments` は rune / 文字列リテラルを保つので、route の path に
 // 含まれる `(` が消えることはない。
-func parseRouteRegistrations(t *testing.T, path string) map[string]string {
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read router: %v", err)
-	}
-	s := stripGoComments(string(src))
-	out := map[string]string{}
-	for _, loc := range routeRegRe.FindAllStringSubmatchIndex(s, -1) {
-		ep := strings.TrimPrefix(s[loc[2]:loc[3]], "/")
-		open := strings.LastIndex(s[loc[0]:loc[1]], "(") + loc[0]
-		depth, j := 1, open+1
-		for j < len(s) && depth > 0 {
-			switch s[j] {
-			case '(':
-				depth++
-			case ')':
-				depth--
-			}
-			j++
-		}
-		out[ep] = s[open:j]
-	}
-	return out
+//
+// **ファイルごとに読む (#3672)。** offset はファイルの中でだけ意味を持つ。
+// 同じ endpoint を 2 つのファイルが登録していたら落とす (routeRegistrationsOf)。
+func parseRouteRegistrations(t *testing.T, paths ...string) map[string]string {
+	t.Helper()
+	return routeRegistrationsOf(t, "parseRouteRegistrations", paths)
 }

@@ -44,8 +44,8 @@ func recipientFKs(t *testing.T) []recipientFK {
 // 流し直しても、制約が既にあるので何も変わらず) 緑のまま通る。down で 000028
 // の状態に戻してから up を流し、その結果を見る。
 func TestMigration000106_RecipientFKsCascadeLikeUpstream(t *testing.T) {
-	up := migrationSQL(t, "000107_abuse_report_notification_recipient_fk_cascade.up.sql")
-	down := migrationSQL(t, "000107_abuse_report_notification_recipient_fk_cascade.down.sql")
+	up := migrationSQL(t, "000106_abuse_report_notification_recipient_fk_cascade.up.sql")
+	down := migrationSQL(t, "000106_abuse_report_notification_recipient_fk_cascade.down.sql")
 	want := []recipientFK{
 		{"FK_abuse_report_notification_recipient_systemWebhookId", "c", "system_webhook"},
 		{"FK_abuse_report_notification_recipient_userId1", "c", "user"},

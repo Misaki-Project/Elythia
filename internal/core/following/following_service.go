@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -142,23 +143,17 @@ type Service struct {
 	// instanceStatsEnabled は meta.enableStatsForFederatedInstances を読む。
 	// 未配線なら本家の既定値 (true) と同じく常に集計する。
 	instanceStatsEnabled func() bool
+	// silentFollowRepo は「静かに成立させる」(#3466) で通したフォローを記録する。
+	silentFollowRepo repository.SilentFollowRepository
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // SilencedHostChecker reports whether a remote host is silenced.
 type SilencedHostChecker interface {
 	IsSilenced(host string) bool
 }
-
-// SetSilencedHostChecker wires the silenced-host lookup.
-func (s *Service) SetSilencedHostChecker(c SilencedHostChecker) {
-	s.silencedChecker = c
-}
-
-// HasSilencedHostChecker reports whether the silenced-host lookup was wired.
-//
-// 未配線だとサイレンスしたホストからのフォローが承認なしで通り、followers
-// 限定ノートがそのまま配送される。起動時検査に使う。
-func (s *Service) HasSilencedHostChecker() bool { return s != nil && s.silencedChecker != nil }
 
 // RelationReloadPublisher notifies streaming connections that a viewer's
 // following snapshot changed (#2400)。実装は stream 側の adapter。
@@ -187,17 +182,38 @@ func (s *Service) publishFollowingReload(followerID string) {
 }
 
 // NewService creates a new following Service.
+//
+// entityPacker packs users and notes (#3792). silencedChecker is the
+// meta.silencedHosts lookup. silentFollowRepo stores the follows that
+// succeeded silently (#3466). userPacker packs the user carried by the main
+// stream follow / unfollow / followed / receiveFollowRequest bodies; nil
+// keeps the legacy shape built from the user row alone (test fixtures).
+//
+// どれも無いと黙って劣化する (avatarUrl などを media proxy を通さずに返す /
+// サイレンスしたホストからのフォローが承認なしで通り、followers 限定ノートが
+// 配送される / 「静かに成立させる」で通ったフォローが following/silent/list に
+// 残らない / main stream の follow / unfollow が profile を読まない形に落ち、
+// unfollow の後もフォロワー限定のカウントが見える) ので、構築子の必須の引数で
+// 受ける (#3825)。
 func NewService(
 	userRepo repository.UserRepository,
 	followingRepo repository.FollowingRepository,
 	followRequestRepo repository.FollowRequestRepository,
 	idGen id.Generator,
+	entityPacker *entity.Packer,
+	silencedChecker SilencedHostChecker,
+	silentFollowRepo repository.SilentFollowRepository,
+	userPacker UserPacker,
 ) *Service {
 	return &Service{
 		userRepo:          userRepo,
 		followingRepo:     followingRepo,
 		followRequestRepo: followRequestRepo,
 		idGen:             idGen,
+		entityPacker:      entityPacker,
+		silencedChecker:   silencedChecker,
+		silentFollowRepo:  silentFollowRepo,
+		userPacker:        userPacker,
 	}
 }
 
@@ -241,19 +257,6 @@ type UserPacker interface {
 	Lite(u *model.User) entity.UserLite
 	DetailedNotMe(ctx context.Context, target, viewer *model.User) (entity.UserDetailed, bool)
 }
-
-// SetUserPacker wires the packer for the main stream follow / unfollow /
-// followed / receiveFollowRequest bodies. Unwired, the events carry the
-// legacy shape built from the user row alone (test fixtures).
-func (s *Service) SetUserPacker(p UserPacker) {
-	s.userPacker = p
-}
-
-// HasUserPacker reports whether the user packer was wired.
-//
-// 未配線だと main stream の follow / unfollow が profile を読まない従来の形に
-// 落ち、unfollow の後もフォロワー限定のカウントが見える。起動時検査に使う。
-func (s *Service) HasUserPacker() bool { return s.userPacker != nil }
 
 // MeUpdatedPublisher emits `meUpdated` (the user's own MeDetailed) to a local
 // user's main stream. The `i` API handler satisfies it.
@@ -348,7 +351,7 @@ func (s *Service) publishFolloweeEvent(event string, follower, followee *model.U
 		return
 	}
 	if packed == nil {
-		s.mainStreamPublisher.PublishMainEvent(follower.ID, event, entity.PackUserForFollowStreamEvent(followee, isFollowing, false, s.idGen))
+		s.mainStreamPublisher.PublishMainEvent(follower.ID, event, s.entityPacker.PackUserForFollowStreamEvent(followee, isFollowing, false, s.idGen))
 		return
 	}
 	d, ok := packed()
@@ -365,7 +368,7 @@ func (s *Service) publishFollowerLite(event string, follower, followee *model.Us
 	if s.mainStreamPublisher == nil || follower == nil || followee == nil || !followee.IsLocal() {
 		return
 	}
-	body := entity.PackUserLite(follower)
+	body := s.entityPacker.PackUserLite(follower)
 	if s.userPacker != nil {
 		body = s.userPacker.Lite(follower)
 	}
@@ -523,6 +526,16 @@ func (s *Service) Follow(followerID, followeeID string, opts FollowOptions) (*Fo
 	// #2106 N22: locked に加え、bot follower かつ local followee の profile.carefulBot=true でも
 	// follow request 化する (「Bot からのフォローに慎重」設定)。
 	needsApproval := followee.IsLocked
+	// **ローカルからリモートへのフォローは、相手の Accept が届くまで申請にする
+	// (#3491)。** 本家 UserFollowingService.follow の 3 つ目の OR 条件
+	// (`isLocalUser(follower) && isRemoteUser(followee)`)。成立は Accept の受信
+	// (鍵アカウント宛てと同じ流れ) で行う。本家と同じく、環境変数
+	// FORCE_FOLLOW_REMOTE_USER_FOR_TESTING=true のときだけ即座に成立させる
+	// (本家の backend e2e がリモートの相手を Accept を返さない形で作るため)。
+	if !needsApproval && follower.Host == nil && followee.Host != nil &&
+		os.Getenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING") != "true" {
+		needsApproval = true
+	}
 	if !needsApproval && follower.IsBot && followee.Host == nil {
 		if profile, perr := s.userRepo.FindProfileByUserID(followeeID); perr == nil && profile != nil && profile.CarefulBot {
 			needsApproval = true
@@ -541,6 +554,24 @@ func (s *Service) Follow(followerID, followeeID string, opts FollowOptions) (*Fo
 		followee.Host == nil && follower.Host != nil && *follower.Host != "" &&
 		s.silencedChecker.IsSilenced(*follower.Host) {
 		needsApproval = true
+	}
+	// **作られてから日の浅いアカウントからのフォローを止める (#3466)。** 本家
+	// PR 17998 の requiresAgeBasedApproval。他の条件で既に承認待ちになるなら
+	// 見ない (鍵アカウントなどは本家どおり通知付きのリクエストにする)。止め方
+	// (followApprovalAction) は Elythia 独自で、既定は本家と同じ request。
+	var approval followApproval
+	if !needsApproval {
+		approval, err = s.checkFollowApproval(follower, followee)
+		if err != nil {
+			return nil, err
+		}
+		needsApproval = approval.request
+	}
+	// 「静かに成立させる」でも、下の autoAccept に当たる相手 (自分がフォロー
+	// していて autoAcceptFollowed が有効) は、本家ならリクエストにならず通知付きで
+	// 成立する相手なので、通知を止めない。
+	if approval.silentFollow && s.shouldAutoAcceptFollow(followee, followerID) {
+		approval.silentFollow = false
 	}
 	// #2106 N21: followee が local + profile.autoAcceptFollowed=true + 相互フォロー
 	// (followee→follower) のときは follow request を作らず即 Following を成立させる
@@ -562,9 +593,15 @@ func (s *Service) Follow(followerID, followeeID string, opts FollowOptions) (*Fo
 			WithReplies:  opts.WithReplies,
 		}
 		if err := s.followRequestRepo.Create(req); err != nil {
+			// 確かめた後に並行の要求が同じ組を作った (一意制約)。500 にしない。
+			if repository.IsUniqueViolation(err) {
+				return nil, ErrAlreadyRequested
+			}
 			return nil, err
 		}
-		if s.notificationHook != nil {
+		// 「静かにリクエストにする」(#3466) は通知だけを作らない。リクエストの
+		// 一覧、main stream の receiveFollowRequest と meUpdated は通常どおり。
+		if s.notificationHook != nil && !approval.silentRequest {
 			s.notificationHook.OnFollowRequested(followerID, followeeID)
 		}
 		// リモートの承認制followeeにはAP Follow activityを送る必要がある
@@ -591,6 +628,26 @@ func (s *Service) Follow(followerID, followeeID string, opts FollowOptions) (*Fo
 		WithReplies:  opts.WithReplies,
 	}
 	if err := s.followingRepo.Create(f); err != nil {
+		// Exists で確かめた後に並行の要求が同じ組を作った (一意制約)。upstream の
+		// insertFollowingDoc も一意制約の違反を握って既にフォロー済みとして扱う。
+		// 500 にしない (カウントは作れた側だけが増やすのでずれない)。
+		if repository.IsUniqueViolation(err) {
+			return nil, ErrAlreadyFollowing
+		}
+		return nil, err
+	}
+	// **同じ組の申請が残っていれば消す (本家 insertFollowingDoc と同じ)。**
+	// 期間の設定 (#3466) を外した後や期間を過ぎた後にフォローし直すと、前に
+	// 作った申請が残ったまま即フォローが成立する。残すと「フォロー済みかつ
+	// 申請中」になり、承認しようとすると following の一意制約で落ちる。
+	if req, err := s.followRequestRepo.FindByPair(followerID, followeeID); err == nil {
+		// 消せなかったときはエラーを返す (本家も await して投げる)。フォローは
+		// 既に成立しているので、申請が残っても承認の側で成功として片付く。
+		if err := s.followRequestRepo.Delete(req); err != nil {
+			return nil, err
+		}
+		s.publishMeUpdated(followee)
+	} else if !repository.IsNotFound(err) {
 		return nil, err
 	}
 
@@ -614,8 +671,15 @@ func (s *Service) Follow(followerID, followeeID string, opts FollowOptions) (*Fo
 		s.adjustInstanceCountsForFollowing(f, 1)
 	}
 
-	if s.notificationHook != nil {
+	// 「静かに成立させる」(#3466) は follow の通知を作らず、受け手が後から
+	// 確かめられるように silent_follow に記録する。Webhook (followed) と
+	// main stream のイベントは止めない — 利用者が自分で設定した連携と、画面の
+	// 状態の更新なので。
+	if s.notificationHook != nil && !approval.silentFollow {
 		s.notificationHook.OnFollowed(followerID, followeeID)
+	}
+	if approval.silentFollow {
+		s.recordSilentFollow(followerID, followeeID)
 	}
 	if s.federationHook != nil {
 		// アウトバウンド: local→remote follow の場合は Follow activity を送る。
@@ -780,6 +844,23 @@ func (s *Service) AcceptRequest(followeeID, followerID string) error {
 	if err := s.followRequestRepo.Delete(req); err != nil {
 		return err
 	}
+	// **既にフォローが成立しているなら、申請を消すだけで成功とする (#3466)。**
+	// 期間の設定を変えた後のフォローし直しなどで、フォローと申請が両方残った
+	// 行が過去に作られうる。ここで following を作ろうとすると一意制約
+	// (23505) で落ち、利用者には 500 が、鍵を外したときの一括承認では残りの
+	// 申請が承認されないまま止まる。本家 insertFollowingDoc も重複を
+	// (リモートからのフォローでは) 握って申請を消す。
+	alreadyFollowing := func() error {
+		if followee, err := s.userRepo.FindByID(req.FolloweeID); err == nil {
+			s.publishMeUpdated(followee)
+		}
+		return nil
+	}
+	if already, err := s.followingRepo.Exists(req.FollowerID, req.FolloweeID); err != nil {
+		return err
+	} else if already {
+		return alreadyFollowing()
+	}
 	f := &model.Following{
 		ID:           s.idGen.Generate(time.Now()),
 		FollowerID:   req.FollowerID,
@@ -789,6 +870,12 @@ func (s *Service) AcceptRequest(followeeID, followerID string) error {
 		WithReplies:  req.WithReplies,
 	}
 	if err := s.followingRepo.Create(f); err != nil {
+		// 同じ申請を同時に承認した (二度押し、鍵の解除の同時実行) ときは、上の
+		// Exists をすり抜けた片方がここで一意制約に当たる。もう片方が成立させて
+		// いるので、既にフォロー済みのときと同じく成功として扱う。
+		if repository.IsUniqueViolation(err) {
+			return alreadyFollowing()
+		}
 		return err
 	}
 	// 承認でも本家は insertFollowingDoc を通るので、Follow と同じ移行済みの

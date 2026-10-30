@@ -135,8 +135,8 @@ const maxNoteEmbedDepth = 2
 
 // PackNote converts a model.Note to a NoteEntity. Renote / Reply の embed は
 // maxNoteEmbedDepth で制限する。
-func PackNote(n *model.Note, idGen id.Generator) NoteEntity {
-	return packNoteAtDepth(n, idGen, 0, true)
+func (pkr *Packer) PackNote(n *model.Note, idGen id.Generator) NoteEntity {
+	return pkr.packNoteAtDepth(n, idGen, 0, true)
 }
 
 // packPoll maps a preloaded model.Poll onto the Misskey-compatible PollEntity.
@@ -173,15 +173,26 @@ func packPoll(p *model.Poll) *PollEntity {
 
 // HideNoteEntity blanks an embedded note's content for a viewer who is not
 // allowed to see it, mirroring upstream NoteEntityService.hideNote. It clears
-// exactly the 7 fields upstream clears (text/cw/poll/files/fileIds/visibleUserIds
-// + isHidden) and keeps everything else (id/userId/user/createdAt/reactions/
+// the 7 fields upstream clears (text/cw/poll/files/fileIds/visibleUserIds
+// + isHidden) and keeps the shell (id/userId/user/createdAt/reactions/
 // counts/hasPoll), so the frontend still renders a "hidden post" placeholder
 // card. Used by both the REST and streaming embed-visibility gates (#1536).
+//
+// In addition to upstream, it also clears the values derived from the body
+// (mentions / tags / emojis), which upstream leaves in place.
 //
 // fileIds / files は non-nil 空スライスにして JSON で [] を出す。
 // visibleUserIds は upstream hideNote (NoteEntityService.ts:184) と同じく nil に
 // して omitempty で key を落とす (#1561 で packer 全体を specified 限定 +
 // omitempty 化したことに合わせる)。
+//
+// mentions / tags / emojis は本文から作る値なので、本文と一緒に消す (本家は
+// 消さない)。返信先 (reply / replyId) など本文から作らない値は残す。
+// mentions / tags は本家でも空のとき key を省くので、nil にして omitempty で
+// 落とせば「何も書いていないノート」と同じ形になる。emojis はリモートのノート
+// では空でも `{}` を出す形なので、key は残して中身だけ空の map に差し替える
+// (packer が確保した map を共有している呼び出し元があっても書き換えないよう、
+// 新しい map にする)。
 func HideNoteEntity(n *NoteEntity) {
 	if n == nil {
 		return
@@ -192,6 +203,12 @@ func HideNoteEntity(n *NoteEntity) {
 	n.FileIDs = make([]string, 0)
 	n.Files = []any{}
 	n.VisibleUserIDs = nil
+	n.Mentions = nil
+	n.Tags = nil
+	if n.Emojis != nil {
+		empty := map[string]string{}
+		n.Emojis = &empty
+	}
 	n.IsHidden = true
 }
 
@@ -202,7 +219,7 @@ func HideNoteEntity(n *NoteEntity) {
 // detail:false (upstream NoteEntityService.ts:432-460, reply at :437 detail:false
 // / renote at :445 detail:true). myReaction is applied later by
 // note_field_resolver (which skips reply embeds), #1816.
-func packNoteAtDepth(n *model.Note, idGen id.Generator, depth int, detail bool) NoteEntity {
+func (pkr *Packer) packNoteAtDepth(n *model.Note, idGen id.Generator, depth int, detail bool) NoteEntity {
 	createdAt := ""
 	if t, err := idGen.ParseTime(n.ID); err == nil {
 		createdAt = t.UTC().Format("2006-01-02T15:04:05.000Z")
@@ -297,7 +314,7 @@ func packNoteAtDepth(n *model.Note, idGen id.Generator, depth int, detail bool) 
 	}
 
 	if n.User != nil {
-		entity.User = PackUserLite(n.User)
+		entity.User = pkr.PackUserLite(n.User)
 	}
 
 	// Renote / Reply の target は repository 層で preload (Renote.User /
@@ -320,11 +337,11 @@ func packNoteAtDepth(n *model.Note, idGen id.Generator, depth int, detail bool) 
 	// reply embed では clippedCount/poll/myReaction を省く (#1816)。
 	if detail && depth < maxNoteEmbedDepth {
 		if n.Renote != nil {
-			r := packNoteAtDepth(n.Renote, idGen, depth+1, true)
+			r := pkr.packNoteAtDepth(n.Renote, idGen, depth+1, true)
 			entity.Renote = &r
 		}
 		if n.Reply != nil {
-			r := packNoteAtDepth(n.Reply, idGen, depth+1, false)
+			r := pkr.packNoteAtDepth(n.Reply, idGen, depth+1, false)
 			entity.Reply = &r
 		}
 	}
@@ -348,14 +365,14 @@ func packNoteAtDepth(n *model.Note, idGen id.Generator, depth int, detail bool) 
 // 1 まとめにしてから resolver を作る。CollectNoteAuthors も flatten 済みの
 // スライスから author を拾うので、埋め込み note の remote user にも Instance /
 // emoji が正しく載る。
-func PackNotes(ctx context.Context, notes []*model.Note, idGen id.Generator, instLookup InstanceLookup, emojiLookup EmojiLookup, reactionReader BufferedReactionsReader) []NoteEntity {
+func (pkr *Packer) PackNotes(ctx context.Context, notes []*model.Note, idGen id.Generator, instLookup InstanceLookup, emojiLookup EmojiLookup, reactionReader BufferedReactionsReader) []NoteEntity {
 	flat := flattenNotesPlusRelations(notes)
 	mergeBufferedReactions(ctx, flat, reactionReader)
 	instResolver := NewInstanceResolver(instLookup, CollectNoteAuthors(flat)...)
 	emojiResolver := NewEmojiResolver(emojiLookup, flat)
 	out := make([]NoteEntity, 0, len(notes))
 	for _, n := range notes {
-		packed := PackNote(n, idGen)
+		packed := pkr.PackNote(n, idGen)
 		applyNoteResolvers(n, &packed, instResolver, emojiResolver)
 		out = append(out, packed)
 	}
@@ -369,10 +386,10 @@ func PackNotes(ctx context.Context, notes []*model.Note, idGen id.Generator, ins
 // instead — calling this in a loop produces N+1 queries.
 //
 // reactionReader / ctx 引数の意味は PackNotes と同じ (#647 / #657)。
-func PackNoteWithInstance(ctx context.Context, n *model.Note, idGen id.Generator, instLookup InstanceLookup, emojiLookup EmojiLookup, reactionReader BufferedReactionsReader) NoteEntity {
+func (pkr *Packer) PackNoteWithInstance(ctx context.Context, n *model.Note, idGen id.Generator, instLookup InstanceLookup, emojiLookup EmojiLookup, reactionReader BufferedReactionsReader) NoteEntity {
 	flat := flattenNotesPlusRelations([]*model.Note{n})
 	mergeBufferedReactions(ctx, flat, reactionReader)
-	packed := PackNote(n, idGen)
+	packed := pkr.PackNote(n, idGen)
 	instResolver := NewInstanceResolver(instLookup, CollectNoteAuthors(flat)...)
 	emojiResolver := NewEmojiResolver(emojiLookup, flat)
 	applyNoteResolvers(n, &packed, instResolver, emojiResolver)

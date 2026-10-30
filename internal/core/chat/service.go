@@ -17,21 +17,26 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/activitypub/mfm"
+	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
+	"github.com/elythia-network/elythia/internal/core/userpack"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/misc/idnhost"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
+
+	"github.com/forPelevin/gomoji"
 )
 
 // AP 由来の値を書く chat 列の上限 (migration/000022_chat.up.sql)。溢れると
 // INSERT ごと落ちて、その配送が retry を使い切って dead になる (#2726)。
 //
-// 判断は docs/divergence.md の「リモート由来の文字列を列に入れるときの規則」
+// 判断は docs/divergence/security.md の「リモート由来の文字列を列に入れるときの規則」
 // どおり: 本文 (name / description / text) は切る、身元 (id / uri) は
 // document ごと拒否する。
 const (
@@ -82,11 +87,18 @@ var (
 	// ErrNoSuchEmoji is returned by React when a custom emoji reaction references
 	// a local emoji that does not exist (upstream 'no such emoji').
 	ErrNoSuchEmoji = errors.New("no such emoji")
+	// ErrInvalidReaction is returned by React when the reaction is neither a
+	// `:name:` custom emoji nor a unicode emoji (upstream throws 'invalid emoji').
+	ErrInvalidReaction = errors.New("invalid reaction")
 	// ErrRoomFull is returned by CreateInvitationViaAP when the room's members
-	// plus its pending invitations already fill maxRoomMembers. Mirrors upstream
+	// plus its pending invitations already fill maxRoomMembers, and by
+	// AddMemberViaAP when the members alone do. Mirrors upstream
 	// createRoomInvitation's 'room is full' (upstream counts memberships only).
 	// Permanent: callers must not retry.
 	ErrRoomFull = errors.New("chat room is full")
+	// ErrFederationDisabled is returned before persisting an outbound chat
+	// interaction when its remote peer would require federation.
+	ErrFederationDisabled = corelocalfederation.ErrFederationDisabled
 )
 
 // maxReactionsPerMessage caps the reactions on a single chat message
@@ -159,6 +171,9 @@ type Service struct {
 	deliverer           APDeliverer
 	mainStreamPublisher MainStreamPublisher
 	chatPusher          ChatPusher
+	// lites は stream / push の fromUser・toUser (UserLite) の instance と絵文字を
+	// payload ごとに 1 回で埋める (#3438)。未配線なら埋めない。
+	lites userpack.LiteFiller
 	// moderatorChecker: chat/rooms/show 等の権限 gate で「moderator は閲覧可」
 	// を判定するために使う (upstream 2026.5.4 互換)。nil 安全。
 	moderatorChecker ModeratorChecker
@@ -177,6 +192,39 @@ type Service struct {
 	// 自分へ送ってきている (otherApprovedMe) なら chatScope チェックを skip し、
 	// 送信後に自分→相手の approval を挿入する。nil なら従来どおり scope のみで判定。
 	approvalRepo repository.ChatApprovalRepository
+	// messageObserver は 1:1 のメッセージを保存した後に呼ぶ (#3469)。
+	// プラグインが管理するアカウント宛のメッセージを、そのプラグインへ届ける
+	// のに使う。未配線なら呼ばない。
+	messageObserver MessageObserver
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
+}
+
+// MessageObserver is told about each direct (1:1) chat message after it has
+// been stored (#3469).
+//
+// **保存できたものだけ。** chatScope・ブロックで拒否したメッセージと、AP の
+// 再送で既存のものを返したときは呼ばない。メッセージの作成を止めないよう、
+// 実装は重い処理をせず (queue に積むなど) すぐ戻ること。
+//
+// recipient は送信の検査のために既に引いてあれば渡す (無ければ nil)。observer が
+// 宛先を引き直さずに済むようにするため。
+type MessageObserver interface {
+	DirectMessageCreated(ctx context.Context, msg *model.ChatMessage, recipient *model.User)
+}
+
+// SetMessageObserver attaches the observer told about new direct messages.
+// nil disables it.
+func (s *Service) SetMessageObserver(o MessageObserver) {
+	s.messageObserver = o
+}
+
+// notifyMessageObserver hands a stored direct message to the observer.
+func (s *Service) notifyMessageObserver(ctx context.Context, msg *model.ChatMessage, recipient *model.User) {
+	if s.messageObserver != nil {
+		s.messageObserver.DirectMessageCreated(ctx, msg, recipient)
+	}
 }
 
 // ChatInvitationNotifier records a 'chatRoomInvitationReceived' notification on
@@ -206,8 +254,18 @@ func (s *Service) SetApprovalRepo(r repository.ChatApprovalRepository) {
 }
 
 // NewService constructs a chat Service.
-func NewService(repo repository.ChatRepository, idGen id.Generator) *Service {
-	return &Service{repo: repo, idGen: idGen}
+//
+// entityPacker is the Packer this Service packs entities with (#3794). lites
+// is the batch resolver of instance / emojis for the UserLite values
+// (fromUser / toUser) of stream and push payloads (#3438). blockingRepo lets
+// CreateMessageToUser reject DMs to a recipient who has blocked the sender;
+// nil disables the block check.
+//
+// どれも無いと黙って劣化する (メディアの URL が生のまま / リモートの利用者に
+// instance と絵文字が載らない / 自分をブロックしている相手へ DM を送れる) ので、
+// 構築子の必須の引数で受ける (#3823)。
+func NewService(repo repository.ChatRepository, idGen id.Generator, entityPacker *entity.Packer, lites userpack.LiteFiller, blockingRepo repository.BlockingRepository) *Service {
+	return &Service{repo: repo, idGen: idGen, entityPacker: entityPacker, lites: lites, blockingRepo: blockingRepo}
 }
 
 // SetStreamingPublisher wires a StreamingPublisher so state-changing methods
@@ -248,10 +306,10 @@ func (s *Service) SetUserRepo(r repository.UserRepository) {
 // **body は publish と同じでは足りない。** SW の newChatMessage ハンドラ
 // (packages/sw/src/scripts/create-notification.ts) は `fromUser.name` /
 // `fromUser.avatarUrl` を無条件で読み、room なら `toRoom.name` も読む。
-// packMessageStream は `msg.FromUser` / `msg.ToRoom` が nil だと該当キーを
-// 落とすが、create 経路は行を素で組むので**必ず nil** (repo は Preload しない)。
-// そのまま渡すと SW が TypeError を投げ、**通知が 1 件も出ない** —
-// publish 側は body を読まない (main-boot.ts は引数を捨てる) ので気付けない。
+// packed (packMessageDetailedStream) は sender / room を引けなかったときに
+// fromUser / toRoom を落とすので、ここでも補う。欠けたまま渡すと SW が
+// TypeError を投げ、**通知が 1 件も出ない** — publish 側は body を読まない
+// (main-boot.ts は引数を捨てる) ので気付けない。
 func (s *Service) pushNewChatMessage(userID string, packed map[string]any, sender *model.User, room *model.ChatRoom) {
 	if s.chatPusher == nil {
 		return
@@ -266,15 +324,34 @@ func (s *Service) pushNewChatMessage(userID string, packed map[string]any, sende
 	s.chatPusher.PushNewChatMessage(userID, s.packMessagePush(packed, sender, room))
 }
 
-// packMessagePush augments the stream payload with the fields the service
-// worker dereferences unconditionally.
+// packMessagePush builds the Web Push body of `newChatMessage` from the main
+// stream payload: the message fields as is, fromUser narrowed to what the
+// service worker reads, toRoom narrowed to {id, name}, and no toUser.
+//
+// **main stream の payload をそのまま送らない。** Web Push は本文が実質 3800 B
+// まで (webpush.maxPushBodyBytes) で、超えると送られずに消える。packMessageDetailed
+// の形 (UserLite 3 人分 + room の description) をそのまま載せると、本文 1000 文字の
+// room や description の長い room で上限を超える (#3438 のレビューで実測)。SW
+// (packages/sw の create-notification.ts / operations.ts) が読むのは fromUser の
+// name / username / avatarUrl、toRoom の name、text、fromUserId / toUserId /
+// toRoomId だけなので、それ以外を落とす。本家は packMessageDetailed をそのまま
+// 送る (docs/divergence/security.md の「`newChatMessage` の Web Push」の行)。本文が長すぎる分は webpush の fitChatPayload が
+// 切り詰める。
 func (s *Service) packMessagePush(packed map[string]any, sender *model.User, room *model.ChatRoom) map[string]any {
-	out := make(map[string]any, len(packed)+2)
+	out := make(map[string]any, len(packed))
 	for k, v := range packed {
+		switch k {
+		case "fromUser", "toUser", "toRoom":
+			continue
+		}
 		out[k] = v
 	}
-	if _, ok := out["fromUser"]; !ok {
-		out["fromUser"] = packUserStream(sender)
+	out["fromUser"] = map[string]any{
+		"id":        sender.ID,
+		"username":  sender.Username,
+		"host":      sender.Host,
+		"name":      sender.Name,
+		"avatarUrl": s.entityPacker.IdenticonURL(sender),
 	}
 	// **text キーを必ず持たせる。** packMessage は msg.Text が nil だとキーごと
 	// 落とすが、SW は `${name}: ${body.text}` を無条件に組むので添付のみの
@@ -288,21 +365,6 @@ func (s *Service) packMessagePush(packed map[string]any, sender *model.User, roo
 		out["toRoom"] = map[string]any{"id": room.ID, "name": room.Name}
 	}
 	return out
-}
-
-// senderForPush resolves the message author for the push body. Returns nil when
-// the repo is unwired or the lookup fails; pushNewChatMessage then drops the
-// push entirely rather than sending a body the service worker cannot read.
-func (s *Service) senderForPush(fromUserID string) *model.User {
-	if s.userRepo == nil {
-		return nil
-	}
-	u, err := s.userRepo.FindByID(fromUserID)
-	if err != nil {
-		slog.Warn("chat: sender lookup failed, skipping newChatMessage push", "fromUserId", fromUserID, "err", err)
-		return nil
-	}
-	return u
 }
 
 // SetMainStreamPublisher attaches a publisher used to emit `newChatMessage`
@@ -326,12 +388,6 @@ func (s *Service) SetAPDelivery(userRepo repository.UserRepository, renderer *ac
 // nil なら moderator bypass は無効化 (= owner / member / 招待のみ true)。
 func (s *Service) SetModeratorChecker(m ModeratorChecker) {
 	s.moderatorChecker = m
-}
-
-// SetBlockingRepo wires a BlockingRepository so CreateMessageToUser can reject
-// DMs to a recipient who has blocked the sender. nil disables the block check.
-func (s *Service) SetBlockingRepo(r repository.BlockingRepository) {
-	s.blockingRepo = r
 }
 
 // HasPermissionToViewRoomInfo は room のメタ情報を閲覧できる権限を持つか判定する
@@ -491,14 +547,32 @@ func (s *Service) CreateMessageToUser(ctx context.Context, fromUserID, toUserID,
 			otherApprovedMe = ok
 		}
 	}
-	if !otherApprovedMe && s.userRepo != nil {
-		recipient, err := s.userRepo.FindByID(toUserID)
-		if err == nil {
-			sender, err := s.userRepo.FindByID(fromUserID)
-			if err == nil {
-				if err := s.canChat(sender, recipient); err != nil {
-					return nil, err
-				}
+	// recipient は observer (#3469) にも渡す。引けていなければ nil。
+	var recipient, sender *model.User
+	if s.userRepo != nil {
+		users, lookupErr := s.userRepo.FindManyByIDs([]string{fromUserID, toUserID})
+		if lookupErr != nil {
+			return nil, fmt.Errorf("chat participants lookup: %w", lookupErr)
+		}
+		for _, user := range users {
+			switch user.ID {
+			case fromUserID:
+				sender = user
+			case toUserID:
+				recipient = user
+			}
+		}
+		if recipient != nil && !recipient.IsLocal() {
+			if err := ensureFederationAvailable(sender); err != nil {
+				return nil, err
+			}
+		}
+		if s.deliverer != nil && s.renderer != nil && s.urls != nil && (sender == nil || recipient == nil) {
+			return nil, errors.New("chat federation: participants are unavailable")
+		}
+		if !otherApprovedMe && sender != nil && recipient != nil {
+			if err := s.canChat(sender, recipient); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -542,16 +616,15 @@ func (s *Service) CreateMessageToUser(ctx context.Context, fromUserID, toUserID,
 	// 作成と同時に recipient (toUserID) の main に emit する (sender には
 	// 送らない: TS と同じ fan-out 方針)。
 	if s.mainStreamPublisher != nil {
-		packed := s.packMessageStream(msg)
+		// 本家は newChatMessage を packMessageDetailed で組む (fromUser / toUser が
+		// UserLite)。前段の参加者照合で取得した値を使い、再検索しない (#3438)。
+		packed := s.packMessageDetailedStream(msg, sender, recipient, nil)
 		s.mainStreamPublisher.PublishMainEvent(toUserID, "newChatMessage", packed)
-		var sender *model.User
-		if s.chatPusher != nil {
-			sender = s.senderForPush(fromUserID)
-		}
 		s.pushNewChatMessage(toUserID, packed, sender, nil)
 	}
 	// リモートユーザー宛ならAP配送 (best-effort)
 	s.tryDeliverToRemoteUser(msg, fromUserID, toUserID)
+	s.notifyMessageObserver(ctx, msg, recipient)
 	return msg, nil
 }
 
@@ -778,7 +851,7 @@ func (s *Service) isLocalRoomURI(roomURI string) bool {
 //
 // **URL builder が未配線なら "" を返す = 「自ホストではない」と答える。**
 // これは fail-open 側で、唯一の利用者である `EnsureRoomViaAP` の拒否が効かなく
-// なる。本番では `router.go` が必ず配線するうえ、実際の防波堤は federation 側の
+// なる。本番では `internal/server/wiring_streaming.go` が必ず配線するうえ、実際の防波堤は federation 側の
 // `sameDeliveryHost` と local actor の除外なので、ここは多層防御の 1 枚目。
 func (s *Service) localRoomIDFromAPURI(roomURI string) string {
 	if s.urls == nil {
@@ -804,11 +877,8 @@ func (s *Service) localRoomIDFromAPURI(roomURI string) string {
 // room の実在 / owner 自身への招待でない / 既存メンバーでない / 既存招待で
 // ない / 定員 (upstream MAX_ROOM_MEMBERS)。
 //
-// 加えて **invitee が room owner (= 招待者) を block していれば招待ごと拒否する**。
-// upstream の createRoomInvitation は `// TODO: cehck block` のまま block を見ないが、
-// 1-on-1 DM の受信 (CreateMessageViaAP) は見ており、同じ chat 機能の中で AP 経路の
-// 招待だけが無制限に通っていた (通知も発火する)。向きは DM と揃えて
-// `Exists(invitee, owner)` = 受け手が送り手を block しているか。
+// 加えて **invitee と room owner (= 招待者) のどちらかが相手を block していれば
+// 招待ごと拒否する** (本家 createRoomInvitation と同じく両方の向きを見る)。
 //
 // **chatScope (canChat) は見ない。** upstream で chatScope を評価するのは
 // createMessageToUser だけで、room の招待は対象外 (createRoomInvitation にも
@@ -852,17 +922,15 @@ func (s *Service) CreateInvitationViaAP(roomURI, inviteeUserID string) error {
 	} else if !repository.IsNotFound(err) {
 		return err
 	}
-	// invitee が owner を block していれば招待を作らない (通知も出さない)。
-	// CreateMessageViaAP の checkBlocked(to, from) gate と同じ形。
-	if s.blockingRepo != nil {
-		blocked, berr := s.blockingRepo.Exists(inviteeUserID, room.OwnerID)
-		if berr != nil {
-			// fail-closed: block 判定が引けない間は招待を作らない。
-			return fmt.Errorf("chat block check: %w", berr)
-		}
-		if blocked {
-			return ErrChatBlocked
-		}
+	// invitee と owner のどちらかが相手を block していれば招待を作らない (通知も
+	// 出さない)。本家 createRoomInvitation が両方の向きを見るのと揃える。
+	blocked, berr := s.BlockedEitherWay(inviteeUserID, room.OwnerID)
+	if berr != nil {
+		// fail-closed: block 判定が引けない間は招待を作らない。
+		return fmt.Errorf("chat block check: %w", berr)
+	}
+	if blocked {
+		return ErrChatBlocked
 	}
 	// 定員 (upstream MAX_ROOM_MEMBERS)。列挙の失敗は fail-closed にする
 	// (数えられないまま作ると定員判定が素通りする)。
@@ -929,7 +997,33 @@ func (s *Service) AddMemberViaAP(roomURI, userID string) error {
 		_ = s.repo.DeleteInvitation(inv.ID)
 		return nil
 	}
+	// owner とのあいだにどちらかの向きのブロックがあれば参加させない (ローカルの
+	// invitations/accept・rooms/join と同じ)。招待は残し、ErrChatBlocked は再送しない。
+	// 判定が引けないときは参加させずに返す (再送で直りうるので生のエラーのまま)。
+	blocked, berr := s.BlockedEitherWay(userID, room.OwnerID)
+	if berr != nil {
+		return fmt.Errorf("chat block check: %w", berr)
+	}
+	if blocked {
+		return ErrChatBlocked
+	}
 	if _, err := s.repo.FindMembership(userID, roomID); err != nil {
+		// **DB 障害を「まだメンバーでない」に丸めない** (#2792)。丸めると満員の
+		// 判定と参加の作成へ進み、障害の間の判断を誤る。
+		if !repository.IsNotFound(err) {
+			return err
+		}
+		// **人数の上限を見る** (chat/invitations/accept と同じ)。招待を作るときは
+		// その時点の人数しか数えないので、見ないと、上限の近い room で招待を
+		// 並べて承諾させるだけで上限を超えて参加させられた。満員なら招待は残す
+		// (空いたら次の Accept で入れる)。ErrRoomFull は再送しない。
+		members, lerr := s.repo.ListMembersByRoom(roomID)
+		if lerr != nil {
+			return lerr
+		}
+		if len(members) >= maxRoomMembers {
+			return ErrRoomFull
+		}
 		if cerr := s.repo.CreateMembership(&model.ChatRoomMembership{
 			ID: s.idGen.Generate(time.Now()), UserID: userID, RoomID: roomID,
 		}); cerr != nil {
@@ -1049,7 +1143,7 @@ func (s *Service) roomAPURI(room *model.ChatRoom, owner *model.User) string {
 // text mk-go stores, then clips it to `chat_message.text`.
 //
 // **連合で届く chat の本文は HTML。** upstream の note 取り込み
-// (`ApNoteService`) も mk-go の `IngestNote` (`internal/core/federation/resolver.go`)
+// (`ApNoteService`) も mk-go の `IngestNote` (`internal/core/federation/resolver_note.go`)
 // も `content` を `mfm.FromHTML` で MFM に戻してから保存しており、chat だけが
 // 生のまま保存していた。frontend は本文を MFM として描画するので、HTML のまま
 // だと `<` や `&` が `&lt;` / `&amp;` とリテラル表示され、`<p>` などのタグは
@@ -1060,7 +1154,7 @@ func (s *Service) roomAPURI(room *model.ChatRoom, owner *model.User) string {
 // NUL も落とす。
 //
 // **note 取り込みと同じ 3 段** (source → _misskey_content → content) で拾う。
-// 前 2 つは `internal/core/federation/processor.go` の probe が読み取って
+// 前 2 つは `internal/core/federation/processor_create.go` の probe が読み取って
 // `mfmSource` として渡してくるので、この層では「原文があるか」だけを見る。
 func remoteChatText(content, mfmSource string) string {
 	// **原文があれば HTML から戻さない。** `mfm.Parse` -> `ToHTML` -> `FromHTML`
@@ -1110,10 +1204,14 @@ func (s *Service) CreateMessageViaAP(ctx context.Context, uri string, fromUser *
 			otherApprovedMe = ok
 		}
 	}
+	var recipient *model.User
 	if !otherApprovedMe && s.userRepo != nil {
-		if recipient, err := s.userRepo.FindByID(toUserID); err == nil && recipient.IsLocal() {
-			if err := s.canChat(fromUser, recipient); err != nil {
-				return nil, err
+		if r, err := s.userRepo.FindByID(toUserID); err == nil {
+			recipient = r
+			if r.IsLocal() {
+				if err := s.canChat(fromUser, r); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -1148,18 +1246,21 @@ func (s *Service) CreateMessageViaAP(ctx context.Context, uri string, fromUser *
 	// (= 以降 local recipient は scope に依らず remote sender へ返信できる、#1748)。
 	s.recordChatApproval(fromUser.ID, toUserID)
 	if s.publisher != nil {
-		s.publisher.PublishUserMessage(ctx, fromUser.ID, toUserID, EventMessage, packMessage(msg))
+		// 本家の ChatMessageLiteFor1on1 は createdAt が必須。fromUser を持たない形
+		// なので、msg.FromUser を入れずに packMessageStream を通す (#3438)。
+		s.publisher.PublishUserMessage(ctx, fromUser.ID, toUserID, EventMessage, s.packMessageStream(msg))
 	}
 	// Remote → local DM を受信した場合も、CreateMessageToUser と同じく
 	// recipient の main チャネルに newChatMessage を emit してフロントの
 	// 未読インジケータを更新させる。sender は remote なので emit 対象外。
 	if s.mainStreamPublisher != nil {
-		packed := s.packMessageStream(msg)
+		packed := s.packMessageDetailedStream(msg, fromUser, s.resolveUser(recipient, toUserID), nil)
 		s.mainStreamPublisher.PublishMainEvent(toUserID, "newChatMessage", packed)
 		// **引数の fromUser をそのまま使う。** remote sender は user 表に
 		// 居ないこともあるので、引き直すと sender 未解決で push を落とす。
 		s.pushNewChatMessage(toUserID, packed, fromUser, nil)
 	}
+	s.notifyMessageObserver(ctx, msg, recipient)
 	return msg, nil
 }
 
@@ -1188,6 +1289,10 @@ func (s *Service) CreateMessageToRoom(ctx context.Context, fromUserID, roomID, t
 	if !isMember {
 		return nil, ErrForbidden
 	}
+	sender, err := s.ensureRoomFederationAvailable(fromUserID, room)
+	if err != nil {
+		return nil, err
+	}
 	msg := &model.ChatMessage{
 		ID:         s.idGen.Generate(time.Now()),
 		FromUserID: fromUserID,
@@ -1204,16 +1309,78 @@ func (s *Service) CreateMessageToRoom(ctx context.Context, fromUserID, roomID, t
 	if err := s.repo.CreateMessage(msg); err != nil {
 		return nil, fmt.Errorf("create room message: %w", err)
 	}
+	// 本家の room の message (ChatMessageLiteForRoom) は fromUser が必須。行は素で
+	// 組んだので、送信者を 1 回だけ引いて載せる。newChatMessage にも同じものを
+	// 使う (#3438)。
+	if s.publisher != nil || s.mainStreamPublisher != nil {
+		msg.FromUser = sender
+	}
 	if s.publisher != nil {
 		s.publisher.PublishRoomMessage(ctx, roomID, EventMessage, s.packMessageStream(msg))
 	}
 	// Room 宛も同様に、sender と **mute した member** を除く全 member
 	// (owner 含む) の main に newChatMessage を emit する。Misskey 本家
 	// ChatService.createMessageToRoom と同じ fan-out 方針。
-	s.emitRoomNewChatMessage(room, fromUserID, msg, nil)
+	members, membersLoaded := s.emitRoomNewChatMessage(room, fromUserID, msg, sender)
 	// remote member が居れば group Create を AP 配送する (best-effort)。
-	s.tryDeliverRoomMessage(msg, room, fromUserID)
+	s.tryDeliverRoomMessage(msg, room, fromUserID, members, membersLoaded)
 	return msg, nil
+}
+
+func ensureFederationAvailable(actor *model.User) error {
+	if actor == nil {
+		return errors.New("chat federation: actor is unavailable")
+	}
+	if !corelocalfederation.IsExternallyAvailable(actor) {
+		return ErrFederationDisabled
+	}
+	return nil
+}
+
+// ensureRoomFederationAvailable checks the actor before a room message is
+// persisted if the room itself or any room participant is remote.
+func (s *Service) ensureRoomFederationAvailable(actorID string, room *model.ChatRoom) (*model.User, error) {
+	if room == nil || s.userRepo == nil {
+		return nil, nil
+	}
+	actor, err := s.userRepo.FindByID(actorID)
+	if err != nil {
+		return nil, fmt.Errorf("chat federation actor lookup: %w", err)
+	}
+	if actor == nil {
+		return nil, errors.New("chat federation actor is unavailable")
+	}
+	if corelocalfederation.IsExternallyAvailable(actor) {
+		return actor, nil
+	}
+	remote := room.Host != nil && *room.Host != ""
+	if !remote && s.deliverer != nil && s.renderer != nil && s.urls != nil {
+		members, err := s.repo.ListMembersByRoom(room.ID)
+		if err != nil {
+			return nil, fmt.Errorf("chat room federation participants: %w", err)
+		}
+		participantIDs := map[string]struct{}{room.OwnerID: {}}
+		for _, member := range members {
+			participantIDs[member.UserID] = struct{}{}
+		}
+		for participantID := range participantIDs {
+			if participantID == actorID {
+				continue
+			}
+			participant, err := s.userRepo.FindByID(participantID)
+			if err != nil {
+				return nil, fmt.Errorf("chat room federation participant lookup: %w", err)
+			}
+			if participant != nil && !participant.IsLocal() {
+				remote = true
+				break
+			}
+		}
+	}
+	if !remote {
+		return actor, nil
+	}
+	return nil, ErrFederationDisabled
 }
 
 // tryDeliverRoomMessage federates a room message as a CherryPick group chat
@@ -1221,7 +1388,7 @@ func (s *Service) CreateMessageToRoom(ctx context.Context, fromUserID, roomID, t
 // `to` and carries the room URI as its `@context`. Best-effort: no-op when AP
 // delivery is unwired, the sender is remote, or the room has no remote members.
 // Per-recipient failures are logged and swallowed.
-func (s *Service) tryDeliverRoomMessage(msg *model.ChatMessage, room *model.ChatRoom, fromUserID string) {
+func (s *Service) tryDeliverRoomMessage(msg *model.ChatMessage, room *model.ChatRoom, fromUserID string, streamMembers []*model.ChatRoomMembership, streamMembersLoaded bool) {
 	if s.deliverer == nil || s.userRepo == nil || s.renderer == nil || s.urls == nil || room == nil {
 		return
 	}
@@ -1231,11 +1398,14 @@ func (s *Service) tryDeliverRoomMessage(msg *model.ChatMessage, room *model.Chat
 		return
 	}
 	// member 集合 = owner (暗黙メンバー) + membership 行。重複は set で除外する。
+	members := streamMembers
+	if !streamMembersLoaded {
+		// stream 側で取得できなかった場合も、AP 側で独立して再取得する。
+		members, _ = s.repo.ListMembersByRoom(room.ID)
+	}
 	memberIDs := map[string]struct{}{room.OwnerID: {}}
-	if members, merr := s.repo.ListMembersByRoom(room.ID); merr == nil {
-		for _, m := range members {
-			memberIDs[m.UserID] = struct{}{}
-		}
+	for _, m := range members {
+		memberIDs[m.UserID] = struct{}{}
 	}
 	memberURIs := make([]string, 0, len(memberIDs))
 	remoteRecipients := make([]*model.User, 0)
@@ -1441,6 +1611,8 @@ func (s *Service) CreateRoomMessageViaAP(uri string, sender *model.User, roomURI
 	if err := s.repo.CreateMessage(msg); err != nil {
 		return fmt.Errorf("create AP room message: %w", err)
 	}
+	// room の message は fromUser が必須 (本家 ChatMessageLiteForRoom、#3438)。
+	msg.FromUser = sender
 	if s.publisher != nil {
 		s.publisher.PublishRoomMessage(context.Background(), roomID, EventMessage, s.packMessageStream(msg))
 	}
@@ -1468,20 +1640,21 @@ func (s *Service) isRoomMemberWith(room *model.ChatRoom, userID, roomID string) 
 // スキップする (message 自体の作成は成功として返される前に呼ばれる)。
 // sender は分かっていれば渡す (nil なら fromUserID で引き直す)。**remote sender は
 // user 表に居ないことがある**ので、AP 経路は必ず渡すこと。
-func (s *Service) emitRoomNewChatMessage(room *model.ChatRoom, fromUserID string, msg *model.ChatMessage, sender *model.User) {
+// 取得できた membership 一覧を返し、AP 準備でも同じ snapshot を使う。
+// 未取得なら loaded=false とし、AP 側の独立取得を残す。
+func (s *Service) emitRoomNewChatMessage(room *model.ChatRoom, fromUserID string, msg *model.ChatMessage, sender *model.User) ([]*model.ChatRoomMembership, bool) {
 	if s.mainStreamPublisher == nil || room == nil {
-		return
+		return nil, false
 	}
 	members, err := s.repo.ListMembersByRoom(room.ID)
 	if err != nil {
 		slog.Warn("chat: ListMembersByRoom failed, skipping newChatMessage emit", "roomID", room.ID, "err", err)
-		return
+		return nil, false
 	}
-	packed := s.packMessageStream(msg)
-	// push が無効な構成では引かない (1 メッセージあたり FindByID が 1 回増える)。
-	if sender == nil && s.chatPusher != nil {
-		sender = s.senderForPush(fromUserID)
-	}
+	// 本家は newChatMessage を packMessageDetailed で組む (fromUser と toRoom を
+	// 含む)。宛先ごとではなくメッセージごとに 1 回だけ組む (#3438)。
+	sender = s.resolveUser(sender, fromUserID)
+	packed := s.packMessageDetailedStream(msg, sender, nil, room)
 	// 重複 emit を防ぐため set 相当で ID を管理する (membership + owner)。
 	emitted := make(map[string]bool, len(members)+1)
 	// **owner は never-muted として扱う** (mute 判定より前に seed する)。
@@ -1516,6 +1689,7 @@ func (s *Service) emitRoomNewChatMessage(room *model.ChatRoom, fromUserID string
 		s.mainStreamPublisher.PublishMainEvent(uid, "newChatMessage", packed)
 		s.pushNewChatMessage(uid, packed, sender, room)
 	}
+	return members, true
 }
 
 // DeleteMessage removes a message and fans out a `deleted` event on the
@@ -1729,9 +1903,40 @@ func (s *Service) normalizeChatReaction(raw string) (string, error) {
 		}
 		return ":" + name + ":", nil
 	}
-	// variation selector (U+FE0F) を strip して upstream の canonical form に揃える。
-	return strings.ReplaceAll(raw, "\ufe0f", ""), nil
+	// **最初の絵文字 1 つだけを保存する。** upstream の normalizeEmojiString は
+	// emojiRegex.exec (アンカー無し) で最初に見つかった絵文字を取り、無ければ
+	// 'invalid emoji' を投げる。以前は入力をそのまま保存しており、会話の相手の
+	// メッセージに任意の文字列 (約 1000 文字まで) をリアクションとして保存し、
+	// 相手と room の全員へ配れた。
+	first, ok := firstEmoji(raw)
+	if !ok {
+		return "", ErrInvalidReaction
+	}
+	return first, nil
 }
+
+// firstEmoji returns the first unicode emoji in s with its variation selectors
+// (U+FE0F) stripped, the canonical form upstream stores.
+func firstEmoji(s string) (string, bool) {
+	all := gomoji.CollectAll(s)
+	if len(all) == 0 {
+		return "", false
+	}
+	e := all[0].Character
+	// upstream normalizeEmojiString は ZWJ を含む絵文字では FE0F を残す
+	// (取ると合字が崩れる表示系がある)。TS 版から引き継いだ行とも一致させる。
+	if !strings.ContainsRune(e, '\u200d') {
+		e = strings.ReplaceAll(e, "\ufe0f", "")
+	}
+	// 1 つの絵文字 (ZWJ の合字や肌の色の修飾を含む) は十分この長さに収まる。
+	if e == "" || utf8.RuneCountInString(e) > maxChatReactionRunes {
+		return "", false
+	}
+	return e, true
+}
+
+// maxChatReactionRunes bounds a unicode chat reaction.
+const maxChatReactionRunes = 32
 
 // normalizeChatReactionForm canonicalises a chat reaction string WITHOUT validating
 // custom emoji existence: a `:name:` custom-emoji reaction is kept as `:name:`,
@@ -1742,7 +1947,11 @@ func normalizeChatReactionForm(raw string) string {
 	if m := chatCustomEmojiPattern.FindStringSubmatch(raw); m != nil {
 		return ":" + m[1] + ":"
 	}
-	return strings.ReplaceAll(raw, "️", "")
+	// React と同じく最初の絵文字だけを取る (保存した形と一致させる)。
+	if e, ok := firstEmoji(raw); ok {
+		return e
+	}
+	return strings.ReplaceAll(raw, "\ufe0f", "")
 }
 
 // Unreact removes a reaction and publishes an `unreact` stream event (#1549)。
@@ -1762,6 +1971,17 @@ func (s *Service) Unreact(ctx context.Context, messageID string, reactor *model.
 	if err != nil {
 		return fmt.Errorf("remove reaction: %w", err)
 	}
+	// 最初の絵文字だけを保存するようになる前の行 (入力から FE0F を落とした
+	// だけの形) も、付けた本人が外せるようにする。
+	if raw := strings.ReplaceAll(emoji, "\ufe0f", ""); !removed && raw != reaction && !chatCustomEmojiPattern.MatchString(emoji) {
+		removed, err = s.repo.RemoveReaction(messageID, reactor.ID+"/"+raw)
+		if err != nil {
+			return fmt.Errorf("remove reaction: %w", err)
+		}
+		if removed {
+			reaction = raw
+		}
+	}
 	// **実際に消えたときだけ publish する (#3037)。** 参加者でも、付けて
 	// いないリアクションを指定されたときにイベントを流さない。upstream
 	// (`ChatService.unreact`) にも同じ趣旨の TODO がある。
@@ -1779,7 +1999,7 @@ func (s *Service) publishReaction(ctx context.Context, msg *model.ChatMessage, e
 	body := map[string]any{
 		"messageId": msg.ID,
 		"reaction":  emoji,
-		"user":      entity.PackUserLite(reactor),
+		"user":      s.entityPacker.PackUserLite(reactor),
 	}
 	switch {
 	case msg.ToRoomID != nil && *msg.ToRoomID != "":
@@ -1811,10 +2031,19 @@ func (s *Service) IsRoomMember(userID, roomID string) (bool, error) {
 	if err == nil && room.OwnerID == userID {
 		return true, nil
 	}
-	if _, err := s.repo.FindMembership(userID, roomID); err == nil {
-		return true, nil
+	// **DB障害を「メンバーでない」に丸めない。** chatRoomチャンネルはイベントの
+	// たびにここを引き、メンバーでなければ購読を外すので、丸めると一時的な障害で
+	// 開いている部屋の配信が止まる。
+	if err != nil && !repository.IsNotFound(err) {
+		return false, err
 	}
-	return false, nil
+	if _, err := s.repo.FindMembership(userID, roomID); err != nil {
+		if !repository.IsNotFound(err) {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
 }
 
 // CanViewRoomTimeline reports whether userID may subscribe to the room's timeline
@@ -1894,34 +2123,128 @@ func (s *Service) packMessageStream(msg *model.ChatMessage) map[string]any {
 			out["createdAt"] = t.UTC().Format("2006-01-02T15:04:05.000Z")
 		}
 	}
-	if msg.FromUser != nil {
-		out["fromUser"] = packUserStream(msg.FromUser)
+	// fromUser と toUser は 1 回でまとめて埋める (利用者ごとに引かない)。
+	lites := s.packUsersStream(msg.FromUser, msg.ToUser)
+	if lites[0] != nil {
+		out["fromUser"] = lites[0]
 	}
-	if msg.ToUser != nil {
-		out["toUser"] = packUserStream(msg.ToUser)
+	if lites[1] != nil {
+		out["toUser"] = lites[1]
 	}
 	return out
 }
 
-// packUserStream is a UserLite-shaped projection for stream payloads.
-// FE の MkAvatar / chat 一覧が avatarUrl / avatarBlurhash を読むため、
-// fromUser / toUser に含める。avatarUrl 未設定時は `entity.IdenticonURL`
-// 経由で identicon URL に fallback する (#692)。
-func packUserStream(u *model.User) map[string]any {
-	return map[string]any{
-		"id":             u.ID,
-		"username":       u.Username,
-		"name":           u.Name,
-		"host":           u.Host,
-		"avatarUrl":      entity.IdenticonURL(u),
-		"avatarBlurhash": u.AvatarBlurhash,
-		"isBot":          u.IsBot,
-		"isCat":          u.IsCat,
+// packMessageDetailedStream packs msg as upstream's ChatMessage
+// (ChatEntityService.packMessageDetailed) for the main stream `newChatMessage`
+// and its Web Push: fromUser, toUser (direct message) and toRoom (room
+// message, as ChatRoom with owner) on top of packMessage + createdAt. The
+// UserLite values are resolved with one FillLites call.
+//
+// 本家は viewer 無しで toRoom を packRoom する。そのとき membership も invitation
+// も null になるので、isMuted / invitationExists は常に false になる。閲覧者に
+// 依らない固定値なので、ここでも false を出す。sender / toUser を引けなかった
+// ときは該当キーを落とす (push 側は sender が無ければ送らない)。
+func (s *Service) packMessageDetailedStream(msg *model.ChatMessage, sender, toUser *model.User, room *model.ChatRoom) map[string]any {
+	out := packMessage(msg)
+	if s.idGen != nil {
+		if t, err := s.idGen.ParseTime(msg.ID); err == nil {
+			out["createdAt"] = t.UTC().Format("2006-01-02T15:04:05.000Z")
+		}
 	}
+	var owner *model.User
+	if room != nil {
+		owner = s.resolveUser(room.Owner, room.OwnerID)
+	}
+	if msg.ToUserID == nil {
+		toUser = nil
+	}
+	lites := s.packUsersStream(sender, toUser, owner)
+	if lites[0] != nil {
+		out["fromUser"] = lites[0]
+	}
+	if lites[1] != nil {
+		out["toUser"] = lites[1]
+	}
+	if room != nil {
+		r := map[string]any{
+			"id":          room.ID,
+			"name":        room.Name,
+			"description": room.Description,
+			"ownerId":     room.OwnerID,
+			// 本家 packRoom の me 無しの値 (上の説明)。
+			"isMuted":          false,
+			"invitationExists": false,
+		}
+		if s.idGen != nil {
+			if t, err := s.idGen.ParseTime(room.ID); err == nil {
+				r["createdAt"] = t.UTC().Format("2006-01-02T15:04:05.000Z")
+			}
+		}
+		if lites[2] != nil {
+			r["owner"] = lites[2]
+		}
+		out["toRoom"] = r
+	}
+	return out
 }
 
-// HasBlockingRepo reports whether the blocking repository was wired.
+// resolveUser returns known when it is non-nil, and otherwise loads the user
+// by id. It returns nil when the repository is not wired or the lookup fails.
+func (s *Service) resolveUser(known *model.User, id string) *model.User {
+	if known != nil {
+		return known
+	}
+	if s.userRepo == nil || id == "" {
+		return nil
+	}
+	u, err := s.userRepo.FindByID(id)
+	if err != nil {
+		slog.Warn("chat: user lookup for stream payload failed", "userId", id, "err", err)
+		return nil
+	}
+	return u
+}
+
+// packUsersStream packs users as upstream's UserLite (the same
+// (*entity.Packer).PackUserLite the REST API uses) and resolves instance / emojis of all
+// of them with one FillLites call. out[i] is nil when users[i] is nil.
 //
-// 未配線だと**自分をブロックしている**相手へ DM を送れる。gate は
-// `Exists(toUserID, fromUserID)` (blocker が受信者)。起動時検査に使う (#2708)。
-func (s *Service) HasBlockingRepo() bool { return s.blockingRepo != nil }
+// 本家の stream / push の fromUser・toUser は userEntityService.pack の UserLite。
+// 以前は chat だけの縮めた形で、avatarDecorations / emojis / onlineStatus が
+// 欠けていた (#3438)。
+func (s *Service) packUsersStream(users ...*model.User) []*entity.UserLite {
+	out := make([]*entity.UserLite, len(users))
+	present := make([]*model.User, 0, len(users))
+	lites := make([]*entity.UserLite, 0, len(users))
+	for i, u := range users {
+		if u == nil {
+			continue
+		}
+		l := s.entityPacker.PackUserLite(u)
+		out[i] = &l
+		present = append(present, u)
+		lites = append(lites, &l)
+	}
+	if s.lites != nil && len(present) > 0 {
+		s.lites.FillLites(present, lites)
+	}
+	return out
+}
+
+// BlockedEitherWay reports whether either user blocks the other. It is false
+// when the blocking repository is unwired.
+//
+// 本家 createRoomInvitation は招待を作る前に、招待される側が招待する側を
+// ブロックしているか (blocked)、招待する側が招待される側をブロックしているか
+// (blocking) の両方を見る。どちらも素の Error で、応答は同じ 500 になるので、
+// 向きを区別せずに返す。
+func (s *Service) BlockedEitherWay(userA, userB string) (bool, error) {
+	if s.blockingRepo == nil {
+		return false, nil
+	}
+	blocked, err := s.blockingRepo.Exists(userB, userA)
+	if err != nil || blocked {
+		return blocked, err
+	}
+	return s.blockingRepo.Exists(userA, userB)
+}

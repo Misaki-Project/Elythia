@@ -41,16 +41,16 @@ func TestProcess_RejectPendingFollowRequest(t *testing.T) {
 	followingRepo := testutil.NewMockFollowingRepository()
 	requestRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, activitypub.NewURLBuilder("https://example.com"), &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, requestRepo, idGen)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, activitypub.NewURLBuilder("https://example.com"), &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, requestRepo, idGen, nil, nil, nil, nil)
 	events := &rejectMainEvents{}
 	webhooks := &rejectWebhooks{}
 	delivery := &rejectDelivery{}
 	followingSvc.SetMainStreamPublisher(events)
 	followingSvc.SetWebhookHook(webhooks)
 	followingSvc.SetFederationHook(delivery)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	p.SetLocalBaseURL("https://example.com")
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p.SetLocalBaseURLForTest("https://example.com")
 	aliceURI := "https://remote.example/users/alice"
 	host := "remote.example"
 	repo.Users["alice1"] = &model.User{ID: "alice1", Username: "alice", UsernameLower: "alice", URI: &aliceURI, Host: &host, IsLocked: true}
@@ -81,12 +81,12 @@ func TestProcess_RejectFollow_RemoteFollowerIsIgnored(t *testing.T) {
 	followingRepo := testutil.NewMockFollowingRepository()
 	requestRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, activitypub.NewURLBuilder("https://example.com"), &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, requestRepo, idGen)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, activitypub.NewURLBuilder("https://example.com"), &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, requestRepo, idGen, nil, nil, nil, nil)
 	events := &rejectMainEvents{}
 	followingSvc.SetMainStreamPublisher(events)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	p.SetLocalBaseURL("https://example.com")
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p.SetLocalBaseURLForTest("https://example.com")
 	aliceURI := "https://remote.example/users/alice"
 	host := "remote.example"
 	repo.Users["alice1"] = &model.User{ID: "alice1", Username: "alice", UsernameLower: "alice", URI: &aliceURI, Host: &host}

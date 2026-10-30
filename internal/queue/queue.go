@@ -226,11 +226,19 @@ func backoffOptFromPolicy(p Policy) driver.EnqueueOption {
 // MaxAttempts=1 なら WithMaxRetry(0) = 「retry なし、初回のみ」になる
 // (#531 review)。
 func (c *Client) EnqueueDeliver(payload DeliverPayload, opts ...driver.EnqueueOption) error {
-	body := mustMarshal(payload)
+	// json.Marshal を通さずに直接呼ぶ。通すと MarshalJSON の出力をもう一度
+	// 走査 (compact) するので、1 つの投稿で inbox の数だけ積む配送では無駄が
+	// 大きい (#3614)。出力は json.Marshal と同じバイト列になる。
+	body, err := payload.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("queue: marshal deliver payload: %w", err)
+	}
 	// 1 回の policyFor で MaxAttempts と retention の両方を済ませる
 	// (RLock 1 回 / map lookup 1 回に集約)。
 	p := c.policyFor(QueueName)
-	base := []driver.EnqueueOption{driver.WithQueue(QueueName)}
+	// MarshalJSON はどちらの形でも encoding/json と同じ書き方の object を返す
+	// ので、driver の検査を省かせる (宛先の数だけ積むので、#3614)。
+	base := []driver.EnqueueOption{driver.WithQueue(QueueName), driver.WithVerbatimJSONPayload()}
 	if p.MaxAttempts > 0 {
 		base = append(base, driver.WithMaxRetry(p.MaxAttempts-1))
 	}
@@ -283,12 +291,14 @@ const clearScheduledNotePageSize = 100
 // と同 pattern (`getJobs(['delayed', 'waiting', 'active'])` → match →
 // `job.remove()`) を driver の inspector API で再現する。
 //
-// **delayed だけでなく retry も走査する** (#3121)。attempts を積むように
-// なったので、予約投稿の job は「backoff 待ち」の状態を取りうる。そちらは
-// `ListRetryTasks` にしか出ないので、delayed だけ見ていると **取り消しや
-// 再スケジュールが古い job に届かず、backoff 明けに予定と違う時刻で公開
-// される** (取り消しは draft が消えているので processor 側が not-found で
-// ack して救われるが、再スケジュールは draft が残るので救われない)。
+// **delayed は scheduled と retry を合わせて走査する** (#3121)。attempts を
+// 積むようになったので、予約投稿の job は「backoff 待ち」の状態を取りうる。
+// そちらは `ListRetryTasks` にしか出ないので、scheduled だけ見ていると
+// **取り消しや再スケジュールが古い job に届かず、backoff 明けに予定と違う
+// 時刻で公開される** (取り消しは draft が消えているので processor 側が
+// not-found で ack して救われるが、再スケジュールは draft が残るので救われない)。
+// 両方を出す `ListDelayedTasks` でたどる。振り分けた一覧は、1 ページ読むたびに
+// delayed の全件を読み直すので、ページを進めると O(N²) になる (#3169)。
 //
 // 削除 failure は集約して error として返す。**caller は log を残すが 500 には
 // しない** — draft の更新 / 削除そのものは成功しており、そこを 500 にすると
@@ -314,8 +324,7 @@ func (c *Client) ClearScheduledNote(draftID string) error {
 		name string
 		list func(string, int, int) ([]*driver.TaskSummary, error)
 	}{
-		{"scheduled", c.inspector.ListScheduledTasks},
-		{"retry", c.inspector.ListRetryTasks},
+		{"delayed", c.inspector.ListDelayedTasks},
 		{"pending", c.inspector.ListPendingTasks},
 		{"active", c.inspector.ListActiveTasks},
 	} {
@@ -328,18 +337,40 @@ func (c *Client) ClearScheduledNote(draftID string) error {
 
 // clearScheduledNoteIn は ClearScheduledNote の 1 bucket 分の走査。列挙自体の
 // 失敗は即 return (見落としたまま「消した」と言わない)、削除の失敗は集約する。
+//
+// **たどり終えてから消す。** 一覧は添字の範囲で切るので、たどりながら消すと
+// 後ろの task が前へ詰まり、次のページで読み飛ばす (#3169)。走査中に新しい
+// job が入って既に読んだ task が次のページにもう一度出ることがあるので、ID で
+// 重複を除く。
 func (c *Client) clearScheduledNoteIn(bucket string, list func(string, int, int) ([]*driver.TaskSummary, error), draftID string, firstErr *error) error {
-	page := 1
-	for {
+	var ids []string
+	seen := make(map[string]struct{})
+	// 一覧の取得に途中で失敗しても、それまでに見つけた job は消してから返す。
+	// 残すと、時刻を変えた予約投稿が古い時刻で公開される。
+	defer func() {
+		for _, id := range ids {
+			if derr := c.inspector.DeleteTask(QueueName, id); derr != nil {
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf("delete task %s: %w", id, derr)
+				}
+			}
+		}
+	}()
+	for page := 1; ; page++ {
 		tasks, err := list(QueueName, page, clearScheduledNotePageSize)
 		if err != nil {
 			return fmt.Errorf("list %s tasks: %w", bucket, err)
 		}
+		// 短いページでは止めず、空のページまで進む。mkq は HASH が既に無い
+		// job を飛ばすので、途中のページが 100 件に満たないことがある。
 		if len(tasks) == 0 {
 			return nil
 		}
 		for _, t := range tasks {
-			if t.Type != TaskTypePostScheduledNote {
+			if t == nil || t.Type != TaskTypePostScheduledNote {
+				continue
+			}
+			if _, dup := seen[t.ID]; dup {
 				continue
 			}
 			payload, derr := DecodePostScheduledNotePayload(t.Payload)
@@ -351,16 +382,9 @@ func (c *Client) clearScheduledNoteIn(bucket string, list func(string, int, int)
 			if payload.NoteDraftID != draftID {
 				continue
 			}
-			if derr := c.inspector.DeleteTask(QueueName, t.ID); derr != nil {
-				if *firstErr == nil {
-					*firstErr = fmt.Errorf("delete task %s: %w", t.ID, derr)
-				}
-			}
+			seen[t.ID] = struct{}{}
+			ids = append(ids, t.ID)
 		}
-		if len(tasks) < clearScheduledNotePageSize {
-			return nil
-		}
-		page++
 	}
 }
 
@@ -399,10 +423,14 @@ func (c *Client) EnqueueImportCustomEmojis(payload ImportCustomEmojisPayload) er
 // 十分なため)。将来オプション渡しが必要になったら EnqueueDeliver と同じ
 // variadic pattern に揃える。
 func (c *Client) EnqueueInbox(ctx context.Context, payload InboxPayload) error {
-	body := mustMarshal(payload)
+	// EnqueueDeliver と同じ理由で、json.Marshal を通さない (#3614)。
+	body, err := payload.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("queue: marshal inbox payload: %w", err)
+	}
 	// EnqueueDeliver と同じ理由で 1-shot lookup (#1184 / #1193)。
 	p := c.policyFor(InboxQueueName)
-	base := []driver.EnqueueOption{driver.WithQueue(InboxQueueName)}
+	base := []driver.EnqueueOption{driver.WithQueue(InboxQueueName), driver.WithVerbatimJSONPayload()}
 	if p.MaxAttempts > 0 {
 		base = append(base, driver.WithMaxRetry(p.MaxAttempts-1))
 	}

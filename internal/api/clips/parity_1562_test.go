@@ -183,7 +183,7 @@ func TestNotes_MutedAndBlockedUsersFiltered(t *testing.T) {
 	h, repo, noteRepo, notes := newHandler(t)
 	mutingRepo := testutil.NewMockMutingRepository()
 	blockingRepo := testutil.NewMockBlockingRepository()
-	h.SetMuteBlockRepos(mutingRepo, blockingRepo)
+	h.mutingRepo, h.blockingRepo = mutingRepo, blockingRepo
 
 	repo.Clips["c1"] = &model.Clip{ID: "c1", UserID: "alice", IsPublic: true}
 	notes.Notes["n1"] = &model.Note{ID: "n1", UserID: "muted", Visibility: model.NoteVisibilityPublic}
@@ -210,7 +210,7 @@ func TestNotes_BlockedHostFiltered(t *testing.T) {
 	h, repo, noteRepo, notes := newHandler(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x", BlockedHosts: []string{"blocked.example"}}
-	h.SetMetaRepo(metaRepo)
+	h.metaRepo = metaRepo
 
 	host := "blocked.example"
 	repo.Clips["c1"] = &model.Clip{ID: "c1", UserID: "alice", IsPublic: true}
@@ -234,7 +234,7 @@ func TestNotes_BlockedHostFilteredForAnonymous(t *testing.T) {
 	h, repo, noteRepo, notes := newHandler(t)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x", BlockedHosts: []string{"blocked.example"}}
-	h.SetMetaRepo(metaRepo)
+	h.metaRepo = metaRepo
 
 	host := "blocked.example"
 	repo.Clips["c1"] = &model.Clip{ID: "c1", UserID: "alice", IsPublic: true}
@@ -331,7 +331,7 @@ func TestShow_FavoriteLookupErrorDegrades(t *testing.T) {
 // metaRepo.Fetch error は fail-closed で 500 (#1544 と同方針)。
 func TestNotes_MetaFetchErrorIs500(t *testing.T) {
 	h, repo, _, _ := newHandler(t)
-	h.SetMetaRepo(testutil.NewMockMetaRepository()) // Meta 未設定 → Fetch error
+	h.metaRepo = testutil.NewMockMetaRepository() // Meta 未設定 → Fetch error
 	repo.Clips["c1"] = &model.Clip{ID: "c1", UserID: "alice", IsPublic: true}
 	c, rec := newReq(t, `{"clipId":"c1"}`)
 	setUser(c, "alice")
@@ -363,7 +363,7 @@ func TestNotes_MutedInstancesFiltered(t *testing.T) {
 		MutedInstances: datatypes.JSON(`["muted.example"]`),
 	}
 	h.SetUserRepo(userRepo)
-	h.SetMuteBlockRepos(testutil.NewMockMutingRepository(), testutil.NewMockBlockingRepository())
+	h.mutingRepo, h.blockingRepo = testutil.NewMockMutingRepository(), testutil.NewMockBlockingRepository()
 
 	mutedHost := "muted.example"
 	okHost := "ok.example"
@@ -388,7 +388,7 @@ func TestNotes_RenoteNestedMuteFiltered(t *testing.T) {
 	h, repo, noteRepo, notes := newHandler(t)
 	h.SetUserRepo(testutil.NewMockUserRepository())
 	mutingRepo := testutil.NewMockMutingRepository()
-	h.SetMuteBlockRepos(mutingRepo, testutil.NewMockBlockingRepository())
+	h.mutingRepo, h.blockingRepo = mutingRepo, testutil.NewMockBlockingRepository()
 	// renote 先行を引く NoteRepository を配線 (#1630)
 	h.SetNoteRepo(notes)
 
@@ -412,4 +412,15 @@ func TestNotes_RenoteNestedMuteFiltered(t *testing.T) {
 	body := rec.Body.String()
 	assert.NotContains(t, body, `"id":"n1"`, "renote whose target replies to a muted user must be filtered")
 	assert.Contains(t, body, `"id":"n2"`)
+}
+
+// 保存できない文字 (NUL) を含む名前と説明は 400 にすること (500 になっていた)。
+func TestCreate_NameOrDescriptionWithNULRejected(t *testing.T) {
+	for _, body := range []string{`{"name":"a\u0000b"}`, `{"name":"ok","description":"d\u0000"}`} {
+		h, _, _, _ := newHandler(t)
+		c, rec := newReq(t, body)
+		setUser(c, "alice")
+		require.NoError(t, h.Create(c))
+		assert.Equal(t, http.StatusBadRequest, rec.Code, body)
+	}
 }

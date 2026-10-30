@@ -4,10 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
+	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/queue/driver"
@@ -22,6 +26,9 @@ var (
 	// ErrNoLocalSigner is returned when DeliverService is asked to sign with a
 	// remote user. リモートユーザーの代理署名は不可能。
 	ErrNoLocalSigner = errors.New("cannot sign on behalf of a remote user")
+	// ErrFederationDisabled is returned when a local-only or pending account
+	// would otherwise be used as an external delivery signer.
+	ErrFederationDisabled = corelocalfederation.ErrFederationDisabled
 )
 
 // HostBlockChecker reports whether a host is on the blocked list and whether
@@ -66,7 +73,15 @@ type DeliverService struct {
 	keypairExtraRepo   repository.UserKeypairExtraRepository   // optional: sender Ed25519 鍵
 	publickeyExtraRepo repository.UserPublickeyExtraRepository // optional: recipient capability 判定
 	urls               *activitypub.URLBuilder
-	hostBlocker        HostBlockChecker
+	// hostBlocker は配送先の host を federation 設定 (none / specified /
+	// blockedHosts) で弾く判定。配信時に呼ばれ、ブロック対象ホストの inbox には
+	// エンキューしない。**nil だと `isBlockedInbox` が常に false になり、ブロック済み
+	// host へも配送する (outbound の defederation が効かない)。** 構築子の必須の
+	// 引数 (#3833。以前は setter と起動時の検査、#2683)。テストは nil を渡せる。
+	hostBlocker             HostBlockChecker
+	localFederationObserver activitypub.LocalFederationObserver
+	noteRepo                repository.NoteRepository
+	localReferenceCache     localReferenceCache
 	// syncDeliverHook, when non-nil, replaces the queue enqueue with an
 	// inline call to the hook. test 専用で federation deliver の queue 経路
 	// を bypass し、sign + HTTP POST を同期実行する e2e_federation 用。
@@ -84,7 +99,19 @@ type DeliverService struct {
 	// に対する DB lookup を 1 回に集約。resolver の resolveActorGroup と同 pattern。
 	capGroup    singleflight.Group
 	signerGroup singleflight.Group
+	// cacheMu / cacheGen は DropLocal (#3732) のための世代。DropLocal は番号を進めてから
+	// 2 つの cache を消し、読み込みの結果は読む前に控えた番号と一致するときだけ積む。
+	// singleflight の鍵にも番号を含め、捨てた後の呼び出しが捨てる前に始まった
+	// 読み込みに相乗りしないようにする。
+	cacheMu  sync.Mutex
+	cacheGen uint64
 }
+
+func (s *DeliverService) SetLocalFederationObserver(observer activitypub.LocalFederationObserver) {
+	s.localFederationObserver = observer
+}
+
+func (s *DeliverService) SetNoteRepo(repo repository.NoteRepository) { s.noteRepo = repo }
 
 // NewDeliverService constructs a DeliverService.
 func NewDeliverService(
@@ -93,6 +120,7 @@ func NewDeliverService(
 	followingRepo repository.FollowingRepository,
 	keypairRepo repository.UserKeypairRepository,
 	urls *activitypub.URLBuilder,
+	hostBlocker HostBlockChecker,
 ) *DeliverService {
 	return &DeliverService{
 		enqueuer:      enqueuer,
@@ -100,14 +128,9 @@ func NewDeliverService(
 		followingRepo: followingRepo,
 		keypairRepo:   keypairRepo,
 		urls:          urls,
+		hostBlocker:   hostBlocker,
 		clock:         time.Now,
 	}
-}
-
-// SetHostBlockChecker attaches a HostBlockChecker. 配信時にこの checker が
-// 呼ばれ、ブロック対象ホストの inbox にはエンキューしない。
-func (s *DeliverService) SetHostBlockChecker(c HostBlockChecker) {
-	s.hostBlocker = c
 }
 
 // SetClock replaces the clock used by the capability / signer cache TTL
@@ -195,6 +218,66 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 	if len(inboxes) == 0 {
 		return nil
 	}
+	usableInboxes := make([]string, 0, len(inboxes))
+	usableSeen := make(map[string]struct{}, len(inboxes))
+	for _, inbox := range inboxes {
+		if inbox == "" || s.isBlockedInbox(inbox) {
+			continue
+		}
+		if _, dup := usableSeen[inbox]; dup {
+			continue
+		}
+		usableSeen[inbox] = struct{}{}
+		usableInboxes = append(usableInboxes, inbox)
+	}
+	if len(usableInboxes) == 0 {
+		return nil
+	}
+	inboxes = usableInboxes
+	var signer *model.User
+	signerNeedsObservation := false
+	var bodyReferences []referenceCandidate
+	if s.localFederationObserver != nil {
+		var err error
+		signer, signerNeedsObservation, err = s.preflightSigner(signerUserID)
+		if err != nil {
+			return err
+		}
+		knownUsers := make(map[string]*model.User, 1)
+		if signer != nil {
+			knownUsers[signer.ID] = signer
+		}
+		bodyReferences, err = s.preflightBodyReferences(body, knownUsers)
+		if err != nil {
+			return err
+		}
+		// Both signer and every local actor/note reference have passed lookup and
+		// availability checks. Only now can an outbound attempt record a first
+		// external reference.
+		host := firstDeliveryHost(inboxes, s)
+		if signerNeedsObservation {
+			if err := s.observeExternalReference(signer.ID, host); err != nil {
+				return err
+			}
+		}
+		for _, candidate := range bodyReferences {
+			if candidate.observe {
+				if err := s.observeExternalReference(candidate.id, host); err != nil {
+					return err
+				}
+			}
+			s.localReferenceCache.rememberUser(candidate.id, s.clock())
+		}
+		needsNoteRecheck := signerNeedsObservation
+		for _, candidate := range bodyReferences {
+			needsNoteRecheck = needsNoteRecheck || candidate.observe
+		}
+		if needsNoteRecheck {
+			if err := s.confirmOutboundLocalNotes(body); err != nil {
+				return err
+			}
+		}
+	}
 	keyID, keyPEM, err := s.signerCredentials(signerUserID)
 	if err != nil {
 		return err
@@ -258,6 +341,201 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 	return nil
 }
 
+func (s *DeliverService) confirmOutboundLocalNotes(body []byte) error {
+	if s.urls == nil || s.noteRepo == nil {
+		return nil
+	}
+	_, noteIDs := activitypub.ExtractLocalAPReferences(s.urls.BaseURL(), string(body))
+	if len(noteIDs) == 0 {
+		return nil
+	}
+	notes, err := s.noteRepo.FindManyLocalReferenceMetadataByIDs(noteIDs)
+	if err != nil {
+		return fmt.Errorf("confirm local note references before delivery: %w", err)
+	}
+	for _, note := range notes {
+		if note != nil && note.UserHost == nil && note.LocalOnly {
+			return ErrFederationDisabled
+		}
+		if note != nil && note.UserHost == nil && s.localReferenceCache.hasUser(note.UserID, s.clock()) {
+			s.localReferenceCache.rememberNote(note.ID, note.UserID, s.clock())
+		}
+	}
+	return nil
+}
+
+func firstDeliveryHost(inboxes []string, s *DeliverService) string {
+	for _, inbox := range inboxes {
+		if inbox == "" || s.isBlockedInbox(inbox) {
+			continue
+		}
+		if u, err := url.Parse(inbox); err == nil {
+			return u.Host
+		}
+	}
+	return ""
+}
+
+type referenceCandidate struct {
+	id      string
+	observe bool
+}
+
+// preflightSigner checks policy without recording a reference. The returned
+// user is memoized for body validation so the signer is looked up only once.
+func (s *DeliverService) preflightSigner(userID string) (*model.User, bool, error) {
+	if s.localReferenceCache.hasUser(userID, s.clock()) {
+		return nil, false, nil
+	}
+	signer, err := s.userRepo.FindByID(userID)
+	if err != nil {
+		return nil, false, fmt.Errorf("load delivery signer: %w", err)
+	}
+	if !signer.IsLocal() {
+		return signer, false, nil
+	}
+	if !s.localFederationObserver.IsExternallyAvailable(signer) {
+		return nil, false, ErrFederationDisabled
+	}
+	if signer.FirstExternalReferenceAt != nil {
+		s.localReferenceCache.rememberUser(signer.ID, s.clock())
+		return signer, false, nil
+	}
+	return signer, true, nil
+}
+
+// preflightBodyReferences validates all account and note policy centrally so
+// every activity kind is covered before any account is recorded as referenced.
+func (s *DeliverService) preflightBodyReferences(body []byte, knownUsers map[string]*model.User) ([]referenceCandidate, error) {
+	if s.urls == nil || s.userRepo == nil {
+		return nil, nil
+	}
+	userIDs := map[string]struct{}{}
+	ids, noteIDs := activitypub.ExtractLocalAPReferences(s.urls.BaseURL(), string(body))
+	for _, id := range ids {
+		userIDs[id] = struct{}{}
+	}
+	notesToConfirm := make(map[string]string, len(noteIDs))
+	var coldNoteIDs []string
+	for _, id := range noteIDs {
+		if authorID, ok := s.localReferenceCache.noteAuthor(id, s.clock()); ok && s.externallyReferencedHas(authorID) {
+			continue
+		}
+		coldNoteIDs = append(coldNoteIDs, id)
+	}
+	if len(coldNoteIDs) > 0 && s.noteRepo != nil {
+		notes, err := s.noteRepo.FindManyLocalReferenceMetadataByIDs(coldNoteIDs)
+		if err != nil {
+			return nil, fmt.Errorf("lookup local note reference %s: %w", strings.Join(coldNoteIDs, ","), err)
+		}
+		for _, note := range notes {
+			if note == nil || note.UserHost != nil {
+				continue
+			}
+			if note.LocalOnly {
+				return nil, ErrFederationDisabled
+			}
+			notesToConfirm[note.ID] = note.UserID
+			userIDs[note.UserID] = struct{}{}
+		}
+	} else if len(coldNoteIDs) > 0 {
+		return nil, fmt.Errorf("lookup local note references: note repository is unavailable")
+	}
+	userIDList := make([]string, 0, len(userIDs))
+	for id := range userIDs {
+		userIDList = append(userIDList, id)
+	}
+	sort.Strings(userIDList)
+	toLookup := make([]string, 0, len(userIDList))
+	for _, id := range userIDList {
+		if s.localReferenceCache.hasUser(id, s.clock()) {
+			continue
+		}
+		if _, ok := knownUsers[id]; ok {
+			continue
+		}
+		toLookup = append(toLookup, id)
+	}
+	resolved := make(map[string]*model.User, len(toLookup))
+	if len(toLookup) > 0 {
+		users, err := s.userRepo.FindManyByIDs(toLookup)
+		if err != nil {
+			return nil, fmt.Errorf("lookup local user reference %s: %w", strings.Join(toLookup, ","), err)
+		}
+		for _, user := range users {
+			if user != nil {
+				resolved[user.ID] = user
+			}
+		}
+	}
+	candidates := make([]referenceCandidate, 0, len(userIDList))
+	confirmedAuthors := make(map[string]struct{}, len(userIDList))
+	for _, id := range userIDList {
+		if s.localReferenceCache.hasUser(id, s.clock()) {
+			confirmedAuthors[id] = struct{}{}
+			continue
+		}
+		u, ok := knownUsers[id]
+		if !ok {
+			u = resolved[id]
+		}
+		if u == nil {
+			continue
+		}
+		if !u.IsLocal() {
+			continue
+		}
+		if u.FirstExternalReferenceAt != nil {
+			confirmedAuthors[id] = struct{}{}
+		}
+		if !s.localFederationObserver.IsExternallyAvailable(u) {
+			return nil, ErrFederationDisabled
+		}
+		candidates = append(candidates, referenceCandidate{id: u.ID, observe: u.FirstExternalReferenceAt == nil})
+	}
+	if len(notesToConfirm) > 0 {
+		confirmIDs := make([]string, 0, len(notesToConfirm))
+		for id := range notesToConfirm {
+			confirmIDs = append(confirmIDs, id)
+		}
+		confirmed, err := s.noteRepo.FindManyLocalReferenceMetadataByIDs(confirmIDs)
+		if err != nil {
+			return nil, fmt.Errorf("confirm local note references: %w", err)
+		}
+		confirmedByID := make(map[string]*model.Note, len(confirmed))
+		for _, note := range confirmed {
+			if note != nil {
+				confirmedByID[note.ID] = note
+			}
+		}
+		for _, id := range confirmIDs {
+			note := confirmedByID[id]
+			if note == nil || note.LocalOnly || note.UserHost != nil || note.UserID != notesToConfirm[id] {
+				return nil, ErrFederationDisabled
+			}
+			if _, ok := confirmedAuthors[note.UserID]; ok {
+				s.localReferenceCache.rememberNote(id, note.UserID, s.clock())
+			}
+		}
+	}
+	return candidates, nil
+}
+
+func (s *DeliverService) externallyReferencedHas(userID string) bool {
+	return s.localReferenceCache.hasUser(userID, s.clock())
+}
+
+func (s *DeliverService) observeExternalReference(userID, host string) error {
+	if s.localReferenceCache.hasUser(userID, s.clock()) {
+		return nil
+	}
+	if _, err := s.localFederationObserver.ObserveExternalReference(userID, "delivery", host); err != nil {
+		return err
+	}
+	s.localReferenceCache.rememberUser(userID, s.clock())
+	return nil
+}
+
 // recipientIsEd25519Capable reports whether the recipient actor has at least
 // one Ed25519 entry in user_publickey_extra (= 受信側が FEP-521a Multikey で
 // Ed25519 を expose している)。未配線時 / DB error / 行なしのいずれも false
@@ -274,7 +552,8 @@ func (s *DeliverService) recipientIsEd25519Capable(recipient *model.User) bool {
 			return entry.capable
 		}
 	}
-	val, _, _ := s.capGroup.Do(recipient.ID, func() (any, error) {
+	gen := s.cacheGeneration()
+	val, _, _ := s.capGroup.Do(flightKey(recipient.ID, gen), func() (any, error) {
 		rows, err := s.publickeyExtraRepo.ListByUserID(recipient.ID)
 		if err != nil {
 			// DB error は cache せず次回 retry させる (= 戻り値の bool 経由で
@@ -282,9 +561,11 @@ func (s *DeliverService) recipientIsEd25519Capable(recipient *model.User) bool {
 			return false, nil
 		}
 		capable := len(rows) > 0
-		s.capCache.Store(recipient.ID, ed25519CapEntry{
-			capable:   capable,
-			fetchedAt: s.clock(),
+		s.storeIfCurrent(gen, func() {
+			s.capCache.Store(recipient.ID, ed25519CapEntry{
+				capable:   capable,
+				fetchedAt: s.clock(),
+			})
 		})
 		return capable, nil
 	})
@@ -306,12 +587,13 @@ func (s *DeliverService) signerEd25519Credentials(userID string) (string, string
 			return entry.keyID, entry.privPEM
 		}
 	}
-	val, _, _ := s.signerGroup.Do(userID, func() (any, error) {
+	gen := s.cacheGeneration()
+	val, _, _ := s.signerGroup.Do(flightKey(userID, gen), func() (any, error) {
 		kp, err := s.keypairExtraRepo.FindByUserID(userID)
 		if err != nil {
 			// 鍵未発行は cache に空 entry を入れて再 query を抑える
 			entry := ed25519SignerEntry{fetchedAt: s.clock()}
-			s.signerCache.Store(userID, entry)
+			s.storeIfCurrent(gen, func() { s.signerCache.Store(userID, entry) })
 			return entry, nil
 		}
 		entry := ed25519SignerEntry{
@@ -319,11 +601,45 @@ func (s *DeliverService) signerEd25519Credentials(userID string) (string, string
 			privPEM:   kp.Ed25519PrivateKey,
 			fetchedAt: s.clock(),
 		}
-		s.signerCache.Store(userID, entry)
+		s.storeIfCurrent(gen, func() { s.signerCache.Store(userID, entry) })
 		return entry, nil
 	})
 	entry := val.(ed25519SignerEntry)
 	return entry.keyID, entry.privPEM
+}
+
+// DropLocal drops the cached Ed25519 capabilities of recipients and the
+// cached Ed25519 keys of local signers in this process (#3732). It is what the
+// cache list of internal/server calls (docs/architecture.md 4.4). It tells no
+// other process.
+func (s *DeliverService) DropLocal() {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheGen++
+	s.capCache.Clear()
+	s.signerCache.Clear()
+}
+
+func (s *DeliverService) cacheGeneration() uint64 {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	return s.cacheGen
+}
+
+// storeIfCurrent runs store only while no DropLocal has run since gen was
+// read. 番号の比較と積むことを同じ lock の中で行い、比べた直後に捨てられて古い値が
+// 残ることを防ぐ。
+func (s *DeliverService) storeIfCurrent(gen uint64, store func()) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cacheGen == gen {
+		store()
+	}
+}
+
+// flightKey is the singleflight key of id in generation gen.
+func flightKey(id string, gen uint64) string {
+	return id + "\x00" + strconv.FormatUint(gen, 10)
 }
 
 // isBlockedInbox returns true when the inbox URL points at a host the local
@@ -492,9 +808,3 @@ func preferredInbox(u *model.User) string {
 	}
 	return ""
 }
-
-// HasHostBlockChecker reports whether the host block checker was wired.
-//
-// 未配線だと `isBlockedInbox` が常に false になり、ブロック済み host へも
-// 配送する (outbound の defederation が効かない)。起動時検査に使う (#2683)。
-func (s *DeliverService) HasHostBlockChecker() bool { return s.hostBlocker != nil }

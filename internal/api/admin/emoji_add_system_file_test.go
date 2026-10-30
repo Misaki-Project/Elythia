@@ -42,6 +42,14 @@ func ownedDriveFile(t *testing.T, h *apiadmin.Handler, f *model.DriveFile) *test
 	return dr
 }
 
+// systemEmojiFile wires a drive repo holding the system-owned image file
+// "f_sys_emoji" at url. admin/emoji/add uses a system-owned file as is,
+// without a copy, so the emoji gets url as its originalUrl.
+func systemEmojiFile(t *testing.T, h *apiadmin.Handler, url string) {
+	t.Helper()
+	ownedDriveFile(t, h, &model.DriveFile{ID: "f_sys_emoji", Type: "image/png", URL: url})
+}
+
 func errorID(t *testing.T, body []byte) (code, id string) {
 	t.Helper()
 	var resp struct {
@@ -67,7 +75,7 @@ func TestEmojiAdd_FileIDCopiesToSystemOwnedFile(t *testing.T) {
 	fetcher := &fakeEmojiImageFetcher{
 		copyDF: systemCopy("sys1", "https://example/system/copy.png", "https://example/system/copy.webp", "image/webp"),
 	}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_img","isSensitive":true}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -101,7 +109,7 @@ func TestEmojiAdd_FileIDSkipsCopyForSystemOwnedFile(t *testing.T) {
 		Size: int(apiadmin.MaxEmojiCopyBytes) + 1,
 	})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys2", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_sys"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -120,7 +128,7 @@ func TestEmojiAdd_FileIDCopiesRemoteCachedFile(t *testing.T) {
 		ID: "f_remote", UserHost: &host, Type: "image/png", URL: "https://remote.example/cached.png",
 	})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys3", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_remote"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -142,7 +150,7 @@ func TestEmojiAdd_FileIDRejectsCopiedNonImageAndCleansUp(t *testing.T) {
 	bad := systemCopy("sys4", "https://example/system/copy.bin", "", "")
 	bad.Type = "text/plain"
 	fetcher := &fakeEmojiImageFetcher{copyDF: bad}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_img"}`, adminUser)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -193,7 +201,7 @@ func TestEmojiAdd_FileIDCopyFailureMapping(t *testing.T) {
 				ID: "f_img", UserID: &owner, Type: "image/png", URL: "https://example/user/orig.png",
 			})
 			fetcher := &fakeEmojiImageFetcher{copyErr: tc.copyErr}
-			h.SetEmojiImageFetcher(fetcher)
+			h.SetEmojiImageFetcherForTest(fetcher)
 
 			rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_img"}`, adminUser)
 			require.Equal(t, tc.status, rec.Code)
@@ -226,7 +234,7 @@ func TestEmojiAdd_DoesNotCopyBeforeValidation(t *testing.T) {
 			ID: "f_img", UserID: &owner, Type: mime, URL: "https://example/user/orig.png",
 		})
 		fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys_x", "https://example/system/copy.png", "", "")}
-		h.SetEmojiImageFetcher(fetcher)
+		h.SetEmojiImageFetcherForTest(fetcher)
 		return h, fetcher
 	}
 
@@ -269,7 +277,7 @@ func TestEmojiAdd_FileIDRejectsOversizedRowBeforeReading(t *testing.T) {
 		Size: int(apiadmin.MaxEmojiCopyBytes) + 1,
 	})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys7", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_big"}`, adminUser)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -290,7 +298,7 @@ func TestEmojiAdd_FileIDAcceptsRowAtSizeLimit(t *testing.T) {
 		Size: int(apiadmin.MaxEmojiCopyBytes),
 	})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys8", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_max"}`, adminUser)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -304,7 +312,7 @@ func TestEmojiAdd_FileIDCopyReturnsNoFile(t *testing.T) {
 	ownedDriveFile(t, h, &model.DriveFile{
 		ID: "f_img", UserID: &owner, Type: "image/png", URL: "https://example/user/orig.png",
 	})
-	h.SetEmojiImageFetcher(&fakeEmojiImageFetcher{})
+	h.SetEmojiImageFetcherForTest(&fakeEmojiImageFetcher{})
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_img"}`, adminUser)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -321,26 +329,11 @@ func TestEmojiAdd_CreateFailureDeletesSystemCopy(t *testing.T) {
 		ID: "f_img", UserID: &owner, Type: "image/png", URL: "https://example/user/orig.png",
 	})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys5", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_img"}`, adminUser)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.Equal(t, []string{"sys5"}, fetcher.deletedIDs, "作成に失敗した複製が孤児として残っている")
-}
-
-// legacy の `url` 直接指定は取り込まない (所有者の概念が無く、外部 URL も指せる)。
-func TestEmojiAdd_URLPathDoesNotCopy(t *testing.T) {
-	h, repo := setupEmojiHandler(t)
-	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys6", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
-
-	rec := doPost(h.EmojiAdd, `{"name":"happy","url":"https://cdn.example/happy.png"}`, adminUser)
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Empty(t, fetcher.copyCalls)
-	assert.Empty(t, fetcher.calls, "url 経路で HTTP 取り込みを走らせない")
-	got, err := repo.FindByNameAndHost("happy", nil)
-	require.NoError(t, err)
-	assert.Equal(t, "https://cdn.example/happy.png", got.OriginalURL)
 }
 
 // fetcher 未配線なら drive の URL をそのまま使う (EmojiCopy と同じ degradation)。
@@ -370,14 +363,14 @@ func TestEmojiAdd_IDGenUnsetReturns500BeforeCopy(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
-	h := apiadmin.NewHandler(nil, nil, metaRepo, userRepo, nil)
+	h := apiadmin.NewHandler(nil, nil, metaRepo, userRepo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	h.SetEmojiRepo(testutil.NewMockEmojiRepository())
 	owner := "u1"
 	ownedDriveFile(t, h, &model.DriveFile{
 		ID: "f_img", UserID: &owner, Type: "image/png", URL: "https://example/user/orig.png",
 	})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys9", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_img"}`, adminUser)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -390,7 +383,7 @@ func TestEmojiAdd_UnknownFileIDReturnsNoSuchFile(t *testing.T) {
 	h, _ := setupEmojiHandler(t)
 	ownedDriveFile(t, h, &model.DriveFile{ID: "f_other", Type: "image/png", URL: "https://example/x.png"})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys10", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"missing"}`, adminUser)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -400,8 +393,8 @@ func TestEmojiAdd_UnknownFileIDReturnsNoSuchFile(t *testing.T) {
 	assert.Empty(t, fetcher.copyCalls)
 }
 
-// url も fileId も無ければ 400 INVALID_PARAM (drive repo が配線済みでも同じ)。
-func TestEmojiAdd_NeitherURLNorFileIDReturns400(t *testing.T) {
+// fileId が無ければ 400 INVALID_PARAM (drive repo が配線済みでも同じ)。
+func TestEmojiAdd_NoFileIDReturns400(t *testing.T) {
 	h, _ := setupEmojiHandler(t)
 	ownedDriveFile(t, h, &model.DriveFile{ID: "f_img", Type: "image/png", URL: "https://example/x.png"})
 
@@ -421,7 +414,7 @@ func TestEmojiAdd_DuplicateLookupFailureReturns500(t *testing.T) {
 		ID: "f_img", UserID: &owner, Type: "image/png", URL: "https://example/user/orig.png",
 	})
 	fetcher := &fakeEmojiImageFetcher{copyDF: systemCopy("sys11", "https://example/system/copy.png", "", "")}
-	h.SetEmojiImageFetcher(fetcher)
+	h.SetEmojiImageFetcherForTest(fetcher)
 
 	rec := doPost(h.EmojiAdd, `{"name":"happy","fileId":"f_img"}`, adminUser)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)

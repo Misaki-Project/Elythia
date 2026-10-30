@@ -281,12 +281,14 @@ func TestRouter_NonObjectBodyOnEndpointWithoutParams(t *testing.T) {
 		})
 	}
 	// i/revoke-token は本家でも requireCredential を持たず、認証を exec の中で
-	// 確かめる (ajv の後)。object でない body は認証より先に 400 になる。
+	// 確かめる (ajv の後)。object でない body は認証より先に 400 になる。paramDef が
+	// anyOf なので、本家の ajv と同じく #/anyOf/0/type で答える (本家の paramDef で
+	// 検証するようになった #3851 から)。
 	t.Run("revoke-token validates before its in-handler credential check", func(t *testing.T) {
 		code, out := serveBody(t, srv.echo, "/api/i/revoke-token", echo.MIMEApplicationJSON, `null`)
 		assert.Equal(t, http.StatusBadRequest, code, out)
 		errObj, _ := out["error"].(map[string]any)
-		assert.Equal(t, mustBeObject, errObj["info"])
+		assert.Equal(t, map[string]any{"param": "#/anyOf/0/type", "reason": "must be object"}, errObj["info"])
 	})
 }
 
@@ -312,6 +314,12 @@ func TestRequireObjectBody(t *testing.T) {
 		{"HEAD", http.MethodHead, "/api/x", "", ``, false},
 		{"non-endpoint route", http.MethodPost, "/api/signup", echo.MIMEApplicationJSON, `null`, false},
 		{"non-API route", http.MethodPost, "/inbox", echo.MIMEApplicationJSON, `null`, false},
+		// 本家の paramDef が {} の endpoint は、何でも ajv を通る (#3843)。
+		{"any-body endpoint JSON null", http.MethodPost, "/api/reversi/invitations", echo.MIMEApplicationJSON, `null`, false},
+		{"any-body endpoint JSON array", http.MethodPost, "/api/admin/captcha/current", echo.MIMEApplicationJSON, `[1]`, false},
+		{"any-body endpoint no body", http.MethodPost, "/api/reversi/invitations", "", ``, false},
+		{"any-body endpoint text/plain", http.MethodPost, "/api/reversi/invitations", "text/plain", `x`, false},
+		{"object endpoint JSON null", http.MethodPost, "/api/reversi/games", echo.MIMEApplicationJSON, `null`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -344,6 +352,15 @@ func TestRequireObjectBody(t *testing.T) {
 			assert.Equal(t, tc.body, seen)
 		})
 	}
+}
+
+// TestAnyBodyEndpoints pins the endpoints whose upstream paramDef accepts a
+// non-object body. An empty set would mean the golden lookup silently failed.
+func TestAnyBodyEndpoints(t *testing.T) {
+	assert.Equal(t, map[string]bool{
+		"admin/captcha/current": true,
+		"reversi/invitations":   true,
+	}, anyBodyEndpoints())
 }
 
 // TestRequireObjectBody_ReadErrorPassesThrough pins that a body read error
@@ -385,4 +402,34 @@ func TestAPIRoutes_AttachCheckAfterRouteMiddleware(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, serve(http.MethodPost, "/api/denied", `null`))
 	assert.Equal(t, http.StatusBadRequest, serve(http.MethodPost, "/api/match", `null`))
 	assert.Equal(t, http.StatusNoContent, serve(http.MethodGet, "/api/match", ``))
+}
+
+// GET の /api では本文を読まず、query だけを引数にする (本家の Fastify と同じ)。
+// 本文で query を上書きできると、cacheSec の endpoint の public な応答を URL と
+// 違う内容で汚せる (#3593)。
+func TestAPIBinder_GetIgnoresBody(t *testing.T) {
+	type params struct {
+		Name  string `json:"name" query:"name"`
+		Limit *int   `json:"limit" query:"limit"`
+	}
+	for _, path := range []string{"/api/emoji", "/api/charts/notes"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			e := echo.New()
+			e.JSONSerializer = fastJSONSerializer{}
+			req := httptest.NewRequest(method, path+"?name=foo", strings.NewReader(`{"name":"bar","limit":5}`))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			c := e.NewContext(req, httptest.NewRecorder())
+			c.SetPath(path)
+			var got params
+			require.NoError(t, (&apiBinder{}).Bind(&got, c), "%s %s", method, path)
+			assert.Equal(t, "foo", got.Name, "%s %s: the query wins over the body", method, path)
+			assert.Nil(t, got.Limit, "%s %s: the body is not read", method, path)
+		}
+	}
+
+	// POST は従来どおり本文を読む。
+	var got params
+	_, err := bindAt(t, http.MethodPost, "/api/emoji", echo.MIMEApplicationJSON, `{"name":"bar"}`, &got)
+	require.NoError(t, err)
+	assert.Equal(t, "bar", got.Name)
 }

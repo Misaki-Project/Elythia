@@ -1,12 +1,12 @@
 /*
- * SPDX-FileCopyrightText: mk-go project
+ * SPDX-FileCopyrightText: Elythia-Network
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 /**
  * Decides whether "clear cached files" has anything to delete (#3102).
  *
- * **mk-go はリモートメディアをキャッシュしない** (docs/divergence.md 5.5) ので、
+ * **mk-go はリモートメディアをキャッシュしない** (docs/divergence/operations.md 5.5) ので、
  * mk-go が作った行に削除対象は無い (`upsertAttachments` は常に `isLink: true` /
  * `size: 0` の行しか作らない)。**しかし純正 Misskey から引き継いだ DB には、
  * `cacheRemoteFiles` が有効だった時期の実体つきの行が残る。** その運用者にとっては
@@ -16,15 +16,10 @@
  * 続けて間違えた経験から、**確かめていないことを断定しない**枝を表で固定する。
  */
 
-/** Subset of `admin/drive/usage` の remote バケット。 */
-export type RemoteUsageBucket = {
-	/** リモート行の総数。 */
-	count: number;
-	/** `size` 列の合計 (バイト)。実体を持たない行は 0。 */
-	size: number;
-	/** `count` のうち実体を持たない行 (`isLink = true`) の数。 */
-	linkCount: number;
-};
+import type * as Elythia from 'elythia-js';
+
+/** `admin/drive/usage` の remote バケット。 */
+export type RemoteUsageBucket = Elythia.DriveUsageBucket;
 
 export type CleanRemoteFilesState =
 	/** 実体つきの行がある。押せる。 */

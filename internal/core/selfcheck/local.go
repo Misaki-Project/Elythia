@@ -26,6 +26,10 @@ type LocalDeps struct {
 	// MigrationCount は同梱している up migration の本数。DB に記録された
 	// version と突き合わせる。
 	MigrationCount int
+	// LocalMigrationLatest は fork の系列 (migration/local/、#3428) に同梱している
+	// up migration の最大の version。0 なら fork の系列は無いものとして見ない
+	// (Elythia 本体の利用者は `schema_migrations_local` を持たない)。
+	LocalMigrationLatest int64
 	// DBHealth は PostgreSQL の統計の読み取り (#3095)。nil なら skip。
 	DBHealth func(ctx context.Context) (dbhealth.Report, error)
 }
@@ -64,14 +68,61 @@ func CheckDatabase(ctx context.Context, deps LocalDeps) Result {
 	}
 	if row.Dirty {
 		return failResult(name, fmt.Sprintf("migration が dirty (version %d)", row.Version),
-			"前回のマイグレーションが中断している。失敗した version を手当てしてから `schema_migrations.dirty` を false に戻す")
+			"前回のマイグレーションが中断している。失敗した version を手当てしてから `elythia migrate -force <当たっている version> -track core` で管理表を戻す (番号の決め方は docs/deployment.md の「マイグレーションが途中で止まったとき」)")
 	}
 	if deps.MigrationCount > 0 && row.Version < int64(deps.MigrationCount) {
 		return failResult(name,
 			fmt.Sprintf("適用済み version %d / 同梱 %d", row.Version, deps.MigrationCount),
 			"`make migrate-up` で未適用のマイグレーションを当てる。適用漏れは「起動はするが一部機能だけ壊れる」形で出る")
 	}
-	return okResult(name, fmt.Sprintf("接続 ok / migration version %d", row.Version))
+	detail := fmt.Sprintf("接続 ok / migration version %d", row.Version)
+	if deps.LocalMigrationLatest > 0 {
+		local, fail := checkLocalMigrations(ctx, deps)
+		if fail != nil {
+			return *fail
+		}
+		detail += fmt.Sprintf(" / local migration version %d", local)
+	}
+	return okResult(name, detail)
+}
+
+// checkLocalMigrations compares the fork's tracking table with the bundled
+// local migrations. It returns the applied version, or a failure.
+//
+// **core と違って本数ではなく最大の version と比べる。** core は 000001 からの
+// 通番なので本数 = 最後の version だが、fork の系列は 900001 のように飛んだ番号で
+// 始めてもよい。golang-migrate の管理表は最後に当てた version を 1 行だけ持つので、
+// 同梱の最大と一致すれば全部当たっている。
+func checkLocalMigrations(ctx context.Context, deps LocalDeps) (int64, *Result) {
+	const name = "database"
+	var rows []struct {
+		Version int64
+		Dirty   bool
+	}
+	if err := deps.DB.WithContext(ctx).
+		Raw(`SELECT version, dirty FROM schema_migrations_local LIMIT 1`).
+		Scan(&rows).Error; err != nil {
+		r := failResult(name, "schema_migrations_local を読めない (表が無ければ fork の migration が未適用)",
+			"`make migrate-up` で fork の系列 (migration/local/) を適用する")
+		return 0, &r
+	}
+	// 行が無い = 全段を down した後。管理表はあるが 1 本も当たっていない。
+	var version int64
+	if len(rows) == 1 {
+		if rows[0].Dirty {
+			r := failResult(name, fmt.Sprintf("fork の migration が dirty (version %d)", rows[0].Version),
+				"前回の fork の migration が中断している。失敗した version を手当てしてから `elythia migrate -force <当たっている version> -track local` で管理表を戻す (番号の決め方は docs/deployment.md の「マイグレーションが途中で止まったとき」)")
+			return 0, &r
+		}
+		version = rows[0].Version
+	}
+	if version < deps.LocalMigrationLatest {
+		r := failResult(name,
+			fmt.Sprintf("fork の migration: 適用済み version %d / 同梱の最新 %d", version, deps.LocalMigrationLatest),
+			"`make migrate-up` で未適用の fork の migration (migration/local/) を当てる")
+		return 0, &r
+	}
+	return version, nil
 }
 
 // CheckRootUser verifies that meta.rootUserId is set.

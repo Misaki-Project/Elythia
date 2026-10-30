@@ -7,24 +7,10 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/model"
-	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 )
-
-// SetMetaRepo attaches a MetaRepository for POST /api/pinned-users.
-//
-// 未配線なら pinned-users は空配列を返す (upstream も `pinnedUsers` が空なら
-// 同じ結果になるので、shape は変わらない)。
-func (h *Handler) SetMetaRepo(r repository.MetaRepository) { h.metaRepo = r }
-
-// HasMetaRepo reports whether the blocked-host filter can read meta.
-//
-// 未配線だと `blockedHosts` の除外が黙って no-op になる (ブロックしたはずの
-// インスタンスのノートが一覧に出続ける)。起動時の critical wiring 検査で落とす。
-func (h *Handler) HasMetaRepo() bool {
-	return h != nil && h.metaRepo != nil
-}
 
 // SetLocalHost records the instance hostname used to resolve `@user@host`
 // entries in `meta.pinnedUsers`.
@@ -42,12 +28,12 @@ func (h *Handler) SetLocalHost(host string) { h.localHost = host }
 // 引数の不正は本家と同じく 400 INVALID_PARAM にする (#3330)。
 func (h *Handler) List(c echo.Context) error {
 	var req struct {
-		Limit    int    `json:"limit"`
-		Offset   int    `json:"offset"`
-		Sort     string `json:"sort"`
-		State    string `json:"state"`
-		Origin   string `json:"origin"`
-		Hostname string `json:"hostname"`
+		Limit    *jsnum.Int `json:"limit"`
+		Offset   jsnum.Int  `json:"offset"`
+		Sort     string     `json:"sort"`
+		State    string     `json:"state"`
+		Origin   string     `json:"origin"`
+		Hostname string     `json:"hostname"`
 	}
 	if err := c.Bind(&req); err != nil {
 		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
@@ -59,8 +45,9 @@ func (h *Handler) List(c echo.Context) error {
 	if !ValidListState(req.State) {
 		return apierr.JSONInvalidParam(c)
 	}
-	if req.Limit <= 0 {
-		req.Limit = 10
+	limit := 10
+	if p := req.Limit.IntPtr(); p != nil && *p > 0 {
+		limit = *p
 	}
 	if req.Origin == "" {
 		req.Origin = "local"
@@ -77,7 +64,7 @@ func (h *Handler) List(c echo.Context) error {
 	// hostname 絞り込み、認証時は mute/block 除外 (#1957-b)。
 	list, err := h.userRepo.ListUsers(model.UserListFilter{
 		State: req.State, Origin: req.Origin, Sort: req.Sort,
-		Limit: req.Limit, Offset: req.Offset,
+		Limit: limit, Offset: int(req.Offset),
 		Hostname:             req.Hostname,
 		ExplorableOnly:       true,
 		ExcludeRelatedTo:     viewerID,

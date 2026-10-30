@@ -192,7 +192,7 @@ func (rl *RateLimiter) Middleware() echo.MiddlewareFunc {
 				return next(c)
 			}
 			endpoint := strings.TrimPrefix(c.Path(), "/api/")
-			limit, ok := rl.limits[endpoint]
+			limit, ok := rl.limitFor(endpoint)
 			if !ok {
 				return next(c)
 			}
@@ -245,6 +245,81 @@ func (rl *RateLimiter) Middleware() echo.MiddlewareFunc {
 				c.Response().Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", minRemaining))
 			}
 
+			return next(c)
+		}
+	}
+}
+
+// ForEndpoint returns the same limiter behavior for one route, using an
+// endpoint-specific limit instead of the shared definition map. It is useful
+// when a route must pass an authentication gate before its bucket is charged.
+// The limiter configuration is copied so this route cannot change group-wide
+// limits or charge the same request twice.
+// A nil shared limit table preserves the global disableEndpointRateLimits setting.
+func (rl *RateLimiter) ForEndpoint(endpoint string, limit *EndpointLimit) echo.MiddlewareFunc {
+	if rl == nil || limit == nil || rl.limits == nil {
+		return func(next echo.HandlerFunc) echo.HandlerFunc { return next }
+	}
+	scoped := *rl
+	endpointLimit := *limit
+	scoped.limits = map[string]*EndpointLimit{endpoint: &endpointLimit}
+	return scoped.Middleware()
+}
+
+// limitFor returns the limit of endpoint: its table entry, or the default
+// limit of plugin routes.
+//
+// **プラグインのルートにも既定の上限を掛ける。** 表は upstream の endpoint を
+// 写した静的なもので、プラグインのルートは載っていないので素通しになっていた
+// (毎回 UPSERT する設定の口や、リモートの利用者なら peer への送信を起こす口を
+// 無制限に叩けた)。`plugin.Router` には上限を宣言する口が無いので、ルートごと
+// (パスの型ごと) に一律の値を使う。表にあればそちらを優先する。peer の受け口
+// (`_peer`) は相手のサーバーが叩くもので、専用の上限 (plugin_peer_ratelimit.go)
+// があるので外す。表が nil (disableEndpointRateLimits) なら掛けない。
+func (rl *RateLimiter) limitFor(endpoint string) (*EndpointLimit, bool) {
+	if limit, ok := rl.limits[endpoint]; ok {
+		return limit, true
+	}
+	if rl.limits == nil || !strings.HasPrefix(endpoint, "plugin/") || strings.HasSuffix(endpoint, "/_peer") {
+		return nil, false
+	}
+	return &PluginRouteDefaultLimit, true
+}
+
+// AllowIP checks the IP bucket of endpoint for a request that does not go
+// through Middleware (the restore status forwarded during a maintenance). It
+// uses the same key as Middleware, so both count against one bucket. It
+// reports the seconds to wait when the bucket is exhausted.
+func (rl *RateLimiter) AllowIP(ctx context.Context, endpoint, ip string) (bool, int64) {
+	limit, ok := rl.limits[endpoint]
+	if rl.disabled || !ok || !rl.enableIPRateLimit || limit.Duration <= 0 || limit.Max <= 0 {
+		return true, 0
+	}
+	info, err := rl.store.Check(ctx, ipHash(ip)+":"+endpoint, limit.Duration, limit.Max)
+	if err != nil {
+		slog.Warn("rate limit store error", "endpoint", endpoint, "err", err)
+		return true, 0
+	}
+	if info.Remaining > 0 {
+		return true, 0
+	}
+	return false, max((info.ResetMs-time.Now().UnixMilli()+999)/1000, 0)
+}
+
+// RequireIPRateLimit applies the IP bucket of endpoint to a route outside the
+// `/api` group (whose Middleware does not see it). With no limiter, a missing
+// table entry, or enableIpRateLimit off, it lets every request through, as
+// AllowIP does.
+func RequireIPRateLimit(rl *RateLimiter, endpoint string) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if rl == nil {
+				return next(c)
+			}
+			if ok, retry := rl.AllowIP(c.Request().Context(), endpoint, c.RealIP()); !ok {
+				c.Response().Header().Set("Retry-After", fmt.Sprintf("%d", retry))
+				return c.JSON(http.StatusTooManyRequests, apierr.RateLimitExceeded())
+			}
 			return next(c)
 		}
 	}

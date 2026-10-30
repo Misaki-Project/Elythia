@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
+	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
@@ -34,6 +35,7 @@ var (
 	// ErrRemoteSourceForbidden is returned when the caller is not a local user.
 	// AP 配送のため秘密鍵が必要で、リモートユーザーを move 元にはできない。
 	ErrRemoteSourceForbidden = errors.New("source must be a local user")
+	ErrFederationDisabled    = corelocalfederation.ErrFederationDisabled
 )
 
 // Resolver fetches a remote actor by URI and returns the persisted local
@@ -84,12 +86,13 @@ type ProxyAccountIDResolver func() (string, bool)
 
 // Service owns the account-move workflow.
 type Service struct {
-	userRepo      repository.UserRepository
-	followingRepo repository.FollowingRepository
-	urls          *activitypub.URLBuilder
-	renderer      *activitypub.Renderer
-	resolver      Resolver
-	deliverer     Deliverer
+	userRepo                repository.UserRepository
+	followingRepo           repository.FollowingRepository
+	urls                    *activitypub.URLBuilder
+	renderer                *activitypub.Renderer
+	resolver                Resolver
+	deliverer               Deliverer
+	localFederationObserver activitypub.LocalFederationObserver
 
 	// followQueue / proxyAccount は post-move 処理 (#2418) 用。既存の
 	// NewService 呼び出しを壊さないよう setter で後付けする。未設定なら
@@ -110,6 +113,10 @@ type Service struct {
 	instanceCounter      InstanceFollowersCounter
 	instanceStatsEnabled func() bool
 	chartHook            ChartHook
+}
+
+func (s *Service) SetLocalFederationObserver(observer activitypub.LocalFederationObserver) {
+	s.localFederationObserver = observer
 }
 
 // InstanceFollowersCounter adjusts instance(host).followersCount. Implemented
@@ -144,6 +151,11 @@ func (s *Service) SetProxyAccountResolver(f ProxyAccountIDResolver) { s.proxyAcc
 // NewService constructs a Service. resolver / deliverer may be nil in tests;
 // Move returns ErrNoSuchUser early if resolver is missing, and skips delivery
 // if deliverer is missing.
+//
+// blockingRepo / mutingRepo / userListRepo / idGen are the repositories used
+// by the post-move carry-over (#2419). 未設定の系統は skip する (移行そのものは
+// 成立させる)。無いと移行先アカウントにブロック / ミュート / リストが黙って
+// 引き継がれないので、構築子の必須の引数で受ける (#3823)。
 func NewService(
 	userRepo repository.UserRepository,
 	followingRepo repository.FollowingRepository,
@@ -151,6 +163,10 @@ func NewService(
 	renderer *activitypub.Renderer,
 	resolver Resolver,
 	deliverer Deliverer,
+	blockingRepo repository.BlockingRepository,
+	mutingRepo repository.MutingRepository,
+	userListRepo repository.UserListRepository,
+	idGen id.Generator,
 ) *Service {
 	return &Service{
 		userRepo:      userRepo,
@@ -159,6 +175,10 @@ func NewService(
 		renderer:      renderer,
 		resolver:      resolver,
 		deliverer:     deliverer,
+		blockingRepo:  blockingRepo,
+		mutingRepo:    mutingRepo,
+		userListRepo:  userListRepo,
+		idGen:         idGen,
 	}
 }
 
@@ -196,6 +216,16 @@ func (s *Service) Move(src *model.User, dstURI string) error {
 	dst, viaLocalURI, err := s.resolveDestination(dstURI)
 	if err != nil || dst == nil {
 		return ErrNoSuchUser
+	}
+	if s.localFederationObserver != nil {
+		if !s.localFederationObserver.IsExternallyAvailable(src) {
+			return ErrFederationDisabled
+		}
+		if dst.IsLocal() {
+			if !s.localFederationObserver.IsExternallyAvailable(dst) {
+				return ErrFederationDisabled
+			}
+		}
 	}
 	// 解決後の dst URI は resolver が正規化した形 (actor.id) を使う。
 	// これが空なら遷移先が AP 的に不正。
@@ -510,20 +540,6 @@ type AntennaMover interface {
 	OnMoveAccount(src, dst *model.User)
 }
 
-// SetCarryOverRepos wires the repositories used by the post-move carry-over
-// (#2419). 未設定の系統は skip する (移行そのものは成立させる)。
-func (s *Service) SetCarryOverRepos(
-	blockingRepo repository.BlockingRepository,
-	mutingRepo repository.MutingRepository,
-	userListRepo repository.UserListRepository,
-	idGen id.Generator,
-) {
-	s.blockingRepo = blockingRepo
-	s.mutingRepo = mutingRepo
-	s.userListRepo = userListRepo
-	s.idGen = idGen
-}
-
 // SetBlockQueue wires the queue used to schedule block carry-over jobs.
 func (s *Service) SetBlockQueue(q BlockEnqueuer) { s.blockQueue = q }
 
@@ -788,18 +804,4 @@ func (s *Service) lookupByURI(uri string) *model.User {
 		}
 	}
 	return nil
-}
-
-// HasCarryOverRepos reports whether the post-move carry-over repositories were
-// wired.
-//
-// 未配線だと移行先アカウントにブロック / ミュート / リストが引き継がれない。
-// 移行そのものは成立するので、利用者からは「引き継がれなかった」ことしか
-// 見えない。起動時検査に使う (#2683)。
-func (s *Service) HasCarryOverRepos() bool {
-	// **blockQueue も含める。** ブロックの引き継ぎは `blockingRepo == nil ||
-	// blockQueue == nil` の**両方**で止まるので、queue だけ消えても検査が
-	// 通ってしまうと effect に書いたブロック引き継ぎが黙って止まる。
-	return s.blockingRepo != nil && s.mutingRepo != nil && s.userListRepo != nil &&
-		s.idGen != nil && s.blockQueue != nil
 }

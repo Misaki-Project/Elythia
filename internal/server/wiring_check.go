@@ -24,7 +24,12 @@ var errWiringCheckSkipped = errors.New("critical wiring check did not run: setup
 
 // criticalWiringCount is the number of entries setupRoutes is expected to
 // register. Guards against an entry being dropped from the table.
-const criticalWiringCount = 118
+const criticalWiringCount = 9
+
+// entityPackerMissingEffect is the effect shared by the per-component
+// entityPacker rows (#3790, #3792, #3794). The Packer's own mediaURL is a
+// required NewPacker argument since #3834.
+const entityPackerMissingEffect = "リモートのメディア (添付ファイル・アバター等) の URL を media proxy を通さずに返し、閲覧者の IP がリモートへ漏れる"
 
 // criticalWiring names one dependency whose absence degrades behaviour
 // silently instead of failing visibly.
@@ -33,10 +38,11 @@ type criticalWiring struct {
 	//
 	// **grep できる識別子ではなく、運用者向けの安定ラベル。** 多くは
 	// "<package>.<field>" だが、消費側が別パッケージにあるもの
-	// (inbox.signatureVerifier / inbox.replayGuard は processors) や、
+	// (以前の inbox.signatureVerifier / inbox.replayGuard は processors。#3829 で構築子の
+	// 引数にして表から外した) や、
 	// 単一の field ではなく複数の配線が揃って初めて成立するもの
-	// (signup.ticketConsumption = db + ticketRepo) がある
-	// (#2682 review L-C)。実体は各 Has… 述語の GoDoc を見ること。
+	// (以前の signup.ticketConsumption = db + ticketRepo。#3825 で構築子の
+	// 引数にして表から外した) がある (#2682 review L-C)。実体は各 Has… 述語の GoDoc を見ること。
 	name string
 	// wired is the consumer's own report of whether it received the
 	// dependency.
@@ -107,6 +113,16 @@ func (s *Server) recordCriticalWiring(deps []criticalWiring) {
 func (s *Server) constructionError() error {
 	if s.pluginSetupErr != nil {
 		return s.pluginSetupErr
+	}
+	// 部品の一覧への不正な登録 (名前が空・停止が nil・名前の重複、#3699)。停止の順を
+	// 名前で検査する前提が崩れるので、起動させない。
+	if s.lifecycle.err != nil {
+		return s.lifecycle.err
+	}
+	// キャッシュの一覧への不正な登録 (#3721)。名前で引くテストと、登録の順に捨てる
+	// 前提が崩れるので、起動させない。
+	if s.caches.err != nil {
+		return s.caches.err
 	}
 	if !s.wiringChecked {
 		return errWiringCheckSkipped

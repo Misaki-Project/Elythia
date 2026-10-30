@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -21,7 +22,13 @@ type PubSubPublisher interface {
 	Publish(ctx context.Context, channel string, payload any) error
 }
 
-// NotePublisher serializes a model.Note via entity.PackNote, embeds the author
+// BatchPubSubPublisher is a PubSubPublisher that can send one payload to many
+// channels at once (core/event.PubSubService.PublishMany).
+type BatchPubSubPublisher interface {
+	PublishMany(ctx context.Context, channels []string, payload any) []error
+}
+
+// NotePublisher serializes a model.Note via (*entity.Packer).PackNoteWithInstance, embeds the author
 // in NoteEntity.User and publishes the JSON to a Redis pubsub topic. これは
 // core/timeline.StreamingPublisher を実装する。
 //
@@ -41,15 +48,32 @@ type NotePublisher struct {
 	// 解決されない後段 field を埋める。未設定時は従来通り Files が
 	// 空配列のまま publish される (旧挙動)。SetFieldResolver で配線。
 	fieldResolver *entity.NoteFieldResolver
+	// entityPacker は流す投稿を包む依存を持つ (#3790)。無いとリモートのメディアの URL を
+	// 生のまま流すので、構築子の必須の引数で受ける (#3827)。
+	entityPacker *entity.Packer
 
 	mu         sync.Mutex
 	cachedID   string
 	cachedBody []byte
 }
 
-// NewNotePublisher constructs a NotePublisher.
-func NewNotePublisher(pub PubSubPublisher, idGen id.Generator) *NotePublisher {
-	return &NotePublisher{pub: pub, idGen: idGen}
+// DropLocal drops the last packed note held by this process (#3736). pack も
+// mu の中で行うので、捨てる前に始まった pack は待ってから捨てる。ただし呼び出し側が
+// 捨てる前に読んだ投稿者で、捨てた後に pack したものは、次の別のノートまで残る。
+func (p *NotePublisher) DropLocal() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cachedID = ""
+	p.cachedBody = nil
+}
+
+// NewNotePublisher constructs a NotePublisher. entityPacker is the Packer the
+// published notes are packed with (#3790). 無いとリモートのメディアの URL を生のまま
+// 流し、閲覧者の IP がリモートへ漏れる。以前は setter で入れ、入れ忘れを起動時の
+// 検査 (criticalWiring) が見ていた。渡し忘れをコンパイルで落とすため、構築子の必須の
+// 引数で受ける (#3827)。
+func NewNotePublisher(pub PubSubPublisher, idGen id.Generator, entityPacker *entity.Packer) *NotePublisher {
+	return &NotePublisher{pub: pub, idGen: idGen, entityPacker: entityPacker}
 }
 
 // SetEmojiLookup attaches an EmojiLookup so published notes get their
@@ -143,15 +167,89 @@ func (p *NotePublisher) PublishNote(topic string, n *model.Note, author *model.U
 	}
 
 	if err := p.pub.Publish(context.Background(), topic, json.RawMessage(body)); err != nil {
-		slog.Warn("note publisher: publish failed", "topic", topic, "err", err)
+		slog.Warn("note publisher: publish failed", "topic", topic, "id", n.ID, "err", err)
 	}
+}
+
+// PublishNoteMany implements core/timeline.BatchStreamingPublisher: it
+// publishes the note to every topic, packing it once. When the underlying
+// publisher supports PublishMany the topics go out in one batch.
+func (p *NotePublisher) PublishNoteMany(topics []string, n *model.Note, author *model.User) {
+	if p.pub == nil || n == nil || author == nil || len(topics) == 0 {
+		return
+	}
+	// PublishNote と同じ凍結の gate (#2624)。
+	if notesfilter.HasSuspendedAuthor(n, author) {
+		return
+	}
+	body := p.packNote(n, author)
+	if body == nil {
+		return
+	}
+	payload := json.RawMessage(body)
+	var errs []error
+	if bp, ok := p.pub.(BatchPubSubPublisher); ok {
+		errs = bp.PublishMany(context.Background(), topics, payload)
+	} else {
+		for i, topic := range topics {
+			if err := p.pub.Publish(context.Background(), topic, payload); err != nil {
+				if errs == nil {
+					errs = make([]error, len(topics))
+				}
+				errs[i] = err
+			}
+		}
+	}
+	logPublishFailures(n.ID, topics, errs)
+}
+
+// logPublishFailures logs at most one warning for a batch.
+//
+// **1 行にまとめる。** Redis が落ちるとフォロワーのページの全宛先が同時に
+// 失敗し、宛先ごとに出すと 1 投稿で最大 200 行が一度に出る (#3606)。失敗した
+// 宛先は全部出す (1 ページ分に収まる)。失敗が 1 件だけなら PublishNote と
+// 同じ文言・同じ属性 (topic / err) で出し、複数なら別の文言で topics / errors
+// (エラーの種類ごとの件数) を出す。同じ文言で topic と topics が混ざると、
+// 属性で絞る検索が片方を取りこぼす。
+func logPublishFailures(noteID string, topics []string, errs []error) {
+	counts := map[string]int{}
+	var (
+		failed, order []string
+		first         error
+	)
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		if first == nil {
+			first = err
+		}
+		failed = append(failed, topics[i])
+		msg := err.Error()
+		if _, ok := counts[msg]; !ok {
+			order = append(order, msg)
+		}
+		counts[msg]++
+	}
+	switch len(failed) {
+	case 0:
+		return
+	case 1:
+		slog.Warn("note publisher: publish failed", "topic", failed[0], "id", noteID, "err", first)
+		return
+	}
+	kinds := make([]string, 0, len(order))
+	for _, msg := range order {
+		kinds = append(kinds, fmt.Sprintf("%d: %s", counts[msg], msg))
+	}
+	slog.Warn("note publisher: publish failed for several topics", "topics", failed, "failed", len(failed), "total", len(topics), "id", noteID, "errors", kinds)
 }
 
 // packNote returns the serialized JSON for the note. フォロワーfanout時に
 // 同じノートが繰返しpublishされるため、直前のノートIDが一致する場合は
 // キャッシュを再利用して絵文字 / インスタンス解決の DB クエリを 1 回に抑える。
 //
-// author を n.User に差し戻してから entity.PackNoteWithInstance に渡すことで、
+// author を n.User に差し戻してから (*entity.Packer).PackNoteWithInstance に渡すことで、
 // Instance / emoji の解決が embed (Renote / Reply) にまで波及する。shallow
 // copy なので元の model.Note は変更されない (Renote 等のポインタは共有)。
 func (p *NotePublisher) packNote(n *model.Note, author *model.User) []byte {
@@ -169,7 +267,7 @@ func (p *NotePublisher) packNote(n *model.Note, author *model.User) []byte {
 	// 持たない。reactionReader への Redis call は短命なので
 	// context.Background() で進める (#657)。将来 PublishNote signature に
 	// ctx を追加するなら一緒に伝播させる。
-	pn := entity.PackNoteWithInstance(context.Background(), &noteForPack, p.idGen, p.instanceLookup, p.emojiLookup, p.reactionReader)
+	pn := p.entityPacker.PackNoteWithInstance(context.Background(), &noteForPack, p.idGen, p.instanceLookup, p.emojiLookup, p.reactionReader)
 	// streaming note event は upstream NoteCreateService が
 	// withReactionAndUserPairCache=true で pack する経路に対応するため、
 	// reactionAndUserPairCache を (空でも) 出力する (#1640)。REST pack は
@@ -256,7 +354,7 @@ type NotificationFollowingChecker interface {
 // NotificationPublisher serializes a notification.Notification and publishes
 // it to the per-user `notifications:<id>` topic. Implements
 // core/notification.StreamingPublisher. When userRepo / noteRepo are set
-// the outbound JSON is packed via entity.PackNotification so the WebSocket
+// the outbound JSON is packed via (*entity.Packer).PackNotification so the WebSocket
 // body matches Misskey's NotificationEntityService.pack shape.
 type NotificationPublisher struct {
 	pub                  PubSubPublisher
@@ -278,11 +376,16 @@ type NotificationPublisher struct {
 	// (#2735)。未配線だと通知 payload の files が空配列のままになり、通知ページの
 	// reply / mention / quote (MkNote で全体描画される) から添付メディアが消える。
 	fieldResolver *entity.NoteFieldResolver
+	// entityPacker は entity を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3796)。構築子の必須の引数で受ける (#3827)。
+	entityPacker *entity.Packer
 }
 
-// NewNotificationPublisher constructs a NotificationPublisher.
-func NewNotificationPublisher(pub PubSubPublisher) *NotificationPublisher {
-	return &NotificationPublisher{pub: pub}
+// NewNotificationPublisher constructs a NotificationPublisher. entityPacker
+// is the Packer it packs entities with (#3796). 無いと avatarUrl などを生のまま
+// 返し、閲覧者の IP がリモートへ漏れるので、構築子の必須の引数で受ける (#3827)。
+func NewNotificationPublisher(pub PubSubPublisher, entityPacker *entity.Packer) *NotificationPublisher {
+	return &NotificationPublisher{pub: pub, entityPacker: entityPacker}
 }
 
 // SetRepos wires the narrow repositories and id generator used by
@@ -388,6 +491,31 @@ func (p *NotificationPublisher) Pack(notifieeID string, n *corenotification.Noti
 	if n == nil {
 		return nil
 	}
+	var load func() (*model.Note, error)
+	if p.noteRepo != nil {
+		noteID := n.NoteID
+		load = func() (*model.Note, error) { return p.noteRepo.FindByIDWithRelations(noteID) }
+	}
+	return p.pack(notifieeID, n, load)
+}
+
+// PackWithNoteSource implements core/notification.NoteSourcePacker: it is
+// Pack with the referenced note taken from src, which the Web Push payload of
+// the same notification also reads (#3611). The visibility gate is the same.
+func (p *NotificationPublisher) PackWithNoteSource(notifieeID string, n *corenotification.Notification, src *corenotification.NoteSource) any {
+	if n == nil {
+		return nil
+	}
+	// note の repository を配線していない構成では、従来どおり note を埋めない。
+	if src == nil || p.noteRepo == nil {
+		return p.Pack(notifieeID, n)
+	}
+	return p.pack(notifieeID, n, src.Note)
+}
+
+// pack is the body of Pack. loadNote reads the note referenced by n.NoteID;
+// nil means no note repository is wired.
+func (p *NotificationPublisher) pack(notifieeID string, n *corenotification.Notification, loadNote func() (*model.Note, error)) any {
 	if p.userRepo == nil || p.idGen == nil {
 		return n
 	}
@@ -398,8 +526,8 @@ func (p *NotificationPublisher) Pack(notifieeID string, n *corenotification.Noti
 		}
 	}
 	var note *model.Note
-	if n.NoteID != "" && p.noteRepo != nil {
-		if n2, err := p.noteRepo.FindByIDWithRelations(n.NoteID); err == nil {
+	if n.NoteID != "" && loadNote != nil {
+		if n2, err := loadNote(); err == nil {
 			// visibility gate (#1471): note embed を pack に通す前に
 			// notifiee が見られるかを判定。core/note.CanSeeNote と同じ
 			// 条件を、stream → repository への直接依存を避けるため inline
@@ -410,7 +538,7 @@ func (p *NotificationPublisher) Pack(notifieeID string, n *corenotification.Noti
 			}
 		}
 	}
-	packed := entity.PackNotification(n, user, note, p.idGen, p.instanceLookup, p.emojiLookup,
+	packed := p.entityPacker.PackNotification(n, user, note, p.idGen, p.instanceLookup, p.emojiLookup,
 		entity.WithRoleLookup(p.roleLookup),
 		entity.WithAbuseReportLookup(p.abuseReportLookup),
 		entity.WithEmojiApplicationLookup(p.emojiApplicationLookup),

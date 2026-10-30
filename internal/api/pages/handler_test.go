@@ -27,7 +27,7 @@ func newHandler(t *testing.T) (*Handler, *testutil.MockPageRepository, *testutil
 	likeRepo := testutil.NewMockPageLikeRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, likeRepo, idGen)
-	return NewHandler(svc, idGen), repo, likeRepo
+	return NewHandler(svc, idGen, nil, nil, nil), repo, likeRepo
 }
 
 func newReq(t *testing.T, body string) (echo.Context, *httptest.ResponseRecorder) {
@@ -73,7 +73,7 @@ func TestCreate_NameInvalidPattern(t *testing.T) {
 // #1548: eyeCatchingImageId が自分の drive file でなければ NO_SUCH_FILE。
 func TestCreate_EyeCatchingImageNoSuchFile(t *testing.T) {
 	h, _, _ := newHandler(t)
-	h.SetDriveFileRepo(testutil.NewMockDriveFileRepository()) // 空 = 不在
+	h.driveFileRepo = testutil.NewMockDriveFileRepository() // 空 = 不在
 	c, rec := newReq(t, `{"title":"t","name":"alpha","eyeCatchingImageId":"f_ghost","content":[],"variables":[]}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Create(c))
@@ -87,7 +87,7 @@ func TestCreate_EyeCatchingImageForeignFile(t *testing.T) {
 	dr := testutil.NewMockDriveFileRepository()
 	other := "bob"
 	dr.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &other}
-	h.SetDriveFileRepo(dr)
+	h.driveFileRepo = dr
 	c, rec := newReq(t, `{"title":"t","name":"alpha","eyeCatchingImageId":"f1","content":[],"variables":[]}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Create(c))
@@ -100,7 +100,7 @@ func TestCreate_EyeCatchingImageOwned(t *testing.T) {
 	dr := testutil.NewMockDriveFileRepository()
 	owner := "alice"
 	dr.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner}
-	h.SetDriveFileRepo(dr)
+	h.driveFileRepo = dr
 	c, rec := newReq(t, `{"title":"t","name":"alpha","eyeCatchingImageId":"f1","content":[],"variables":[]}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Create(c))
@@ -111,7 +111,7 @@ func TestCreate_EyeCatchingImageOwned(t *testing.T) {
 func TestUpdate_EyeCatchingImageNoSuchFile(t *testing.T) {
 	h, repo, _ := newHandler(t)
 	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Name: "alpha"}
-	h.SetDriveFileRepo(testutil.NewMockDriveFileRepository())
+	h.driveFileRepo = testutil.NewMockDriveFileRepository()
 	c, rec := newReq(t, `{"pageId":"p1","eyeCatchingImageId":"f_ghost"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Update(c))
@@ -157,7 +157,7 @@ func TestCreate_RepoError(t *testing.T) {
 	repo := &failingPageRepo{MockPageRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, testutil.NewMockPageLikeRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{"title":"t","name":"alpha","content":[],"variables":[]}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Create(c))
@@ -179,12 +179,14 @@ func TestShow_ByID(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), `"createdAt":`)
 }
 
-func TestShow_ByName(t *testing.T) {
+// 本家の paramDef は {pageId} と {name, username} だけを受ける。本家に無い
+// {userId, name} は受けない (#3772)。
+func TestShow_UserIDShapeIsNotAccepted(t *testing.T) {
 	h, repo, _ := newHandler(t)
 	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Name: "alpha", Visibility: model.PageVisibilityPublic}
 	c, rec := newReq(t, `{"userId":"alice","name":"alpha"}`)
 	require.NoError(t, h.Show(c))
-	assert.Equal(t, http.StatusOK, rec.Code)
+	testutil.AssertInvalidParam(t, rec)
 }
 
 // TestShow_IncludesUserAndIsLiked guards #1134 for the single-page path:
@@ -276,7 +278,7 @@ func TestShow_NotFound(t *testing.T) {
 // のみ返すため shape が一致し、private page の存在を 403 で露呈しない。
 func TestShow_AccessDenied(t *testing.T) {
 	h, repo, _ := newHandler(t)
-	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "owner", Visibility: model.PageVisibilityFollowers}
+	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "owner", Visibility: model.PageVisibilityPrivate}
 	c, rec := newReq(t, `{"pageId":"p1"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Show(c))
@@ -287,22 +289,10 @@ func TestShow_AccessDenied(t *testing.T) {
 	assert.Equal(t, "NO_SUCH_PAGE", errObj["code"])
 }
 
-// 存在隠蔽は経路非依存であることを固定する (#1432 review)。{userId, name} 経路
-// (ShowByName) でも非public・非所有者には 404 NO_SUCH_PAGE を返す。
-func TestShow_AccessDenied_ByName(t *testing.T) {
-	h, repo, _ := newHandler(t)
-	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "owner", Name: "alpha", Visibility: model.PageVisibilityFollowers}
-	c, rec := newReq(t, `{"userId":"owner","name":"alpha"}`)
-	setUser(c, "alice")
-	require.NoError(t, h.Show(c))
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "NO_SUCH_PAGE")
-}
-
 // {username, name} 経路 (#955) でも非public・非所有者には 404 NO_SUCH_PAGE。
 func TestShow_AccessDenied_ByUsername(t *testing.T) {
 	h, repo, _ := newHandler(t)
-	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Name: "alpha", Visibility: model.PageVisibilityFollowers}
+	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Name: "alpha", Visibility: model.PageVisibilityPrivate}
 	h.SetUserSource(&stubUserSource{
 		byUsernameBundle: &coreuser.UserWithProfile{User: &model.User{ID: "alice", Username: "alice"}},
 	})
@@ -320,7 +310,7 @@ func TestShow_AccessDenied_ByUsername(t *testing.T) {
 // 経路なので明示的に固定する。
 func TestShow_AccessDenied_Guest(t *testing.T) {
 	h, repo, _ := newHandler(t)
-	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "owner", Visibility: model.PageVisibilityFollowers}
+	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "owner", Visibility: model.PageVisibilityPrivate}
 	c, rec := newReq(t, `{"pageId":"p1"}`)
 	// setUser is intentionally NOT called — middleware.GetUser returns nil.
 	require.NoError(t, h.Show(c))
@@ -364,13 +354,15 @@ func TestUpdate_AccessDenied(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// 本家は空の title をそのまま保存する (#3772)。
 func TestUpdate_TitleEmpty(t *testing.T) {
 	h, repo, _ := newHandler(t)
-	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice"}
+	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Title: "t"}
 	c, rec := newReq(t, `{"pageId":"p1","title":""}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Update(c))
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, "", repo.Pages["p1"].Title)
 }
 
 func TestUpdate_NameConflict(t *testing.T) {
@@ -399,7 +391,7 @@ func TestUpdate_RepoError(t *testing.T) {
 	repo := &failingUpdateRepo{MockPageRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, testutil.NewMockPageLikeRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{"pageId":"p1","title":"x"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Update(c))
@@ -455,7 +447,7 @@ func TestDelete_RepoError(t *testing.T) {
 	repo := &failingDeleteRepo{MockPageRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, testutil.NewMockPageLikeRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{"pageId":"p1"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Delete(c))
@@ -514,11 +506,42 @@ func TestMy_RepoError(t *testing.T) {
 	repo := &listFailRepo{MockPageRepository: testutil.NewMockPageRepository()}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, testutil.NewMockPageLikeRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{}`)
 	setUser(c, "alice")
 	require.NoError(t, h.My(c))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// mySpyRepo records the limit and offset ListByUser was called with.
+type mySpyRepo struct {
+	*testutil.MockPageRepository
+	gotLimit, gotOffset int
+}
+
+func (r *mySpyRepo) ListByUser(userID, since, until string, limit, offset int) ([]*model.Page, error) {
+	r.gotLimit, r.gotOffset = limit, offset
+	return r.MockPageRepository.ListByUser(userID, since, until, limit, offset)
+}
+
+// i/pages の整数は、本家の ajv と同じく 10.0 や 1e1 も受ける。本家の paramDef に
+// offset は無いので、型によらず読まない (#3851)。
+func TestMy_IntegerParamsLikeUpstream(t *testing.T) {
+	repo := &mySpyRepo{MockPageRepository: testutil.NewMockPageRepository()}
+	idGen, _ := id.NewGenerator("aidx")
+	h := NewHandler(corepage.NewService(repo, testutil.NewMockPageLikeRepository(), idGen), idGen, nil, nil, nil)
+	for _, body := range []string{
+		`{"limit":1e1,"sinceDate":1.0,"untilDate":4102444800000.0}`,
+		`{"limit":10.0,"offset":"x"}`,
+		`{"limit":10,"offset":5}`,
+	} {
+		c, rec := newReq(t, body)
+		setUser(c, "alice")
+		require.NoError(t, h.My(c))
+		assert.Equal(t, http.StatusOK, rec.Code, body)
+		assert.Equal(t, 10, repo.gotLimit, body)
+		assert.Equal(t, 0, repo.gotOffset, body)
+	}
 }
 
 // --- Featured --------------------------------------------------------------
@@ -641,7 +664,7 @@ func TestFeatured_IgnoresRequestParams(t *testing.T) {
 	repo := &featuredSpyRepo{MockPageRepository: testutil.NewMockPageRepository()}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, testutil.NewMockPageLikeRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{"limit":3,"offset":5,"sinceId":"aaa","untilId":"zzz"}`)
 	require.NoError(t, h.Featured(c))
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -664,7 +687,7 @@ func TestFeatured_RepoError(t *testing.T) {
 	repo := &featuredFailRepo{MockPageRepository: testutil.NewMockPageRepository()}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, testutil.NewMockPageLikeRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{}`)
 	require.NoError(t, h.Featured(c))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -703,7 +726,7 @@ func TestLike_NotFound(t *testing.T) {
 // noSuchPage に集約して 403 で存在露呈しない。
 func TestLike_AccessDenied(t *testing.T) {
 	h, repo, _ := newHandler(t)
-	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Visibility: model.PageVisibilityFollowers}
+	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Visibility: model.PageVisibilityPrivate}
 	c, rec := newReq(t, `{"pageId":"p1"}`)
 	setUser(c, "bob")
 	require.NoError(t, h.Like(c))
@@ -758,7 +781,7 @@ func TestLike_RepoError(t *testing.T) {
 	likeRepo := &failingCreateLikeRepo{MockPageLikeRepository: testutil.NewMockPageLikeRepository()}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, likeRepo, idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{"pageId":"p1"}`)
 	setUser(c, "bob")
 	require.NoError(t, h.Like(c))
@@ -821,7 +844,7 @@ func TestUnlike_RepoError(t *testing.T) {
 	likeRepo := &failingDeleteLikeRepo{MockPageLikeRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corepage.NewService(repo, likeRepo, idGen)
-	h := NewHandler(svc, idGen)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newReq(t, `{"pageId":"p1"}`)
 	setUser(c, "bob")
 	require.NoError(t, h.Unlike(c))
@@ -968,7 +991,7 @@ func TestShow_ResolvesAttachedFilesAndEyeCatchingImage(t *testing.T) {
 	driveRepo.Files["f2"] = &model.DriveFile{ID: "f2", UserID: &alice, Name: "b.png", Type: "image/png"}
 	driveRepo.Files["f3"] = &model.DriveFile{ID: "f3", UserID: &bob, Name: "c.png", Type: "image/png"} // owner mismatch
 	driveRepo.Files["eye1"] = &model.DriveFile{ID: "eye1", UserID: &alice, Name: "eye.png", Type: "image/png"}
-	h.SetDriveFileRepo(driveRepo)
+	h.driveFileRepo = driveRepo
 	h.SetUserSource(&stubUserSource{bundle: &coreuser.UserWithProfile{User: &model.User{ID: "alice", Username: "alice", UsernameLower: "alice"}}})
 
 	c, rec := newReq(t, `{"pageId":"`+pageID+`"}`)
@@ -1061,4 +1084,37 @@ func TestCreate_OrdinaryJSONBStillPasses(t *testing.T) {
 	setUser(c, "alice")
 	require.NoError(t, h.Create(c))
 	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// summary / eyeCatchingImageId の null は、本家と同じく外す。省略は今の値を
+// 残す (#3751)。同梱の frontend は、アイキャッチ画像を外すと null を送る。
+func TestUpdate_NullClearsSummaryAndEyeCatchingImage(t *testing.T) {
+	h, repo, _ := newHandler(t)
+	summary, img := "s", "img"
+	repo.Pages["p1"] = &model.Page{ID: "p1", UserID: "alice", Name: "alpha", Title: "t", Summary: &summary, EyeCatchingImageID: &img}
+
+	c, rec := newReq(t, `{"pageId":"p1","title":"t2"}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Update(c))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	last := repo.UpdateFieldsCalls[len(repo.UpdateFieldsCalls)-1]
+	assert.NotContains(t, last, "summary", "an absent summary must be kept")
+	assert.NotContains(t, last, "eyeCatchingImageId", "an absent eyeCatchingImageId must be kept")
+	require.NotNil(t, repo.Pages["p1"].Summary)
+	require.NotNil(t, repo.Pages["p1"].EyeCatchingImageID)
+
+	c, rec = newReq(t, `{"pageId":"p1","summary":null,"eyeCatchingImageId":null}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Update(c))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	last = repo.UpdateFieldsCalls[len(repo.UpdateFieldsCalls)-1]
+	require.Contains(t, last, "summary")
+	require.Contains(t, last, "eyeCatchingImageId")
+	assert.Nil(t, repo.Pages["p1"].Summary)
+	assert.Nil(t, repo.Pages["p1"].EyeCatchingImageID)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Nil(t, resp["summary"])
+	assert.Nil(t, resp["eyeCatchingImageId"])
 }

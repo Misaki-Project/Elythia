@@ -12,11 +12,13 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/elythia-network/elythia/internal/misc/keyword"
+	"github.com/elythia-network/elythia/internal/misc/remoteurl"
 	"github.com/elythia-network/elythia/internal/safehttp"
-	"github.com/redis/go-redis/v9"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/net/html/charset"
 )
 
@@ -31,8 +33,17 @@ var (
 	ErrPrivateIP = safehttp.ErrSSRFBlocked
 )
 
-const cachePrefix = "url-preview:"
-const cacheTTL = 24 * time.Hour
+// Cache bounds.
+//
+// **件数に上限のあるプロセス内のキャッシュにする。** 以前は Redis に URL ごとの
+// キーを 24 時間置いており、`/url` は認証も rate limit も無いので、クエリを
+// 変えた URL を投げ続けるだけで Redis (キュー・rate limit・タイムラインと同居)
+// のメモリを無制限に増やせた。upstream も MemoryKVCache (1 時間) のプロセス内
+// キャッシュで、件数で有界。
+const (
+	cacheSize = 1000
+	cacheTTL  = time.Hour
+)
 
 // Config holds URL preview settings read from Meta.
 type Config struct {
@@ -48,10 +59,16 @@ type Config struct {
 // Fetcher fetches and parses URL previews with caching and SSRF protection.
 type Fetcher struct {
 	cfg         Config
-	redis       *redis.Client
-	keyPrefix   string // TS drop-in互換用 `<host>:` prefix
 	client      *http.Client
 	proxyClient *http.Client
+	// cache はポインタで持つ。forRequest がリクエストごとに Fetcher を複製するので、
+	// 値で持つと mutex と世代の番号が複製されて、DropLocal が複製に届かない (#3776)。
+	cache *previewCache
+
+	// cfgProvider returns the current settings (meta). 管理画面で変えた値
+	// (有効/無効、リダイレクト、上限、timeout、summaryProxy) を再起動なしで
+	// 効かせる。nil なら NewFetcher に渡した Config を使い続ける (テスト用)。
+	cfgProvider func() (Config, error)
 
 	// sensitiveList は meta.urlPreviewSensitiveList を返す provider
 	// (upstream 2026.7.0 #17635)。admin が随時変更するため、起動時
@@ -72,49 +89,130 @@ func (f *Fetcher) SetHTTPClient(c *http.Client) {
 	f.client = c
 }
 
-// NewFetcher creates a URL preview Fetcher.
+// SetTransport replaces the transport under the preview client, keeping
+// the timeout and redirect policy built from the settings. The transport
+// must apply the same SSRF guard (safehttp.NewSSRFSafeTransport).
 //
-// keyPrefix (通常は `cfg.Redis.KeyPrefix()` = `<host>:`) は TS 本家と同じ
-// キー名前空間の下にキャッシュキーを置くために前置される。空文字列なら
-// prefix 無し。
+// サーバーは外向き全体で 1 つの Transport を共有して、同じ相手への接続を
+// 使い回す (#3591)。設定を毎回読む構成では forRequest もこの Transport を引き継ぐ。
+func (f *Fetcher) SetTransport(rt http.RoundTripper) {
+	f.client = newPreviewClient(f.cfg, rt)
+}
+
+// SetConfigProvider makes the fetcher read its settings on every request.
+func (f *Fetcher) SetConfigProvider(p func() (Config, error)) {
+	f.cfgProvider = p
+}
+
+// forRequest returns the fetcher to use for one request: f itself, or a copy
+// carrying the current settings and HTTP clients built from them.
 //
-// allowedPrivateNetworks は SSRF guard で例外的に許可する CIDR (config の
-// allowedPrivateNetworks をそのまま渡す)。transportOpts は forward proxy /
-// outgoing address / address family などの outbound 設定で、AP fetch や
-// media proxy と挙動を揃えるため `safehttp.WithProxy(...)` などを渡す
-// (#638)。
-func NewFetcher(cfg Config, rdb *redis.Client, keyPrefix string, allowedPrivateNetworks []string, transportOpts ...safehttp.Option) *Fetcher {
+// transport (SSRF guard と proxy) は共有し、timeout と redirect の扱いだけを
+// 設定から組み直す。
+func (f *Fetcher) forRequest() (*Fetcher, error) {
+	if f.cfgProvider == nil {
+		return f, nil
+	}
+	cfg, err := f.cfgProvider()
+	if err != nil {
+		return nil, fmt.Errorf("%w: read settings: %v", ErrFetchFailed, err)
+	}
+	g := *f
+	g.cfg = cfg
+	g.client = newPreviewClient(cfg, f.client.Transport)
+	g.proxyClient = &http.Client{Timeout: previewTimeout(cfg)}
+	return &g, nil
+}
+
+func previewTimeout(cfg Config) time.Duration {
 	timeout := time.Duration(cfg.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	return timeout
+}
 
+func newPreviewClient(cfg Config, transport http.RoundTripper) *http.Client {
 	client := &http.Client{
-		Timeout:   timeout,
-		Transport: safehttp.NewSSRFSafeTransport(allowedPrivateNetworks, transportOpts...),
+		Timeout:   previewTimeout(cfg),
+		Transport: transport,
 	}
 	if !cfg.AllowRedirect {
 		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
 	}
+	return client
+}
 
+// NewFetcher creates a URL preview Fetcher.
+//
+// allowedPrivateNetworks は SSRF guard で例外的に許可する CIDR (config の
+// allowedPrivateNetworks をそのまま渡す)。transportOpts は forward proxy /
+// outgoing address / address family などの outbound 設定で、AP fetch や
+// media proxy と挙動を揃えるため `safehttp.WithProxy(...)` などを渡す
+// (#638)。
+func NewFetcher(cfg Config, allowedPrivateNetworks []string, transportOpts ...safehttp.Option) *Fetcher {
 	return &Fetcher{
-		cfg:       cfg,
-		redis:     rdb,
-		keyPrefix: keyPrefix,
-		client:    client,
+		cfg:    cfg,
+		client: newPreviewClient(cfg, safehttp.NewSSRFSafeTransport(allowedPrivateNetworks, transportOpts...)),
 		// proxyClient は管理者が設定した summalyProxy への呼び出し用。
 		// operator-trusted endpoint (社内 summaly や localhost に立てた
 		// proxy) を指定するケースがあるため SSRF guard は適用しない。
 		// ここに forward proxy を掛けると 127.0.0.1 への内向き呼び出しまで
 		// proxy 経由になって壊れるので、明示的に裸の Client を使う。
-		proxyClient: &http.Client{Timeout: timeout},
+		proxyClient: &http.Client{Timeout: previewTimeout(cfg)},
+		cache:       &previewCache{lru: expirable.NewLRU[string, []byte](cacheSize, nil, cacheTTL)},
 	}
 }
 
-// Fetch returns the URL preview, using Redis cache when available.
+// previewCache holds the previews of one Fetcher and every copy forRequest
+// makes of it.
+type previewCache struct {
+	mu  sync.Mutex
+	lru *expirable.LRU[string, []byte]
+	// gen は DropLocal で進める世代の番号 (#3776)。取得はロックの外で走るので、
+	// 捨てる前に始めた取得の結果を、捨てた後に積まないために使う。
+	gen uint64
+}
+
+// get returns the cached preview for key, and the generation to pass to add
+// when it is missing.
+func (c *previewCache) get(key string) (data []byte, gen uint64, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	data, ok = c.lru.Get(key)
+	return data, c.gen, ok
+}
+
+// add stores data unless the cache was dropped since gen was read.
+func (c *previewCache) add(key string, data []byte, gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gen == gen {
+		c.lru.Add(key, data)
+	}
+}
+
+// DropLocal drops the previews held by this process (#3776). 他のプロセスへは
+// 伝えない。
+//
+// 取得の条件 (redirect の可否、本文の上限など) は meta の設定で決まるが、
+// metaUpdated では捨てていない (以前からの挙動)。ここで捨てるのは、一覧から
+// 全部を捨てるときだけ。
+func (f *Fetcher) DropLocal() {
+	f.cache.mu.Lock()
+	defer f.cache.mu.Unlock()
+	f.cache.gen++
+	f.cache.lru.Purge()
+}
+
+// Fetch returns the URL preview, using the in-process cache when available.
 func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (*Result, error) {
+	f, err := f.forRequest()
+	if err != nil {
+		return nil, err
+	}
 	if !f.cfg.Enabled {
 		return nil, ErrDisabled
 	}
@@ -135,19 +233,19 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (*Result, error) {
 		return result, nil
 	}
 
-	// Redisキャッシュ確認
-	cacheKey := f.keyPrefix + cachePrefix + hashURL(rawURL)
-	if f.redis != nil {
-		if cached, err := f.redis.Get(ctx, cacheKey).Bytes(); err == nil {
-			var result Result
-			// 旧バージョン期に検証前の値が入った可能性に備え、cache 読み出し
-			// にも scheme 検証を掛ける (不正 entry は miss 扱いで再取得)。
-			if json.Unmarshal(cached, &result) == nil && validateResultSchemes(&result) == nil {
-				// sensitive 上書きは cache 読み出し後に評価する (upstream 同様、
-				// リスト変更が cache 済み entry にも即時反映される)。
-				f.applySensitiveList(&result)
-				return &result, nil
-			}
+	// キャッシュ確認
+	cacheKey := hashURL(rawURL)
+	// 世代の番号は取得の前に読む。取得の途中で捨てられたら、取った値は積まない。
+	cached, gen, ok := f.cache.get(cacheKey)
+	if ok {
+		var result Result
+		// 旧バージョン期に検証前の値が入った可能性に備え、cache 読み出し
+		// にも scheme 検証を掛ける (不正 entry は miss 扱いで再取得)。
+		if json.Unmarshal(cached, &result) == nil && validateResultSchemes(&result) == nil {
+			// sensitive 上書きは cache 読み出し後に評価する (upstream 同様、
+			// リスト変更が cache 済み entry にも即時反映される)。
+			f.applySensitiveList(&result)
+			return &result, nil
 		}
 	}
 
@@ -162,12 +260,10 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (*Result, error) {
 		return nil, err
 	}
 
-	// Redisキャッシュ保存 (keyword 由来の sensitive 上書き前の生値を保存し、
+	// キャッシュ保存 (keyword 由来の sensitive 上書き前の生値を保存し、
 	// リスト変更が過去 entry へ遡って効くようにする)。
-	if f.redis != nil {
-		if data, err := json.Marshal(result); err == nil {
-			f.redis.Set(ctx, cacheKey, data, cacheTTL)
-		}
+	if data, err := json.Marshal(result); err == nil {
+		f.cache.add(cacheKey, data, gen)
 	}
 
 	f.applySensitiveList(result)
@@ -191,7 +287,7 @@ func (f *Fetcher) applySensitiveList(result *Result) {
 //
 // upstream は thumbnail / icon を無条件に mediaProxy URL へ書き換えるので
 // 非 http(s) 値がクライアントに出ることが構造上ありえないが、mk-go の
-// `entity.ProxyMediaURL` は host を持たない URL (`javascript:…` / `data:…`) を
+// `(*entity.Packer).ProxyMediaURL` は host を持たない URL (`javascript:…` / `data:…`) を
 // proxy 対象外として素通しするため、ここで落とす必要がある。
 func validateResultSchemes(result *Result) error {
 	if !isHTTPScheme(result.URL) {
@@ -200,18 +296,40 @@ func validateResultSchemes(result *Result) error {
 	if result.Player.URL != nil && *result.Player.URL != "" && !isHTTPScheme(*result.Player.URL) {
 		return fmt.Errorf("%w: unsupported schema in player url", ErrFetchFailed)
 	}
+	// scheme が http(s) でも host を持たない player の URL (`https:///…` など) は、
+	// preview 全体は落とさずに player だけを捨てる。
+	if result.Player.URL != nil && *result.Player.URL != "" && !hasHTTPHost(*result.Player.URL) {
+		result.Player = PlayerResult{Allow: []string{}}
+	}
 	// thumbnail / icon は preview 全体を落とすほどではないので、値だけ捨てる
 	// (upstream も画像が壊れているだけで preview 自体は返す)。
-	dropNonHTTP(&result.Thumbnail)
-	dropNonHTTP(&result.Icon)
+	dropMalformedMedia(&result.Thumbnail)
+	dropMalformedMedia(&result.Icon)
 	return nil
 }
 
-// dropNonHTTP clears an optional URL field when it is not http(s).
-func dropNonHTTP(field **string) {
-	if *field != nil && **field != "" && !isHTTPScheme(**field) {
-		*field = nil
+// dropMalformedMedia replaces an optional image URL with its remoteurl.Media
+// form, or clears it when the value is not an absolute http(s) URL with a host.
+//
+// 画面ではメディアプロキシで包んでから img の src に入れるが、プロキシは host を
+// 持つ絶対 URL しか包まない。scheme の接頭辞だけを見ると `https:///…` が通り、
+// 相対参照を解決しても host が空のまま包まれずに出てしまう。
+func dropMalformedMedia(field **string) {
+	if *field == nil || **field == "" {
+		return
 	}
+	clean, ok := remoteurl.Media(**field)
+	if !ok {
+		*field = nil
+		return
+	}
+	*field = &clean
+}
+
+// hasHTTPHost reports whether raw parses as an http(s) URL with a host.
+func hasHTTPHost(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https")
 }
 
 // isHTTPScheme reports whether the URL uses http(s)。

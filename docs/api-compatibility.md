@@ -1,6 +1,6 @@
 # API互換性状況
 
-対象バージョン: **Misskey 2026.10.0** (Elythia 2.0.0)
+対象バージョン: **Misskey 2026.10.1** (Elythia 2.1.0)
 最終更新: 2026-09-23
 
 本ドキュメントは互換性調査 (#107, #124) と、Playwright Phase 1-4 で発見・修正した drift backlog の**履歴**を集約したもの。
@@ -17,9 +17,9 @@
 
 ## 概要
 
-- **upstream catch-up**: **2026.10.0 まで追従完了**。2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 → 2026.10.0 と段階的に追従した (**2026.8.0 に stable は無い**)。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
-- **本家 backend e2e**: Misskey 本家の `test/e2e/**` をテスト本体無改変で Elythia に向けて実行する基盤を整備し、**25 ファイル 1256 テストが全通過**。PR ごとに CI で回る。『通らないことが正しい』23 件は根拠付きで expected-failure として登録している ([`upstream-backend-e2e.md`](upstream-backend-e2e.md))
-- **Playwright e2e**: 298 spec ファイルを PR ごとに実行。Misskey TS backend に対しては upstream 追従時に実行し、spec が Elythia の挙動に引きずられていないかを検証する
+- **upstream catch-up**: **2026.10.1 まで追従完了**。2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 → 2026.10.0 → 2026.10.1 と段階的に追従した (**2026.8.0 に stable は無い**)。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
+- **本家 backend e2e**: Misskey 本家の `test/e2e/**` を本家ソースを正本として Elythia に向けて実行する基盤を整備し、**25 ファイル 1256 テストが全通過**。ローカル連合状態は UserLite の期待DTOだけに追加し、ほかの比較を維持する。PR ごとに CI で回る。『通らないことが正しい』23 件は根拠付きで expected-failure として登録している ([`upstream-backend-e2e.md`](upstream-backend-e2e.md))
+- **Playwright e2e**: 299 spec ファイルを PR ごとに実行。Misskey TS backend に対しては upstream 追従時に実行し、spec が Elythia の挙動に引きずられていないかを検証する
 - **drift backlog**: Phase 1-4 の spec 整備中に発見した 40+ 件の drop-in 互換 drift は fix 済
 
 ## エンドポイントカバー率 (Playwright Phase 1-4 時点)
@@ -215,8 +215,10 @@ upstream / 他実装が出してくる variant に対するロバスト性:
 
 ### チャンネルカバー率
 
-**upstream の 18 チャンネルをすべて実装**し、Elythia 独自の `notifications` を
-加えて 19。#125 で欠損 9 チャンネルを追加した。
+**upstream の 19 チャンネルをすべて実装**し、Elythia 独自の `notifications`・
+`bubbleVersus`・`bubbleVersusMatch` を加えて 22。#125 で欠損 9 チャンネルを追加した。
+`clip` は本家 2026.10.1 で増えたもの (#3809)。一覧は
+[divergence/config.md](divergence/config.md#4-1-websocket-streaming-チャンネル) にある。
 
 `notifications` は upstream に無い (upstream は `main` チャンネルで通知を流す)
 ので、これに依存するクライアントは Misskey TS では動かない。
@@ -280,11 +282,13 @@ TS版の`.config/default.yml`をそのまま使用可能。以下の設定もGo�
 
 ### テーブル
 
-Go側のマイグレーション (000001〜) はTS版テーブルに対して原則追加のみだが、例外が 19 件ある ([migration-from-ts.md](migration-from-ts.md#破壊的なマイグレーション))。TS版のマイグレーションで作成される全テーブルは維持される。
+Go側のマイグレーション (000001〜) はTS版テーブルに対して原則追加のみだが、例外が 22 件ある ([migration-from-ts.md](migration-from-ts.md#破壊的なマイグレーション))。TS版のマイグレーションで作成される全テーブルは維持される。
 
-**Elythia 固有のテーブル (upstream に対応するものが無い) は 18 件:**
+この22件は本体の系列だけを数える。Misakiのリモートアバターデコレーション削除は`migration/local/`の独立した1本で、CherryPick由来のリモート行を削除し、downで復元できない。旧Misaki版から更新する場合は[移行履歴の照合](misaki-migration-reconciliation.md)も先に確認する。
 
-> [divergence.md](divergence.md) §2-1 は同じものを **21** と数えている。差は 3 件で、
+**Elythia 固有のテーブル (upstream に対応するものが無い) は 20 件:**
+
+> [divergence/db.md](divergence/db.md) §2-1 は同じものを **23** と数えている。差は 3 件で、
 > あちらは `note_unread` (upstream DB には legacy として残るが 2026.7.0 の `models/` に
 > entity が無く参照 0 件。Elythia はこれを実用している) と bookkeeping 2 件
 > (`migrations` / `schema_migrations`) を加える。CI の
@@ -309,8 +313,10 @@ Go側のマイグレーション (000001〜) はTS版テーブルに対して原
 | `note_quote_authorization` | 引用の承認 (FEP-044f、#3234) | `000101` |
 | `note_quote_request` | 引用の承認を求めた記録 (FEP-044f、#3234) | `000102` |
 | `bubble_game_versus_record` | バブルゲームの対戦の記録 (#3232) | `000105` |
+| `plugin_secret` | サーバープラグインの秘密の値。暗号文だけを置く (#3470) | `000119` |
+| `silent_follow` | 通知を出さずに成立させたフォローの記録 (#3466) | `000120` |
 
-Elythia の migration が作るテーブルは 121。上記 18 件と golang-migrate 台帳の
+Elythia の migration が作るテーブルは 123。上記 20 件と golang-migrate 台帳の
 `schema_migrations` を除く **102 はすべて upstream にも存在する** (TypeORM 台帳の
 `migrations` を含む)。
 
@@ -359,8 +365,8 @@ drop-in テスト (#367) で発見した補完カラム:
   カバレッジが崩れ、drop-in 切替でも挙動が変わるため)。表示経路を足すなら
   upstream に無い additive 拡張になる。
   ただし入力側だけは Elythia に意図的乖離がある — `admin/promo/create` は public
-  以外の note を reject する (`docs/divergence.md` §7)
-- **upstream 2026.10.0 まで追従済** — `#947` (2026.3.2 → 2026.5.1) / `#1164` (2026.5.1 → 2026.5.4、LD-Signature 初期実装 + 2026.5.4 hardening 含む) を経て 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 → 2026.10.0 まで完了。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
+  以外の note を reject する (`docs/divergence/security.md` §7)
+- **upstream 2026.10.1 まで追従済** — `#947` (2026.3.2 → 2026.5.1) / `#1164` (2026.5.1 → 2026.5.4、LD-Signature 初期実装 + 2026.5.4 hardening 含む) を経て 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 → 2026.10.0 → 2026.10.1 まで完了。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
 
 詳細は[TS版からの移行ガイド](migration-from-ts.md)の「既知の制限」セクションも参照。
 

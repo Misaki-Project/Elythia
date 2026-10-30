@@ -3,6 +3,8 @@ package processors
 import (
 	"context"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +97,7 @@ func newProcessorFull(drafts map[string]*model.NoteDraft, users map[string]*mode
 	dr := &stubDraftRepo{drafts: drafts}
 	ur := &stubUserRepo{users: users}
 	pub := &stubPublisher{}
-	return NewPostScheduledNoteProcessor(dr, ur, pub), dr, ur, pub
+	return NewPostScheduledNoteProcessor(dr, ur, pub, nil), dr, ur, pub
 }
 
 func taskFor(draftID string) driver.Task {
@@ -123,6 +125,22 @@ func TestPostScheduledNote_HappyPath(t *testing.T) {
 	// draft は publish 後に削除される
 	assert.NotContains(t, draftRepo.drafts, "d1")
 	assert.Contains(t, draftRepo.deleted, "d1")
+}
+
+func TestPostScheduledNote_OffPeriodDraftRemainsLocalOnlyAfterReenable(t *testing.T) {
+	scheduledAt := timeFromMs(1234)
+	drafts := map[string]*model.NoteDraft{
+		"d1": {
+			ID: "d1", UserID: "u1", Visibility: "public", LocalOnly: true,
+			IsActuallyScheduled: true, ScheduledAt: &scheduledAt,
+		},
+	}
+	users := map[string]*model.User{"u1": {ID: "u1", Username: "alice", FederationStatus: model.FederationStatusOn}}
+	p, _, pub := newProcessor(drafts, users)
+
+	require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
+	require.Len(t, pub.calls, 1)
+	assert.True(t, pub.calls[0].LocalOnly, "re-enabling the account must not make an OFF-period scheduled draft public")
 }
 
 // Draft が削除済み (= user 手動 cancel など) でも error 化せず silent success。
@@ -163,7 +181,7 @@ func TestPostScheduledNote_LockTakenOnlyAtPublish(t *testing.T) {
 	t.Run("draft の lookup が引けないときは取らない", func(t *testing.T) {
 		p, draftRepo, pub := newProcessor(draftsOf(), map[string]*model.User{"u1": {ID: "u1"}})
 		lock := &stubLock{acquired: true}
-		p.SetLock(lock)
+		p.lock = lock
 		draftRepo.findErr = errors.New("connection refused")
 
 		require.Error(t, p.Handle(context.Background(), taskFor("d1")))
@@ -174,7 +192,7 @@ func TestPostScheduledNote_LockTakenOnlyAtPublish(t *testing.T) {
 	t.Run("利用者の lookup が引けないときも取らない", func(t *testing.T) {
 		p, _, userRepo, pub := newProcessorFull(draftsOf(), map[string]*model.User{"u1": {ID: "u1"}})
 		lock := &stubLock{acquired: true}
-		p.SetLock(lock)
+		p.lock = lock
 		userRepo.err = errors.New("connection refused")
 
 		require.Error(t, p.Handle(context.Background(), taskFor("d1")))
@@ -185,7 +203,7 @@ func TestPostScheduledNote_LockTakenOnlyAtPublish(t *testing.T) {
 	t.Run("publish するときだけ取る", func(t *testing.T) {
 		p, _, pub := newProcessor(draftsOf(), map[string]*model.User{"u1": {ID: "u1"}})
 		lock := &stubLock{acquired: true}
-		p.SetLock(lock)
+		p.lock = lock
 
 		require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
 		assert.Equal(t, 1, lock.calls, "publish の手前で取っていない")
@@ -197,7 +215,7 @@ func TestPostScheduledNote_LockTakenOnlyAtPublish(t *testing.T) {
 	t.Run("利用者が消えていたら ack", func(t *testing.T) {
 		p, _, pub := newProcessor(draftsOf(), map[string]*model.User{})
 		lock := &stubLock{acquired: true}
-		p.SetLock(lock)
+		p.lock = lock
 
 		require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
 		assert.Equal(t, 0, lock.calls)
@@ -276,7 +294,7 @@ func TestPostScheduledNote_LockAcquired_PublishesOnce(t *testing.T) {
 	users := map[string]*model.User{"u1": {ID: "u1"}}
 	p, _, pub := newProcessor(drafts, users)
 	lock := &stubLock{acquired: true}
-	p.SetLock(lock)
+	p.lock = lock
 
 	require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
 	assert.Equal(t, 1, lock.calls, "lock は 1 度だけ取得試行")
@@ -291,7 +309,7 @@ func TestPostScheduledNote_LockBusy_SkipsPublish(t *testing.T) {
 		"d1": {ID: "d1", UserID: "u1", IsActuallyScheduled: true, ScheduledAt: &scheduledAt},
 	}
 	p, _, pub := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
-	p.SetLock(&stubLock{acquired: false})
+	p.lock = &stubLock{acquired: false}
 
 	require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
 	assert.Empty(t, pub.calls, "lock 占有失敗時は publish しない")
@@ -303,7 +321,7 @@ func TestPostScheduledNote_LockError_Retries(t *testing.T) {
 		"d1": {ID: "d1", UserID: "u1", IsActuallyScheduled: true, ScheduledAt: &scheduledAt},
 	}
 	p, _, _ := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
-	p.SetLock(&stubLock{err: errors.New("redis down")})
+	p.lock = &stubLock{err: errors.New("redis down")}
 
 	err := p.Handle(context.Background(), taskFor("d1"))
 	require.Error(t, err, "lock backend error は retry 用に伝播")
@@ -338,6 +356,83 @@ func TestPostScheduledNote_WithPollExpiredAfter(t *testing.T) {
 	require.NotNil(t, pub.calls[0].Poll.ExpiresAt)
 	// publish 時刻 + 1h が ExpiresAt になっている (= 数秒のズレを許容)
 	assert.WithinDuration(t, time.Now().Add(time.Hour), *pub.calls[0].Poll.ExpiresAt, 5*time.Second)
+}
+
+// #3443: time.Duration の範囲 (約 9.22e12 ms) を超える PollExpiredAfter でも
+// 期限が過去へ巻き戻らず、publish 時刻 + expiredAfter になる。
+func TestPostScheduledNote_PollExpiredAfterBeyondDuration(t *testing.T) {
+	scheduledAt := timeFromMs(1234)
+	expiredAfter := int64(9_300_000_000_000) // 約 295 年。Duration に掛けると溢れる
+	drafts := map[string]*model.NoteDraft{
+		"d1": {
+			ID: "d1", UserID: "u1", Visibility: "public",
+			IsActuallyScheduled: true, ScheduledAt: &scheduledAt,
+			HasPoll:          true,
+			PollChoices:      []string{"a", "b"},
+			PollExpiredAfter: &expiredAfter,
+		},
+	}
+	p, _, pub := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
+
+	before := time.Now().UnixMilli()
+	require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
+	after := time.Now().UnixMilli()
+	require.Len(t, pub.calls, 1)
+	require.NotNil(t, pub.calls[0].Poll)
+	require.NotNil(t, pub.calls[0].Poll.ExpiresAt)
+	got := pub.calls[0].Poll.ExpiresAt.UnixMilli()
+	assert.GreaterOrEqual(t, got, before+expiredAfter)
+	assert.LessOrEqual(t, got, after+expiredAfter)
+}
+
+// #3443: 期限が上限 (9999-12-30T23:59:59.999Z) を超える PollExpiredAfter は、publish 失敗
+// として scheduledNotePostFailed を通知し、publish しない。
+func TestPostScheduledNote_PollExpiredAfterOutOfRange(t *testing.T) {
+	scheduledAt := timeFromMs(1234)
+	expiredAfter := int64(math.MaxInt64)
+	drafts := map[string]*model.NoteDraft{
+		"d1": {
+			ID: "d1", UserID: "u1", Visibility: "public",
+			IsActuallyScheduled: true, ScheduledAt: &scheduledAt,
+			HasPoll:          true,
+			PollChoices:      []string{"a", "b"},
+			PollExpiredAfter: &expiredAfter,
+		},
+	}
+	p, dr, pub := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
+	notif := &stubNotifier{}
+	p.SetNotifier(notif)
+
+	require.NoError(t, p.Handle(context.Background(), taskFor("d1")), "publish 失敗は retry しない")
+	assert.Empty(t, pub.calls, "範囲外の期限で publish しない")
+	require.Len(t, notif.calls, 1)
+	assert.Equal(t, notification.TypeScheduledNotePostFailed, notif.calls[0].Type)
+	assert.Empty(t, dr.deleted, "失敗した draft は消さない")
+}
+
+// #3443: 上限 (9999-12-30T23:59:59.999Z) を超える PollExpiresAt を持つ draft も
+// publish せず、scheduledNotePostFailed を通知する。
+func TestPostScheduledNote_PollExpiresAtOutOfRange(t *testing.T) {
+	scheduledAt := timeFromMs(1234)
+	expiresAt := time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	drafts := map[string]*model.NoteDraft{
+		"d1": {
+			ID: "d1", UserID: "u1", Visibility: "public",
+			IsActuallyScheduled: true, ScheduledAt: &scheduledAt,
+			HasPoll:       true,
+			PollChoices:   []string{"a", "b"},
+			PollExpiresAt: &expiresAt,
+		},
+	}
+	p, dr, pub := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
+	notif := &stubNotifier{}
+	p.SetNotifier(notif)
+
+	require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
+	assert.Empty(t, pub.calls, "範囲外の期限で publish しない")
+	require.Len(t, notif.calls, 1)
+	assert.Equal(t, notification.TypeScheduledNotePostFailed, notif.calls[0].Type)
+	assert.Empty(t, dr.deleted, "失敗した draft は消さない")
 }
 
 // PollExpiredAfter なし、PollExpiresAt のみ指定された draft は絶対時刻が
@@ -493,4 +588,82 @@ func TestPostScheduledNote_NoNotifierConfigured(t *testing.T) {
 	// SetNotifier 呼ばない → nil
 	require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
 	assert.Len(t, pub.calls, 1)
+}
+
+// A draft saved before drafts/create and update checked lengths can still be
+// scheduled. Its text or cw over the notes/create limits is a publish failure:
+// notify scheduledNotePostFailed and do not publish.
+func TestPostScheduledNote_ContentOverLimit(t *testing.T) {
+	cases := map[string]struct {
+		text, cw *string
+		fail     bool
+	}{
+		"text at the limit": {text: ptr(strings.Repeat("あ", 3000)), fail: false},
+		"text over":         {text: ptr(strings.Repeat("あ", 3001)), fail: true},
+		"cw at the limit":   {text: ptr("x"), cw: ptr(strings.Repeat("あ", 100)), fail: false},
+		"cw over":           {text: ptr("x"), cw: ptr(strings.Repeat("あ", 101)), fail: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			scheduledAt := timeFromMs(1234)
+			drafts := map[string]*model.NoteDraft{
+				"d1": {
+					ID: "d1", UserID: "u1", Visibility: "public", Text: tc.text, CW: tc.cw,
+					IsActuallyScheduled: true, ScheduledAt: &scheduledAt,
+				},
+			}
+			p, dr, pub := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
+			notif := &stubNotifier{}
+			p.SetNotifier(notif)
+
+			require.NoError(t, p.Handle(context.Background(), taskFor("d1")), "publish 失敗は retry しない")
+			require.Len(t, notif.calls, 1)
+			if !tc.fail {
+				assert.Len(t, pub.calls, 1)
+				assert.Equal(t, notification.TypeScheduledNotePosted, notif.calls[0].Type)
+				return
+			}
+			assert.Empty(t, pub.calls, "長すぎる下書きは publish しない")
+			assert.Equal(t, notification.TypeScheduledNotePostFailed, notif.calls[0].Type)
+			assert.Empty(t, dr.deleted, "失敗した draft は消さない")
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+// A draft whose author left with the account retained (isDeleted) or is
+// suspended when the schedule fires is not published.
+func TestPostScheduledNote_DeletedOrSuspendedAuthor(t *testing.T) {
+	cases := map[string]struct {
+		user       model.User
+		wantNotify bool
+	}{
+		"deleted":   {user: model.User{ID: "u1", IsDeleted: true, IsSuspended: true}},
+		"suspended": {user: model.User{ID: "u1", IsSuspended: true}, wantNotify: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			scheduledAt := timeFromMs(1234)
+			drafts := map[string]*model.NoteDraft{
+				"d1": {ID: "d1", UserID: "u1", Visibility: "public", Text: ptr("x"),
+					IsActuallyScheduled: true, ScheduledAt: &scheduledAt},
+			}
+			user := tc.user
+			p, dr, pub := newProcessor(drafts, map[string]*model.User{"u1": &user})
+			notif := &stubNotifier{}
+			p.SetNotifier(notif)
+
+			require.NoError(t, p.Handle(context.Background(), taskFor("d1")), "retry しても変わらない")
+			assert.Empty(t, pub.calls, "publish しない")
+			assert.Empty(t, dr.deleted, "下書きは消さない")
+			if !tc.wantNotify {
+				assert.Empty(t, notif.calls, "退会した利用者には通知しない")
+				return
+			}
+			require.Len(t, notif.calls, 1)
+			assert.Equal(t, notification.TypeScheduledNotePostFailed, notif.calls[0].Type)
+			assert.Equal(t, "d1", notif.calls[0].Extra["noteDraftId"])
+		})
+	}
 }

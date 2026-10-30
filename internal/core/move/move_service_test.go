@@ -45,6 +45,14 @@ type fakeDeliverer struct {
 	returnErr error
 }
 
+type moveFederationObserver struct{ recorded []string }
+
+func (*moveFederationObserver) IsExternallyAvailable(*model.User) bool { return true }
+func (o *moveFederationObserver) ObserveExternalReference(userID, _, _ string) (bool, error) {
+	o.recorded = append(o.recorded, userID)
+	return true, nil
+}
+
 func (f *fakeDeliverer) DeliverToFollowers(signerUserID string, body []byte) error {
 	f.called++
 	f.signer = signerUserID
@@ -61,7 +69,7 @@ func newService(resolver move.Resolver, deliverer move.Deliverer) (*move.Service
 	followingRepo := testutil.NewMockFollowingRepository()
 	urls := activitypub.NewURLBuilder("https://local.example")
 	renderer := activitypub.NewRenderer(urls)
-	svc := move.NewService(userRepo, followingRepo, urls, renderer, resolver, deliverer)
+	svc := move.NewService(userRepo, followingRepo, urls, renderer, resolver, deliverer, nil, nil, nil, nil)
 	return svc, userRepo, followingRepo
 }
 
@@ -167,6 +175,25 @@ func TestMove_AlsoKnownAsMissing(t *testing.T) {
 	assert.ErrorIs(t, svc.Move(me, dstURI), move.ErrDestinationForbids)
 }
 
+func TestMove_InvalidAlsoKnownAsDoesNotRecordExternalReferences(t *testing.T) {
+	srcURI := "https://local.example/users/src"
+	dstURI := "https://local.example/users/dst"
+	resolver := &fakeResolver{localIDs: map[string]string{dstURI: "dst"}}
+	svc, userRepo, _ := newService(resolver, &fakeDeliverer{})
+	src := &model.User{ID: "src", URI: strPtr(srcURI), FederationStatus: model.FederationStatusOn}
+	dst := &model.User{ID: "dst", AlsoKnownAs: nil, FederationStatus: model.FederationStatusOn}
+	userRepo.Users[src.ID] = src
+	userRepo.Users[dst.ID] = dst
+	observer := &moveFederationObserver{}
+	svc.SetLocalFederationObserver(observer)
+
+	err := svc.Move(src, dstURI)
+	require.ErrorIs(t, err, move.ErrDestinationForbids)
+	assert.Empty(t, observer.recorded, "invalid move must not make either local account externally referenced")
+	assert.Nil(t, src.FirstExternalReferenceAt)
+	assert.Nil(t, dst.FirstExternalReferenceAt)
+}
+
 func TestMove_DestinationAlreadyMoved(t *testing.T) {
 	srcURI := "https://local.example/users/me"
 	dstURI := "https://other.example/users/new"
@@ -269,7 +296,7 @@ func TestMove_UserRepoUpdateError(t *testing.T) {
 	renderer := activitypub.NewRenderer(urls)
 	// UpdateUser がエラーを返すラッパー。
 	failRepo := &failingUserRepo{MockUserRepository: userRepo}
-	svc := move.NewService(failRepo, followingRepo, urls, renderer, resolver, deliverer)
+	svc := move.NewService(failRepo, followingRepo, urls, renderer, resolver, deliverer, nil, nil, nil, nil)
 	me := &model.User{ID: "me", URI: strPtr(srcURI)}
 
 	err := svc.Move(me, dstURI)
@@ -537,7 +564,7 @@ func moveWithRepos(t *testing.T, userRepo repository.UserRepository, followingRe
 		AlsoKnownAs: strPtr("https://local.example/users/src"),
 	}}}
 	urls := activitypub.NewURLBuilder("https://local.example")
-	svc := move.NewService(userRepo, followingRepo, urls, activitypub.NewRenderer(urls), resolver, &fakeDeliverer{})
+	svc := move.NewService(userRepo, followingRepo, urls, activitypub.NewRenderer(urls), resolver, &fakeDeliverer{}, nil, nil, nil, nil)
 	if fq != nil {
 		svc.SetFollowQueue(fq)
 	}
@@ -592,7 +619,7 @@ func TestPostMoveProcess_NilArgs(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	followingRepo := testutil.NewMockFollowingRepository()
 	urls := activitypub.NewURLBuilder("https://local.example")
-	svc := move.NewService(userRepo, followingRepo, urls, activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{})
+	svc := move.NewService(userRepo, followingRepo, urls, activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{}, nil, nil, nil, nil)
 
 	assert.NotPanics(t, func() { svc.PostMoveProcess(nil, &model.User{ID: "dst"}) })
 	assert.NotPanics(t, func() { svc.PostMoveProcess(&model.User{ID: "src"}, nil) })
@@ -683,8 +710,8 @@ func runMoveWithCarryOver(t *testing.T, setup func(*carryOverFixture)) *carryOve
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
 	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls,
-		activitypub.NewRenderer(urls), resolver, &fakeDeliverer{})
-	svc.SetCarryOverRepos(fx.blockingRepo, fx.mutingRepo, fx.userListRepo, idGen)
+		activitypub.NewRenderer(urls), resolver, &fakeDeliverer{},
+		fx.blockingRepo, fx.mutingRepo, fx.userListRepo, idGen)
 	svc.SetBlockQueue(fx.blockQueue)
 	svc.SetRoleAssigner(fx.roleAssigner)
 	svc.SetAntennaMover(fx.antennaMover)
@@ -799,8 +826,7 @@ func TestMove_CarryOverIsOptional(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	userRepo.Users["src"] = &model.User{ID: "src"}
 	urls := activitypub.NewURLBuilder("https://local.example")
-	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls,
-		activitypub.NewRenderer(urls), resolver, &fakeDeliverer{})
+	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls, activitypub.NewRenderer(urls), resolver, &fakeDeliverer{}, nil, nil, nil, nil)
 
 	src := &model.User{ID: "src", Username: "src", URI: strPtr("https://local.example/users/src")}
 	assert.NotPanics(t, func() { require.NoError(t, svc.Move(src, dstURI)) })
@@ -920,8 +946,8 @@ func moveWithCarryOverDeps(
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
 	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls,
-		activitypub.NewRenderer(urls), resolver, &fakeDeliverer{})
-	svc.SetCarryOverRepos(blockingRepo, mutingRepo, userListRepo, idGen)
+		activitypub.NewRenderer(urls), resolver, &fakeDeliverer{},
+		blockingRepo, mutingRepo, userListRepo, idGen)
 	if blockQueue != nil {
 		svc.SetBlockQueue(blockQueue)
 	}
@@ -1094,8 +1120,7 @@ func TestHasRecentConfirmedMoveIn(t *testing.T) {
 				userRepo.Users["oldMe"] = tc.src
 			}
 			urls := activitypub.NewURLBuilder("https://local.example")
-			svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls,
-				activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{})
+			svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls, activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{}, nil, nil, nil, nil)
 
 			dst := &model.User{ID: "dstUser", Username: "me"}
 			if tc.aka != "" {
@@ -1121,8 +1146,7 @@ func TestHasRecentConfirmedMoveIn_MultipleAlsoKnownAs(t *testing.T) {
 		MovedToURI: strPtr(dstURI), MovedAt: &recent,
 	}
 	urls := activitypub.NewURLBuilder("https://local.example")
-	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls,
-		activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{})
+	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls, activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{}, nil, nil, nil, nil)
 
 	dst := &model.User{
 		ID: "dstUser", Username: "me",
@@ -1143,8 +1167,7 @@ func TestHasRecentConfirmedMoveIn_LocalSource(t *testing.T) {
 	userRepo.Users["oldLocal"] = &model.User{
 		ID: "oldLocal", Username: "old", MovedToURI: strPtr(dstURI), MovedAt: &recent,
 	}
-	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls,
-		activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{})
+	svc := move.NewService(userRepo, testutil.NewMockFollowingRepository(), urls, activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{}, nil, nil, nil, nil)
 
 	dst := &model.User{ID: "dstUser", Username: "me", AlsoKnownAs: strPtr(srcURI)}
 	assert.True(t, svc.HasRecentConfirmedMoveIn(dst))
@@ -1153,8 +1176,8 @@ func TestHasRecentConfirmedMoveIn_LocalSource(t *testing.T) {
 // nil / 未配線で panic しない。
 func TestHasRecentConfirmedMoveIn_NilSafe(t *testing.T) {
 	urls := activitypub.NewURLBuilder("https://local.example")
-	svc := move.NewService(testutil.NewMockUserRepository(), testutil.NewMockFollowingRepository(),
-		urls, activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{})
+	svc := move.NewService(testutil.NewMockUserRepository(), testutil.NewMockFollowingRepository(), urls, activitypub.NewRenderer(urls), &fakeResolver{}, &fakeDeliverer{}, nil, nil, nil, nil)
+
 	assert.False(t, svc.HasRecentConfirmedMoveIn(nil))
 }
 

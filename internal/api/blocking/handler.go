@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/api/userrelation"
 	coreblocking "github.com/elythia-network/elythia/internal/core/blocking"
@@ -41,19 +42,10 @@ type Handler struct {
 	packer UserPacker
 	// extras は一覧の利用者のピン留め・移行先をまとめて埋める (#3330)。
 	extras userpack.DetailExtrasMany
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
-
-// SetDetailExtras wires the batch filler of pinnedNotes / pinnedPage / movedTo /
-// alsoKnownAs for the embedded users of blocking/list (#3330).
-func (h *Handler) SetDetailExtras(x userpack.DetailExtrasMany) {
-	h.extras = x
-}
-
-// HasDetailExtras reports whether the detail extras filler was wired.
-//
-// 未配線だと blocking/list の利用者の pinnedNotes などが空、movedTo / alsoKnownAs が
-// null のまま返る。起動時検査に使う。
-func (h *Handler) HasDetailExtras() bool { return h.extras != nil }
 
 // UserPacker packs a user as UserDetailedNotMe seen by viewer.
 // *userpack.Packer satisfies it.
@@ -61,23 +53,15 @@ type UserPacker interface {
 	DetailedNotMe(ctx context.Context, target, viewer *model.User) (entity.UserDetailed, bool)
 }
 
-// SetUserPacker wires the packer used by blocking/create・delete. Unwired, the
-// response is built from the user row, profile and relation block only.
-func (h *Handler) SetUserPacker(p UserPacker) {
-	h.packer = p
-}
-
-// HasUserPacker reports whether the user packer was wired.
-//
-// 未配線だと create / delete の応答が instance・絵文字・ピン留め・移行先・
-// モデレーター向けの項目を欠いた形に落ちる。起動時検査に使う。
-func (h *Handler) HasUserPacker() bool { return h.packer != nil }
-
 // NewHandler creates a new blocking Handler.
 // userRepo / idGen are required by blocking/list to embed the
 // `blockee` user object that the upstream Misskey frontend renders.
-func NewHandler(svc *coreblocking.Service, userRepo repository.UserRepository, idGen id.Generator) *Handler {
-	return &Handler{svc: svc, userRepo: userRepo, idGen: idGen}
+// entityPacker is the Packer this handler packs entities with (#3792); extras
+// fills pinnedNotes / pinnedPage / movedTo / alsoKnownAs for the embedded users
+// of blocking/list (#3330); packer builds the create / delete response as the
+// upstream UserDetailedNotMe (#3330).
+func NewHandler(svc *coreblocking.Service, userRepo repository.UserRepository, idGen id.Generator, entityPacker *entity.Packer, extras userpack.DetailExtrasMany, packer UserPacker) *Handler {
+	return &Handler{svc: svc, userRepo: userRepo, idGen: idGen, entityPacker: entityPacker, extras: extras, packer: packer}
 }
 
 // SetRelationRepos wires the repositories used to compute the viewer->blockee
@@ -140,6 +124,8 @@ func (h *Handler) Delete(c echo.Context) error {
 		switch {
 		case errors.Is(err, coreblocking.ErrSelfBlock):
 			return c.JSON(http.StatusBadRequest, apierr.Error("BLOCKEE_IS_YOURSELF", "You cannot unblock yourself.", "06f6fac6-524b-473c-a354-e97a40ae6eac"))
+		case errors.Is(err, coreblocking.ErrBlockeeNotFound):
+			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "8621d8bf-c358-4303-a066-5ea78610eb3f"))
 		case errors.Is(err, coreblocking.ErrNotBlocking):
 			return c.JSON(http.StatusBadRequest, apierr.Error("NOT_BLOCKING", "You are not blocking that user.", "291b2efa-60c6-45c0-9f6a-045c8f9b02cd"))
 		}
@@ -178,7 +164,7 @@ func (h *Handler) respondPackedUser(c echo.Context, viewer *model.User, userID s
 		return c.JSON(http.StatusOK, detailed)
 	}
 	profile, _ := h.userRepo.FindProfileByUserID(userID)
-	detailed := entity.PackUserDetailed(target, profile, h.idGen)
+	detailed := h.entityPacker.PackUserDetailed(target, profile, h.idGen)
 	if viewer != nil {
 		viewerIsFollowing := h.relation.Apply(&detailed, viewer.ID, target, profile)
 		// followers-only count を非フォロワーに leak させない (upstream blocking/create・delete も
@@ -191,13 +177,16 @@ func (h *Handler) respondPackedUser(c echo.Context, viewer *model.User, userID s
 }
 
 // ListRequest is the request body for blocking/list.
+//
+// 本家の paramDef に offset は無く、送られても無視して先頭から返すので読まない。
+// limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が整数の
+// 小数(10.0)を受ける (#3760)。
 type ListRequest struct {
-	Limit     *int   `json:"limit"`
-	Offset    int    `json:"offset"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // List handles POST /api/blocking/list.
@@ -210,16 +199,16 @@ func (h *Handler) List(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 30, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 30, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	rows, err := h.svc.List(user.ID, sinceID, untilID, limit, req.Offset)
+	rows, err := h.svc.List(user.ID, sinceID, untilID, limit)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -284,7 +273,7 @@ func (h *Handler) fetchBlockeeMap(ctx context.Context, viewer *model.User, rows 
 	iAmModerator := h.moderator != nil && viewerID != "" && h.moderator.IsModerator(viewerID)
 	packed := make([]entity.UserDetailed, len(users))
 	for i, u := range users {
-		d := entity.PackUserDetailed(u, profileByUser[u.ID], h.idGen)
+		d := h.entityPacker.PackUserDetailed(u, profileByUser[u.ID], h.idGen)
 		// viewer->blockee の relation block を付与 (isBlocking=true 等)。Apply は
 		// viewerID 空 / self では no-op。relation 未配線 (test stub) でも安全。
 		viewerIsFollowing := h.relation.Apply(&d, viewerID, u, profileByUser[u.ID])

@@ -17,11 +17,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	apiadmin "github.com/elythia-network/elythia/internal/api/admin"
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/config"
 	"github.com/elythia-network/elythia/internal/core/cache"
 	"github.com/elythia-network/elythia/internal/core/chart"
+	"github.com/elythia-network/elythia/internal/core/event"
 	corefederation "github.com/elythia-network/elythia/internal/core/federation"
-	corenote "github.com/elythia-network/elythia/internal/core/note"
+	"github.com/elythia-network/elythia/internal/core/pluginaccount"
+	"github.com/elythia-network/elythia/internal/core/pluginsecret"
+	corereaction "github.com/elythia-network/elythia/internal/core/reaction"
 	corerole "github.com/elythia-network/elythia/internal/core/role"
 	"github.com/elythia-network/elythia/internal/misc/password"
 	"github.com/elythia-network/elythia/internal/misc/redact"
@@ -32,6 +37,7 @@ import (
 	"github.com/elythia-network/elythia/internal/repository"
 	mksentry "github.com/elythia-network/elythia/internal/sentry"
 	"github.com/elythia-network/elythia/internal/server/middleware"
+	"github.com/elythia-network/elythia/internal/stream"
 	"github.com/elythia-network/elythia/plugin"
 	"github.com/labstack/echo/v4"
 	echomw "github.com/labstack/echo/v4/middleware"
@@ -44,7 +50,17 @@ type Server struct {
 	// userRepo は CachedUserRepository でラップ済みの共有 instance。
 	// auth middleware と setupRoutes の両方からこれを使うことで、片側の
 	// mutation で他方の cache が stale 化するのを防ぐ (#300 3-3)。
-	userRepo       repository.UserRepository
+	userRepo repository.UserRepository
+	// userCache は userRepo の中身 (同じもの)。他のプロセスとキャッシュの
+	// 無効化をやりとりする配線 (#3664) が、具体的な型を要る。
+	userCache *repository.CachedUserRepository
+	// crossProcessCaches は、他のプロセスと無効化をやりとりする部品 (#3664)。
+	// 配線の検査が、受けたプロセスで実際に捨てた (読み直した) ことを見るために
+	// 持つ。本体のコードからは使わない。
+	crossProcessCaches crossProcessCaches
+	// relationCache は閲覧者ごとのミュート・ブロック・フォローの一覧 (#3607)。
+	// 関係の repository と userRepo の書き込みがここを捨てる。
+	relationCache  *repository.RelationCache
 	config         *config.Config
 	db             *gorm.DB
 	redis          *cache.RedisClients
@@ -67,6 +83,8 @@ type Server struct {
 	queueRuntimeStats *runtimestats.Recorder
 	// startedAt は admin/server-metrics が返す uptime の起点 (#2395)。
 	startedAt time.Time
+	// apiSpecは/api.jsonの本文。ルートが揃った後に初めて読まれたときに作る(#3810)。
+	apiSpec apiSpecCache
 	// peerDeps はプラグイン同士の通信 (#2537) に要る一式。setupRoutes が
 	// 署名・解決・ブロック判定を組み立ててから setupPlugins に渡す。
 	// 未配線 (nil) のときは peer を宣言したプラグインも受け口を張らない。
@@ -75,13 +93,24 @@ type Server struct {
 	// 既定 (RoleBoth) は env 未設定時の従来どおりの挙動。setupRoutes は
 	// role を見て背景処理を出し分けるので、New より前に決まっている必要がある。
 	role config.ProcessRole
-	// queueOnlyServer は RoleQueue のときだけ立てる /healthz 用の最小 server。
-	// Shutdown で閉じるために保持する。
-	queueOnlyServer *http.Server
+	// streamManager / streamPubSub / internalPubSub は世代ごとに作り直すもの
+	// (#3463)。setupRoutes が入れ、StopBackground が閉じる。以前は setupRoutes の
+	// ローカル変数で、止める口が無かった。
+	streamManager  *stream.Manager
+	streamPubSub   *event.PubSubService
+	internalPubSub *event.PubSubService
 
 	// pluginRoles はプラグインのルートで権限を判定するための参照 (#2477)。
 	// setupRoutes で roleService を作った後に入る。
 	pluginRoles middleware.RoleChecker
+	// pluginAccounts はプラグインが管理するアカウント (#3468) の操作。
+	// setupRoutes が setupPlugins より前に入れる。nil のときは、各プラグインの
+	// ctx.Accounts() が呼ぶとエラーを返す実装になる。
+	pluginAccounts *pluginaccount.Service
+	// pluginSecrets はプラグインの秘密の値 (#3470) を暗号化して出し入れする。
+	// setupRoutes で setupPlugins より前に入る。nil のときは秘密の値の入力口を
+	// 張らず、プラグインには鍵の無い口 (呼ぶと ErrSecretsUnavailable) を渡す。
+	pluginSecrets *pluginsecret.Service
 	// roleService は HTTP と queue が共有する process-local policy registry。
 	// 有効な plugin provider の登録は起動時だけ行い、enabled の変更には
 	// 再起動を要求する。
@@ -105,55 +134,118 @@ type Server struct {
 	// 明示設定が無ければ DB (instance_secret) の生成値を使うため、New() で
 	// 一度だけ解決して保持する。
 	mediaProxySecret []byte
+	// passwordHasherは設定のbcryptCostから作ったHasher(#3780)。
+	// setupRoutesがパスワードをハッシュする部品へ渡す。
+	passwordHasher password.Hasher
 
 	// deliverSvc は federation deliver service への参照。本番では queue
 	// 経由で deliver を enqueue するが、test (#780) で queue を bypass する
 	// ための SetSyncDeliverHookForTest を呼べるよう参照を保持する。
 	deliverSvc *corefederation.DeliverService
 
-	// shutdownHooks は Shutdown() 時に queue / HTTP echo より先に呼ばれる。
-	// ctx-aware にすることで graceful drain (例: hashtag service の
-	// in-flight worker、#727) を hook で wire できる。シンプルな
-	// stop/close 系 hook は引数 _ で受け流すだけ。
-	shutdownHooks []func(context.Context)
-	shutdownOnce  sync.Once
-	shutdownErr   error
+	// lifecycle は、この世代の部品のうち停止が要るものの名前付きの一覧 (#3699)。
+	// Shutdown() 時に queue の worker を止め始めた後 (上限内に止まらなかった worker
+	// は並行して走る)、chart と HTTP echo より先に、登録した順に止める。
+	// ctx を渡すので graceful drain (例: hashtag service の in-flight worker、
+	// #727) もここで止められる。テストが組む Server のリテラルでも使えるよう、
+	// ポインタではなく値で持つ (ゼロ値が空の一覧)。
+	lifecycle lifecycle
+	// caches は、この世代のキャッシュの名前付きの一覧 (#3721)。登録した順に捨てる。
+	// 本番では捨てない (#3802)。登録漏れの検査 (#3777) の土台。lifecycle と同じく値で持つ。
+	caches       cacheList
+	shutdownOnce sync.Once
+	shutdownErr  error
+	// startOnce makes StartBackground and StartBackgroundForTest start the
+	// generation once, whichever is called first; later calls of either
+	// return startErr, the result of the first (#3703, #3709).
+	startOnce sync.Once
+	startErr  error
+	// runMu orders the start of the generation against its stop (#3709). The
+	// start holds it for its whole run; the stop (shutdown) and the rollback
+	// of a failed construction (cleanupConstruction) take it only to set
+	// stopped, before they stop anything.
+	//
+	// 起動の間は握ったままにする。起動は部品のgoroutineを立てるほか、cronの登録
+	// (registerSchedulerJobsの12個の登録の関数)と撤去(PruneUnregistered)でRedisを
+	// context.Background()のまま呼ぶので、その分だけ長くかかりうる。本番の経路では
+	// StartBackgroundとStopBackgroundをどちらもSupervisorのgenMuの下で呼ぶので、
+	// 固まった起動は#3709の前から停止を止めていた(Supervisor.ShutdownはlockBeforeで
+	// 見切る)。runMuが本番に足す待ちは無い。走っている起動を待つのは、
+	// Server.StopBackgroundを直接呼ぶもの(テスト)だけで、その待ちはctxを見ない。
+	// 停止は印を立てる間だけ握り、部品やqueueを止めて待つ間は握らない。起動が握ったまま
+	// 取るのは一覧のmutex・chartの管理のmutex・queueのdriverの中のmutexで、停止の側が
+	// runMuを握ったままそれらを待つことは無いので、待ち合いにならない。
+	runMu sync.Mutex
+	// stopped is set, under runMu, once the stop or the rollback of the
+	// generation has begun. A start that sees it starts nothing and returns
+	// errGenerationStopped.
+	stopped bool
+	// queueStarted is set, under runMu, once the start has started the queue
+	// worker (#3713). stopQueue then shuts the worker and the scheduler down
+	// whatever the role, so what StartBackgroundForTest started on a server
+	// role stops too.
+	//
+	// 停止(stopQueue)はrunMuを取らずに読む。停止は先にmarkStoppedでrunMuを取り、
+	// 済んだ起動はそれより前にrunMuを放しているので、起動の書き込みは停止の読みより
+	// 前に起きる(happens-before)。markStoppedより後の起動は何も起動せず、書かない。
+	queueStarted bool
 
-	// reactionFlushWorkerはqueue roleの定期enqueue loop。field化はconstructor
-	// rollbackをsleep無しで検証し、起動前にownershipを登録するため。
-	reactionFlushWorker   func(context.Context, func() error)
+	// outboundTr は外向きの HTTP で共有する SSRF-safe な Transport
+	// (outboundTransport)。初めて使うときに 1 度だけ作る (#3591)。
+	outboundTrOnce sync.Once
+	outboundTr     *http.Transport
+
+	// reactionFlushWorkerは全部の役割で回すリアクションのtickのloop。tickごとに
+	// metaから設定を読み直し、flushを積むのはqueue roleだけ(#3663)。field化は
+	// constructor rollbackをsleep無しで検証し、起動前にownershipを登録するため。
+	reactionFlushWorker func(context.Context, func() error)
+	// selfCheckRunnerとremoteCheckerは、admin/self-checkとadmin/federation/check-hostの
+	// 実行元。nilなら組み立てで本物を作る。どちらも外へ取りに行く(self-checkはproxyも
+	// 通らない)ので、照合のテストがbeforeSetupで数えるだけの偽物を入れる(#3877)。
+	selfCheckRunner apiadmin.SelfCheckRunner
+	remoteChecker   apiadmin.RemoteChecker
+	// paramEnforcedは、本家と同じ400で拒否するendpointの一覧。nilなら
+	// paramEnforcedEndpoints(宣言の全部)。本家の残りのendpoint(reset-db)では数えるだけの
+	// 検証を試せないので、影の検証のテストがbeforeSetupで差し替える(#3888)。
+	paramEnforced []string
+	// reactionCountWriter は世代のリアクションの書き込み先 (#3663)。テストが
+	// 取りこぼしたプロセスの状態を作るために読む。
+	reactionCountWriter *corereaction.SwitchableWriter
+	// background は、この世代で応答の後などに投げっぱなしで起動する goroutine
+	// (投稿後の hook、サインインの記録、メールなど) を数える箱 (#3661)。
+	// 世代の停止 (shutdown) で上限付きで待ち、待ちの終わり近くで ctx を切る。
+	background            *bgwork.Group
 	pluginGoStarter       func(func())
 	pluginGoGate          *pluginGoGate
 	beforePluginGoRelease func()
-}
-
-// registerShutdownHook registers fn to be invoked during Shutdown.
-// Hooks run in registration order before the queue / echo shutdown.
-// ctx は Shutdown() の caller から伝播され、graceful drain の deadline
-// として使える (#764)。
-func (s *Server) registerShutdownHook(fn func(context.Context)) {
-	s.shutdownHooks = append(s.shutdownHooks, fn)
-}
-
-func (s *Server) startConstructionWorker(run func(context.Context)) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var once sync.Once
-	s.registerShutdownHook(func(shutdownCtx context.Context) {
-		once.Do(cancel)
-		select {
-		case <-done:
-		case <-shutdownCtx.Done():
-		}
-	})
-	go func() {
-		defer close(done)
-		run(ctx)
-	}()
+	// metaUpdatedHandled is a test hook called after this process has handled
+	// one internal:metaUpdated message (#3663). 本番では nil。
+	//
+	// テストが「別のプロセスの通知 1 回」で効くことを、処理の終わりを待って
+	// 確かめるために使う。目印を同じトピックへ流して待つと購読が 2 回走り、
+	// 購読の中の順序の誤りを見逃す。
+	//
+	// **購読の最後 (全部の処理の後) で呼ぶこと。** 前で呼ぶと、テストが処理の
+	// 終わる前に検査を始める。
+	metaUpdatedHandled atomic.Pointer[func(payload []byte)]
+	// builtHandlers is what buildHandlers built for this generation, after
+	// setupRoutes has run every setter on it. 本番では読まない。
+	//
+	// 構築子の必須の引数にした依存 (#3817) は、型では渡し忘れを防げても nil は
+	// 渡せる。TestBuiltHandlersHaveNoNilDependencies が組み立てた後の handler の
+	// フィールドを見て、nil を渡した配線を落とすために持つ。
+	builtHandlers apiHandlers
+	// builtRouteParts is what setupRoutes built in its own body for this
+	// generation (#3823). 本番では読まない。builtHandlers と同じ理由で持つ。
+	builtRouteParts routeParts
+	// builtCore is what buildCore built for this generation, limited to the
+	// parts whose dependencies are required constructor arguments (#3825).
+	// 本番では読まない。builtHandlers と同じ理由で持つ。
+	builtCore coreParts
 }
 
 func runReactionFlushWorker(ctx context.Context, enqueue func() error) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(corereaction.FlushInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -513,6 +605,21 @@ func accessLogConfig(out io.Writer) echomw.RequestLoggerConfig {
 	}
 }
 
+// selfEncodedRoutes are the routes whose handlers negotiate Content-Encoding
+// themselves, so the global gzip middleware must not wrap them (it does not
+// look at an existing Content-Encoding and would compress the body again).
+//
+//   - `/vite/*` / `/embed_vite/*`: 事前圧縮の .br / .gz を返し、無ければ
+//     自前で gzip する (serveFrontendBuild、dev では frontendDynamicGzip)
+//   - `/api/emojis`: 一覧が変わるまで gzip 済みの本文を使い回す (#3593)
+//   - `/api.json`: 1 度だけ作った gzip 済みの本文を使い回す (#3810)
+var selfEncodedRoutes = map[string]bool{
+	"/vite/*":       true,
+	"/embed_vite/*": true,
+	"/api/emojis":   true,
+	"/api.json":     true,
+}
+
 // gzipConfig returns the GzipConfig used by the global middleware stack.
 // Shared with gzip_test.go so production and tests stay in sync.
 func gzipConfig() echomw.GzipConfig {
@@ -522,7 +629,9 @@ func gzipConfig() echomw.GzipConfig {
 		Skipper: func(c echo.Context) bool {
 			// WebSocket upgrade 経路 (/streaming) は frame 単位の bidirectional
 			// 通信で gzip すると壊れる。
-			return c.Path() == "/streaming"
+			// /backup-download は数 GB の dump をそのまま渡す。gzip し直すと CPU を
+			// 使い、Content-Length が消えて進捗が出ず、Range の応答まで包まれる。
+			return c.Path() == "/streaming" || c.Path() == "/backup-download" || selfEncodedRoutes[c.Path()]
 		},
 		Level:     gzip.DefaultCompression,
 		MinLength: 1024,
@@ -623,30 +732,19 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	}
 	logDevModeBanner(cfg)
 
-	// パスワードのハッシュ強度をプロセス全体に反映する。
-	//
-	// **ゼロ値は「未設定」として扱う。** config.resolve を通れば必ず範囲内の値が
-	// 入るが、Config を構造体リテラルで組む呼び出し元 (テスト / ツール) では 0 の
-	// まま来る。そこで起動を失敗させると、この項目を知らない呼び出し元が全部壊れる。
-	bcryptCost := cfg.BcryptCost
-	if bcryptCost == 0 {
-		bcryptCost = password.DefaultCost
-	}
-	if err := password.SetCost(bcryptCost); err != nil {
-		// resolve を通っていれば到達しない。通っていない呼び出し元のために
-		// 既定へ落として続行する。
-		slog.Warn("bcrypt cost が不正なので既定値を使います", "value", bcryptCost, "err", err)
-		bcryptCost = password.DefaultCost
-		_ = password.SetCost(bcryptCost)
-	}
-	if bcryptCost != password.DefaultCost {
-		slog.Info("bcrypt cost overridden", "cost", bcryptCost, "default", password.DefaultCost)
+	// パスワードのハッシュ強度。使う部品(signup・signin・パスワードの変更と
+	// リセット)へsetupRoutesが渡す(#3780)。0と範囲外の扱いはHasherFromConfigに
+	// ある。起動のログはここで出し、出る位置を変えない。
+	passwordHasher := password.HasherFromConfig(cfg.BcryptCost)
+	if passwordHasher.Cost() != password.DefaultCost {
+		slog.Info("bcrypt cost overridden", "cost", passwordHasher.Cost(), "default", password.DefaultCost)
 	}
 
 	// 投稿後のベストエフォートフックの同時実行数。**絞らないと応答のテールが
 	// 伸びる** (負荷時に数百 goroutine が GOMAXPROCS 個の P を奪い合い、応答を
-	// 返す goroutine もその列に並ぶ)。0 なら core/note 側の既定が入る。
-	corenote.SetHookConcurrency(cfg.NoteHookConcurrency)
+	// 返す goroutine もその列に並ぶ)。枠はbuildCoreがCreateServiceに設定の数で
+	// 作る(#3780)。0ならcore/note側の既定が入る。起動のログはここで出し、出る
+	// 位置を変えない。
 	if cfg.NoteHookConcurrency > 0 {
 		slog.Info("note hook concurrency overridden", "perKind", cfg.NoteHookConcurrency)
 	}
@@ -714,7 +812,11 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 
 	// CachedUserRepository を一度だけ構築して auth middleware と
 	// setupRoutes (services) が同じ cache を共有するようにする (#300 3-3)。
-	userRepo := repository.NewCachedUserRepository(repository.NewUserRepository(db))
+	//
+	// relationCache は userRepo より先に作る。HardDeleteUser の CASCADE で消える
+	// 関係の行を、userRepo の側から捨てるため (#3607)。
+	relationCache := repository.NewRelationCache(db)
+	userRepo := repository.NewCachedUserRepository(repository.NewUserRepositoryWithRelationCache(db, relationCache))
 	accessTokenRepo := repository.NewAccessTokenRepository(db)
 
 	// body size 制限は auth.Authenticate より前に置く: auth は token 抽出のため
@@ -779,6 +881,8 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	s := &Server{
 		echo:           e,
 		userRepo:       userRepo,
+		userCache:      userRepo,
+		relationCache:  relationCache,
 		config:         cfg,
 		db:             db,
 		redis:          redis,
@@ -802,6 +906,8 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 		// 背景処理を出し分ける。
 		role:                role,
 		reactionFlushWorker: runReactionFlushWorker,
+		background:          bgwork.New(),
+		passwordHasher:      passwordHasher,
 	}
 	for _, fn := range beforeSetup {
 		fn(s)
@@ -843,20 +949,81 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 
 func (s *Server) cleanupConstruction() {
 	s.shutdownOnce.Do(func() {
-		if s.pluginGoGate != nil {
-			s.pluginGoGate.discard()
-		}
-		for _, hook := range s.shutdownHooks {
-			hook(context.Background())
-		}
-		s.shutdownHooks = nil
-		if s.queueDriver != nil {
-			if err := s.queueDriver.Close(); err != nil {
-				slog.Warn("queue driver close failed during server construction rollback", "err", err)
-			}
-			s.queueDriver = nil
-		}
+		// 構築に失敗した世代は使われないが、後から起動を呼ばれても何も起動しないよう、
+		// 停止と同じ印を立てる(#3709)。段の表の外に置くので、段のpanicで飛ばない。
+		s.markStopped()
+		// エラーを返す口は無い。段のpanicはrunShutdownStepsが段ごとに記録し、一覧の
+		// 部品の停止のpanicはstopAllが部品ごとに記録するので、ここでは重ねて記録しない
+		// (#3707、#3711)。
+		_ = runShutdownSteps(context.Background(), s.cleanupSteps())
 	})
+}
+
+// cleanupSteps returns the steps of rolling back a failed construction, in
+// the order they run (docs/architecture.md 4.3). It is run with
+// context.Background().
+func (s *Server) cleanupSteps() []shutdownStep {
+	return []shutdownStep{
+		{name: "pluginGoGate", run: func(context.Context) error {
+			if s.pluginGoGate != nil {
+				s.pluginGoGate.discard()
+			}
+			return nil
+		}},
+		{name: "lifecycle", run: func(ctx context.Context) error {
+			// 一覧の部品は、構築では起動していない(#3703)。起動していない部品の停止は
+			// 待たずに返る(docs/architecture.md 4.3)。停止のpanicはstopAllが部品ごとに
+			// 回収して記録するので、後の段は続く(#3707)。エラーはcleanupConstructionが
+			// 捨てる(記録はstopAllの1部品1行で足りる)。
+			return s.lifecycle.stopAll(ctx)
+		}},
+		{name: "background", run: func(ctx context.Context) error {
+			// 構築の途中で起動したものがあれば止める (#3661)。構築に失敗した世代は
+			// 使われないので、待ちは短くてよい。
+			bgCtx, bgCancel := context.WithTimeout(ctx, time.Second)
+			s.background.Stop(bgCtx)
+			bgCancel()
+			return nil
+		}},
+		{name: "releaseParts", run: func(context.Context) error {
+			s.lifecycle.parts = nil
+			// キャッシュの一覧も、失敗した世代のハンドラへの参照を手放す (#3721)。
+			s.caches.parts = nil
+			return nil
+		}},
+		{name: "queueDriver", run: func(context.Context) error {
+			if s.queueDriver != nil {
+				if err := s.queueDriver.Close(); err != nil {
+					slog.Warn("queue driver close failed during server construction rollback", "err", err)
+				}
+				s.queueDriver = nil
+			}
+			return nil
+		}},
+		{name: "streaming", run: func(ctx context.Context) error {
+			// setupRoutes が作った購読も閉じる。メンテナンスの後の作り直しは失敗すると
+			// 繰り返すので、閉じないと試すたびに Redis の接続と goroutine が漏れる (#3463)。
+			if s.streamManager != nil {
+				closeCtx, cancel := context.WithTimeout(ctx, time.Second)
+				s.streamManager.CloseAll(closeCtx, stream.ServiceRestartCloseCode, "server restarting")
+				cancel()
+			}
+			return nil
+		}},
+		{name: "pubsub", run: func(context.Context) error {
+			s.closePubSubs()
+			return nil
+		}},
+	}
+}
+
+// closePubSubs closes the Redis subscriptions of this generation.
+func (s *Server) closePubSubs() {
+	for _, ps := range []*event.PubSubService{s.internalPubSub, s.streamPubSub} {
+		if ps != nil {
+			_ = ps.Close()
+		}
+	}
 }
 
 // Handler returns the underlying http.Handler for use with httptest.
@@ -909,8 +1076,19 @@ func (s *Server) DumpRoutes(w io.Writer) error {
 	return enc.Encode(payload)
 }
 
-// StartBackgroundForTest starts the queue worker (and optional
-// scheduler / chart management) without launching the HTTP listener.
+// StartBackgroundForTest starts the named parts of the generation, the queue
+// worker and the optional auto-scale and scheduler, without launching the
+// HTTP listener. Unlike StartBackground it does not look at the process role
+// and does not start the chart management.
+//
+// It goes through the same once as StartBackground (#3709): only the first
+// call of either starts anything, and later calls of either return the
+// result of the first. Once StopBackground has begun, it starts nothing and
+// returns errGenerationStopped.
+//
+// StopBackground stops the queue worker, auto-scale and scheduler it started
+// whatever the process role (#3713), as it does for StartBackground.
+//
 // 用途: e2e_federation 系のテストで `httptest.Server` 経由で echo handler を
 // 外部 listener にぶら下げつつ、deliver / inbox 処理など async queue 経路も
 // 動かしたい場合 (#435)。本番経路 (Server.Start) は HTTP listener を含めて
@@ -919,19 +1097,7 @@ func (s *Server) DumpRoutes(w io.Writer) error {
 //
 // production code から呼ばないこと。
 func (s *Server) StartBackgroundForTest() error {
-	if err := s.queueServer.Start(); err != nil {
-		return fmt.Errorf("start queue worker: %w", err)
-	}
-	// queueServer.Start 後にのみ controller を起動する (Start 前は driver.Resize
-	// が ErrResizeNotSupported を返す = no pool yet)。startAutoScale は
-	// jobQueueAutoScale=false なら nil runner を返す cheap no-op。
-	runner, err := startAutoScale(context.Background(), s.config, s.queueDriver, s.queueMetrics, s.queueRuntimeStats)
-	if err != nil {
-		return fmt.Errorf("start autoscale: %w", err)
-	}
-	s.autoscale = runner
-	s.registerSchedulerJobs()
-	return nil
+	return s.startOnceWith(backgroundStart{anyRole: true})
 }
 
 // registerSchedulerJobs registers every periodic cron job and starts the
@@ -951,6 +1117,7 @@ func (s *Server) registerSchedulerJobs() {
 		{"instance refresh", s.queueScheduler.RegisterInstanceRefreshJob},
 		{"retention", s.queueScheduler.RegisterRetentionJob},
 		{"checkExpiredMutings", s.queueScheduler.RegisterCheckExpiredMutingsJob},
+		{"archiveAnnouncements", s.queueScheduler.RegisterArchiveAnnouncementsJob},
 		{"clean", s.queueScheduler.RegisterCleanJob},
 		{"chunkedUploadGc", s.queueScheduler.RegisterChunkedUploadGCJob},
 		{"cleanRemoteNotes", s.queueScheduler.RegisterCleanRemoteNotesJob},
@@ -991,20 +1158,84 @@ func (s *Server) SetSyncDeliverHookForTest(fn func(payload queue.DeliverPayload)
 	}
 }
 
-// Start begins listening on the configured port (or UNIX domain socket) and
-// launches the queue worker.
+// StartBackground launches the background work of this server generation, in
+// this order: the named parts of the lifecycle list in list order (#3703),
+// the queue worker, auto-scale and scheduler (when the process role runs the
+// queue) and the chart save loop. It does not listen; the Supervisor owns the
+// listener and routes requests to Handler / ServeHandler.
 //
-// If s.config.Socket is non-empty the HTTP server binds to that path instead
-// of a TCP port. This matches Misskey 本家 YAML の `socket` / `chmodSocket`
-// 設定と同じ運用感覚で使える。
-func (s *Server) Start() error {
+// Only the first call of StartBackground or StartBackgroundForTest starts
+// anything; later calls of either return its result. When it returns an
+// error, the caller stops the generation with StopBackground, which also
+// stops the parts that did not start. Once StopBackground has begun (or the
+// construction failed), it starts nothing and returns errGenerationStopped;
+// a start that is running when StopBackground begins finishes first, and
+// StopBackground then stops what it started (#3709).
+//
+// listener を Server から外したのは、メンテナンスで Server を作り直しても
+// listener を張ったままにするため (#3463)。
+func (s *Server) StartBackground() error {
+	return s.startOnceWith(backgroundStart{startChart: true})
+}
+
+// errGenerationStopped is returned by StartBackground and
+// StartBackgroundForTest when the stop of the generation (or the rollback of
+// its failed construction) began before the start (#3709).
+var errGenerationStopped = errors.New("server: the generation has been stopped")
+
+// backgroundStart is what a start of the generation starts besides the parts
+// of the lifecycle list and the queue worker, auto-scale and scheduler.
+type backgroundStart struct {
+	// anyRole starts the queue worker, auto-scale and scheduler whatever the
+	// process role (StartBackgroundForTest). Otherwise they start only when
+	// the role runs the queue.
+	anyRole bool
+	// startChart starts the chart save loop (StartBackground).
+	startChart bool
+}
+
+// startOnceWith starts the generation, with the differences in what, unless
+// it was started already (it then returns the result of the first start) or
+// its stop has begun (errGenerationStopped).
+//
+// StartBackgroundForTestもstartOnceを通す(#3709)。通さないと、StartBackgroundと
+// 両方を呼んだときにqueueのStartを2回呼ぶ。
+func (s *Server) startOnceWith(what backgroundStart) error {
+	s.startOnce.Do(func() {
+		s.startErr = s.startBackground(what)
+	})
+	return s.startErr
+}
+
+func (s *Server) startBackground(what backgroundStart) error {
+	// 起動の間は印のmutexを握る(#3709)。停止は始めに印を立てるのにこのmutexを取るので、
+	// 起動の途中から止め始めることは無く、止める側は起動が済んでから、起動したものを
+	// すべて止める。印が先に立っていれば、止める人の居ないworkerを残さないよう何も
+	// 起動しない(queueのdriverも閉じた後でありうる)。
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if s.stopped {
+		return errGenerationStopped
+	}
+	// 部品(バッファ、配送の健全性、statsのpublisher、構築時のworkerなど)を、queueより
+	// 先に一覧の順で起動する(#3703)。queueのworkerのジョブがバッファ・健全性・連合の
+	// ルールの記録へ書くので、書き手より先に、溜めたものをflushする側を動かす。
+	// #3703より前は構築の途中で起動していたので、queue・chartより先という順は変わらない。
+	// 部品の起動が失敗したら(panic)、queueもchartも起動せずに返す。止めるのは呼び出し元。
+	if err := s.lifecycle.startAll(); err != nil {
+		return err
+	}
 	// queue 側 (worker / autoscale / scheduler) は RoleServer では起動しない。
 	// Web ノードもジョブを **enqueue** はするので queueClient は生かしたまま、
-	// 消費側だけ止める (#2459)。
-	if s.role.RunsQueue() {
+	// 消費側だけ止める (#2459)。StartBackgroundForTestはroleを見ずに起動する。
+	if what.anyRole || s.role.RunsQueue() {
 		if err := s.queueServer.Start(); err != nil {
 			return fmt.Errorf("start queue worker: %w", err)
 		}
+		// workerを起動したら、続くautoscaleの起動が失敗しても止めるよう、ここで記録する
+		// (#3713)。roleがqueueを回さない世代(StartBackgroundForTest)の停止は、これを見て
+		// workerとschedulerを止める。
+		s.queueStarted = true
 		// queueServer.Start 後にのみ controller を起動する (Start 前は driver.Resize
 		// が ErrResizeNotSupported を返す = no pool yet)。startAutoScale は
 		// jobQueueAutoScale=false なら nil runner を返す cheap no-op。
@@ -1017,94 +1248,318 @@ func (s *Server) Start() error {
 	}
 	// chart は **両方の role で回す**。メモリ上の集計バッファはプロセスごとに
 	// 溜まり (API 経由の投稿は server、連合 inbox 由来は queue)、自分の分は
-	// 自分で flush しないと失われる。
-	if s.chartMgmt != nil {
+	// 自分で flush しないと失われる。StartBackgroundForTestは起動しない。
+	if what.startChart && s.chartMgmt != nil {
 		if err := s.chartMgmt.Start(context.Background()); err != nil {
 			slog.Warn("chart management service start failed", "err", err)
 		}
 	}
-
-	if !s.role.RunsServer() {
-		return s.serveQueueOnly()
-	}
-
-	if s.config.Socket != "" {
-		ln, err := config.ListenUnixSocket(s.config.Socket, s.config.ChmodSocket)
-		if err != nil {
-			return err
-		}
-		s.echo.Listener = ln
-		slog.Info("starting Elythia server",
-			"socket", s.config.Socket, "url", s.config.URL)
-		// Echo.Start は内部で net.Listen してしまうので、ここでは Start では
-		// なく Serve を使って既に張った listener を使う。
-		if err := s.echo.Server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
-	}
-
-	addr := fmt.Sprintf(":%d", s.config.Port)
-	slog.Info("starting Elythia server", "addr", addr, "url", s.config.URL)
-	return s.echo.Start(addr)
+	return nil
 }
 
-// Shutdown gracefully shuts down the server, the queue worker and
-// any background services such as the chart management loop.
+// ServeHandler returns the handler the listener should serve for this
+// process role: the full router for a node that runs the server, or the
+// minimal /healthz (+ /metrics) mux for a queue-only node.
+func (s *Server) ServeHandler() http.Handler {
+	if !s.role.RunsServer() {
+		return s.queueOnlyMux()
+	}
+	return s.echo
+}
+
+// Shutdown stops this server generation: streaming connections, the queue
+// worker and every background service such as the chart management loop.
+// It is the same as StopBackground and safe to call more than once.
 func (s *Server) Shutdown(ctx context.Context) error {
+	return s.StopBackground(ctx)
+}
+
+// StopBackground stops everything StartBackground and the constructor
+// started, closes the streaming connections with a 1012 close frame and
+// closes this generation's Redis subscriptions. It does not close the DB
+// pool or the Redis clients, which the caller owns. Only the first call does
+// the work; later calls return its result.
+//
+// It first marks the generation stopped, after a start that is running has
+// finished; StartBackground and StartBackgroundForTest called after that
+// start nothing and return errGenerationStopped (#3709).
+//
+// The stop runs the named steps of shutdownSteps in order. When a step
+// panics, the panic is logged and the later steps still run (#3711); when
+// the stop of a part of the lifecycle list panics, the panic is logged and
+// the rest of the list still stops (#3707). The errors of the stop are one
+// error per panicked step (wrapping errShutdownStep and naming the step),
+// the error of the lifecycle list (one error per panicked part, wrapping
+// errLifecycleStop) and the error of echo's shutdown. It returns nil when
+// there is none, the error itself when there is exactly one (so a stop
+// without a panic returns echo's error as is), and otherwise their
+// errors.Join in step order (see runShutdownSteps).
+func (s *Server) StopBackground(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		s.shutdownErr = s.shutdown(ctx)
 	})
 	return s.shutdownErr
 }
 
+// streamCloseMax bounds how long stopping a generation waits for the
+// streaming connections to close.
+const streamCloseMax = 3 * time.Second
+
+// streamCloseContext derives the deadline of the streaming close wait: at
+// most streamCloseMax and at most a third of what is left of ctx, so the
+// shutdown hooks keep most of the time.
+func streamCloseContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return shutdownStepContext(ctx, streamCloseMax)
+}
+
+// queueStopMax bounds how long stopping a generation waits for the queue
+// worker before it runs the shutdown hooks.
+const queueStopMax = 3 * time.Second
+
+// lateChartSaveMax is the least time given to the chart save after a queue
+// worker that did not stop within the queue wait of stopQueue has finally
+// stopped (see lateSaveContext).
+//
+// ここに来るのは、worker が min(queueStopMax, 残りの 1/3) 以内に止まらなかった
+// ときで、止まるまでの待ちの上限は driver の側 (mkq は 30 秒) にある。止まった
+// 時点で停止の ctx は切れていることがあり、切れた ctx では保存が DB に届かない。
+// 上限が要るのは、メンテナンスの作り直しが genMu を握ったままここを通るため。
+// SIGTERM では、Supervisor.Shutdown が期限で返った後にプロセスが終われば、この
+// 保存も途中で切られる。
+const lateChartSaveMax = 2 * time.Second
+
+// lateSaveContext derives the context of the chart save after a late queue
+// worker: ctx without its cancellation, with the later of ctx's deadline and
+// now+lateChartSaveMax. ctx に時間が残っていれば、それを 2 秒で切らずに使う。
+func lateSaveContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(lateChartSaveMax)
+	if d, ok := ctx.Deadline(); ok && d.After(deadline) {
+		deadline = d
+	}
+	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
+}
+
+// lateBackgroundWaitMin is the least wait of the late path for the
+// goroutines of the generation, even when the shutdown ctx has expired.
+const lateBackgroundWaitMin = time.Second
+
+// lateBackgroundWait is how long the late path of the shutdown (after a queue
+// worker that did not stop in time) waits for the goroutines of the
+// generation: a quarter of what is left of ctx like bgwork.Group.Stop, but at
+// least lateBackgroundWaitMin and at most bgwork.MaxWait.
+//
+// 下限を置くのは、ここでは停止の期限が切れていることが多いから。止まらなかった
+// worker が起動した hook は、ここで待たないと閉じた DB に当たる。
+func lateBackgroundWait(ctx context.Context) time.Duration {
+	limit := bgwork.MaxWait
+	if deadline, ok := ctx.Deadline(); ok {
+		limit = min(limit, time.Until(deadline)/4)
+	}
+	return max(limit, lateBackgroundWaitMin)
+}
+
+// shutdownStepContext derives the deadline of one waiting step of the
+// shutdown: at most limit and at most a third of what is left of ctx.
+func shutdownStepContext(ctx context.Context, limit time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok {
+		limit = min(limit, time.Until(deadline)/3)
+	}
+	return context.WithTimeout(ctx, limit)
+}
+
+// stopQueue stops the auto-scale controller, the scheduler and the queue
+// worker in the background and waits for them at most queueStopMax (and a
+// third of what is left of ctx). It returns a channel closed once they have
+// stopped, and whether they stopped within the wait.
+func (s *Server) stopQueue(ctx context.Context) (<-chan struct{}, bool) {
+	done := make(chan struct{})
+	// 止めるものが無い構成(MK_ONLY_SERVERでautoscaleも無く、queueを起動していない)は
+	// 待たない。期限の切れたctxでは、下のselectが止まっているqueueを「止まらなかった」と
+	// 取り違え、誤った警告と2回目のchartの保存を出しうる。
+	// workerとschedulerを止めるのは、roleがqueueを回すとき(起動していない世代も
+	// #3713より前と同じ)と、起動がworkerを起動したとき(#3713)。queueStartedは
+	// runMuを取らずに読む(queueStartedのコメント)。
+	stopWorker := s.role.RunsQueue() || s.queueStarted
+	if s.autoscale == nil && !stopWorker {
+		close(done)
+		return done, true
+	}
+	go func() {
+		defer close(done)
+		// queueServer.Shutdown 前に controller を停止 (Resize 呼びの停止 = pool に
+		// 余計な変更が走らない状態で queueServer の pool を畳める)。Shutdown ctx を
+		// 伝播することで autoscale の goroutine drain にも graceful deadline が効く。
+		s.autoscale.Stop(ctx)
+		// RoleServerでは(StartBackgroundForTestを除き)schedulerもworkerも起動していない。
+		// mkq driverはどちらのShutdownも未起動で安全だが、「起動済み」を前提にしたdriverへ
+		// 差し替わっても壊れないようroleで守る(#2459)。起動を記録した世代はroleにかかわらず
+		// 止める(#3713)。
+		if stopWorker {
+			if s.queueScheduler != nil {
+				s.queueScheduler.Shutdown()
+			}
+			s.queueServer.Shutdown()
+		}
+	}()
+	waitCtx, cancel := shutdownStepContext(ctx, queueStopMax)
+	defer cancel()
+	select {
+	case <-done:
+		return done, true
+	case <-waitCtx.Done():
+		// 止まらない worker は、キャンセルを見ない handler が掴んでいる。待ち続けると
+		// 後の hook (バッファの flush や chart の保存) の時間が無くなるので先へ進む。
+		// バッファは閉じた後の書き込みをその場で書くので、この worker の書き込みも
+		// 残る。chart は queue が止まった後でもう一度保存する (lateChartSaveMax)。
+		slog.Warn("queue worker did not stop before the shutdown hooks; continuing")
+		return done, false
+	}
+}
+
+// markStopped sets the stopped flag under runMu. A start that is running
+// holds runMu, so markStopped waits for it to finish (#3709).
+func (s *Server) markStopped() {
+	s.runMu.Lock()
+	s.stopped = true
+	s.runMu.Unlock()
+}
+
 func (s *Server) shutdown(ctx context.Context) error {
-	// 登録順に shutdown hook を走らせる。publisher goroutine の clean 停止と、
-	// graceful drain が必要な service (hashtag #727 等) の Shutdown(ctx) を
-	// 兼ねる。hook が ctx を取るので timeout 共有が可能 (#764)。
-	for _, hook := range s.shutdownHooks {
-		hook(ctx)
+	// 何かを止めるより先に、起動しない印を立てる(#3709)。走っている起動があれば、
+	// 印を立てる前にそれが済むのを待つので、下の手順はその起動が起動したものも止める。
+	// 止め終わってから立てると、その間に起動したworkerを止める人が居なくなる。
+	// 段の表の外に置くので、段のpanicで飛ぶことは無い(#3711)。
+	s.markStopped()
+	return runShutdownSteps(ctx, s.shutdownSteps())
+}
+
+// shutdownSteps returns the steps of stopping the generation, in the order
+// they run (docs/architecture.md 4.3). Each call returns a new table whose
+// steps share the result of the queue step: the background step and the
+// lateQueue step read whether the queue worker stopped in time.
+//
+// When the queue step panics, the queue is taken as not stopped in time:
+// the background step does nothing, and the lateQueue step collects the
+// goroutines and saves the chart again without waiting for the queue,
+// since there is no channel to wait on.
+//
+// queueの段がpanicしたときは、workerが止まったかが分からない。止まらなかったものとして
+// 扱い、箱の回収を一覧とchartの後(lateQueueの段)へ回す。止まったものとして扱うと、
+// 止まっていないworkerが箱へ足した分を捨てうる。待つchannelは無い(stopQueueが
+// 返していない)ので、lateQueueの段は待たない。nilのchannelを待つと永久に止まる。
+func (s *Server) shutdownSteps() []shutdownStep {
+	var (
+		queueDone    <-chan struct{}
+		queueStopped bool
+	)
+	return []shutdownStep{
+		{name: "streaming", run: func(ctx context.Context) error {
+			// streaming を最初に閉じる。接続の close handler は DB を触る
+			// (lastActiveDate など) ので、DB を閉じる前に終わらせる。close frame を
+			// 送るので、クライアントは 1006 ではなく 1012 を受けて繋ぎ直す (#3463)。
+			//
+			// **待ちには別の上限を付ける。** 待ちが ctx を使い切ると、後に続く shutdown
+			// hook (chart の SaveAll や buffer の flush) の時間が 0 になる。
+			if s.streamManager != nil {
+				closeCtx, cancel := streamCloseContext(ctx)
+				left := s.streamManager.CloseAll(closeCtx, stream.ServiceRestartCloseCode, "server restarting")
+				cancel()
+				if left > 0 {
+					slog.Warn("streaming connections did not close before the deadline", "left", left)
+				}
+			}
+			return nil
+		}},
+		{name: "queue", run: func(ctx context.Context) error {
+			// **queue の worker と scheduler を、hook と chart より先に止める (#3662)。**
+			// worker のジョブはバッファ (TouchBuffer など) と chart へ書くので、先に
+			// それらを閉じると、止まるまでに終わったジョブの書き込みが誰にも flush
+			// されずに消える。hook どうしは登録順のまま走らせる。後に登録した hook の
+			// 処理が、先に登録した hook の閉じるものを使う組は無い (#3662 で全件を確認)。
+			queueDone, queueStopped = s.stopQueue(ctx)
+			return nil
+		}},
+		{name: "background", run: func(ctx context.Context) error {
+			// 投げっぱなしの goroutine (投稿後の hook、サインインの記録、メールなど) を
+			// 回収する (#3661)。hook と chart より前に置くのは、箱の goroutine が書く
+			// バッファと chart の分を、flush と保存に含めるため。queue の後に置くのは、
+			// 受信の処理 (inbox) が止まるまで hook を起動し続けるため。待ちには上限があり、
+			// 止まらない goroutine は残して進む (DB を閉じた後に失敗する)。
+			// queue が上限内に止まらなかったときは、止まらなかった worker がまだ箱へ
+			// 足しうるので、閉じるのは lateQueue の段の <-queueDone の後にする (先に
+			// 閉じると、その worker のジョブが起動する fanout・アンテナ・通知が捨てられる)。
+			if queueStopped {
+				s.background.Stop(ctx)
+			}
+			return nil
+		}},
+		{name: "lifecycle", run: func(ctx context.Context) error {
+			// 部品の一覧 (#3699) を登録順に止める。publisher goroutine の clean 停止と、
+			// graceful drain が必要な service (hashtag #727 等) の Shutdown(ctx) を
+			// 兼ねる。ctx を渡すので timeout 共有が可能 (#764)。
+			// 部品の停止のpanicはstopAllが回収してエラーにするので、後の段はpanicがあっても
+			// 走る(#3707)。エラーは段のエラーとして返し、echoのエラーとまとめる。
+			return s.lifecycle.stopAll(ctx)
+		}},
+		{name: "chart", run: func(ctx context.Context) error {
+			if s.chartMgmt != nil {
+				s.chartMgmt.Stop(ctx)
+			}
+			return nil
+		}},
+		{name: "lateQueue", run: func(ctx context.Context) error {
+			// 上限内に止まらなかった worker は、driver を閉じる前にここで待つ (以前と
+			// 同じく、待ちの上限は driver の側にある)。止まるまでに chart へ足された分を
+			// 保存する。
+			if queueStopped {
+				return nil
+			}
+			// queueの段がpanicしたときはchannelが無いので待たない(shutdownStepsのGoDoc)。
+			if queueDone != nil {
+				<-queueDone
+			}
+			// 箱を先に回収してから保存する。ここでは停止の期限が切れていることが多い
+			// ので、箱の待ちは ctx の取り消しに縛られない上限 (lateBackgroundWait) で
+			// 取る。保存の期限 (lateSaveContext) は待った後に取るので、保存の時間は
+			// 箱の待ちに削られない (#3661 のレビュー2周目 L-3)。
+			s.background.StopWithin(lateBackgroundWait(ctx))
+			saveCtx, cancel := lateSaveContext(ctx)
+			if s.chartMgmt != nil {
+				_ = s.chartMgmt.SaveAll(saveCtx)
+			}
+			cancel()
+			return nil
+		}},
+		{name: "queueDriver", run: func(context.Context) error {
+			// queueClient.Close を直接呼ばないこと。queueDriver.Close が
+			// Client / Inspector を含むサブコンポーネントの Close を一括処理する。
+			// mkq driver は Client.Close が no-op で接続は driver 本体が持つので、
+			// 閉じ口は driver.Close の一本に統一する。
+			if s.queueDriver != nil {
+				if err := s.queueDriver.Close(); err != nil {
+					slog.Warn("queue driver close failed", "err", err)
+				}
+			}
+			return nil
+		}},
+		{name: "pubsub", run: func(context.Context) error {
+			// この世代の Redis 購読を閉じる。internal: の購読は解除の関数を捨てて
+			// いるので、個別ではなく pubsub ごと閉じる (#3463)。Publish はクライアントを
+			// 直接使うので、閉じた後も (古い世代の残りの処理が) 送ることはできる。
+			s.closePubSubs()
+			return nil
+		}},
+		{name: "echo", run: func(ctx context.Context) error {
+			// listener は Supervisor が持つ。echo は listen していないので、Shutdown は
+			// echo が自分で張った server を持っていた場合 (テストなど) にだけ効く。
+			// 戻り値は段のエラーとして返す。ほかに失敗した段が無ければ、runShutdownStepsは
+			// これをそのまま返す(#3707より前と同じ値)。
+			if s.echo != nil {
+				return s.echo.Shutdown(ctx)
+			}
+			return nil
+		}},
 	}
-	if s.chartMgmt != nil {
-		s.chartMgmt.Stop(ctx)
-	}
-	// queueServer.Shutdown 前に controller を停止 (Resize 呼びの停止 = pool に
-	// 余計な変更が走らない状態で queueServer の pool を畳める)。Shutdown ctx を
-	// 伝播することで autoscale の goroutine drain にも graceful deadline が効く。
-	s.autoscale.Stop(ctx)
-	// RoleServer では scheduler も worker も起動していない。mkq driver は
-	// どちらの Shutdown も未起動で安全だが、「起動済み」を前提にした driver へ
-	// 差し替わっても壊れないよう role で守る (#2459)。
-	if s.role.RunsQueue() {
-		if s.queueScheduler != nil {
-			s.queueScheduler.Shutdown()
-		}
-		s.queueServer.Shutdown()
-	}
-	// queueClient.Close を直接呼ばないこと。queueDriver.Close が
-	// Client / Inspector を含むサブコンポーネントの Close を一括処理する。
-	// mkq driver は Client.Close が no-op で接続は driver 本体が持つので、
-	// 閉じ口は driver.Close の一本に統一する。
-	if s.queueDriver != nil {
-		if err := s.queueDriver.Close(); err != nil {
-			slog.Warn("queue driver close failed", "err", err)
-		}
-	}
-	// RoleQueue では echo を listen していないので、代わりに最小 server を閉じる。
-	// echo.Shutdown 自体は listener 無しでも無害だが、閉じる対象を取り違えると
-	// in-flight な /healthz が切られないまま抜ける。
-	var err error
-	if s.queueOnlyServer != nil {
-		err = s.queueOnlyServer.Shutdown(ctx)
-	} else {
-		err = s.echo.Shutdown(ctx)
-	}
-	// UDS listen していた場合、Shutdown で net.Listener.Close() は呼ばれる
-	// が、ソケットファイル自体は残るので明示的に unlink しておく。
-	if rmErr := config.RemoveUnixSocket(s.config.Socket); rmErr != nil {
-		slog.Warn("failed to remove socket file", "socket", s.config.Socket, "err", rmErr)
-	}
-	return err
 }
 
 // setChartManagement registers the chart management service so its

@@ -46,7 +46,7 @@ func TestCreateInvitationViaAP_BlockedInviteeCreatesNoRow(t *testing.T) {
 	blocks := testutil.NewMockBlockingRepository()
 	// blocker=localUser (invitee), blockee=remoteOwner (inviter)。
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "localUser", BlockeeID: "remoteOwner"}))
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 	notifier := &recordingInvitationNotifier{}
 	svc.SetInvitationNotifier(notifier)
 
@@ -58,18 +58,48 @@ func TestCreateInvitationViaAP_BlockedInviteeCreatesNoRow(t *testing.T) {
 	assert.Empty(t, notifier.calls, "blocked invitation must not notify")
 }
 
-// block の向きを取り違えていないこと: owner が invitee を block していても
-// 招待自体は通る (DM 側の checkBlocked(to, from) と同じ向き)。
-func TestCreateInvitationViaAP_ReverseBlockStillInvites(t *testing.T) {
+// owner が invitee を block している向きでも招待を作らない。本家
+// createRoomInvitation は両方の向きを見る ('blocked' / 'blocking')。
+func TestCreateInvitationViaAP_ReverseBlockCreatesNoRow(t *testing.T) {
 	svc, repo := newRoomFedService(t)
 	seedRemoteRoom(t, repo, "room1", "remoteOwner")
 	blocks := testutil.NewMockBlockingRepository()
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "remoteOwner", BlockeeID: "localUser"}))
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
-	require.NoError(t, svc.CreateInvitationViaAP(remoteRoomURI("room1"), "localUser"))
-	_, err := repo.FindInvitation("localUser", "room1")
-	assert.NoError(t, err, "逆向きの block は招待を止めない")
+	err := svc.CreateInvitationViaAP(remoteRoomURI("room1"), "localUser")
+	assert.ErrorIs(t, err, corechat.ErrChatBlocked)
+	_, ferr := repo.FindInvitation("localUser", "room1")
+	assert.Error(t, ferr, "逆向きの block でも招待の行を作らない")
+}
+
+// BlockedEitherWay は両方の向きを見て、未配線なら false を返す。
+func TestBlockedEitherWay(t *testing.T) {
+	svc, _ := newRoomFedService(t)
+	blocked, err := svc.BlockedEitherWay("a", "b")
+	require.NoError(t, err)
+	assert.False(t, blocked, "blocking repo 未配線なら false")
+
+	blocks := testutil.NewMockBlockingRepository()
+	svc.SetBlockingRepoForTest(blocks)
+	blocked, err = svc.BlockedEitherWay("a", "b")
+	require.NoError(t, err)
+	assert.False(t, blocked)
+
+	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "a", BlockeeID: "b"}))
+	blocked, err = svc.BlockedEitherWay("a", "b")
+	require.NoError(t, err)
+	assert.True(t, blocked)
+	blocked, err = svc.BlockedEitherWay("b", "a")
+	require.NoError(t, err)
+	assert.True(t, blocked)
+	blocked, err = svc.BlockedEitherWay("a", "c")
+	require.NoError(t, err)
+	assert.False(t, blocked)
+
+	blocks.ExistsErr = errors.New("db down")
+	_, err = svc.BlockedEitherWay("a", "c")
+	assert.Error(t, err)
 }
 
 // 無関係な block 行があるだけで招待が止まらないこと (述語が広すぎないか)。
@@ -78,7 +108,7 @@ func TestCreateInvitationViaAP_UnrelatedBlockStillInvites(t *testing.T) {
 	seedRemoteRoom(t, repo, "room1", "remoteOwner")
 	blocks := testutil.NewMockBlockingRepository()
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "localUser", BlockeeID: "someoneElse"}))
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
 	require.NoError(t, svc.CreateInvitationViaAP(remoteRoomURI("room1"), "localUser"))
 	_, err := repo.FindInvitation("localUser", "room1")
@@ -91,7 +121,7 @@ func TestCreateInvitationViaAP_BlockCheckFailClosed(t *testing.T) {
 	seedRemoteRoom(t, repo, "room1", "remoteOwner")
 	blocks := testutil.NewMockBlockingRepository()
 	blocks.ExistsErr = errors.New("db down")
-	svc.SetBlockingRepo(blocks)
+	svc.SetBlockingRepoForTest(blocks)
 
 	err := svc.CreateInvitationViaAP(remoteRoomURI("room1"), "localUser")
 
@@ -270,7 +300,7 @@ func TestCreateInvitationViaAP_InvitationListFailureIsError(t *testing.T) {
 	boom := errors.New("db down")
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	svc := corechat.NewService(&invitationListFailingRepo{MockChatRepository: base, err: boom}, idGen)
+	svc := corechat.NewService(&invitationListFailingRepo{MockChatRepository: base, err: boom}, idGen, nil, nil, nil)
 
 	cerr := svc.CreateInvitationViaAP(remoteRoomURI("room1"), "localUser")
 

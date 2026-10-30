@@ -15,7 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/elythia-network/elythia/internal/config"
-	"github.com/elythia-network/elythia/internal/frontendutil"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/testutil"
 )
@@ -322,6 +321,13 @@ func TestApplyFrontendCSP_PassesMediaOrigins(t *testing.T) {
 	assert.Contains(t, v, "img-src 'self' data: blob: https://objects.example")
 }
 
+// wantEsmShSources are the only esm.sh sources the policy may allow.
+var wantEsmShSources = []string{
+	"https://esm.sh/shiki@4.5.0/",
+	"https://esm.sh/@shikijs/langs@4.5.0/",
+	"https://esm.sh/@shikijs/themes@4.5.0/",
+}
+
 // esm.sh の許可は**意図的な妥協**なので、増えていないことを固定する (#2425)。
 //
 // Misskey frontend は shiki (コードブロックの syntax highlight) を CDN から
@@ -330,6 +336,8 @@ func TestApplyFrontendCSP_PassesMediaOrigins(t *testing.T) {
 //
 // **外部 origin がこれ以上増えるのは別の判断**なので、ここが落ちたら意図した
 // 追加かどうかを確認すること。
+//
+// esm.sh は origin 全体ではなく、shiki が読むパスだけを許す。
 func TestFrontendCSP_ExternalOriginsAreLimited(t *testing.T) {
 	policy := buildFrontendCSP(false, cspExtras{})
 
@@ -348,7 +356,7 @@ func TestFrontendCSP_ExternalOriginsAreLimited(t *testing.T) {
 				external = append(external, tok)
 			}
 		}
-		assert.Equal(t, []string{"https://esm.sh"}, external,
+		assert.Equal(t, wantEsmShSources, external,
 			"script-src の外部 origin を増やすときは理由を確認すること")
 	})
 
@@ -369,7 +377,7 @@ func TestFrontendCSP_ExternalOriginsAreLimited(t *testing.T) {
 				external = append(external, tok)
 			}
 		}
-		assert.Equal(t, []string{"https://esm.sh"}, external)
+		assert.Equal(t, wantEsmShSources, external)
 	})
 
 	// リモート添付動画 (MkMediaVideo が file.url を直接読む) と埋め込み
@@ -426,17 +434,13 @@ func TestFrontendCSP_HashesCoverRenderedInlineScripts(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "boot.js"),
 		[]byte("window.__markerBootJs = 1;"), 0o644))
 	t.Setenv("MISSKEY_FRONTEND_DIR", dir)
-	frontendutil.ResetLoaderCacheForTest()
-	// cache は sync.Once なので、戻さないと fixture の loader がプロセス全体に
-	// 残る。同 package に shell を描画するテストが他にもある。
-	t.Cleanup(frontendutil.ResetLoaderCacheForTest)
 
 	cfg := &config.Config{
 		URL:                           "https://example.test",
 		Version:                       "0.0.1-test",
 		FrontendContentSecurityPolicy: CSPModeEnforce,
 	}
-	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()

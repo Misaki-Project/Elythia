@@ -44,6 +44,11 @@ type ServerStatsPublisher struct {
 	// O(1) append の circular buffer。TS の Array.unshift + length>200 で pop
 	// と同じ semantics を head pointer 方式で実装。
 	logBuf *statsRingBuffer
+
+	// enabled は meta の enableServerMachineStats を返す。本家は無効なら
+	// ServerStatsService が何もしないので、それに揃えて無効のあいだは集めも
+	// 流しもしない。nil も無効として扱う。構築子の必須の引数で受ける (#3827)。
+	enabled func() bool
 }
 
 // ServerStatsLogMax は requestLog 応答で返す最大件数。TS 本家と同じ 200。
@@ -51,7 +56,12 @@ const ServerStatsLogMax = 200
 
 // NewServerStatsPublisher constructs a ServerStatsPublisher. interval<=0 は
 // デフォルト (2秒) を使用する。
-func NewServerStatsPublisher(pub PubSubPublisher, interval time.Duration) *ServerStatsPublisher {
+//
+// enabled decides on each tick whether host metrics are collected and
+// published. nil publishes nothing. 以前は setter で入れ、入れ忘れ (管理画面で
+// 有効にしても値が流れない) を起動時の検査 (criticalWiring) が見ていた。渡し忘れを
+// コンパイルで落とすため、構築子の必須の引数で受ける (#3827)。
+func NewServerStatsPublisher(pub PubSubPublisher, interval time.Duration, enabled func() bool) *ServerStatsPublisher {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
@@ -60,7 +70,15 @@ func NewServerStatsPublisher(pub PubSubPublisher, interval time.Duration) *Serve
 		interval: interval,
 		stopCh:   make(chan struct{}),
 		logBuf:   newStatsRingBuffer(ServerStatsLogMax),
+		enabled:  enabled,
 	}
+}
+
+func (p *ServerStatsPublisher) isEnabled() bool {
+	p.mu.Lock()
+	fn := p.enabled
+	p.mu.Unlock()
+	return fn != nil && fn()
 }
 
 // Start begins the collection loop in a goroutine. 二重呼び出しはno-op。
@@ -124,6 +142,13 @@ type serverStatsSnapshot struct {
 }
 
 func (p *ServerStatsPublisher) tick() {
+	if !p.isEnabled() {
+		// 管理画面で無効にした後は、有効だったあいだの履歴も requestLog で
+		// 返さない。差分の起点も捨て、再び有効にした最初の tick を初回として扱う。
+		p.logBuf.Reset()
+		p.prevTick = time.Time{}
+		return
+	}
 	snap := p.collect()
 	body, err := json.Marshal(snap)
 	if err != nil {
@@ -141,6 +166,10 @@ func (p *ServerStatsPublisher) tick() {
 // または ServerStatsLogMax を超える値は ServerStatsLogMax に丸める。frontend
 // 起動直後の requestLog で historical な timeline を埋めるために使う。
 func (p *ServerStatsPublisher) Log(maxLen int) []json.RawMessage {
+	// 無効にした直後、次の tick が履歴を捨てるまでの間も返さない。
+	if !p.isEnabled() {
+		return []json.RawMessage{}
+	}
 	return p.logBuf.Log(maxLen)
 }
 

@@ -193,7 +193,7 @@ func newTestHandler() (*Handler, *mockAuthSessionRepo) {
 	repo := newMockRepo()
 	cfg := &config.Config{URL: "http://localhost:3000"}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(repo, cfg, idGen)
+	h := NewHandler(repo, cfg, idGen, nil, nil, nil)
 	return h, repo
 }
 
@@ -328,7 +328,7 @@ func TestAccept_UpdateSessionError(t *testing.T) {
 
 	cfg := &config.Config{URL: "http://localhost:3000"}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failUpdateRepo{base}, cfg, idGen)
+	h := NewHandler(&failUpdateRepo{base}, cfg, idGen, nil, nil, nil)
 
 	rec := post(h.Accept, `{"token":"tok1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -655,7 +655,7 @@ func TestMiAuthCheck_LosesFetchRace(t *testing.T) {
 	base.accessTokens["k"] = &model.AccessToken{ID: "at1", Token: "t", UserID: "u1", Session: &sess}
 	cfg := &config.Config{URL: "http://localhost:3000"}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failMarkRepo{base}, cfg, idGen)
+	h := NewHandler(&failMarkRepo{base}, cfg, idGen, nil, nil, nil)
 
 	rec := postMiAuthCheck(h, sess, nil)
 	var out map[string]any
@@ -679,4 +679,33 @@ func TestMiAuthCheck_NoUserRepoOmitsUser(t *testing.T) {
 	assert.Equal(t, "t", out["token"])
 	_, hasUser := out["user"]
 	assert.False(t, hasUser)
+}
+
+// TestEmptyStringsAreLookedUpNotRejected pins that an empty appSecret or token
+// is looked up and answered with upstream's NO_SUCH_APP / NO_SUCH_SESSION,
+// not rejected as a missing param (#3764).
+func TestEmptyStringsAreLookedUpNotRejected(t *testing.T) {
+	h, repo := newTestHandler()
+	repo.apps["s1"] = &model.App{ID: "a1", Secret: "s1"}
+	user := &model.User{ID: "u1"}
+	for _, tc := range []struct {
+		name string
+		fn   func(echo.Context) error
+		body string
+		code string
+	}{
+		{"auth/session/generate", h.SessionGenerate, `{"appSecret":""}`, "NO_SUCH_APP"},
+		{"auth/session/show", h.SessionShow, `{"token":""}`, "NO_SUCH_SESSION"},
+		{"auth/accept", h.Accept, `{"token":""}`, "NO_SUCH_SESSION"},
+		{"auth/session/userkey appSecret", h.SessionUserkey, `{"appSecret":"","token":"t"}`, "NO_SUCH_APP"},
+		{"auth/session/userkey token", h.SessionUserkey, `{"appSecret":"s1","token":""}`, "NO_SUCH_SESSION"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := post(tc.fn, tc.body, user)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
+			assert.Equal(t, tc.code, out["error"].(map[string]any)["code"])
+		})
+	}
 }

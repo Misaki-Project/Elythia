@@ -1,8 +1,8 @@
 # プロジェクトの構成の再編 (正式改名・frontend の組み込み・テスト配置の整理・プラグインまわりの名前の整理)
 
-**Status**: Draft (#3180、2026-09-24。正式名は 2026-09-30 に決定) / **Scope**: リポジトリ全体の構成、改名の範囲、本家 Misskey への追従方式
+**Status**: 完了 (#3180、2026-09-24 に起票し、2026-10-07 に全段階を終えた。正式名は 2026-09-30 に決定) / **Scope**: リポジトリ全体の構成、改名の範囲、本家 Misskey への追従方式
 
-未決事項 (末尾) はすべて決まった (2026-09-30)。再編の機会にあわせて行うこと (R6〜R8、D10〜D13) を 2026-10-04 に足した。P1 の試算 (#3370) の結果で D1 / D3 / D4 を確定した (2026-10-04)。段階を進めるごとにこの文書を更新する。作業の進み具合は #3180 と、段階ごとの sub-issue で管理する。
+未決事項 (末尾) はすべて決まった (2026-09-30)。再編の機会にあわせて行うこと (R6〜R8、D10〜D13) を 2026-10-04 に足した。P1 の試算 (#3370) の結果で D1 / D3 / D4 を確定した (2026-10-04)。段階を進めるごとにこの文書を更新する。作業の進み具合は #3180 と、段階ごとの sub-issue で管理する。**2026-10-07 に P7 を終え、全段階が完了した** (改名と移管は 2.0.0 として出した)。
 
 ---
 
@@ -121,7 +121,7 @@
 
 - **frontend の CI を required check にする。** 今の `frontend-check` は submodule の都合で required から外している。frontend を本体に取り込めば外す理由が無くなるので、`build` / `test` / `lint` に並べる。frontend の依存の更新も本体の仕組み (Dependabot など) に載せる
 - **ライセンスと著作権の表示を整える。** frontend を取り込むと本家 Misskey (AGPL-3.0) のコードが本体に入る。`frontend/` に本家の `LICENSE` / `COPYING` を残し、リポジトリ直下に由来を説明する `NOTICE` を置く
-- **`docs/divergence.md` を分ける。** 今は 1 ファイルに REST・連合・MFM・frontend・意図的な安全側の差が混ざっている (1764 行。数え方: `wc -l docs/divergence.md`)。P7 で領域ごとのファイルに分け、読んでいるゲート (`TestDivergenceDoc` など) も合わせて直す
+- **`docs/divergence.md` を分ける。** 今は 1 ファイルに REST・連合・MFM・frontend・意図的な安全側の差が混ざっている (1764 行。数え方: `wc -l docs/divergence.md`)。P7 で領域ごとのファイルに分け、読んでいるゲート (`TestDivergenceDoc` など) も合わせて直す。**#3415 で分けた** (`docs/divergence.md` は目次になり、中身は `docs/divergence/` の下)
 
 ### 非機能要件
 
@@ -139,7 +139,7 @@
 | 種類 | 参照元 | 移行先 |
 |---|---|---|
 | **自分たちの frontend** | `internal/frontendutil` の既定値 (`frontendBase = "third_party/misskey"`、`MISSKEY_FRONTEND_*` で上書き可)、`Dockerfile.bundled` (`built/`・`packages/frontend/assets`・`assets/`)、`compose.uds.yaml.example` の bind mount (`./third_party/misskey/built:/frontend`)、`tools/pluginbuild` / `plugindev` (`packages/frontend/src/server-plugins.generated.ts` などを書く)、`make frontend-check` / `frontend-test`、Playwright のビルド | `frontend/` |
-| **比較対象の本家** | tools 7 つ (`apicompat` / `erroriddiff` / `limitspec` / `permspec` / `securespec` (以上 `packages/backend/src/server/api/endpoints`)、`schemadrift` (`packages/backend/migration`・`src/models`)、`shapediff` (`packages/misskey-js/src/autogen/types.ts`))、テスト 9 ファイル、本家 backend e2e (`tests/upstream-e2e`)、promo の確認 | `.cache/misskey/<版>/` (git 管理外) |
+| **比較対象の本家** | tools 7 つ (`apicompat` / `erroriddiff` / `limitspec` (#3890 で消した) / `permspec` / `securespec` (以上 `packages/backend/src/server/api/endpoints`)、`schemadrift` (`packages/backend/migration`・`src/models`)、`shapediff` (`packages/misskey-js/src/autogen/types.ts`))、テスト 9 ファイル、本家 backend e2e (`tests/upstream-e2e`)、promo の確認 | `.cache/misskey/<版>/` (git 管理外) |
 | **本家の backend パッケージから借りているもの** | `Dockerfile` / `Dockerfile.bundled` が `packages/backend/assets` (favicon・アイコン = `static-assets`) と `packages/backend/node_modules/@misskey-dev/emoji-assets` (twemoji / fluent-emoji) を焼き込む | 下の D3 で決める |
 
 ### submodule を checkout している workflow (10 本)
@@ -200,7 +200,7 @@
 P3 (#3378) で上のとおりにした (2026-10-05)。
 
 - 場所は `internal/upstreamsrc` が返す。**submodule へ戻す経路は作らなかった** — P4 で fork が消えたときに、黙って fork を読んでいたことが隠れるため。本家が無ければ「`make upstream-fetch` を実行する」と出して落ちる
-- skip を禁じる変数は `MK_UPSTREAM_REQUIRE`。本家を読むテストは今 `achievement` の 1 本で、`make upstream-check` (golden を本家から作り直して差分が無いこと + このテスト) が立てる。`apicompat` workflow が回す
+- skip を禁じる変数は `MK_UPSTREAM_REQUIRE`。本家を読むテストは今 `achievement` の 1 本で、`make upstream-check` (golden を本家から作り直して差分が無いこと + このテスト) が立てる。`apicompat` workflow が回す。#3673で`internal/api/paramschema`の`TestResponseMatchesUpstreamEndpointBase`が加わり、2本になった
 - 本家 backend e2e の 3 ファイルは `tests/upstream-e2e/harness/` に置き、実行のたびに本家の `packages/backend/` へコピーする。vitest の設定を本家の外に置いたまま走らせる形は、設定ファイルの import が設定ファイルの場所から解決されて失敗するので採らない
 - 試算: fork と本家は、比較対象として読むパス (`packages/backend/src` / `migration` / `misskey-js/src/autogen`) で差分が 0。本家から作り直した golden 11 個 (`make shapecheck-gen` が書く全て) は、commit 済みのものとバイト一致した
 - `UPSTREAM_MISSKEY_VERSION`・`config.MisskeyVersion`・e2e の `misskey/misskey:<版>` が揃っていることを `TestUpstreamVersionIsConsistent` が見る
@@ -225,7 +225,7 @@ P3 (#3378) で上のとおりにした (2026-10-05)。
 5. 衝突はファイル単位で衝突マーカーとして残る。解いてコミットし、`UPSTREAM_MISSKEY_VERSION` を上げる
 6. backend 側の変更は今と同じく triage して Go に移植する (docs/upstream-catch-up.md)
 
-- 今の fork の rebase (`rebase --onto`) と比べて、衝突の解き方が「コミット単位」から「ファイル単位」になる。独自変更の一覧は git の履歴ではなく `docs/divergence.md` §4-2 で保つ
+- 今の fork の rebase (`rebase --onto`) と比べて、衝突の解き方が「コミット単位」から「ファイル単位」になる。独自変更の一覧は git の履歴ではなく `docs/divergence/frontend.md` §4-2 で保つ
 - 取り込まないパスを絞り込みで外すのは、本家が版ごとに `.github/workflows` などを変えるため (2026.9.1 では `.github/workflows` だけで 24 ファイル)。外さないと、無いファイルへの差分として当たらない。
 - **P1 (#3370) の試算:** 過去 3 回の追従を scratch で再現し、今の方式 (独自コミットを 1 件ずつ当て直す) と比べた。どちらも衝突の量は同じで、衝突したファイル以外は実際の `-mk.0` の木 (backend を除く) と完全に一致した。試算では `packages/backend` 以外の差分をまとめて当てた。D1 の「取り込む」パスだけに絞ると、当てるファイルはさらに減る (表の「うち「取り込む」パス」の列)
 
@@ -250,7 +250,7 @@ P4d-3 (#3379) で上のとおりに作った (2026-10-05)。
 
 - **frontend の版 = 本体の版。`mkGoFrontendVersion` は廃止する** (Q7)。読んでいるのは同梱 frontend の `/about-mkgo` の表示だけで (2026-09-30 に確認)、更新ダイアログの判定には使っていない (`check-client-update.ts` のコメントも「fork のタグでは判定できない」として使っていない)。追従している本家の版は `/api/meta` の `version` に既に出ている。ビルド時に埋める `MkGoFrontendVersion` の ldflags (`Makefile` と `Dockerfile` / `deploy/uds/Dockerfile.mkgo`) と、`tests/diff` の除外も合わせて消す
 - `-mk.N` のタグ、`submodulepin-check`、`bundled_assets_pin_test`、`docs/divergence.md` の pin 行は廃止または置き換える
-- `docs/divergence.md` §4-2 (独自変更の一覧) は ~~tag 列を PR 番号に置き換える~~ **#3379 で取り込むまでの記録として凍結し、取り込んだ後の変更は PR 番号を鍵にした新しい節 (§4-2b) に書く** (P4d-2 で変更)。143 行の tag を PR 番号へ置き換えると対応表を作る手間が大きく、アーカイブした fork の tag との対応も失われるため
+- `docs/divergence/frontend.md` §4-2 (独自変更の一覧) は ~~tag 列を PR 番号に置き換える~~ **#3379 で取り込むまでの記録として凍結し、取り込んだ後の変更は PR 番号を鍵にした新しい節 (§4-2b) に書く** (P4d-2 で変更)。143 行の tag を PR 番号へ置き換えると対応表を作る手間が大きく、アーカイブした fork の tag との対応も失われるため
 
 ### D6. テスト関連の配置
 
@@ -352,15 +352,15 @@ P4 (bind mount の元が `third_party/misskey/built` から `frontend/built` に
 | 段階 | 内容 | 名前に依存 |
 |---|---|---|
 | P1 | 追従方式の試算と、取り込む範囲の確定 (#3370、2026-10-04 に完了) | しない |
-| P1b | 復路の保証をやめる (D9、#3191)。宣言は P6 の版の CHANGELOG | しない |
+| P1b | 復路の保証をやめる (D9、#3191)。宣言は P6 の版の CHANGELOG (2.0.0 の CHANGELOG の Note で宣言した) | しない |
 | P2 | テスト関連の配置の整理 (D6。#3373、2026-10-04 に完了) | しない |
 | P3 | 本家の参照を `.cache/misskey` へ分離 (D2。#3378、2026-10-05 に完了)。この時点では frontend はまだ submodule のまま。fork の `packages/backend` にある、本家 backend e2e を mk-go へ向けて走らせる 3 ファイル (`test-server-mkgo/entry.ts` など) を `tests/` へ移す | しない |
 | P4 | **2026-10-05 に完了** (#3379。P4a #3382、P4b #3384 と本番の切り替え、P4c #3385、P4e #3386、P4d #3387 / #3388 / #3389)。`api.json` の作り方は決めずに残した (後の issue で決める)。frontend の取り込み (D1 / D3 / D4 / D5)、submodule と fork の廃止。frontend の CI の required 化とライセンスの表示 (R8 / D12)、本番の切り替え (D13) を含む。あわせて、`@misskey-dev/emoji-assets` を frontend の依存に持ち直す (今は backend の `node_modules` から取っている)、Node.js の版を本家の `Dockerfile` でなく `.node-version` から読む、fork の assets image (`Dockerfile.assets` と publish の workflow。`Dockerfile.bundled` が使う) を本体の workflow でのビルドに置き換える (R2)、`misskey-js` の型の生成 (`build-misskey-js-with-types`) が使う `api.json` の作り方を決める (`api.json` は本家のソースに無く、本家 backend をビルドして `generate-api-json` で作る生成物。`.cache/misskey` で本家 backend をビルドするか、本体の API から作るか) | しない |
 | P5 | 正式な名前 (**決定: Elythia**) と、プラグインの呼び名 (**決定: 据え置き**) の決定。どちらも 2026-09-30 | — |
-| P5b | リポジトリの移管 (D10)。P6 / P6b を `develop` に入れた後、2.0.0 を出す前に行う (2026-10-05 に順番を変更) | する |
-| P6 | 改名 (D7) と実行バイナリのサブコマンド化 (R7 / D11)。2.0.0 として出す (R6)。`docker-compose.yml` には `name:` を付けない (R3、2026-10-06 に変更) | する |
-| P6b | プラグインまわりの名前の移行 (D8)。連合に出る nodeinfo の宣言を含むので P6 とは別 PR にするが、同じ版で出す | する |
-| P7 | ドキュメント・CLAUDE.md の整理。`docs/divergence.md` の分割 (R8) を含む | する |
+| P5b | **2026-10-06 に完了** (#3402。あわせてプラグイン 4 つと mkq / mkqd も移管した)。リポジトリの移管 (D10)。P6 / P6b を `develop` に入れた後、2.0.0 を出す前に行う (2026-10-05 に順番を変更) | する |
+| P6 | **2026-10-07 に 2.0.0 として完了** (#3394。#3395〜#3399、移管後の #3402 / #3404 / #3405、リリースは #3412)。改名 (D7) と実行バイナリのサブコマンド化 (R7 / D11)。2.0.0 として出す (R6)。`docker-compose.yml` には `name:` を付けない (R3、2026-10-06 に変更) | する |
+| P6b | **2026-10-06 に完了** (#3400、#3401。CHANGELOG の Note は 2026-10-07 の #3413)。プラグインまわりの名前の移行 (D8)。連合に出る nodeinfo の宣言を含むので P6 とは別 PR にするが、同じ版で出す | する |
+| P7 | **2026-10-07 に完了** (#3414、#3415)。ドキュメント・CLAUDE.md の整理。`docs/divergence.md` の分割 (R8) を含む | する |
 
 - **P1 (試算) を最初に済ませた (#3370)。** 追従の方式 (D4) が実用になるかで P4 の作業量が変わるため。2026.7.0 → 2026.9.0、2026.9.0 → 2026.9.1、2026.9.1 → 2026.10.0 の 3 回で確かめた。P1b と P2 は他の段階と触るファイルが重ならないので、P1 と並行して進める
 - P1b を P3 / P4 より先に置くのは、TS を立てる e2e の読み先が動く段階で `mkgo-born` を「守る」対象から「測る」対象に変えておくため (D9)
@@ -372,7 +372,7 @@ P4 (bind mount の元が `third_party/misskey/built` から `frontend/built` に
 ## 未決事項
 
 - ~~Q1. 正式な名前 (P5)~~ → **Elythia** に決定 (2026-09-30)。置き場所は `Elythia-Network`、機械が読む名前は小文字 (R1)
-- ~~Q2. fork の履歴を持ち込むか~~ → **スナップショットとして取り込む** (2026-09-30)。独自変更の経緯は `docs/divergence.md` §4-2 と、アーカイブした fork で追う
+- ~~Q2. fork の履歴を持ち込むか~~ → **スナップショットとして取り込む** (2026-09-30)。独自変更の経緯は `docs/divergence/frontend.md` §4-2 と、アーカイブした fork で追う
 - ~~Q3. 本家の取得方法~~ → **手元は共有の bare mirror + worktree、CI は毎回 shallow** (2026-09-30、D2)
 - ~~Q4. 旧名の配布イメージの猶予期間~~ → **設けない**。改名の版で旧名での publish を止め、移転を案内する (2026-09-30)
 - ~~Q5. 旧 URL (`/about-mkgo` など) の転送を残す期間~~ → **転送しない** (2026-09-30)

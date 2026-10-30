@@ -14,19 +14,20 @@ import (
 // 絵文字を作った直後にそれを装着しても **保存されているのに API が
 // `avatarDecorations: []` を返す** — #2258 が catalog 側で踏んだ形そのもの。
 //
-// **`entity.SetEmojiDecorationLookup` だけは `TestProcessGlobalsAreRestored` が
-// 見ているが、invalidator 側は誰も見ていなかった。** どちらも消してもビルドも
-// テストも通り、症状は「30 秒だけ消える」なのでログにも出ない。
+// **resolver を Packer に入れる配線 (`EmojiDecoration: emojiDecorationResolver`)
+// は `TestEntityPackerDepsAreWired` が見ているが、invalidator 側は誰も見て
+// いなかった。** どちらも消してもビルドもテストも通り、症状は「30 秒だけ
+// 消える」なのでログにも出ない。
 //
 // **criticalWiring の表には載せない。** あちらは GoDoc が「認証や一回性の保証」
 // と tier を定義しており、未配線で起きるのが「空配列 / 0 / 使えない」のものは
 // 意図的に載せていない (兄弟の `SetAvatarDecorationInvalidator` も同様)。
 func TestEmojiDecorationCacheIsWired(t *testing.T) {
-	assertWired(t, routerGo, "adminHandler.SetEmojiDecorationInvalidator(emojiDecorationResolver)",
+	assertWired(t, serverPkg, "adminHandler.SetEmojiDecorationInvalidator(emojiDecorationResolver)",
 		"admin の絵文字変更 (追加 / 更新 / 削除 / bulk / 申請の承認) が\n"+
 			"絵文字デコレーションのキャッシュに伝わらず、作った直後の絵文字を\n"+
 			"装着しても最大 30 秒 avatarDecorations が空で返る。")
-	assertWired(t, routerGo, "DecorationCache: emojiDecorationResolver",
+	assertWired(t, serverPkg, "DecorationCache: emojiDecorationResolver",
 		"絵文字 zip インポートがキャッシュに伝わらない。インポート直後の\n"+
 			"絵文字は装着しても出ず、置き換えで消えた絵文字は残り続ける。")
 }
@@ -69,7 +70,7 @@ var emojiCacheNotifiers = map[string]bool{
 // admin だけ見る gate では素通りする (敵対的レビューで実測された)。
 //
 // **`internal/core/federation` は対象外。** あそこも `emoji` を書くが
-// (`resolver.go` の `Create` / `UpdateFields`)、作るのは必ず `Host: &host` の
+// (`resolver_tags.go` の `Create` / `UpdateFields`)、作るのは必ず `Host: &host` の
 // リモート行で、resolver の map は `ListLocal` (= `host IS NULL`) しか載せない。
 // **ローカル行に触るようになったらここへ足すこと** — そうなるまでこの gate は
 // あちらについて何も言わない。
@@ -223,6 +224,26 @@ func callsAny(fn *ast.FuncDecl, names map[string]bool, recv func(ast.Expr) bool)
 // 返す (upstream 2026.10.0)。第 3 引数を全ロールの集合に取り違えると、テストの
 // 単体の handler は通ったまま、本番だけ非公開ロールの ID を返す。
 func TestAvatarDecorationRoleSetsAreWired(t *testing.T) {
-	assertWired(t, routerGo, "avatardecorations.NewHandler(s.db, roleService.ExistingRoleIDSet, roleService.PublicRoleIDSet)",
+	assertWired(t, serverPkg, "avatardecorations.NewHandler(s.db, roleService.ExistingRoleIDSet, roleService.PublicRoleIDSet)",
 		"ログインしていない利用者に、非公開ロールの ID を返してしまう。")
+	// 上の構築の行は buildHandlers の中にある (#3694)。ルートを登録する setupRoutes が
+	// 使うのは別名なので、構築から別名までの段も照合する。上の行だけだと、setupRoutes の
+	// 別名を別の式に書き換えても緑のまま通る (docs/architecture.md 4.2)。別名は
+	// buildHandlers の戻り値を受けた変数 hSvcs から取る形にしてあり、別名を
+	// buildHandlers の呼び出しより前に書くとコンパイルが通らない。照合もその形で行う。
+	// **hSvcs の欄を代入で書き換える形 (`hSvcs.avatarDecorations = …`) は、ここでは
+	// 捕まらない。** 構築・別名・代入の行の文字列がどれも残るため。その形は
+	// internal/server の TestSetupRoutesAliasesEveryBuiltHandler が落とす。
+	assertWired(t, serverPkg, "avatarDecorations: avatarDecorationsHandler",
+		"buildHandlers が作った get-avatar-decorations の handler を apiHandlers に入れていない。")
+	assertWired(t, serverPkg, "hSvcs := s.buildHandlers(w, coreSvcs, fedSvcs, idGen, noteHider, entityPacker, sharedUserPacker, metaRepo, abuseNotifStates, abuseReportRepoForNotif.CountUnresolved, signupApplicationNotifLookup, twoFAPendingGuard, streamRevokePublisher)",
+		"setupRoutes が buildHandlers の handler を使っていない。")
+	assertWired(t, serverPkg, "w.handlers = hSvcs",
+		"buildHandlers の handler を wiring に入れていない。")
+	assertWired(t, serverPkg, "avatarDecorationsHandler := hSvcs.avatarDecorations",
+		"get-avatar-decorations に登録する handler が、buildHandlers で作ったものでなくなる。")
+	// ルートの登録は registerEmojisRoutes へ移った (#3697)。行の avatarDecorationsHandler は
+	// その関数の引数なので、setupRoutes がその引数に同じ名前の別名を渡していることまで照合する。
+	assertRouteRegisteredBy(t, "routes_emojis.go", "registerEmojisRoutes", `api.POST("/get-avatar-decorations", avatarDecorationsHandler.Get)`,
+		"get-avatar-decorations のルートが、buildHandlers で作った handler を使っていない。")
 }

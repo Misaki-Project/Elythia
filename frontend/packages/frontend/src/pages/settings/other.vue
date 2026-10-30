@@ -80,6 +80,14 @@ SPDX-License-Identifier: AGPL-3.0-only
 				</MkFolder>
 			</SearchMarker>
 
+			<SearchMarker :keywords="['account', 'federation', 'local-only']">
+				<MkFolder>
+					<template #icon><SearchIcon><i class="ti ti-world"></i></SearchIcon></template>
+					<template #label><SearchLabel>{{ i18n.ts._localOnlyAccount.settingsTitle }}</SearchLabel></template>
+					<XFederation/>
+				</MkFolder>
+			</SearchMarker>
+
 			<SearchMarker :keywords="['account', 'close', 'delete']">
 				<MkFolder v-if="shouldShowAccountDeletionSection($i.policies, $i.isDeleted)">
 					<template #icon><SearchIcon><i class="ti ti-alert-triangle"></i></SearchIcon></template>
@@ -171,6 +179,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 <script lang="ts" setup>
 import { computed, ref, watch } from 'vue';
 import XMigration from './migration.vue';
+import XFederation from './federation.vue';
 import MkSwitch from '@/components/MkSwitch.vue';
 import FormLink from '@/components/form/link.vue';
 import MkFolder from '@/components/MkFolder.vue';

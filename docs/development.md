@@ -100,6 +100,7 @@ cd mk && docker compose up -d
 | `make docker-restart` | `app` を再起動して配信エントリを検証 (Docker Compose 構成) |
 | `make docker-update` | pull → ビルド → 再起動 → 検証 (Docker Compose 構成) |
 | `make uds-rebuild` `make uds-restart` `make uds-update` | 同上 (UDS 本番構成) |
+| `make uds-backup-refresh` | backup-daemon (と作ってあれば backup) の image を作り直し、動いていれば入れ替える (UDS。`uds-update` が再起動の後に呼ぶ) |
 
 `docker-update` / `uds-update` は**フロントエンドの再ビルドと再起動を必ずセットで実行する**。Elythia はエントリポイントを起動時に 1 回だけ解決してキャッシュするため、ビルドだけして再起動しないと HTML が消えた古い `scripts/<hash>.js` を指したまま 404 になる。
 
@@ -124,7 +125,7 @@ cd mk && docker compose up -d
 | `make tidy` | `go mod tidy`。**このリポジトリでは private plugin の解決に失敗するので使えない**。依存追加は `go get`、`go.sum` の充足検証は **`GOWORK=off go build`**。**`-mod=readonly` では効かない** — Go 1.16 以降それは既定値で、素の `go build` と同じ。効いていないのは `go.work` のほうで、workspace があると `go.sum` ではなく `go.work.sum` が使われ、`go.sum` から行を消しても**どちらの書き方でも exit 0 になる** (実測)。CI は `go.work` を持たない (生成物で gitignore 済み) ので、既存の `go build ./...` が既に検証している (→ [プラグインの書き方](plugins/authoring.md)) |
 | `make plugins` | `plugins/` を走査して組み込み用ファイルを生成 (#2480)。`make build` が内部で呼ぶ |
 | `make plugins-all` | `disabled` のプラグインも含めて生成 (CI 検証用) |
-| `make emoji-regex` | MFM の Unicode 絵文字の正規表現 (`internal/activitypub/mfm/emoji_regex_gen.go`) を、mfm-js が依存する `@misskey-dev/emoji-data` の `emojiRegex` から生成 (#3324)。`frontend/` に `pnpm install` 済みであること。生成物は手で直さない |
+| `make emoji-regex` | frontend の MFM の解析器 `@elythia-network/mfm` (#3515) が同梱する Unicode 絵文字の正規表現 (`@misskey-dev/emoji-data` の `emojiRegex`) を、snapshot (`tools/emojiregex/testdata/source.txt`) に書き写す (#3324)。サーバーの解析器 (Go のモジュール `github.com/elythia-network/mfm`、#3514) の `emoji_regex_gen.go` と一致しなければ落ちる。`frontend/` に `pnpm install` 済みであること |
 
 ### コード品質
 
@@ -136,11 +137,12 @@ cd mk && docker compose up -d
 | `make actionlint` | GitHub Actions の workflow を検査 (式の typo・存在しない `needs` 参照・`runs-on` の誤り・`run:` の中のシェルを shellcheck 経由で)。**CodeQL の `actions` とは別物** — あちらは script injection などのセキュリティを見るが、式が壊れているかは見ない。`lint` job から `make` 経由で呼ぶので、版の定義は Makefile に 1 つだけ置く |
 | `make test` | `go test ./... -v -race -count=1 -shuffle=3` (CI と同じテスト実行条件。PostgreSQL が要る → [testing.md](testing.md)) |
 | `make test-fast` | `-race` 抜き (反復用)。**コミット前の検査ではない** — CI で落ちるものが手元で緑になる |
+| `make fuzz-imagedecode` | 画像デコーダの fuzz (`FUZZTIME` / `FUZZ` / `FUZZPARALLEL`)。デコーダの依存を上げたら回す ([testing.md](testing.md#画像デコーダの-fuzz-3480)) |
 | `make frontend-test` | fork frontend の vitest (#2844) |
 | `make plugin-vet` | 同梱プラグインを`go vet` + 既定無効を検査（CIの`build` jobの2 step相当） |
 | `make plugin-test` | 同梱プラグインのテスト (別 module なので `./...` に含まれない) |
 | `make plugin-doc-check` | `docs/plugins/authoring.md` の Go スニペットが実際にコンパイルできるか |
-| `make emoji-regex-check` | `make emoji-regex` の生成物と snapshot (正規表現と mfm-js / emoji-data の版) が、`frontend/` の mfm-js と emoji-data から作り直したものと一致するか。node_modules が要るので `make gates` には入れず、手元では `make frontend-check` から、CI では `frontend` workflow の `frontend-lint` job から呼ばれる (#3324) |
+| `make emoji-regex-check` | `make emoji-regex` の生成物と snapshot (正規表現と mfm-js / emoji-data の版) が、`frontend/` の `@elythia-network/mfm` から作り直したものと一致するか。node_modules が要るので `make gates` には入れず、手元では `make frontend-check` から、CI では `frontend` workflow の `frontend-lint` job から呼ばれる (#3324) |
 | `make frontend-lint` | fork frontend の eslint。CI `frontend` workflow の `frontend-lint` job の eslint step のうち frontend の分と同じで、範囲は `package.json` の script が持つ (`--quiet "src/**/*.{ts,vue}"`)。`make frontend-check` から呼ばれる (#2906)。実測 55 秒 |
 | `make frontend-test` | fork frontend の vitest (`test/unit/**/*.test.ts`)。CI `frontend` workflow の `frontend-test` job の frontend unit tests step と同じ |
 | `make plugin-dev` | プラグインを編集しながら動かす (`PLUGIN=plugins/status`) |
@@ -149,10 +151,14 @@ cd mk && docker compose up -d
 
 | ターゲット | 内容 |
 |---|---|
-| `make migrate-up` | 最新まで適用 |
-| `make migrate-down` | 1段階ロールバック (`-steps 1`) |
-| `go run ./cmd/elythia migrate -direction down` | **全段ロールバック**。`-steps` 未指定は「全部」の意味で、全テーブルが消える |
+| `make migrate-up` | 最新まで適用。本体 (`migration/`) の後に、fork の系列 (`migration/local/`) があれば流す |
+| `make migrate-down` | 本体の系列を1段階ロールバック (`-track core -steps 1`) |
+| `make migrate-down-local` | fork の系列を1段階ロールバック (`-track local -steps 1`) |
+| `go run ./cmd/elythia migrate -direction down -track core` | **全段ロールバック**。`-steps` 未指定は「全部」の意味で、全テーブルが消える。down は `-track core` / `-track local` が必須 (#3428) |
 | `make migrate-create` | 新規マイグレーションファイル作成 |
+| `make migrate-create-local` | fork の系列 (`migration/local/`) に新規マイグレーションファイル作成 |
+
+fork が本体の表を変える独自の migration を足す手順と決まりは [fork の独自 migration](fork-migrations.md) にある。
 
 #### 大規模テーブルへの index 追加
 
@@ -187,14 +193,13 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 | ターゲット | 検出対象 |
 |---|---|
 | `make shapecheck` | レスポンス形状の drift。`make shapecheck-gen` で golden snapshot を再生成、`make shapecheck-report` でレポート出力 |
-| `make errorid-check` | error id / HTTP status / kind の drift。id gate は **router.go に inline endpoint が復活したら落とす** (#2791 で全 14 件を `internal/api` へ移設済み。closure は gate から漏れる) |
-| `make limitspec-check` | ページネーションの default / max の drift |
-| `make perm-check` | router middleware の権限が Misskey 本家より緩くないか (アクセス階層 / `secure` の双方向 / OAuth scope の 3 本) |
-| `make wiring-check` | router / server で配線しないと効かないもの (FTT のトグル、global な security header、invite の moderator bypass、プラグイン peer の本文上限 / rate limit / catchall / 専用キュー / enqueuer、Web Push の producer 配線、chart management の logger を配線時に解決する形、ドライブ使用量の集計と route (#3053)、IP 履歴の記録 3 本 (#3103)、IP からの関連アカウント検索の repository と route (#3104)、`criticalWiringCount` の実数照合) が外れていないか。判定は AST 照合なので `//` でも `/* */` でも落ちる (#2856)。**既知の限界**: `if cond { ... }` の条件付き配線、未参照の関数の中に置かれた同じ配線、`e := e.Group(...)` のようにレシーバを同名でシャドウする形は素通りする |
-| `make catalog-check` | `pg_indexes` 等のシステムカタログのクエリが `schemaname` で絞られているか (#2777) |
+| `make errorid-check` | error id / HTTP status / kind の drift。id gate は **`internal/server` に inline endpoint が復活したら落とす** (#2791 で全 14 件を `internal/api` へ移設済み。closure は gate から漏れる) |
+| `make perm-check` | router middleware の権限が Misskey 本家より緩くないか (アクセス階層 / `secure` の双方向 / OAuth scope の 3 本)。あわせて、`allowGet`のGETのrouteと`cacheSec`の`Cache-Control`の表が本家と一致するかも見る |
+| `make wiring-check` | router / server で配線しないと効かないもの (FTT のトグル、global な security header、プラグイン peer の本文上限 / rate limit / catchall / 専用キュー / enqueuer、Web Push の producer 配線、chart management の logger を配線時に解決する形、ドライブ使用量の集計と route (#3053)、IP 履歴の記録 3 本 (#3103)、IP からの関連アカウント検索の repository と route (#3104)、`criticalWiringCount` の実数照合) が外れていないか。判定は AST 照合なので `//` でも `/* */` でも落ちる (#2856)。**既知の限界**: `if cond { ... }` の条件付き配線、未参照の関数の中に置かれた同じ配線、`e := e.Group(...)` のようにレシーバを同名でシャドウする形は素通りする |
+| `make catalog-check` | `pg_indexes` 等のシステムカタログのクエリが `schemaname` で絞られているか (#2777)、`indexdef` / `pg_get_indexdef` を WHERE に書いていないか (#3365)。`FROM` / `JOIN` / カンマで並べた FROM、`pg_catalog.` の修飾、引用符で囲んだ名前を拾う。判定は文字列リテラル単位で、葉がすべて文字列の `+` の連結はつないでから見る (変数を挟む連結はつながず、リテラルごとに判定する。GORM の builder は見ない)。`migration/` の SQL は、コメントを外し、引用符の外の `;` で文に分けて、文ごとに判定する (#3369。テストでは各パッケージの schema に並行して流れるため。DO ブロックの本体の中も文ごとに分ける)。`E'...'` の `\'` とドル引用 (`$$...$$`、`$tag$...$tag$`) は PostgreSQL と同じに読み、直前が `DO` / `AS` のドル引用だけを本体として中まで読む。閉じのタグは直前の文字に関係なく閉じる (`END$$` も閉じる)。ただし本体の中の文字列・コメント・引用符付き識別子に現れたタグでは閉じないので、そこだけは PostgreSQL より遅く閉じる (PostgreSQL はそこで閉じて構文エラーになるので、差が出るのは適用できない SQL だけ)。単一引用符で書いた関数の本体 (`AS '...'`) は文字列として扱い、中を 1 つの文として見る (既知の限界。今の migration には無い)。引用符・ドル引用・ブロックコメントが閉じていないファイルは、取りこぼさないようそれ自体を違反として落とす。`-- unscoped:` は、その文の `;` より前に書いたときだけ効く (`;` の後ろの同じ行に書いた注記は、どの文にも効かない)。#3365 の検査は最初の `WHERE` より後ろに語として出るかだけを見るので、`JOIN ... ON` や `WHERE` の無い `HAVING` に書いた形は拾わず、逆に `ORDER BY` で読む安全な形も落とす。**CTE や副問い合わせで定義に別名を付け (`indexdef AS d`)、外側の `WHERE` で比べる形も拾わない**が、これは安全な形ではない (PG18 の実測で、`MATERIALIZED` でない CTE と副問い合わせはインライン化され、`pg_get_indexdef` の条件が index の pg_class の scan の Filter まで押し下げられる)。Go のソースでは、カンマの後の `pg_indexes` は SQL の外 (地の文、コメント、文字列) でも拾う (migration はコメントを外してから見るので、コメントの中は拾わない)。落ちたら SELECT 句で読み、並べ替えや絞り込みは Go の側で行う (migration では、定義を `array_agg` などで配列に読み切ってから比べる。`000068` が例。`MATERIALIZED` を付けた CTE も、絞った後に読む形になる。ただしゲートは `MATERIALIZED` の有無を見ない) |
 | `make notfound-check` | repository の lookup error を種別を見ずに 4xx にしている箇所を検出する (#2792)。**allowlist は件数で持つ** — key が `<file>:<func>` なので、同じ関数に足しても key が変わらない。増えたら新規流入、減ったら陳腐化として落ちる。**既知の限界**: **lookup が別ブロックに hoist されている形は射程外** — lookup と `if` のペアリングは「同じブロック内の後続 3 文」で見るので、`goroutine` に切り出して結果を外側の変数へ書く形 (`note_create_service.go` の reply / renote 先取得) は距離ではなくブロックが違うため掛からない。`lookupIfLookahead` を広げても増えない / **service 呼び出しの潰しは射程外** — `h.svc.Show(...)` の err を種別を見ずに 4xx にする形は api / core どちらの述語にも掛からない (lookup メソッドの呼び出ししか見ないため)。数え方: gate の `condChecksErrNonNil` / `bodyReturns4xx` をレシーバが `*svc` / `*Service` の `Show` / `Get` / `Find` / `Resolve` / `Fetch` / `Lookup` / `Require` 呼び出しに向け直して `internal/api` + `internal/server` + `internal/activitypub` を走査すると **29 件** (`ap/handler.go` 7 / `following/*` 7 / `users/*` 5 / `channels/*` 5 / `flash` 2 / `clips` 2 / ほか)。**AP の 404 はリモートに「消えた」と解釈されうる**。`notes/state` / `notes/conversation` / `antennas/show` の 3 件は #2799 で潰した / **重複チェックを DB 障害で skip する形も射程外** — `if dup, err := repo.Find(...); err == nil && dup != nil` は err を握り潰しているので `condMentionsErr` に掛からない。接続断のあいだ重複が作られる。**DB 側の backstop は無い** — 例えば `sw_subscription` に unique index は無く (`000020` が張るのは非 unique、`000068` がそれも落とす)、重複行は恒久的に残って web push が二重配信される。#2792 は handler 側の guard で塞いだだけなので、そこを外すと再発する。signup / page / reaction / poll などにも同じ形が残る / 同じ関数で 1 件直して 1 件足すと件数が変わらず素通りする / 4xx 以外への潰し (204 を返す `invite/handler.go:Delete` など) と `x, _ := repo.Find(...)` の握り潰しは対象外 / lookup メソッド名が `Find` で始まらず `Get` でもないもの (`metaRepo.Fetch()` など) は射程外 / 4xx を返すのが `if` の外や `else` 側にある形、`return h.notFound(c)` のような自前ヘルパー、`switch { case err != nil: ... }` も対象外。`internal/server` の該当は現在 0 件 (非テストの `internal/server/**` で `.Find*(` が 35、`.Get(` を足して 55。うち gate の述語に掛かったのは 2 件で、それも潰した) |
-| `make nulparam-check` | 列に入らない値 (NUL) が SQL の bind parameter に載らないか (#3025)。**NUL を含む値はどの列にも入らないうえ、比較の右辺に置くだけで PostgreSQL がクエリごと落とす** (手元の simple protocol で SQLSTATE 08P01、本番の pgx extended protocol で 22021)。`IsNotFound` でもないので handler は 500 に倒し、**認証済みの一般利用者がパラメータ 1 文字で 5xx を立てられた**。3 本ある — カーソル (`id.NormalizeCursor` の ok を**代入の直後の `if !ok` で受けて return している**か。「関数のどこかに `!ok` がある」形だと、手前の `pagination.ResolveLimit` の `limitOK` へ受け直すだけで黙り、guard を DB 呼び出しの後ろへ動かしても空に倒しても緑になる。**ok を伝播する wrapper 5 つの呼び出し側も見る**) / repository の**単一行 lookup** (`Find*` / `Get*` が `(*model.X, error)` を返すもの) と `*ByID*` / LIKE パターンを組み立てる関数。**「どの値を見ているか」まで照合するのが要点** — 呼び出しの有無だけだと、複数の値を取る lookup で片方が無防備なまま緑になる (実際に `ListUsers` が `Username` は見て `Hostname` を見ていなかった)。`storableIDs` は**代入し直していること**まで見る (`storableIDs(ids)` は式文として合法で `go vet` も黙るが、フィルタは効かない)。**mock では検出できない** — `internal/testutil` の mock は NUL を渡しても普通に「見つからない」を返すので、guard を外しても handler テストは緑のまま通る。だから静的に見る。**既知の範囲**: 値を受ける一覧系 (`ListByUser(userID, ...)` など) は見ていない (数え方: 非テストの `internal/repository` 85 ファイルで、レシーバ付きメソッドのうち `string` / `*string` / `[]string` のパラメータを持つものが **524**、うち gate が見る単一行 lookup + `*ByID*` は **118**、guard を呼ばずに DB を触るものが **311** 残っている)。**カーソルだけは「受け取ったのに正規化していない handler」も見る** (`TestCursorParamsAreNormalized`) — 呼び出し側だけを見ていると、そもそも呼んでいない handler が視界に入らない。一覧系で実際に届く経路は測って個別に塞いであり、一覧は docs/divergence.md にある |
-| `make compose-check` | 配布する compose がログをローテーションするか (`max-size` / `max-file` の値そのものを見る、#2828)。あわせて、直下の compose が運営者向けの 3 つだけか、`tests/` の下の検証用 compose が `name:` を持ち (overlay はベースと同じ値)、build context・dockerfile・bind mount の相対パスが git で追跡されたものを指すかを見る (#3373) |
+| `make nulparam-check` | 列に入らない値 (NUL) が SQL の bind parameter に載らないか (#3025)。**NUL を含む値はどの列にも入らないうえ、比較の右辺に置くだけで PostgreSQL がクエリごと落とす** (手元の simple protocol で SQLSTATE 08P01、本番の pgx extended protocol で 22021)。`IsNotFound` でもないので handler は 500 に倒し、**認証済みの一般利用者がパラメータ 1 文字で 5xx を立てられた**。3 本ある — カーソル (`id.NormalizeCursor` の ok を**代入の直後の `if !ok` で受けて return している**か。「関数のどこかに `!ok` がある」形だと、手前の `pagination.ResolveLimit` の `limitOK` へ受け直すだけで黙り、guard を DB 呼び出しの後ろへ動かしても空に倒しても緑になる。**ok を伝播する wrapper 5 つの呼び出し側も見る**) / repository の**単一行 lookup** (`Find*` / `Get*` が `(*model.X, error)` を返すもの) と `*ByID*` / LIKE パターンを組み立てる関数。**「どの値を見ているか」まで照合するのが要点** — 呼び出しの有無だけだと、複数の値を取る lookup で片方が無防備なまま緑になる (実際に `ListUsers` が `Username` は見て `Hostname` を見ていなかった)。`storableIDs` は**代入し直していること**まで見る (`storableIDs(ids)` は式文として合法で `go vet` も黙るが、フィルタは効かない)。**mock では検出できない** — `internal/testutil` の mock は NUL を渡しても普通に「見つからない」を返すので、guard を外しても handler テストは緑のまま通る。だから静的に見る。**既知の範囲**: 値を受ける一覧系 (`ListByUser(userID, ...)` など) は見ていない (数え方: 非テストの `internal/repository` 85 ファイルで、レシーバ付きメソッドのうち `string` / `*string` / `[]string` のパラメータを持つものが **524**、うち gate が見る単一行 lookup + `*ByID*` は **118**、guard を呼ばずに DB を触るものが **311** 残っている)。**カーソルだけは「受け取ったのに正規化していない handler」も見る** (`TestCursorParamsAreNormalized`) — 呼び出し側だけを見ていると、そもそも呼んでいない handler が視界に入らない。一覧系で実際に届く経路は測って個別に塞いであり、一覧は docs/divergence/security.md にある |
+| `make compose-check` | 配布する compose がログをローテーションするか (`max-size` / `max-file` の値そのものを見る、#2828)。あわせて、直下の compose が運営者向けの 3 つだけか、`tests/` の下の検証用 compose が `name:` を持ち (overlay はベースと同じ値)、build context・dockerfile・bind mount の相対パスが git で追跡されたものを指すかを見る (#3373)。さらに、ベンチのスタック (`tests/bench/ab/compose.yml`) の postgres が `fsync` / `synchronous_commit` / `full_page_writes` を切って動き、overlay が postgres を定義せず、overlay と `tests/bench/` の外の compose (本番の雛形、e2e、開発用) のどの service の `command` / `entrypoint` / `environment` にもこの 3 つの名前が現れないかを見る (#3659) |
 | `make testflags-check` | `make test` が CI と同じテスト実行条件 (`-race` / `-count=1` / `-shuffle` seed) で走るか (#2841)。**両方向を見る** — CI にあって手元に無い flag も、手元にあって CI に無い flag (`-short` 等) も落とす。あわせて doc に書かれた `-shuffle` の seed が CI と一致するかも検査する |
 | `make migrationdoc-check` | migration の本数を述べた doc が実態と合っているか (#2874)。**gate が見るのは 7 ファイル 21 箇所**。1 本足したとき実際に動くのはその一部で、#2866 (000082) では 17 箇所、**うち 5 箇所が漏れた**。総本数 / 破壊的なマイグレーションの件数 / `-- data loss:` 宣言の本数 / 作られるテーブル数と、down が no-op のものの**一覧**を突き合わせる。**一覧が本体** — 件数だけだと「1 本足して 1 本消す」で素通りする。**破壊的の件数は doc 自身の表の行数を truth にする** — migration の中身から「共有テーブルか」を判定すると upstream に無いテーブルを触るものまで拾う。対象外は 3 つ — 「51 本」(2 つの doc で定義が違うのに同じ数)、「102」(「上記 9 件」の定義に依存)、「データを不可逆に変えるのはこのうち 8 本」(機械判定できない)。拾えなかったら落とす |
 | `make mdtable-check` | tracked な md の表の各行がヘッダと同じ列数か (#2930)。**GFM は溢れたセルを黙って捨てる**ので、ソースに書いた内容が GitHub 上で読めなくなる。原因はほぼセル区切りとして働くパイプで、**コードスパンの中でも働く** (`\\|` へエスケープする)。`docs/divergence.md` の 1 行で**描画が 599 文字あるべきところ 394 文字で止まり、205 文字 (34.2%) が読めなかった**。**見るのは列数だけ** — コードスパンの対応付けを自前で持つ案は、次の周で**二重バッククォートのコードスパンを含む行**を落とした (#2857 の「自前パーサに継ぎ足すと手当てするたびに隣の穴が開く」型)。取りこぼす側 (列数が一致したままコードスパンが割れる形など) はテストの doc コメントに明記してある。現 corpus (表 227 個) に対し偽陽性 0 |
@@ -220,7 +225,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 | `make dropin-up` `dropin-test` `dropin-down` `dropin-logs` | TS 2 インスタンスの federation smoke | [Drop-in e2e](dropin-e2e.md) |
 | `make dropin-mk-up` `dropin-mk-test` `dropin-mk-down` `dropin-mk-logs` | 上記の backend を Elythia に差し替えた overlay | 同上 |
 | `make dropin-swap-test` | TS → Elythia 切替の state preservation を通しで検証 | 同上 |
-| `make dropin-mkgo-born-test` | **Elythia 生まれの DB を TS に引き渡せるか** (測る対象。保証はしない、#3191) | 同上 |
+| `make dropin-elythia-born-test` | **Elythia 生まれの DB を TS に引き渡せるか** (測る対象。保証はしない、#3191) | 同上 |
 | `make dropin-fedibird-test` | Fedibird-like AP mock との Ed25519 双方向 verify | 同上 |
 | `make dropin-frontend-baseline` `dropin-frontend-up` `dropin-frontend-down` `dropin-frontend-logs` | 3 TS インスタンス + cypress | [Drop-in frontend e2e](dropin-frontend-e2e.md) |
 | `make dropin-frontend-mk-up` `dropin-frontend-mk-down` `dropin-frontend-swap-test` | 上記の Elythia overlay と切替シナリオ | 同上 |
@@ -230,9 +235,11 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 | `make playwright-up` `playwright-test` `playwright-down` | Playwright によるフロントエンド / API テスト | [Playwright](playwright.md) |
 | `make upstream-fetch` | 比較対象の本家 (`UPSTREAM_MISSKEY_VERSION` の版) を `.cache/misskey/<版>/` へ取得する。golden の再生成・本家 backend e2e・apicompat の前提 (#3378) | [本家への追従](upstream-catch-up.md) |
 | `make upstream-check` | golden と本家を読むテストが本家の版と一致するか (本家から作り直して差分が無いこと)。`apicompat` workflow が回す | [shape drift](shape-drift.md) |
+| `make paramdef-gen` | 本家の`paramDef`のgoldenと、ajvの照合corpusを作り直す(#3673)。nodeと`frontend/node_modules`(TypeScriptと、本家と同じ版のajv)が要る。`make upstream-check`からも呼ばれる | [本家への追従](upstream-catch-up.md#本家の版を上げた後に必須-引数のschemaparamdefのgoldenとajvの照合corpus) |
+| `make elythia-paramdef-gen` | Elythia独自のendpointの`paramDef`(`elythia_paramdefs.json`)から、ajvの照合corpusと、elythia-jsの型と突き合わせる型の検査を作り直す(#3869)。nodeと`frontend/node_modules`が要る。`make paramdef-gen`からも呼ばれる。型の検査だけなら`make elythia-js-paramdefs` | [引数の検証](param-shadow.md#elythia独自のendpointの宣言3869) |
 | `make upstream-sync TO=<版>` | 本家の新しい版の差分のうち、`frontend/` が取り込むパスだけを 3-way で当てる (設計 D4、#3379)。区分に当たらないパスがあれば何も当てずに止まる。`DRY=1` で分類だけを表示 | [本家への追従](upstream-catch-up.md) |
 | `make upstream-sync-lock` | `frontend/pnpm-lock.yaml` を、直前の lock を基点に package.json から作り直す (`pnpm install --lockfile-only`、node の container で実行) | [本家への追従](upstream-catch-up.md) |
-| `make upstream-e2e-deps` `upstream-e2e-up` `upstream-e2e-migrate` `upstream-e2e-test` `upstream-e2e-down` | Misskey 本家の backend e2e をテスト本体無改変で Elythia に向けて実行 | [本家 backend e2e](upstream-backend-e2e.md) |
+| `make upstream-e2e-deps` `upstream-e2e-up` `upstream-e2e-migrate` `upstream-e2e-test` `upstream-e2e-down` | Misskey 本家の backend e2e を本家ソースを正本として Elythia に向けて実行 (UserLite の期待DTOにローカル連合状態のみ追加) | [本家 backend e2e](upstream-backend-e2e.md) |
 
 ### ベンチマーク
 
@@ -247,6 +254,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 | ターゲット | 内容 |
 |---|---|
 | `make uds-init` `uds-build` `uds-up` `uds-down` `uds-down-v` `uds-logs` `uds-ps` | UNIX ドメインソケット構成の本番スタック操作 ([UDSデプロイ](docker-uds.md)) |
+| (変数) `UDS_BUILDER` `UDS_BUILDER_IMAGE` | `uds-build` / `uds-up` が `mkgo` のイメージをビルドする専用ビルダーの名前 (既定 `elythia-builder`) と、そのコンテナのイメージ。ビルド後に止める。`UDS_BUILDER=` で既定のビルダーを使う ([UDSデプロイ](docker-uds.md#mkgo-のイメージは専用のビルダーでビルドする)) |
 | `make uds-frontend-build` | 本番向けフロントエンドビルド |
 | `make uds-rebuild` | フロントエンド + イメージをまとめてビルド |
 | `make uds-restart` | `mkgo` を再起動して配信エントリを検証 |
@@ -324,7 +332,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 - **golangci-lint** (`make golangci-lint`) — errcheck / govet / ineffassign / staticcheck
 
 #### frontendジョブ (`.github/workflows/frontend.yml`)
-- `ci.yml`ではなく別のworkflowにあり、pathsで絞らずに毎回起動する。`changes`ジョブが差分からfrontendに関係する変更か (`frontend/`・`plugins/`・`plugin/`・`tools/pluginbuild/`・`tools/emojiregex/`・`internal/activitypub/mfm/emoji_regex_gen.go`・workflow自身・`Makefile`・`go.mod` / `go.sum`。リネームは移動元と移動先の両方を見る) を判定し、関係なければ`frontend-lint` / `frontend-test`をskipする
+- `ci.yml`ではなく別のworkflowにあり、pathsで絞らずに毎回起動する。`changes`ジョブが差分からfrontendに関係する変更か (`frontend/`・`plugins/`・`plugin/`・`tools/pluginbuild/`・`tools/emojiregex/`・workflow自身・`Makefile`・`go.mod` / `go.sum`。リネームは移動元と移動先の両方を見る) を判定し、関係なければ`frontend-lint` / `frontend-test`をskipする
 - `frontend`ジョブは`if: always()`で両者を束ねる集約ジョブ。関係しない差分では成功し、関係する差分では両方の成功を要求する。`changes`が落ちたら失敗する
 - 中身と手元での再現は[ci.md](ci.md)にある。手元用の`make frontend-check`は残っているが、CIの同名ジョブは#3379で無くなった
 
@@ -337,10 +345,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 | `vulncheck` | CI | 依存・Go stdlib の**到達可能な**既知脆弱性 + Go version の pin 整合 |
 | `plugin-tests` | CI | 同梱プラグインのテスト (別 module なので `go list ./...` に入らない) |
 | `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない) |
-| `spec (mk-go 1/4)` 〜 `4/4` | Playwright | ブラウザからの統合互換。TS backend での実行は `workflow_dispatch` のみ |
+| `spec (Elythia 1/4)` 〜 `4/4` | Playwright | ブラウザからの統合互換。TS backend での実行は `workflow_dispatch` のみ |
 | `e2e (1/4)` 〜 `4/4` | Upstream backend e2e | 本家の backend e2e が Elythia に対して通るか |
 | `diff` | Diff e2e | Elythia と TS の**レスポンスの値**が一致するか |
-| `swap-test` / `mkgo-born` / `ed25519-verify` / `federation` / `federation-mastodon` | Drop-in e2e | 切替・TS へ戻す経路の測定・Ed25519・実連合 (Misskey TS / Mastodon) の 5 シナリオ |
+| `swap-test` / `elythia-born` / `ed25519-verify` / `federation` / `federation-mastodon` | Drop-in e2e | 切替・TS へ戻す経路の測定・Ed25519・実連合 (Misskey TS / Mastodon) の 5 シナリオ |
 
 どれが何を守っているかの対比は [ci.md](ci.md) にまとめてある。
 
@@ -391,7 +399,7 @@ make plugin-test            # 同梱プラグインのテスト (別 module な�
 make plugin-doc-check       # docs/plugins/authoring.md の Go スニペットがコンパイルできるか
 
 # 静的 parity ゲート (サーバー / ブラウザ / Docker 不要)
-make gates                  # shapecheck / errorid-check / limitspec-check / perm-check / wiring-check / catalog-check / notfound-check / nulparam-check / compose-check / testflags-check / migrationdoc-check / mdtable-check / notiftype-check / pluginembed-check / dockerignore-check / secretfield-check / ipshape-check / iprecord-check / sqlbind-check / gaterun-check を一括
+make gates                  # shapecheck / errorid-check / perm-check / wiring-check / catalog-check / notfound-check / nulparam-check / compose-check / testflags-check / migrationdoc-check / mdtable-check / notiftype-check / pluginembed-check / dockerignore-check / secretfield-check / ipshape-check / iprecord-check / sqlbind-check / gaterun-check を一括
 make apicompat              # docs/api-compat.md を生成 (route dump に stack 起動が必要)
 
 # プラグインの組み込み
@@ -401,7 +409,7 @@ make plugin-dev             # 編集しながら動かす (PLUGIN=plugins/status
 
 # 更新 (運用)
 make pull                   # 本体 + plugins/ の独立リポジトリを一括 pull
-make uds-update             # pull → ビルド → 再起動 → 配信 entry の検証 (UDS 本番)
+make uds-update             # pull → ビルド → 再起動 → 配信 entry の検証 → バックアップの image → 事前圧縮 (UDS 本番)
 make docker-update          # 同上 (Docker Compose 構成)
 make uds-restart            # mkgo を再起動して配信 entry を検証だけする
                             # **`up -d` は再起動を保証しない** — frontend は bind mount
@@ -410,9 +418,11 @@ make uds-restart            # mkgo を再起動して配信 entry を検証だ�
 
 # マイグレーション（接続先は -config、既定 .config/default.yml から決まる）
 make migrate-up             # 最新まで適用
-make migrate-down           # 1段階ロールバック (-steps 1)
-go run ./cmd/elythia migrate -direction down   # 全段ロールバック (破壊的。全テーブルが消える)
+make migrate-down           # 本体の系列を1段階ロールバック (-track core -steps 1)
+make migrate-down-local     # fork の系列 (migration/local/) を1段階ロールバック
+go run ./cmd/elythia migrate -direction down -track core   # 全段ロールバック (破壊的。全テーブルが消える)
 make migrate-create         # 新規マイグレーションファイル作成（プロンプト対話）
+make migrate-create-local   # fork の系列に新規マイグレーションファイル作成 (docs/fork-migrations.md)
 
 # Docker
 make docker-build
@@ -436,8 +446,9 @@ make dropin-swap-test       # TS-then-mk 切替シナリオ (bash orchestrator)
 # 双方向 Ed25519 verify を検証する e2e。
 make dropin-fedibird-test    # mock ↔ mk-A の Ed25519 inbound/outbound 検証
 
-# 本家 backend e2e (#2347) — Misskey 本家の test/e2e/** をそのまま Elythia に
-# 向けて実行する。テスト本体は無改変。詳細は docs/upstream-backend-e2e.md。
+# 本家 backend e2e (#2347) — Misskey 本家の test/e2e/** を本家ソースを正本として
+# Elythia に向けて実行する。UserLite の期待DTOにローカル連合状態のみ追加する。
+# 詳細は docs/upstream-backend-e2e.md。
 make upstream-e2e-deps       # 本家を取得し、本家側の依存を用意 (初回 / UPSTREAM_MISSKEY_VERSION を上げた後)
 make upstream-e2e-up         # e2e 用 PostgreSQL / Redis を起動
 make upstream-e2e-migrate    # e2e 用 DB にマイグレーションを適用
@@ -455,7 +466,7 @@ make dropin-frontend-mk-up       # mk overlay だけ立ち上げ (clean DB の m
 make dropin-frontend-mk-down     # mk overlay cleanup
 
 # その他の e2e / 検証
-make dropin-mkgo-born-test   # Elythia 生まれの DB を TS に引き渡せるか (#2383)
+make dropin-elythia-born-test # Elythia 生まれの DB を TS に引き渡せるか (#2383)
 make federation-misskey-e2e  # 本物の Misskey TS との実連合を起動から撤去まで通しで (#2362)
 make federation-mastodon-e2e # 本物の Mastodon と引用の承認 (FEP-044f) を通しで (#3234)
 make diff-check              # Elythia と TS のレスポンスを値レベルで diff (#2078)
@@ -465,7 +476,7 @@ make frontend-lint           # eslint だけ (CI と同じ範囲、実測 55 秒
 make e2e-down-all            # 検証用スタックを一括撤去 (**本番 project `mk` は対象外**)
 ```
 
-**上記は全体ではない。** `make help` が全 143 target を出す (`^名前:.*##` の行を数えた)。一覧と説明は
+**上記は全体ではない。** `make help` が全 150 target を出す (`^名前:.*##` の行を数えた)。一覧と説明は
 このファイルの上の節、CI 上の対応は [docs/ci.md](ci.md)。
 
 エントリポイント：

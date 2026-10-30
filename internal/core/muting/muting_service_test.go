@@ -133,6 +133,7 @@ func TestUnmute(t *testing.T) {
 	addUser(ur, "b")
 
 	require.ErrorIs(t, svc.Unmute("a", "a"), muting.ErrSelfMute)
+	require.ErrorIs(t, svc.Unmute("a", "nosuchuser"), muting.ErrMuteeNotFound, "upstream looks up the mutee before the relation (#3760)")
 	require.ErrorIs(t, svc.Unmute("a", "b"), muting.ErrNotMuting)
 
 	_, err := svc.Mute("a", "b", nil)
@@ -151,10 +152,10 @@ func TestIsMutedAndList(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, yes)
 
-	rows, err := svc.List("a", "", "", 0, 0)
+	rows, err := svc.List("a", "", "", 0)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
-	rows, err = svc.List("a", "", "", 5, 0)
+	rows, err = svc.List("a", "", "", 5)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
 }
@@ -229,6 +230,7 @@ func TestRenoteUnmute(t *testing.T) {
 	addUser(ur, "a")
 	addUser(ur, "b")
 	require.ErrorIs(t, svc.Unmute("a", "a"), muting.ErrSelfMute)
+	require.ErrorIs(t, svc.Unmute("a", "nosuchuser"), muting.ErrMuteeNotFound, "upstream looks up the mutee before the relation (#3760)")
 	require.ErrorIs(t, svc.Unmute("a", "b"), muting.ErrNotMuting)
 	_, err := svc.Mute("a", "b")
 	require.NoError(t, err)
@@ -244,10 +246,10 @@ func TestRenoteIsMutedAndList(t *testing.T) {
 	yes, err := svc.IsRenoteMuted("a", "b")
 	require.NoError(t, err)
 	assert.True(t, yes)
-	rows, err := svc.List("a", "", "", 0, 0)
+	rows, err := svc.List("a", "", "", 0)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
-	rows, err = svc.List("a", "", "", 5, 0)
+	rows, err = svc.List("a", "", "", 5)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
 }

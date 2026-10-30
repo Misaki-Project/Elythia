@@ -10,8 +10,6 @@
 //     spec even if the UI falls back to the generic display).
 //
 // Types defined in upstream but skipped for now:
-//   - markSensitiveDriveFile / unmarkSensitiveDriveFile / deleteDriveFile:
-//     mk-go admin/drive write handlers are not implemented
 //   - deleteNote / deletePage / deleteFlash / deleteGalleryPost / deleteChatRoom:
 //     out of scope for the current modlog rollout
 package moderationlog
@@ -90,6 +88,13 @@ const (
 	LogUpdateAbuseReportNotificationRecipient LogType = "updateAbuseReportNotificationRecipient"
 	LogDeleteAbuseReportNotificationRecipient LogType = "deleteAbuseReportNotificationRecipient"
 
+	// Drive files of other users, changed by moderators through
+	// drive/files/update and drive/files/delete (#3678)。info は本家と同じ
+	// {fileId, fileUserId, fileUserUsername, fileUserHost}。
+	LogMarkSensitiveDriveFile   LogType = "markSensitiveDriveFile"
+	LogUnmarkSensitiveDriveFile LogType = "unmarkSensitiveDriveFile"
+	LogDeleteDriveFile          LogType = "deleteDriveFile"
+
 	// Content deletion by moderators
 	LogDeleteGalleryPost LogType = "deleteGalleryPost"
 	LogDeleteFlash       LogType = "deleteFlash"
@@ -144,6 +149,40 @@ const (
 	LogCreateFederationRule LogType = "createFederationRule"
 	LogUpdateFederationRule LogType = "updateFederationRule"
 	LogDeleteFederationRule LogType = "deleteFederationRule"
+	// DB のバックアップの管理画面 (#3462)。閲覧も含めて、成立した操作を残す
+	// (Log は非同期で、書き込みの失敗は警告のログだけになる)。
+	// バックアップには利用者の秘密鍵・token・パスワードの hash が入るので、
+	// 誰がいつ一覧を見て、どの世代を落としたか・消したかを追えるようにする。
+	// info は listBackups が {generationCount, totalBytes}、takeBackup が {}、
+	// verifyBackup が {generationId}、deleteBackup が {generationId, freedBytes}
+	// (途中で失敗したら partial: true)、downloadBackup が
+	// {generationId, via, size, encrypted}。
+	LogListBackups    LogType = "listBackups"
+	LogTakeBackup     LogType = "takeBackup"
+	LogVerifyBackup   LogType = "verifyBackup"
+	LogDeleteBackup   LogType = "deleteBackup"
+	LogDownloadBackup LogType = "downloadBackup"
+	// 画面からのリストア (#3463 (6c))。バックアップ用のサービスが書く。準備を始めた
+	// ときは今の DB に、名前を入れ替えた後は戻した DB に書く (どちらの DB を見ても、
+	// 誰がいつ戻したかが分かるように)。info は {generationId, opId, phase}
+	// (phase は "prepare" か "switch")。
+	LogRestoreBackup LogType = "restoreBackup"
+	// 画面からのロールバック (#3463 (6d))。書く DB はリストアと同じ (準備は今の DB、
+	// 入れ替えた後は戻した DB)。info は {database, from, keptAs, opId, phase}。
+	// from は戻した先の退避した DB の名前、keptAs は今の DB を脇へ置いた名前。
+	LogRollbackBackup LogType = "rollbackBackup"
+	// 退避した DB の一覧 (#3463 (6d)、admin/backup/restore/candidates)。listBackups と
+	// 同じく閲覧も残す。本体が書く。info は {databaseCount}。
+	LogListKeptDatabases LogType = "listKeptDatabases"
+	// 配送のブレーカーを手で閉じた (#3048 の admin/federation/close-delivery-breaker)。
+	// info は {host}。止まっていた配送を再開させる書き込みなので、誰がいつどの
+	// ホストへの配送を戻したかを残す。
+	LogCloseDeliveryBreaker LogType = "closeDeliveryBreaker"
+	// 承認制の登録 (#2555) の審査。info は {applicationId}。承認は登録
+	// (registration_ticket の発行) につながるので、申請の行の processedById だけで
+	// なく、他の操作と同じ時系列に残す。
+	LogApproveSignupApplication LogType = "approveSignupApplication"
+	LogRejectSignupApplication  LogType = "rejectSignupApplication"
 )
 
 // UserInfo builds the standard {userId, userUsername, userHost} info

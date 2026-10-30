@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
-	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/core/notification"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/model"
@@ -80,20 +79,20 @@ func (h *Handler) Grouped(c echo.Context) error {
 		slog.Error("notifications-grouped: resolve abuse report states failed", "err", err)
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
-	packed := entity.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), opts...)
+	packed := h.entityPacker.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), opts...)
 	// depth-2 embed hide (#1570): grouping の前に通知 note の renote/reply embed と
 	// 著者設定ゲートを viewer 可視性で適用する。Show と同じく #1444 CanSeeNote gate は
 	// 落とすだけで embed に再帰しないため、ここで hide しないと grouped 経由で
 	// 非可視 embed 本文が漏れる (#1546 で混入しかけた IDOR を塞ぐ)。
-	notehide.HideNotificationNotes(user, packed)
+	h.noteHider.HideNotificationNotes(user, packed)
 
 	grouped := groupNotifications(all, packed, noteByID)
 	// 本家 i/notifications-grouped.ts:153 と同じく grouping 後に limit で slice する。
 	// **現状は到達しない** — collectNotifications が svc.List に limit を渡して既に
 	// 切っており、grouping は件数を増やさないため。upstream と同じ位置に置くことで、
 	// 将来 fetch 側が多めに取るようになっても upstream と同じ行が返るようにしてある。
-	if len(grouped) > (*req.Limit) {
-		grouped = grouped[:(*req.Limit)]
+	if len(grouped) > int(*req.Limit) {
+		grouped = grouped[:int(*req.Limit)]
 	}
 
 	// **取得が 0 件なら既読化しない** (#2833)。upstream i/notifications-grouped.ts は

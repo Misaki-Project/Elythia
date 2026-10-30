@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/core/notification"
@@ -93,24 +94,16 @@ type PostScheduledNoteProcessor struct {
 }
 
 // NewPostScheduledNoteProcessor wires the processor with its dependencies.
-func NewPostScheduledNoteProcessor(drafts ScheduledNoteDraftRepo, users ScheduledNoteUserRepo, publisher ScheduledNotePublisher) *PostScheduledNoteProcessor {
-	return &PostScheduledNoteProcessor{drafts: drafts, users: users, publisher: publisher}
-}
-
-// SetLock wires an app-level idempotency lock. nil disables (= Phase 1 互換)。
-// production では Redis-backed 実装を配線して重複 publish を防止する
-// (#1045 Phase 2-A)。
-// HasLock reports whether the idempotency lock is wired.
 //
-// 未配線だと Handle が lock 取得を飛ばして**常に publish する**。queue は
-// at-least-once なので、同じ job が二度 fire したときに予約投稿が 2 回
-// 出て scheduledNotePosted も 2 回飛ぶ。冪等性を handler 側の性質に
-// 頼らず保証するための lock なので、inbox の replay guard と同じ
-// 一回性の tier として起動時に検査する (#2682 review M-C)。
-func (p *PostScheduledNoteProcessor) HasLock() bool { return p.lock != nil }
-
-func (p *PostScheduledNoteProcessor) SetLock(l ScheduledNoteLock) {
-	p.lock = l
+// lock is the app-level idempotency lock. nil disables it (the Phase 1
+// behavior); production passes the Redis-backed implementation to prevent
+// duplicate publishes (#1045 Phase 2-A).
+func NewPostScheduledNoteProcessor(drafts ScheduledNoteDraftRepo, users ScheduledNoteUserRepo, publisher ScheduledNotePublisher, lock ScheduledNoteLock) *PostScheduledNoteProcessor {
+	// lock を渡さないと Handle が lock 取得を飛ばして**常に publish する**。queue は
+	// at-least-once なので、同じ job が二度 fire したときに予約投稿が 2 回出て
+	// scheduledNotePosted も 2 回飛ぶ。以前は setter で入れて起動時に検査していた
+	// (#2682 review M-C) が、#3829 で構築子の必須の引数にした。
+	return &PostScheduledNoteProcessor{drafts: drafts, users: users, publisher: publisher, lock: lock}
 }
 
 // SetNotifier wires the notification dispatcher used to fire
@@ -198,6 +191,15 @@ func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Tas
 		// 防御的: nil ユーザを Create に流すと panic の元なので skip。
 		return errors.New("scheduled note draft has nil user")
 	}
+	if user.IsDeleted {
+		// アカウントを残す退会でも、予約の時刻に投稿を出さない。本家はローカルの
+		// 退会で利用者の行ごと消すので、下書きも CASCADE で消えて投稿されない。
+		// 下書きは退会のジョブ (RevokeDeletedLocalCredentials) が消すので、
+		// ここでは触らない。
+		slog.Info("scheduled note draft user is deleted, skipping",
+			"noteDraftId", payload.NoteDraftID, "userId", draft.UserID)
+		return nil
+	}
 	in := note.CreateInput{
 		User:           user,
 		Text:           draft.Text,
@@ -220,16 +222,32 @@ func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Tas
 	//   - hasPoll=true なら PollChoices / PollMultiple / PollExpiresAt または
 	//     PollExpiredAfter から `*time.Time` 期限を復元
 	//   - PollExpiredAfter (= 経過 ms) 優先、無ければ PollExpiresAt (= 絶対時刻)
+	//
+	// 期限が上限 (note.MaxPollExpiresAtUnixMilli) を超える draft は、publish 失敗
+	// として scheduledNotePostFailed を通知する。upstream も Date で表せない期限は
+	// fetchAndCreate が落ちて同じ通知になる (#3443)。lock を取った後で扱うため、
+	// ここでは控えるだけ。
+	// 本文と CW の長さも同じく publish 失敗として扱う。drafts/create・update は
+	// 本家と同じ上限で弾くが、それより前に保存された下書きは検査を通っていない。
+	inputErr := scheduledContentErr(draft.Text, draft.CW)
+	if user.IsSuspended {
+		// 凍結中の利用者の予約投稿は出さない (本家は凍結後も出す。意図的な乖離)。
+		// 投稿の失敗と同じく scheduledNotePostFailed を通知し、下書きは残す。
+		inputErr = errScheduledNoteAuthorSuspended
+	}
+	var pollErr error
 	if draft.HasPoll {
 		pollInput := &note.PollInput{
 			Choices:  draft.PollChoices,
 			Multiple: draft.PollMultiple,
 		}
 		if draft.PollExpiredAfter != nil {
-			exp := time.Now().Add(time.Duration(*draft.PollExpiredAfter) * time.Millisecond)
+			var exp time.Time
+			exp, pollErr = note.PollExpiresAtAfter(time.Now(), *draft.PollExpiredAfter)
 			pollInput.ExpiresAt = &exp
 		} else if draft.PollExpiresAt != nil {
 			exp := *draft.PollExpiresAt
+			pollErr = note.ValidatePollExpiresAt(exp)
 			pollInput.ExpiresAt = &exp
 		}
 		in.Poll = pollInput
@@ -255,7 +273,15 @@ func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Tas
 			return nil
 		}
 	}
-	publishedNote, err := p.publisher.Create(in)
+	var publishedNote *model.Note
+	if inputErr == nil {
+		inputErr = pollErr
+	}
+	if inputErr != nil {
+		err = inputErr
+	} else {
+		publishedNote, err = p.publisher.Create(in)
+	}
 	if err != nil {
 		// #2106 L61: upstream PostScheduledNoteProcessorService は publish 失敗時に
 		// scheduledNotePostFailed 通知のみ行い rethrow せず正常終了する (retry しない)。
@@ -292,6 +318,29 @@ func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Tas
 		// TTL 内の再発火は silent skip になる。log のみ。
 		slog.Warn("scheduled note draft delete failed",
 			"noteDraftId", payload.NoteDraftID, "err", err)
+	}
+	return nil
+}
+
+// errScheduledNoteAuthorSuspended is the publish failure for a draft whose
+// author is suspended when the schedule fires.
+var errScheduledNoteAuthorSuspended = errors.New("scheduled note author is suspended")
+
+// Upstream MAX_NOTE_TEXT_LENGTH and the cw limit of notes/create and
+// notes/drafts/create.
+const (
+	scheduledNoteTextMax = 3000
+	scheduledNoteCWMax   = 100
+)
+
+// scheduledContentErr reports a draft whose text or cw is longer than
+// notes/create accepts.
+func scheduledContentErr(text, cw *string) error {
+	if text != nil && utf8.RuneCountInString(*text) > scheduledNoteTextMax {
+		return errors.New("scheduled note text is too long")
+	}
+	if cw != nil && utf8.RuneCountInString(*cw) > scheduledNoteCWMax {
+		return errors.New("scheduled note cw is too long")
 	}
 	return nil
 }

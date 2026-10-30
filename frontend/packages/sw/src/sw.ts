@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import { get } from 'idb-keyval';
+import { del, get, set } from 'idb-keyval';
 import * as Misskey from 'misskey-js';
 import { FETCH_TIMEOUT_MS } from '@/const.js';
 import type { PushNotificationDataMap } from '@/types.js';
@@ -11,7 +11,22 @@ import type { I18n } from '@@/js/i18n.js';
 import type { Locale } from 'i18n';
 import { createEmptyNotification, createNotification } from '@/scripts/create-notification.js';
 import { swLang } from '@/scripts/lang.js';
+import { MAINTENANCE_CACHE, keepCacheOnActivate, maintenanceAwareNavigation } from '@/scripts/maintenance.js';
+import type { MaintenanceStore } from '@/scripts/maintenance.js';
 import * as swos from '@/scripts/operations.js';
+import { registerStaticRoutes } from '@/scripts/routes.js';
+import type { RouteInstallEvent } from '@/scripts/routes.js';
+
+// Elythia: メンテナンスの画面を覚えておく先 (#3463)。
+const MAINTENANCE_MARK_KEY = 'elythia-maintenance-at';
+const maintenanceStore: MaintenanceStore = {
+	openCache: () => caches.open(MAINTENANCE_CACHE),
+	deleteCache: () => caches.delete(MAINTENANCE_CACHE),
+	getMark: () => get<number>(MAINTENANCE_MARK_KEY),
+	setMark: (at) => set(MAINTENANCE_MARK_KEY, at),
+	delMark: () => del(MAINTENANCE_MARK_KEY),
+	now: () => Date.now(),
+};
 
 async function respondToNavigation(request: Request): Promise<Response> {
 	const controller = new AbortController();
@@ -19,11 +34,9 @@ async function respondToNavigation(request: Request): Promise<Response> {
 		controller.abort('navigation-timeout');
 	}, FETCH_TIMEOUT_MS);
 
+	let response: Response | undefined;
 	try {
-		const response = await fetch(request, { signal: controller.signal });
-
-		if (response?.status && response.status < 500) return response;
-		if (response?.type === 'opaqueredirect') return response;
+		response = await fetch(request, { signal: controller.signal });
 	} catch (error) {
 		if (_DEV_) {
 			console.warn('navigation fetch failed; showing offline page', error);
@@ -31,6 +44,11 @@ async function respondToNavigation(request: Request): Promise<Response> {
 	} finally {
 		globalThis.clearTimeout(timeout);
 	}
+
+	// Elythia: 目印の付いた 503 (メンテナンス中) はオフラインの画面に差し替えない。
+	// 繋がらないときも、直前にメンテナンスを見ていればその画面を出す (#3463)。
+	const answer = await maintenanceAwareNavigation(response, maintenanceStore, request.method);
+	if (answer) return answer;
 
 	// Only show offline page when network request actually fails
 	const html = await offlineContentHTML();
@@ -62,18 +80,14 @@ async function offlineContentHTML() {
 globalThis.addEventListener('install', (ev) => {
 	// 次の問題が発生するため、ServiceWorkerAutoPreload をオプトアウトする必要がある
 	// https://issues.chromium.org/issues/466790291
-	if ('addRoutes' in ev) {
-		// doc: https://developer.mozilla.org/en-US/docs/Web/API/InstallEvent/addRoutes
+	// Elythia: 規則はナビゲーションだけを fetch-event に回し、残りを network に送る形にした (#3613)
+	// doc: https://developer.mozilla.org/en-US/docs/Web/API/InstallEvent/addRoutes
+	const routes = registerStaticRoutes(ev as unknown as RouteInstallEvent, (init) => {
+		// doc: https://developer.mozilla.org/ja/docs/Web/API/URLPattern
 		// @ts-expect-error 実験的なAPIなので型定義がない
-		ev.addRoutes({
-			condition: {
-				// doc: https://developer.mozilla.org/ja/docs/Web/API/URLPattern
-				// @ts-expect-error 実験的なAPIなので型定義がない
-				urlPattern: new URLPattern({}),
-			},
-			source: 'fetch-event',
-		});
-	}
+		return new URLPattern(init);
+	});
+	if (routes) ev.waitUntil(routes);
 });
 
 globalThis.addEventListener('activate', ev => {
@@ -81,7 +95,8 @@ globalThis.addEventListener('activate', ev => {
 		caches.keys()
 			.then(cacheNames => Promise.all(
 				cacheNames
-					.filter((v) => v !== swLang.cacheName)
+					// Elythia: メンテナンスの画面は版をまたいで残す (#3463)。
+					.filter((v) => !keepCacheOnActivate(v, swLang.cacheName))
 					.map(name => caches.delete(name)),
 			))
 			.then(() => globalThis.clients.claim()),

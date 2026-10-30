@@ -87,9 +87,9 @@ type EmojiCacheInvalidation struct {
 	All bool `json:"all,omitempty"`
 }
 
-// mayAffectLocal reports whether ev can concern a local emoji, i.e. whether
+// MayAffectLocal reports whether ev can concern a local emoji, i.e. whether
 // the ListLocal cache must be dropped too.
-func (ev EmojiCacheInvalidation) mayAffectLocal() bool {
+func (ev EmojiCacheInvalidation) MayAffectLocal() bool {
 	if ev.All || len(ev.IDs) > 0 {
 		// id だけでは host が分からないので、local の可能性を残す側に倒す。
 		return true
@@ -163,9 +163,20 @@ func (c *CachedEmojiRepository) ApplyRemoteInvalidation(ev EmojiCacheInvalidatio
 	// 他プロセスのリモート絵文字の作成 (連合の受信で頻繁に起きる) で ListLocal
 	// まで落とすと、/api/emojis のフルスキャンが受信のたびに走る。local に
 	// 関わりうるものだけ落とす。
-	if ev.mayAffectLocal() {
+	if ev.MayAffectLocal() {
 		c.Invalidate()
 	}
+}
+
+// DropLocal drops both caches of this process, the local list and the
+// (name, host) entries, without calling the invalidation hook, so no other
+// process is told (#3727). It is what the cache list of internal/server
+// calls (docs/architecture.md 4.4).
+//
+// 公開の Invalidate はローカルの一覧しか捨てず (name, host) の entry を残すので、
+// キャッシュの一覧からは呼ばない。
+func (c *CachedEmojiRepository) DropLocal() {
+	c.ApplyRemoteInvalidation(EmojiCacheInvalidation{All: true})
 }
 
 // ListLocal returns the cached local emoji slice if still valid, otherwise

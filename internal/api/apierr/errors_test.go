@@ -97,6 +97,14 @@ func TestInternalError(t *testing.T) {
 	assert.Equal(t, "server", errObj["kind"])
 }
 
+func TestMaintenance(t *testing.T) {
+	errObj := Maintenance()["error"].(map[string]any)
+	assert.Equal(t, "MAINTENANCE", errObj["code"])
+	assert.Equal(t, UUIDMaintenance, errObj["id"])
+	assert.Equal(t, "server", errObj["kind"])
+	assert.Equal(t, "The server is under maintenance.", errObj["message"])
+}
+
 // #1559 framework auth errors の code / id を upstream ApiCallService.ts と固定。
 func TestAuthFrameworkErrors(t *testing.T) {
 	for _, tc := range []struct {
@@ -414,4 +422,12 @@ func TestNoSecurityKey(t *testing.T) {
 	errObj := NoSecurityKey()["error"].(map[string]any)
 	assert.Equal(t, "NO_SECURITY_KEY", errObj["code"])
 	assert.Equal(t, UUIDNoSecurityKey, errObj["id"])
+}
+
+// PLUGIN_MANAGED_ACCOUNT は Elythia 独自のエラー (#3468)。
+func TestPluginManagedAccount(t *testing.T) {
+	body := PluginManagedAccount()["error"].(map[string]any)
+	if body["code"] != "PLUGIN_MANAGED_ACCOUNT" || body["id"] != UUIDPluginManagedAccount || body["kind"] != KindClient {
+		t.Fatalf("unexpected body: %#v", body)
+	}
 }

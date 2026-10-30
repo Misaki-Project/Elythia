@@ -1,7 +1,6 @@
 package federation
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,8 +11,8 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
+	"github.com/elythia-network/elythia/internal/bgwork"
 	coreblocking "github.com/elythia-network/elythia/internal/core/blocking"
-	corechat "github.com/elythia-network/elythia/internal/core/chat"
 	corefollowing "github.com/elythia-network/elythia/internal/core/following"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	corereaction "github.com/elythia-network/elythia/internal/core/reaction"
@@ -64,6 +63,11 @@ type RelayActorChecker interface {
 
 // Processor dispatches inbound activities to the right handler.
 type Processor struct {
+	// background は受信後のベストエフォートフックを起動する箱 (#3661)。
+	// 世代の停止で待つ。nil なら素の goroutine で起動する (テスト)。**本番で nil だと、
+	// 世代を止めても受信後の hook の goroutine を待たず、閉じた DB へ書きに行く。**
+	// 構築子の必須の引数 (#3833。以前は setter と起動時の検査)。
+	background *bgwork.Group
 	// rules は連合のルール (#3090)。nil なら評価しない。
 	rules            RuleEvaluator
 	resolver         *Resolver
@@ -73,8 +77,20 @@ type Processor struct {
 	userRepo         repository.UserRepository
 	noteRepo         repository.NoteRepository
 
+	// accountCreatedAt はフォローしてきたリモートの人のアカウントの作成日時を、
+	// 分からなければ Misskey 系の相手の `/api/users/show` から埋める (#3465)。
+	// 未配線なら埋めない (列は NULL のまま)。
+	accountCreatedAt AccountCreatedAtFillerFunc
+
 	// Block/Flag/Move/Add/Remove federation hooks.
-	// SetBlockingService等で注入。nilの場合は対応activityがErrUnsupportedActivityを返す。
+	// 構築子 (blockingService) と SetAbuseReportRepo 等で注入。nilの場合は対応activityが
+	// ErrUnsupportedActivityを返す。
+	//
+	// blockingService が nil だと、inbound の Block / Undo(Block) が
+	// `ErrUnsupportedActivity` になるだけでなく、**reversi の Invite からブロック判定が
+	// 丸ごと飛ぶ** (`reversi_inbox.go` の `p.blockingService != nil` guard)。ブロック済みの
+	// リモート利用者が対象の `reversi:<userID>` ストリームへ `invited` を push できる。
+	// 構築子の必須の引数 (#3833。以前は setter と起動時の検査)。
 	blockingService *coreblocking.Service
 	// quoteRequests は FEP-044f の QuoteRequest に答える (#3234)。未配線なら
 	// ErrUnsupportedActivity。
@@ -150,6 +166,11 @@ type Processor struct {
 	// object が "{localBaseURL}/users/{id}" 形式のとき、ローカルユーザーを
 	// ID で lookup するために使用する (ローカルユーザーの user.uri は NULL
 	// なので FindByURI では解決できない)。
+	//
+	// **空文字だと静かに壊れる。** relay の Accept / Reject は activity id が
+	// 自ホストの URI であることを要求する (fail-closed) ので、ここが空だと
+	// relay の状態遷移が全て落ちる。ローカル URI の判定も全部外れる。構築子の
+	// 必須の引数 (#3833。以前は setter と起動時の検査)。
 	localBaseURL string
 
 	// inboundFollowAcceptor は inbound Follow に対して Accept activity を
@@ -214,19 +235,6 @@ func (p *Processor) handleQuoteRequest(act genericActivity) error {
 	return p.quoteRequests.Handle(quoter, act.raw)
 }
 
-// SetLocalBaseURL configures the local instance's base URL. This is used to
-// detect whether an inbound activity's object refers to a local user.
-func (p *Processor) SetLocalBaseURL(baseURL string) {
-	p.localBaseURL = baseURL
-}
-
-// HasLocalBaseURL reports whether the local base URL was wired.
-//
-// **未配線だと静かに壊れる。** relay の Accept / Reject は activity id が
-// 自ホストの URI であることを要求する (fail-closed) ので、ここが空だと
-// relay の状態遷移が全て落ちる。ローカル URI の判定も全部外れる。
-func (p *Processor) HasLocalBaseURL() bool { return p.localBaseURL != "" }
-
 // resolveTargetUser looks up a user referenced by URI in an inbound activity.
 // ローカルユーザの user.uri は DB 上 NULL なので FindByURI では解決できない。
 // 対策として localBaseURL 配下の URI ("{baseURL}/users/{id}") を検出し、
@@ -236,7 +244,9 @@ func (p *Processor) HasLocalBaseURL() bool { return p.localBaseURL != "" }
 // 使うのは本家に対応の無い reversi の招待と chat room の招待の宛先だけ。
 // Follow / Block とその Undo は本家が getUserFromApId で引くので
 // userFromAPID を使う (#3330)。
-func (p *Processor) resolveTargetUser(uri string) (*model.User, error) {
+func (p *Processor) resolveTargetUser(uri string, sourceHost ...string) (*model.User, error) {
+	var user *model.User
+	var err error
 	if p.localBaseURL != "" {
 		prefix := p.localBaseURL + "/users/"
 		if id, ok := strings.CutPrefix(uri, prefix); ok {
@@ -245,11 +255,24 @@ func (p *Processor) resolveTargetUser(uri string) (*model.User, error) {
 				id = id[:slash]
 			}
 			if id != "" {
-				return p.userRepo.FindByID(id)
+				user, err = p.userRepo.FindByID(id)
+				goto checked
 			}
 		}
 	}
-	return p.userRepo.FindByURI(uri)
+	user, err = p.userRepo.FindByURI(uri)
+checked:
+	if err != nil {
+		return nil, err
+	}
+	host := ""
+	if len(sourceHost) > 0 {
+		host = sourceHost[0]
+	}
+	if err := p.resolver.RequireInboundLocalUser(user, host); err != nil {
+		return nil, err
+	}
+	return user, nil
 }
 
 // userFromAPID looks up the user an AP id names the way upstream
@@ -264,7 +287,7 @@ func (p *Processor) resolveTargetUser(uri string) (*model.User, error) {
 // としてフォローの承認・解除を進めていた (#3330)。
 // ローカルの host で `/users/` 以外を指すものは、本家と同じく誰にも当てない
 // (本家は `parsed.type !== 'users'` で null)。
-func (p *Processor) userFromAPID(uri string) (*model.User, error) {
+func (p *Processor) userFromAPID(uri string, sourceHost ...string) (*model.User, error) {
 	var (
 		u   *model.User
 		err error
@@ -282,6 +305,13 @@ func (p *Processor) userFromAPID(uri string) (*model.User, error) {
 	}
 	if u == nil || u.IsDeleted {
 		return nil, repository.ErrNotFound
+	}
+	host := ""
+	if len(sourceHost) > 0 {
+		host = sourceHost[0]
+	}
+	if err := p.resolver.RequireInboundLocalUser(u, host); err != nil {
+		return nil, err
 	}
 	return u, nil
 }
@@ -383,6 +413,11 @@ type NoteChartHook interface {
 
 // NewProcessor constructs a Processor. reactionService / noteDeleteSvc は省略
 // 可能 (nil)。nil の場合、対応する activity 種別は ErrUnsupportedActivity を返す。
+//
+// localBaseURL は inbound activity の object がローカルユーザーを指すかの判定に
+// 使う、自インスタンスの base URL。background は受信後のベストエフォートフックを
+// 起動する箱 (#3661)。localBaseURL / blockingService / background はテストでは
+// 空文字か nil を渡せる (それぞれのフィールドの説明のとおりに劣化する)。
 func NewProcessor(
 	resolver *Resolver,
 	followingService *corefollowing.Service,
@@ -390,6 +425,9 @@ func NewProcessor(
 	noteDeleteSvc *corenote.DeleteService,
 	userRepo repository.UserRepository,
 	noteRepo repository.NoteRepository,
+	localBaseURL string,
+	blockingService *coreblocking.Service,
+	background *bgwork.Group,
 ) *Processor {
 	return &Processor{
 		resolver:         resolver,
@@ -398,6 +436,9 @@ func NewProcessor(
 		noteDeleteSvc:    noteDeleteSvc,
 		userRepo:         userRepo,
 		noteRepo:         noteRepo,
+		localBaseURL:     localBaseURL,
+		blockingService:  blockingService,
+		background:       background,
 	}
 }
 
@@ -465,8 +506,24 @@ type genericActivity struct {
 // DB に積み上がっていた。
 //
 // signer が nil (署名なし経路 / 未配線) のときは従来どおり DB 経路に倒れる。
+//
+// signer は呼び出し側がこの job の中で DB から引いた行 (inbox では
+// Resolver.ResolveActor の戻り値) でなければならない。signer.URI が
+// activity.actor と一致するとき、凍結・削除の判定はこの行で行い、DB を
+// 引き直さない (#3610)。
 func (p *Processor) ProcessWithSigner(body []byte, signer *model.User) error {
 	return p.process(body, signer)
+}
+
+// ProcessNormalized is ProcessWithSigner for a body the caller has already
+// passed through NormalizeActivity (#3610).
+//
+// inbox の gate は actor / id を読むために同じ前処理 (配列の剥がし + Normalize +
+// decode) を済ませているので、その結果をそのまま使い、もう一度 Normalize しない。
+// NormalizedActivity は NormalizeActivity でしか中身を作れないので、正規化して
+// いない本文がこの入口を素通りすることは無い。
+func (p *Processor) ProcessNormalized(n NormalizedActivity, signer *model.User) error {
+	return p.processNormalized(n, signer)
 }
 
 // Process handles an inbound activity without signer information.
@@ -475,6 +532,32 @@ func (p *Processor) Process(body []byte) error {
 }
 
 func (p *Processor) process(body []byte, signer *model.User) error {
+	return p.processNormalized(NormalizeActivity(body), signer)
+}
+
+// NormalizedActivity is an inbound activity after the singleton-array unwrap,
+// activitypub.Normalize and decode that Process applies, done once (#3610).
+//
+// The zero value is an activity without an actor, which Process drops.
+// Fields are unexported so that only NormalizeActivity can produce one: a
+// caller cannot hand ProcessNormalized a body that skipped normalization.
+type NormalizedActivity struct {
+	// source は NormalizeActivity に渡された本文 (正規化の前の生のバイト)。
+	// 署名の検証や LD-Signature の検査に使うのはこちらで、act.raw ではない。
+	source []byte
+	act    genericActivity
+	err    error
+	// unwrappedFrom / unwrappedSize は 1 要素の配列を剥がしたときの前後の長さ
+	// (剥がしていなければ 0)。ログにだけ使う。
+	unwrappedFrom, unwrappedSize int
+}
+
+// NormalizeActivity runs the unwrap+Normalize+decode pass once.
+//
+// Normalize の失敗は err に残し、ProcessNormalized が Process と同じ扱い
+// (衝突キーは ErrUnsupportedActivity、それ以外は error) をする。
+func NormalizeActivity(body []byte) NormalizedActivity {
+	n := NormalizedActivity{source: body}
 	// Foundkey 系 fork instance は valid な AS Activity を 1 要素 JSON
 	// array で wrap して送信してくるケースがある (#1185)。AS 仕様上
 	// inbox direct POST は object 前提なので、array が来た時は剥がして
@@ -484,15 +567,42 @@ func (p *Processor) process(body []byte, signer *model.User) error {
 	// encode するが top-level の array → object 変換はしないので、
 	// object 化はここで済ませる必要がある。
 	if unwrapped, ok := tryUnwrapSingletonArray(body); ok {
+		n.unwrappedFrom, n.unwrappedSize = len(body), len(unwrapped)
+		body = unwrapped
+	}
+	normalized, err := activitypub.Normalize(body)
+	if err != nil {
+		n.err = err
+		return n
+	}
+	// Normalize は内部で json.Marshal して再エンコードするため、ここでの
+	// Unmarshal は構文エラーで失敗しない。型エラー (actor が object など) は
+	// 握り、読めたフィールドを使う。gate (Fields) と本処理は同じ値を見る。
+	_ = json.Unmarshal(normalized, &n.act)
+	n.act.raw = normalized
+	// upstream Misskey #17340: activity.actor が string IRI でなく embedded
+	// {"id": "..."} object のケースを救済する (triage #999)。
+	n.act.normalizeActor(normalized)
+	return n
+}
+
+// Source returns the body NormalizeActivity was given (before normalization).
+func (n NormalizedActivity) Source() []byte { return n.source }
+
+// Fields returns actor / id / type as Process will see them. All are "" when
+// the body could not be normalized.
+func (n NormalizedActivity) Fields() ActivityFields {
+	return ActivityFields{Actor: n.act.Actor, ID: n.act.ID, Type: n.act.Type}
+}
+
+func (p *Processor) processNormalized(n NormalizedActivity, signer *model.User) error {
+	if n.unwrappedFrom > 0 {
 		// 観測性のため発火を記録 (log message は中立的に表現、Foundkey 由来は
 		// helper / 本コメント側の doc に残す)。
 		slog.Info("federation: unwrapping singleton JSON array activity",
-			"originalSize", len(body), "unwrappedSize", len(unwrapped))
-		body = unwrapped
+			"originalSize", n.unwrappedFrom, "unwrappedSize", n.unwrappedSize)
 	}
-
-	normalized, err := activitypub.Normalize(body)
-	if err != nil {
+	if err := n.err; err != nil {
 		// **retry しても結果が変わらないものは ack する (レビュー L1)。** 衝突
 		// キーを持つ document も JSON として壊れた body も、同じ body を何度
 		// 投げ直しても同じ error になる。生で返すと inbox job が 8 回 retry して
@@ -504,18 +614,12 @@ func (p *Processor) process(body []byte, signer *model.User) error {
 		}
 		return fmt.Errorf("invalid activity json: %w", err)
 	}
-	body = normalized
-
-	// Normalize は内部で json.Marshal して再エンコードするため、ここでの
-	// Unmarshal は構文エラーで失敗しないことが保証される。
-	var act genericActivity
-	_ = json.Unmarshal(body, &act)
-	act.raw = body
-	// upstream Misskey #17340: activity.actor が string IRI でなく embedded
-	// {"id": "..."} object のケースを救済する (triage #999)。
-	act.normalizeActor(body)
+	act := n.act
 	if act.Actor == "" {
-		return errors.New("activity missing actor")
+		// 送り直しても actor は現れない。error で返すと inbox の job が再試行を
+		// 使い切ってから failed に積まれる (既定 8 回) ので、受け取って捨てる。
+		slog.Info("federation: dropping activity without an actor id")
+		return nil
 	}
 
 	// upstream performOneActivity は actor.isSuspended なら dispatch 前に
@@ -523,11 +627,31 @@ func (p *Processor) process(body []byte, signer *model.User) error {
 	// suspended remote actor を DB lookup で判定して drop する (新規 actor は
 	// まだ DB に無く suspended にもなり得ないので素通し)。fetch はせず DB read
 	// のみなので追加コストは小さい。
+	//
+	// 削除済み (isDeleted) の actor も同じく捨てる。本家は署名の持ち主を引く
+	// `getAuthUserFromKeyId` / `getAuthUserFromApId` が削除済みなら null を返し、
+	// InboxProcessorService が `skip: failed to resolve user` で捨てる。ここに
+	// 届く act.Actor は、HTTP 署名の持ち主か、転送なら LD-Signature で認証された
+	// actor なので、どちらの経路もこの判定を通る。
 	if p.userRepo != nil {
-		actor, err := p.userRepo.FindByURI(act.Actor)
+		var actor *model.User
+		var err error
+		if signer != nil && signer.URI != nil && *signer.URI == act.Actor {
+			// **署名者がそのまま actor なら、引き直さない (#3610)。** signer は
+			// 同じ job の中で署名の検証のために DB から引いた行で、同じ URI を
+			// 引き直しても数ミリ秒前と同じ行が返るだけ。凍結を古い値で判定する
+			// 窓は、引き直しても残る「判定から処理までの間」と変わらない。
+			// 転送 (署名者 != actor) と署名の無い経路は今どおり DB を引く。
+			actor = signer
+		} else {
+			actor, err = p.userRepo.FindByURI(act.Actor)
+		}
 		switch {
 		case err == nil && actor != nil && actor.IsSuspended:
 			slog.Info("federation: dropping activity from suspended actor", "actor", act.Actor, "type", act.Type)
+			return nil
+		case err == nil && actor != nil && actor.IsDeleted:
+			slog.Info("federation: dropping activity from deleted actor", "actor", act.Actor, "type", act.Type)
 			return nil
 		case err != nil && !repository.IsNotFound(err):
 			// **判定できないまま素通しにしない** (#3116)。以前は `err == nil` を
@@ -535,7 +659,7 @@ func (p *Processor) process(body []byte, signer *model.User) error {
 			// そのまま処理されていた** (moderation の fail-open)。not-found は
 			// 「まだ取り込んでいない actor」= 凍結されているはずがないので素通しが
 			// 正しいが、障害は retry させる。
-			return fmt.Errorf("suspended actor check: %w", err)
+			return fmt.Errorf("actor moderation check: %w", err)
 		}
 	}
 
@@ -766,35 +890,8 @@ type ActivityFields struct {
 // 配列 wrap や `as:type` で読めず、gate が見ているものとずれる。
 // 取得不能 / 欠落の field は "" になる。
 func ExtractActivityFields(body []byte) ActivityFields {
-	if unwrapped, ok := tryUnwrapSingletonArray(body); ok {
-		body = unwrapped
-	}
-	normalized, err := activitypub.Normalize(body)
-	if err != nil {
-		return ActivityFields{}
-	}
-	var act genericActivity
-	// ExtractActorIRI と同じ理由で型エラーを握る。
-	if err := unmarshalIgnoringTypeErrors(normalized, &act); err != nil {
-		return ActivityFields{}
-	}
-	act.normalizeActor(normalized)
-	return ActivityFields{Actor: act.Actor, ID: act.ID, Type: act.Type}
+	return NormalizeActivity(body).Fields()
 }
-
-// SetBlockingService wires the blocking service for Block/Undo Block activities.
-func (p *Processor) SetBlockingService(svc *coreblocking.Service) {
-	p.blockingService = svc
-}
-
-// HasBlockingService reports whether the blocking service was wired.
-//
-// 未配線だと inbound の Block / Undo(Block) が `ErrUnsupportedActivity` に
-// なるだけでなく、**reversi の Invite からブロック判定が丸ごと飛ぶ**
-// (`reversi_inbox.go` の `p.blockingService != nil` guard)。ブロック済みの
-// リモート利用者が対象の `reversi:<userID>` ストリームへ `invited` を push
-// できる。起動時検査に使う。
-func (p *Processor) HasBlockingService() bool { return p != nil && p.blockingService != nil }
 
 // SetAbuseReportRepo wires the abuse report repository for Flag activities.
 func (p *Processor) SetAbuseReportRepo(repo repository.AbuseReportRepository, idGen id.Generator) {
@@ -842,6 +939,16 @@ func (p *Processor) SetRelayActorChecker(c RelayActorChecker) {
 // inbound actor self-delete to purge a deleted remote user's mirror data.
 type AccountDeleteEnqueuer interface {
 	EnqueueDeleteAccount(payload queue.DeleteAccountPayload) error
+}
+
+// AccountCreatedAtFillerFunc fills a remote user's unknown account creation
+// time. (*AccountCreatedAtFiller).Fill satisfies it.
+type AccountCreatedAtFillerFunc func(ctx context.Context, u *model.User)
+
+// SetAccountCreatedAtFiller wires the best-effort lookup of a remote
+// follower's account creation time on inbound Follow (#3465).
+func (p *Processor) SetAccountCreatedAtFiller(fn AccountCreatedAtFillerFunc) {
+	p.accountCreatedAt = fn
 }
 
 // SetAccountDeleteEnqueuer wires the enqueuer used to cascade-purge a remote
@@ -1026,2242 +1133,6 @@ func (p *Processor) SetReversi(
 // by handleReversiInvite to push `invited` events in real-time (#417 P2)。
 func (p *Processor) SetReversiStreamPublisher(pub ReversiStreamPublisher) {
 	p.reversiStreamPub = pub
-}
-
-// handleFollow processes an inbound Follow activity.
-func (p *Processor) handleFollow(act genericActivity) error {
-	follower, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	followeeURI, err := readObjectString(act.Object)
-	if err != nil {
-		return err
-	}
-	// 本家 follow() は getUserFromApId で引く (自ホストかは host で判定し、
-	// `/users/{id}` の id だけを読む。削除済みの利用者は引かない)。
-	// 見つからなければ本家は 'skip: followee not found' で ack する。以前は
-	// error を返して inbox の retry を使い切っていた (#3330)。DB 障害は retry
-	// させるために伝播する (#3115 と同じ扱い)。
-	followee, err := p.userFromAPID(followeeURI)
-	if err != nil {
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("follow: lookup followee: %w", err)
-	}
-	// upstream follow() は followee が remote の場合 'skip: フォローしようと
-	// しているユーザーはローカルユーザーではありません' で明示的に拒否する
-	// (ApInboxService.ts)。これが無いと relay / 悪意ある remote actor が
-	// Follow(actor=remoteA, object=既知 remoteB) を送るだけで local DB に
-	// remoteA->remoteB の Following 行が作られ、フォロワー数や timeline fanout を
-	// 汚染できる。skip は error にせず ack して終わる (inbox retry を防ぐ) (#1826)。
-	if !followee.IsLocal() {
-		slog.Info("federation: skipping inbound Follow targeting a remote followee",
-			"follower", act.Actor, "followee", followeeURI)
-		return nil
-	}
-	// inbound AP Follow は AP protocol で withReplies を運ばないので
-	// FollowOptions{} (default false) で作成する (#1056)。remote follower の
-	// per-followee withReplies preference は AP protocol 範囲外。
-	result, err := p.followingService.Follow(follower.ID, followee.ID, corefollowing.FollowOptions{})
-	// block 起因の失敗は upstream UserFollowingService.follow と同じ AP 流儀で
-	// 処理する (#1631)。エラーのまま返すと inbox が retry → dead-letter になり
-	// 相手サーバーの pending follow が永遠に解消されない。
-	if errors.Is(err, corefollowing.ErrBlocking) && !follower.IsLocal() && followee.IsLocal() && p.blockingService != nil {
-		// ErrBlocking = remote follower が local followee を block している。
-		// upstream は相互 block なら blocked (Reject) を優先し、blocking 単独
-		// なら自動で block 解除して follow を続行する。
-		blocked, berr := p.blockingService.IsBlocked(followee.ID, follower.ID)
-		if berr != nil {
-			return berr
-		}
-		if blocked {
-			err = corefollowing.ErrBlocked
-		} else {
-			if uerr := p.blockingService.Unblock(follower.ID, followee.ID); uerr != nil {
-				return fmt.Errorf("inbound follow: auto-unblock %s->%s: %w", follower.ID, followee.ID, uerr)
-			}
-			slog.Info("inbound follow: auto-unblocked stale remote block",
-				"follower", follower.ID, "followee", followee.ID)
-			result, err = p.followingService.Follow(follower.ID, followee.ID, corefollowing.FollowOptions{})
-		}
-	}
-	if errors.Is(err, corefollowing.ErrBlocked) && !follower.IsLocal() && followee.IsLocal() {
-		// local followee が remote follower を block している場合は Reject を
-		// 送り返して正常終了する (upstream「エラーにするのではなく Reject を
-		// 送り返しておしまい」)。配送失敗は Accept 側と同じく warn のみ。
-		if p.inboundFollowAcceptor != nil {
-			if rerr := p.inboundFollowAcceptor.SendRejectForInboundFollow(follower, followee, act.raw); rerr != nil {
-				slog.Warn("inbound follow reject delivery failed",
-					"follower", follower.ID, "followee", followee.ID, "err", rerr)
-			}
-		}
-		return nil
-	}
-	alreadyFollowing := errors.Is(err, corefollowing.ErrAlreadyFollowing)
-	// ErrAlreadyRequested はlocked followeeへの再送。既に FollowRequest が
-	// 存在するので何もしなくて良い (Accept は承認時に送られる)。エラーとして
-	// 上に返すと inbox が 4xx を返して相手が retry を続けるので swallow する。
-	alreadyRequested := errors.Is(err, corefollowing.ErrAlreadyRequested)
-	if err != nil && !alreadyFollowing && !alreadyRequested {
-		return err
-	}
-	// Accept を返送するのは Following が成立した (新規 or 既存) 場合のみ。
-	// 既にフォローされている (ErrAlreadyFollowing) 場合も Accept を再送する:
-	// 相手サーバーが Accept を見逃していた or retry で新規 Follow を
-	// 送り直した状況で、我々が何も返さないと相手は永遠に pending のままに
-	// なる (idempotent な Accept 再送で解消する)。original Follow の raw を
-	// そのまま object に包むことでリモート側が送った Follow と matching
-	// できる。FollowRequest 止まり (locked followee) の場合は acceptor を
-	// 呼ばない (Accept は明示承認後)。
-	shouldAccept := alreadyFollowing || (result != nil && result.Following != nil)
-	if shouldAccept && p.inboundFollowAcceptor != nil {
-		if err := p.inboundFollowAcceptor.SendAcceptForInboundFollow(follower, followee, act.raw); err != nil {
-			slog.Warn("inbound follow accept delivery failed",
-				"follower", follower.ID, "followee", followee.ID, "err", err)
-		}
-	}
-	return nil
-}
-
-// handleUndo processes an Undo activity wrapping a Follow / Like / Announce.
-func (p *Processor) handleUndo(act genericActivity) error {
-	var inner genericActivity
-	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
-	// `inner.actor` が embedded object のケースに**到達できない** (#2662)。
-	if err := unmarshalIgnoringTypeErrors(act.Object, &inner); err != nil {
-		return fmt.Errorf("invalid undo object: %w", err)
-	}
-	// inner.actor が embedded object のケースも救済する (#999 / upstream #17340)。
-	//
-	// **現状の Undo 配下はどれも `inner.Actor` を読まない** (権威は外側の
-	// `act.Actor`、対象は `inner.Object`)。Accept / Reject と形を揃えるための
-	// 予防で、ここだけは挙動で観測できない = テストで固定できない。消しても
-	// 今は壊れないが、inner.actor を読む sub-handler を足したときに object
-	// 形式が黙って落ちるので残す (#2665)。
-	inner.normalizeActor(act.Object)
-	switch strings.ToLower(inner.Type) {
-	case "follow":
-		return p.handleUndoFollow(act, inner)
-	case "like":
-		return p.handleUndoLike(act, inner)
-	case "announce":
-		return p.handleUndoAnnounce(act, inner)
-	case "block":
-		return p.handleUndoBlock(act, inner)
-	case "accept":
-		return p.handleUndoAccept(act, inner)
-	case "emojireaction", "emojireact":
-		return p.handleUndoLike(act, inner)
-	case "invite":
-		// CherryPick が pre-start reversi 招待を取り消す際に Undo(Invite) を
-		// 送ってくる (#417 P4)。inner.Object が reversi Game なら reversi
-		// 側で処理、それ以外 (例: Group Invite) は未対応扱いにして inbox
-		// が 202 を返すようにする (400 にすると peer 側の配送 retry を
-		// 招いてしまう)。
-		if err := p.handleReversiUndoInvite(act, inner); err != nil {
-			if errors.Is(err, ErrNotReversiGame) {
-				return ErrUnsupportedActivity
-			}
-			return err
-		}
-		return nil
-	}
-	return ErrUnsupportedActivity
-}
-
-// handleUndoAccept processes an inbound Undo(Accept): a remote followee revokes
-// a previously-accepted follow, which means we should drop our local follower's
-// following relationship to them (upstream ApInboxService.undoAccept、#1560)。
-//
-// 二段ネスト: act=Undo, inner=Accept, inner.Object=元の Follow。
-//   - act.Actor       = remote followee (accept を撤回した側)
-//   - Follow.actor     = local follower (フォローしていた側)
-//
-// follower→followee の Following があれば Unfollow する。
-func (p *Processor) handleUndoAccept(act genericActivity, inner genericActivity) error {
-	followee, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	// inner.Object は元の Follow。その actor が local follower。
-	//
-	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
-	// `"actor": {"id": ...}` 形式で早期 return してしまい、Undo(Accept(Follow))
-	// が unfollow されない (#2662)。string URI は握っても ID / Actor が空のまま
-	// なので従来どおり skip に落ちる。
-	var follow genericActivity
-	if uerr := unmarshalIgnoringTypeErrors(inner.Object, &follow); uerr != nil {
-		// object が Follow の URI 文字列だけのケースは follower を特定できない。
-		// upstream は getUserFromApId(activity.object) で解決するが、mk-go では
-		// Follow URI から follower を逆引きする経路が無いので skip (ack)。
-		return nil
-	}
-	follow.normalizeActor(inner.Object)
-	followerURI, err := readActorString(follow)
-	if err != nil || followerURI == "" {
-		return nil
-	}
-	follower, err := p.userFromAPID(followerURI)
-	if err != nil {
-		// **#3115 が Accept / Reject で確立した原則の裏返し** (#3116)。ack すると
-		// job が retry されず、**accept を撤回された相手をフォローし続ける**。
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("undo accept: lookup follower: %w", err)
-	}
-	if follower == nil {
-		return nil
-	}
-	if err := p.followingService.Unfollow(follower.ID, followee.ID); err != nil {
-		// フォローしていなければ no-op (upstream の 'skip: フォローされていない')。
-		if errors.Is(err, corefollowing.ErrNotFollowing) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// handleUndoFollow undoes a previously created Follow.
-func (p *Processor) handleUndoFollow(act genericActivity, inner genericActivity) error {
-	follower, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	followeeURI, err := readObjectString(inner.Object)
-	if err != nil {
-		return err
-	}
-	// 本家 undoFollow() も getUserFromApId で引き、見つからなければ skip (#3330)。
-	followee, err := p.userFromAPID(followeeURI)
-	if err != nil {
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("undo follow: lookup followee: %w", err)
-	}
-	// #2106 L30: upstream undoFollow は followee が remote (host != null) なら skip する
-	// (handleFollow の gate と対称)。remote→remote の Undo を DB 走査 / counter 経路に
-	// 入れない防御線を Undo 側にも揃える。
-	if followee.Host != nil {
-		return nil
-	}
-	if err := p.followingService.Unfollow(follower.ID, followee.ID); err != nil &&
-		!errors.Is(err, corefollowing.ErrNotFollowing) {
-		return err
-	}
-	// locked local followee 宛の pending follow request を取り消す。upstream
-	// undoFollow は requestExist を見て cancelFollowRequest を呼ぶ。これが無いと
-	// remote が accept 前に Undo(Follow) を送った場合、phantom な follow request 行と
-	// receiveFollowRequest 通知が残る (handleReject と同じ pattern、#1948-21)。
-	if err := p.followingService.CancelRequest(follower.ID, followee.ID); err != nil &&
-		!errors.Is(err, corefollowing.ErrRequestNotFound) {
-		return err
-	}
-	return nil
-}
-
-// handleUndoLike removes a reaction previously added via Like.
-//
-// Note: reversi game session URI を対象とした Undo(EmojiReaction) は
-// handleLike と対称に 202 ack で握り潰す (#417 P5)。dispatch 順も handleLike
-// と揃えており、ResolveActor を先頭で実行することで actor cache の populate
-// が両 path で同様に行われるようにする (#417 P5 Devin review)。
-// reactionService nil の本番 config は無いので unconditional な ResolveActor
-// で実害なし。
-func (p *Processor) handleUndoLike(act genericActivity, inner genericActivity) error {
-	reactor, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		// permanent な actor resolve 失敗は ack して skip (#1183)。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Undo(Like) (actor unresolvable)",
-				"actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	targetURI, err := readObjectString(inner.Object)
-	if err != nil {
-		// inner.object 欠如した malformed Undo(Like) は handleLike と同じく
-		// 202 ack 扱い (旧実装は reactionService nil 経路で ErrUnsupportedActivity
-		// を返していた)。
-		return ErrUnsupportedActivity
-	}
-	if corereversi.IsReversiGameSessionURI(targetURI) {
-		return nil
-	}
-	if p.reactionService == nil {
-		return ErrUnsupportedActivity
-	}
-	target, err := p.resolver.ResolveNote(targetURI)
-	if err != nil {
-		// permanent な target resolve 失敗は ack。Undo の対象 reaction record
-		// が存在しないだけでも idempotent (= 削除済みは ErrReactionNotFound で
-		// nil 返却) なので、resolve できない先の reaction は元から無い扱いで
-		// 整合する (#1183)。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Undo(Like) (target unresolvable)",
-				"object", targetURI, "actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	if err := p.reactionService.Delete(reactor, target.ID); err != nil {
-		// 既に削除済みは許容
-		if errors.Is(err, corereaction.ErrReactionNotFound) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// handleUndoAnnounce removes a previously created Announce (renote).
-// inner.Object には元ノートの URI を持つことを想定する。
-func (p *Processor) handleUndoAnnounce(act genericActivity, inner genericActivity) error {
-	announcer, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		// permanent な actor resolve 失敗は ack (#1183)。announcer が居な
-		// ければ Announce record も作っていないはずなので削除対象も無く
-		// idempotent と整合する。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Undo(Announce) (actor unresolvable)",
-				"actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	targetURI, err := readObjectString(inner.Object)
-	if err != nil {
-		return err
-	}
-	target, err := p.resolver.ResolveNote(targetURI)
-	if err != nil {
-		// permanent な target resolve 失敗は ack。target が解決できなければ
-		// renote record も無いはずなので、削除対象が無いまま activity を ack
-		// する形で整合する (#1183)。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Undo(Announce) (target unresolvable)",
-				"object", targetURI, "actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	// announcer が pure renote を 1 件でも持っていれば削除する。複数あった場合
-	// は最新の 1 件のみで十分 (本家 misskey の挙動と同じ)。
-	// viewerID には announcer.ID を渡す: push-down 後 (#1500) も self-branch で
-	// announcer 自身の renote は visibility を問わず全件見えるため、下の
-	// `n.UserID != announcer.ID` で残す対象行は従来どおり取得できる。
-	renotes, err := p.noteRepo.ListRenotesOf(target.ID, announcer.ID, "", "", 50)
-	if err != nil {
-		return err
-	}
-	for _, n := range renotes {
-		if n.UserID != announcer.ID {
-			continue
-		}
-		if !corenote.IsPureRenote(n) {
-			continue
-		}
-		if err := p.noteRepo.Delete(n); err != nil {
-			return err
-		}
-		// 取り消されたブーストの通知を消す (#3201)。**この経路は DeleteService を
-		// 通らない** (noteRepo.Delete を直接呼ぶ) ので、DeleteService 側の hook
-		// だけではリモートからのリノート取り消しが丸ごと漏れる。
-		if p.notificationHook != nil {
-			p.notificationHook.OnNoteDeleted(n)
-		}
-		// handleAnnounce の increment と同条件でのみ減算する。条件がずれると
-		// 加算しなかった boost の undo で count が負に振れる (#2283)。
-		//
-		// なお upstream は renoteCount を減算しない (incRenoteCount しか無く、
-		// note 削除時も据え置き) ため、これは mk-go の意図的な divergence。
-		// unrenote 後もカウントが残り続ける方が不自然なので維持する
-		// (docs/divergence.md 参照)。
-		if target.UserID != announcer.ID && !announcer.IsBot {
-			_ = p.noteRepo.IncrementCount(target.ID, "renoteCount", -1)
-		}
-		return nil
-	}
-	return nil
-}
-
-// lookup の失敗を ack するか伝播させるかの規則 (#3115 / #3116 / #3121)。
-//
-//  1. **inbox job / queue job から到達する経路は分ける。** not-found は retry しても
-//     結果が変わらないので ack、それ以外は伝播させて queue に retry させる。
-//     `repository.IsNotFound` で判定する。ack すると job が成功扱いになるので、
-//     **一時的な接続断だけで activity が恒久的に失われる** — 相手の再送は
-//     当てにできない (inbox は enqueue した時点で 202 を返す)。
-//  2. **fire-and-forget な hook は ack のまま。** 配送 hook は `safeGo` で
-//     投げっぱなしに呼ばれ、戻り値も retry の仕組みも無いので、error を返しても
-//     行き先が無い。**理由を書いて残す** (`note_delivery_hook.go` の
-//     `findNoteAuthor` に書いてある。他はそこを参照する)。
-//  3. **#534 の idempotency invariant と混同しない。** あれは「retry しても結果が
-//     変わらないもの」の話で、`ErrRequestNotFound` / `ErrBlocking` / `ErrBlocked` が
-//     それに該当する。**retry すれば成功しうる障害はそこに入らない。**
-//  4. **「確かめられなかった」は「無かった」ではない (#3121)。** 署名検証の失敗は
-//     既定で ack する — 署名が合わない body を retry しても結果は変わらないため。
-//     しかし検証は DB も読むので、そのまま書くと **DB 障害のあいだに届いた
-//     activity まで同じ ack に落ちる**。actor / 公開鍵の lookup は
-//     `ErrLookupUnavailable` で種別を残し、`inbox.go` がそれだけ retry に倒す。
-//     **落とす側は 1 箇所ではない** — HTTP 署名 (`verifyPayload`)、転送 activity の
-//     認可 (`authorizeActor` → LD-Signature の creator 解決と鍵引き)、Headers 無しの
-//     legacy 経路 (`ldVerifier.VerifyAndCompact`) の 3 つが同じ sentinel を見る。
-//
-// この規則で数えれば対象は導ける (件数を別に持たない)。
-//
-// **#3121 時点で ack のまま残っているもの** (どれも規則 1-4 で説明が付く):
-//   - `resolver.go` の `fetchActor` / `fetchNote` の失敗 — リモートが取れないという
-//     相手側の事情で、**こちらの retry で取り戻せるとは限らない**。分けるなら HTTP
-//     status から一時的か恒久的かを決める別の設計が要るので、ここでは触っていない。
-//   - 同 `userRepo.Create` / `noteRepo.Create` の失敗 — 読み側を先に分けたので、DB が
-//     落ちていれば手前の lookup で止まる。ここに来るのは列に入らない値のように
-//     retry しても変わらないものが主だが、**書き込みだけが落ちている状態は
-//     取りこぼす**。
-//   - `post_scheduled_note.go` の publish 失敗 — 二重 publish / 二重通知を避ける
-//     ための意図的な設計 (#2106 L61)。予約投稿の job は attempts を積むように
-//     なったが (#3121)、retry されるのは **publish に到達する前の失敗だけ**。
-//   - 配送 hook 一式 — 規則 2。
-
-// handleAccept processes an inbound Accept activity. リモートfolloweeがローカル
-// followerからのフォローリクエストを承認した場合に、フォロー関係を確立する。
-// inner.id が自ホストの follow-relay URI で、かつ送信元 actor がその relay
-// 自身であれば relay の Accept とみなし、RelayStatusMarker.MarkAccepted を
-// 呼び出す。actor の inbox / sharedInbox と relay の inbox の完全一致は本家
-// 2026.10.0 と同じで、id が自ホストの URI であることと actor の host の照合は
-// mk-go 側の追加。status が requesting の relay だけが動く (MarkAccepted 側)。
-func (p *Processor) handleAccept(act genericActivity) error {
-	// こちらが送った QuoteRequest への承認 (FEP-044f、#3234)。object が id だけの
-	// 文字列でも来るので、下の Follow 用の解釈より先に見る。
-	if p.quoteAnswers != nil {
-		if reqURI := quoteAnswerRequestURI(act.Object, p.localBaseURL); reqURI != "" {
-			return p.quoteAnswers.HandleAnswer(act.Actor, reqURI, true, quoteAnswerResult(act.raw))
-		}
-	}
-	var inner genericActivity
-	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
-	// `inner.actor` が embedded object のケースに**到達できない** (#2662)。
-	if err := unmarshalIgnoringTypeErrors(act.Object, &inner); err != nil {
-		// objectが文字列（Follow IDのURI）の場合もあるが、現状はnilで許容
-		return nil
-	}
-	// inner.actor が embedded object のケースも救済する (#999 / upstream #17340)。
-	inner.normalizeActor(act.Object)
-	// chat room invitation の Accept (remote が我々の room 招待を承認) は
-	// membership 化する (#1203)。
-	if strings.EqualFold(inner.Type, "invite") {
-		return p.handleChatRoomAccept(act, inner)
-	}
-	if !strings.EqualFold(inner.Type, "follow") {
-		return nil
-	}
-	if relayID := matchFollowRelayID(inner.ID, p.localBaseURL); relayID != "" && p.relayMarker != nil {
-		// 送信元がその relay 自身でなければ状態を変えずに drop する。
-		// 通さないと、署名が通る任意のリモート actor が未承認 / 拒否済みの
-		// relay を accepted に倒せ、全公開ノートがその inbox へ流れ出す。
-		allowed, err := p.relayStatusChangeAllowed(act.Actor, relayID, "Accept")
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return nil
-		}
-		return p.relayMarker.MarkAccepted(context.Background(), relayID)
-	}
-	// actorはリモートfollowee（承認した側）
-	followee, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	// inner.actorはローカルfollower（フォローを申請した側）
-	followerURI, err := readActorString(inner)
-	if err != nil {
-		return nil
-	}
-	follower, err := p.userFromAPID(followerURI)
-	if err != nil {
-		// **not-found だけ ack する** (#3115)。その利用者が居ないことは retry
-		// しても変わらないので、7 回 retry (試行は計 8 回、
-		// `defaultInboxJobMaxAttempts`) してから dead letter に積む意味が無い。
-		//
-		// **DB 障害は伝播させる。** ack すると**job が成功扱いになって queue が
-		// retry しない**ので、一時的な接続断だけで Accept が恒久的に失われ、
-		// ローカル利用者のフォローリクエストは「リクエスト中」のまま永久に残る。
-		// **相手の再送は当てにできない** — inbox は enqueue した時点で 202 を
-		// 返すので、worker が ack しようが error を返そうが相手が見る応答は
-		// 変わらない。#534 の idempotency invariant は「retry しても結果が
-		// 変わらないもの」の話で、**retry すれば成功しうる障害はそこに入らない**
-		// (#2792 と同じ判断)。
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	// フォローリクエストを承認してフォロー関係を確立
-	if err := p.followingService.AcceptRequest(followee.ID, follower.ID); err != nil {
-		// フォローリクエストが存在しない場合は無視（既にフォロー済み等）
-		if errors.Is(err, corefollowing.ErrRequestNotFound) {
-			return nil
-		}
-		// block 関係による拒否 (AcceptRequest の多層防御、#3111 レビュー) も
-		// retry しても結果は変わらないので ack する。生で返すと inbox job が
-		// 8 回 retry してから dead letter に積まれ、その間 inbox health の
-		// 統計にも失敗として乗る (#534 の idempotency invariant)。
-		if errors.Is(err, corefollowing.ErrBlocking) || errors.Is(err, corefollowing.ErrBlocked) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// mergeCreateAudience unions the Create activity's to/cc onto the carried Note
-// object's to/cc and fills the object's attributedTo from the activity actor
-// when absent, mirroring upstream ApInboxService.create
-// (packages/backend/src/.../ApInboxService.ts:403-417). The merged JSON is what
-// IngestNoteWithCreated parses, so visibility (public/home/followers/specified)
-// and visibleUserIds are derived from the combined audience rather than the
-// Note object's own to/cc only (#1560).
-//
-// 本家は activity / object 双方の to/cc を同一 union 値に揃えるが、mk-go は
-// object 側しか後段で参照しないので object の to/cc のみ書き戻す。union は
-// 順序保持 dedup で、activity 側を先・object 側を後に連結する (本家 concat 順)。
-//
-// object が JSON object でない (string IRI 等) / parse 不能なケースでは元の
-// act.Object をそのまま返し、既存挙動へ degrade する (fail-safe)。union 自体は
-// visibility を広げる方向ではなく、Create 側にしか無い followers/specified の
-// audience を拾うので、誤って public 化する事故を防ぐ fail-closed 寄りの補正。
-func mergeCreateAudience(act genericActivity) json.RawMessage {
-	if len(act.Object) == 0 {
-		return act.Object
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(act.Object, &obj); err != nil || obj == nil {
-		// object が embedded JSON object でなければ何もできない (本家も
-		// `typeof activity.object === 'object'` でガードしている)。
-		return act.Object
-	}
-
-	actTo := decodeAudience(act.To)
-	actCC := decodeAudience(act.CC)
-	objTo := decodeAudience(obj["to"])
-	objCC := decodeAudience(obj["cc"])
-
-	mergedTo := unionStrings(actTo, objTo)
-	mergedCC := unionStrings(actCC, objCC)
-
-	mutated := false
-	if encoded, ok := encodeAudienceIfChanged(obj["to"], mergedTo); ok {
-		obj["to"] = encoded
-		mutated = true
-	}
-	if encoded, ok := encodeAudienceIfChanged(obj["cc"], mergedCC); ok {
-		obj["cc"] = encoded
-		mutated = true
-	}
-
-	// object.attributedTo が無ければ activity.actor で補う。IngestNote は空の
-	// attributedTo を ErrInvalidNote で弾くので、Create actor から埋めて本家の
-	// `activity.object.attributedTo = activity.actor` に揃える。
-	if _, present := obj["attributedTo"]; !present && act.Actor != "" {
-		if encoded, err := json.Marshal(act.Actor); err == nil {
-			obj["attributedTo"] = encoded
-			mutated = true
-		}
-	}
-
-	if !mutated {
-		return act.Object
-	}
-	merged, err := json.Marshal(obj)
-	if err != nil {
-		return act.Object
-	}
-	return merged
-}
-
-// decodeAudience parses an AP audience field into a []string. The value may be
-// a single id, an object carrying `id`, or an array of either. Unreadable
-// elements are dropped. Empty / null input yields nil.
-func decodeAudience(raw json.RawMessage) []string {
-	if len(raw) == 0 {
-		return nil
-	}
-	// APIDList は upstream getApIds と同じく `{"id": ...}` 形式の要素も拾う。
-	// `[]string` 決め打ちだと object 要素で unmarshal ごと失敗し audience が丸ごと
-	// 落ちる (#2662)。
-	var list activitypub.APIDList
-	if err := json.Unmarshal(raw, &list); err != nil {
-		return nil
-	}
-	return list
-}
-
-// unionStrings concatenates a then b, preserving first-seen order and dropping
-// duplicates, matching upstream `unique(concat([toArray(a), toArray(b)]))`.
-func unionStrings(a, b []string) []string {
-	if len(a) == 0 && len(b) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(a)+len(b))
-	out := make([]string, 0, len(a)+len(b))
-	for _, v := range a {
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	for _, v := range b {
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	return out
-}
-
-// encodeAudienceIfChanged re-encodes merged as a JSON array and reports whether
-// it differs from the original raw value. Returns ok=false (no write) when the
-// merged audience is empty so a missing field is not materialised as `[]`, and
-// when the canonical array form already equals the original (avoids needless
-// string→array normalisation churn). 元と等価なら書き戻さないことで、純粋に
-// audience 追加が無い一般 note では act.Object をそのまま素通しする。
-func encodeAudienceIfChanged(raw json.RawMessage, merged []string) (json.RawMessage, bool) {
-	if len(merged) == 0 {
-		return nil, false
-	}
-	encoded, err := json.Marshal(merged)
-	if err != nil {
-		return nil, false
-	}
-	if bytes.Equal(bytes.TrimSpace(raw), encoded) {
-		return nil, false
-	}
-	return encoded, true
-}
-
-// handleCreate persists an inbound Note or Question carried by a Create activity.
-// Question (投票) はNote同様にIngestNoteで処理され、Pollレコードが自動作成される。
-// ノート取込み成功後、fanoutHookが配線されていればタイムライン/ストリーミングに
-// 配信する (#330)。
-//
-// `_misskey_talk: true` flag が立った Note は CherryPick / レガシー Misskey の
-// 1-on-1 chat federation。notes テーブルではなく chat_messages として処理する
-// ため IngestNote をスキップして chatService にルートする (#692)。
-func (p *Processor) handleCreate(act genericActivity, signer *model.User) error {
-	// bearcaps (bear:) object URI は未対応として skip する (#1560、upstream
-	// ApInboxService.create の 'skip: bearcaps url not supported')。
-	if isBearcapURI(act.Object) {
-		slog.Info("federation: skipping Create with bearcaps object url", "actor", act.Actor)
-		return nil
-	}
-	// Mastodon 系リレーは Announce ではなく Create を LD-Signature 付きで
-	// 転送する (#2338)。配送してきたのが購読中のリレーなら、著者を DB に
-	// 作らず ephemeral 経路で解決する。
-	//
-	// signer が nil (署名なし経路 / 未配線) のときは従来どおり DB 経路に
-	// 倒れる (fail-safe)。
-	viaRelay := p.isRelayDelivery(signer)
-	actor, err := p.resolveCreateActor(act.Actor, viaRelay)
-	if err != nil {
-		if errors.Is(err, ErrHostNotAllowed) {
-			// federation policy で許可されない host の actor からの Create は
-			// retry で解消しないため ack して drop する (#1419 review)。署名検証
-			// 経路では verifyPayload が先に弾くが、署名なし inbound 経路でも
-			// retry ループにならないようここでも吸収する。
-			slog.Info("federation: dropping Create from non-federated host actor",
-				"actor", act.Actor)
-			return nil
-		}
-		return err
-	}
-	// Note の `_misskey_talk` を覗き見て chat か通常 note かを分岐する。
-	// IngestNote が走る前に短絡しないと chat message が notes テーブルに
-	// 流れ込んでタイムラインを汚す。1-on-1 は chatService、group (room) は
-	// chatRoomReceiver が処理するのでどちらか配線済みなら probe する。
-	if p.chatService != nil || p.chatRoomReceiver != nil {
-		var probe struct {
-			Type    string `json:"type"`
-			ID      string `json:"id"`
-			Content string `json:"content"`
-			// **MFM の原文も拾う。** `content` は HTML なので、MFM に戻すと
-			// 情報が落ちる (装飾・色・絵文字・引用の改行など)。note 取り込みは
-			// 同じ 3 段 (source -> _misskey_content -> content) で拾っており、
-			// chat だけ `content` しか見ていなかった。
-			Source *struct {
-				Content   string `json:"content"`
-				MediaType string `json:"mediaType"`
-			} `json:"source"`
-			MisskeyContent string          `json:"_misskey_content"`
-			MisskeyTalk    bool            `json:"_misskey_talk"`
-			To             json.RawMessage `json:"to"`
-			Context        json.RawMessage `json:"@context"`
-		}
-		if err := json.Unmarshal(act.Object, &probe); err == nil && probe.MisskeyTalk && probe.Type == "Note" {
-			mfmSource := ""
-			if probe.Source != nil && probe.Source.MediaType == "text/x.misskeymarkdown" {
-				mfmSource = probe.Source.Content
-			}
-			if mfmSource == "" {
-				mfmSource = probe.MisskeyContent
-			}
-			// **メッセージの id を配送してきた actor のホストに縛る。**
-			//
-			// この分岐は `ingestCreateNote` の手前で短絡するので、通常の note に
-			// 掛かる `id host == attributedTo host` の検査 (`resolver.go` の
-			// `validateNote` 相当) を一度も通らない。縛らないと、署名が通る
-			// リモート actor が**任意ホストの URI を名乗って chat メッセージを
-			// 1 通送れる**。以後その URI を使う正規の連合 chat メッセージは
-			// `FindMessageByURI` が hit して黙って捨てられる (= 相手のメッセージを
-			// 先回りして潰せる)。
-			//
-			// **`sameDeliveryHost` を使う。`assertRequestHostMatches` では緩い。**
-			// あちらは `normalizeMatchHost` 経由で **`www.` を剥がして同一視する**
-			// ので、`www.remote.example` の actor が `remote.example` の id を
-			// 名乗れてしまう。`normalizeMatchHost` 自身のコメントが「actor が
-			// 申告する値の host 検証には `sameDeliveryHost` を使うこと」と書いて
-			// いて (#2662)、chat の id はまさに actor の申告値。note 側の
-			// `validateNote` も `punyHost` 比較で `www.` を剥がさない。
-			//
-			// **1-on-1 と room の両方の手前に置く。** どちらも同じ `probe.ID` を
-			// メッセージの uri として保存する。
-			if !sameDeliveryHost(act.Actor, probe.ID) {
-				slog.Warn("federation: chat message id host does not match delivering actor",
-					"actor", act.Actor, "id", probe.ID)
-				// retry では解決しないので ack して drop する。
-				return ErrUnsupportedActivity
-			}
-			// note の @context が room URI なら group chat message (#1209)。
-			// それ以外は従来の 1-on-1 DM。
-			if roomURI, isRoom := chatRoomURIFromContext(probe.Context); isRoom {
-				return p.handleChatRoomMessageCreate(actor, probe.ID, probe.Content, mfmSource, roomURI)
-			}
-			return p.handleChatCreate(actor, probe.ID, probe.Content, mfmSource, probe.To)
-		}
-	}
-	// 本家 ApInboxService.create は resolve 前に activity.to/cc を Note object の
-	// to/cc に union し、object.attributedTo が無ければ activity.actor で埋める
-	// (#1560)。これをしないと audience を Create 側だけに載せる実装 (一部 Mastodon
-	// 系) の note が followers/specified を public 等に誤判定し得る。visibility は
-	// fail-closed に倒すため union 後の object を ingest に渡す。union に失敗した
-	// 場合は元の object を使う (= 既存挙動へ degrade)。
-	object := mergeCreateAudience(act)
-	// act.Actor を配送 actor として渡し、note の著者 (attributedTo) が配送者本人で
-	// あることを検証させる (なりすまし forge 防止、#1839)。
-	note, created, err := p.ingestCreateNote(object, act.Actor, viaRelay)
-	if errors.Is(err, corenote.ErrContainsTooManyMentions) {
-		// upstream Misskey #17167 (= 2026.5.0 fix / triage #1004): role policy
-		// 由来の "note contains too many mentions" は永続的に解決しない error な
-		// ので queue retry に乗せず ack して drop する。upstream は同種 error を
-		// IdentifiableError('9f466dab-...') で switch する patch だが、mk-go は
-		// sentinel error の errors.Is で同等の non-retry 化を行う。
-		// 上限は投稿者の role policy で決まる (#3330) ので、既定値を記録しない。
-		slog.Info("federation: dropping inbound note exceeding mentionLimit",
-			"actor", act.Actor)
-		return nil
-	}
-	if errors.Is(err, ErrHostNotAllowed) {
-		// federation policy (none / specified / blockedHosts) で許可されない
-		// host の Create(Note) は retry で解消しないため ack して drop する
-		// (#1419 review)。handleAnnounce 等は isPermanentSkipError で吸収する
-		// が、handleCreate は他の error を retry に乗せる方針なので明示分岐。
-		slog.Info("federation: dropping inbound Create(Note) from non-federated host",
-			"actor", act.Actor)
-		return nil
-	}
-	if errors.Is(err, ErrNoteAttributionMismatch) {
-		// id/attributedTo host 不一致・attribution≠配送actor (なりすまし forge) は
-		// retry で解消しないため ack して drop する (#1839)。malformed note
-		// (ErrInvalidNote) は従来どおり下の err 分岐で surface する。
-		slog.Info("federation: dropping forged inbound Create(Note) (attribution mismatch)",
-			"actor", act.Actor)
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if note != nil {
-		// IngestNoteが既存ノートを返した場合 (重複) でもfanout自体は
-		// べき等なので呼んで問題ない (通知フックは冪等でないので下で created
-		// ゲートを掛ける)。authorはnoteに紐付くUserを使うが、
-		// IngestNoteはUser fieldを設定しないためactorを使う。
-		// Renote/Reply relation は IngestNote 直後では未ロード (ID だけ) な
-		// ので、ストリーミング payload で renote 先が null にならないように
-		// preload 付きで再取得する (#416)。
-		//
-		// Reply / Renote が無い「素の Create(Note)」(連合の大半を占める一般
-		// 投稿) では preload する relation が無いので reload を skip する
-		// (#569)。User 関係だけ caller の actor から手で詰める。これにより
-		// inbox worker drain time の支配的コストの 1 つだった redundant
-		// SELECT が消える。
-		hydrated := note
-		if note.ReplyID != nil || note.RenoteID != nil {
-			hydrated = hydrateNoteForFanout(p.noteRepo, note)
-		} else if note.User == nil {
-			note.User = actor
-		}
-		// fanoutHook / notificationHook はベストエフォートで、local note
-		// create 側 (note_create_service) では既に safeGo で非同期発火して
-		// いる。federation 側もこれに揃え、worker が Redis LPUSH / publish
-		// 待ちで block されないようにする (#569)。順序保証は Misskey TS と
-		// 同じく各 hook 側の冪等性で吸収する。
-		if p.fanoutHook != nil {
-			safeGoFedHook(func() { p.fanoutHook.OnNoteCreated(hydrated, actor) })
-		}
-		// **リレー経由では発火させない (#2743)。** Mastodon 系リレーは元の
-		// Create をそのまま転送して署名だけがリレーのものになるので、
-		// ingestCreateNote と同じ viaRelay で判定する。これを見落とすと
-		// ephemeral 有効時に DB に行が無い note が antenna の ZSET に積まれ、
-		// 上限 200 を幽霊 ID が埋める。
-		// **`created` では gate しない。** notification / chart hook は dedup hit を
-		// 除くが、antenna で同じことをすると「リレーや Announce の target 解決が
-		// 先に DB へ入れた note は、その後の直接配送でも antenna に入らない」に
-		// なる (ephemeral 無効時、リレー経由でも DB 行はできる)。リレーを購読
-		// している構成では取りこぼしが恒常化する。再配送での WS 重複は
-		// fanoutHook も同じく許している側で、こちらのほうが軽い。
-		if p.antennaHook != nil && !viaRelay {
-			safeGoFedHook(func() { p.antennaHook.OnNoteCreated(hydrated, actor) })
-		}
-		// 通知フックは dedup hit では発火させない。**通知は冪等ではない** —
-		// 呼ぶたびに新しい id で 1 件積まれるので、同じ Create(Note) が再配送
-		// されると受信者の通知一覧に同じメンション / DM が 2 件並ぶ。実運用の
-		// インスタンスでは配送リトライや inbox / sharedInbox への二重投げが
-		// 日常的に起きるため、fanout (note id で冪等) と同じ扱いにはできない。
-		//
-		// upstream も通知は NoteCreateService.create の中でしか作らないので、
-		// 既存ノートを返した経路では通知が出ない (= ここと同じ挙動)。
-		if p.notificationHook != nil && created {
-			safeGoFedHook(func() {
-				// reply / quote / mention 通知を local notifiee に対して
-				// 生成する。hydrated.Reply / hydrated.Renote は preload
-				// 済みなので、notification hook 側で UserID を取れる
-				// (#415)。
-				p.notificationHook.OnNoteCreated(hydrated, actor, hydrated.Reply, hydrated.Renote)
-			})
-		}
-		// chart hook は resolver が新しく作ったときに呼ぶ (Resolver.fireNoteCreated、
-		// #3330)。ここでも呼ぶと二重に数える。dedup hit で呼ばないのは
-		// resolver 側も同じ (#1156)。
-	}
-	return nil
-}
-
-// safeGoFedHook runs fn in a new goroutine, recovering from panics. local
-// note service の safeGo と同じ振る舞い (`note_create_service.go`)。
-func safeGoFedHook(fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("recovered panic in federation best-effort hook", "panic", r)
-			}
-		}()
-		fn()
-	}()
-}
-
-// hydrateNoteForFanout reloads a freshly-created note via
-// FindByIDWithRelations so that Renote/Reply relations are preloaded before
-// handing it to the fanout hook. reload が失敗した場合は元の note をその
-// まま返す (best-effort)。
-func hydrateNoteForFanout(repo interface {
-	FindByIDWithRelations(id string) (*model.Note, error)
-}, note *model.Note) *model.Note {
-	if repo == nil || note == nil {
-		return note
-	}
-	if loaded, err := repo.FindByIDWithRelations(note.ID); err == nil && loaded != nil {
-		return loaded
-	}
-	return note
-}
-
-// handleLike attaches a reaction to a local note based on a Like activity.
-//
-// Note: P5 (#417) で reversi 早期分岐を入れた都合上、reactionService nil
-// チェックを reversi 分岐の後に移動している。副作用として:
-//   - ResolveActor が無条件で呼ばれる (旧実装は reactionService nil 時に
-//     早期 return していた)。reversi 分岐側でも actor 解決は必要なので
-//     妥当な変更。reactionService が wire されていない config は production
-//     には無いので実害なし (#417 P5 Devin review)。
-//   - object が malformed (string でも nested object でもない) Like は
-//     reactionService の有無に関わらず ErrUnsupportedActivity (= 202 ack)
-//     を返す。旧実装は reactionService 配線時に readObjectString error を
-//     400 として返していたが、404 / 400 で peer の retry を誘発するより
-//     202 で握り潰すほうが連合衛生的に望ましい (#417 P5 Devin review)。
-func (p *Processor) handleLike(act genericActivity) error {
-	reactor, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		// permanent な actor resolve 失敗 (削除済 / visibility 制限 /
-		// authorized fetch 拒否 / malformed JSON) は activity を ack して
-		// failed bucket 行きを避ける (#1183)。reactor が居なければ reaction
-		// 自体作れないので skip = noop。transient (5xx / network) は従来通り
-		// retry サイクルに乗せる。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Like (actor unresolvable)",
-				"actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	// アクティビティ全体を Like として解釈し content/_misskey_reaction を取得する。
-	// object は URI 文字列の場合とネストされた Like オブジェクトの場合がある。
-	var like activitypub.Like
-	_ = json.Unmarshal(act.raw, &like)
-	if like.Object == "" {
-		// object が文字列の場合: Activity.Object は json:"-" でスキップされるため
-		// act.Object (RawMessage) から直接読む
-		uri, rerr := readObjectString(act.Object)
-		if rerr != nil {
-			return ErrUnsupportedActivity
-		}
-		like.Object = uri
-	}
-	reaction := like.Content
-	if like.MisskeyReaction != "" {
-		reaction = like.MisskeyReaction
-	}
-	// upstream like() は reaction を `_misskey_reaction ?? content ?? name` で解決
-	// する。一部の Mastodon-fork / Pleroma 系 EmojiReact は shortcode を `name` に
-	// 乗せるため、content/_misskey_reaction が無ければ name を fallback に使う
-	// (#1948-21)。like.Name は埋め込み Object の name (AS activity の name)。
-	if reaction == "" {
-		reaction = like.Name.String()
-	}
-	// reversi game session URI (`/games/{UUID}/{sessionID}`) は CherryPick
-	// 拡張の reaction 連合。純正 Misskey フロントは `reacted` を表示する UI を
-	// 持たないので mk-go では state 変化させず 202 ack だけ返す (#417 P5)。
-	// resolver.ResolveNote が 404 で失敗するのを避けるため Note Like より先に
-	// 弾く必要がある。
-	if corereversi.IsReversiGameSessionURI(like.Object) {
-		// reactor / reaction は note Like 経路で使われるので blank assign 不要。
-		// actor 解決は handleLike 冒頭で済ませているのでキャッシュ取込の
-		// 副作用はこの早期 return でも残る。
-		return nil
-	}
-	if p.reactionService == nil {
-		return ErrUnsupportedActivity
-	}
-	target, err := p.resolver.ResolveNote(like.Object)
-	if err != nil {
-		// permanent な target resolve 失敗 (followers-only / 削除済 等) は
-		// reaction record を作らず ack。retry しても永久に解消しない (#1183)。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Like (target unresolvable)",
-				"object", like.Object, "actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	// Like activity に乗ってきたカスタム絵文字メタデータを emoji table に
-	// upsert する。Misskey TS の apNoteService.extractEmojis(...) 相当
-	// (#459)。reactionService.Create 自体は emoji 不在でも reaction 文字列
-	// を保存できるので、upsert 失敗で Create を止める必要はなく、UI 表示
-	// 側の reactionEmojis 解決が FallbackReaction (heart) に落ちる程度。
-	if reactor.Host != nil && len(like.Tag) > 0 {
-		p.resolver.upsertEmojis(extractEmojiTags(like.Tag), *reactor.Host)
-	}
-	if _, err := p.reactionService.Create(reactor, target.ID, reaction); err != nil {
-		if errors.Is(err, corereaction.ErrAlreadyReacted) {
-			return nil
-		}
-		// reaction service が visibility 違反 (`ErrNoteNotVisible`) 等を
-		// 返すケースも permanent 扱いで skip (#1183)。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Like (reaction policy violation)",
-				"object", like.Object, "actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// handleAnnounce creates a renote pointing at the announced note.
-// signer は antenna hook の relay 判定にのみ使う。既存の viaRelay
-// (announcer が relay actor 本人か) は renote 抑止の判定で、そちらの意味は
-// 変えない — Mastodon 系リレーが転送した Announce は従来どおり renote を作る。
-func (p *Processor) handleAnnounce(act genericActivity, signer *model.User) error {
-	// bearcaps (bear:) object URI は未対応として skip (#1560、upstream
-	// ApInboxService.announce の 'skip: bearcaps url not supported')。
-	if isBearcapURI(act.Object) {
-		slog.Info("federation: skipping Announce with bearcaps object url", "actor", act.Actor)
-		return nil
-	}
-	announcer, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		// permanent な actor resolve 失敗は ack して skip (#1183、handleLike
-		// と同じ理由)。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Announce (actor unresolvable)",
-				"actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	targetURI, err := readObjectString(act.Object)
-	if err != nil {
-		return err
-	}
-	// relay 由来かどうかは **note を解決する前に** 判定する。ResolveNote は
-	// 解決と同時に DB へ永続化するので、後から判定したのでは「リレー投稿を
-	// DB に入れない」(#2332) が成立しない。
-	//
-	// announcer.Inbox / SharedInbox が registered relay の Inbox と一致した
-	// 場合のみ relay 由来と判定。
-	viaRelay := p.relayActorChecker != nil && p.relayActorChecker.IsRelayActor(announcer)
-
-	var target *model.Note
-	targetCreated := false
-	if viaRelay {
-		// リレー経由でしか観測しない投稿は Redis に置く。ephemeral store が
-		// 未配線 / 機能無効なら ResolveNoteEphemeral が通常経路に倒れる。
-		target, err = p.resolver.ResolveNoteEphemeral(targetURI)
-	} else {
-		// **新規取り込みかどうかは resolver から受け取る** (#2751)。取得 URI で
-		// 既存行を引く方式では、Announce の object が document id と別名の URL
-		// (`https://h/@user/1` に対し id は `https://h/notes/1`) のときに何度
-		// 取り込んでも「新規」に見え、既知の note を繰り返し antenna へ押し込める。
-		target, targetCreated, err = p.resolver.ResolveNoteWithCreated(targetURI)
-	}
-	if err != nil {
-		// permanent な target resolve 失敗 (削除済 note / followers-only) は
-		// Announce 記録を skip して ack (#1183)。
-		if isPermanentSkipError(err) {
-			slog.Info("federation: skipping Announce (target unresolvable)",
-				"object", targetURI, "actor", act.Actor, "err", err)
-			return nil
-		}
-		return err
-	}
-	// upstream Misskey #17308 (= 2026.5.0 fix / triage #1002): relay 由来の
-	// Announce は renote として保存せず、target note 自体を timeline stream に
-	// publish する。renote 表示にしてしまうと「relay actor がリノートした」と
-	// いう偽装表示になり、原投稿者からの直接配送と区別がつかなくなるため。
-	if viaRelay {
-		return p.publishRelayDeliveredNote(target, targetURI, act.Actor)
-	}
-	// upstream announceNote の 2 つの skip guard (#1560、ApInboxService.ts:350-361):
-	//   1. !isVisibleForMe(renote, actor): boost は public/home の note にしか
-	//      行えない。followers / specified の note を announce してくる activity は
-	//      不正なので drop する (mk-go は remote-remote の follow graph を持たない
-	//      ため、isVisibleForMe を「対象が public/home か」で近似する)。
-	//   2. activity.published < 対象 note の createdAt: announce が対象 note より
-	//      前に published されたと主張する malformed timestamp は drop する。
-	if target.Visibility != model.NoteVisibilityPublic && target.Visibility != model.NoteVisibilityHome {
-		slog.Info("federation: skipping Announce of non-public note", "object", targetURI, "actor", act.Actor, "visibility", target.Visibility)
-		return nil
-	}
-	// **ブースト対象そのものを antenna に載せる** (#2751)。hook に渡る renote 行は
-	// Text / CW を持たないので、キーワード指定または withFile の antenna は
-	// inbound Announce では原理的に 1 件もマッチしない (upstream は
-	// ApInboxService.ts:329 の resolveNote(target) 経由で target 自体を
-	// NoteCreateService へ通すので載る)。
-	//
-	// **upstream より後ろ、可視性 gate の直後に置く。** upstream は resolveNote の
-	// 時点で載せるが、mk-go の antenna 可視性判定 (corenote.CanSeeNote) は
-	// upstream の checkHitAntenna より緩く、followers note でも「viewer が
-	// mention されている / reply 先が viewer」なら通す (#2106 N27 の意図的緩和)。
-	// resolveNote の位置に置くと、crafted Announce を投げるだけで**配送されて
-	// いない followers-only note を対象ユーザーの antenna に載せられる**入口が
-	// できる。public/home に絞った後なら、その入口は開かない。
-	//
-	// **新規に取り込んだときだけ発火させる。** 無条件だと再ブーストのたびに古い
-	// note が antenna に湧く。upstream も既知の note では createNote を通らない
-	// ので載らない。
-	//
-	// **ローカル note は対象外。** 作成時に既に antenna を通っている。
-	// **canonical なローカル URI は `targetCreated` が既に弾く** —
-	// `extractLocalNoteID` (urls.NoteURI の前方一致) → `FindByID` hit で
-	// created=false になるため。その範囲では UserHost の条件は二重で、片方を
-	// 外してもテストは落ちない (等価変異)。ただし前方一致から外れるローカル URL
-	// は remote 扱いで fetch されうるので、条件としては残す。
-	//
-	// **リレー経由は #2743 の方針どおり外す。** 取りこぼしの範囲は
-	// docs/divergence.md に記載。`!viaRelay` はここに到達する時点で常に真
-	// (上の early return を通る) で、renote 側の hook と同じく将来 early return
-	// を消したときの保険。実際に止めているのは signer 側の判定。
-	if p.antennaHook != nil && targetCreated && !viaRelay && !p.isRelayDelivery(signer) &&
-		target.UserHost != nil && *target.UserHost != "" {
-		hydratedTarget, author := p.hydrateWithAuthor(target)
-		if author == nil {
-			// replica 遅延などで直前に入れた行の author を引けないことがある。
-			// 黙って落とすと「antenna に載らない」だけが残るのでログに出す。
-			slog.Warn("federation: announced target has no resolvable author, skipping antenna",
-				"noteURI", targetURI, "userId", target.UserID)
-		} else {
-			safeGoFedHook(func() { p.antennaHook.OnNoteCreated(hydratedTarget, author) })
-		}
-	}
-	if act.Published != "" {
-		if published, perr := time.Parse(time.RFC3339, act.Published); perr == nil {
-			if targetCreatedAt, terr := p.resolver.idGen.ParseTime(target.ID); terr == nil && published.Before(targetCreatedAt) {
-				slog.Info("federation: skipping Announce with malformed createdAt (published before target)",
-					"object", targetURI, "actor", act.Actor)
-				return nil
-			}
-		}
-	}
-	// announce 自身に id があれば URI として保存し、重複検出にも使う。
-	// upstream Misskey #17356 (= 2026.5.1 fix) は同 activity の重複処理 race を
-	// Redis 分散 lock で防ぐが、mk-go は single-instance 前提で DB unique 制約 +
-	// 本 FindByURI 経由の dedup によって race を防いでいる。multi-instance 構成
-	// (mk-go pod 複数台 load balance) を採用する場合は別途 Redis lock 化を検討
-	// (= triage #1009 / upstream #17356 close)。
-	if act.ID != "" {
-		// `note.uri` は varchar(512)。**Announce の id は renote の身元**で、
-		// 下の dedup (`FindByURI`) の鍵でもあるので切らずに拒否する (#2723)。
-		// 切ると別の行と衝突する。
-		//
-		// **DB を引く前に見る。** NUL 入りの値は `FindByURI` の SELECT 自体が
-		// 22021 で落ちる。
-		//
-		// **この error は上位に surface する** — `dispatchActivity` がそのまま返すので
-		// inbox job は retry を使い切って dead になる (既定 8 回)。そもそも保存
-		// できない activity なので結末としては正しい。
-		//
-		// **ここでの利得は「早く落とす」ことではない。** gate は `ResolveNote` の後
-		// なので、対象 note の fetch と永続化は既に済んでいる。得られるのは、原因が
-		// 22001 ではなく明示的な拒否として残ること。
-		//
-		// **NUL も届く。** `url.Parse` は制御文字を弾くが、**fragment だけは例外**で
-		// `https://h/a#<NUL>` は parse を通る (実測)。`authorizeActor` の host 検査も
-		// `Hostname()` を見るだけなので抜ける。「NUL は来ないから長さだけ見ればいい」に
-		// 縮めないこと。
-		if !fitsColumn(act.ID, noteURIMaxRunes) {
-			slog.Warn("federation: rejecting Announce whose id does not fit note.uri",
-				"id", truncateRunes(act.ID, noteURIMaxRunes))
-			return ErrInvalidNote
-		}
-		switch _, err := p.noteRepo.FindByURI(act.ID); {
-		case err == nil:
-			// 既に取り込み済み。
-			return nil
-		case !repository.IsNotFound(err):
-			// **障害を「重複でない」に倒さない** (#3116)。倒すと DB 障害のあいだ
-			// 同じ Announce が二重の renote になる。
-			return fmt.Errorf("announce dedup: %w", err)
-		}
-	}
-	// 遅延配送 Announce では activity.published を採用して timeline 並びを
-	// origin と揃える (#940)。空 / parse 不可なら nowFn にフォールバック。
-	now := parseAPPublishedTime(act.Published, nowFn())
-	// upstream announceNote は activity の to/cc から renote の visibility を決める。
-	// 旧実装は public 固定で、home renote 由来の Announce (Misskey renderAnnounce は
-	// home を to=[followers], cc=[Public] で送る) が public 化され public TL / RSS /
-	// 連合配送に乗っていた (#1826)。inbound Note と同じ deriveVisibility で揃える
-	// (Misskey renderAnnounce の public=to[Public] / home=to[followers]+cc[Public] /
-	// followers=to[followers] shape を正しく判定する)。実装が送らない exotic shape
-	// (cc のみ Public 等) での upstream parseAudience との差、および specified renote の
-	// visibleUsers / 通知の扱いは #1864 で別途対応する。
-	renoteVisibility := deriveVisibility(announcer, decodeAudience(act.To), decodeAudience(act.CC))
-	// upstream NoteCreateService は renote の visibility を対象 note 以下に clamp する
-	// (home note は public で renote できず home に落ちる)。target は上の gate で
-	// public/home に限定済みなので、home target に対する public boost を home に
-	// 落とす。これが無いと crafted Announce(to=[Public], object=home note) で home
-	// note を global timeline に leak させられる。
-	if target.Visibility == model.NoteVisibilityHome && renoteVisibility == model.NoteVisibilityPublic {
-		renoteVisibility = model.NoteVisibilityHome
-	}
-	renote := &model.Note{
-		ID:         p.resolver.idGen.Generate(now),
-		UserID:     announcer.ID,
-		UserHost:   announcer.Host,
-		RenoteID:   &target.ID,
-		Visibility: renoteVisibility,
-	}
-	if act.ID != "" {
-		// 上の gate で列に入ることを確かめてある。
-		uri := act.ID
-		renote.URI = &uri
-	}
-	renote.RenoteUserID = &target.UserID
-	renote.RenoteUserHost = target.UserHost
-	if err := p.noteRepo.Create(renote); err != nil {
-		return err
-	}
-	// upstream NoteCreateService の incRenoteCount 条件
-	// (`data.renote.userId !== user.id && !user.isBot`) を inbound Announce
-	// にも適用する。自己 boost と bot の boost は加算しない (#2283)。
-	// Undo(Announce) 側の減算も同条件にして対称性を保つこと。
-	if target.UserID != announcer.ID && !announcer.IsBot {
-		_ = p.noteRepo.IncrementCount(target.ID, "renoteCount", 1)
-	}
-	hydrated := hydrateNoteForFanout(p.noteRepo, renote)
-	// hook はベストエフォートで safeGoFedHook 経由で非同期発火する (#1158)。
-	// handleCreate (#569) と同じく Redis LPUSH / publish 待ちで inbox worker
-	// drain を block しないことが目的。順序保証は handleCreate と同様に各 hook
-	// 側の冪等性で吸収する。closure capture する `hydrated` / `announcer` /
-	// `target` は handleAnnounce 内 local 変数で関数 return 後も生存するため
-	// goroutine 上の参照は安全 (race なし)。
-	if p.fanoutHook != nil {
-		safeGoFedHook(func() { p.fanoutHook.OnNoteCreated(hydrated, announcer) })
-	}
-	// **リレー経由では発火させない (#2743)。** Misskey 系リレー (announcer が
-	// relay actor 本人) は上の `if viaRelay` で publishRelayDeliveredNote へ
-	// 抜けるので、ここの `!viaRelay` は実質常に true — early return を将来
-	// 消したときの保険として残してある。実際にここで止めているのは Mastodon
-	// 系リレーが他人の Announce を転送する形で、それは signer 側で判定する。
-	//
-	// **signer が nil のときは素通しする** (isRelayDelivery の fail-safe)。
-	// production の inbox は必ず signer を積むので到達しない。
-	//
-	// **ここで渡すのは renote 行。** renote は text を持たないので、キーワード
-	// 指定のある antenna はこの行では当たらない。ブースト対象そのものは上の
-	// #2751 の block が別途渡している (新規取り込み時のみ)。
-	if p.antennaHook != nil && !viaRelay && !p.isRelayDelivery(signer) {
-		safeGoFedHook(func() { p.antennaHook.OnNoteCreated(hydrated, announcer) })
-	}
-	if p.notificationHook != nil {
-		// remote user が local note を renote した時に元投稿者へ通知を出す
-		// (#415)。target が renoteTarget。reply 通知は Announce では発生
-		// しないので nil を渡す。
-		safeGoFedHook(func() {
-			p.notificationHook.OnNoteCreated(hydrated, announcer, nil, target)
-		})
-	}
-	// chart hook 発火 (#1156)。dedup チェック (上部の `act.ID != ""` ゲート付き
-	// FindByURI) を通り抜けて noteRepo.Create(renote) も成功した時点で「この
-	// 経路では」新規作成と確定するので、created flag は持たない。
-	//
-	// 例外として `act.ID` が空 (= activity id を持たない Announce) の場合は
-	// 上の dedup 自体が skip されるため、同じ Boost が複数回届くと renote 行も
-	// 毎回新規に生成され chart も毎回 fire する。これは本 PR で導入した挙動
-	// ではなく既存の handleAnnounce 設計に従ったもの。activity id 無しの
-	// Announce を出す実装は実運用ではほぼ無いので影響軽微だが、`act.ID` の
-	// dedup 強化は別 issue でフォロー (= renote 重複そのものの解消が主題)。
-	if p.noteChartHook != nil {
-		safeGoFedHook(func() { p.noteChartHook.OnNoteCreated(hydrated) })
-	}
-	return nil
-}
-
-// publishRelayDeliveredNote handles a relay-delivered Announce (= no renote
-// creation, just publish the target note to timeline streams). 仕様詳細は
-// handleAnnounce 内の relay-delivered コメント参照 (upstream #17308 / triage
-// #1002)。
-//
-// target の author を最も信頼できる relation 経由で解決する: まず
-// hydrateNoteForFanout で User relation を pre-load し、それが空なら
-// userRepo.FindByID(target.UserID) に fallback する。author が解決できない
-// 場合 (= target.UserID も無い等の broken state) は fanoutHook を呼ばずに
-// 戻る (safe degrade)。
-//
-// renoteCount は increment しない (= target は新規 renote 対象ではない)、
-// notificationHook も呼ばない (= 原投稿者には relay 経由配送の通知を出さない、
-// 上流 / 他 instance から直接届く Create で通知済みの可能性が高いため二重通知
-// 回避)。
-func (p *Processor) publishRelayDeliveredNote(target *model.Note, targetURI, relayActor string) error {
-	hydrated, author := p.hydrateWithAuthor(target)
-	if author == nil {
-		slog.Warn("federation: relay-delivered note has no resolvable author, skipping fanout",
-			"relay", relayActor, "noteURI", targetURI, "userId", target.UserID)
-		return nil
-	}
-	if p.fanoutHook != nil {
-		safeGoFedHook(func() { p.fanoutHook.OnNoteCreated(hydrated, author) })
-	}
-	// **antennaHook はここでは発火させない (#2743)。** 理由は AntennaHook の
-	// doc を参照。handleCreate / handleAnnounce との差はこの 1 点だけなので、
-	// 「揃っていない」と見て足さないこと。
-	slog.Debug("federation: relay-delivered note published",
-		"relay", relayActor, "noteURI", targetURI, "authorId", author.ID)
-	return nil
-}
-
-// hydrateWithAuthor pre-loads a note's relations for hook delivery and resolves
-// its author, falling back to userRepo when the User relation is empty.
-// author が解決できない (broken state) 場合は nil を返すので、呼び出し側は
-// hook を呼ばずに戻ること。
-func (p *Processor) hydrateWithAuthor(n *model.Note) (*model.Note, *model.User) {
-	hydrated := hydrateNoteForFanout(p.noteRepo, n)
-	author := hydrated.User
-	if author == nil && p.userRepo != nil && n.UserID != "" {
-		if u, err := p.userRepo.FindByID(n.UserID); err == nil {
-			author = u
-		}
-	}
-	return hydrated, author
-}
-
-// isRelayDelivery reports whether the activity was forwarded by a subscribed
-// relay, based on the verified HTTP signer (#2338).
-//
-// signer が nil (署名なし経路 / verifier 未配線) なら false。判定できない
-// ときはリレー扱いしない = 従来どおり DB に保存する fail-safe。
-func (p *Processor) isRelayDelivery(signer *model.User) bool {
-	return signer != nil && p.relayActorChecker != nil && p.relayActorChecker.IsRelayActor(signer)
-}
-
-// resolveCreateActor resolves the author of an inbound Create, keeping
-// relay-forwarded authors out of the database (#2338).
-func (p *Processor) resolveCreateActor(uri string, viaRelay bool) (*model.User, error) {
-	if viaRelay {
-		return p.resolver.ResolveActorEphemeral(uri)
-	}
-	return p.resolver.ResolveActor(uri)
-}
-
-// ingestCreateNote persists an inbound Create's note, diverting relay-forwarded
-// ones to the ephemeral store (#2338).
-func (p *Processor) ingestCreateNote(object []byte, deliveringActorURI string, viaRelay bool) (*model.Note, bool, error) {
-	if viaRelay {
-		return p.resolver.IngestNoteEphemeral(object, deliveringActorURI)
-	}
-	return p.resolver.IngestNoteWithCreated(object, deliveringActorURI)
-}
-
-// handleDelete removes a remote note (or actor) referenced by a Delete activity.
-func (p *Processor) handleDelete(act genericActivity) error {
-	targetURI, err := readObjectString(act.Object)
-	if err != nil {
-		return err
-	}
-	// こちらの引用が受けていた承認の取り消し (FEP-044f、#3234 段階 4)。承認の型か、
-	// 型の分からない id のときだけ照合する。型の付いたノート (Tombstone / Note) と、
-	// actor 自身の Delete (アカウント削除。object が actor の id) では引かない
-	// (Mastodon も actor の削除を先に見る)。
-	if p.quoteAnswers != nil && targetURI != act.Actor && mayBeQuoteAuthorization(act.Object) {
-		handled, err := p.quoteAnswers.HandleRevocation(act.Actor, targetURI)
-		if handled || err != nil {
-			return err
-		}
-	}
-	// upstream Misskey #17294 (= 2026.5.0 fix / triage #1001): object が Actor
-	// (self-delete または object.type が Actor 系) で、その actor がローカルに
-	// 存在しないなら無視する。これをやらないと ResolveActor が remote fetch を
-	// 試みて 404 で失敗 → queue retry に乗り続ける挙動になる (= "存在しない
-	// actor の delete を受け取り続けて queue が膨れる" 既存 bug)。
-	if isActorDelete(act.Actor, targetURI, act.Object) {
-		if _, ferr := p.userRepo.FindByURI(targetURI); ferr != nil {
-			// **not-found だけ ack する** (#3116)。存在しない actor の delete は
-			// retry しても結果が変わらないので、ここで止めないと queue が膨れる
-			// (上のコメントの元の動機)。
-			//
-			// **DB 障害は伝播させる。** 以前は「他の DB error も ignore して
-			// retry を避ける方がマシ」と書いて**種別を見ずに ack** していたが、
-			// それだと一時的な接続断だけでリモートのアカウント削除を取りこぼす。
-			// #3115 が Accept / Reject で確立した原則と正面から衝突していた。
-			if repository.IsNotFound(ferr) {
-				return nil
-			}
-			return fmt.Errorf("actor delete: lookup actor: %w", ferr)
-		}
-		// 存在する actor の delete は従来通り resolve に進む。
-	}
-	author, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	// Actor 自身の Delete (アカウント削除) は tombstone + cascade purge する
-	// (#1220, upstream ApInboxService.deleteActor 相当)。
-	if author.URI != nil && *author.URI == targetURI {
-		return p.handleActorDelete(author)
-	}
-	note, err := p.noteRepo.FindByURI(targetURI)
-	if err != nil {
-		// 既に存在しないなら成功扱い。**障害は伝播させる** (#3116) —
-		// ack すると job が成功扱いになって retry されず、**削除されたはずの
-		// ノートがこちらに残り続ける**。
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("delete note: lookup note: %w", err)
-	}
-	if note.UserID != author.ID {
-		return errors.New("delete from non-author")
-	}
-	if p.noteDeleteSvc != nil {
-		return p.noteDeleteSvc.Delete(author, note.ID)
-	}
-	return p.noteRepo.Delete(note)
-}
-
-// handleActorDelete processes a remote actor's self-delete (account deletion):
-// the user is tombstoned (isDeleted=true) and a cascade purge of their notes /
-// drive files / following is enqueued. Mirrors upstream
-// ApInboxService.deleteActor.
-//
-// Local users are never deleted via inbound AP (loopback / spoof guard), and
-// an already-deleted user is a no-op so AP retries stay idempotent. Marking
-// runs before enqueue (upstream order); a purge-enqueue failure is logged but
-// not retried (the tombstone is already committed, and re-running would skip on
-// the idempotency guard anyway).
-func (p *Processor) handleActorDelete(actor *model.User) error {
-	if actor.IsLocal() {
-		return nil
-	}
-	if actor.IsDeleted {
-		return nil
-	}
-	if err := p.userRepo.UpdateUser(actor.ID, map[string]any{"isDeleted": true}); err != nil {
-		return fmt.Errorf("actor delete: mark deleted: %w", err)
-	}
-	if p.accountDeleteEnqueuer != nil {
-		// #2230: inbound Delete(actor) は remote user なので Soft=true で行を tombstone として
-		// 残す。物理削除すると再連合 (resolve) でアカウントが復活し得る (upstream 同様)。
-		if err := p.accountDeleteEnqueuer.EnqueueDeleteAccount(queue.DeleteAccountPayload{UserID: actor.ID, Soft: true}); err != nil {
-			slog.Warn("actor delete: enqueue cascade purge failed", "userId", actor.ID, "err", err)
-		}
-	}
-	return nil
-}
-
-// isActorDelete reports whether the given Delete activity targets an actor.
-// Heuristics: (a) actor URI と object URI が一致するなら self-delete、
-// (b) object が embedded 形式で type が Actor 系 (Person / Service / Application
-// / Group / Organization) なら actor delete とみなす。
-// upstream Misskey の isActor() / getApId() の組合せに相当する判定。
-func isActorDelete(actorURI, targetURI string, object json.RawMessage) bool {
-	if actorURI != "" && actorURI == targetURI {
-		return true
-	}
-	switch strings.ToLower(peekObjectType(object)) {
-	case "person", "service", "application", "group", "organization":
-		return true
-	}
-	return false
-}
-
-// handleUpdate refreshes a remote actor's stored profile fields, or applies
-// an inbound Update Note activity from a federated peer.
-//
-// Misskey 本家にはノート編集 API が無いが、Mastodon 系の Update Note は受信
-// するだけ受信して反映する (`Resolver.UpdateRemoteNote` 経由)。それ以外の
-// type (Question / Article 等) は no-op。
-// Reversi Game 型の Update (CherryPick 拡張) はこの中で分岐する。
-func (p *Processor) handleUpdate(act genericActivity) error {
-	// 先に object の type を覗いて Note / Person / Game の判定を行う。
-	objectType := peekObjectType(act.Object)
-	if strings.EqualFold(objectType, "game") {
-		// Game オブジェクトは reversi 拡張専用。未ワイヤなら skip。
-		if !p.reversiReady() {
-			return nil
-		}
-		if err := p.handleReversiUpdate(act); err != nil {
-			if errors.Is(err, ErrNotReversiGame) {
-				return nil
-			}
-			return err
-		}
-		return nil
-	}
-	if strings.EqualFold(objectType, "note") {
-		// act.Actor を渡して note 著者との一致を検証させる (#1819、Question 経路と対称)。
-		_, err := p.resolver.UpdateRemoteNote(act.Object, act.Actor)
-		// ErrInvalidNote は受信側の不備として skip 扱い (200 を返す)。
-		if errors.Is(err, ErrInvalidNote) {
-			return nil
-		}
-		return err
-	}
-	if strings.EqualFold(objectType, "question") {
-		// inbound Update(Question): リモート poll の vote 数を refresh する
-		// (upstream ApInboxService.update -> apQuestionService.updateQuestion、#1779)。
-		return p.resolver.UpdateRemoteQuestion(act.Object, act.Actor)
-	}
-
-	// object が単なる URI なら fetch、object 内に Person があればそれを使う
-	var person activitypub.Person
-	if err := json.Unmarshal(act.Object, &person); err != nil || person.ID == "" {
-		// object が文字列 URI のケース
-		uri, rerr := readObjectString(act.Object)
-		if rerr != nil {
-			return rerr
-		}
-		person.ID = uri
-	}
-	if person.Type != "" && !strings.EqualFold(person.Type.String(), "person") {
-		// Note / Question / Game は上で dispatch 済。残り (Article 等) は未対応。
-		return nil
-	}
-	// upstream ApInboxService.update は配送 actor 本人 (actor.uri) のみを再取得・
-	// 更新する。object の id が配送 actor と異なる Update(Person) は、別 actor の
-	// TTL-bypass 強制再取得 (amplification) を誘発するため拒否する (Note/Question
-	// 経路と対称、#1848)。act.Actor は authorizeActor で署名者と一致を検証済み。
-	if act.Actor != "" && person.ID != act.Actor {
-		return nil
-	}
-	if _, err := p.userRepo.FindByURI(person.ID); err != nil {
-		// 未取得のリモートユーザーなら無視 (次回 follow/inbox などで取り込まれる)。
-		// **障害は伝播させる** (#3116) — ack するとプロフィールの更新が消える。
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("update person: lookup user: %w", err)
-	}
-	// upstream ApInboxService.update -> ApPersonService.updatePerson は actor を
-	// 強制再取得して name だけでなく avatar/banner/bio/fields/isBot/isCat/
-	// isLocked/movedTo/alsoKnownAs/emojis 等の全プロフィールを更新する (#1560)。
-	// mk-go も ForceResolveActor (TTL バイパスで refreshActor を回す既存経路、
-	// handleMove と同じ) を呼んで full refresh する。旧実装は name のみ反映して
-	// いた。fetch 失敗時は refreshActor が silent に既存値を維持する。
-	if _, err := p.resolver.ForceResolveActor(person.ID); err != nil {
-		return err
-	}
-	return nil
-}
-
-// peekObjectType reads only the "type" field from a JSON object body. パース
-// 不能・object でない・type フィールド無しの場合は空文字を返す。
-func peekObjectType(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var obj struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return ""
-	}
-	return obj.Type
-}
-
-// objectAPID extracts the AP id of an activity object whether it is encoded as
-// a bare string URI or as an object with an "id" field (upstream getApId 相当)。
-func objectAPID(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	// readObjectString と同じ理由で正規化する (#2662)。
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return trimWHATWGURL(s)
-	}
-	var obj struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(raw, &obj); err == nil {
-		return trimWHATWGURL(obj.ID)
-	}
-	return ""
-}
-
-// isBearcapURI reports whether the object id is a bearcaps (`bear:`) URI.
-// upstream create()/announce() は bearcaps を未対応として skip する
-// (ApInboxService.ts:401,291、#1560)。mk-go の resolver も bear: を扱えないため
-// fetch で error にする前に cleanly skip する。
-func isBearcapURI(raw json.RawMessage) bool {
-	return strings.HasPrefix(objectAPID(raw), "bear:")
-}
-
-// handleReject undoes a Follow that was rejected by the followee.
-//
-// 想定: 自分 (ローカル follower) が remote followee に対して Follow を送ったが
-// 拒否された場合に呼ばれる。inner.Follow.actor がローカル follower、object が
-// remote followee。inner.id が自ホストの follow-relay URI で、かつ送信元
-// actor がその relay 自身なら relay 関連として RelayStatusMarker.MarkRejected
-// を呼ぶ。
-func (p *Processor) handleReject(act genericActivity) error {
-	if p.quoteAnswers != nil {
-		if reqURI := quoteAnswerRequestURI(act.Object, p.localBaseURL); reqURI != "" {
-			return p.quoteAnswers.HandleAnswer(act.Actor, reqURI, false, "")
-		}
-	}
-	var inner genericActivity
-	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
-	// `inner.actor` が embedded object のケースに**到達できない** (#2662)。
-	if err := unmarshalIgnoringTypeErrors(act.Object, &inner); err != nil {
-		return fmt.Errorf("invalid reject object: %w", err)
-	}
-	// inner.actor が embedded object のケースも救済する (#999 / upstream #17340)。
-	inner.normalizeActor(act.Object)
-	// chat room invitation の Reject (remote が我々の room 招待を辞退) は
-	// pending invitation を削除する (#1203)。
-	if strings.EqualFold(inner.Type, "invite") {
-		return p.handleChatRoomReject(act, inner)
-	}
-	if !strings.EqualFold(inner.Type, "follow") {
-		return ErrUnsupportedActivity
-	}
-	if relayID := matchFollowRelayID(inner.ID, p.localBaseURL); relayID != "" && p.relayMarker != nil {
-		// Accept 側と同じ理由で送信元を検証する。こちらを通すと稼働中の
-		// relay 配送を任意の actor が無言で止められる。
-		allowed, err := p.relayStatusChangeAllowed(act.Actor, relayID, "Reject")
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return nil
-		}
-		return p.relayMarker.MarkRejected(context.Background(), relayID)
-	}
-	followee, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	followerURI, err := readActorString(inner)
-	if err != nil {
-		return err
-	}
-	// ローカルユーザーは user.uri が NULL なので、URI から ID を読んで引く
-	// (userFromAPID)。これをやらないと FindByURI が fail して reject が silent
-	// drop されてしまい、ローカル側の FollowRequest が消えずに永遠に pending の
-	// ままになる。
-	follower, err := p.userFromAPID(followerURI)
-	if err != nil {
-		// **Accept と同じ扱い** (#3115)。not-found は retry しても変わらないので
-		// ack するが、**DB 障害を ack すると job が成功扱いになって retry されず**、
-		// 直上のコメントが書いている「FollowRequest が永遠に pending」がそのまま
-		// 起きる。Accept と Reject は同じ決定の裏表なので、片方だけ直さない。
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	// Reject されるのはこちらが送った Follow なので、follower はローカルの利用者の
-	// はず。本家 rejectFollow と同じく、ローカルでなければ何もしない
-	// (`skip: follower is not a local user`)。
-	if !follower.IsLocal() {
-		return nil
-	}
-	// 既存のフォローがあれば解除する。pending な follow request も同様。
-	// #2106 N11: upstream remoteReject は AP 配送を伴わない内部削除なので、rejecter へ
-	// 余計な Undo(Follow) を逆配送しない (Following 行が残るエッジケースでの連合ノイズ /
-	// 相手の重複処理を防ぐ)。申請だけが残っていた場合も同じで、unfollow の通知
-	// (main stream と Webhook) は本家と同じく 1 回だけ出す (#3330)。
-	return p.followingService.RemoteReject(follower.ID, followee.ID)
-}
-
-// handleBlock processes an inbound Block activity. リモートユーザーがローカル
-// ユーザーをブロックした場合にブロック関係を作成する。
-func (p *Processor) handleBlock(act genericActivity) error {
-	if p.blockingService == nil {
-		return ErrUnsupportedActivity
-	}
-	blocker, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	blockeeURI, err := readObjectString(act.Object)
-	if err != nil {
-		return err
-	}
-	// 本家 block() は getUserFromApId で引き、見つからなければ skip (#3330)。
-	// ローカルユーザーは user.uri が NULL なので、URI から ID を読んで引く。
-	blockee, err := p.userFromAPID(blockeeURI)
-	if err != nil {
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("block: lookup blockee: %w", err)
-	}
-	// ローカルユーザーのみ対象
-	if blockee.Host != nil {
-		return nil
-	}
-	if _, err := p.blockingService.Block(blocker.ID, blockee.ID); err != nil {
-		if errors.Is(err, coreblocking.ErrAlreadyBlocking) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// handleUndoBlock removes a blocking relationship created by a previous Block.
-func (p *Processor) handleUndoBlock(act genericActivity, inner genericActivity) error {
-	if p.blockingService == nil {
-		return ErrUnsupportedActivity
-	}
-	blocker, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	blockeeURI, err := readObjectString(inner.Object)
-	if err != nil {
-		return err
-	}
-	// 本家 undoBlock() も getUserFromApId で引き、見つからなければ skip (#3330)。
-	blockee, err := p.userFromAPID(blockeeURI)
-	if err != nil {
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("undo block: lookup blockee: %w", err)
-	}
-	// #2106 L30: upstream undoBlock は blockee が remote (host != null) なら skip する
-	// (handleBlock の gate と対称)。
-	if blockee.Host != nil {
-		return nil
-	}
-	if err := p.blockingService.Unblock(blocker.ID, blockee.ID); err != nil {
-		if errors.Is(err, coreblocking.ErrNotBlocking) {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// abuseReportCommentMaxRunes は `abuse_user_report.comment` の varchar(2048)
-// (migration/000013_abuse_report.up.sql)。
-const abuseReportCommentMaxRunes = 2048
-
-// handleFlag processes an inbound Flag (abuse report) activity. リモートインスタンスからの
-// 通報を保存する。
-func (p *Processor) handleFlag(act genericActivity) error {
-	if p.abuseReportRepo == nil {
-		return ErrUnsupportedActivity
-	}
-	reporter, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	// object から URI 配列を取得する (ユーザーや Note の URI)。upstream は
-	// `getApIds(activity.object)` なので、単一値・配列に加えて
-	// `{"id": "..."}` の object 形式も受ける (ApInboxService.ts:560)。旧実装は
-	// string と []string しか受けず、object 形式の Flag を落としていた。
-	var uris activitypub.APIDList
-	if err := json.Unmarshal(act.Object, &uris); err != nil {
-		return errors.New("flag: cannot parse object")
-	}
-	if len(uris) == 0 {
-		return errors.New("flag: empty object")
-	}
-	// upstream flag() は object URI を config.url + '/users/' prefix の LOCAL
-	// user URI に絞ってから user id に map し users[0] を報告対象にする
-	// (#1560、ApInboxService.ts:560-577)。mk-go も flagTargetUserID で
-	// `{baseURL}/users/...` 形式のローカル URI だけを対象にし、本家と同じく最後の
-	// 段を ID として引く (`/users/{id}/followers` は誰にも当たらない、#3330)。旧実装は
-	// 任意 host の user/note URI を受け、note 作者 (リモート可) まで fallback
-	// して別 instance のユーザーを誤って報告し得た。
-	target, err := p.flagTargetUser(uris)
-	if err != nil {
-		return err
-	}
-	if target == nil {
-		// ローカル user を 1 件も解決できない Flag は ack して drop する
-		// (リモート対象や不正 URI。retry しても解決しないため error にしない)。
-		slog.Info("federation: skipping Flag with no resolvable local target", "actor", act.Actor)
-		return nil
-	}
-	// contentフィールドを取得。upstream は comment に flagged URI 一覧を
-	// 付与する (`${content}\n${JSON.stringify(uris, null, 2)}`、#1560)。
-	// **mk-go は pretty print しない** (upstream は 2 space indent)。通報の
-	// 本文だけの差で、既存の通報との一貫性を優先して compact のままにする
-	// (docs/divergence.md 3-3)。
-	var content struct {
-		Content string `json:"content"`
-	}
-	_ = json.Unmarshal(act.raw, &content)
-	urisJSON, _ := json.Marshal(uris)
-	// `abuse_user_report.comment` は varchar(2048) (upstream の MiAbuseUserReport
-	// も同じ)。**通報本文も URI 一覧も相手が自由に決められる**ので、溢れると
-	// Create が 22001 で落ちて error を返し、**その inbox job が retry を
-	// 使い切って dead になる = 通報が届かない**。通報本文は読むための文字列
-	// なので切って NUL を落とす (#2726)。
-	//
-	// **URI 一覧を先に置かない。** 切るのは末尾なので、本文が長いと URI が
-	// 落ちる。upstream の並び (content → uris) を保ったまま切ると、少なくとも
-	// 通報の趣旨は残る。
-	comment := remoteText(content.Content+"\n"+string(urisJSON), abuseReportCommentMaxRunes)
-	report := &model.AbuseUserReport{
-		ID:           p.abuseIDGen.Generate(nowFn()),
-		TargetUserID: target.ID,
-		ReporterID:   reporter.ID,
-		Comment:      comment,
-		// 対象の行は flagTargetUser で引いたものをそのまま使う。以前は ID から
-		// 引き直し、その失敗を握り潰して TargetUserHost を nil (= ローカル扱い)
-		// のまま保存しえた (#3330)。
-		TargetUserHost: target.Host,
-		ReporterHost:   reporter.Host,
-	}
-	if err := p.abuseReportRepo.Create(report); err != nil {
-		slog.Warn("failed to create abuse report from flag activity", "err", err)
-		return err
-	}
-	// 通知 (通知欄 / admin stream / abuseReport system webhook) はローカルの
-	// 通報と同じ処理に任せる (#3256)。
-	if p.abuseCreated != nil {
-		p.abuseCreated.NotifyCreated(context.Background(), report, reporter, target)
-	}
-	return nil
-}
-
-// flagTargetUser picks the user an inbound Flag reports among its object
-// URIs, the way upstream ApInboxService.flag does: among the existing users
-// named by the `{url}/users/...` URIs (flagTargetUserID), the one with the
-// smallest ID. It returns nil when none of them exists.
-//
-// **本家は `findBy({ id: In(userIds) })` の users[0] で、ORDER BY を持たない。**
-// 返る順は PostgreSQL の plan 次第で、利用者の表が大きく ID が少数なら主キーの
-// Index Scan (ID の昇順) になり、表が小さいか ID が多いと Seq Scan / Bitmap Heap
-// Scan (物理的な並び) になる。mk-go は普段の plan と同じ ID の昇順に固定する
-// (URI の並び順の先頭ではない、#3330)。本家と同じく host と isDeleted では
-// 絞らない。
-//
-// 引けなかったことを「誰も居ない」に潰さない (#3121)。潰すと job が ack されて
-// retry されず、通報が届かない。
-func (p *Processor) flagTargetUser(uris []string) (*model.User, error) {
-	var ids []string
-	seen := make(map[string]struct{}, len(uris))
-	for _, uri := range uris {
-		id := p.resolver.flagTargetUserID(uri)
-		if id == "" {
-			continue
-		}
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	users, err := p.userRepo.FindManyByIDs(ids)
-	if err != nil {
-		return nil, fmt.Errorf("flag: lookup target users: %w", err)
-	}
-	var target *model.User
-	for _, u := range users {
-		if u != nil && (target == nil || u.ID < target.ID) {
-			target = u
-		}
-	}
-	return target, nil
-}
-
-// handleMove processes an inbound Move activity. アカウント移行通知を受けて
-// リモートactorのプロフィールを強制再取得する。TTLキャッシュをバイパスして
-// movedTo/alsoKnownAsの最新値を反映する。
-func (p *Processor) handleMove(act genericActivity) error {
-	// upstream move() は activity.target を getApHrefNullable で読み、無い/不正なら
-	// 'skip: invalid activity target' で早期 return する。target が無い Move で
-	// ForceResolveActor (TTL-bypass の強制 refetch) を発火させない (#1948-21)。
-	// getApHrefNullable は string か object.href を読む (id ではない) ので、同じ
-	// 受理集合になるよう readApHref を使う。
-	var t struct {
-		Target json.RawMessage `json:"target"`
-	}
-	if len(act.raw) > 0 {
-		_ = json.Unmarshal(act.raw, &t)
-	}
-	if readApHref(t.Target) == "" {
-		return nil // skip: invalid activity target
-	}
-	if _, err := p.resolver.ForceResolveActor(act.Actor); err != nil {
-		return err
-	}
-	return nil
-}
-
-// handleAdd processes an inbound Add activity. actorのfeaturedコレクションへの
-// ノートピン留めを処理する。
-func (p *Processor) handleAdd(act genericActivity) error {
-	if p.pinningRepo == nil {
-		return ErrUnsupportedActivity
-	}
-	actor, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	// targetがactorのfeaturedコレクションか確認
-	var target struct {
-		Target string `json:"target"`
-	}
-	_ = json.Unmarshal(act.raw, &target)
-	if actor.Featured == nil || target.Target != *actor.Featured {
-		return nil
-	}
-	noteURI, err := readObjectString(act.Object)
-	if err != nil {
-		return err
-	}
-	// ローカルノートならDBから検索、リモートならResolveNoteでフェッチ+取り込み
-	note, err := p.noteRepo.FindByURI(noteURI)
-	if err != nil {
-		note, err = p.resolver.ResolveNote(noteURI)
-		if err != nil {
-			return err
-		}
-	}
-	// **ピン留めできるのは自分の投稿だけ。** これを見ないと、署名付きの
-	// リモート actor が**他人のノートを自分のプロフィールに並べられる**。
-	// ローカルの非公開ノートも対象になりうる (`ResolveNote` はローカル URI を
-	// 可視性を見ずに引く) ので、`users/show` の `pinnedNoteIds` 経由でその ID が
-	// 未認証の相手に出る。
-	//
-	// **同じ規則が `featured.go` に既にある** (pull 側の featured 取り込み)。
-	// こちらの push 側 (`Add`) だけが取り残されていた。upstream も
-	// `NotePiningService.addPinned` が `findOneBy({id, userId: user.id})` で
-	// 弾いている。
-	if note.UserID != actor.ID {
-		return nil
-	}
-	// **件数にも上限を置く。** `Add` は署名さえ通れば何度でも送れるので、
-	// 上限が無いと `user_note_pining` を無制限に増やせる。しかも
-	// `internal/api/users/handler.go` の設計メモ (#1489) は `pinnedNoteIds` を
-	// 絞らない理由として「pinning は per-user 上限が厳しい (= 数件) ので
-	// mass enumeration リスクは低い」と書いており、**その前提がここで壊れる**。
-	//
-	// 値は pull 側の `featuredPinLimit` と同じ。片方だけ緩いと、同じ
-	// リモート actor が経路によって違う上限を受けることになる。
-	//
-	// **上限に当たったら古い方を外して入れ替える。捨てない。** upstream は
-	// `Remove(A)` と `Add(B)` を**別々の deliver job** で配る
-	// (`NotePiningService.deliverPinnedChange`)。こちらの inbox は並列に
-	// 処理するので `Add(B)` が先に着くことがあり、そこで捨てると
-	// (`return nil` は inbox job を成功扱いにするので再試行されない) B は
-	// **次の actor 更新まで現れない** (既定 TTL 24 時間)。
-	//
-	// **再試行にはしない。** upstream は throw して job を再送させるが、
-	// mk-go でそれをやると、上限を超える `Add` を投げ続けるだけで job が
-	// 8 倍に膨らむ — この上限が防いでいる負荷を別の形で呼び込む。入れ替えなら
-	// 行数は上限に収まったまま、順序の入れ替わりも拾える。
-	//
-	// **数えられなかったら errで返す。** ここで握り潰すと上限が効かないまま
-	// 進むし、`nil` で捨てると inbox job が「処理済み」として再試行しない。
-	// error なら再試行されるので、DB 障害が上限の無効化にも取りこぼしにも
-	// 化けない (#2792 と同じ判断)。
-	// **既にピン留め済みなら何もしない。** 再送や順序の入れ替わりで同じ
-	// `Add` が二度届く。上限判定より前に置く — ここを通すと「既にあるものを
-	// 入れるために別のピンを外す」ことになる。
-	switch existing, ferr := p.pinningRepo.FindByPair(actor.ID, note.ID); {
-	case ferr == nil && existing != nil:
-		return nil
-	case ferr != nil && !repository.IsNotFound(ferr):
-		// **障害を「まだ無い」に倒さない** (#3116)。倒すと上限判定の側へ進み、
-		// 「既にあるものを入れるために別のピンを外す」ことになる。
-		return fmt.Errorf("pin dedup: %w", ferr)
-	}
-	count, cerr := p.pinningRepo.CountByUser(actor.ID)
-	if cerr != nil {
-		return fmt.Errorf("count pinned notes: %w", cerr)
-	}
-	if count >= featuredPinLimit {
-		rows, lerr := p.pinningRepo.ListByUser(actor.ID)
-		if lerr != nil {
-			return fmt.Errorf("list pinned notes: %w", lerr)
-		}
-		// `ListByUser` は id DESC なので末尾が最も古い。新しい方を
-		// `featuredPinLimit - 1` 件残して、あふれる分を外す。
-		for i := featuredPinLimit - 1; i < len(rows); i++ {
-			if derr := p.pinningRepo.Delete(rows[i]); derr != nil {
-				return fmt.Errorf("evict pinned note: %w", derr)
-			}
-		}
-	}
-	now := nowFn()
-	pin := &model.UserNotePining{
-		ID:     p.pinningIDGen.Generate(now),
-		UserID: actor.ID,
-		NoteID: note.ID,
-	}
-	if err := p.pinningRepo.Create(pin); err != nil {
-		// 既にピン留め済み（重複キー）の場合のみ無視
-		if existing, _ := p.pinningRepo.FindByPair(actor.ID, note.ID); existing != nil {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// handleRemove processes an inbound Remove activity. actorのfeaturedコレクションから
-// ノートのピン留めを解除する。
-func (p *Processor) handleRemove(act genericActivity) error {
-	var target struct {
-		Target string `json:"target"`
-	}
-	_ = json.Unmarshal(act.raw, &target)
-	// chat room target の Remove は group chat の leave (#1364)。featured pin
-	// より先に判定する (pinningRepo 未配線でも chat leave は処理する)。actor の
-	// membership を削除する (cherrypick ApInboxService.remove と同じく actor 基準)。
-	if roomURI := chatRoomURI(target.Target); roomURI != "" && p.chatRoomReceiver != nil {
-		actor, err := p.resolver.ResolveActor(act.Actor)
-		if err != nil {
-			return err
-		}
-		if err := p.chatRoomReceiver.RemoveMemberViaAP(roomURI, actor.ID); err != nil {
-			if errors.Is(err, corechat.ErrNotFound) || errors.Is(err, corechat.ErrInvalidTarget) {
-				return ErrUnsupportedActivity
-			}
-			return err
-		}
-		return nil
-	}
-	if p.pinningRepo == nil {
-		return ErrUnsupportedActivity
-	}
-	actor, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return err
-	}
-	if actor.Featured == nil || target.Target != *actor.Featured {
-		return nil
-	}
-	noteURI, err := readObjectString(act.Object)
-	if err != nil {
-		return err
-	}
-	note, err := p.noteRepo.FindByURI(noteURI)
-	if err != nil {
-		// 理由は handleAccept と同じ (#3115)。ここで DB 障害を ack すると
-		// job が成功扱いになって retry されず、pin が外れないまま残る。
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	pin, err := p.pinningRepo.FindByPair(actor.ID, note.ID)
-	if err != nil {
-		if repository.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	// **書き込みの失敗も伝播させる** (#3115)。lookup だけ retry に倒して
-	// ここを捨てると、「pin が外れないまま残る」という同じ結末が DELETE 側で
-	// 残る。対になる `handleAdd` は Create / eviction の Delete を両方伝播する。
-	if err := p.pinningRepo.Delete(pin); err != nil {
-		return fmt.Errorf("unpin note: %w", err)
-	}
-	return nil
-}
-
-// normalizeActor populates act.Actor when JSON tag-driven Unmarshal could not
-// pull a plain string (= upstream Misskey #17340 fix; activity.actor may be
-// either a string IRI or an embedded {"id": "..."} object). Pass the raw bytes
-// that were Unmarshaled into act. No-op when Actor is already populated.
-//
-// 同 normalization は inner activity (Undo / Accept / Reject の object) にも
-// 適用する必要があるため、handler 側でも inner.normalizeActor(act.Object) を
-// 呼ぶ運用にする。
-func (act *genericActivity) normalizeActor(raw json.RawMessage) {
-	if act.Actor != "" {
-		return
-	}
-	var probe struct {
-		Actor json.RawMessage `json:"actor"`
-	}
-	if err := json.Unmarshal(raw, &probe); err != nil || len(probe.Actor) == 0 {
-		return
-	}
-	if id, err := readObjectString(probe.Actor); err == nil {
-		act.Actor = id
-	}
-}
-
-// readObjectString reads an activity Object field that is either a plain
-// string IRI or a nested object with an "id" field.
-//
-// **戻り値は `trimWHATWGURL` を通す。** 書き込み側 (`ingestNoteWithCreated` /
-// `fetchActor`) が正規化した値を `note.uri` / `user.uri` に入れているので、
-// 読み出し側が生値のままだと `FindByURI` が miss する。id に改行を付ける実装の
-// ノートが「取り込めるが Delete / Update / ピン留めが一切届かない」状態になる
-// (#2662)。upstream は書き込みも読み出しも生値なので対称。
-func readObjectString(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 {
-		return "", errors.New("missing object")
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil && s != "" {
-		if s = trimWHATWGURL(s); s != "" {
-			return s, nil
-		}
-		return "", errors.New("object missing id")
-	}
-	var obj struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return "", err
-	}
-	obj.ID = trimWHATWGURL(obj.ID)
-	if obj.ID == "" {
-		return "", errors.New("object missing id")
-	}
-	return obj.ID, nil
-}
-
-// readApHref mirrors upstream getApHrefNullable: it returns the value when it is
-// a bare URI string, or its `href` property when it is an AS Link/object, and ""
-// otherwise (including {id}-only objects, which upstream also treats as absent).
-// Used for fields like Move.target that upstream reads via getApHrefNullable
-// rather than getApId (#1948-21).
-func readApHref(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-	var obj struct {
-		Href string `json:"href"`
-	}
-	if err := json.Unmarshal(raw, &obj); err == nil {
-		return obj.Href
-	}
-	return ""
-}
-
-// readActorString reads an activity's actor field, supporting both string and
-// object forms (mirrors readObjectString but on the actor field of an inner
-// activity such as the Follow inside a Reject).
-func readActorString(act genericActivity) (string, error) {
-	if act.Actor != "" {
-		return act.Actor, nil
-	}
-	return "", errors.New("inner activity missing actor")
-}
-
-// handleChatCreate processes a Note flagged with `_misskey_talk: true`
-// inside a Create activity (CherryPick / レガシー Misskey の 1-on-1 chat
-// federation, #692)。
-//
-// `to` は CherryPick の renderChatMessage が string[] で出すが、互換性のため
-// 単一文字列 / 配列の両方を受け付ける。配列の場合は先頭エントリを recipient
-// として扱う。**1-on-1 経路なのでそれで正しい。**
-//
-// group chat は別プロトコルで、note の `@context` に room URI が入る形で届く。
-// Create の入口 (`chatRoomURIFromContext`) が先に振り分け、
-// `handleChatRoomMessageCreate` → `CreateRoomMessageViaAP` が room のメンバー
-// 全員に配る。ここに複数 recipient が来ることはない。
-func (p *Processor) handleChatCreate(sender *model.User, noteURI, content, mfmSource string, toRaw json.RawMessage) error {
-	if p.chatService == nil {
-		return ErrUnsupportedActivity
-	}
-	if noteURI == "" {
-		return fmt.Errorf("chat create: missing note id")
-	}
-	if sender.IsLocal() {
-		return fmt.Errorf("chat create: sender %s is local (loopback?)", sender.ID)
-	}
-	to, err := readRecipientURI(toRaw)
-	if err != nil {
-		return fmt.Errorf("chat create: %w", err)
-	}
-	recipient, err := p.userRepo.FindByURI(to)
-	if err != nil {
-		// chat は cherrypick 由来で本家に対応が無いので、ExtractLocalUserID
-		// (本家 fetchPerson の最後の段) ではなく従来どおり `users` の次の段で読む
-		// (#3330)。
-		if localID := p.resolver.localUserIDFromAPID(to); localID != "" {
-			recipient, err = p.userRepo.FindByID(localID)
-		}
-		if err != nil {
-			return fmt.Errorf("chat create: resolve recipient: %w", err)
-		}
-	}
-	if !recipient.IsLocal() {
-		return fmt.Errorf("chat create: recipient %s is not local", to)
-	}
-	_, err = p.chatService.CreateMessageViaAP(context.Background(), noteURI, sender, recipient.ID, content, mfmSource)
-	// 列に収まらない uri は retry しても解決しないので drop する (#2726)。
-	if errors.Is(err, corechat.ErrInvalidTarget) {
-		slog.Warn("chat create: message cannot be stored", "actor", sender.ID)
-		return ErrUnsupportedActivity
-	}
-	return err
-}
-
-// readRecipientURI extracts the first recipient URI from a `to` field that
-// may be either a JSON string or a JSON array of strings. Empty / missing
-// values produce an error so the caller can distinguish "malformed" from
-// "valid but addressed to public".
-func readRecipientURI(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 {
-		return "", errors.New("missing 'to' field")
-	}
-	var single string
-	if err := json.Unmarshal(raw, &single); err == nil {
-		if single == "" {
-			return "", errors.New("'to' is empty")
-		}
-		return single, nil
-	}
-	var multi []string
-	if err := json.Unmarshal(raw, &multi); err == nil {
-		for _, s := range multi {
-			if s != "" {
-				return s, nil
-			}
-		}
-		return "", errors.New("'to' has no usable recipient")
-	}
-	return "", errors.New("'to' is neither string nor array")
-}
-
-// handleChatMessage processes an inbound Misskey:ChatMessage activity
-// (CherryPick v12 federation). The activity itself IS the message object
-// (not wrapped in Create), so act.ID is the message URI.
-func (p *Processor) handleChatMessage(act genericActivity) error {
-	if p.chatService == nil {
-		return ErrUnsupportedActivity
-	}
-	// attributedTo と actor の一致を検証
-	var raw struct {
-		AttributedTo string `json:"attributedTo"`
-		To           string `json:"to"`
-		Content      string `json:"content"`
-		// Create 経由の probe と同じ 3 段で MFM の原文も拾う。
-		Source *struct {
-			Content   string `json:"content"`
-			MediaType string `json:"mediaType"`
-		} `json:"source"`
-		MisskeyContent string `json:"_misskey_content"`
-	}
-	if err := json.Unmarshal(act.raw, &raw); err != nil {
-		return fmt.Errorf("chat message: unmarshal: %w", err)
-	}
-	if raw.AttributedTo == "" || raw.AttributedTo != act.Actor {
-		return fmt.Errorf("chat message: attributedTo (%s) != actor (%s)", raw.AttributedTo, act.Actor)
-	}
-	if raw.To == "" {
-		return fmt.Errorf("chat message: missing 'to' field")
-	}
-	// actor (送信者) を解決
-	sender, err := p.resolver.ResolveActor(act.Actor)
-	if err != nil {
-		return fmt.Errorf("chat message: resolve sender: %w", err)
-	}
-	// ローカルユーザーはDB上URI==nilのためFindByURIでは解決できない。
-	// handleAcceptと同じパターンでlocalUserIDFromAPID→FindByIDにフォールバック
-	// (chat は本家に対応が無いので、従来どおり `users` の次の段で読む、#3330)。
-	recipient, err := p.userRepo.FindByURI(raw.To)
-	if err != nil {
-		if localID := p.resolver.localUserIDFromAPID(raw.To); localID != "" {
-			recipient, err = p.userRepo.FindByID(localID)
-		}
-		if err != nil {
-			return fmt.Errorf("chat message: resolve recipient: %w", err)
-		}
-	}
-	if !recipient.IsLocal() {
-		return fmt.Errorf("chat message: recipient %s is not local", raw.To)
-	}
-	// **id を配送元ホストに縛る。** `Create` + `_misskey_talk` 側と同じ理由で、
-	// ここも `act.ID` をそのままメッセージの uri として保存する
-	// (`CreateMessageViaAP` の呼び出しはこの 2 箇所だけ)。片方だけ塞いでも、
-	// この兄弟の活動型で同じ squat が通る。
-	if !sameDeliveryHost(act.Actor, act.ID) {
-		slog.Warn("federation: chat message id host does not match delivering actor",
-			"actor", act.Actor, "id", act.ID)
-		return ErrUnsupportedActivity
-	}
-	mfmSource := ""
-	if raw.Source != nil && raw.Source.MediaType == "text/x.misskeymarkdown" {
-		mfmSource = raw.Source.Content
-	}
-	if mfmSource == "" {
-		mfmSource = raw.MisskeyContent
-	}
-	_, err = p.chatService.CreateMessageViaAP(context.Background(), act.ID, sender, recipient.ID, raw.Content, mfmSource)
-	// handleChatCreate と同じ理由で non-retry に落とす (#2726)。
-	if errors.Is(err, corechat.ErrInvalidTarget) {
-		slog.Warn("chat message: message cannot be stored", "actor", act.Actor)
-		return ErrUnsupportedActivity
-	}
-	return err
 }
 
 // mayBeQuoteAuthorization reports whether a Delete's object may be a FEP-044f

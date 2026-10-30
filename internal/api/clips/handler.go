@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	coreclip "github.com/elythia-network/elythia/internal/core/clip"
@@ -15,6 +16,7 @@ import (
 	"github.com/elythia-network/elythia/internal/core/notesfilter"
 	"github.com/elythia-network/elythia/internal/core/ugcvisibility"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
@@ -24,13 +26,16 @@ import (
 
 // Handler handles clip-related API endpoints.
 type Handler struct {
-	svc          *coreclip.Service
-	idGen        id.Generator
-	favoriteRepo ClipFavoriteRepository
-	instanceRepo repository.InstanceRepository
-	emojiRepo    repository.EmojiRepository
-	bufReader    entity.BufferedReactionsReader
-	fieldRes     *entity.NoteFieldResolver
+	// relationCache は閲覧者のミュート・ブロックの一覧を要求をまたいで持つ
+	// (#3607)。nil なら repository から読む。
+	relationCache *repository.RelationCache
+	svc           *coreclip.Service
+	idGen         id.Generator
+	favoriteRepo  ClipFavoriteRepository
+	instanceRepo  repository.InstanceRepository
+	emojiRepo     repository.EmojiRepository
+	bufReader     entity.BufferedReactionsReader
+	fieldRes      *entity.NoteFieldResolver
 	// userRepo は clips/notes 経由で他人の clip を閲覧する際の hardMutedWords
 	// filter (#787) のために viewer profile を引く。未配線時は filter skip。
 	userRepo repository.UserRepository
@@ -55,20 +60,14 @@ type Handler struct {
 	// ugcVisibilityFn は meta.ugcVisibilityForVisitor の live lookup。
 	// clips/notes の匿名 visitor への gate に使う。
 	ugcVisibilityFn func() string
+	// noteHider は閲覧者が見てはいけない投稿の中身を隠す (#3786)。未配線だと
+	// 匿名の閲覧者への ugcVisibilityForVisitor が効かないので、NewHandler の
+	// 必須の引数で受ける (#3817)。
+	noteHider *notehide.Hider
+	// entityPacker は投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3790)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
-
-// SetUGCVisibilityLookup wires a live lookup of meta.ugcVisibilityForVisitor.
-//
-// **毎回読む。** 起動時に焼き込むと、運営者が管理画面で締めても
-// プロセスを再起動するまで反映されない。
-func (h *Handler) SetUGCVisibilityLookup(fn func() string) {
-	h.ugcVisibilityFn = fn
-}
-
-// HasUGCVisibility reports whether the visitor content visibility lookup was
-// wired. 未配線だと clips/notes の匿名 visitor への gate が素通しになる。
-// 起動時検査に使う。
-func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibilityFn != nil }
 
 // visitorHidesAllNotes reports whether ugcVisibilityForVisitor = none hides
 // every note from viewer. Mirrors upstream generateVisibilityQuery's
@@ -81,19 +80,6 @@ func (h *Handler) visitorHidesAllNotes(viewer *model.User) bool {
 // mute/block check (#1630).
 func (h *Handler) SetNoteRepo(r repository.NoteRepository) {
 	h.noteRepo = r
-}
-
-// SetMuteBlockRepos wires the muting / blocking repositories used by the
-// clips/notes muted-user / blocked-user filters (#1562).
-func (h *Handler) SetMuteBlockRepos(m repository.MutingRepository, b repository.BlockingRepository) {
-	h.mutingRepo = m
-	h.blockingRepo = b
-}
-
-// SetMetaRepo wires a MetaRepository used by the clips/notes blocked-host
-// filter (#1562).
-func (h *Handler) SetMetaRepo(r repository.MetaRepository) {
-	h.metaRepo = r
 }
 
 // blockedHosts returns meta.blockedHosts, or nil when the meta repo is not
@@ -169,8 +155,32 @@ func (h *Handler) SetQueryService(qs *corenote.QueryService) {
 }
 
 // NewHandler creates a new clips Handler.
-func NewHandler(svc *coreclip.Service, idGen id.Generator) *Handler {
-	return &Handler{svc: svc, idGen: idGen}
+// noteHider applies the per-viewer hideNote gate to the notes this handler
+// packs (#3786) and entityPacker is the Packer it packs entities with (#3790).
+// metaRepo backs the clips/notes blocked-host filter (#1562). ugcVisibilityFn
+// is a live lookup of meta.ugcVisibilityForVisitor, read on every request so
+// that changing the setting takes effect without a restart. mutingRepo and
+// blockingRepo back the clips/notes muted-user / blocked-user filters (#1562).
+func NewHandler(
+	svc *coreclip.Service,
+	idGen id.Generator,
+	noteHider *notehide.Hider,
+	entityPacker *entity.Packer,
+	metaRepo repository.MetaRepository,
+	ugcVisibilityFn func() string,
+	mutingRepo repository.MutingRepository,
+	blockingRepo repository.BlockingRepository,
+) *Handler {
+	return &Handler{
+		svc:             svc,
+		idGen:           idGen,
+		noteHider:       noteHider,
+		entityPacker:    entityPacker,
+		metaRepo:        metaRepo,
+		ugcVisibilityFn: ugcVisibilityFn,
+		mutingRepo:      mutingRepo,
+		blockingRepo:    blockingRepo,
+	}
 }
 
 // CreateRequest is the request body for clips/create.
@@ -180,9 +190,9 @@ type CreateRequest struct {
 	IsPublic    bool    `json:"isPublic"`
 }
 
-// upstream paramDef の長さ制約 (clips/create.ts / update.ts)。ajv は UTF-16
-// code unit 長だが、mk-go では他 endpoint と同じく rune 数で近似する (#1624 と
-// 同方針。サロゲートペアを含む文字列は upstream より長く受理される)。
+// upstream paramDef の長さ制約 (clips/create.ts / update.ts)。ajv の既定
+// (unicode: true) は code point を数えるので、rune 数で数える今の形が本家と
+// 一致する (#3742)。
 const (
 	clipNameMaxLength        = 100
 	clipDescriptionMaxLength = 2048
@@ -193,7 +203,8 @@ const (
 // name が nil の場合 (update の未指定) は検査しない。
 func validateClipParams(name *string, description **string) bool {
 	if name != nil {
-		if n := len([]rune(*name)); n < 1 || n > clipNameMaxLength {
+		// NUL と不正な UTF-8 は保存できない (SQLSTATE 22021 で 500 になっていた)。
+		if n := len([]rune(*name)); n < 1 || n > clipNameMaxLength || !colfit.Storable(*name) {
 			return false
 		}
 	}
@@ -201,7 +212,7 @@ func validateClipParams(name *string, description **string) bool {
 		if *(*description) == "" {
 			// 空文字は null に正規化して保存する (#1562)
 			*description = nil
-		} else if len([]rune(**description)) > clipDescriptionMaxLength {
+		} else if !colfit.Fits(**description, clipDescriptionMaxLength) {
 			return false
 		}
 	}
@@ -339,18 +350,17 @@ func (h *Handler) Delete(c echo.Context) error {
 
 // ListRequest is the request body for clips/list.
 type ListRequest struct {
-	Limit     *int   `json:"limit"`
-	Offset    int    `json:"offset"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // List handles POST /api/clips/list.
 //
 // frontend Paginator は cursor mode (untilId / sinceId) で叩いてくる。
-// upstream Misskey TS と同じく cursor 指定時は offset を無視する。
+// offset は本家の paramDef に無いので、本家と同じく読まない (#3742)。
 func (h *Handler) List(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req ListRequest
@@ -358,15 +368,15 @@ func (h *Handler) List(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	rows, err := h.svc.ListByUser(user.ID, sinceID, untilID, limit, req.Offset)
+	rows, err := h.svc.ListByUser(user.ID, sinceID, untilID, limit, 0)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -451,13 +461,13 @@ func (h *Handler) RemoveNote(c echo.Context) error {
 
 // NotesRequest is the request body for clips/notes.
 type NotesRequest struct {
-	ClipID    string  `json:"clipId"`
-	UntilID   string  `json:"untilId"`
-	SinceID   string  `json:"sinceId"`
-	SinceDate *int64  `json:"sinceDate"`
-	UntilDate *int64  `json:"untilDate"`
-	Limit     *int    `json:"limit"`
-	Search    *string `json:"search"`
+	ClipID    string     `json:"clipId"`
+	UntilID   string     `json:"untilId"`
+	SinceID   string     `json:"sinceId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
+	Limit     *jsnum.Int `json:"limit"`
+	Search    *string    `json:"search"`
 }
 
 // clipNotesSearchMaxLength は upstream clips/notes paramDef の search
@@ -485,11 +495,11 @@ func (h *Handler) Notes(c echo.Context) error {
 		requesterID = user.ID
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -513,9 +523,9 @@ func (h *Handler) Notes(c echo.Context) error {
 	// post-fetch で適用する (#1562。antennas / roles の #1544 と同形のため
 	// LIMIT 後適用 = ページ過少充填はあり得る)。channel mute は upstream
 	// clips/notes が適用しないため渡さない。upstream が併せ持つ
-	// muted-instances と renote 入れ子変種 (renote の reply/renote author) は
-	// #1544 と同じく未対応の follow-up。
-	mbSets, err := notesfilter.LoadMuteBlockSets(user, h.mutingRepo, h.blockingRepo, nil, h.userRepo)
+	// muted-instances と renote 入れ子変種 (renote の reply/renote author) も
+	// 適用する (#1630。入れ子は h.noteRepo が要り、#3818 まで本番で未配線だった)。
+	mbSets, err := notesfilter.LoadMuteBlockSetsCached(h.relationCache, user, h.mutingRepo, h.blockingRepo, nil, h.userRepo)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -528,10 +538,10 @@ func (h *Handler) Notes(c echo.Context) error {
 		return apierr.JSONInternalError(c)
 	}
 	notes = notesfilter.ApplyBlockedHosts(notes, blockedHosts)
-	notes = notesfilter.ApplyHardMute(h.userRepo, user, notes)
-	entities := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	notes = notesfilter.ApplyHardMute(h.userRepo, user, notes, h.idGen)
+	entities := h.entityPacker.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(entities, user)
-	notehide.HideEmbeds(user, entities)
+	h.noteHider.HideEmbeds(user, entities)
 	out := make([]any, 0, len(entities))
 	for _, pn := range entities {
 		out = append(out, pn)
@@ -540,7 +550,7 @@ func (h *Handler) Notes(c echo.Context) error {
 }
 
 // clipToMap packs a clip into the misskey_dart-compatible shape via
-// entity.PackClip. owner (clip の所有ユーザー) を userRepo から解決して user
+// (*entity.Packer).PackClip. owner (clip の所有ユーザー) を userRepo から解決して user
 // field を埋める。misskey_dart の Clip.fromJson は createdAt / user /
 // favoritedCount を非null必須とするため、旧 ad-hoc map では落ちていた (#1245)。
 // viewer は favoritedCount / isFavorited / notesCount の出し分けに使う (#1562)。
@@ -549,7 +559,7 @@ func (h *Handler) clipToMap(cl *model.Clip, viewer *model.User) map[string]any {
 	if h.userRepo != nil {
 		owner, _ = h.userRepo.FindByID(cl.UserID)
 	}
-	return entity.PackClip(cl, h.idGen, owner, h.clipExtras(cl, viewer))
+	return h.entityPacker.PackClip(cl, h.idGen, owner, h.clipExtras(cl, viewer))
 }
 
 // clipExtras resolves the viewer-dependent clip fields (#1562)。upstream
@@ -622,18 +632,8 @@ func (h *Handler) PackForEmbed(cl *model.Clip) map[string]any {
 	return h.clipToMap(cl, nil)
 }
 
-// HasMetaRepo reports whether the meta repository was wired.
-//
-// 未配線だと blocked-host の note が post-fetch 経路で漏れる。起動時検査に
-// 使う (#2708)。
-func (h *Handler) HasMetaRepo() bool { return h.metaRepo != nil }
-
-// HasMuteBlockRepos reports whether both mute/block repositories were wired.
-//
-// channelMuting は `LoadMuteBlockSets` へ意図的に nil を渡している
-// (clips に channel 次元が無い) ので対象外。残る 2 つは nil が**空集合として
-// 素通し**されるため、欠けるとその次元の filter が黙って消える。起動時検査に
-// 使う (#2709 review)。
-func (h *Handler) HasMuteBlockRepos() bool {
-	return h.mutingRepo != nil && h.blockingRepo != nil
+// SetRelationCache wires the per-user relation cache used by the mute / block
+// filter (#3607). nil keeps reading the repositories.
+func (h *Handler) SetRelationCache(rc *repository.RelationCache) {
+	h.relationCache = rc
 }

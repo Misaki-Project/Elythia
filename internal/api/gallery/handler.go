@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
+	"github.com/elythia-network/elythia/internal/api/optional"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/entity"
@@ -49,11 +51,15 @@ type Handler struct {
 	ranking GalleryRanking
 	roles   RoleChecker
 	modLog  ModLogger
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // NewHandler creates a new gallery Handler.
-func NewHandler(db *gorm.DB, idGen id.Generator) *Handler {
-	return &Handler{db: db, idGen: idGen}
+// entityPacker is the Packer this Handler packs entities with (#3794).
+func NewHandler(db *gorm.DB, idGen id.Generator, entityPacker *entity.Packer) *Handler {
+	return &Handler{db: db, idGen: idGen, entityPacker: entityPacker}
 }
 
 // SetRanking wires the featured gallery-posts ranking used by like / unlike /
@@ -76,13 +82,13 @@ func (h *Handler) SetModLog(m ModLogger) { h.modLog = m }
 // 未配線時は空配列に degrade する。
 func (h *Handler) Featured(c echo.Context) error {
 	var req struct {
-		Limit   *int   `json:"limit"`
-		UntilID string `json:"untilId"`
+		Limit   *jsnum.Int `json:"limit"`
+		UntilID string     `json:"untilId"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid parameters.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -141,23 +147,24 @@ func (h *Handler) Popular(c echo.Context) error {
 // frontend Paginator (cursor mode) は untilId / sinceId を投げてくる。
 // id 範囲フィルタ + paginationOrder 同等の ASC/DESC を直接組み立てる。
 func (h *Handler) Posts(c echo.Context) error {
+	// offset は本家の paramDef に無いので読まない。limit と sinceDate /
+	// untilDate は、本家(ajv の integer)と同じく値が整数の小数を受ける (#3754)。
 	var req struct {
-		Limit     *int   `json:"limit"`
-		Offset    int    `json:"offset"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid parameters.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -174,9 +181,6 @@ func (h *Handler) Posts(c echo.Context) error {
 		q = q.Order("id DESC")
 	}
 	q = q.Limit(limit)
-	if sinceID == "" && untilID == "" && req.Offset > 0 {
-		q = q.Offset(req.Offset)
-	}
 	var posts []*model.GalleryPost
 	if err := q.Find(&posts).Error; err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
@@ -205,11 +209,8 @@ func (h *Handler) PostsCreate(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
-	// #2106 L26: upstream gallery/posts/create は files 全件 not-owned のとき bare Error を投げ
-	// INTERNAL_ERROR(500) になるが、mk-go は semantics 上適切な 400 INVALID_PARAM を意図的に
-	// 維持する (worse な 500 拡散を避ける、#2106 方針)。
 	if len(owned) == 0 {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "No valid files.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
+		return noValidFiles(c)
 	}
 	now := time.Now()
 	post := &model.GalleryPost{
@@ -319,14 +320,32 @@ func (h *Handler) usernameOf(userID string) string {
 	return u.Username
 }
 
+// noSuchFileID is the error id of NO_SUCH_FILE for gallery/posts/create and
+// update. Upstream has no error for it (meta.errors is empty); the id is
+// Elythia's.
+const noSuchFileID = "04b23109-5e19-4cbf-a6a0-bbf371b254b5"
+
+// noValidFiles answers a request whose fileIds name none of the user's files.
+//
+// 本家は素の Error を投げて 500 になる (gallery/posts/create.ts / update.ts)。
+// 500 は避けて 400 を返す (#2106 L26)。以前は INVALID_PARAM にしていたが、
+// INVALID_PARAM は本家の paramDef の検証で拒否した意味で使うので、本家の
+// 検証を通った入力には、本家の notes/create などと同じ名前の NO_SUCH_FILE
+// を返す (#3754)。
+func noValidFiles(c echo.Context) error {
+	return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", noSuchFileID))
+}
+
 // PostsUpdate handles POST /api/gallery/posts/update.
 func (h *Handler) PostsUpdate(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req struct {
-		PostID      string    `json:"postId"`
-		Title       *string   `json:"title"`
-		Description *string   `json:"description"`
-		FileIDs     *[]string `json:"fileIds"`
+		PostID string  `json:"postId"`
+		Title  *string `json:"title"`
+		// Description distinguishes null (clear, like upstream) from absent
+		// (keep) (#3754).
+		Description optional.Nullable[string] `json:"description"`
+		FileIDs     *[]string                 `json:"fileIds"`
 		// upstream paramDef は isSensitive: default false。省略時も false で
 		// 上書きされる (TypeORM は undefined だけ skip)。bool で受け常に書く。
 		IsSensitive bool `json:"isSensitive"`
@@ -344,8 +363,9 @@ func (h *Handler) PostsUpdate(c echo.Context) error {
 	if req.Title != nil {
 		fields["title"] = *req.Title
 	}
-	if req.Description != nil {
-		fields["description"] = *req.Description
+	if req.Description.Present {
+		// null は本家と同じく説明を消す (nil を書く)。
+		fields["description"] = req.Description.Value
 	}
 	if req.FileIDs != nil {
 		if len(*req.FileIDs) == 0 || len(*req.FileIDs) > galleryMaxFiles {
@@ -357,7 +377,7 @@ func (h *Handler) PostsUpdate(c echo.Context) error {
 			return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 		}
 		if len(owned) == 0 {
-			return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "No valid files.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
+			return noValidFiles(c)
 		}
 		fields["fileIds"] = model.StringArray(owned)
 	}
@@ -467,7 +487,7 @@ func (h *Handler) resolveFiles(fileIDs []string) []entity.DriveFileEntity {
 	}
 	for _, fid := range fileIDs {
 		if f := byID[fid]; f != nil {
-			out = append(out, entity.PackDriveFile(f, h.idGen))
+			out = append(out, h.entityPacker.PackDriveFile(f, h.idGen))
 		}
 	}
 	return out
@@ -509,7 +529,7 @@ func (h *Handler) packMany(posts []*model.GalleryPost, viewer *model.User) []map
 		var rows []*model.DriveFile
 		if err := h.db.Where("id IN ?", allFileIDs).Find(&rows).Error; err == nil {
 			for _, f := range rows {
-				fileByID[f.ID] = entity.PackDriveFile(f, h.idGen)
+				fileByID[f.ID] = h.entityPacker.PackDriveFile(f, h.idGen)
 			}
 		}
 	}
@@ -579,7 +599,7 @@ func (h *Handler) buildPostMap(p *model.GalleryPost, files []entity.DriveFileEnt
 		resp["tags"] = tags
 	}
 	if p.User != nil {
-		resp["user"] = entity.PackUserLite(p.User)
+		resp["user"] = h.entityPacker.PackUserLite(p.User)
 	}
 	if isLiked != nil {
 		resp["isLiked"] = *isLiked

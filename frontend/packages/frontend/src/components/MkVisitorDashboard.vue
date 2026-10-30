@@ -30,7 +30,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				<MkInfo v-if="instance.federation === 'specified'" warn>{{ i18n.ts.federationSpecified }}</MkInfo>
 				<MkInfo v-else-if="instance.federation === 'none'" warn>{{ i18n.ts.federationDisabled }}</MkInfo>
 			</div>
-			<!-- mk-go: 「他のサーバーを探す」を削除した (#2814)。理由は docs/divergence.md の §4-2 -->
+			<!-- mk-go: 「他のサーバーを探す」を削除した (#2814)。理由は docs/divergence/frontend.md の §4-2 -->
 			<div class="_gaps_s" :class="$style.mainActions">
 				<MkButton v-if="!registrationClosed" :class="$style.mainAction" full rounded gradate data-testid="signup" style="margin-right: 12px;" @click="signup()">{{ i18n.ts.joinThisServer }}</MkButton>
 				<MkButton :class="$style.mainAction" full rounded data-testid="signin" @click="signin()">{{ i18n.ts.login }}</MkButton>
@@ -60,12 +60,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { ref } from 'vue';
+import { defineAsyncComponent, ref } from 'vue';
 import * as Misskey from 'misskey-js';
 import { instanceName } from '@@/js/config.js';
 import type { MenuItem } from '@/types/menu.js';
-import XSigninDialog from '@/components/MkSigninDialog.vue';
-import XSignupDialog from '@/components/MkSignupDialog.vue';
 import MkButton from '@/components/MkButton.vue';
 import MkStreamingNotesTimeline from '@/components/MkStreamingNotesTimeline.vue';
 import MkInfo from '@/components/MkInfo.vue';
@@ -75,12 +73,15 @@ import { i18n } from '@/i18n.js';
 import { instance } from '@/instance.js';
 import { isRegistrationClosed } from '@/utility/registration-mode.js';
 
-// mk-go 独自の meta なので misskey-js の型集合には無い (#2557)。
-const approvalRequiredForSignup = (instance as unknown as Record<string, unknown>).approvalRequiredForSignup === true;
+// Elythia 独自の meta (#2557)。型は elythia-js の MetaDetailed が持つ (#3418)。
+const approvalRequiredForSignup = instance.approvalRequiredForSignup === true;
 const registrationClosed = isRegistrationClosed();
 import MkNumber from '@/components/MkNumber.vue';
-import XActiveUsersChart from '@/components/MkVisitorDashboard.ActiveUsersChart.vue';
 import { openInstanceMenu } from '@/ui/_common_/common.js';
+
+// mk-go: グラフ (chart.js 一式) とダイアログ (webauthn・captcha) は、出すとき・開くときだけ読む。
+// エントランスの中のダッシュボードも、グラフが出るまで chart.js を待たなくてよい。
+const XActiveUsersChart = defineAsyncComponent(() => import('@/components/MkVisitorDashboard.ActiveUsersChart.vue'));
 
 const stats = ref<Misskey.entities.StatsResponse | null>(null);
 
@@ -91,7 +92,7 @@ if (instance.clientOptions.showActivitiesForVisitor !== false) {
 }
 
 function signin() {
-	const { dispose } = os.popup(XSigninDialog, {
+	const { dispose } = os.popup(defineAsyncComponent(() => import('@/components/MkSigninDialog.vue')), {
 		autoSet: true,
 	}, {
 		closed: () => dispose(),
@@ -99,7 +100,7 @@ function signin() {
 }
 
 function signup() {
-	const { dispose } = os.popup(XSignupDialog, {
+	const { dispose } = os.popup(defineAsyncComponent(() => import('@/components/MkSignupDialog.vue')), {
 		autoSet: true,
 	}, {
 		closed: () => dispose(),

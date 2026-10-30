@@ -26,9 +26,13 @@ type CachedMetaRepository struct {
 	onUpdate func()
 }
 
-// NewCachedMetaRepository creates a cached wrapper with a 5-minute TTL.
+// MetaCacheTTL is the TTL of the server's meta cache. internal:metaUpdated を
+// 取りこぼしたプロセスも、この期限で新しい meta を読む (#3663)。
+const MetaCacheTTL = 5 * time.Minute
+
+// NewCachedMetaRepository creates a cached wrapper with the MetaCacheTTL TTL.
 func NewCachedMetaRepository(inner MetaRepository) MetaRepository {
-	return &CachedMetaRepository{inner: inner, ttl: 5 * time.Minute}
+	return &CachedMetaRepository{inner: inner, ttl: MetaCacheTTL}
 }
 
 // NewCachedMetaRepositoryWithTTL creates a cached wrapper with a custom TTL.
@@ -47,6 +51,13 @@ func (c *CachedMetaRepository) SetInvalidationHook(fn func()) {
 // Invalidate clears the cached meta. Exported so a cross-worker subscriber can
 // drop this process's cache on a remote metaUpdated event (#1740).
 func (c *CachedMetaRepository) Invalidate() {
+	c.invalidate()
+}
+
+// DropLocal drops the cached meta row of this process without firing the
+// invalidation hook, so no other process is told (#3721). It is what the
+// cache list of internal/server calls (docs/architecture.md 4.4).
+func (c *CachedMetaRepository) DropLocal() {
 	c.invalidate()
 }
 
@@ -80,6 +91,23 @@ func (c *CachedMetaRepository) Fetch() (*model.Meta, error) {
 // Update delegates to the inner repository and invalidates the cache.
 func (c *CachedMetaRepository) Update(fields map[string]any) error {
 	err := c.inner.Update(fields)
+	if err == nil {
+		c.invalidate()
+		c.notifyUpdate()
+	}
+	return err
+}
+
+// UpdateChecked delegates to the inner repository and invalidates the cache.
+// The inner repository must implement CheckedMetaUpdater.
+//
+// 判定はキャッシュを通さず、内側の transaction の中で読んだ行で行う。
+func (c *CachedMetaRepository) UpdateChecked(fields map[string]any, check func(current *model.Meta) error) error {
+	inner, ok := c.inner.(CheckedMetaUpdater)
+	if !ok {
+		return ErrCheckedUpdateUnsupported
+	}
+	err := inner.UpdateChecked(fields, check)
 	if err == nil {
 		c.invalidate()
 		c.notifyUpdate()

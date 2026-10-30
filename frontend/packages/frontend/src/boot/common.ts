@@ -27,7 +27,7 @@ import { resolveClientUpdate } from '@/utility/check-client-update.js';
 import { deckStore } from '@/ui/deck/deck-store.js';
 import { analytics, initAnalytics } from '@/analytics.js';
 import { miLocalStorage } from '@/local-storage.js';
-import { fetchCustomEmojis } from '@/custom-emojis.js';
+import { refreshCustomEmojisOnBoot } from '@/custom-emojis.js';
 import { prefer } from '@/preferences.js';
 import { $i } from '@/i.js';
 import { launchPlugins } from '@/plugin.js';
@@ -78,7 +78,7 @@ export async function common(createVue: () => Promise<App<Element>>) {
 	// cache が採られる。その場合ダイアログが 1 回分遅れるだけで誤検知はしない。
 	const lastVersion = miLocalStorage.getItem('lastVersion');
 	const lastMkGoVersion = miLocalStorage.getItem('lastMkGoVersion');
-	const mkGoVersion = (instance as typeof instance & { mkGoVersion?: string }).mkGoVersion ?? null;
+	const mkGoVersion = instance.mkGoVersion ?? null;
 
 	const clientUpdate = resolveClientUpdate({
 		misskeyVersion: version,
@@ -228,6 +228,12 @@ export async function common(createVue: () => Promise<App<Element>>) {
 		}
 	}, { immediate: true });
 
+	// mk-go: 「アニメーション」の設定を CSS からも見えるようにする。未読の点滅 (_blink) は
+	// CSS だけで動いていて、設定を切っても止まらなかった (#3594)。
+	watch(prefer.r.animation, v => {
+		window.document.documentElement.classList.toggle('_noAnimation_', !v);
+	}, { immediate: true });
+
 	// Keep screen on
 	const onVisibilityChange = () => window.document.addEventListener('visibilitychange', () => {
 		if (window.document.visibilityState === 'visible') {
@@ -262,9 +268,7 @@ export async function common(createVue: () => Promise<App<Element>>) {
 	}
 	//#endregion
 
-	try {
-		await fetchCustomEmojis();
-	} catch (err) { /* empty */ }
+	await refreshCustomEmojisOnBoot();
 
 	// analytics
 	fetchInstanceMetaPromise.then(async () => {

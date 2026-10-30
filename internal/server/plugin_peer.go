@@ -180,6 +180,40 @@ type pluginPeerDeps struct {
 	urlFor func(host, plugin string) string
 }
 
+// newPluginPeerDeps builds the dependencies of the peer channel.
+//
+// blocker is the host-block checker. 無いとプラグイン間通信でブロックリストと
+// 連合ポリシーが効かなくなる。以前は構造体リテラルで組み、入れ忘れを起動時の検査
+// (criticalWiring) が見ていた。渡し忘れをコンパイルで落とすため、構築子の必須の引数で
+// 受ける (#3827)。ほかの欄も同じく引数で受ける。urlFor はテストが httptest の
+// サーバーへ向ける seam なので受けない (nil のとき https)。パッケージ内のテストは、
+// 要る欄だけを書いた構造体リテラルで組む (多くは 1〜3 欄しか書かない)。
+func newPluginPeerDeps(
+	selfHost string,
+	client *http.Client,
+	resolver peerActorResolver,
+	keyCache *activitypub.PublicKeyCache,
+	blocker peerHostBlocker,
+	signer peerSigner,
+	remote peerPluginLister,
+	idGen id.Generator,
+	limiter *peerRateLimiter,
+	enqueuer peerEnqueuer,
+) *pluginPeerDeps {
+	return &pluginPeerDeps{
+		selfHost: selfHost,
+		client:   client,
+		resolver: resolver,
+		keyCache: keyCache,
+		blocker:  blocker,
+		signer:   signer,
+		remote:   remote,
+		idGen:    idGen,
+		limiter:  limiter,
+		enqueuer: enqueuer,
+	}
+}
+
 // peerURL builds the endpoint URL for a host.
 func (d *pluginPeerDeps) peerURL(host, plugin string) string {
 	if d.urlFor != nil {
@@ -308,7 +342,9 @@ func (p *pluginPeer) Send(ctx context.Context, host string, payload any) (string
 }
 
 // blocked reports whether an **inbound** peer request from host must be
-// refused. AP の inbox と同じ判定。
+// refused. AP の inbox のドメインブロックと連合モードの判定と同じ。受信を拒否する
+// ソフトウェア (meta.inboxSuspendedSoftware、#3362) はここでは見ない — あれは
+// ActivityPub の受信に掛ける設定で、プラグイン同士の通信は対象にしていない。
 func (p *pluginPeer) blocked(host string) bool {
 	if p.deps.blocker == nil {
 		// **配線が落ちていたら通さない (fail-closed)。** ここは「相手が
@@ -572,6 +608,20 @@ func (p *pluginPeer) echoHandler() echo.HandlerFunc {
 		if err != nil {
 			// **プラグインのエラー文面は返さない。** 内部事情 (DB のエラー等)
 			// が相手のサーバーに漏れる。ログにだけ残す。
+			//
+			// **相手の入力の誤りは 400 + Debug にする。** 署名はホスト単位の
+			// 信頼なので、相手のホストの誰でも正しく署名した不正な payload を
+			// 送れる。それを 500 + ERROR にすると、こちらの障害と見分けが
+			// つかないうえ、送信側が 5xx として再送してくる。段階は相手起因の
+			// 署名検証の失敗と同じ Debug に揃える。
+			//
+			// 判定はプラグインが ErrBadPeerPayload を包んだときだけ。JSON の
+			// 解読エラーを型で拾うと、プラグインが自分の DB や本体 API の応答を
+			// 読み損ねた障害まで 400 (再送なし、ERROR なし) に化ける。
+			if errors.Is(err, plugin.ErrBadPeerPayload) {
+				p.logger.Debug("peer ハンドラが payload を拒否しました", "from", from, "err", err)
+				return peerError(c, http.StatusBadRequest, "payload を処理できません")
+			}
 			p.logger.Error("peer ハンドラがエラーを返しました", "from", from, "err", err)
 			return peerError(c, http.StatusInternalServerError, "処理できません")
 		}
@@ -718,13 +768,4 @@ func apiCatchall(c echo.Context) error {
 		))
 	}
 	return c.JSON(http.StatusOK, map[string]any{})
-}
-
-// HasBlocker reports whether the host-block checker was wired.
-//
-// **起動時のゲートに載せるための述語。** `recordCriticalWiring` の一覧に peer が
-// 1 つも無く、`blocker:` の行を消してもブロック判定が黙って無効になる状態で
-// 全テストが緑になっていた (inbox の同種の fail-open は全て載っている)。
-func (d *pluginPeerDeps) HasBlocker() bool {
-	return d != nil && d.blocker != nil
 }

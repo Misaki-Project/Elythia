@@ -107,23 +107,29 @@ func TestConnection_CloseWithCode_IgnoresClientMessagesWhileFlushing(t *testing.
 func TestConnection_CloseWithCode_SetsWriteDeadlineForFlush(t *testing.T) {
 	fc := newFakeConn()
 	c := NewConnection("c1", nil, fc)
+	c.SetCloseFlushTimeout(0) // 0 以下は無視し、既定の期限のまま
 	require.NoError(t, c.Send(map[string]string{"type": "queued"}))
 	start := time.Now()
 	c.CloseWithCode(RevokeCloseCode, "x")
 	go c.Start()
 	require.Eventually(t, fc.isClosed, 2*time.Second, 5*time.Millisecond)
-	assert.WithinDuration(t, start.Add(closeFlushTimeout), fc.getWriteDeadline(), time.Second)
+	assert.WithinDuration(t, start.Add(defaultCloseFlushTimeout), fc.getWriteDeadline(), time.Second)
+}
+
+// 期限を持たない (NewConnection を通らない) 接続でも、既定の期限で吐き切る。
+func TestConnection_FlushTimeout_DefaultsWhenUnset(t *testing.T) {
+	assert.Equal(t, defaultCloseFlushTimeout, (&Connection{}).flushTimeout())
+	c := NewConnection("c1", nil, newFakeConn())
+	c.SetCloseFlushTimeout(20 * time.Millisecond)
+	assert.Equal(t, 20*time.Millisecond, c.flushTimeout())
 }
 
 // writeLoop が動いていなくても (Start 前 / 書き込みで詰まっている) 必ず閉じる。
 func TestConnection_CloseWithCode_FallsBackWhenWriterIsNotRunning(t *testing.T) {
-	orig := closeFlushTimeout
-	closeFlushTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { closeFlushTimeout = orig })
-
 	fc := newFakeConn()
 	closedByHandler := make(chan struct{})
 	c := NewConnection("c1", nil, fc)
+	c.SetCloseFlushTimeout(20 * time.Millisecond)
 	c.SetCloseHandler(func() { close(closedByHandler) })
 	c.CloseWithCode(RevokeCloseCode, "x")
 
@@ -169,7 +175,7 @@ type revokeFixture struct {
 //   - n1: 匿名
 func newRevokeFixture(t *testing.T, bus PubSubBus) *revokeFixture {
 	t.Helper()
-	m := NewManager(NewRegistry(), bus)
+	m := NewManager(NewRegistry(), bus, nil, nil, nil, nil)
 	f := &revokeFixture{m: m, conns: map[string]*fakeConn{}}
 	add := func(id string, user *model.User, cred string) {
 		fc := newFakeConn()
@@ -261,14 +267,14 @@ func TestManager_SubscribeStreamRevoke_ClosesAfterSettleDelay(t *testing.T) {
 }
 
 func TestManager_StreamRevoke_NilBusIsNoop(t *testing.T) {
-	m := NewManager(nil, nil)
+	m := NewManager(nil, nil, nil, nil, nil, nil)
 	m.SubscribeStreamRevoke()
 	m.UnsubscribeStreamRevoke()
 }
 
 func TestManager_ShutdownUnsubscribesStreamRevoke(t *testing.T) {
 	bus := newStubBus()
-	m := NewManager(NewRegistry(), bus)
+	m := NewManager(NewRegistry(), bus, nil, nil, nil, nil)
 	m.SubscribeStreamRevoke()
 	require.Contains(t, bus.subs, StreamRevokeTopic)
 	m.Shutdown()
@@ -276,7 +282,7 @@ func TestManager_ShutdownUnsubscribesStreamRevoke(t *testing.T) {
 }
 
 func TestManager_SettleDelay(t *testing.T) {
-	m := NewManager(nil, nil)
+	m := NewManager(nil, nil, nil, nil, nil, nil)
 	assert.Equal(t, defaultRevokeSettle, m.settleDelay())
 	m.SetRevokeSettleDelay(5 * time.Millisecond)
 	assert.Equal(t, 5*time.Millisecond, m.settleDelay())
@@ -337,7 +343,7 @@ func TestStreamRevokePublisher(t *testing.T) {
 // 実 WebSocket で、失効した接続のクライアントが 1008 の close frame を受け取る
 // こと。Accept が credential を Connection に載せていないと何も閉じない。
 func TestManager_AcceptThenRevoke_ClientReceivesPolicyViolation(t *testing.T) {
-	m := NewManager(NewRegistry(), nil)
+	m := NewManager(NewRegistry(), nil, nil, nil, nil, nil)
 	t.Cleanup(m.Shutdown)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -438,7 +444,7 @@ func (f publisherFunc) Publish(_ context.Context, channel string, payload any) e
 // そのプロセスの古い cache で認証される。
 func TestManager_SubscribeStreamRevoke_NotifiesObserversImmediately(t *testing.T) {
 	bus := newStubBus()
-	m := NewManager(NewRegistry(), bus)
+	m := NewManager(NewRegistry(), bus, nil, nil, nil, nil)
 	t.Cleanup(m.Shutdown)
 	m.SetRevokeSettleDelay(time.Hour)
 	got := make(chan string, 2)
@@ -485,7 +491,7 @@ func TestManager_Revoke_SecondPassClosesReconnectedStream(t *testing.T) {
 }
 
 func TestManager_RecheckDelay(t *testing.T) {
-	m := NewManager(nil, nil)
+	m := NewManager(nil, nil, nil, nil, nil, nil)
 	assert.Equal(t, defaultRevokeRecheck, m.recheckDelay())
 	m.SetRevokeRecheckDelay(5 * time.Millisecond)
 	assert.Equal(t, 5*time.Millisecond, m.recheckDelay())
