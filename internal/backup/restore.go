@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/elythia-network/elythia/internal/migrationhistory"
 	"github.com/elythia-network/elythia/internal/pgactivity"
 )
 
@@ -1158,7 +1159,18 @@ func (r *Restorer) CheckDatabaseMigrations(ctx context.Context, dbname string) (
 			return fmt.Errorf("%w: %s of %q is at %d but this binary ships up to %d; use a binary at least as new as that database",
 				ErrRestoreMigrationTooNew, s.Table, dbname, s.Version, latest)
 		})
-	return out, err
+	if err != nil {
+		return out, err
+	}
+	for _, s := range states {
+		if s.Table == CoreMigrationsTable && !s.Missing && s.Version == 117 && !s.Dirty {
+			dbURL := r.Conn.Migrate(dbname)
+			if err := migrationhistory.CheckLegacy117(ctx, r.CoreMigrationsDir, dbURL, uint(s.Version), s.Dirty); err != nil {
+				return out, fmt.Errorf("backup: check migration history of %q: %w", dbname, redactURL(err, dbURL))
+			}
+		}
+	}
+	return out, nil
 }
 
 // latestMigration returns the highest up migration version in dir and the
@@ -1333,6 +1345,19 @@ func (r *Restorer) Migrate(dbname string) ([]MigrationState, error) {
 		if err != nil {
 			// URL にはパスワードが入るので、err の文面に URL が含まれないものだけを返す。
 			return nil, fmt.Errorf("backup: open migrations for %s: %w", t.table, redactURL(err, dbURL))
+		}
+		if t.table == CoreMigrationsTable {
+			v, dirty, verr := m.Version()
+			if errors.Is(verr, gomigrate.ErrNilVersion) {
+				verr = nil
+			}
+			if verr == nil {
+				verr = migrationhistory.CheckLegacy117(context.Background(), t.dir, dbURL, v, dirty)
+			}
+			if verr != nil {
+				_, _ = m.Close()
+				return nil, fmt.Errorf("backup: check migration history for %s: %w", t.table, redactURL(verr, dbURL))
+			}
 		}
 		err = m.Up()
 		v, dirty, verr := m.Version()

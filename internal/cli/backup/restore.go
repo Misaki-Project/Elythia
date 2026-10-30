@@ -48,6 +48,9 @@ func defaultRestoreEnv() restoreEnv {
 			return r.Restore(ctx, o)
 		},
 		replace: func(ctx context.Context, r *bkp.Restorer, m, db, keepAs, repl string) error {
+			if _, err := r.CheckDatabaseMigrations(ctx, repl); err != nil {
+				return err
+			}
 			return r.SwitchDatabase(ctx, m, db, keepAs, repl)
 		},
 		cleanRedis: cleanRedis,
