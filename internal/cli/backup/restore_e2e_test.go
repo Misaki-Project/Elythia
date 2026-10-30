@@ -37,6 +37,8 @@ func TestRestoreCommandEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	pg, err := tcpostgres.Run(ctx, "postgres:18-alpine",
 		tcpostgres.WithDatabase("postgres"), tcpostgres.WithUsername("test"), tcpostgres.WithPassword("test"),
+		testcontainers.WithTmpfs(map[string]string{"/var/lib/postgresql": "rw,size=512m"}),
+		testcontainers.WithEnv(map[string]string{"POSTGRES_INITDB_ARGS": "--no-sync"}),
 		testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").
 			WithOccurrence(2).WithStartupTimeout(60*time.Second)))
 	require.NoError(t, err)
@@ -133,4 +135,78 @@ backup:
 	code = restore(e, []string{"-config", cfgPath, "-rollback", before[1], "-confirm", "elythia", "-migrations", rsCoreMigrations})
 	require.Equal(t, 0, code, out.String()+errOut.String())
 	assert.Equal(t, "in_elythia", noteIn("elythia"))
+
+	t.Run("rollback refuses unreconciled legacy117 before switching", func(t *testing.T) {
+		const kept = "elythia_before_restore_legacy"
+		const aside = "elythia_rolled_back_20261011000000"
+		exec1("postgres", "CREATE DATABASE "+pgx.Identifier{kept}.Sanitize()+" OWNER app")
+		require.NoError(t, applyBackupFixtureMigrations(url("app", "app-pass", kept), 116))
+		exec1(kept,
+			`DROP TABLE schema_migrations_local`,
+			`UPDATE schema_migrations SET version = 117, dirty = false`,
+			`INSERT INTO "user" ("id", "username", "usernameLower") VALUES ('legacyroot', 'root', 'root')`,
+			`INSERT INTO meta ("id", "rootUserId") SELECT 'legacy', 'legacyroot' WHERE NOT EXISTS (SELECT 1 FROM meta)`,
+			`UPDATE meta SET "rootUserId" = 'legacyroot'`,
+			`INSERT INTO note ("id", "userId", "visibility") VALUES ('legacy_note', 'legacyroot', 'public')`)
+
+		// 接続を保持すると ALTER DATABASE が別の理由で失敗し、切替前検査が
+		// 無くても通ってしまう。各観測の接続は restore を呼ぶ前に閉じる。
+		databaseOIDs := func() map[string]int64 {
+			conn, err := pgx.Connect(ctx, url("test", "test", "postgres"))
+			require.NoError(t, err)
+			defer conn.Close(ctx)
+			rows, err := conn.Query(ctx, `SELECT datname, oid::bigint FROM pg_database WHERE datname IN ($1, $2, $3)`, "elythia", kept, aside)
+			require.NoError(t, err)
+			defer rows.Close()
+			oids := map[string]int64{}
+			for rows.Next() {
+				var name string
+				var oid int64
+				require.NoError(t, rows.Scan(&name, &oid))
+				oids[name] = oid
+			}
+			require.NoError(t, rows.Err())
+			return oids
+		}
+		assertLegacyUnchanged := func() {
+			conn, err := pgx.Connect(ctx, url("app", "app-pass", kept))
+			require.NoError(t, err)
+			defer conn.Close(ctx)
+			var version int64
+			var dirty, localLedger, accountCreatedAt bool
+			require.NoError(t, conn.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+			assert.EqualValues(t, 117, version)
+			assert.False(t, dirty)
+			require.NoError(t, conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.tables
+				WHERE table_schema = current_schema() AND table_name = 'schema_migrations_local')`).Scan(&localLedger))
+			assert.False(t, localLedger, "refusal must not create the local migration ledger")
+			require.NoError(t, conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'user' AND column_name = 'accountCreatedAt')`).Scan(&accountCreatedAt))
+			assert.False(t, accountCreatedAt, "refusal must not migrate the legacy database")
+		}
+		beforeOIDs := databaseOIDs()
+		require.Len(t, beforeOIDs, 2)
+		require.Contains(t, beforeOIDs, "elythia")
+		require.Contains(t, beforeOIDs, kept)
+		require.Equal(t, "in_elythia", noteIn("elythia"))
+		require.Equal(t, "legacy_note", noteIn(kept))
+		assertLegacyUnchanged()
+
+		e.now = func() time.Time { return time.Date(2026, time.October, 11, 0, 0, 0, 0, time.UTC) }
+		out.Reset()
+		errOut.Reset()
+		code := restore(e, []string{"-config", cfgPath, "-rollback", kept, "-confirm", "elythia", "-migrations", rsCoreMigrations})
+		assert.Equal(t, 1, code, out.String()+errOut.String())
+		assert.Contains(t, out.String()+errOut.String(), "docs/misaki-migration-reconciliation.md")
+
+		// 切替後の自己検査でも終了コード 1 になる。実際の名前・OID・投稿で、
+		// 本番名を動かす前に拒否したことを確かめる。
+		afterOIDs := databaseOIDs()
+		assert.Equal(t, beforeOIDs, afterOIDs, "refusal must preserve both database names and identities")
+		assert.NotContains(t, afterOIDs, aside, "the current database must not be renamed aside")
+		assert.Equal(t, "in_elythia", noteIn("elythia"))
+		require.Contains(t, afterOIDs, kept, "the legacy database must retain its kept name")
+		assert.Equal(t, "legacy_note", noteIn(kept))
+		assertLegacyUnchanged()
+	})
 }
