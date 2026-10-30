@@ -430,9 +430,14 @@ func TestDefaultsReachUnreachableServices(t *testing.T) {
 	assert.Error(t, err)
 
 	e := defaultRestoreEnv()
-	// ロールバックの入れ替えは SwitchDatabase を通す (入れ替える前に名前を確かめる)。
-	err = e.replace(ctx, &bkp.Restorer{Conn: connFor(cfg)}, "postgres", "elythia", "elythia_rolled_back_1", "elythia_before_restore_1")
-	assert.ErrorContains(t, err, "check the database names before switching")
+	// Rollback validates the replacement's migration history before switching.
+	r := &bkp.Restorer{
+		Conn:               connFor(cfg),
+		CoreMigrationsDir:  rsCoreMigrations,
+		LocalMigrationsDir: filepath.Join(rsCoreMigrations, "local"),
+	}
+	err = e.replace(ctx, r, "postgres", "elythia", "elythia_rolled_back_1", "elythia_before_restore_1")
+	assert.ErrorContains(t, err, `backup: connect to "elythia_before_restore_1"`)
 	// 保存先は (1) #3458 の実装で開く。
 	assert.Equal(t, reflect.ValueOf(bkp.OpenStorage).Pointer(), reflect.ValueOf(e.openStorage).Pointer())
 	assert.NotNil(t, e.restore)
