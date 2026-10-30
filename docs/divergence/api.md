@@ -185,10 +185,13 @@ nodeinfoの`usage.users.total`、`/api/stats`の`usersCount`・`originalUsersCou
 
 upstream の endpoint は `endpoints/` 配下 438 件 + `ApiServerService.ts` の fastify 直登録 6 件 (POST 5 / GET 1) = **444 件**。うち **444 件すべてを実装済み (coverage 100.0%)**。
 
-### 1-1. Elythia にしかない (110)
+### 1-1. Elythia にしかない (123)
+
+本体の110件に、Misakiで既定有効の`role-level`プラグインの13件を含める。`make apicompat`は登録済みのプラグインルートも集計する。生成結果の内訳はGET variant 25件、chat拡張15件、その他83件 (うちrole-level 13件)。
 
 | 分類 | 件数 | 内容 |
 |---|---|---|
+| role-levelプラグイン | 13 | `/api/plugin/role-level/*`配下のPOSTルート。level設定・XP操作・assignment参照・監査・孤立データの検査と整理・プロフィール表示設定を提供する。Misakiの通常ビルドでは既定有効で、生成API一覧の「その他」に含まれる。詳細は[Misaki固有の記録](misaki.md#role-level)を参照 |
 | GET variant 追加 | 25 | `charts/*` 12 件、`emoji` / `emojis` / `federation/instances` / `federation/stats` / `fetch-rss` / `get-online-users-count` / `hashtags/trend` / `notes/featured` / `notes/reactions` / `server-info` / `bubble-game/ranking` / `users/featured-notes` / `retention`。**対応する POST は両側にある**。`notes/reactions` 以外の 24 件は本家も `allowGet: true` で GET を受ける (`tools/apicompat` は本家を POST だけで数えるので、ここに分類される)。GET の route と `cacheSec` の `Cache-Control` は `TestCacheSecDrift` が本家と突き合わせる (#3593)。`notes/reactions` は本家が 2026.9.0 で `allowGet` を外した後も GET を残している |
 | cherrypick chat 拡張 | 15 | `chat/messages` / `chat/messages/create` / `read` / `update` / `reactions/create` / `reactions/delete`、`chat/rooms/joined` / `unmute` / `transfer-ownership` / `members/ban` / `members/update-membership` / `invitations/accept` / `delete` / `reject`、`chat/unread-count` |
 | 分割アップロード | 4 | `drive/files/create-chunked/start` / `append` / `finish` / `abort` (#2313 / #2314)。upstream に分割アップロードが無いため対応物なし。S3 の multipart upload を包むもので、`UploadId` は `chunked_upload_session` に閉じてクライアントへ出さない。能力は `/api/meta` の `chunkedUpload` で告知し、**未対応構成では field ごと出さない**ので純正クライアントは単発アップロードに倒れる |

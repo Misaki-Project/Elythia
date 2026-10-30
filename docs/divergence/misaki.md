@@ -12,7 +12,7 @@
 
 `plugins/rolelevel`に同梱する`role-level`はmanual roleへlevel・XP・level別policyを追加する。coreの`role` / `role_assignment` schemaは変更せず、独自データは`plugin_role_level`へ保存する。Misakiでは既定有効で、`plugins.role-level.enabled: false`で実行時に無効化できる。無効化してもrole・assignmentやpluginの保存済みデータは削除しない。
 
-`/api/plugin/role-level/*`配下の13 routeは、level設定・XP操作・assignment参照・監査・孤立データの検査と整理・プロフィール表示設定を提供する。本体の静的routeとは別にプラグインが登録するため、差分カタログの静的endpointの合計へ重ねて加えない。管理操作と参照は各routeの認可契約に従い、定期jobは設定したplugin actorを使う。公開プロフィールは対象本人のself-service assignment APIで割当と公開属性を確認する。`roles/assignment-show` / `admin/roles/assignment-show`の`assignmentId`は保存済みXPとの照合に使う。
+`/api/plugin/role-level/*`配下の13 routeは、level設定・XP操作・assignment参照・監査・孤立データの検査と整理・プロフィール表示設定を提供する。プラグインが登録したルートも`make apicompat`の集計対象で、Misakiの既定ビルドでは差分カタログの合計123件に含む。生成結果の「その他」83件のうち13件がrole-levelである。管理操作と参照は各routeの認可契約に従い、定期jobは設定したplugin actorを使う。公開プロフィールは対象本人のself-service assignment APIで割当と公開属性を確認する。`roles/assignment-show` / `admin/roles/assignment-show`の`assignmentId`は保存済みXPとの照合に使う。
 
 APIキーで呼べるのは`POST /api/plugin/role-level/admin/change-exp`だけで、`write:admin:role-level-experience`に加え、発行元アカウントの管理権限と対象roleの認可も必要になる。Bearer認証を使い、strict JSON bodyに`i`を混ぜない。XP操作の`note`はrole-levelの監査へ残し、同じ`idempotencyKey`の再送でXPと監査を二重に追加しない。詳細は[role-level README](../../plugins/rolelevel/README.md)と[プラグインの運用](../plugins/operating.md)にある。
 

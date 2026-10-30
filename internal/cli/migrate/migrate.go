@@ -414,6 +414,13 @@ func (e env) runTrack(logger *slog.Logger, cfg *config.Config, track, direction 
 	}
 	defer m.Close()
 
+	if track == trackCore && direction == "up" {
+		if err := refuseLegacy117(dir, dbURL, m); err != nil {
+			logDBError(log, cfg, "migration history check failed", err)
+			return 1
+		}
+	}
+
 	switch {
 	case direction == "up" && steps > 0:
 		err = m.Steps(steps)

@@ -8,11 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
-	gomigrate "github.com/golang-migrate/migrate/v4"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,10 +65,7 @@ func TestRestoreCommandEndToEnd(t *testing.T) {
 	exec1("postgres", "CREATE ROLE app LOGIN PASSWORD 'app-pass' CREATEDB",
 		"CREATE DATABASE src OWNER app", "CREATE DATABASE elythia OWNER app")
 	for _, db := range []string{"src", "elythia"} {
-		m, err := gomigrate.New("file://"+rsCoreMigrations, strings.Replace(url("app", "app-pass", db), "postgres://", "pgx5://", 1))
-		require.NoError(t, err)
-		require.NoError(t, m.Up())
-		_, _ = m.Close()
+		require.NoError(t, applyBackupFixtureMigrations(url("app", "app-pass", db), 0))
 		exec1(db, `INSERT INTO "user" ("id", "username", "usernameLower") VALUES ('u1', 'root', 'root')`,
 			`INSERT INTO meta ("id", "rootUserId") SELECT 'x', 'u1' WHERE NOT EXISTS (SELECT 1 FROM meta)`,
 			`UPDATE meta SET "rootUserId" = 'u1'`,

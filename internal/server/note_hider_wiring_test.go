@@ -11,6 +11,7 @@ import (
 
 	"github.com/elythia-network/elythia/internal/config"
 	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 )
 
 // **組み立てで作った`notehide.Hider`が、匿名の閲覧者へ
@@ -35,6 +36,9 @@ func TestNewServer_NoteHiderAppliesTheVisitorPolicy(t *testing.T) {
 	if db == nil {
 		t.Skip("PostgreSQL unavailable")
 	}
+	// 他のテストより先に走ると meta 行はまだ無い。UPDATE が 0 行のまま
+	// 組み立てると EnsureInitial が既定の local を作り、none を検査できない。
+	require.NoError(t, repository.NewMetaRepository(db).EnsureInitial("note-hider-meta"))
 	var meta struct{ UgcVisibilityForVisitor string }
 	require.NoError(t, db.Raw(`SELECT "ugcVisibilityForVisitor" AS ugc_visibility_for_visitor FROM "meta" LIMIT 1`).Scan(&meta).Error)
 	t.Cleanup(func() {
@@ -84,7 +88,9 @@ func TestNewServer_NoteHiderAppliesTheVisitorPolicy(t *testing.T) {
 			name = tt.policy + "/signed-in"
 		}
 		t.Run(name, func(t *testing.T) {
-			require.NoError(t, db.Exec(`UPDATE "meta" SET "ugcVisibilityForVisitor" = ?`, tt.policy).Error)
+			updated := db.Exec(`UPDATE "meta" SET "ugcVisibilityForVisitor" = ?`, tt.policy)
+			require.NoError(t, updated.Error)
+			require.Positive(t, updated.RowsAffected, "the visitor policy must be set before server construction")
 			srv := newServerWithConfig(t, func(*config.Config) {})
 			n := pinned(t, srv, tt.token)
 			assert.Equal(t, tt.hidden, n["isHidden"] == true, "isHidden: %v", n["isHidden"])

@@ -32,7 +32,7 @@ Elythia は Misskey TS からの drop-in 移行 (Misskey TS の DB / Redis を�
 
 | 軸 | Elythia 独自 | cherrypick 由来 | 未実装 |
 |---|---|---|---|
-| API endpoint | GET variant 25 + alias 4 + 分割アップロード 4 + 承認制 7 + 絵文字の申請 10 + exact assignment lookup 2 + admin 観測 8 + 配送のブレーカー 1 + 消えたインスタンスの片付け 2 + 連合のルール 5 + IP 検索 3 + バブルゲームの対戦 10 + フォローの止め方 1 + DB のバックアップ 11 + アカウント単位の連合制御 2 | chat 15 | **0** |
+| API endpoint | GET variant 25 + alias 4 + 分割アップロード 4 + 承認制 7 + 絵文字の申請 10 + exact assignment lookup 2 + admin 観測 8 + 配送のブレーカー 1 + 消えたインスタンスの片付け 2 + 連合のルール 5 + IP 検索 3 + バブルゲームの対戦 10 + フォローの止め方 1 + DB のバックアップ 11 + アカウント単位の連合制御 2 + role-levelプラグイン 13 | chat 15 | **0** |
 | API レスポンスの additive field | 11 (`runtime` / `mkGoVersion` / `chunkedUpload` / `approvalRequiredForSignup` / `registrationClosed` / `signupApplicationForm` / `canRequestCustomEmojis` / `minimumUsernameLength` / `managedByPlugin` / `federationStatus` / `has<秘密の欄>` (`admin/meta` の 11 欄と `admin/captcha/current` の `hasSecretKey` を 1 つと数える。[security.md §7](divergence/security.md#7-意図的な安全側-divergence))) | reversi packed game の `crc32` 等 | — |
 | DB テーブル | 21 (+ bookkeeping 2) | 0 | 0 |
 | DB カラム | 33 (+ 未使用の残存列 3) | 3 | 0 |
@@ -40,7 +40,7 @@ Elythia は Misskey TS からの drop-in 移行 (Misskey TS の DB / Redis を�
 | config キー | 20 前後 | 0 | — |
 | fork frontend の独自変更 | 143 tag (`2026.7.0-mk.0` ～ `2026.10.0-mk.5`) | — | — |
 
-このサマリのfrontend tagは上流Elythiaの凍結した系列で、Misakiの履歴tagは[Misaki固有の記録](divergence/misaki.md#旧frontend-forkの履歴)に別掲する。プラグインが動的に登録する`/api/plugin/role-level/*`の13 routeも、上の本体の静的endpoint件数には含めない。
+このサマリのfrontend tagは上流Elythiaの凍結した系列で、Misakiの履歴tagは[Misaki固有の記録](divergence/misaki.md#旧frontend-forkの履歴)に別掲する。API endpointは生成結果と同じく、Misakiで既定有効の`/api/plugin/role-level/*`の13ルートを含めて123件と数える (GET variant 25件 + chat拡張15件 + その他83件)。
 
 **upstream endpoint の未実装はゼロ** (coverage 100.0%、444/444)。DB schema も upstream の全テーブル・全共有カラムを superset で保持しており、逆方向の欠落は無い。
 

@@ -46,6 +46,11 @@ var handlerNilAllowed = map[string]string{
 	// newPluginNotificationDispatcher が nil でないとき (通知を受け取るプラグインが
 	// 居るとき) だけ SetMessageObserver を呼ぶ。テストの組み立てはプラグインを登録しない。
 	"chatService.messageObserver": "通知を受け取るプラグインが居ないときは配線しない (newPluginNotificationDispatcher が nil)",
+	// role-levelが未同梱か無効なら、プラグイン所有の非表示設定テーブルは読まない。
+	// setupRoutesはroleLevelPluginEnabledがtrueのときだけreaderを配線し、
+	// users/showと利用者一覧のroles/badgeRolesへプロフィールの非表示設定を適用する。
+	// このテストの組み立てではrole-levelを登録していないのでnil。
+	"users.profileRoleVisibility": "role-levelが未同梱または無効のときはnil。setupRoutesは有効時だけusers/showと利用者一覧のプロフィール用readerを配線する",
 	// 依存ではなく状態。updated の間引きの窓 (clip ごと) で、最初の publishUpdated が
 	// 作る。組み立てた直後はまだクリップを更新していないので nil。
 	"clipService.pendingUpdated": "依存ではなく状態。最初の publishUpdated が作るので、組み立てた直後は nil",

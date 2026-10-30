@@ -115,12 +115,11 @@ func runDaemonDB() (*tcpostgres.PostgresContainer, error) {
 	if err != nil {
 		return c, err
 	}
-	core, _, err := migrate.LatestVersion(filepath.Join("..", "..", "..", migrate.CoreDir))
-	if err != nil || core == 0 {
-		return c, fmt.Errorf("bundled migrations: %d, %v", core, err)
-	}
 	url, err := c.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
+		return c, err
+	}
+	if err := applyBackupFixtureMigrations(url, 0); err != nil {
 		return c, err
 	}
 	db, err := gorm.Open(postgres.Open(url), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
@@ -132,12 +131,7 @@ func runDaemonDB() (*tcpostgres.PostgresContainer, error) {
 			_ = sqlDB.Close()
 		}
 	}()
-	testutil.ApplyMigrations(db)
 	for _, q := range []string{
-		// golang-migrate が当てた後と同じ 1 行にする。
-		`CREATE TABLE IF NOT EXISTS schema_migrations (version bigint NOT NULL PRIMARY KEY, dirty boolean NOT NULL)`,
-		`DELETE FROM schema_migrations`,
-		fmt.Sprintf(`INSERT INTO schema_migrations (version, dirty) VALUES (%d, false)`, core),
 		`CREATE TABLE daemon_fixture (id int PRIMARY KEY)`,
 		`INSERT INTO daemon_fixture SELECT generate_series(1, 5)`,
 	} {

@@ -22,7 +22,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	gomigrate "github.com/golang-migrate/migrate/v4"
 	"github.com/jackc/pgx/v5"
 	"github.com/pquerna/otp/totp"
 	"github.com/redis/go-redis/v9"
@@ -441,10 +440,7 @@ func TestRestoreFromAdminEndToEnd(t *testing.T) {
 			_, err = admin.Exec(r.ctx, "CREATE DATABASE "+name+" OWNER app")
 			require.NoError(t, err)
 			require.NoError(t, admin.Close(r.ctx))
-			m, err := gomigrate.New("file://"+rsCoreMigrations, strings.Replace(r.url("app", "app-pass", name), "postgres://", "pgx5://", 1))
-			require.NoError(t, err)
-			require.NoError(t, m.Steps(steps))
-			_, _ = m.Close()
+			require.NoError(t, applyBackupFixtureMigrations(r.url("app", "app-pass", name), steps))
 			if len(sqls) > 0 {
 				r.exec(name, sqls...)
 			}
@@ -634,10 +630,7 @@ func setupRestoreE2E(t *testing.T) *restoreE2E {
 		require.NoError(t, err, s)
 	}
 	require.NoError(t, admin.Close(ctx))
-	m, err := gomigrate.New("file://"+rsCoreMigrations, strings.Replace(r.url("app", "app-pass", "elythia"), "postgres://", "pgx5://", 1))
-	require.NoError(t, err)
-	require.NoError(t, m.Up())
-	_, _ = m.Close()
+	require.NoError(t, applyBackupFixtureMigrations(r.url("app", "app-pass", "elythia"), 0))
 	seedAdminUsers(t, r)
 	r.exec("elythia", `INSERT INTO note ("id", "userId", "visibility") VALUES ('n_before', 'u1', 'public')`)
 

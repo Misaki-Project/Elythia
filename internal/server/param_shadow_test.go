@@ -389,7 +389,10 @@ var apiRegistrationAllowed = map[string]string{
 	// 登録の無い/api/*に200と空のobjectを返すcatchall。goldenのendpointではない。
 	`api.Any("/*", apiCatchall)`: "router.go",
 	// プラグインのroute(/api/plugin/<名前>/...)。Elythia独自で、goldenに無い。
-	`api.Group(pluginRoutePrefix+def.Name, middleware.RejectAppToken())`: "plugin_wiring.go",
+	// pluginAppTokenPolicyはapp tokenを既定で拒否する。例外は
+	// POST /api/plugin/role-level/admin/change-expだけで、専用scope
+	// write:admin:role-level-experienceとhandlerの管理者/モデレーター認可を併用する。
+	`api.Group(pluginRoutePrefix+def.Name, pluginAppTokenPolicy())`: "plugin_wiring.go",
 }
 
 // apiBypassingRegistration matches a registration on the /api group that

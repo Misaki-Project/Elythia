@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -89,31 +90,35 @@ func prepareMisakiLegacy117(t *testing.T, f *dbFixture) {
 // 列・index・制約・enumを比較する。schema名と台帳だけはDBごとに異なる。
 func misakiSchemaCatalog(t *testing.T, f *dbFixture) []string {
 	t.Helper()
-	var rows []struct{ Kind, Owner, Name, Definition string }
-	require.NoError(t, f.db.Raw(`
+	type catalogRow struct{ Kind, Owner, Name, Definition string }
+	var rows []catalogRow
+	for _, query := range []string{`
 		SELECT 'column' AS kind, table_name AS owner, column_name AS name,
 		       ordinal_position::text || ':' || udt_name || ':' || is_nullable || ':' || coalesce(column_default, '') AS definition
 		FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name NOT IN ('schema_migrations', 'schema_migrations_local')
-		UNION ALL
-		SELECT 'index', tablename, indexname, indexdef FROM pg_indexes
-		WHERE schemaname = current_schema() AND tablename NOT IN ('schema_migrations', 'schema_migrations_local')
-		UNION ALL
-		SELECT 'constraint', c.relname, p.conname, pg_get_constraintdef(p.oid)
+		WHERE table_schema = current_schema() AND table_name NOT IN ('schema_migrations', 'schema_migrations_local')`, `
+		SELECT 'index' AS kind, tablename AS owner, indexname AS name, indexdef AS definition
+		FROM pg_indexes
+		WHERE schemaname = current_schema() AND tablename NOT IN ('schema_migrations', 'schema_migrations_local')`, `
+		SELECT 'constraint' AS kind, c.relname AS owner, p.conname AS name, pg_get_constraintdef(p.oid) AS definition
 		FROM pg_constraint p JOIN pg_class c ON c.oid = p.conrelid
 		WHERE p.connamespace = to_regnamespace(current_schema())
-		  AND c.relname NOT IN ('schema_migrations', 'schema_migrations_local')
-		UNION ALL
-		SELECT 'enum', typname, e.enumlabel, e.enumsortorder::text
+		  AND c.relname NOT IN ('schema_migrations', 'schema_migrations_local')`, `
+		SELECT 'enum' AS kind, typname AS owner, e.enumlabel AS name, e.enumsortorder::text AS definition
 		FROM pg_type p JOIN pg_enum e ON e.enumtypid = p.oid
-		WHERE p.typnamespace = to_regnamespace(current_schema())
-		ORDER BY 1, 2, 3`).Scan(&rows).Error)
+		WHERE p.typnamespace = to_regnamespace(current_schema())`,
+	} {
+		var part []catalogRow
+		require.NoError(t, f.db.Raw(query).Scan(&part).Error)
+		rows = append(rows, part...)
+	}
 	require.NotEmpty(t, rows)
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, fmt.Sprintf("%s:%s:%s:%s", row.Kind, row.Owner, row.Name,
 			strings.ReplaceAll(row.Definition, f.schema, "test_schema")))
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -136,6 +141,45 @@ func TestMisakiHistory_Legacy117ReachesSameSchemaAsFresh(t *testing.T) {
 	code, out = fresh.migrate(t, "-direction", "up")
 	require.Equal(t, 0, code, out)
 	assert.Equal(t, misakiSchemaCatalog(t, fresh), misakiSchemaCatalog(t, legacy))
+}
+
+func TestMisakiHistory_UpRefusesUnreconciledLegacy117(t *testing.T) {
+	f := newMisakiHistoryFixture(t, "misaki_refuse")
+	prepareMisakiLegacy117(t, f)
+	require.False(t, f.columnExists(t, "user", "accountCreatedAt"))
+	code, out := f.migrate(t, "-direction", "up")
+	assert.Equal(t, 1, code, out)
+	assert.Contains(t, out, "docs/misaki-migration-reconciliation.md")
+	assert.Equal(t, []int64{117}, f.versions(t, "schema_migrations"), "refusal must not advance the core ledger")
+	assert.False(t, f.tableExists(t, "schema_migrations_local"), "refusal must not create the local ledger")
+}
+
+func TestMisakiHistory_UpAcceptsCanonical117(t *testing.T) {
+	f := newMisakiHistoryFixture(t, "misaki_canonical117")
+	code, out := f.migrate(t, "-direction", "up", "-track", "core", "-steps", "117")
+	require.Equal(t, 0, code, out)
+	require.Equal(t, []int64{117}, f.versions(t, "schema_migrations"))
+	require.True(t, f.columnExists(t, "user", "accountCreatedAt"))
+	code, out = f.migrate(t, "-direction", "up")
+	require.Equal(t, 0, code, out)
+	assert.Equal(t, []int64{138}, f.versions(t, "schema_migrations"))
+	assert.Equal(t, []int64{1}, f.versions(t, "schema_migrations_local"))
+}
+
+func TestMisakiHistory_UpDoesNotGuardCustom117(t *testing.T) {
+	f := newDBFixture(t, "misaki_custom117")
+	f.coreDir, f.localDir = filepath.ToSlash(f.coreDir), filepath.ToSlash(f.localDir)
+	writeMigration(t, f.coreDir, "000001_custom", `CREATE TABLE custom_one (id int)`, `DROP TABLE custom_one`)
+	writeMigration(t, f.coreDir, "000117_custom", `CREATE TABLE custom_two (id int)`, `DROP TABLE custom_two`)
+	writeMigration(t, f.coreDir, "000118_custom", `CREATE TABLE custom_three (id int)`, `DROP TABLE custom_three`)
+	code, out := f.migrate(t, "-direction", "up", "-track", "core", "-steps", "2")
+	require.Equal(t, 0, code, out)
+	require.Equal(t, []int64{117}, f.versions(t, "schema_migrations"))
+	code, out = f.migrate(t, "-direction", "up")
+	require.Equal(t, 0, code, out)
+	assert.Equal(t, []int64{118}, f.versions(t, "schema_migrations"))
+	assert.True(t, f.tableExists(t, "custom_three"))
+	assert.False(t, f.tableExists(t, "schema_migrations_local"))
 }
 
 func TestMisakiHistory_RejectsAmbiguousLegacyStates(t *testing.T) {
