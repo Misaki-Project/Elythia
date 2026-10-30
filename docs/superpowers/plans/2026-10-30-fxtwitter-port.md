@@ -29,7 +29,7 @@
 
 ## Task 1: Generic host compatibility
 
-Files: `plugin/http.go`, `plugin/plugintest/*`, relevant `internal/server/plugin_*` adapter/tests; `frontend/packages/frontend/src/plugin-api.ts`, exports, lightbox/sensitive components/utilities and focused unit tests; `Dockerfile.bundled`, host API documentation.
+Files: `plugin/http.go`, `plugin/plugintest/*`, relevant `internal/server/plugin_*` adapter/tests; `frontend/packages/frontend/src/plugin-api.ts`, exports, lightbox/sensitive components/utilities and focused unit tests; `Dockerfile.bundled`, host API documentation; CI and Misaki plugin compatibility workflow pull-request base filters.
 
 Consumes: current Request/API/PreviewProvider contracts and old-copy reference at `E:/tmp/fxtwitter-preview-e2e-20261002`.
 Produces: optional authenticated active-role lookup for cold-fetch budgets, authenticated same-origin Blob fetch and media viewer host API with sensitivity preserved; only required stable component exports; selective disabled-plugin build inclusion. No Fx code in core.
@@ -37,6 +37,7 @@ Produces: optional authenticated active-role lookup for cold-fetch budgets, auth
 - [ ] Add focused behavior tests for each missing capability and record a meaningful RED.
 - [ ] Port the minimal generic API implementation onto current contracts; preserve optional-interface compatibility and fail-closed role lookup.
 - [ ] Verify focused tests, typecheck and host/plugin boundary tests; do not replace current coordinator or port TL preferences/manual activation.
+- [ ] Let CI and Misaki plugin compatibility run for stacked PR bases by removing only their pull_request branch filter, preserving push filters and read-only permissions.
 - [ ] Review spec compliance and code quality, commit only host files and docs.
 
 ## Task 2: Independent plugin backend
