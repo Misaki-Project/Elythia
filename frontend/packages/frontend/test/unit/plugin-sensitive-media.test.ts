@@ -6,6 +6,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/vue';
 import { defineComponent, h } from 'vue';
 import LightboxItem from '@/components/MkLightbox.item.vue';
+import type { Content } from '@/components/MkLightbox.item.vue';
 import { prefer } from '@/preferences.js';
 import { directives } from '@/directives/index.js';
 import { components } from '@/components/index.js';
@@ -23,12 +24,30 @@ afterEach(() => {
 	mocks.confirm.mockClear();
 });
 
-function renderItem(isSensitive = true, initiallyRevealed = false) {
+function renderItem(isSensitive = true, initiallyRevealed = false, content: Partial<Content> = {}) {
 	return render(LightboxItem, {
-		props: { content: { id: 'plugin-image', type: 'image', url: 'blob:plugin-image', width: 640, height: 480, isSensitive }, activated: true, initiallyRevealed, pixelatedZoom: false },
+		props: { content: { id: 'plugin-image', type: 'image', url: 'blob:plugin-image', width: 640, height: 480, isSensitive, ...content }, activated: true, initiallyRevealed, pixelatedZoom: false },
 		global: { directives, components },
 	});
 }
+
+test.each([
+	[undefined, 'A red kite above a lake', 'A red kite above a lake'],
+	['Drive description', 'Blob description', 'Drive description'],
+	['', 'Blob description', ''],
+	[null, 'Blob description', 'Blob description'],
+	[undefined, undefined, null],
+] as const)('real viewer alt respects DriveFile comment=%s and Blob alt=%s', (comment, alt, expected) => {
+	preferState.nsfw = 'respect';
+	const file: Content['file'] = comment === undefined ? undefined : {
+		id: 'drive-image', createdAt: '2026-10-31T00:00:00.000Z', name: 'drive.png', type: 'image/png',
+		md5: '0123456789abcdef0123456789abcdef', size: 1, isSensitive: false, blurhash: null, properties: {},
+		url: 'blob:drive-image', thumbnailUrl: null, comment, folderId: null, userId: null,
+	};
+	const result = renderItem(false, false, { alt, file, filename: 'download.png' });
+	expect(result.container.querySelector('img[src="blob:plugin-image"]')?.getAttribute('alt')).toBe(expected);
+	expect(result.container.textContent).toContain('download.png');
+});
 
 test('plugin-owned sensitive media hides actual image and requires confirmation before reveal', async () => {
 	preferState.nsfw = 'respect';

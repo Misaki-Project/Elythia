@@ -129,6 +129,7 @@ export type PluginMediaItem = {
 	width?: number | null;
 	height?: number | null;
 	filename?: string | null;
+	alt?: string;
 	isSensitive?: boolean;
 	initiallyRevealed?: boolean;
 };
@@ -464,7 +465,7 @@ function buildHost(name: string): PluginHost {
 					objectUrls.push(url);
 					return {
 						id: item.id, type: item.type, url, thumbnailUrl: url,
-						width: item.width, height: item.height, filename: item.filename,
+						width: item.width, height: item.height, filename: item.filename, alt: item.alt,
 						isSensitive: item.isSensitive === true,
 					};
 				});

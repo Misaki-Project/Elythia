@@ -66,6 +66,17 @@ describe('plugin Blob fetch', () => {
 });
 
 describe('plugin media viewer', () => {
+	test('preserves alt text independently of the download filename', async () => {
+		vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:alt-image');
+		vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+		const api = await host();
+		await api.openMedia([{ id: 'alt-image', type: 'image', blob: new Blob(['image'], { type: 'image/png' }), filename: 'download.png', alt: 'A red kite above a lake' }]);
+		const [component, props, events] = mocks.popup.mock.calls[0];
+		await component;
+		expect(props).toMatchObject({ contents: [{ id: 'alt-image', filename: 'download.png', alt: 'A red kite above a lake' }] });
+		(events as { closed(): void }).closed();
+	});
+
 	test('passes explicit sensitivity and selection to the lightbox and revokes URLs on close', async () => {
 		const create = vi.spyOn(URL, 'createObjectURL').mockReturnValueOnce('blob:first').mockReturnValueOnce('blob:second');
 		const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
