@@ -23,6 +23,7 @@ import (
 	"github.com/elythia-network/elythia/internal/bgwork"
 	coredrive "github.com/elythia-network/elythia/internal/core/drive"
 	corerole "github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/pluginstore"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/queue/driver"
@@ -765,10 +766,14 @@ func (c *pluginContext) startGo(fn func(context.Context)) {
 
 // --- Router ---
 
+type pluginActiveRolesProvider interface {
+	GetUserRolesStrict(string) ([]*model.Role, error)
+}
+
 type pluginRouter struct {
 	group      *echo.Group
 	roles      middleware.RoleChecker
-	roleLister corerole.UserRolesProvider
+	roleLister pluginActiveRolesProvider
 	// err holds the first registration failure (pluginJobs と同じ方針)。
 	err error
 }
@@ -803,8 +808,8 @@ func reservedPluginPath(path string) bool {
 // エラーはhost-ownedのStatusErrorまたはcoded status errorのときだけメッセージを
 // 返す。素のerrorを返すとプラグインの内部事情 (DBのエラー文字列など) がそのまま
 // 外に出るため、ログにだけ残して汎用メッセージを返す。
-func wrapPluginHandler(h plugin.Handler, roles middleware.RoleChecker, roleListers ...corerole.UserRolesProvider) echo.HandlerFunc {
-	var roleLister corerole.UserRolesProvider
+func wrapPluginHandler(h plugin.Handler, roles middleware.RoleChecker, roleListers ...pluginActiveRolesProvider) echo.HandlerFunc {
+	var roleLister pluginActiveRolesProvider
 	if len(roleListers) > 0 {
 		roleLister = roleListers[0]
 	}
@@ -878,7 +883,7 @@ func writePluginBlob(c echo.Context, b plugin.Blob) error {
 
 type pluginRequest struct {
 	c          echo.Context
-	roleLister corerole.UserRolesProvider
+	roleLister pluginActiveRolesProvider
 	// roles は権限判定に使う。未配線なら常に false を返す (画面は出ても
 	// API は通らない、という安全側に倒す)。
 	roles middleware.RoleChecker
@@ -955,7 +960,7 @@ func (r *pluginRequest) ActiveRoleIDs() ([]string, error) {
 	if r.roleLister == nil {
 		return nil, errors.New("active role lookup is unavailable")
 	}
-	roles, err := r.roleLister.GetUserRoles(id)
+	roles, err := r.roleLister.GetUserRolesStrict(id)
 	if err != nil {
 		return nil, err
 	}
