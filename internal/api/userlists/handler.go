@@ -9,6 +9,7 @@ import (
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
@@ -28,6 +29,9 @@ type Handler struct {
 	favoriteRepo       UserListFavoriteReader
 	proxyFollow        ProxyFollowEnqueuer
 	userListEventPub   UserListEventPublisher
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // UserListFavoriteReader abstracts the favorite count / exists lookup for
@@ -39,14 +43,11 @@ type UserListFavoriteReader interface {
 }
 
 // NewHandler creates a new userlists Handler.
-func NewHandler(repo repository.UserListRepository, idGen id.Generator) *Handler {
-	return &Handler{repo: repo, idGen: idGen}
-}
-
-// SetRolePolicyProvider wires a role policy source so Create / Push enforce
-// the userListLimit / userEachUserListsLimit role policies (#1029).
-func (h *Handler) SetRolePolicyProvider(p role.PolicyProvider) {
-	h.rolePolicyProvider = p
+// entityPacker is the Packer this Handler packs entities with (#3794);
+// rolePolicyProvider enforces the userListLimit / userEachUserListsLimit role
+// policies (#1029).
+func NewHandler(repo repository.UserListRepository, idGen id.Generator, entityPacker *entity.Packer, rolePolicyProvider role.PolicyProvider) *Handler {
+	return &Handler{repo: repo, idGen: idGen, entityPacker: entityPacker, rolePolicyProvider: rolePolicyProvider}
 }
 
 // SetUserRepo wires a UserRepository so Push can validate the target user's
@@ -181,9 +182,15 @@ func (h *Handler) Create(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.Name == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "name is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
+	// upstream users/lists/create.ts の name は maxLength 100。NUL と不正な UTF-8 も
+	// 保存できない (どちらも検査が無く、SQLSTATE 22021 / 22001 で 500 になっていた)。
+	if !colfit.Fits(req.Name, 100) {
+		return apierr.JSONInvalidParam(c)
+	}
 	// userListLimit role policy gate (#1029)。
 	if h.rolePolicyProvider != nil {
-		if limit, ok := role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(user.ID)["userListLimit"]); ok && limit >= 0 {
+		// 負の値は upstream と同じく「1 件も作れない」になる (`count >= limit` が常に真)。
+		if limit, ok := role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(user.ID)["userListLimit"]); ok {
 			count, err := h.repo.CountByUser(user.ID)
 			if err != nil {
 				return apierr.JSONInternalError(c)
@@ -336,7 +343,8 @@ func (h *Handler) Push(c echo.Context) error {
 	// userEachUserListsLimit role policy gate (#1029)。list owner の policy
 	// で評価する (= owner == viewer は直上で確定済)。
 	if h.rolePolicyProvider != nil {
-		if limit, ok := role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(list.UserID)["userEachUserListsLimit"]); ok && limit >= 0 {
+		// 負の値は upstream と同じく「1 件も作れない」になる (`count >= limit` が常に真)。
+		if limit, ok := role.PolicyNumber(h.rolePolicyProvider.GetUserPolicies(list.UserID)["userEachUserListsLimit"]); ok {
 			count, err := h.repo.CountMembers(list.ID)
 			if err != nil {
 				return apierr.JSONInternalError(c)
@@ -370,7 +378,7 @@ func (h *Handler) Push(c echo.Context) error {
 	// (#1549、upstream UserListService.addMember の publishUserListStream)。
 	// body は packed UserLite (= upstream userEntityService.pack(target))。
 	if h.userListEventPub != nil && target != nil {
-		h.userListEventPub.PublishUserListEvent(list.ID, "userAdded", entity.PackUserLite(target))
+		h.userListEventPub.PublishUserListEvent(list.ID, "userAdded", h.entityPacker.PackUserLite(target))
 	}
 	return c.NoContent(http.StatusNoContent)
 }
@@ -420,7 +428,7 @@ func (h *Handler) Pull(c echo.Context) error {
 	// userList channel に userRemoved を流して member list を live 更新する
 	// (#1549、upstream UserListService.removeMember の publishUserListStream)。
 	if h.userListEventPub != nil && target != nil {
-		h.userListEventPub.PublishUserListEvent(list.ID, "userRemoved", entity.PackUserLite(target))
+		h.userListEventPub.PublishUserListEvent(list.ID, "userRemoved", h.entityPacker.PackUserLite(target))
 	}
 	return c.NoContent(http.StatusNoContent)
 }
@@ -453,9 +461,3 @@ func (h *Handler) Delete(c echo.Context) error {
 	}
 	return c.NoContent(http.StatusNoContent)
 }
-
-// HasRolePolicyProvider reports whether the role policy provider was wired.
-//
-// 未配線だと `userListLimit` と `userEachUserListsLimit` が両方とも効かない。
-// 起動時検査に使う (#2683)。
-func (h *Handler) HasRolePolicyProvider() bool { return h.rolePolicyProvider != nil }

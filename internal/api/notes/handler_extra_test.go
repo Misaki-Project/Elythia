@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/core/translate"
 	"github.com/elythia-network/elythia/internal/entitycompat/shapetest"
+	"github.com/elythia-network/elythia/internal/misc/hashtag"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/server/middleware"
@@ -40,10 +42,10 @@ func newExtraHandlerWithFollowing(t *testing.T) (*Handler, *testutil.MockNoteRep
 	followingRepo := testutil.NewMockFollowingRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, followingRepo)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 	h.SetFavoriteRepo(favRepo)
 	return h, noteRepo, favRepo, followingRepo
 }
@@ -159,7 +161,7 @@ func TestFavoritesCreate_NilRepo(t *testing.T) {
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic}
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
 	// SetFavoriteRepo を呼ばない → favoriteRepo は nil のまま
 	rec := postExtra(h.FavoritesCreate, `{"noteId":"n1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -173,7 +175,7 @@ func TestFavoritesCreate_NoQueryServiceRejects(t *testing.T) {
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic}
 	favRepo := testutil.NewMockNoteFavoriteRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen) // queryService=nil
+	h := newHandlerNilDeps(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen) // queryService=nil
 	h.SetFavoriteRepo(favRepo)
 	rec := postExtra(h.FavoritesCreate, `{"noteId":"n1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -340,7 +342,7 @@ func TestFavoritesDelete_InvalidParam(t *testing.T) {
 
 func TestFavoritesDelete_NilRepo(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(testutil.NewMockNoteRepository(), nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(testutil.NewMockNoteRepository(), nil, nil, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.FavoritesDelete, `{"noteId":"n1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -375,8 +377,8 @@ func TestFeatured_FiltersMutedAuthor(t *testing.T) {
 	mutingRepo.Mutings["m1"] = &model.Muting{ID: "m1", MuterID: "viewer", MuteeID: "muted"}
 	userRepo := testutil.NewMockUserRepository()
 	userRepo.Users["viewer"] = &model.User{ID: "viewer", Username: "viewer", UsernameLower: "viewer"}
-	h.SetMutingRepo(mutingRepo)
-	h.SetBlockingRepo(testutil.NewMockBlockingRepository())
+	h.mutingRepo = mutingRepo
+	h.blockingRepo = testutil.NewMockBlockingRepository()
 	h.SetUserRepo(userRepo)
 
 	rec := postExtra(h.Featured, `{}`, &model.User{ID: "viewer"})
@@ -401,6 +403,38 @@ func TestFeatured_ChannelFilter(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	require.Len(t, resp, 1)
 	assert.Equal(t, "n_ch", resp[0]["id"])
+}
+
+// 本家の notes/featured は allowGet: true。GET の query の channelId / limit も
+// 読むこと。読まないと、全体の注目ノートが channelId 付きの URL で public に
+// キャッシュされる (#3593)。
+func TestFeatured_GetReadsQuery(t *testing.T) {
+	h, noteRepo, _ := newExtraHandler(t)
+	chID := "ch1"
+	noteRepo.Notes["n_ch1"] = &model.Note{ID: "n_ch1", UserID: "u1", Visibility: "public", ChannelID: &chID, User: &model.User{ID: "u1"}}
+	noteRepo.Notes["n_ch2"] = &model.Note{ID: "n_ch2", UserID: "u1", Visibility: "public", ChannelID: &chID, User: &model.User{ID: "u1"}}
+	noteRepo.Notes["n_glb"] = &model.Note{ID: "n_glb", UserID: "u1", Visibility: "public", User: &model.User{ID: "u1"}}
+	get := func(query string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		_ = h.Featured(echo.New().NewContext(httptest.NewRequest(http.MethodGet, "/api/notes/featured?"+query, nil), rec))
+		return rec
+	}
+
+	rec := get("channelId=ch1")
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp, 2)
+	for _, n := range resp {
+		assert.NotEqual(t, "n_glb", n["id"])
+	}
+
+	rec = get("channelId=ch1&limit=1")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Len(t, resp, 1)
+
+	assert.Equal(t, http.StatusBadRequest, get("limit=abc").Code)
 }
 
 // --- Unrenote ---
@@ -478,6 +512,33 @@ func TestMentions_InvalidJSON(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// visibility は note_visibility_enum が受け付ける値と空文字 (未指定) だけを通す (#3518)。
+//
+// **通すと 500 になる。** 値は `note.visibility = ?` にそのまま渡り、enum への
+// 型変換で PostgreSQL がクエリごと落とす。mock の repository は落ちないので、
+// 検査を外すとここが 200 になる。
+func TestMentions_RejectsUnknownVisibility(t *testing.T) {
+	for _, v := range []string{"private", "bogus", "PUBLIC", "public "} {
+		t.Run(v, func(t *testing.T) {
+			h, _, _ := newExtraHandler(t)
+			rec := postExtra(h.Mentions, `{"visibility":"`+v+`"}`, &model.User{ID: "u1"})
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+		})
+	}
+}
+
+// 受け入れる値はリテラルで書く (定数を参照すると、集合を変える変異と一緒に
+// 期待値まで動く)。
+func TestMentions_AcceptsKnownVisibility(t *testing.T) {
+	for _, v := range []string{"", "public", "home", "followers", "specified"} {
+		t.Run("v="+v, func(t *testing.T) {
+			h, _, _ := newExtraHandler(t)
+			rec := postExtra(h.Mentions, `{"visibility":"`+v+`"}`, &model.User{ID: "u1"})
+			assert.Equal(t, http.StatusOK, rec.Code)
+		})
+	}
+}
+
 // #1554 mentions は viewer が mute した author の note を除外する。
 func TestMentions_FiltersMutedAuthor(t *testing.T) {
 	h, noteRepo, _ := newExtraHandler(t)
@@ -486,8 +547,8 @@ func TestMentions_FiltersMutedAuthor(t *testing.T) {
 	mutingRepo.Mutings["mx"] = &model.Muting{ID: "mx", MuterID: "u1", MuteeID: "muted"}
 	userRepo := testutil.NewMockUserRepository()
 	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "u1", UsernameLower: "u1"}
-	h.SetMutingRepo(mutingRepo)
-	h.SetBlockingRepo(testutil.NewMockBlockingRepository())
+	h.mutingRepo = mutingRepo
+	h.blockingRepo = testutil.NewMockBlockingRepository()
 	h.SetUserRepo(userRepo)
 
 	ids := mentionIDs(t, postExtra(h.Mentions, `{}`, &model.User{ID: "u1"}))
@@ -596,7 +657,7 @@ func TestUserListTimeline_Success(t *testing.T) {
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, testutil.NewMockFollowingRepository())
-	h := NewHandler(noteRepo, corenote.NewCreateService(noteRepo, pollRepo, idGen, nil), corenote.NewDeleteService(noteRepo), querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil), corenote.NewDeleteService(noteRepo), querySvc, nil, nil, nil, nil, idGen)
 	listRepo := testutil.NewMockUserListRepository()
 	listRepo.Lists["l1"] = &model.UserList{ID: "l1", UserID: "u1", Name: "my list"}
 	h.SetUserListRepo(listRepo)
@@ -673,7 +734,7 @@ func TestUserListTimeline_PassesFilterToRepo(t *testing.T) {
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, fRepo)
-	h := NewHandler(noteRepo, corenote.NewCreateService(noteRepo, pollRepo, idGen, nil), corenote.NewDeleteService(noteRepo), querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil), corenote.NewDeleteService(noteRepo), querySvc, nil, nil, nil, nil, idGen)
 	h.SetUserListRepo(listRepo)
 
 	rec := postExtra(h.UserListTimeline,
@@ -714,7 +775,7 @@ func TestUserListTimeline_WithoutUserListRepo(t *testing.T) {
 	// 行わない userListNotesRepo fake を使う。
 	noteRepo := &userListNotesRepo{MockNoteRepository: testutil.NewMockNoteRepository(), rows: nil}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.UserListTimeline, `{"listId":"l1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
@@ -727,7 +788,7 @@ func (f *failingListByUserListRepo) ListByUserList(_ string, _ int, _, _ string,
 
 func TestUserListTimeline_RepoError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failingListByUserListRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(&failingListByUserListRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.UserListTimeline, `{"listId":"l1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -752,6 +813,46 @@ func TestSearchByTag_InvalidParam(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// query のグループ数とグループ内のタグ数に上限を置く。上限ちょうどは通し、
+// 1 つ超えたら本家の INVALID_PARAM で拒否する。
+func TestSearchByTag_QuerySizeLimits(t *testing.T) {
+	groupsOf := func(groups, tagsPerGroup int) string {
+		q := make([][]string, groups)
+		for i := range q {
+			q[i] = make([]string, tagsPerGroup)
+			for j := range q[i] {
+				q[i][j] = fmt.Sprintf("t%d_%d", i, j)
+			}
+		}
+		b, err := json.Marshal(map[string]any{"query": q})
+		require.NoError(t, err)
+		return string(b)
+	}
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"groups at limit", groupsOf(maxSearchByTagGroups, 1), http.StatusOK},
+		{"groups over limit", groupsOf(maxSearchByTagGroups+1, 1), http.StatusBadRequest},
+		{"tags per group at limit", groupsOf(1, hashtag.MaxNoteTags), http.StatusOK},
+		{"tags per group over limit", groupsOf(1, hashtag.MaxNoteTags+1), http.StatusBadRequest},
+		{"empty strings still count", `{"query":[["` + strings.Repeat(`","`, hashtag.MaxNoteTags) + `"]]}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, _ := newExtraHandler(t)
+			rec := postExtra(h.SearchByTag, tc.body, nil)
+			require.Equal(t, tc.want, rec.Code, rec.Body.String())
+			if tc.want == http.StatusBadRequest {
+				var resp map[string]map[string]any
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+				assert.Equal(t, "INVALID_PARAM", resp["error"]["code"])
+			}
+		})
+	}
+}
+
 // #1554 search-by-tag の reply filter: reply=true は reply note のみ返す。
 func TestSearchByTag_ReplyFilter(t *testing.T) {
 	h, noteRepo, _ := newExtraHandler(t)
@@ -774,8 +875,8 @@ func TestSearchByTag_FiltersMutedAuthor(t *testing.T) {
 	mutingRepo.Mutings["m1"] = &model.Muting{ID: "m1", MuterID: "viewer", MuteeID: "muted"}
 	userRepo := testutil.NewMockUserRepository()
 	userRepo.Users["viewer"] = &model.User{ID: "viewer", Username: "viewer", UsernameLower: "viewer"}
-	h.SetMutingRepo(mutingRepo)
-	h.SetBlockingRepo(testutil.NewMockBlockingRepository())
+	h.mutingRepo = mutingRepo
+	h.blockingRepo = testutil.NewMockBlockingRepository()
 	h.SetUserRepo(userRepo)
 
 	rec := postExtra(h.SearchByTag, `{"tag":"t"}`, &model.User{ID: "viewer"})
@@ -886,7 +987,7 @@ func (f *failingSearchByTagRepo) SearchByTag(_ [][]string, _ string, _ int, _, _
 
 func TestSearchByTag_RepoError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failingSearchByTagRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(&failingSearchByTagRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.SearchByTag, `{"tag":"x"}`, nil)
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
@@ -905,7 +1006,7 @@ func TestClips_Success(t *testing.T) {
 // 返す (汎用 RequireRolePolicy の 403 ROLE_PERMISSION_DENIED ではない、upstream translate.ts:72-75)。
 func TestTranslate_CannotUseTranslator_503Unavailable(t *testing.T) {
 	h, noteRepo, _ := newExtraHandler(t)
-	h.SetPolicyProvider(&draftStubPolicyProvider{policies: map[string]any{"canUseTranslator": false}})
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{"canUseTranslator": false}}
 	txt := "hello"
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: &txt}
 	rec := postExtra(h.Translate, `{"noteId":"n1","targetLang":"en"}`, &model.User{ID: "viewer"})
@@ -919,7 +1020,7 @@ func TestTranslate_CannotUseTranslator_503Unavailable(t *testing.T) {
 // (gate で弾かれていれば note fetch 前に 400 になる)。
 func TestTranslate_CanUseTranslator_PassesPolicyGate(t *testing.T) {
 	h, noteRepo, _ := newExtraHandler(t)
-	h.SetPolicyProvider(&draftStubPolicyProvider{policies: map[string]any{"canUseTranslator": true}})
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{"canUseTranslator": true}}
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: nil}
 	rec := postExtra(h.Translate, `{"noteId":"n1","targetLang":"en"}`, &model.User{ID: "viewer"})
 	assert.Equal(t, http.StatusNoContent, rec.Code, "policy gate 通過後 null-text 204 に到達 (#2010)")
@@ -964,7 +1065,7 @@ func newTranslateHandler(t *testing.T) (*Handler, *testutil.MockNoteRepository, 
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, followingRepo)
-	h := NewHandler(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
 	h.SetTranslator(translate.NewDeepL("dummy", false, nil))
 	return h, noteRepo, followingRepo
 }
@@ -1041,7 +1142,7 @@ func TestTranslate_NoQueryServiceRejects(t *testing.T) {
 	secret := "secret body"
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: &secret}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen) // queryService=nil
+	h := newHandlerNilDeps(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen) // queryService=nil
 	h.SetTranslator(translate.NewDeepL("dummy", false, nil))
 	rec := postExtra(h.Translate, `{"noteId":"n1","targetLang":"en"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -1057,10 +1158,10 @@ func TestShowPartialBulk_Success(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	noteRepo.Notes["n1"] = &model.Note{
 		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
@@ -1078,7 +1179,7 @@ func TestShowPartialBulk_DiffShape(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
 	text := "hello"
 	noteRepo.Notes["n1"] = &model.Note{
 		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
@@ -1114,7 +1215,7 @@ func (f *failingFindManyRepo) FindManyByIDsWithUser(_ []string) ([]*model.Note, 
 
 func TestShowPartialBulk_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failingFindManyRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(&failingFindManyRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.ShowPartialBulk, `{"noteIds":["n1"]}`, nil)
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
@@ -1127,7 +1228,7 @@ func TestShowPartialBulk_InvalidParam(t *testing.T) {
 
 // queryService 未配線時は note 行があっても空配列を返す fail-closed 挙動
 // を担保する (Devin #529 FLAG-1、Show / BulkShow と同種の defensive)。
-// router.go で RequireAuth() 無しに公開している endpoint なので、
+// internal/server のルートの登録で RequireAuth() 無しに公開している endpoint なので、
 // followers / specified visibility のノートを匿名閲覧者に漏らさないため
 // に重要。
 func TestShowPartialBulk_NoQueryServiceRejects(t *testing.T) {
@@ -1136,7 +1237,7 @@ func TestShowPartialBulk_NoQueryServiceRejects(t *testing.T) {
 	// fail-closed 挙動を担保する。
 	noteRepo := testutil.NewMockNoteRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen)
 	noteRepo.Notes["n1"] = &model.Note{
 		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
 		User: &model.User{ID: "u1"},
@@ -1160,7 +1261,7 @@ func TestFavoritesCreate_CreateError(t *testing.T) {
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic}
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
 	h.SetFavoriteRepo(&failingFavCreateRepo{testutil.NewMockNoteFavoriteRepository()})
 	rec := postExtra(h.FavoritesCreate, `{"noteId":"n1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -1176,7 +1277,7 @@ func TestFavoritesDelete_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	noteRepo := testutil.NewMockNoteRepository()
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic}
-	h := NewHandler(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, nil, nil, nil, nil, nil, idGen)
 	// note 存在 + favorite 存在の状態で Delete だけ失敗させ、500 経路を踏ませる。
 	failing := &failingFavDeleteRepo{testutil.NewMockNoteFavoriteRepository()}
 	failing.Favorites["u1:n1"] = &model.NoteFavorite{UserID: "u1", NoteID: "n1"}
@@ -1193,7 +1294,7 @@ func (f *failingFeaturedRepo) ListFeatured(_, _ string, _, _ int) ([]*model.Note
 
 func TestFeatured_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failingFeaturedRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(&failingFeaturedRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.Featured, `{}`, nil)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -1213,7 +1314,7 @@ func TestUnrenote_ListError(t *testing.T) {
 	noteRepo.Notes["orig"] = &model.Note{ID: "orig", UserID: "u1"}
 	failing := &failingListRenotesRepo{MockNoteRepository: noteRepo}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(failing, nil, corenote.NewDeleteService(failing), nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(failing, nil, corenote.NewDeleteService(failing), nil, nil, nil, nil, nil, idGen)
 
 	rec := postExtra(h.Unrenote, `{"noteId":"orig"}`, &model.User{ID: "u1"})
 
@@ -1227,7 +1328,7 @@ func TestUnrenote_DeleteError(t *testing.T) {
 	noteRepo.Notes["rn1"] = &model.Note{ID: "rn1", UserID: "u1", RenoteID: &renoteID}
 	idGen, _ := id.NewGenerator("aidx")
 	deleteSvc := corenote.NewDeleteService(&failingDeleteNoteRepo{noteRepo})
-	h := NewHandler(noteRepo, nil, deleteSvc, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, deleteSvc, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.Unrenote, `{"noteId":"orig"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -1240,7 +1341,7 @@ func (f *failingMentionsRepo) ListMentions(_, _ string, _ bool, _ int, _, _ stri
 
 func TestMentions_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failingMentionsRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(&failingMentionsRepo{testutil.NewMockNoteRepository()}, nil, nil, nil, nil, nil, nil, nil, idGen)
 	rec := postExtra(h.Mentions, `{}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -1264,7 +1365,7 @@ func captureTranslateHandler(t *testing.T) (*Handler, *testutil.MockNoteReposito
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, followingRepo)
-	h := NewHandler(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, nil, nil, querySvc, nil, nil, nil, nil, idGen)
 	h.SetTranslator(translate.NewDeepLWithClient("key", srv.URL, srv.Client()))
 	return h, noteRepo, &sent
 }
@@ -1298,5 +1399,80 @@ func TestTranslate_BlankText_204(t *testing.T) {
 		rec := postExtra(h.Translate, `{"noteId":"n1","targetLang":"en"}`, nil)
 		assert.Equal(t, http.StatusNoContent, rec.Code, "空白のみは 204 (%q)", txt)
 		assert.Empty(t, *sent, "DeepL を呼ばない (%q)", txt)
+	}
+}
+
+// notConfiguredTranslator answers like a MetaDeepL whose meta has no key.
+type notConfiguredTranslator struct{ calls int }
+
+func (n *notConfiguredTranslator) Translate(context.Context, string, string) (*translate.TranslateResult, error) {
+	n.calls++
+	return nil, translate.ErrNotConfigured
+}
+
+// キーを翻訳のたびに meta から読むので (#3663)、未設定は Translate の
+// ErrNotConfigured で分かる。本家の `deeplAuthKey == null` と同じ
+// UNAVAILABLE にし、空白だけの本文の 204 はその前に返す (本家の順序)。
+func TestTranslate_TranslatorNotConfigured_Unavailable(t *testing.T) {
+	noteRepo := testutil.NewMockNoteRepository()
+	followingRepo := testutil.NewMockFollowingRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	h := newHandlerNilDeps(noteRepo, nil, nil, corenote.NewQueryService(noteRepo, followingRepo), nil, nil, nil, nil, idGen)
+	tr := &notConfiguredTranslator{}
+	h.SetTranslator(tr)
+
+	txt, blank := "本文", "  "
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: &txt}
+	noteRepo.Notes["n2"] = &model.Note{ID: "n2", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: &blank}
+
+	rec := postExtra(h.Translate, `{"noteId":"n1","targetLang":"en"}`, nil)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	code, idStr := translateBody(t, rec)
+	assert.Equal(t, "UNAVAILABLE", code)
+	assert.Equal(t, "50a70314-2d8a-431b-b433-efa5cc56444c", idStr)
+	assert.Equal(t, 1, tr.calls)
+
+	rec = postExtra(h.Translate, `{"noteId":"n2","targetLang":"en"}`, nil)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, 1, tr.calls, "blank text must not reach the translator")
+}
+
+// tag と query の各タグは、本家の paramDef と同じく 128 文字 (code point) までで、
+// 超えたら INVALID_PARAM。数えるのは正規化 (NFKC) の前の文字数。
+func TestSearchByTag_TagLengthLimit(t *testing.T) {
+	queryOf := func(tag string) string {
+		b, err := json.Marshal(map[string]any{"query": [][]string{{"ok", tag}}})
+		require.NoError(t, err)
+		return string(b)
+	}
+	tagOf := func(tag string) string {
+		b, err := json.Marshal(map[string]any{"tag": tag})
+		require.NoError(t, err)
+		return string(b)
+	}
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"tag at limit", tagOf(strings.Repeat("あ", 128)), http.StatusOK},
+		{"tag over limit", tagOf(strings.Repeat("あ", 129)), http.StatusBadRequest},
+		{"tag over limit before normalization", tagOf(strings.Repeat("e\u0301", 65)), http.StatusBadRequest},
+		{"query tag at limit", queryOf(strings.Repeat("あ", 128)), http.StatusOK},
+		{"query tag over limit", queryOf(strings.Repeat("あ", 129)), http.StatusBadRequest},
+		{"query tag over limit before normalization", queryOf(strings.Repeat("e\u0301", 65)), http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, _ := newExtraHandler(t)
+			rec := postExtra(h.SearchByTag, tc.body, nil)
+			require.Equal(t, tc.want, rec.Code, rec.Body.String())
+			if tc.want == http.StatusBadRequest {
+				var resp map[string]map[string]any
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+				assert.Equal(t, "INVALID_PARAM", resp["error"]["code"])
+				assert.Equal(t, "3d81ceae-475f-4600-b2a8-2bc116157532", resp["error"]["id"])
+			}
+		})
 	}
 }

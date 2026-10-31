@@ -1,22 +1,33 @@
 package hashtags
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/meself"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/api/userrelation"
+	corehashtag "github.com/elythia-network/elythia/internal/core/hashtag"
 	"github.com/elythia-network/elythia/internal/core/userpack"
+	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/colfit"
+	"github.com/elythia-network/elythia/internal/misc/hashtag"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/misc/searchnorm"
 	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/labstack/echo/v4"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 )
 
@@ -33,34 +44,33 @@ type Handler struct {
 	// moderators は閲覧者がモデレーターかを判定する。本家 packMany はモデレーターに
 	// moderationNote と 2FA の項目を足し、カウントのゲートを外す (#3330)。
 	moderators userpack.ModeratorChecker
+	// trendFlight は hashtags/trend の同時の集計を 1 回にまとめる (#3579)。
+	// プロセスごとに持つので、複数プロセスで動かすとプロセスの数だけ集計する。
+	trendFlight singleflight.Group
+	// meta は hashtags/trend から meta.hiddenTags / meta.sensitiveWords に当たる
+	// タグを外すのに使う (#3628)。キャッシュ付きの meta (metaUpdated で無効化される)
+	// を渡す。nil なら外さない (NewHandler の必須の引数で受ける。#3817)。
+	meta repository.MetaRepository
+	// selfPacker は閲覧者自身を MeDetailed へ昇格させ、/api/i の handler で未読・
+	// role・ピン留めを埋める (#3784)。未配線なら補完せずに昇格だけする。
+	selfPacker *meself.Packer
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// SetModeratorChecker wires the moderator check of hashtags/users (#3330).
-func (h *Handler) SetModeratorChecker(m userpack.ModeratorChecker) {
-	h.moderators = m
-}
-
-// HasModeratorChecker reports whether the moderator check was wired.
-//
-// 未配線だとモデレーターにも moderationNote などが出ず、非公開のカウントも
-// 0 のまま返る。起動時検査に使う。
-func (h *Handler) HasModeratorChecker() bool { return h.moderators != nil }
-
-// SetDetailExtras wires the batch filler of pinnedNotes / pinnedPage / movedTo /
-// alsoKnownAs for hashtags/users (#3330).
-func (h *Handler) SetDetailExtras(x userpack.DetailExtrasMany) {
-	h.extras = x
-}
-
-// HasDetailExtras reports whether the detail extras filler was wired.
-//
-// 未配線だと hashtags/users の pinnedNotes などが空、movedTo / alsoKnownAs が
-// null のまま返る。起動時検査に使う。
-func (h *Handler) HasDetailExtras() bool { return h.extras != nil }
+// SetSelfPacker wires the Packer that promotes the viewer's own entry into
+// MeDetailed. Unset promotes without the handler-only fields.
+func (h *Handler) SetSelfPacker(p *meself.Packer) { h.selfPacker = p }
 
 // NewHandler creates a new hashtags Handler.
-func NewHandler(db *gorm.DB) *Handler {
-	return &Handler{db: db}
+// entityPacker is the Packer this handler packs entities with (#3792); extras
+// fills pinnedNotes / pinnedPage / movedTo / alsoKnownAs for hashtags/users
+// (#3330); moderators gates the moderator-only fields and counts of
+// hashtags/users; meta supplies the hidden tags and sensitive words kept out of
+// hashtags/trend (#3628).
+func NewHandler(db *gorm.DB, entityPacker *entity.Packer, extras userpack.DetailExtrasMany, moderators userpack.ModeratorChecker, meta repository.MetaRepository) *Handler {
+	return &Handler{db: db, entityPacker: entityPacker, extras: extras, moderators: moderators, meta: meta}
 }
 
 // SetIDGen wires the configured ID generator so Trend / Users use the operator's
@@ -98,13 +108,13 @@ var listSortOrders = map[string]string{
 
 // List handles POST /api/hashtags/list.
 func (h *Handler) List(c echo.Context) error {
+	// offset は本家の paramDef に無いので、本家と同じく読まない (#3746)。
 	var req struct {
-		Limit                    *int   `json:"limit"`
-		Sort                     string `json:"sort"`
-		Offset                   int    `json:"offset"`
-		AttachedToUserOnly       bool   `json:"attachedToUserOnly"`
-		AttachedToLocalUserOnly  bool   `json:"attachedToLocalUserOnly"`
-		AttachedToRemoteUserOnly bool   `json:"attachedToRemoteUserOnly"`
+		Limit                    *jsnum.Int `json:"limit"`
+		Sort                     string     `json:"sort"`
+		AttachedToUserOnly       bool       `json:"attachedToUserOnly"`
+		AttachedToLocalUserOnly  bool       `json:"attachedToLocalUserOnly"`
+		AttachedToRemoteUserOnly bool       `json:"attachedToRemoteUserOnly"`
 	}
 	if err := c.Bind(&req); err != nil || req.Sort == "" {
 		// upstream Misskey TS は paramDef で sort を required にしている (#925)。
@@ -115,7 +125,7 @@ func (h *Handler) List(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "sort must be one of upstream-defined enum.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -131,9 +141,6 @@ func (h *Handler) List(c echo.Context) error {
 		q = q.Where(`"attachedRemoteUsersCount" != 0`)
 	}
 	q = q.Order(order).Limit(limit)
-	if req.Offset > 0 {
-		q = q.Offset(req.Offset)
-	}
 	var tags []*model.Hashtag
 	if err := q.Find(&tags).Error; err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
@@ -147,33 +154,36 @@ func (h *Handler) List(c echo.Context) error {
 
 // Search handles POST /api/hashtags/search.
 func (h *Handler) Search(c echo.Context) error {
+	// query は欠落(nil)と空文字列を区別する。本家は空文字列を通し、前方一致の
+	// '%' で全タグから返す (#3746)。
 	var req struct {
-		Query  string `json:"query"`
-		Limit  *int   `json:"limit"`
-		Offset int    `json:"offset"`
+		Query  *string    `json:"query"`
+		Limit  *jsnum.Int `json:"limit"`
+		Offset jsnum.Int  `json:"offset"`
 	}
-	if err := c.Bind(&req); err != nil || req.Query == "" {
+	if err := c.Bind(&req); err != nil || req.Query == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "query is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	query := *req.Query
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// 列に入らない文字は保存された値に現れないので、一致しえない (#3025)。
 	// **引く前に弾く** — LIKE のパターンに載せるとクエリごと落ちて 500 になる。
 	// repository 層の検索と同じく、空の結果で答える (エラーではない)。
-	if !colfit.Storable(req.Query) {
+	if !colfit.Storable(query) {
 		return c.JSON(http.StatusOK, []string{})
 	}
 	// upstream search.ts: name LIKE sqlLikeEscape(query.toLowerCase())+'%' (前方一致)
 	// を mentionedLocalUsersCount DESC で並べ offset を適用する。hashtag.name は
 	// normalizeForSearch 済 (lowercase) で格納されるため小文字化で一致する。
 	q := h.db.Model(&model.Hashtag{}).
-		Where(`"name" LIKE ? ESCAPE '\'`, escapeLike(strings.ToLower(req.Query))+"%").
+		Where(`"name" LIKE ? ESCAPE '\'`, escapeLike(strings.ToLower(query))+"%").
 		Order(`"mentionedLocalUsersCount" DESC`).
 		Limit(limit)
 	if req.Offset > 0 {
-		q = q.Offset(req.Offset)
+		q = q.Offset(int(req.Offset))
 	}
 	var tags []*model.Hashtag
 	if err := q.Find(&tags).Error; err != nil {
@@ -188,11 +198,19 @@ func (h *Handler) Search(c echo.Context) error {
 
 // Show handles POST /api/hashtags/show.
 func (h *Handler) Show(c echo.Context) error {
+	// tag は欠落(nil)と空文字列を区別する。本家は空文字列を通し、一致する
+	// タグが無いので NO_SUCH_HASHTAG になる (#3746)。
 	var req struct {
-		Tag string `json:"tag"`
+		Tag *string `json:"tag"`
 	}
-	if err := c.Bind(&req); err != nil || req.Tag == "" {
+	if err := c.Bind(&req); err != nil || req.Tag == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "tag is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
+	}
+	tagName := *req.Tag
+	// 本家の paramDef は tag に maxLength: 128 を持つ (ajv は code point で数える)。
+	// 正規化 (NFKC) の前に判定する。
+	if utf8.RuneCountInString(tagName) > hashtag.MaxTagLength {
+		return apierr.JSONInvalidParam(c)
 	}
 	// upstream show.ts: hashtags.findOneBy({name: normalizeForSearch(tag)})。
 	// hashtag.name は normalizeForSearch (NFKC+lowercase) 済で格納されるため、
@@ -200,11 +218,11 @@ func (h *Handler) Show(c echo.Context) error {
 	// 列に入らない文字を含む tag はどの行とも一致しえない (#3025)。**引く前に
 	// 弾く** — 比較の右辺に載せるとクエリごと落ち、下の `err != nil` が
 	// **DB 障害まで NO_SUCH_HASHTAG に潰す**経路に流れ込む。
-	if !colfit.Storable(req.Tag) {
+	if !colfit.Storable(tagName) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_HASHTAG", "No such hashtag.", "110ee688-193e-4a3a-9ecf-c167b2e6981e"))
 	}
 	var tag model.Hashtag
-	if err := h.db.Where("name = ?", searchnorm.Normalize(req.Tag)).First(&tag).Error; err != nil {
+	if err := h.db.Where("name = ?", searchnorm.Normalize(tagName)).First(&tag).Error; err != nil {
 		// HTTP semantics 的には not-found = 404 が望ましいが、upstream
 		// Misskey TS は ApiError の既定動作で 400 を返している (#925)。
 		// drop-in 互換を優先して 400 + NO_SUCH_HASHTAG body に揃える。
@@ -214,45 +232,133 @@ func (h *Handler) Show(c echo.Context) error {
 	return c.JSON(http.StatusOK, packTag(&tag))
 }
 
+// trendBucketSeconds / trendBucketCount / trendTopN define the hashtags/trend
+// window: 20 buckets of 10 minutes (200 minutes), top 10 tags.
+const (
+	trendBucketSeconds = 600 // 10 分
+	trendBucketCount   = 20  // 過去 200 分
+	trendTopN          = 10
+)
+
+// aggregateTrend は bucket を uint32 の bit で持つので、32 個を超えるとコンパイルを止める。
+var _ [32 - trendBucketCount]struct{}
+
+// trendRow is one public / home note that carries tags, as read by Trend.
+type trendRow struct {
+	ID     string
+	UserID string
+	Tags   []string
+}
+
 // Trend handles POST /api/hashtags/trend.
 //
-// Misskey TS 互換: 直近 200 分 (10 分 × 20 bucket) の note 数を hashtag
-// 別に集計し、frontend の MkMiniChart が描画できる時系列を返す。
-//
-// TS 上流 (HashtagService.getCharts) は Redis HyperLogLog で users 単位
-// のユニーク数を count するが、mk-go では HLL を維持せず note テーブル
-// から動的に集計する。
+// 応答の形 (tag / chart / usersCount) は本家と同じだが、数え方は Elythia
+// 独自。直近 200 分 (10 分 × 20 bucket) の note から、hashtag ごとに投稿した
+// user の数 (重複を除く) を数え、frontend の MkMiniChart が描画できる時系列を
+// 返す。本家は Redis の 1 時間の窓のランキングと HyperLogLog から組み立て、
+// 窓の取り方も件数も違う (docs/divergence/api.md「hashtags/trend のランキングの
+// 数え方」)。mk-go では HLL を維持せず note テーブルから動的に集計する。
 //
 // mk-go の note テーブルは createdAt 列を持たず、aidx ID 先頭 8 文字に
 // ms timestamp が埋め込まれている (`internal/misc/id`)。200 分前の
 // cutoff prefix を生成して `id > cutoffID` で範囲フィルタをかける。
-// tags 配列 (varchar(128)[]) には migration 000043 で GIN index を張った
-// ので `<>` フィルタも index で効く。
 //
 // visibility フィルタ: TS の HashtagService.updateHashtag は public /
 // home の note のみ集計対象にする。followers / specified を含めると
 // 公開トレンドに非公開タグが現れてプライバシー上の問題になるため、
 // SQL の WHERE で同じ条件を強制する。
 //
-// 取得した row は Go 側で aidx parse → bucket idx 計算 → tag/bucket 別
-// の unique users を集計する。直近 200 分の対象 note 数は中規模インス
-// タンスなら数千件オーダーで、Go 側の集計コストは無視できる。
-//
 // chart の bucket は新しいもの順 (index 0 = 直近 10 分、index 19 = 200 分前)。
-// usersCount は TS と同じく `max(chart)` で算出する。
+// usersCount は本家と同じく `max(chart)` で算出する。
+//
+// 同時に来た呼び出しは 1 回の集計にまとめる (#3579)。結果は閲覧者・認証・
+// リクエストの中身に依らないので、誰に返しても同じ値になる。期限付きの
+// キャッシュは持たない — 本家はサーバー側で毎回 Redis から引き直すので、
+// 集計が終わった後に来た呼び出しは必ず集計し直す (鮮度を本家と揃える)。
+// 本家の cacheSec (60 秒) は匿名 GET の Cache-Control だけで、middleware の
+// APICacheControl が同じ値を付けている。
+//
+// 本家の updateHashtagsRanking と同じく、meta.hiddenTags と meta.sensitiveWords
+// に当たるタグはランキングに入れない (#3628)。
 func (h *Handler) Trend(c echo.Context) error {
-	const (
-		bucketSeconds = 600 // 10 分
-		bucketCount   = 20  // 過去 200 分
-		topN          = 10
-	)
-
-	gen, err := h.generator()
+	hidden, sensitive, err := h.trendExclusions()
+	if err != nil {
+		// 隠すための設定が読めないまま集計すると、隠したタグを公開のトレンドに
+		// 出してしまう。meta はキャッシュから読むので、ここで落ちるのは DB に
+		// 届かないときで、そのときは集計の SELECT も通らない。
+		slog.Error("hashtags/trend: fetch meta", "error", err)
+		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
+	}
+	// まとめる単位を、除外の設定ごとに分ける。設定を変えた後に来た呼び出しが、
+	// 変える前の設定で始まっていた集計に合流して、外したはずのタグ (または
+	// 戻したはずのタグ) の結果を受け取らないようにする。変える前から待っていた
+	// 呼び出しには、変える前の設定の結果が返る (本家でも、変える前に積んだ
+	// ランキングはそのまま読まれる)。
+	key := trendFlightKey(hidden, sensitive)
+	// computeTrend はリクエストの context を使わない。使うと、先頭の呼び出しが
+	// 切断されたときに、待っていた呼び出しまで同じ誤りで 500 になる。
+	v, err, _ := h.trendFlight.Do(key, func() (any, error) {
+		v, err := h.computeTrend(corehashtag.NewRankingFilter(hidden, sensitive))
+		if err != nil {
+			// 待っていた呼び出しにも同じエラーが返るので、記録は集計した側で 1 回だけ。
+			slog.Error("hashtags/trend: aggregate", "error", err)
+		}
+		return v, err
+	})
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
+	// 同じ値を複数の呼び出しへ返すので、ここから先で書き換えない (JSON に
+	// するだけ)。
+	return c.JSON(http.StatusOK, v)
+}
 
-	cutoff := time.Now().Add(-time.Duration(bucketSeconds*bucketCount) * time.Second)
+// trendExclusions returns meta.hiddenTags and meta.sensitiveWords, or nothing
+// when the meta repository is not wired.
+func (h *Handler) trendExclusions() (hidden, sensitive []string, err error) {
+	if h.meta == nil {
+		return nil, nil, nil
+	}
+	m, err := h.meta.Fetch()
+	if err != nil {
+		return nil, nil, err
+	}
+	if m == nil {
+		return nil, nil, nil
+	}
+	return m.HiddenTags, m.SensitiveWords, nil
+}
+
+// trendFlightKey returns the singleflight key of a trend aggregation with the
+// given exclusions. Different settings never share a key.
+//
+// 設定は長くなりうるので、そのまま連ねずに hash にする。区切りの曖昧さで別の
+// 設定が同じ鍵にならないよう、要素ごとに長さを前置する。
+func trendFlightKey(hidden, sensitive []string) string {
+	sum := sha256.New()
+	var n [8]byte
+	for _, list := range [][]string{hidden, sensitive} {
+		binary.BigEndian.PutUint64(n[:], uint64(len(list)))
+		sum.Write(n[:])
+		for _, v := range list {
+			binary.BigEndian.PutUint64(n[:], uint64(len(v)))
+			sum.Write(n[:])
+			sum.Write([]byte(v))
+		}
+	}
+	return "trend:" + hex.EncodeToString(sum.Sum(nil))
+}
+
+// computeTrend reads the tagged public / home notes of the last 200 minutes
+// and aggregates them into the hashtags/trend response, leaving out the tags
+// that filter excludes.
+func (h *Handler) computeTrend(filter *corehashtag.RankingFilter) ([]map[string]any, error) {
+	gen, err := h.generator()
+	if err != nil {
+		return nil, err
+	}
+
+	cutoff := time.Now().Add(-time.Duration(trendBucketSeconds*trendBucketCount) * time.Second)
 	cutoffID := id.AidxCutoffPrefix(cutoff)
 
 	// model.StringArray を含む struct を Scan(&rows) に渡すと GORM の
@@ -260,12 +366,7 @@ func (h *Handler) Trend(c echo.Context) error {
 	// (model.StringArray の Scanner で runtime には正しく動くが、初期 type
 	// infer で躓く)。Rows().Scan() で個別に scan するとこの noise を回避
 	// できるので、本 handler では明示的なループ scan を採用する。
-	type row struct {
-		ID     string
-		UserID string
-		Tags   []string
-	}
-	var rows []row
+	var rows []trendRow
 	sqlRows, err := h.db.Raw(`
 		SELECT "id", "userId", "tags"
 		FROM "note"
@@ -274,54 +375,57 @@ func (h *Handler) Trend(c echo.Context) error {
 		  AND "visibility" IN ('public', 'home')
 	`, cutoffID).Rows()
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
+		return nil, err
 	}
 	defer sqlRows.Close()
 	for sqlRows.Next() {
-		var r row
+		var r trendRow
 		var tags model.StringArray
 		if err := sqlRows.Scan(&r.ID, &r.UserID, &tags); err != nil {
-			return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
+			return nil, err
 		}
 		r.Tags = []string(tags)
 		rows = append(rows, r)
 	}
 	if err := sqlRows.Err(); err != nil {
-		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
+		return nil, err
 	}
+	return aggregateTrend(rows, gen, time.Now(), filter.Excludes), nil
+}
 
-	// bucketUsers[tag][bucketIdx] = set of unique userId
-	bucketUsers := make(map[string][bucketCount]map[string]struct{})
-	totalUsers := make(map[string]map[string]struct{})
-
-	now := time.Now()
+// aggregateTrend ranks the tags of rows by unique users and builds the
+// per-bucket unique-user chart of the top tags.
+//
+// tag ごとに「user → その user が投稿した bucket の bit 集合」を持つ。
+// 以前は tag ごとに bucket 20 個分の set を作っていたので、tag の種類が
+// 多いと集計 1 回で数十万の allocation になっていた (#3579)。
+// 数えるものは同じ: total は tag の unique user 数、chart[i] は bucket i の
+// unique user 数。
+//
+// excluded が true を返すタグはランキングに入れない (#3628)。数えた後、並べる
+// 前に外すので、判定はタグの種類ごとに 1 回で済み、残るタグの値は変わらない。
+func aggregateTrend(rows []trendRow, gen id.Generator, now time.Time, excluded func(tag string) bool) []map[string]any {
+	perTag := make(map[string]map[string]uint32)
 	for _, r := range rows {
 		ts, perr := gen.ParseTime(r.ID)
 		if perr != nil {
 			continue
 		}
 		secsAgo := now.Sub(ts).Seconds()
-		if secsAgo < 0 || secsAgo >= float64(bucketSeconds*bucketCount) {
+		if secsAgo < 0 || secsAgo >= float64(trendBucketSeconds*trendBucketCount) {
 			continue
 		}
-		bucketIdx := int(secsAgo) / bucketSeconds
+		bit := uint32(1) << (int(secsAgo) / trendBucketSeconds)
 		for _, tag := range r.Tags {
 			if tag == "" {
 				continue
 			}
-			buckets, exists := bucketUsers[tag]
-			if !exists {
-				for i := range buckets {
-					buckets[i] = map[string]struct{}{}
-				}
-				bucketUsers[tag] = buckets
+			users := perTag[tag]
+			if users == nil {
+				users = make(map[string]uint32)
+				perTag[tag] = users
 			}
-			bucketUsers[tag][bucketIdx][r.UserID] = struct{}{}
-
-			if _, exists := totalUsers[tag]; !exists {
-				totalUsers[tag] = map[string]struct{}{}
-			}
-			totalUsers[tag][r.UserID] = struct{}{}
+			users[r.UserID] |= bit
 		}
 	}
 
@@ -330,8 +434,11 @@ func (h *Handler) Trend(c echo.Context) error {
 		tag   string
 		total int
 	}
-	rankings := make([]ranked, 0, len(totalUsers))
-	for tag, users := range totalUsers {
+	rankings := make([]ranked, 0, len(perTag))
+	for tag, users := range perTag {
+		if excluded(tag) {
+			continue
+		}
 		rankings = append(rankings, ranked{tag: tag, total: len(users)})
 	}
 	sort.Slice(rankings, func(i, j int) bool {
@@ -340,18 +447,22 @@ func (h *Handler) Trend(c echo.Context) error {
 		}
 		return rankings[i].tag < rankings[j].tag
 	})
-	if len(rankings) > topN {
-		rankings = rankings[:topN]
+	if len(rankings) > trendTopN {
+		rankings = rankings[:trendTopN]
 	}
 
 	result := make([]map[string]any, 0, len(rankings))
 	for _, rk := range rankings {
-		chart := make([]int, bucketCount)
-		buckets := bucketUsers[rk.tag]
+		chart := make([]int, trendBucketCount)
+		for _, bits := range perTag[rk.tag] {
+			for i := 0; i < trendBucketCount; i++ {
+				if bits&(1<<i) != 0 {
+					chart[i]++
+				}
+			}
+		}
 		maxUsers := 0
-		for i := 0; i < bucketCount; i++ {
-			n := len(buckets[i])
-			chart[i] = n
+		for _, n := range chart {
 			if n > maxUsers {
 				maxUsers = n
 			}
@@ -362,7 +473,7 @@ func (h *Handler) Trend(c echo.Context) error {
 			"usersCount": maxUsers,
 		})
 	}
-	return c.JSON(http.StatusOK, result)
+	return result
 }
 
 // validUsersSorts は upstream Misskey TS hashtags/users paramDef enum と一致 (#925)。
@@ -387,17 +498,23 @@ const usersAliveWindow = 5 * 24 * time.Hour
 // 正規化して array containment (`tags @> {normTag}`) する。user.tags 側も同じ
 // 正規化で populate される前提 (Part 2)。
 func (h *Handler) Users(c echo.Context) error {
+	// tag は欠落(nil)と空文字列を区別する。本家は空文字列を通し、空の結果を
+	// 返す (#3746)。
 	var req struct {
-		Tag    string `json:"tag"`
-		Sort   string `json:"sort"`
-		State  string `json:"state"`
-		Origin string `json:"origin"`
-		Limit  *int   `json:"limit"`
-		Offset int    `json:"offset"`
+		Tag    *string    `json:"tag"`
+		Sort   string     `json:"sort"`
+		State  string     `json:"state"`
+		Origin string     `json:"origin"`
+		Limit  *jsnum.Int `json:"limit"`
+		Offset jsnum.Int  `json:"offset"`
 	}
-	if err := c.Bind(&req); err != nil || req.Tag == "" || req.Sort == "" {
+	if err := c.Bind(&req); err != nil || req.Tag == nil || req.Sort == "" {
 		// upstream Misskey TS は paramDef で tag + sort を required にしている (#925)。
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "tag and sort are required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
+	}
+	// 本家の paramDef は tag に maxLength: 128 を持つ (hashtags/show と同じ)。
+	if utf8.RuneCountInString(*req.Tag) > hashtag.MaxTagLength {
+		return apierr.JSONInvalidParam(c)
 	}
 	if _, ok := validUsersSorts[req.Sort]; !ok {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "sort must be one of upstream-defined enum.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
@@ -414,22 +531,23 @@ func (h *Handler) Users(c echo.Context) error {
 	if _, ok := validUsersOrigins[req.Origin]; !ok {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "origin must be one of upstream-defined enum.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	if req.Offset < 0 {
 		req.Offset = 0
 	}
+	tagValue := *req.Tag
 
 	// 列に入らない文字を含む tag はどの行とも一致しえない (#3025)。配列の
 	// containment も bind parameter なので、載せるとクエリごと落ちる。
-	if !colfit.Storable(req.Tag) {
+	if !colfit.Storable(tagValue) {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	// containment query。upstream は `:tag <@ user.tags` (= tag 配列が user.tags の
 	// 部分集合)。単一要素なので `tags @> {normTag}` と等価。
-	normTag := searchnorm.Normalize(req.Tag)
+	normTag := searchnorm.Normalize(tagValue)
 	q := h.db.Model(&model.User{}).
 		Where("tags @> ?", model.StringArray{normTag}).
 		Where("\"isSuspended\" = FALSE")
@@ -458,7 +576,7 @@ func (h *Handler) Users(c echo.Context) error {
 	}
 
 	var users []*model.User
-	if err := q.Limit(limit).Offset(req.Offset).Find(&users).Error; err != nil {
+	if err := q.Limit(limit).Offset(int(req.Offset)).Find(&users).Error; err != nil {
 		return apierr.JSONInternalError(c)
 	}
 
@@ -490,7 +608,7 @@ func (h *Handler) Users(c echo.Context) error {
 	// 替えて読めないよう、#1558)・ピン留め・移行先を DetailedMany でまとめて組み、
 	// 関係は getRelations と同じく関係ごとに 1 回の IN で引く (#3330)。匿名の
 	// 閲覧者にはピン留めを出さない (本家 packMany と同じ)。
-	packer := userpack.New(userpack.Lookups{
+	packer := userpack.New(h.entityPacker, userpack.Lookups{
 		Relations:  h.relation,
 		Moderators: h.moderators,
 		ExtrasMany: h.extras,
@@ -500,7 +618,7 @@ func (h *Handler) Users(c echo.Context) error {
 	for i, u := range users {
 		// upstream の pack は isDetailed && isMe で MeDetailed を返すので、
 		// 結果に自分が混ざるときは自分だけ MeDetailed になる。
-		out = append(out, meself.Pack(ctx, packed[i], u, profByID[u.ID], viewer))
+		out = append(out, h.selfPacker.Pack(ctx, packed[i], u, profByID[u.ID], viewer))
 	}
 	return c.JSON(http.StatusOK, out)
 }

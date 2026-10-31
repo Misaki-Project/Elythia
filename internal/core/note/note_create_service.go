@@ -16,17 +16,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/elythia-network/elythia/internal/activitypub/mfm"
+	"github.com/elythia-network/elythia/internal/activitypub"
+	apmfm "github.com/elythia-network/elythia/internal/activitypub/mfm"
+	"github.com/elythia-network/elythia/internal/bgwork"
+	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/hashtag"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/misc/idnhost"
+	"github.com/elythia-network/elythia/internal/misc/jsstr"
 	"github.com/elythia-network/elythia/internal/misc/keyword"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 
 	corechannel "github.com/elythia-network/elythia/internal/core/channel"
 	"github.com/elythia-network/elythia/internal/core/role"
+
+	"github.com/elythia-network/mfm"
+	"gorm.io/gorm"
 )
 
 // featured ランキング更新の sampling rate / note 年齢上限 (upstream
@@ -82,6 +89,7 @@ var (
 	// ErrContainsTooManyMentions is returned when the note exceeds the role
 	// policy's mentionLimit.
 	ErrContainsTooManyMentions = errors.New("note contains too many mentions")
+	ErrFederationDisabled      = corelocalfederation.ErrFederationDisabled
 )
 
 // CreateInput is the input parameter for CreateService.Create.
@@ -222,14 +230,23 @@ type SilencingProvider interface {
 
 // CreateService provides note creation logic.
 type CreateService struct {
-	noteRepo repository.NoteRepository
+	// background は作成後のベストエフォートフックを起動する箱 (#3661)。
+	// 世代の停止で待つ。nil なら素の goroutine で起動する (テスト)。
+	background              *bgwork.Group
+	noteRepo                repository.NoteRepository
+	localFederationObserver activitypub.LocalFederationObserver
+	localFederationLocker   interface {
+		WithLockedUser(userID string, fn func(tx *gorm.DB, user *model.User) error) error
+	}
 	// rolePolicyProvider は mentionLimit の gate に使う (#2321)。nil なら
 	// DefaultMentionLimit にフォールバックする。
 	rolePolicyProvider role.PolicyProvider
 	pollRepo           repository.PollRepository
 	followingRepo      repository.FollowingRepository
 	idGen              id.Generator
-	fanoutHook         TimelineFanoutHook
+	// entityPacker は main stream へ流す投稿を包む依存を持つ (#3790)。
+	entityPacker *entity.Packer
+	fanoutHook   TimelineFanoutHook
 	// materializer はリレー由来で DB に無い返信 / renote 対象を昇格させる
 	// (#2332)。note.replyId / renoteId は note への外部キーなので、行が無いと
 	// INSERT が失敗する。
@@ -261,6 +278,23 @@ type CreateService struct {
 	remoteUserResolver RemoteUserResolver
 	// remoteMentionTimeout overrides defaultRemoteMentionFetchTimeout (tests).
 	remoteMentionTimeout time.Duration
+	// hookSlotsは作成後のベストエフォートフックの同時実行の枠(#3780)。
+	// NewCreateServiceが既定の枠で作り、組み立てのときにSetHookConcurrencyで
+	// 設定の数に作り直す。
+	hookSlots *hookSlots
+}
+
+func (s *CreateService) SetLocalFederationObserver(observer activitypub.LocalFederationObserver) {
+	s.localFederationObserver = observer
+}
+
+// SetLocalFederationLocker serializes note insertion with federation status
+// changes so a stale ON snapshot cannot create a remotely visible note while
+// the account is being turned OFF.
+func (s *CreateService) SetLocalFederationLocker(locker interface {
+	WithLockedUser(userID string, fn func(tx *gorm.DB, user *model.User) error) error
+}) {
+	s.localFederationLocker = locker
 }
 
 // RemoteUserResolver resolves a remote `username@host` that is not in the DB
@@ -326,36 +360,11 @@ func (s *CreateService) SetRolePolicyProvider(p role.PolicyProvider) {
 	s.rolePolicyProvider = p
 }
 
-// SetSilencingProvider attaches a SilencingProvider so public-visibility
-// notes from `canPublicNote=false` users are demoted to `home` (#1024).
-// nil 時は demotion skip (= 旧挙動)。
-func (s *CreateService) SetSilencingProvider(p SilencingProvider) {
-	s.silencingProvider = p
-}
-
-// SetBlockingRepo attaches a BlockingRepository for detecting reply/renote
-// block violations. When unset the block check is skipped (backward compat).
-func (s *CreateService) SetBlockingRepo(r repository.BlockingRepository) {
-	s.blockingRepo = r
-}
-
 // SetThreadMutingRepo attaches a NoteThreadMutingRepository so reply/mention
 // main-stream events are suppressed for recipients who thread-muted the thread,
 // matching upstream NoteCreateService (#1954). nil disables the gate.
 func (s *CreateService) SetThreadMutingRepo(r repository.NoteThreadMutingRepository) {
 	s.threadMuteRepo = r
-}
-
-// SetDriveFileRepo attaches a DriveFileRepository for validating fileIds.
-// When unset fileId validation is skipped (backward compat).
-func (s *CreateService) SetDriveFileRepo(r repository.DriveFileRepository) {
-	s.driveFileRepo = r
-}
-
-// SetMetaRepo attaches a MetaRepository for prohibited-word detection.
-// When unset the check is skipped.
-func (s *CreateService) SetMetaRepo(r repository.MetaRepository) {
-	s.metaRepo = r
 }
 
 // SetChannelRepo attaches a ChannelRepository for the "renote outside of
@@ -368,19 +377,65 @@ func (s *CreateService) SetChannelRepo(r repository.ChannelRepository) {
 // followingRepo は省略可 (nil)。指定された場合、followers可視性ノートへの
 // reply/renoteで閲覧権限を厳格にチェックする。
 // fanoutHookも省略可 (nil)。設定されていればnote作成成功時にコールバックされる。
+//
+// background is the group the best-effort hooks run in, so stopping the
+// server generation waits for them (#3661). entityPacker packs the notes
+// published to the main stream (#3790). blockingRepo detects reply / renote
+// block violations, metaRepo detects sensitive and prohibited words,
+// silencingProvider demotes public notes of `canPublicNote=false` users to
+// `home` (#1024) and driveFileRepo validates fileIds. A nil gate dependency
+// skips its check (tests).
+//
+// どれも無いと黙って劣化する (世代を止めても投稿後のhookのgoroutineを待たない /
+// main stream の投稿のメディアの URL を media proxy を通さずに返す / **自分を
+// ブロックしている**相手への返信・引用が通る。判定は
+// `checkBlocked(t.UserID, in.User.ID)` / meta のセンシティブワードと禁止ワードが
+// 効かない / silenced な利用者の public 投稿が home へ降格されない / 他人の drive
+// file ID を `fileIds` に指定して自分の note に貼れる (IDOR)) ので、構築子の必須の
+// 引数で受ける (#3825)。
 func NewCreateService(
 	noteRepo repository.NoteRepository,
 	pollRepo repository.PollRepository,
 	idGen id.Generator,
 	followingRepo repository.FollowingRepository,
+	background *bgwork.Group,
+	entityPacker *entity.Packer,
+	blockingRepo repository.BlockingRepository,
+	metaRepo repository.MetaRepository,
+	silencingProvider SilencingProvider,
+	driveFileRepo repository.DriveFileRepository,
 ) *CreateService {
 	return &CreateService{
-		noteRepo:      noteRepo,
-		pollRepo:      pollRepo,
-		followingRepo: followingRepo,
-		idGen:         idGen,
+		noteRepo:          noteRepo,
+		pollRepo:          pollRepo,
+		followingRepo:     followingRepo,
+		idGen:             idGen,
+		background:        background,
+		entityPacker:      entityPacker,
+		blockingRepo:      blockingRepo,
+		metaRepo:          metaRepo,
+		silencingProvider: silencingProvider,
+		driveFileRepo:     driveFileRepo,
+		hookSlots:         newHookSlots(0),
 	}
 }
+
+// SetHookConcurrency sets how many best-effort hooks of each kind may run at
+// once. n <= 0 selects the default (GOMAXPROCS * defaultHookConcurrencyFactor).
+//
+// **組み立てのときに1度だけ呼ぶこと。** 投稿を受け付けた後で差し替えると、
+// 古い枠を掴んだgoroutineと新しい枠を掴んだgoroutineが別々に数えられ、
+// その間だけ上限を超えて走る。
+func (s *CreateService) SetHookConcurrency(n int) {
+	s.hookSlots = newHookSlots(n)
+	// ログは設定から作り直すここでだけ出す。NewCreateServiceが作る既定の枠でも
+	// 出すと、1つの世代で既定の値と設定の値の2行が並ぶ。
+	slog.Debug("note hook concurrency configured", "perKind", s.hookSlots.perKind(), "kinds", int(hookKindCount))
+}
+
+// HookConcurrency returns how many best-effort hooks of each kind may run at
+// once.
+func (s *CreateService) HookConcurrency() int { return s.hookSlots.perKind() }
 
 // SetFanoutHook attaches a TimelineFanoutHook to be invoked on note creation.
 // 後付けセッターにすることで、Wireのような循環依存問題を起こさず、テストでも
@@ -450,9 +505,11 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 
 	// #2106 L33: upstream NoteCreateService は text を trim し、trim 後が空なら null に正規化
 	// してから content-less 判定・保存を行う。先頭/末尾空白を upstream と同じく除去して
-	// 保存値・AP 配送値を揃える。
+	// 保存値・AP 配送値を揃える。削る空白は JavaScript の trim と同じにする。
+	// strings.TrimSpace は U+0085 を削り U+FEFF を削らないので、本家と保存値や
+	// content-less の判定が分かれた (#3884)。
 	if in.Text != nil {
-		trimmed := strings.TrimSpace(*in.Text)
+		trimmed := jsstr.Trim(*in.Text)
 		if trimmed == "" {
 			in.Text = nil
 		} else {
@@ -508,6 +565,21 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 			}()
 		}
 		wg.Wait()
+	}
+	hasRemoteActionTarget := false
+	if in.User != nil && in.User.IsLocal() {
+		for _, target := range []*model.Note{replyTarget, renoteTarget} {
+			if target == nil || target.UserHost == nil || *target.UserHost == "" {
+				continue
+			}
+			hasRemoteActionTarget = true
+			break
+		}
+		// Production note insertion is checked again against the locked row
+		// below. Keep the cached check only for legacy callers without the locker.
+		if hasRemoteActionTarget && s.localFederationLocker == nil && s.localFederationObserver != nil && !s.localFederationObserver.IsExternallyAvailable(in.User) {
+			return nil, ErrFederationDisabled
+		}
 	}
 
 	// effective channel を決める (#1859):
@@ -700,20 +772,33 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		return nil, ErrCannotCreateAlreadyExpiredPoll
 	}
 
-	// user 指定 channel の存在チェック (空文字正規化済 specifiedChannelID)。reply
-	// 継承で得た channel は元 note が属する実在 channel なので検証不要 (#1859)。
-	// channelHook 未設定なら channel 機能無効として扱いエラーは返さない。
+	// user 指定 channel の存在チェック (空文字正規化済 specifiedChannelID) と、
+	// reply 継承で得た channel のアーカイブのチェック。channelHook 未設定なら
+	// channel 機能無効として扱いエラーは返さない。
+	//
+	// reply 継承の channel も検証する。元 note が属する channel なので実在はするが、
+	// アーカイブ済みかもしれない。アーカイブ済みの channel には、どの経路からも
+	// 新しいノートを入れないため。指定した channel と同じなら 1 回で済ませる。
 	// 注: reply 先 channel が削除済の極端ケースでは upstream (findOneBy→null で
-	// channel=null) と異なり dangling な channelId を残す。mk-go に channel 削除
-	// 経路が無く到達しない上、OnNotePosted も no-op で無害なため許容する。
-	if specifiedChannelID != nil && s.channelHook != nil {
-		if err := s.channelHook.EnsureChannelExists(*specifiedChannelID); err != nil {
-			// **DB 障害を not-found に丸めない** (#2792)。丸めると障害が
-			// NO_SUCH_CHANNEL (400) に化け、監視でも 5xx が立たない。
-			if errors.Is(err, ErrChannelNotFound) {
-				return nil, ErrChannelNotFound
+	// channel=null) と異なり NO_SUCH_CHANNEL になる。mk-go に channel 削除経路が
+	// 無く到達しない。
+	if s.channelHook != nil {
+		toCheck := make([]string, 0, 2)
+		if specifiedChannelID != nil {
+			toCheck = append(toCheck, *specifiedChannelID)
+		}
+		if effectiveChannelID != nil && (specifiedChannelID == nil || *effectiveChannelID != *specifiedChannelID) {
+			toCheck = append(toCheck, *effectiveChannelID)
+		}
+		for _, chID := range toCheck {
+			if err := s.channelHook.EnsureChannelExists(chID); err != nil {
+				// **DB 障害を not-found に丸めない** (#2792)。丸めると障害が
+				// NO_SUCH_CHANNEL (400) に化け、監視でも 5xx が立たない。
+				if errors.Is(err, ErrChannelNotFound) {
+					return nil, ErrChannelNotFound
+				}
+				return nil, fmt.Errorf("ensure channel exists: %w", err)
 			}
-			return nil, fmt.Errorf("ensure channel exists: %w", err)
 		}
 	}
 
@@ -925,7 +1010,22 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		}
 	}
 
-	if err := s.noteRepo.Create(note); err != nil {
+	federationHookAllowed := true
+	if s.localFederationLocker != nil && in.User.IsLocal() {
+		err := s.localFederationLocker.WithLockedUser(in.User.ID, func(tx *gorm.DB, lockedUser *model.User) error {
+			if hasRemoteActionTarget && s.localFederationObserver != nil && !s.localFederationObserver.IsExternallyAvailable(lockedUser) {
+				return ErrFederationDisabled
+			}
+			federationHookAllowed = lockedUser.FederationStatus != model.FederationStatusPending && lockedUser.FederationStatus != model.FederationStatusOff
+			if lockedUser.FederationStatus == model.FederationStatusOff {
+				note.LocalOnly = true
+			}
+			return s.noteRepo.CreateWithTx(note, tx)
+		})
+		if err != nil {
+			return nil, err
+		}
+	} else if err := s.noteRepo.Create(note); err != nil {
 		return nil, err
 	}
 
@@ -946,6 +1046,7 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 	}
 
 	// 投票が指定されていればPollレコードを作成しnote.hasPollを更新
+	var createdPoll *model.Poll
 	if in.Poll != nil && len(in.Poll.Choices) > 0 {
 		votes := make([]int64, len(in.Poll.Choices))
 		poll := &model.Poll{
@@ -966,28 +1067,21 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 			return nil, err
 		}
 		note.HasPoll = true
+		createdPoll = poll
 	}
 
-	// User / Renote / Reply リレーションをpreloadして返す。失敗時は引数の
-	// Userをそのまま埋めて返す。fanout / hook 先で renote/reply embed を
-	// 触るため full version を使う (#425)。
-	finalNote := note
-	if loaded, err := s.noteRepo.FindByIDWithRelations(noteID); err == nil && loaded != nil {
-		finalNote = loaded
-	} else {
-		finalNote.User = in.User
-	}
+	finalNote := s.hydrateCreated(note, in.User, createdPoll)
 
 	// ベストエフォートフックを非同期で並列実行する。各フックは独立しており、
 	// 失敗してもノート作成自体は成功扱い。TS版と同様にfire-and-forgetで配信する。
 	if s.fanoutHook != nil {
-		safeGoKind(hookFanout, func() { s.fanoutHook.OnNoteCreated(finalNote, in.User) })
+		safeGoKind(s.background, s.hookSlots, hookFanout, func() { s.fanoutHook.OnNoteCreated(finalNote, in.User) })
 	}
 	if s.notificationHook != nil {
-		safeGo(func() { s.notificationHook.OnNoteCreated(finalNote, in.User, replyTarget, renoteTarget) })
+		safeGo(s.background, s.hookSlots, func() { s.notificationHook.OnNoteCreated(finalNote, in.User, replyTarget, renoteTarget) })
 	}
-	if s.federationHook != nil {
-		safeGo(func() { s.federationHook.OnNoteCreated(finalNote, in.User) })
+	if s.federationHook != nil && federationHookAllowed {
+		safeGo(s.background, s.hookSlots, func() { s.federationHook.OnNoteCreated(finalNote, in.User) })
 	}
 	// OnNotePosted は note が実際に属する effective channel (re-scope 後、#1859) で
 	// 発火する。reply で別 channel に入った/外れた場合も正しい channel に通知する。
@@ -995,7 +1089,7 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		chID := *effectiveChannelID
 		noteID := finalNote.ID
 		authorID := in.User.ID
-		safeGo(func() { s.channelHook.OnNotePosted(chID, noteID, authorID) })
+		safeGo(s.background, s.hookSlots, func() { s.channelHook.OnNotePosted(chID, noteID, authorID) })
 	}
 	if s.antennaHook != nil {
 		// アンテナへの fan-out は同期で行う。upstream は
@@ -1008,10 +1102,10 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		s.antennaHook.OnNoteCreated(finalNote, in.User)
 	}
 	if s.indexHook != nil {
-		safeGo(func() { s.indexHook.OnNoteCreated(finalNote) })
+		safeGo(s.background, s.hookSlots, func() { s.indexHook.OnNoteCreated(finalNote) })
 	}
 	if s.chartHook != nil {
-		safeGo(func() { s.chartHook.OnNoteCreated(finalNote) })
+		safeGo(s.background, s.hookSlots, func() { s.chartHook.OnNoteCreated(finalNote) })
 	}
 	if s.hashtagHook != nil {
 		// HashtagHook は実装側 (core/hashtag.Service) が内部で goroutine を
@@ -1019,7 +1113,7 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 		s.hashtagHook.OnNoteCreated(finalNote, in.User)
 	}
 	if s.webhookHook != nil {
-		safeGo(func() { s.webhookHook.OnNoteCreated(finalNote, in.User, replyTarget, renoteTarget) })
+		safeGo(s.background, s.hookSlots, func() { s.webhookHook.OnNoteCreated(finalNote, in.User, replyTarget, renoteTarget) })
 	}
 	// reply / renote / mention 各イベントを対象local userのmainにemit。
 	// Misskey本家NoteCreateServiceと同じfan-out方針 (TS lines 792 / 809 / 935)。
@@ -1029,7 +1123,7 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 	// で CachedUserRepository wrapper の invalidate が走り、stale notesCount
 	// が profile API に出続ける問題を防ぐ (Devin review #552 BUG-2)。
 	// userRepo 未配線の旧経路は noteRepo の同等メソッドにフォールバック。
-	safeGo(func() {
+	safeGo(s.background, s.hookSlots, func() {
 		if s.userRepo != nil {
 			_ = s.userRepo.IncrementNotesCount(in.User.ID, 1)
 			return
@@ -1038,6 +1132,45 @@ func (s *CreateService) Create(in CreateInput) (*model.Note, error) {
 	})
 
 	return finalNote, nil
+}
+
+// hydrateCreated returns the just-inserted note with the relations the
+// packers and hooks read (User / Poll, and Renote / Reply with their own
+// relations).
+//
+// 返信でもリノートでもない投稿は、INSERT した手元の値をそのまま使う (#3611)。
+// 以前は FindByIDWithRelations で note + poll + user を読み直していた。手元の値で
+// 足りるのは次の理由による。
+//   - DB が埋める列 (default のある列) は、GORM が INSERT の RETURNING で手元へ
+//     書き戻す。note にトリガーは無い
+//   - 作成から hook までの間に、この要求が note の行に書くのは hasPoll だけで、
+//     手元にも反映している
+//   - poll は作った値をそのまま付ける (投票数は 0 で、まだ誰も投票できない)
+//
+// 作者は、要求の認証で使った in.User (token のキャッシュから来うる) ではなく
+// DB から 1 本で読み直す。読み直していた頃と同じく、名前やアイコンの変更を
+// 直後の投稿にも反映するため。CachedUserRepository.FindManyByIDs はキャッシュを
+// 読まずに委譲する。
+//
+// 返信・リノートでは、埋め込む相手の relation (2 段目まで) が要るので、従来
+// どおり FindByIDWithRelations で読み直す。どの経路でも、失敗したときは手元の
+// 値に in.User を付けて返す (従来と同じ)。
+func (s *CreateService) hydrateCreated(note *model.Note, author *model.User, poll *model.Poll) *model.Note {
+	if note.ReplyID != nil || note.RenoteID != nil {
+		if loaded, err := s.noteRepo.FindByIDWithRelations(note.ID); err == nil && loaded != nil {
+			return loaded
+		}
+		note.User = author
+		return note
+	}
+	note.User = author
+	if s.userRepo != nil {
+		if users, err := s.userRepo.FindManyByIDs([]string{author.ID}); err == nil && len(users) == 1 && users[0] != nil {
+			note.User = users[0]
+		}
+	}
+	note.Poll = poll
+	return note
 }
 
 // updateFeaturedOnRenote boosts the renoted target note's featured engagement
@@ -1074,7 +1207,7 @@ func (s *CreateService) updateFeaturedOnRenote(target *model.Note) {
 // 同一userに対して複数イベント(例: 相手へのリプライかつメンション)が
 // 並列で届きうる(frontendはイベント種別ごとに意味付けるため)。
 //
-// 旧実装は target が note を見られるか検証せずに `entity.PackNote` の full
+// 旧実装は target が note を見られるか検証せずに `(*entity.Packer).PackNote` の full
 // payload (Text / CW / Files / Renote / Reply embed) を main stream に流して
 // いた (#1472)。followers visibility note を非フォロワー reply/renote/mention
 // target に届けたり、specified visibility note を visibleUserIDs 外の
@@ -1085,7 +1218,7 @@ func (s *CreateService) publishNoteMainEvents(note *model.Note, author *model.Us
 	if s.mainStreamPublisher == nil {
 		return
 	}
-	packed := entity.PackNote(note, s.idGen)
+	packed := s.entityPacker.PackNote(note, s.idGen)
 	// reply: reply先がlocal (UserHost == nil) かつ自分自身へのリプライで
 	// ない場合にemit。visibility gate (#1472): reply target が note を見ら
 	// れないとき (= 非 follower や visibleUserIds 外) は本文 leak になるので
@@ -1300,15 +1433,18 @@ func normalizeChannelID(id *string) *string {
 // caller が fetch error で nil を渡すケースも fail-open で false: 反映漏れ
 // の方が「投稿が思わぬ form で blocked される」より影響軽微で、upstream
 // も同タイミングで throw しないので挙動も揃う。
+//
+// 本家と同じく、欄の中の URL を表示される形に直したもの (apmfm.KeywordCheckTarget)
+// も同じ欄の一部として判定する。
 func matchesSensitiveWords(meta *model.Meta, text, cw *string) bool {
 	if meta == nil || len(meta.SensitiveWords) == 0 {
 		return false
 	}
 	words := []string(meta.SensitiveWords)
-	if cw != nil && *cw != "" && keyword.IsKeyWordIncluded(*cw, words) {
+	if cw != nil && *cw != "" && keyword.IsKeyWordIncluded(apmfm.KeywordCheckTarget(*cw), words) {
 		return true
 	}
-	if text != nil && *text != "" && keyword.IsKeyWordIncluded(*text, words) {
+	if text != nil && *text != "" && keyword.IsKeyWordIncluded(apmfm.KeywordCheckTarget(*text), words) {
 		return true
 	}
 	return false
@@ -1326,15 +1462,17 @@ func matchesSensitiveWords(meta *model.Meta, text, cw *string) bool {
 // keyword.IsKeyWordIncluded (regex / space-AND / case-sensitive) に揃え、upstream
 // checkProhibitedWordsContain と同じく poll choices も検査対象に含める。各 field を
 // 独立に渡すのは sensitiveWords (#1106) と同方針 (concat 案は改行越境 match で挙動が読みにくい)。
+// cw と text は、欄の中の URL を表示される形に直したもの (apmfm.KeywordCheckTarget) も
+// 同じ欄の一部として判定する (本家 checkProhibitedWordsContain と同じく URL も見る)。
 func checkProhibitedWords(meta *model.Meta, text, cw *string, pollChoices []string) error {
 	if meta == nil || len(meta.ProhibitedWords) == 0 {
 		return nil
 	}
 	words := []string(meta.ProhibitedWords)
-	if cw != nil && *cw != "" && keyword.IsKeyWordIncluded(*cw, words) {
+	if cw != nil && *cw != "" && keyword.IsKeyWordIncluded(apmfm.KeywordCheckTarget(*cw), words) {
 		return ErrContainsProhibitedWords
 	}
-	if text != nil && *text != "" && keyword.IsKeyWordIncluded(*text, words) {
+	if text != nil && *text != "" && keyword.IsKeyWordIncluded(apmfm.KeywordCheckTarget(*text), words) {
 		return ErrContainsProhibitedWords
 	}
 	for _, choice := range pollChoices {
@@ -1445,7 +1583,7 @@ func (s *CreateService) mentionedRemoteUsersJSON(mentions []string) string {
 			urlByID[p.UserID] = p.URL
 		}
 	}
-	out := make([]mfm.MentionedRemoteUser, 0, len(remoteIDs))
+	out := make([]apmfm.MentionedRemoteUser, 0, len(remoteIDs))
 	for _, id := range mentions {
 		u, ok := byID[id]
 		if !ok {
@@ -1457,7 +1595,7 @@ func (s *CreateService) mentionedRemoteUsersJSON(mentions []string) string {
 		if u.URI != nil {
 			uri = *u.URI
 		}
-		out = append(out, mfm.MentionedRemoteUser{URI: uri, URL: urlByID[id], Username: u.Username, Host: u.Host})
+		out = append(out, apmfm.MentionedRemoteUser{URI: uri, URL: urlByID[id], Username: u.Username, Host: u.Host})
 	}
 	// JSON.stringify と同じく `<` `>` `&` をエスケープしない (url の query に
 	// `&` が入る)。要素は文字列とそのポインタだけなので、Encode は失敗しない
@@ -1998,26 +2136,3 @@ func (s *CreateService) materializeIfMissing(noteID string, lookupErr error) boo
 	_, err := s.materializer.EnsureNote(context.Background(), noteID)
 	return err == nil
 }
-
-// HasBlockingRepo / HasMetaRepo / HasSilencingProvider report whether the
-// note-creation gates were wired.
-//
-// 未配線時にそれぞれ: **自分をブロックしている**相手への返信・引用が通る
-// (gate は `checkBlocked(t.UserID, in.User.ID)` = 返信先の著者が自分を
-// ブロックしているか)、meta のセンシティブワードと禁止ワードの両方が効かない、
-// silenced な利用者の public 投稿が home へ降格されない。起動時検査に使う
-// (#2683)。
-func (s *CreateService) HasBlockingRepo() bool { return s.blockingRepo != nil }
-
-// HasMetaRepo reports whether the meta repository was wired.
-func (s *CreateService) HasMetaRepo() bool { return s.metaRepo != nil }
-
-// HasSilencingProvider reports whether the silencing provider was wired.
-func (s *CreateService) HasSilencingProvider() bool { return s.silencingProvider != nil }
-
-// HasDriveFileRepo reports whether the drive file repository was wired.
-//
-// 未配線だと `checkFileIDs` が素通しになり、**他人の drive file ID を
-// `notes/create` の `fileIds` に指定して自分の note に貼れる** (IDOR)。
-// page の eyecatch (#2683 の `pages.driveFileRepo`) より経路が広い。
-func (s *CreateService) HasDriveFileRepo() bool { return s.driveFileRepo != nil }

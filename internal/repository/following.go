@@ -3,6 +3,7 @@ package repository
 import (
 	"github.com/elythia-network/elythia/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // FollowingRepository provides data access for the `following` table.
@@ -130,19 +131,35 @@ type FollowingRepository interface {
 
 type followingRepository struct {
 	db *gorm.DB
+	rc *RelationCache
 }
 
 // NewFollowingRepository creates a new FollowingRepository.
 func NewFollowingRepository(db *gorm.DB) FollowingRepository {
-	return &followingRepository{db: db}
+	return NewFollowingRepositoryWithRelationCache(db, nil)
+}
+
+// NewFollowingRepositoryWithRelationCache creates a FollowingRepository whose
+// writes invalidate rc (the follower's RelationFollowing entry, #3607).
+func NewFollowingRepositoryWithRelationCache(db *gorm.DB, rc *RelationCache) FollowingRepository {
+	return &followingRepository{db: db, rc: rc}
 }
 
 func (r *followingRepository) Create(f *model.Following) error {
-	return r.db.Create(f).Error
+	if err := r.db.Create(f).Error; err != nil {
+		return err
+	}
+	r.rc.Invalidate(RelationFollowing, f.FollowerID)
+	return nil
 }
 
 func (r *followingRepository) Delete(f *model.Following) error {
-	return r.db.Delete(f).Error
+	owners, err := deleteByIDReturning(r.db, f, f.ID, "followerId")
+	if err != nil {
+		return err
+	}
+	r.rc.Invalidate(RelationFollowing, append(owners, f.FollowerID)...)
+	return nil
 }
 
 func (r *followingRepository) FindByPair(followerID, followeeID string) (*model.Following, error) {
@@ -276,7 +293,10 @@ func (r *followingRepository) ListFollowers(userID string, limit, offset int) ([
 // findBy({followeeId, notify:'normal'}) と完全一致で絞るため値も 'normal' に揃える。
 func (r *followingRepository) ListFollowersToNotify(userID string) ([]*model.Following, error) {
 	var rows []*model.Following
-	if err := r.db.Where(`"followeeId" = ? AND notify = ?`, userID, "normal").
+	// 'normal' は bind せずリテラルで書く。000131 の部分 index
+	// (WHERE "notify" = 'normal') は、prepared statement の generic plan では
+	// 値が bind 変数だと述語を満たすと判定できず使われない。
+	if err := r.db.Where(`"followeeId" = ? AND notify = 'normal'`, userID).
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -376,23 +396,41 @@ func (r *followingRepository) ListFollowingByHost(host string, limit, offset int
 // a following list) and visibilityColumn the owner's matching user_profile
 // column. Mirrors upstream QueryService.generateFollowingRelationVisibilityQuery.
 //
+// otherColumn / otherVisibilityColumn name the other side of the relation:
+// a row of a followers list is also a row of the follower's following list
+// (and vice versa), so it is shown only when that side's list allows the
+// viewer too. The other side is judged like users/following and
+// users/followers: a missing profile counts as public.
+//
 // 本家と同じく持ち主の user_profile を INNER JOIN するので、profile 行の無い
 // 持ち主の行は出ない。条件は LIMIT より前 (同じ WHERE) に置く — 取ってから
 // 間引くとページが欠け、カーソルも進まなくなる。
-func followRelationVisibility(q *gorm.DB, ownerColumn, visibilityColumn string, viewer model.FollowListViewer) *gorm.DB {
+//
+// 行は相手側の一覧の行でもあるので、相手側の設定にも同じ判定を掛ける (本家は
+// 持ち主の側だけを見る)。相手側は profile が無くても行を落とさないよう
+// LEFT JOIN にし、users/following と同じく無い場合は public として扱う。
+func followRelationVisibility(q *gorm.DB, ownerColumn, visibilityColumn, otherColumn, otherVisibilityColumn string, viewer model.FollowListViewer) *gorm.DB {
 	if viewer.Moderator {
 		return q
 	}
 	owner := `"following".` + ownerColumn
-	visibility := `"ownerProfile".` + visibilityColumn
+	other := `"following".` + otherColumn
 	q = q.Joins(`INNER JOIN "user_profile" "ownerProfile" ON "ownerProfile"."userId" = ` + owner)
+	q = q.Joins(`LEFT JOIN "user_profile" "otherProfile" ON "otherProfile"."userId" = ` + other)
+	q = listVisibleTo(q, owner, `"ownerProfile".`+visibilityColumn, viewer)
+	return listVisibleTo(q, other, `COALESCE("otherProfile".`+otherVisibilityColumn+`, 'public')`, viewer)
+}
+
+// listVisibleTo adds the condition that the list of the user in userColumn,
+// whose visibility is the SQL expression visibility, is visible to viewer.
+func listVisibleTo(q *gorm.DB, userColumn, visibility string, viewer model.FollowListViewer) *gorm.DB {
 	if viewer.UserID == "" {
 		return q.Where(visibility + ` = 'public'`)
 	}
 	return q.Where(
 		`(`+visibility+` = 'public'`+
-			` OR `+owner+` = ?`+
-			` OR (`+visibility+` = 'followers' AND `+owner+` IN (SELECT "meFollowing"."followeeId" FROM "following" "meFollowing" WHERE "meFollowing"."followerId" = ?)))`,
+			` OR `+userColumn+` = ?`+
+			` OR (`+visibility+` = 'followers' AND `+userColumn+` IN (SELECT "meFollowing"."followeeId" FROM "following" "meFollowing" WHERE "meFollowing"."followerId" = ?)))`,
 		viewer.UserID, viewer.UserID)
 }
 
@@ -411,7 +449,7 @@ func (r *followingRepository) ListFollowersByHostCursor(host, sinceID, untilID s
 		limit = 100
 	}
 	q := r.db.Model(&model.Following{}).Select(`"following".*`).Where(`"following"."followeeHost" = ?`, host)
-	q = followRelationVisibility(q, `"followeeId"`, `"followersVisibility"`, viewer)
+	q = followRelationVisibility(q, `"followeeId"`, `"followersVisibility"`, `"followerId"`, `"followingVisibility"`, viewer)
 	if sinceID != "" {
 		q = q.Where(`"following"."id" > ?`, sinceID)
 	}
@@ -440,7 +478,7 @@ func (r *followingRepository) ListFollowingByHostCursor(host, sinceID, untilID s
 		limit = 100
 	}
 	q := r.db.Model(&model.Following{}).Select(`"following".*`).Where(`"following"."followerHost" = ?`, host)
-	q = followRelationVisibility(q, `"followerId"`, `"followingVisibility"`, viewer)
+	q = followRelationVisibility(q, `"followerId"`, `"followingVisibility"`, `"followeeId"`, `"followersVisibility"`, viewer)
 	if sinceID != "" {
 		q = q.Where(`"following"."id" > ?`, sinceID)
 	}
@@ -502,9 +540,16 @@ func (r *followingRepository) UpdateRelation(followerID, followeeID string, fiel
 	if len(fields) == 0 {
 		return nil
 	}
-	return r.db.Model(&model.Following{}).
+	if err := r.db.Model(&model.Following{}).
 		Where(`"followerId" = ? AND "followeeId" = ?`, followerID, followeeID).
-		Updates(fields).Error
+		Updates(fields).Error; err != nil {
+		return err
+	}
+	// 今のキャッシュは followee の集合しか持たないので、notify / withReplies の
+	// 更新では中身が変わらない。それでも書き込みはすべて捨てる、という形を
+	// 崩さない (後から列をキャッシュに足したときに捨て損ねない)。
+	r.rc.Invalidate(RelationFollowing, followerID)
+	return nil
 }
 
 // UpdateAllByFollower applies a partial field update to every Following row
@@ -513,17 +558,35 @@ func (r *followingRepository) UpdateAllByFollower(followerID string, fields map[
 	if len(fields) == 0 {
 		return nil
 	}
-	return r.db.Model(&model.Following{}).
+	if err := r.db.Model(&model.Following{}).
 		Where(`"followerId" = ?`, followerID).
-		Updates(fields).Error
+		Updates(fields).Error; err != nil {
+		return err
+	}
+	r.rc.Invalidate(RelationFollowing, followerID)
+	return nil
 }
 
 // DeleteAllByUser removes every Following row whose follower or followee is
 // userID.
+//
+// userID をフォローしていた全員の一覧から userID が消えるので、消した行の
+// followerId を RETURNING で受け取り、その全員の項目を捨てる。
 func (r *followingRepository) DeleteAllByUser(userID string) (int64, error) {
-	tx := r.db.Where(`"followerId" = ? OR "followeeId" = ?`, userID, userID).
-		Delete(&model.Following{})
-	return tx.RowsAffected, tx.Error
+	var deleted []model.Following
+	tx := r.db.Clauses(clause.Returning{Columns: []clause.Column{{Name: "followerId"}}}).
+		Where(`"followerId" = ? OR "followeeId" = ?`, userID, userID).
+		Delete(&deleted)
+	if tx.Error != nil {
+		return tx.RowsAffected, tx.Error
+	}
+	owners := make([]string, 0, len(deleted)+1)
+	owners = append(owners, userID)
+	for _, f := range deleted {
+		owners = append(owners, f.FollowerID)
+	}
+	r.rc.Invalidate(RelationFollowing, owners...)
+	return tx.RowsAffected, nil
 }
 
 // ListRemoteFollowerInboxes returns deduplicated inbox URLs for remote

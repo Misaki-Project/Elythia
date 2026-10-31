@@ -1,18 +1,16 @@
 # Elythia
 
-Misskey互換のGoバックエンド実装。TypeScript/NestJS製の[Misskey](https://github.com/misskey-dev/misskey)と同一のDB・Redis・フロントエンドを共有し、バックエンドを差し替えられる。
-
-互換バージョン: **Misskey 2026.10.0** (Elythia `2.0.0`)
+Elythiaは、Goで書かれたActivityPubサーバーです。[Misskey](https://github.com/misskey-dev/misskey)から生まれ、Misskeyのクライアントや連合との互換性を保ちながら、独自の機能を育てています。
 
 ## 特徴
 
-- Go 1.27 / Echo v4 / GORM + pgx / go-redis v9
-- Misskeyフロントエンド(SPA)をそのまま配信
-- TypeScript版と同じPostgreSQL/Redisを共有、無停止で移行可能
-- ActivityPub連合対応（HTTP Signatures、リモートオブジェクト解決、配信キュー）
-- ジョブキューは `mkq` (BullMQ wire-compat)
-- Playwright e2e (298 spec ファイル) を PR ごとに実行。upstream 追従時は Misskey TS backend に対しても回して drop-in 互換を検証
-- `RemoteStatsFetcher` でリモートユーザーの notesCount / followersCount / followingCount を origin から取得 (Elythia 独自拡張)
+- **Misskeyのクライアントがそのまま使える** — 本家のAPIとの互換を保ち、独自の拡張は原則として追加で行います(本家と意図的に違えた挙動は[差分カタログ](docs/divergence.md)に記録しています)
+- **Webの画面も同梱** — Misskeyのフロントエンドを取り込み、独自の改良を加えて配信しています
+- **TS版Misskeyから乗り換えられる** — 既存のDBを引き継いで起動できます。手順と注意は[移行ガイド](docs/migration-from-ts.md)を参照してください(TS版へ戻すことは保証していません)
+- **Goで再構築** — バックエンドをGoで一から書き直しています
+- **プラグインで広げられる** — コアを変えずに、APIや画面の追加、定期ジョブ、プラグインが管理するアカウントへの通知の処理などを足せます(ビルド時に組み込み)
+- **ActivityPubで連合** — MisskeyやMastodonなど、ほかのサーバーの利用者と交流できます
+- **互換性をCIで検証** — APIの応答の形、本家のテスト、実際のMisskey・Mastodonとの連合を、CIで確かめています
 
 ## クイックスタート
 
@@ -163,15 +161,17 @@ go test -race -count=1 -shuffle=3 -timeout 10m \
 | [CI で回る項目](docs/ci.md) | どの check が何を見ていて、落ちたとき何を疑うか |
 | [ActivityPub連合](docs/federation.md) | AP実装、HTTP Signatures、配信パイプライン |
 | [デプロイ](docs/deployment.md) | Docker/Compose/systemd、逆プロキシ |
+| [DBのバックアップ](docs/backup.md) | `elythia backup`で取ってホストの外へ送る手順、戻せるかを確かめる手順、保存先に置かれるもの |
 | [1.5.0 から 2.0.0 へ上げる](docs/upgrade/2.0.0.md) | 構成ごとの移行手順 (名前・イメージ・バイナリ・frontend の置き場所が変わる版) |
 | [コントリビューション](docs/contributing.md) | Issue/PR運用、レビュー基準 |
 | [TS版からの移行](docs/migration-from-ts.md) | 既存Misskeyからの移行手順 |
+| [fork の独自 migration](docs/fork-migrations.md) | fork が本体の表を変える migration を、本体と衝突せずに足す手順 (`migration/local/`) |
 | [Playwright](docs/playwright.md) | Playwrightによるフロントエンド / API テスト |
 | [Drop-in e2e (pytest)](docs/dropin-e2e.md) | TS-A backend を mk-A に差し替えた state preservation 検証 |
 | [Drop-in frontend e2e (cypress)](docs/dropin-frontend-e2e.md) | 3 TS instance + cypress で frontend 視点の互換 |
 | [差分比較ハーネス](docs/diff-e2e.md) | Elythia と TS の実APIレスポンスを値レベルでdiff |
 | [シェイプドリフト検出](docs/shape-drift.md) | レスポンス形状・エラーID・権限のドリフトを検出する静的ゲート |
-| [本家 backend e2e](docs/upstream-backend-e2e.md) | Misskey 本家の `test/e2e/**` を無改変で Elythia に向けて実行する |
+| [本家 backend e2e](docs/upstream-backend-e2e.md) | Misskey 本家の `test/e2e/**` を本家ソースを正本として Elythia に向けて実行する (UserLite の期待DTOにローカル連合状態のみ追加) |
 | [プラグイン](docs/plugins/) | ビルド時組み込みプラグインの書き方・運用 |
 | [プラグイン peer プロトコル](docs/plugin-peer-protocol.md) | Elythia 同士でだけ通じる署名付き HTTP チャネルの wire 仕様 |
 | [UDSデプロイ](docs/docker-uds.md) | UNIXドメインソケット構成 |
@@ -180,7 +180,7 @@ go test -race -count=1 -shuffle=3 -timeout 10m \
 | [メディアプロキシの govips 評価](docs/mediaproxy-govips-evaluation.md) | 画像変換ライブラリの比較検討 |
 | [upstream追従手順](docs/upstream-catch-up.md) | Misskey TSの新リリース取り込み |
 | [設計メモ](docs/design/) | オートスケール、inbox verify、mkq等の設計判断 |
-| [upstream 差分](docs/update/) | Misskey TS 2026.3.2 → 2026.10.0 の backend 差分 (`<yyyymm><nn>diff.md`) と triage note |
+| [upstream 差分](docs/update/) | Misskey TS 2026.3.2 → 2026.10.1 の backend 差分 (`<yyyymm><nn>diff.md`) と triage note |
 
 ## ライセンス
 

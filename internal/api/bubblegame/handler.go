@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
@@ -20,11 +21,15 @@ import (
 type Handler struct {
 	repo  repository.BubbleGameRepository
 	idGen id.Generator
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // NewHandler creates a new bubble-game handler.
-func NewHandler(repo repository.BubbleGameRepository, idGen id.Generator) *Handler {
-	return &Handler{repo: repo, idGen: idGen}
+// entityPacker is the Packer this Handler packs entities with (#3794).
+func NewHandler(repo repository.BubbleGameRepository, idGen id.Generator, entityPacker *entity.Packer) *Handler {
+	return &Handler{repo: repo, idGen: idGen, entityPacker: entityPacker}
 }
 
 // seedMaxAge is how old a seed may be when its score is registered (mk-go,
@@ -39,15 +44,18 @@ const bubbleGameModeMaxRunes = 128
 func (h *Handler) Register(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req struct {
-		Score       int     `json:"score"`
-		Seed        string  `json:"seed"`
-		Logs        [][]any `json:"logs"`
-		GameMode    string  `json:"gameMode"`
-		GameVersion int     `json:"gameVersion"`
+		Score       jsnum.Int `json:"score"`
+		Seed        string    `json:"seed"`
+		Logs        [][]any   `json:"logs"`
+		GameMode    *string   `json:"gameMode"`
+		GameVersion jsnum.Int `json:"gameVersion"`
 	}
-	if err := c.Bind(&req); err != nil || req.Seed == "" || req.GameMode == "" {
+	// 本家の paramDef は gameMode に minLength を持たないので、空文字も登録する (#3768)。
+	// 欠けは本家の paramDef が先に 400 にする。
+	if err := c.Bind(&req); err != nil || req.Seed == "" || req.GameMode == nil {
 		return apierr.JSONInvalidParam(c)
 	}
+	gameMode := *req.GameMode
 	// upstream register.ts paramDef は score:{minimum:0}。負値を ajv 同様 400 で弾く (#2027)。
 	if req.Score < 0 {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParamClient("#/properties/score/minimum", "must be >= 0"))
@@ -77,7 +85,7 @@ func (h *Handler) Register(c echo.Context) error {
 	// 列に入らない値を SQLSTATE 22021 / 22P05 でクエリごと落とすので、引く前に
 	// 弾かないと**任意の認証ユーザーが 500 を起こせる**。`seed` は上で
 	// `ParseInt` を通っているので数字だけ (列幅 1024 に収まる)。
-	if !colfit.Fits(req.GameMode, bubbleGameModeMaxRunes) {
+	if !colfit.Fits(gameMode, bubbleGameModeMaxRunes) {
 		return apierr.JSONInvalidParam(c)
 	}
 	logsJSON, _ := json.Marshal(req.Logs)
@@ -89,9 +97,9 @@ func (h *Handler) Register(c echo.Context) error {
 		UserID:      user.ID,
 		SeededAt:    seedDate,
 		Seed:        req.Seed,
-		GameVersion: req.GameVersion,
-		GameMode:    req.GameMode,
-		Score:       req.Score,
+		GameVersion: int(req.GameVersion),
+		GameMode:    gameMode,
+		Score:       int(req.Score),
 		Logs:        logsJSON,
 		IsVerified:  false,
 	}
@@ -104,24 +112,31 @@ func (h *Handler) Register(c echo.Context) error {
 // Ranking handles GET/POST /api/bubble-game/ranking. upstream ranking.ts は
 // allowGet:true で、frontend drop-and-fusion.vue は misskeyApiGet (GET +
 // query string) で gameMode を投げる。Echo の Bind は GET だと query を
-// `query` タグでしか拾わないため、fetch-rss と同様に QueryParam を先に読み、
-// 無ければ JSON body に fallback する (#1774)。
+// `query` タグでしか拾わないため、GET では QueryParam で読む (#1774)。
 func (h *Handler) Ranking(c echo.Context) error {
-	gameMode := c.QueryParam("gameMode")
-	if gameMode == "" {
-		var req struct {
-			GameMode string `json:"gameMode"`
+	// 本家は GET なら query、POST なら body だけを読む。POST の query を読むと、
+	// 本家の paramDef が見た body とは別の gameMode で引くことになる (#3768)。
+	// 空文字は本家と同じく、その名前のモードとして引く。
+	var gameMode string
+	if c.Request().Method == http.MethodGet {
+		if !c.QueryParams().Has("gameMode") {
+			return apierr.JSONInvalidParam(c)
 		}
-		// Bind 失敗は無視 (空 gameMode のまま下の guard で 400 を返す)。
-		_ = c.Bind(&req)
-		gameMode = req.GameMode
-	}
-	if gameMode == "" {
-		return apierr.JSONInvalidParam(c)
+		gameMode = c.QueryParam("gameMode")
+	} else {
+		var req struct {
+			GameMode *string `json:"gameMode"`
+		}
+		if err := c.Bind(&req); err != nil || req.GameMode == nil {
+			return apierr.JSONInvalidParam(c)
+		}
+		gameMode = *req.GameMode
 	}
 
 	records, err := h.repo.Ranking(gameMode, 10)
 	if err != nil {
+		// 本家はエラーになりキャッシュされない。空の一覧を public にしない (#3593)。
+		middleware.SkipPublicCache(c)
 		return c.JSON(http.StatusOK, []any{})
 	}
 
@@ -135,12 +150,14 @@ func (h *Handler) Ranking(c echo.Context) error {
 		// 4 フィールドマップだと avatarUrl 等の必須フィールドが欠けて
 		// frontend のランキング表示が壊れるため packer を経由する (#1553)。
 		if r.User != nil {
-			entry["user"] = entity.PackUserLite(r.User)
+			entry["user"] = h.entityPacker.PackUserLite(r.User)
 		}
 		result[i] = entry
 	}
 	// upstream ranking.ts は cacheSec:60 → 未認証 GET に Cache-Control: public,
 	// max-age=60 を付ける (ApiCallService。POST/認証済みには付けない、#2027)。
+	// /api では middleware.APICacheControl が同じ表 (APICacheSec) から同じ値を付けるので
+	// 二重になる。この handler 単体のテストが見ているので残す (#3593)。
 	// token は raw token (HasRawToken) で見るので無効 token GET でも cache を付けない (#2049)。
 	if c.Request().Method == http.MethodGet && middleware.GetUser(c) == nil && !middleware.HasRawToken(c) {
 		c.Response().Header().Set("Cache-Control", "public, max-age=60")

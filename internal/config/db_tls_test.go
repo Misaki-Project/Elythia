@@ -143,7 +143,7 @@ func TestLoad_DBExtraSSL(t *testing.T) {
 	}
 }
 
-// db.extra.* は bindEnvKeys に登録していないので、MK_DB_EXTRA_SSL が効くのは
+// db.extra.* は connectionTimeoutMillis のほかは bindEnvKeys に登録していないので、MK_DB_EXTRA_SSL が効くのは
 // 設定ファイルにそのキーがあるときだけ。docs/configuration.md の記述を固定する。
 func TestLoad_DBExtraSSLFromEnv(t *testing.T) {
 	const base = "url: https://example.com\ndb:\n  host: db.internal\n  port: 5432\n  db: misskey\n  user: u\n  pass: p\n"
@@ -317,4 +317,30 @@ func TestDBTLSErrorHint_FollowsConfiguredKeys(t *testing.T) {
 
 	explicitCA := &Config{DB: DBOptions{Extra: map[string]any{"sslmode": "verify-ca", "sslrootcert": "/etc/ssl/pg-ca.pem"}}}
 	assert.Contains(t, explicitCA.DBTLSErrorHint(verr), "/etc/ssl/pg-ca.pem")
+}
+
+// TestDSN_ApplicationName checks that DBApplicationName reaches pgx as the
+// application_name runtime parameter on every DSN form, and that leaving it
+// empty adds nothing (#3463).
+func TestDSN_ApplicationName(t *testing.T) {
+	cfg := &Config{
+		DB:                DBOptions{Host: "db", Port: 5432, DB: "misskey", User: "u", Pass: "p"},
+		DBSlaves:          []DBSlaveOptions{{Host: "replica", Port: 5432, DB: "misskey", User: "u", Pass: "p"}},
+		DBApplicationName: "elythia/server 1",
+	}
+	for label, dsn := range map[string]string{
+		"keyword":  cfg.DSN(),
+		"slave":    cfg.SlaveDSN(0),
+		"url":      cfg.DatabaseURL("postgres"),
+		"pluginst": cfg.DSN() + " search_path=plugin_x",
+	} {
+		pc, err := pgconn.ParseConfig(dsn)
+		require.NoError(t, err, label)
+		assert.Equal(t, "elythia/server 1", pc.RuntimeParams["application_name"], label)
+	}
+
+	cfg.DBApplicationName = ""
+	assert.NotContains(t, cfg.DSN(), "application_name")
+	assert.NotContains(t, cfg.SlaveDSN(0), "application_name")
+	assert.NotContains(t, cfg.DatabaseURL("postgres"), "application_name")
 }

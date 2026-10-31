@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/stretchr/testify/assert"
@@ -105,7 +106,7 @@ func TestAnnouncementRepository_ListGlobal_ExcludesPerUser(t *testing.T) {
 	require.NoError(t, repo.Create(global))
 	require.NoError(t, repo.Create(targeted))
 
-	items, err := repo.ListGlobal(true, 100, 0, "", "")
+	items, err := repo.ListGlobal(true, 100, "", "")
 	require.NoError(t, err)
 	ids := make(map[string]bool, len(items))
 	for _, a := range items {
@@ -124,27 +125,23 @@ func TestAnnouncementRepository_ListGlobal_Pagination(t *testing.T) {
 	require.NoError(t, repo.Create(a1))
 	require.NoError(t, repo.Create(a2))
 
-	items, err := repo.ListGlobal(true, 1, 0, "", "")
+	items, err := repo.ListGlobal(true, 1, "", "")
 	require.NoError(t, err)
 	assert.Len(t, items, 1)
 	// default limitとcap経路
-	items, err = repo.ListGlobal(true, 0, 0, "", "")
+	items, err = repo.ListGlobal(true, 0, "", "")
 	require.NoError(t, err)
 	assert.NotEmpty(t, items)
-	items, err = repo.ListGlobal(true, 999, 0, "", "")
+	items, err = repo.ListGlobal(true, 999, "", "")
 	require.NoError(t, err)
 	assert.LessOrEqual(t, len(items), 100)
-	// offset
-	items, err = repo.ListGlobal(true, 10, 1, "", "")
-	require.NoError(t, err)
-	assert.NotEmpty(t, items)
 }
 
 func TestAnnouncementRepository_ListGlobal_Error(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	repo := NewAnnouncementRepository(testDB.WithContext(ctx))
-	_, err := repo.ListGlobal(true, 10, 0, "", "")
+	_, err := repo.ListGlobal(true, 10, "", "")
 	assert.Error(t, err)
 }
 
@@ -164,7 +161,7 @@ func TestAnnouncementRepository_ListForUser_IncludesGlobalAndOwnTargeted(t *test
 	require.NoError(t, repo.Create(mine))
 	require.NoError(t, repo.Create(others))
 
-	items, err := repo.ListForUser(me, true, 100, 0, "", "")
+	items, err := repo.ListForUser(me, true, 100, "", "")
 	require.NoError(t, err)
 	ids := make(map[string]bool, len(items))
 	for _, a := range items {
@@ -184,18 +181,15 @@ func TestAnnouncementRepository_ListForUser_Pagination(t *testing.T) {
 	require.NoError(t, repo.Create(a1))
 	require.NoError(t, repo.Create(a2))
 
-	items, err := repo.ListForUser("u", true, 1, 0, "", "")
+	items, err := repo.ListForUser("u", true, 1, "", "")
 	require.NoError(t, err)
 	assert.Len(t, items, 1)
-	items, err = repo.ListForUser("u", true, 0, 0, "", "")
+	items, err = repo.ListForUser("u", true, 0, "", "")
 	require.NoError(t, err)
 	assert.NotEmpty(t, items)
-	items, err = repo.ListForUser("u", true, 999, 0, "", "")
+	items, err = repo.ListForUser("u", true, 999, "", "")
 	require.NoError(t, err)
 	assert.LessOrEqual(t, len(items), 100)
-	items, err = repo.ListForUser("u", true, 10, 1, "", "")
-	require.NoError(t, err)
-	assert.NotEmpty(t, items)
 }
 
 func TestAnnouncementRepository_ListGlobal_CursorPagination(t *testing.T) {
@@ -212,7 +206,7 @@ func TestAnnouncementRepository_ListGlobal_CursorPagination(t *testing.T) {
 	require.NoError(t, repo.Create(a3))
 
 	// untilId: a3より古いもの → a1, a2
-	items, err := repo.ListGlobal(true, 100, 0, "", a3.ID)
+	items, err := repo.ListGlobal(true, 100, "", a3.ID)
 	require.NoError(t, err)
 	ids := make(map[string]bool, len(items))
 	for _, a := range items {
@@ -223,7 +217,7 @@ func TestAnnouncementRepository_ListGlobal_CursorPagination(t *testing.T) {
 	assert.False(t, ids[a3.ID])
 
 	// sinceId: a1より新しいもの → a2, a3
-	items, err = repo.ListGlobal(true, 100, 0, a1.ID, "")
+	items, err = repo.ListGlobal(true, 100, a1.ID, "")
 	require.NoError(t, err)
 	ids = make(map[string]bool, len(items))
 	for _, a := range items {
@@ -234,7 +228,7 @@ func TestAnnouncementRepository_ListGlobal_CursorPagination(t *testing.T) {
 	assert.True(t, ids[a3.ID])
 
 	// sinceId + untilId: a1 < id < a3 → a2のみ
-	items, err = repo.ListGlobal(true, 100, 0, a1.ID, a3.ID)
+	items, err = repo.ListGlobal(true, 100, a1.ID, a3.ID)
 	require.NoError(t, err)
 	assert.Len(t, items, 1)
 	assert.Equal(t, a2.ID, items[0].ID)
@@ -253,7 +247,7 @@ func TestAnnouncementRepository_ListForUser_CursorPagination(t *testing.T) {
 	require.NoError(t, repo.Create(a3))
 
 	// untilId: a3より古いもの → a1, a2
-	items, err := repo.ListForUser("u", true, 100, 0, "", a3.ID)
+	items, err := repo.ListForUser("u", true, 100, "", a3.ID)
 	require.NoError(t, err)
 	ids := make(map[string]bool, len(items))
 	for _, a := range items {
@@ -264,7 +258,7 @@ func TestAnnouncementRepository_ListForUser_CursorPagination(t *testing.T) {
 	assert.False(t, ids[a3.ID])
 
 	// sinceId: a1より新しいもの → a2, a3
-	items, err = repo.ListForUser("u", true, 100, 0, a1.ID, "")
+	items, err = repo.ListForUser("u", true, 100, a1.ID, "")
 	require.NoError(t, err)
 	ids = make(map[string]bool, len(items))
 	for _, a := range items {
@@ -327,14 +321,14 @@ func TestAnnouncementRepository_SinceIDFlipsOrderASC(t *testing.T) {
 	}
 
 	// ListGlobal / ListForUserも同様にASC反転すること
-	items, err = repo.ListGlobal(true, 100, 0, a1.ID, "")
+	items, err = repo.ListGlobal(true, 100, a1.ID, "")
 	require.NoError(t, err)
 	own = assertOwn(items)
 	require.Len(t, own, 2)
 	assert.Equal(t, a2.ID, own[0].ID)
 	assert.Equal(t, a3.ID, own[1].ID)
 
-	items, err = repo.ListForUser("u", true, 100, 0, a1.ID, "")
+	items, err = repo.ListForUser("u", true, 100, a1.ID, "")
 	require.NoError(t, err)
 	own = assertOwn(items)
 	require.Len(t, own, 2)
@@ -346,7 +340,7 @@ func TestAnnouncementRepository_ListForUser_Error(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	repo := NewAnnouncementRepository(testDB.WithContext(ctx))
-	_, err := repo.ListForUser("u", true, 10, 0, "", "")
+	_, err := repo.ListForUser("u", true, 10, "", "")
 	assert.Error(t, err)
 }
 
@@ -364,7 +358,7 @@ func TestAnnouncementRepository_ListForUser_ActiveOnlyAppliesToGlobal(t *testing
 
 	// activeOnly=true の場合、inactive な global announcement も除外される
 	// はず(括弧無しだと isActive filter が global に適用されず漏れる)。
-	items, err := repo.ListForUser("some_user", true, 100, 0, "", "")
+	items, err := repo.ListForUser("some_user", true, 100, "", "")
 	require.NoError(t, err)
 	for _, a := range items {
 		assert.NotEqual(t, inactive.ID, a.ID)
@@ -439,7 +433,7 @@ func TestAnnouncementRepository_ListForAdmin_FiltersByUserID(t *testing.T) {
 	defer cleanupAnnouncement(t, oUser.ID)
 
 	// userId 指定 → そのユーザー宛のみ
-	rows, err := repo.ListForAdmin(tu.ID, "active", 10, 0, "", "")
+	rows, err := repo.ListForAdmin(tu.ID, "active", 10, 0, "", "", time.Now())
 	require.NoError(t, err)
 	ids := make(map[string]bool)
 	for _, r := range rows {
@@ -450,7 +444,7 @@ func TestAnnouncementRepository_ListForAdmin_FiltersByUserID(t *testing.T) {
 	assert.False(t, ids[oUser.ID])
 
 	// userId 未指定 → global only
-	rows, err = repo.ListForAdmin("", "active", 10, 0, "", "")
+	rows, err = repo.ListForAdmin("", "active", 10, 0, "", "", time.Now())
 	require.NoError(t, err)
 	ids = make(map[string]bool)
 	for _, r := range rows {
@@ -476,7 +470,7 @@ func TestAnnouncementRepository_ListForAdmin_StatusBranches(t *testing.T) {
 	defer cleanupAnnouncement(t, archived.ID)
 
 	// archived: archived row が含まれ active row が含まれないこと。
-	rows, err := repo.ListForAdmin("", "archived", 10, 0, "", "")
+	rows, err := repo.ListForAdmin("", "archived", 10, 0, "", "", time.Now())
 	require.NoError(t, err)
 	archivedIDs := make(map[string]bool)
 	for _, r := range rows {
@@ -486,7 +480,7 @@ func TestAnnouncementRepository_ListForAdmin_StatusBranches(t *testing.T) {
 	assert.True(t, archivedIDs[archived.ID])
 	assert.False(t, archivedIDs[active.ID])
 	// all (両方含む)
-	rows, err = repo.ListForAdmin("", "all", 10, 0, "", "")
+	rows, err = repo.ListForAdmin("", "all", 10, 0, "", "", time.Now())
 	require.NoError(t, err)
 	ids := make(map[string]bool)
 	for _, r := range rows {
@@ -496,11 +490,11 @@ func TestAnnouncementRepository_ListForAdmin_StatusBranches(t *testing.T) {
 	assert.True(t, ids[archived.ID])
 
 	// limit / offset / since / until / clamp paths
-	_, err = repo.ListForAdmin("", "active", 0, 0, "", "")
+	_, err = repo.ListForAdmin("", "active", 0, 0, "", "", time.Now())
 	require.NoError(t, err)
-	_, err = repo.ListForAdmin("", "active", 1000, 5, "", "")
+	_, err = repo.ListForAdmin("", "active", 1000, 5, "", "", time.Now())
 	require.NoError(t, err)
-	_, err = repo.ListForAdmin("", "active", 10, 0, "since_x", "until_x")
+	_, err = repo.ListForAdmin("", "active", 10, 0, "since_x", "until_x", time.Now())
 	require.NoError(t, err)
 }
 
@@ -550,12 +544,12 @@ func TestAnnouncementRepository_ListGlobal_IsActiveFilter(t *testing.T) {
 		return false
 	}
 
-	got, err := repo.ListGlobal(true, 100, 0, "", "")
+	got, err := repo.ListGlobal(true, 100, "", "")
 	require.NoError(t, err)
 	assert.True(t, contains(got, "ann_n7_act"), "isActive=true returns active")
 	assert.False(t, contains(got, "ann_n7_inact"), "isActive=true excludes inactive")
 
-	got, err = repo.ListGlobal(false, 100, 0, "", "")
+	got, err = repo.ListGlobal(false, 100, "", "")
 	require.NoError(t, err)
 	assert.True(t, contains(got, "ann_n7_inact"), "isActive=false returns inactive")
 	assert.False(t, contains(got, "ann_n7_act"), "isActive=false must NOT mix in active announcements")

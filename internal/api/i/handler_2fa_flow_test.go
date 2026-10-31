@@ -241,7 +241,7 @@ func TestTwoFADone_ReplayRejected(t *testing.T) {
 	user := setupUserWithPassword(repo, "u1", "pass")
 	tempSecret := "JBSWY3DPEHPK3PXP"
 	repo.Profiles["u1"].TwoFactorTempSecret = &tempSecret
-	h.SetTOTPReplayGuard(newReplayGuard(t))
+	h.totpReplayGuard = newReplayGuard(t)
 
 	token, err := totp.GenerateCode(tempSecret, time.Now())
 	require.NoError(t, err)
@@ -258,6 +258,35 @@ func TestTwoFADone_ReplayRejected(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, rec2.Code, "same TOTP code must be refused as replay on the second submit")
 }
 
+// i/2fa/doneでも、本家のテスト用の素通しはhandlerのtestModeのときだけ効き、
+// MISSKEY_TEST_CHECK_DUPLICATED_TOTP=1なら効かない(#3780)。本家のe2eは
+// 2FAの登録をこの素通しに頼る。
+func TestTwoFADone_TOTPBypassOnlyInTestMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		testMode bool
+		env      string
+		wantCode int
+	}{
+		{name: "test mode bypasses the check", testMode: true, env: "", wantCode: http.StatusOK},
+		{name: "test mode with the duplicated check env validates", testMode: true, env: "1", wantCode: http.StatusForbidden},
+		{name: "production validates", testMode: false, env: "", wantCode: http.StatusForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MISSKEY_TEST_CHECK_DUPLICATED_TOTP", tt.env)
+			h, repo := newExtraHandler(t)
+			h.SetTestMode(tt.testMode)
+			user := setupUserWithPassword(repo, "u1", "pass")
+			tempSecret := "JBSWY3DPEHPK3PXP"
+			repo.Profiles["u1"].TwoFactorTempSecret = &tempSecret
+
+			rec := postExtra(h.TwoFADone, `{"token":"000000"}`, user)
+			assert.Equal(t, tt.wantCode, rec.Code, rec.Body.String())
+		})
+	}
+}
+
 // TestVerify2FAToken_ReplayRejected: verify2FAToken 経由
 // (TwoFARegisterKey / TwoFAKeyDone から呼ばれる sensitive 操作) でも TOTP
 // replay 保護が効くこと。
@@ -267,7 +296,7 @@ func TestVerify2FAToken_ReplayRejected(t *testing.T) {
 	secret := "JBSWY3DPEHPK3PXP"
 	repo.Profiles["u1"].TwoFactorSecret = &secret
 	repo.Profiles["u1"].TwoFactorEnabled = true
-	h.SetTOTPReplayGuard(newReplayGuard(t))
+	h.totpReplayGuard = newReplayGuard(t)
 
 	token, err := totp.GenerateCode(secret, time.Now())
 	require.NoError(t, err)
@@ -286,7 +315,7 @@ func TestTwoFAUnregister_Success(t *testing.T) {
 	secret := "JBSWY3DPEHPK3PXP"
 	repo.Profiles["u1"].TwoFactorSecret = &secret
 	repo.Profiles["u1"].TwoFactorEnabled = true
-	h.SetTOTPReplayGuard(newReplayGuard(t))
+	h.totpReplayGuard = newReplayGuard(t)
 
 	// upstream 互換: 2FA 有効中の unregister は TOTP token も要求される。
 	token, err := totp.GenerateCode(secret, time.Now())
@@ -409,7 +438,7 @@ func TestTwoFAUnregister_ClearsPasswordLessLogin(t *testing.T) {
 	repo.Profiles["u1"].TwoFactorSecret = &secret
 	repo.Profiles["u1"].TwoFactorEnabled = true
 	repo.Profiles["u1"].UsePasswordLessLogin = true
-	h.SetTOTPReplayGuard(newReplayGuard(t))
+	h.totpReplayGuard = newReplayGuard(t)
 
 	// 2FA 有効中の unregister は TOTP token も要求される。
 	token, err := totp.GenerateCode(secret, time.Now())

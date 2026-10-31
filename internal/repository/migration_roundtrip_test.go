@@ -74,12 +74,12 @@ func runMigrate(fn func() error) error {
 	return nil
 }
 
-func TestMigrations_Fork98UpgradeAppliesRegistrationClosed(t *testing.T) {
-	db, err := testutil.OpenTestDBSchema("fork98upgrade")
+func TestMigrations_Core97To98AppliesRegistrationClosed(t *testing.T) {
+	db, err := testutil.OpenTestDBSchema("core97upgrade")
 	require.NoError(t, err)
 	var schema string
 	require.NoError(t, db.Raw("SELECT current_schema()").Scan(&schema).Error)
-	require.Equal(t, "internal_repository_fork98upgrade", schema)
+	require.Equal(t, "internal_repository_core97upgrade", schema)
 	require.NoError(t, db.Exec(`DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`).Error)
 	require.NoError(t, db.Exec(`CREATE SCHEMA "`+schema+`"`).Error)
 	m, err := migrate.New("file://../../migration", migrateURL(schema))
@@ -89,8 +89,8 @@ func TestMigrations_Fork98UpgradeAppliesRegistrationClosed(t *testing.T) {
 		require.NoError(t, serr)
 		require.NoError(t, derr)
 	}()
-	// forkの98は既に適用済み。上流98のDDLを同じ番号で置き換えても実行されない。
-	require.NoError(t, m.Migrate(98))
+	// 正規core97には列がなく、core98で既存のmeta行にも既定値が入る。
+	require.NoError(t, m.Migrate(97))
 	var columns int64
 	columnCount := func() int64 {
 		require.NoError(t, db.Raw(`SELECT count(*) FROM information_schema.columns
@@ -98,15 +98,24 @@ func TestMigrations_Fork98UpgradeAppliesRegistrationClosed(t *testing.T) {
 		return columns
 	}
 	require.Zero(t, columnCount())
-	require.NoError(t, runMigrate(m.Up))
+	require.NoError(t, db.Exec(`INSERT INTO meta (id) VALUES ('core97')`).Error)
+	require.NoError(t, m.Migrate(98))
 	version, dirty, err := m.Version()
+	require.NoError(t, err)
+	require.Equal(t, uint(98), version)
+	require.False(t, dirty)
+	require.EqualValues(t, 1, columnCount(), "正規core98で登録受付設定が追加される")
+	var closed bool
+	require.NoError(t, db.Raw(`SELECT "registrationClosed" FROM meta WHERE id='core97'`).Scan(&closed).Error)
+	require.False(t, closed)
+
+	require.NoError(t, runMigrate(m.Up))
+	version, dirty, err = m.Version()
 	require.NoError(t, err)
 	require.Equal(t, maxMigrationVersion(t), version)
 	require.False(t, dirty)
-	require.EqualValues(t, 1, columnCount(), "上流の登録受付設定が98からの更新で欠落している")
-	var closed bool
-	require.NoError(t, db.Exec(`INSERT INTO meta (id) VALUES ('fork98')`).Error)
-	require.NoError(t, db.Raw(`SELECT "registrationClosed" FROM meta WHERE id='fork98'`).Scan(&closed).Error)
+	require.EqualValues(t, 1, columnCount(), "最新への更新後も登録受付設定が残る")
+	require.NoError(t, db.Raw(`SELECT "registrationClosed" FROM meta WHERE id='core97'`).Scan(&closed).Error)
 	require.False(t, closed)
 }
 

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/elythia-network/elythia/internal/misc/idnhost"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/repository"
 )
 
 // toPunyHost normalizes a host the same way upstream UtilityService.toPuny does
@@ -237,7 +239,7 @@ func (h *Handler) FederationRemoveAllFollowing(c echo.Context) error {
 // 操作しても効果なし、将来 schema 拡張で対応 column が増えたら updates()
 // に変換 case を足す。
 type federationUpdateInstanceRequest struct {
-	Host           string  `json:"host"`
+	Host           *string `json:"host"`
 	IsSuspended    *bool   `json:"isSuspended"`
 	IsBlocked      *bool   `json:"isBlocked"`
 	IsSilenced     *bool   `json:"isSilenced"`
@@ -292,20 +294,30 @@ func (h *Handler) FederationUpdateInstance(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	var req federationUpdateInstanceRequest
-	if err := c.Bind(&req); err != nil || req.Host == "" {
+	if err := c.Bind(&req); err != nil || req.Host == nil {
 		// 本家は paramDef の ajv 検査で 400 にする (#3330)。
 		return apierr.JSONInvalidParam(c)
 	}
+	// 空のhostは、ほかの存在しないhostと同じく404にする (#3861)。本家の
+	// paramDefはminLengthを持たず、空のhostはinstanceが見つからずに500になる
+	// 見込み。
+	if *req.Host == "" {
+		return apierr.JSONNotFound(c)
+	}
 	// upstream は lookup 前に toPuny(host) で punycode / 小文字化する。IDN / 大文字
 	// host でも instance を引けるよう正規化してから FindByHost / UpdateFields に渡す。
-	host := toPunyHost(req.Host)
+	host := toPunyHost(*req.Host)
 	// before snapshot for moderation log diff (`isSuspended` の変化判定 +
 	// `moderationNote` の before/after)。
 	beforePtr, err := h.instanceRepo.FindByHost(host)
-	if err != nil {
+	if errors.Is(err, repository.ErrNotFound) {
 		// upstream は instance==null で `throw new Error('instance not found')`
-		// (= 500 INTERNAL_ERROR) する。旧実装は silent 204 だったが本家に合わせて
-		// エラーを伝播する。
+		// (= 500 INTERNAL_ERROR) するが、存在しない host は呼び出し側の誤りなので
+		// 404 にする (#3518、docs/divergence/security.md の 7 節)。旧実装の silent
+		// 204 には戻さない。
+		return apierr.JSONNotFound(c)
+	}
+	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
 	// 値コピーで snapshot を凍結する: UpdateFields の実装によっては同じ struct

@@ -69,14 +69,12 @@ func dbFollowersHandler(t *testing.T, db *gorm.DB) *Handler {
 	pinRepo := repository.NewUserNotePiningRepository(db)
 	fRepo := repository.NewFollowingRepository(db)
 	frRepo := repository.NewFollowRequestRepository(db)
-	h := NewHandler(coreuser.NewService(userRepo, noteRepo, pinRepo, idGen),
-		corefollowing.NewService(userRepo, fRepo, frRepo, idGen), noteRepo, idGen)
+	h := NewHandler(coreuser.NewService(userRepo, noteRepo, pinRepo, idGen, nil),
+		corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil), noteRepo, idGen, nil, nil, nil, nil, nil, nil, repository.NewMutingRepository(db), repository.NewBlockingRepository(db), nil)
 	h.SetUserRepo(userRepo)
 	h.SetPiningRepo(pinRepo)
 	h.SetFollowingRepo(fRepo)
 	h.SetFollowRequestRepo(frRepo)
-	h.SetBlockingRepo(repository.NewBlockingRepository(db))
-	h.SetMutingRepo(repository.NewMutingRepository(db))
 	h.SetRenoteMutingRepo(repository.NewRenoteMutingRepository(db))
 	h.SetMemoRepo(repository.NewUserMemoRepository(db))
 	h.SetPageRepo(repository.NewPageRepository(db))
@@ -366,10 +364,14 @@ func TestFollowers_RemoteStatsOverrideRegatesCounts(t *testing.T) {
 // A remote user whose lists are followers-only shows the origin's counts to
 // a viewer who follows them and 0 to one who does not, after the override.
 func TestFollowers_RemoteStatsOverrideRegatesFollowersOnly(t *testing.T) {
+	// ローカルからリモートへのフォローは Accept まで申請になる (#3491)。このテストは
+	// フォローが成立した後の表示を見るので、本家の backend e2e と同じ切り替えで即座に
+	// 成立させる。
+	t.Setenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING", "true")
 	h, repo := newTestHandler(t)
 	addTestUser(repo)
-	h.SetBlockingRepo(testutil.NewMockBlockingRepository())
-	h.SetMutingRepo(testutil.NewMockMutingRepository())
+	h.blockingRepo = testutil.NewMockBlockingRepository()
+	h.mutingRepo = testutil.NewMockMutingRepository()
 	h.SetRenoteMutingRepo(testutil.NewMockRenoteMutingRepository())
 	host := "remote.example"
 	repo.Users["remote-yui"] = &model.User{ID: "remote-yui", Username: "yui", UsernameLower: "yui", Host: &host,

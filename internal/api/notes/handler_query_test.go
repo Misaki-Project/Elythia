@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
@@ -25,11 +26,11 @@ func newQueryHandler(t *testing.T) (*Handler, *testutil.MockNoteRepository) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
 	searchSvc := search.NewService(search.NewSQLLikeProvider(noteRepo, nil))
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, searchSvc, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, searchSvc, idGen)
 	return h, noteRepo
 }
 
@@ -98,8 +99,8 @@ func TestRenotes_FiltersBlockingAuthor(t *testing.T) {
 	blockingRepo.Blockings["b1"] = &model.Blocking{ID: "b1", BlockerID: "blocker", BlockeeID: "alice"}
 	userRepo := testutil.NewMockUserRepository()
 	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", UsernameLower: "alice"}
-	h.SetMutingRepo(mutingRepo)
-	h.SetBlockingRepo(blockingRepo)
+	h.mutingRepo = mutingRepo
+	h.blockingRepo = blockingRepo
 	h.SetUserRepo(userRepo)
 
 	c, rec := newJSONRequest(t, "/api/notes/renotes", `{"noteId":"parent"}`)
@@ -127,8 +128,8 @@ func TestReplies_FiltersMutedAuthor(t *testing.T) {
 	blockingRepo := testutil.NewMockBlockingRepository()
 	userRepo := testutil.NewMockUserRepository()
 	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", UsernameLower: "alice"}
-	h.SetMutingRepo(mutingRepo)
-	h.SetBlockingRepo(blockingRepo)
+	h.mutingRepo = mutingRepo
+	h.blockingRepo = blockingRepo
 	h.SetUserRepo(userRepo)
 
 	c, rec := newJSONRequest(t, "/api/notes/replies", `{"noteId":"parent"}`)
@@ -469,7 +470,7 @@ func TestSearch_UserIDOverridesChannelID(t *testing.T) {
 // #1783: canSearchNotes policy が false の viewer (匿名含む) は UNAVAILABLE。
 func TestSearch_CanSearchNotesDenied(t *testing.T) {
 	h, _ := newQueryHandler(t)
-	h.SetPolicyProvider(&draftStubPolicyProvider{policies: map[string]any{"canSearchNotes": false}})
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{"canSearchNotes": false}}
 	c, rec := newJSONRequest(t, "/api/notes/search", `{"query":"x"}`)
 	require.NoError(t, h.Search(c))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -483,7 +484,7 @@ func TestSearch_CanSearchNotesAllowed(t *testing.T) {
 	hello := "hello"
 	n := seedPublicNote(repo, "n1")
 	n.Text = &hello
-	h.SetPolicyProvider(&draftStubPolicyProvider{policies: map[string]any{"canSearchNotes": true}})
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{"canSearchNotes": true}}
 	c, rec := newJSONRequest(t, "/api/notes/search", `{"query":"hello"}`)
 	require.NoError(t, h.Search(c))
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -518,11 +519,11 @@ func TestSearch_NoopProviderReturnsUnavailable(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
 	searchSvc := search.NewService(search.NewNoopProvider())
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, searchSvc, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, searchSvc, idGen)
 
 	c, rec := newJSONRequest(t, "/api/notes/search", `{"query":"hello"}`)
 	require.NoError(t, h.Search(c))
@@ -538,10 +539,10 @@ func TestSearch_NoSearchService(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	c, rec := newJSONRequest(t, "/api/notes/search", `{"query":"hello"}`)
 	require.NoError(t, h.Search(c))
@@ -698,11 +699,11 @@ func newFailingQueryHandler(t *testing.T) *Handler {
 	repo := &failingQueryRepo{MockNoteRepository: mock}
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(repo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(repo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(repo)
 	querySvc := corenote.NewQueryService(repo, nil)
 	searchSvc := search.NewService(search.NewSQLLikeProvider(repo, nil))
-	return NewHandler(repo, createSvc, deleteSvc, querySvc, nil, nil, nil, searchSvc, idGen)
+	return newHandlerNilDeps(repo, createSvc, deleteSvc, querySvc, nil, nil, nil, searchSvc, idGen)
 }
 
 func TestRenotes_RepoError(t *testing.T) {
@@ -784,9 +785,9 @@ func TestBulkShow_NoQueryServiceRejects(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, nil, nil, nil, nil, nil, idGen)
 
 	seedPublicNote(noteRepo, "n1")
 	seedPublicNote(noteRepo, "n2")
@@ -809,13 +810,68 @@ func TestShow_NoQueryServiceRejects(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, nil, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, nil, nil, nil, nil, nil, idGen)
 
 	seedPublicNote(noteRepo, "n1")
 	c, rec := newJSONRequest(t, "/api/notes/show", `{"noteId":"n1"}`)
 	require.NoError(t, h.Show(c))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "NO_SUCH_NOTE")
+}
+
+// notes/search と notes/search-by-tag は、閲覧者に本文が隠れるノートを結果から
+// 除く。作者本人には残る。
+func TestSearch_DropsNotesHiddenFromViewer(t *testing.T) {
+	future := int(time.Now().Add(time.Hour).Unix())
+	cases := []struct {
+		name   string
+		setup  func(u *model.User)
+		viewer *model.User
+		want   int
+	}{
+		{"control", func(*model.User) {}, nil, 1},
+		{"requireSignin anonymous", func(u *model.User) { u.RequireSigninToViewContents = true }, nil, 0},
+		{"requireSignin signed in", func(u *model.User) { u.RequireSigninToViewContents = true }, &model.User{ID: "viewer"}, 1},
+		{"hiddenBefore anonymous", func(u *model.User) { u.MakeNotesHiddenBefore = &future }, nil, 0},
+		{"hiddenBefore other user", func(u *model.User) { u.MakeNotesHiddenBefore = &future }, &model.User{ID: "viewer"}, 0},
+		{"hiddenBefore author", func(u *model.User) { u.MakeNotesHiddenBefore = &future }, &model.User{ID: "author"}, 1},
+		{"followersOnlyBefore anonymous", func(u *model.User) { u.MakeNotesFollowersOnlyBefore = &future }, nil, 0},
+	}
+	endpoints := []struct {
+		name string
+		path string
+		body string
+		call func(h *Handler, c echo.Context) error
+	}{
+		{"search", "/api/notes/search", `{"query":"secret"}`, (*Handler).Search},
+		{"search-by-tag", "/api/notes/search-by-tag", `{"tag":"secret"}`, (*Handler).SearchByTag},
+	}
+	for _, ep := range endpoints {
+		for _, tc := range cases {
+			t.Run(ep.name+"/"+tc.name, func(t *testing.T) {
+				h, repo := newQueryHandler(t)
+				text := "secret word"
+				// 作成時刻を読める ID にする (読めないと epoch 0 扱いで隠れる側に倒れ、
+				// 期間の判定を試せない)。
+				gen, err := id.NewGenerator("aidx")
+				require.NoError(t, err)
+				n := seedPublicNote(repo, gen.Generate(time.Now().Add(-time.Minute)))
+				n.Text = &text
+				n.Tags = []string{"secret"}
+				tc.setup(n.User)
+
+				c, rec := newJSONRequest(t, ep.path, ep.body)
+				if tc.viewer != nil {
+					setAuthUser(c, tc.viewer)
+				}
+				require.NoError(t, ep.call(h, c))
+				require.Equal(t, http.StatusOK, rec.Code)
+				var resp []map[string]any
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+				assert.Len(t, resp, tc.want)
+			})
+		}
+	}
 }

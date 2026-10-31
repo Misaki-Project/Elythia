@@ -20,11 +20,11 @@ func newPollsHandler(t *testing.T) (*Handler, *testutil.MockNoteRepository, *tes
 	pollRepo := testutil.NewMockPollRepository()
 	voteRepo := testutil.NewMockPollVoteRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	pollSvc := corepoll.NewService(noteRepo, pollRepo, voteRepo, nil, idGen)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, pollSvc, nil, idGen)
+	pollSvc := corepoll.NewService(noteRepo, pollRepo, voteRepo, nil, idGen, nil)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, pollSvc, nil, idGen)
 	return h, noteRepo, pollRepo
 }
 
@@ -142,13 +142,13 @@ func TestPollsVote_NoPoll(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "5f979967-52d9-4314-a911-1c673727f92f")
 }
 
-// failingVoteRepo causes Create to fail.
+// failingVoteRepo causes the vote insert to fail.
 type failingVoteRepo struct {
 	*testutil.MockPollVoteRepository
 }
 
-func (f *failingVoteRepo) Create(_ *model.PollVote) error {
-	return testutil.ErrNotFound
+func (f *failingVoteRepo) CreateIfNotVoted(_ *model.PollVote, _ bool) (bool, error) {
+	return false, testutil.ErrNotFound
 }
 
 func TestPollsVote_RepoError(t *testing.T) {
@@ -157,11 +157,11 @@ func TestPollsVote_RepoError(t *testing.T) {
 	seedPollNote(noteRepo, pollRepo, model.NoteVisibilityPublic, nil)
 	voteRepo := &failingVoteRepo{MockPollVoteRepository: testutil.NewMockPollVoteRepository()}
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	pollSvc := corepoll.NewService(noteRepo, pollRepo, voteRepo, nil, idGen)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, pollSvc, nil, idGen)
+	pollSvc := corepoll.NewService(noteRepo, pollRepo, voteRepo, nil, idGen, nil)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, pollSvc, nil, idGen)
 
 	c, rec := newJSONRequest(t, "/api/notes/polls/vote", `{"noteId":"n1","choice":0}`)
 	setAuthUser(c, &model.User{ID: "viewer"})

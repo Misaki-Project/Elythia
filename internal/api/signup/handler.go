@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/config"
 	"github.com/elythia-network/elythia/internal/core/captcha"
 	coreemail "github.com/elythia-network/elythia/internal/core/email"
@@ -51,6 +52,9 @@ type SigninRecorder interface {
 
 // Handler handles POST /api/signup.
 type Handler struct {
+	// background は応答の後の処理 (確認メールの送信) を起動する箱 (#3661)。世代の停止で
+	// 待つ。nil なら素の goroutine で起動する (テスト)。
+	background    *bgwork.Group
 	signupService *coresignup.Service
 	metaRepo      repository.MetaRepository
 	idGen         id.Generator
@@ -91,6 +95,9 @@ type Handler struct {
 	// signup-application/apply を守る署名付きフォームトークン (#2806)。
 	// **captcha の代替ではない** — 位置づけは core/signupform の doc を見ること。
 	formTokens *signupform.Issuer
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // SetFormTokenIssuer wires the signed form tokens used when no real captcha
@@ -127,8 +134,15 @@ func (h *Handler) SetTestMode(v bool) {
 }
 
 // NewHandler creates a new signup Handler.
-func NewHandler(signupService *coresignup.Service, metaRepo repository.MetaRepository, idGen id.Generator) *Handler {
-	return &Handler{signupService: signupService, metaRepo: metaRepo, idGen: idGen}
+// background is the group the work after a response runs in, so stopping the
+// server generation waits for it (#3661); entityPacker is the Packer this
+// handler packs entities with (#3792); userPolicies is the effective-policy
+// source for the signup response (#2673).
+func NewHandler(signupService *coresignup.Service, metaRepo repository.MetaRepository, idGen id.Generator,
+	background *bgwork.Group, entityPacker *entity.Packer, userPolicies role.PolicyProvider,
+) *Handler {
+	return &Handler{signupService: signupService, metaRepo: metaRepo, idGen: idGen,
+		background: background, entityPacker: entityPacker, userPolicies: userPolicies}
 }
 
 // SetCaptcha attaches a CaptchaService for signup verification.
@@ -157,8 +171,9 @@ func (h *Handler) SetEmailValidationClient(c *http.Client) {
 }
 
 type signupRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username         string                 `json:"username"`
+	Password         string                 `json:"password"`
+	FederationStatus model.FederationStatus `json:"federationStatus"`
 	// Host は TestMode でのみ読む。upstream SignupApiService も
 	// NODE_ENV === 'test' のときだけ body.host を受け付け、リモートユーザーを
 	// 直接作れるようにしている (e2e が「リモートユーザーのノートが LTL に
@@ -204,6 +219,10 @@ func (h *Handler) Signup(c echo.Context) error {
 	var req signupRequest
 	if err := c.Bind(&req); err != nil || req.Username == "" || req.Password == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid parameters.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
+	}
+	status := requestedFederationStatus(req.FederationStatus)
+	if status != model.FederationStatusOn && status != model.FederationStatusOff && status != model.FederationStatusPending {
+		return apierr.JSONInvalidParam(c)
 	}
 
 	meta, err := h.metaRepo.Fetch()
@@ -289,7 +308,7 @@ func (h *Handler) Signup(c echo.Context) error {
 				return resp()
 			}
 		}
-		pending, perr := h.signupService.CreatePending(req.Username, req.EmailAddress, req.Password, ticketID)
+		pending, perr := h.signupService.CreatePendingWithFederationStatus(req.Username, req.EmailAddress, req.Password, ticketID, nil, status)
 		if perr != nil {
 			h.releaseInvitation(ticket)
 			// upstream は username 系 error を Fastify-style reply error
@@ -367,7 +386,7 @@ func (h *Handler) Signup(c echo.Context) error {
 			return resp()
 		}
 	}
-	result, err := h.signupService.SignupWithHost(req.Username, req.Password, isInitialSetup, remoteHost, coresignup.UsernamePolicyPublic)
+	result, err := h.signupService.SignupWithHostAndFederationStatus(req.Username, req.Password, isInitialSetup, remoteHost, coresignup.UsernamePolicyPublic, requestedFederationStatus(req.FederationStatus))
 	if err != nil {
 		h.releaseInvitation(ticket)
 		// upstream の `/api/signup` は username 系 error を Fastify-style
@@ -409,7 +428,7 @@ func (h *Handler) Signup(c echo.Context) error {
 	// 足して返すだけ。ここで signin を通すと login 通知が 1 件生まれ、作りたての
 	// アカウントの hasUnreadNotification / unreadNotificationsCount が upstream と
 	// 食い違う (#1804 の適用範囲を signup-pending に限定)。
-	return c.JSON(http.StatusOK, packSignupResponse(result.User, result.Profile, result.Token, h.idGen, h.signupPolicies(result.User.ID)))
+	return c.JSON(http.StatusOK, packSignupResponse(h.entityPacker, result.User, result.Profile, result.Token, h.idGen, h.signupPolicies(result.User.ID)))
 }
 
 // SignupPending handles POST /api/signup-pending. Misskey TS 互換: code を
@@ -510,11 +529,8 @@ func (h *Handler) sendSignupConfirmation(meta *model.Meta, to, code, acceptLangu
 		Subject:  subject,
 		BodyHTML: bodyHTML,
 	})
-	go h.emailSender(to, miscsmtp.Message{
-		Subject: subject,
-		Text:    text,
-		HTML:    html,
-	})
+	msg := miscsmtp.Message{Subject: subject, Text: text, HTML: html}
+	h.background.Go(func(context.Context) { h.emailSender(to, msg) })
 }
 
 // signupConfirmURL builds the email confirmation link Misskey TS uses
@@ -602,10 +618,6 @@ func (h *Handler) validateInvitationCode(code string, emailRequired bool) (*mode
 	return ticket, nil
 }
 
-// SetUserPolicyResolver wires the effective-policy source for the signup
-// response.
-func (h *Handler) SetUserPolicyResolver(r role.PolicyProvider) { h.userPolicies = r }
-
 // signupPolicies returns the policies advertised in the signup response.
 //
 // **実効値を返すこと。** upstream の SignupApiService は MeDetailed を pack し、
@@ -626,8 +638,8 @@ func (h *Handler) signupPolicies(userID string) map[string]any {
 // mk-go も同じ packer を通し、MeDetailed struct に無い /api/i 固有 field
 // (pinnedPage / clientData / room / securityKeysList 等) だけを新規ユーザーの
 // 既定値で補う。個別に map を組み立てていた頃は 24 個の field が欠けていた。
-func packSignupResponse(u *model.User, profile *model.UserProfile, token string, idGen id.Generator, policies map[string]any) map[string]any {
-	me := entity.PackMeDetailed(u, profile, idGen)
+func packSignupResponse(pk *entity.Packer, u *model.User, profile *model.UserProfile, token string, idGen id.Generator, policies map[string]any) map[string]any {
+	me := pk.PackMeDetailed(u, profile, idGen)
 	me.Policies = policies
 	b, _ := json.Marshal(me)
 	resp := map[string]any{}
@@ -652,9 +664,9 @@ func packSignupResponse(u *model.User, profile *model.UserProfile, token string,
 // defaultPolicies returns the Misskey default policies for a new user.
 var errInvalidCode = errors.New("invalid invitation code")
 
-// HasUserPolicyResolver reports whether the effective-policy resolver was wired.
-//
-// 未配線だと素の default policy を返すので、meta の base policy override も
-// server cap も反映されず、signup と /api/i が違う値を答える (#2673)。
-// 起動時検査に使う (#2683)。
-func (h *Handler) HasUserPolicyResolver() bool { return h.userPolicies != nil }
+func requestedFederationStatus(status model.FederationStatus) model.FederationStatus {
+	if status == "" {
+		return model.FederationStatusOn
+	}
+	return status
+}

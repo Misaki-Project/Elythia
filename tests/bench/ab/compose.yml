@@ -1,0 +1,170 @@
+# base / head の 2 つの commit を、同じスタックで交互に流す (#3544)。
+# run.sh から使う。app の image は APP_IMAGE で差し替える。本家 Misskey と比べる
+# ときは、本家の側の回だけ compose.upstream.yml を重ねる (#3654)。
+#
+# **CPU の上限の合計は 3.75 にしてある。** GitHub-hosted runner は 4 vCPU で、
+# 残りを OS・dockerd・sampler に残す。上限が足りずに奪い合うと、どちらの commit が
+# 速いかではなく、その回にどれだけ奪われたかを測ることになる。配分は app 1.25 /
+# postgres 0.75 / redis 0.5 / web 0.5 / k6 0.75。最初の版は web と redis を 0.25 に
+# していて、5 VU の smoke でも短い山で上限に当たり (1 回 100ms の区切りのうち 75ms
+# 止まる)、app の差と関係なく p99 が伸びていた。上限に当たった回数と時間は、回ごとに
+# throttle.csv に残す。GitHub-hosted runner での配分は、段階 (3) の実測で見直す。
+#
+# postgres / redis / nginx / k6 の image は digest で固定する。日を変えて流した比較どうしで、
+# app 以外の条件を揃える。seed の image (tests/bench/http/common/Dockerfile.seed) は
+# 固定していないが、計測の前に止めるので数字には入らない。
+#
+# **postgres は fsync / synchronous_commit / full_page_writes を切って動かす (#3659)。**
+# GitHub-hosted runner の一部の機種 (AMD EPYC 9V74) では、ノートの INSERT / COMMIT が
+# ディスクの書き込みの待ちで断続的に数十〜数百 ms 止まり、notes-create の p95 が、
+# 同じ commit 同士でも 2.5ms〜39.5ms に揺れた。本家も同じく止まる。測りたいのは app の
+# 差なので、fsync・full page write・COMMIT の待ちを外す。これで 9V74 でも揺れなくなることを、
+# PR #3660 の上の実行で確かめた (docs/bench-compare.md)。
+# 設定は compose.yml の postgres にだけ書き、compose.upstream.yml では postgres を
+# 触らない (base / head、本家 / Elythia の両側に同じ条件がかかる。
+# TestBenchPostgresSkipsDiskWaits が見る)。本番・e2e の compose には入れない。
+# 経緯は issue #3659。
+#
+# project 名は本番 (mk) と衝突させない (CLAUDE.md Section 0)。
+name: mk-bench-ab
+
+services:
+  postgres:
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    # 落ちたら DB ごと捨てる使い捨てのスタックなので、クラッシュ時の安全は要らない
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: pg_isready -U misskey
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 1024M
+    networks: [bench]
+
+  redis:
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    healthcheck:
+      test: redis-cli ping
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    networks: [bench]
+
+  app:
+    # run.sh が専用 project 名を含む一意な tag を回ごとに渡す。既定値は down など
+    # image を使わない操作のためのもの
+    image: ${APP_IMAGE:-mk-bench-ab-app:base}
+    environment:
+      TZ: Asia/Tokyo
+      # 負荷は k6 の 1 つの IP から来るので、IP の制限だけ外す
+      MK_ENABLEIPRATELIMIT: "false"
+      # prod-like は false (利用者ごとの制限を残す)、unlimited は true。seed の間だけは
+      # run.sh が true にする (admin/accounts/create は 1 時間に 30 なので 50 人を作れない)
+      MK_DISABLEENDPOINTRATELIMITS: "${BENCH_DISABLE_ENDPOINT_RATE_LIMITS:-false}"
+      MK_ENABLETIMELINECACHE: "false"
+      # sampler が Go のヒープを /debug/pprof/heap から読む
+      MK_ENABLEPPROF: "true"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - ./elythia.yml:/app/.config/default.yml:ro
+    # sampler がヒープを読むためだけに、localhost の空いている port へ出す
+    ports:
+      - "127.0.0.1::3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    deploy:
+      resources:
+        limits:
+          cpus: "1.25"
+          # 本家との比較 (run.sh --upstream) は両側とも 2048M にする。本家の公式 image は
+          # Node.js のプロセスが 4 つ (pnpm の外側の 2 つ、server、queue の worker) で、
+          # 1024M では足りなくなるおそれがある
+          memory: "${BENCH_APP_MEMORY:-1024M}"
+    networks: [bench]
+
+  web:
+    image: nginx:alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app: { condition: service_healthy }
+    healthcheck:
+      # localhost は ::1 に解決されるが、nginx.conf は IPv4 でしか listen しない
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    networks: [bench]
+
+  seed:
+    profiles: [tools]
+    build:
+      context: ../http/common
+      dockerfile: Dockerfile.seed
+    environment:
+      TARGET_URL: http://web
+      TARGET_NAME: bench-ab
+      # run.sh --smoke が小さくする
+      SEED_USERS: "${BENCH_SEED_USERS:-50}"
+      SEED_NOTES: "${BENCH_SEED_NOTES:-50}"
+      SEED_REPLY_RATIO: "0.35"
+      SEED_VISIBILITY: "public:80,home:15,followers:5"
+      # 作れなかった利用者・ノート・フォローがあれば非 0 で終わる
+      SEED_STRICT: "1"
+      # 本家の側の回でだけ run.sh が渡す (本家の利用者ごとの制限を基本ロールで決める)
+      SEED_RATE_LIMIT_FACTOR: "${BENCH_SEED_RATE_LIMIT_FACTOR:-}"
+      OUTPUT_DIR: /seed
+    volumes:
+      - seed:/seed
+      - ../http/common/seed.py:/app/seed.py:ro
+    networks: [bench]
+
+  k6:
+    profiles: [tools]
+    image: grafana/k6:0.55.0@sha256:b24f418fc99a26dd57904c952c03bfaf79462be18508acc45aafa07ff68e7df2
+    # 結果を書く results/ の持ち主に合わせる (run.sh が渡す)
+    user: "${BENCH_UID:-0}:${BENCH_GID:-0}"
+    environment:
+      TARGET_URL: http://web
+    volumes:
+      # /lib は image の musl loader と重なるので避ける
+      - ./k6:/scripts/ab:ro
+      - ../http/k6/lib:/scripts/lib:ro
+      - seed:/seed:ro
+      - ${BENCH_RUN_DIR:-./results}:/out
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 512M
+    networks: [bench]
+
+volumes:
+  seed:
+
+networks:
+  bench:
+    driver: bridge

@@ -5,6 +5,15 @@ import pluginVue from 'eslint-plugin-vue';
 import pluginMisskey from '@misskey-dev/eslint-plugin';
 import sharedConfig from '../shared/eslint.config.js';
 
+const mfmParserImports = [
+	{ name: 'mfm-js', message: 'mfm-js is no longer used. Use `@/utility/mfm.js`.' },
+	{ name: '@elythia-network/mfm', message: 'Use `@/utility/mfm.js` instead of importing the MFM parser directly.' },
+];
+const mfmParserImportPatterns = [
+	{ group: ['mfm-js/*'], message: 'mfm-js is no longer used. Use `@/utility/mfm.js`.' },
+	{ group: ['@elythia-network/mfm/*'], message: 'Use `@/utility/mfm.js` instead of importing the MFM parser directly.' },
+];
+
 export default [
 	...sharedConfig,
 	{
@@ -43,6 +52,15 @@ export default [
 		rules: {
 			'@typescript-eslint/no-empty-interface': ['error', {
 				allowSingleExtends: true,
+			}],
+			// MFM は src/utility/mfm.ts を通して扱う (解析器を差し替える口をそこに置いている)。
+			// shared の punycode の制限もここで指定し直す。
+			'no-restricted-imports': ['error', {
+				paths: [
+					{ name: 'punycode' },
+					...mfmParserImports,
+				],
+				patterns: mfmParserImportPatterns,
 			}],
 			'import/consistent-type-specifier-style': ['error', 'prefer-top-level'],
 			// window ... グローバルスコープと衝突し、予期せぬ結果を招くため

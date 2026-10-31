@@ -6,6 +6,15 @@ import (
 	"gorm.io/datatypes"
 )
 
+// FederationStatus controls whether a local account may participate in ActivityPub.
+type FederationStatus string
+
+const (
+	FederationStatusPending FederationStatus = "pending"
+	FederationStatusOff     FederationStatus = "off"
+	FederationStatusOn      FederationStatus = "on"
+)
+
 // User represents the `user` table.
 // Misskey互換のカラム名・型を維持する
 type User struct {
@@ -16,8 +25,13 @@ type User struct {
 	// 全 user 行書き込み (lastActiveDate の 5 分おき更新を含む) で bump され、
 	// 意味が「最終アクセス時刻」に化けて state:'alive' フィルタや +updatedAt sort が
 	// 壊れる。自動更新を切り、IncrementNotesCount で明示的に書く (#2285)。
-	UpdatedAt        *time.Time `gorm:"column:updatedAt;type:timestamp with time zone;autoUpdateTime:false;autoCreateTime:false" json:"updatedAt"`
-	LastFetchedAt    *time.Time `gorm:"column:lastFetchedAt;type:timestamp with time zone" json:"lastFetchedAt"`
+	UpdatedAt     *time.Time `gorm:"column:updatedAt;type:timestamp with time zone;autoUpdateTime:false;autoCreateTime:false" json:"updatedAt"`
+	LastFetchedAt *time.Time `gorm:"column:lastFetchedAt;type:timestamp with time zone" json:"lastFetchedAt"`
+	// AccountCreatedAt はリモートの人がアカウントを作った日時 (#3465、Elythia 独自の列)。
+	// ID から出る createdAt はリモートでは「このサーバーが初めて知った日時」なので、
+	// actor の `published` か、Misskey 系なら相手の `/api/users/show` の
+	// `createdAt` から埋める。ローカルの人と、どちらからも取れなかった人は nil。
+	AccountCreatedAt *time.Time `gorm:"column:accountCreatedAt;type:timestamp with time zone" json:"accountCreatedAt"`
 	LastActiveDate   *time.Time `gorm:"column:lastActiveDate;type:timestamp with time zone" json:"lastActiveDate"`
 	HideOnlineStatus bool       `gorm:"column:hideOnlineStatus;default:false" json:"hideOnlineStatus"`
 	Username         string     `gorm:"column:username;type:varchar(128);not null" json:"username"`
@@ -63,6 +77,18 @@ type User struct {
 	URI                          *string        `gorm:"column:uri;type:varchar(512)" json:"uri"`
 	FollowersURI                 *string        `gorm:"column:followersUri;type:varchar(512)" json:"followersUri"`
 	Token                        *string        `gorm:"column:token;type:char(16)" json:"-"`
+	// ManagedByPlugin is the name of the plugin that manages this account, or
+	// nil for an ordinary account (#3468).
+	//
+	// 埋まっているアカウントには、どの経路からもログインできない。ネイティブ
+	// トークンはプラグインのプロセス内の呼び出し (AsUser) でだけ受け付ける。
+	// Elythia 独自の列 (migration 000118)。
+	ManagedByPlugin              *string          `gorm:"column:managedByPlugin;type:varchar(32)" json:"managedByPlugin,omitempty"`
+	FederationStatus             FederationStatus `gorm:"column:federationStatus;type:varchar(16);not null;default:'on'" json:"-"`
+	FederationEnabledAt          *time.Time       `gorm:"column:federationEnabledAt;type:timestamp with time zone" json:"-"`
+	FirstExternalReferenceAt     *time.Time       `gorm:"column:firstExternalReferenceAt;type:timestamp with time zone" json:"-"`
+	FirstExternalReferenceReason *string          `gorm:"column:firstExternalReferenceReason;type:varchar(32)" json:"-"`
+	FirstExternalReferenceHost   *string          `gorm:"column:firstExternalReferenceHost;type:varchar(255)" json:"-"`
 
 	// Relations
 	Avatar *DriveFile `gorm:"foreignKey:AvatarID" json:"avatar,omitempty"`
@@ -70,6 +96,15 @@ type User struct {
 }
 
 func (User) TableName() string { return "user" }
+
+// IsPluginManaged reports whether a plugin manages this account (#3468).
+//
+// 列が NULL でなければ、空文字でも管理するアカウントとして扱う。本体は空文字を
+// 書かないが、手で UPDATE した行でログインの拒否が外れる向きには倒さない。
+// 判定はここ 1 箇所に集める (経路ごとに書くと、1 つだけ条件がずれる)。
+func (u *User) IsPluginManaged() bool {
+	return u != nil && u.ManagedByPlugin != nil
+}
 
 // IsLocal returns true if the user is a local user.
 func (u *User) IsLocal() bool {

@@ -15,6 +15,7 @@ import (
 	"github.com/elythia-network/elythia/internal/entitycompat/shapetest"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/labstack/echo/v4"
@@ -63,9 +64,9 @@ func newHandlerWithFailingCounters(t *testing.T) (*Handler, *testutil.MockUserRe
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	uSvc := coreuser.NewService(userRepo, nil, nil, nil)
-	return NewHandler(fSvc, uSvc), mockUR, fRepo, frRepo
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	uSvc := coreuser.NewService(userRepo, nil, nil, nil, nil)
+	return NewHandler(fSvc, uSvc, nil, nil), mockUR, fRepo, frRepo
 }
 
 // newHandlerWithFailingRequestDelete builds a handler whose FollowRequest Delete fails.
@@ -76,9 +77,9 @@ func newHandlerWithFailingRequestDelete(t *testing.T) (*Handler, *testutil.MockU
 	frRepo := &failingFollowRequestRepo{MockFollowRequestRepository: mockFRR}
 	fRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	uSvc := coreuser.NewService(userRepo, nil, nil, nil)
-	return NewHandler(fSvc, uSvc), userRepo, mockFRR
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	uSvc := coreuser.NewService(userRepo, nil, nil, nil, nil)
+	return NewHandler(fSvc, uSvc, nil, nil), userRepo, mockFRR
 }
 
 // newHandlerWithFailingListReceived builds a handler whose ListReceived fails.
@@ -89,20 +90,27 @@ func newHandlerWithFailingListReceived(t *testing.T) (*Handler, *testutil.MockUs
 	frRepo := &failingListReqRepo{MockFollowRequestRepository: mockFRR}
 	fRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	uSvc := coreuser.NewService(userRepo, nil, nil, nil)
-	return NewHandler(fSvc, uSvc), userRepo
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	uSvc := coreuser.NewService(userRepo, nil, nil, nil, nil)
+	return NewHandler(fSvc, uSvc, nil, nil), userRepo
 }
 
 func newTestHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
+	t.Helper()
+	return newTestHandlerWithSilentFollows(t, nil)
+}
+
+// newTestHandlerWithSilentFollows is newTestHandler with the silent follow
+// store the following service is built with (#3466, #3825).
+func newTestHandlerWithSilentFollows(t *testing.T, silent repository.SilentFollowRepository) (*Handler, *testutil.MockUserRepository) {
 	t.Helper()
 	userRepo := testutil.NewMockUserRepository()
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	uSvc := coreuser.NewService(userRepo, nil, nil, nil)
-	return NewHandler(fSvc, uSvc), userRepo
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, silent, nil)
+	uSvc := coreuser.NewService(userRepo, nil, nil, nil, nil)
+	return NewHandler(fSvc, uSvc, nil, nil), userRepo
 }
 
 func addUser(repo *testutil.MockUserRepository, id string, locked bool) *model.User {
@@ -185,9 +193,9 @@ func newTestHandlerWithRepos(t *testing.T) (*Handler, *testutil.MockUserReposito
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	uSvc := coreuser.NewService(userRepo, nil, nil, nil)
-	return NewHandler(fSvc, uSvc), userRepo, fRepo, frRepo
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	uSvc := coreuser.NewService(userRepo, nil, nil, nil, nil)
+	return NewHandler(fSvc, uSvc, nil, nil), userRepo, fRepo, frRepo
 }
 
 // #1056: POST /api/following/create with withReplies=true should persist
@@ -367,17 +375,16 @@ func TestList_EmbedsRelationFlags(t *testing.T) {
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	uSvc := coreuser.NewService(userRepo, nil, nil, nil)
-	h := NewHandler(fSvc, uSvc)
-	h.SetIDGen(idGen)
-	h.SetListPacker(userpack.New(userpack.Lookups{Relations: userrelation.Repos{
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	uSvc := coreuser.NewService(userRepo, nil, nil, nil, nil)
+	h := NewHandler(fSvc, uSvc, nil, userpack.New(nil, userpack.Lookups{Relations: userrelation.Repos{
 		Following:     fRepo,
 		Blocking:      testutil.NewMockBlockingRepository(),
 		Muting:        testutil.NewMockMutingRepository(),
 		RenoteMuting:  testutil.NewMockRenoteMutingRepository(),
 		FollowRequest: frRepo,
 	}}, idGen))
+	h.SetIDGen(idGen)
 
 	addUser(userRepo, "alice", false)
 	bob := addUser(userRepo, "bob", false)
@@ -669,9 +676,9 @@ func newTestHandlerWithFollowings(t *testing.T) (*Handler, *testutil.MockUserRep
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen)
-	uSvc := coreuser.NewService(userRepo, nil, nil, nil)
-	h := NewHandler(fSvc, uSvc)
+	fSvc := corefollowing.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
+	uSvc := coreuser.NewService(userRepo, nil, nil, nil, nil)
+	h := NewHandler(fSvc, uSvc, nil, nil)
 	h.SetIDGen(idGen)
 	return h, userRepo, fRepo
 }
@@ -781,4 +788,38 @@ func TestList_DefaultLimit(t *testing.T) {
 	var out []map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
 	assert.Equal(t, 10, len(out), "limit 未指定 → default 10")
+}
+
+// 一覧の limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が
+// 整数の小数を受ける。following/silent/list (独自) も同じ形 (#3756)。
+func TestListsAcceptIntegerValuedFractions(t *testing.T) {
+	h, repo := newTestHandlerWithSilentFollows(t, &fakeSilentFollowRepo{})
+	bob := addUser(repo, "bob", false)
+	for _, tc := range []struct {
+		name string
+		fn   func(echo.Context) error
+	}{
+		{"list", h.List},
+		{"requests/list", h.ListRequests},
+		{"requests/sent", h.RequestsSent},
+		{"silent/list", h.ListSilent},
+	} {
+		for _, body := range []string{`{"limit":10.0}`, `{"limit":1e1}`, `{"sinceDate":1.0}`, `{"untilDate":4102444800000.0}`} {
+			assert.Equal(t, http.StatusOK, postJSON(tc.fn, body, bob).Code, tc.name+" "+body)
+		}
+		assert.Equal(t, http.StatusBadRequest, postJSON(tc.fn, `{"limit":10.5}`, bob).Code, tc.name)
+	}
+
+	// 小数の limit が件数として効く (読んだうえで無視していない)。
+	a := addUser(repo, "lockeda", true)
+	b := addUser(repo, "lockedb", true)
+	for _, target := range []*model.User{a, b} {
+		_, err := h.followingService.Follow(bob.ID, target.ID, corefollowing.FollowOptions{})
+		require.NoError(t, err)
+	}
+	var sent []map[string]any
+	rec := postJSON(h.RequestsSent, `{"limit":1.0}`, bob)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &sent))
+	assert.Len(t, sent, 1)
 }

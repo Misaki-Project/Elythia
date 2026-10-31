@@ -1,0 +1,1870 @@
+{
+	"endpoints": {
+		"admin/backup/delete": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					},
+					"id": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"password",
+					"id"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/download": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					},
+					"id": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"password",
+					"id"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/list": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					}
+				},
+				"required": [
+					"password"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/reauth-challenge": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/backup/restore/abort": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					},
+					"opId": {
+						"type": "string",
+						"minLength": 1
+					},
+					"ticket": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"password",
+					"opId",
+					"ticket"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/restore/candidates": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					}
+				},
+				"required": [
+					"password"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/restore/confirm": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					},
+					"opId": {
+						"type": "string",
+						"minLength": 1
+					},
+					"ticket": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"password",
+					"opId",
+					"ticket"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/restore/prepare": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					},
+					"kind": {},
+					"id": {
+						"type": "string",
+						"minLength": 1
+					},
+					"database": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"password"
+				],
+				"anyOf": [
+					{
+						"properties": {
+							"kind": {
+								"type": "string",
+								"enum": [
+									"restore"
+								]
+							}
+						},
+						"required": [
+							"id"
+						]
+					},
+					{
+						"properties": {
+							"kind": {
+								"type": "string",
+								"enum": [
+									"rollback"
+								]
+							}
+						},
+						"required": [
+							"kind",
+							"database"
+						]
+					}
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/restore/status": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"opId": {
+						"type": "string",
+						"minLength": 1
+					},
+					"ticket": {
+						"type": "string",
+						"minLength": 1
+					},
+					"session": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"opId",
+					"ticket",
+					"session"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/take": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					}
+				},
+				"required": [
+					"password"
+				]
+			},
+			"meta": {}
+		},
+		"admin/backup/verify": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					},
+					"id": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"password",
+					"id"
+				]
+			},
+			"meta": {}
+		},
+		"admin/database-health": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/drive/usage": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"forceRecalc": {
+						"type": "boolean"
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/emoji-application/approve": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"applicationId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"applicationId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/emoji-application/list": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"filter": {
+						"type": "string",
+						"enum": [
+							"pending",
+							"processed",
+							"all"
+						]
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id",
+						"nullable": true
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/emoji-application/list-by-user": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"status": {
+						"type": "string",
+						"enum": [
+							"all",
+							"pending",
+							"approved",
+							"rejected",
+							"canceled"
+						]
+					},
+					"query": {
+						"type": "string"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id",
+						"nullable": true
+					}
+				},
+				"required": [
+					"userId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/emoji-application/reject": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"applicationId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"reason": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"applicationId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/emoji-application/related": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"applicationId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id",
+						"nullable": true
+					}
+				},
+				"required": [
+					"applicationId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/emoji-application/reset-user-quota": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"reason": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"userId",
+					"reason"
+				]
+			},
+			"meta": {}
+		},
+		"admin/emoji-application/user-summary": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"userId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/emoji/fetch-remote-meta": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"emojiId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"name": {
+						"type": "string",
+						"minLength": 1
+					},
+					"host": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [],
+				"anyOf": [
+					{
+						"required": [
+							"emojiId"
+						]
+					},
+					{
+						"required": [
+							"name",
+							"host"
+						]
+					}
+				]
+			},
+			"meta": {}
+		},
+		"admin/federation/check-host": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"host": {
+						"type": "string",
+						"minLength": 1
+					},
+					"account": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"host"
+				]
+			},
+			"meta": {}
+		},
+		"admin/federation/clean-gone-instance": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"host": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"host"
+				]
+			},
+			"meta": {}
+		},
+		"admin/federation/close-delivery-breaker": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"host": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"host"
+				]
+			},
+			"meta": {}
+		},
+		"admin/federation/delivery-health": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"windowSeconds": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 3600
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/federation/gone-instances": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/federation/inbox-health": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"windowSeconds": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 3600
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/federation/rules/create": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"mode": {
+						"type": "string",
+						"enum": [
+							"disabled",
+							"record",
+							"enforce"
+						]
+					},
+					"target": {
+						"type": "string",
+						"enum": [
+							"note",
+							"activity"
+						]
+					},
+					"position": {
+						"type": "integer"
+					},
+					"hosts": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"activityTypes": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"isBot": {
+						"type": "boolean",
+						"nullable": true
+					},
+					"newWithinHours": {
+						"type": "integer",
+						"nullable": true
+					},
+					"patterns": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"hasAttachment": {
+						"type": "boolean",
+						"nullable": true
+					},
+					"tags": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"reject": {
+						"type": "boolean"
+					},
+					"stripMedia": {
+						"type": "boolean"
+					},
+					"sensitive": {
+						"type": "boolean"
+					},
+					"unlist": {
+						"type": "boolean"
+					},
+					"cw": {
+						"type": "string",
+						"nullable": true
+					}
+				},
+				"required": [
+					"mode",
+					"target"
+				]
+			},
+			"meta": {}
+		},
+		"admin/federation/rules/delete": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"ruleId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"ruleId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/federation/rules/hits": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"ruleId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 50
+					}
+				},
+				"required": [
+					"ruleId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/federation/rules/list": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/federation/rules/update": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"ruleId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"name": {
+						"type": "string"
+					},
+					"mode": {
+						"type": "string",
+						"enum": [
+							"disabled",
+							"record",
+							"enforce"
+						]
+					},
+					"target": {
+						"type": "string",
+						"enum": [
+							"note",
+							"activity"
+						]
+					},
+					"position": {
+						"type": "integer"
+					},
+					"hosts": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"activityTypes": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"isBot": {
+						"type": "boolean",
+						"nullable": true
+					},
+					"newWithinHours": {
+						"type": "integer",
+						"nullable": true
+					},
+					"patterns": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"hasAttachment": {
+						"type": "boolean",
+						"nullable": true
+					},
+					"tags": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"reject": {
+						"type": "boolean"
+					},
+					"stripMedia": {
+						"type": "boolean"
+					},
+					"sensitive": {
+						"type": "boolean"
+					},
+					"unlist": {
+						"type": "boolean"
+					},
+					"cw": {
+						"type": "string",
+						"nullable": true
+					}
+				},
+				"required": [
+					"ruleId",
+					"mode",
+					"target"
+				]
+			},
+			"meta": {}
+		},
+		"admin/ip/accounts": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"ip": {
+						"type": "string"
+					},
+					"sinceDays": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 3650
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"offset": {
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 10000
+					}
+				},
+				"required": [
+					"ip"
+				]
+			},
+			"meta": {}
+		},
+		"admin/ip/lookup-log": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"offset": {
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 10000
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/ip/related-accounts": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"sinceDays": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 3650
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"offset": {
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 10000
+					}
+				},
+				"required": [
+					"userId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/roles/assignment-show": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"roleId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"userId",
+					"roleId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/self-check": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/server-metrics": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/server-plugins": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/signup-application/approve": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"applicationId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"applicationId"
+				]
+			},
+			"meta": {}
+		},
+		"admin/signup-application/list": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"filter": {
+						"type": "string",
+						"enum": [
+							"pending",
+							"approved",
+							"processed",
+							"all"
+						]
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"offset": {
+						"type": "integer",
+						"minimum": 0
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/signup-application/reject": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"applicationId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"applicationId"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/accept": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"matchId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"matchId"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/cancel": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"matchId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"matchId"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/decline": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"matchId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"matchId"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/history": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"untilDate": {
+						"type": "integer"
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/invitations": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/invite": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"gameMode": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"userId",
+					"gameMode"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/record": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"matchId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"matchId"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/report": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"matchId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"score": {
+						"type": "integer"
+					},
+					"frame": {
+						"type": "integer"
+					},
+					"reason": {
+						"type": "string"
+					},
+					"logs": {
+						"type": "array",
+						"items": {
+							"type": "array",
+							"items": {
+								"type": "number"
+							}
+						}
+					},
+					"gameVersion": {
+						"type": "integer"
+					}
+				},
+				"required": [
+					"matchId",
+					"score",
+					"frame",
+					"reason",
+					"logs"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/set-public": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"matchId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"isPublic": {
+						"type": "boolean"
+					}
+				},
+				"required": [
+					"matchId",
+					"isPublic"
+				]
+			},
+			"meta": {}
+		},
+		"bubble-game/versus/show": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"matchId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"matchId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/messages": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roomId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"chat/messages/create": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"toUserId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"toRoomId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"text": {
+						"type": "string",
+						"nullable": true,
+						"maxLength": 2000
+					},
+					"fileId": {
+						"type": "string",
+						"format": "misskey:id",
+						"nullable": true
+					}
+				},
+				"required": [],
+				"anyOf": [
+					{
+						"required": [
+							"toUserId"
+						]
+					},
+					{
+						"required": [
+							"toRoomId"
+						]
+					}
+				]
+			},
+			"meta": {}
+		},
+		"chat/messages/reactions/create": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"messageId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"reaction": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"messageId",
+					"reaction"
+				]
+			},
+			"meta": {}
+		},
+		"chat/messages/reactions/delete": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"messageId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"reaction": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"messageId",
+					"reaction"
+				]
+			},
+			"meta": {}
+		},
+		"chat/messages/read": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"messageId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"messageId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/messages/update": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"messageId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"text": {
+						"type": "string",
+						"nullable": true,
+						"maxLength": 2000
+					}
+				},
+				"required": [
+					"messageId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/rooms/invitations/accept": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roomId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"roomId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/rooms/invitations/delete": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"invitationId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"invitationId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/rooms/invitations/reject": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roomId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"roomId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/rooms/joined": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"sinceId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"sinceDate": {
+						"type": "integer"
+					},
+					"untilDate": {
+						"type": "integer"
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"chat/rooms/members/ban": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roomId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"roomId",
+					"userId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/rooms/members/update-membership": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roomId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"isMuted": {
+						"type": "boolean"
+					}
+				},
+				"required": [
+					"roomId",
+					"userId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/rooms/transfer-ownership": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roomId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"userId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"roomId",
+					"userId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/rooms/unmute": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roomId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"roomId"
+				]
+			},
+			"meta": {}
+		},
+		"chat/unread-count": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"drive/files/create-chunked/abort": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"uploadId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"uploadId"
+				]
+			},
+			"meta": {}
+		},
+		"drive/files/create-chunked/finish": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"uploadId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"uploadId"
+				]
+			},
+			"meta": {}
+		},
+		"drive/files/create-chunked/start": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"size": {
+						"type": "integer"
+					},
+					"comment": {
+						"type": "string",
+						"nullable": true,
+						"maxLength": 512
+					},
+					"folderId": {
+						"type": "string",
+						"format": "misskey:id",
+						"nullable": true
+					},
+					"isSensitive": {
+						"type": "boolean"
+					},
+					"force": {
+						"type": "boolean"
+					}
+				},
+				"required": [
+					"size"
+				]
+			},
+			"meta": {}
+		},
+		"emoji-application/cancel": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"applicationId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"applicationId"
+				]
+			},
+			"meta": {}
+		},
+		"emoji-application/create": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"kind": {
+						"type": "string",
+						"enum": [
+							"own",
+							"remote"
+						]
+					},
+					"license": {
+						"type": "string"
+					},
+					"comment": {
+						"type": "string"
+					},
+					"fileId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"category": {
+						"type": "string"
+					},
+					"aliases": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"isSensitive": {
+						"type": "boolean"
+					},
+					"remoteHost": {
+						"type": "string"
+					},
+					"remoteName": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"name"
+				],
+				"if": {
+					"properties": {
+						"kind": {
+							"enum": [
+								"remote"
+							]
+						}
+					},
+					"required": [
+						"kind"
+					]
+				},
+				"then": {
+					"properties": {
+						"remoteHost": {
+							"type": "string",
+							"minLength": 1
+						},
+						"remoteName": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"required": [
+						"remoteHost",
+						"remoteName"
+					]
+				}
+			},
+			"meta": {}
+		},
+		"emoji-application/list-mine": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id",
+						"nullable": true
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"following/silent/list": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"sinceId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"sinceDate": {
+						"type": "integer"
+					},
+					"untilDate": {
+						"type": "integer"
+					},
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"i/federation": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"i/flashs": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"sinceId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"sinceDate": {
+						"type": "integer"
+					},
+					"untilDate": {
+						"type": "integer"
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"i/flashs/likes": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 100
+					},
+					"sinceId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"untilId": {
+						"type": "string",
+						"format": "misskey:id"
+					},
+					"sinceDate": {
+						"type": "integer"
+					},
+					"untilDate": {
+						"type": "integer"
+					},
+					"search": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 100,
+						"nullable": true
+					}
+				},
+				"required": []
+			},
+			"meta": {}
+		},
+		"i/update-federation": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"federationStatus": {
+						"type": "string",
+						"enum": [
+							"on",
+							"off"
+						]
+					}
+				},
+				"required": [
+					"federationStatus"
+				]
+			},
+			"meta": {}
+		},
+		"roles/assignment-show": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"roleId": {
+						"type": "string",
+						"format": "misskey:id"
+					}
+				},
+				"required": [
+					"roleId"
+				]
+			},
+			"meta": {}
+		},
+		"signup-application/apply": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"answers": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"formToken": {
+						"type": "string"
+					},
+					"hcaptcha-response": {
+						"type": "string",
+						"nullable": true
+					},
+					"g-recaptcha-response": {
+						"type": "string",
+						"nullable": true
+					},
+					"turnstile-response": {
+						"type": "string",
+						"nullable": true
+					},
+					"m-captcha-response": {
+						"type": "string",
+						"nullable": true
+					},
+					"testcaptcha-response": {
+						"type": "string",
+						"nullable": true
+					}
+				},
+				"required": [
+					"answers"
+				]
+			},
+			"meta": {}
+		},
+		"signup-application/form-token": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"signup-application/register": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"claimCode": {
+						"type": "string",
+						"minLength": 1
+					},
+					"username": {
+						"type": "string",
+						"minLength": 1
+					},
+					"password": {
+						"type": "string",
+						"minLength": 1
+					},
+					"federationStatus": {
+						"type": "string",
+						"enum": [
+							"on",
+							"off",
+							"pending",
+							"",
+							null
+						],
+						"nullable": true
+					},
+					"emailAddress": {
+						"type": "string"
+					}
+				},
+				"required": [
+					"claimCode",
+					"username",
+					"password"
+				]
+			},
+			"meta": {}
+		},
+		"signup-application/status": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"claimCode": {
+						"type": "string",
+						"minLength": 1
+					}
+				},
+				"required": [
+					"claimCode"
+				]
+			},
+			"meta": {}
+		}
+	}
+}

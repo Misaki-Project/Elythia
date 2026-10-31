@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/note"
@@ -21,7 +22,9 @@ import (
 	"github.com/elythia-network/elythia/internal/core/translate"
 	"github.com/elythia-network/elythia/internal/core/ugcvisibility"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/jsstr"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/queue/driver"
@@ -47,13 +50,23 @@ type Handler struct {
 	// note_favorite.noteId が note への外部キーなので、行が無いと INSERT が
 	// 失敗する。favorite には core service が無く、この handler が FK 行を
 	// 書いているためここが差し込み口になる。
-	materializer      NoteMaterializer
-	driveFileRepo     repository.DriveFileRepository
-	draftRepo         repository.NoteDraftRepository
-	pollRepo          repository.PollRepository
-	threadMutingRepo  repository.NoteThreadMutingRepository
-	noteReactionRepo  repository.NoteReactionRepository
-	channelRepo       repository.ChannelRepository
+	materializer NoteMaterializer
+	// driveFileRepo は添付ファイルの解決と、下書きの添付の所有権検査に使う。nil だと
+	// 下書きの添付で他人の drive ファイル ID を指定でき (`handler_drafts.go` の
+	// 所有権検査が nil で true を返す)、加えて `fieldResolver()` が drive を引けなく
+	// なるので **全 note の files が空配列**になる。下書きから note への昇格は
+	// `note.CreateService` の driveFileRepo の checkFileIDs を通るので、他人の
+	// ファイルの実体までは出ない (#2708)。
+	driveFileRepo    repository.DriveFileRepository
+	draftRepo        repository.NoteDraftRepository
+	pollRepo         repository.PollRepository
+	threadMutingRepo repository.NoteThreadMutingRepository
+	noteReactionRepo repository.NoteReactionRepository
+	channelRepo      repository.ChannelRepository
+	// channelMutingRepo は閲覧者がミュートしたチャンネルの投稿を除く。nil だと
+	// チャンネルミュートが**一切**効かない。別ソースが無いので in-memory・SQL
+	// (`TimelineFilter.MutedChannelIDs`)・user-list timeline・HTL の followed-channel
+	// 差し引きの全経路が死ぬ (#2708)。
 	channelMutingRepo repository.ChannelMutingRepository
 	// channelFollowingRepo は home timeline で follow 中 channel の note を
 	// 含めるため、viewer の followed channel id を引くのに使う (#1686)。
@@ -61,22 +74,43 @@ type Handler struct {
 	channelFollowingRepo repository.ChannelFollowingRepository
 	// userFollowingRepo は HTL の「返信先が followers 限定の投稿」ガードに使う。
 	// upstream timeline.ts は取得側の noteFilter で followings を参照する。
-	// 未配線ならガードをスキップする。
+	// nil ならガードをスキップし、followers 限定投稿への返信が非フォロワーの
+	// HTL / STL に出る (#2708)。
 	userFollowingRepo repository.FollowingRepository
-	mutingRepo        repository.MutingRepository
-	renoteMutingRepo  repository.RenoteMutingRepository
+	// mutingRepo は閲覧者がミュートした利用者の投稿を除く (upstream Misskey TS の
+	// muting JOIN と同 semantics、#874)。nil だと post-fetch filter のミュート集合と、
+	// `notes/polls/recommendation` が SQL へ渡す除外集合が空になる。timeline の SQL 側は
+	// `UseMutingSubquery` が別に効くので残る (#2708)。
+	mutingRepo repository.MutingRepository
+	// renoteMutingRepo は閲覧者が renote ミュートした利用者の pure renote を除く
+	// (#903、upstream の generateMutedUserRelatedRenotesQuery と同 semantics)。nil だと
+	// `loadRenoteMutedUserIDs` が nil を返し、renote ミュートが read 時に一切効かない
+	// (#2709 review)。
+	renoteMutingRepo repository.RenoteMutingRepository
 	// blockingRepo は notes/children・replies・renotes の list 応答で被block /
 	// mute / instance-mute filter を適用するのに使う (#1554、upstream
-	// generateBaseNoteFilteringQuery 相当)。未配線時は filter skip。
+	// generateBaseNoteFilteringQuery 相当)。nil だとブロック / ミュート / チャンネル
+	// ミュートの post-fetch filter が丸ごと skip される (`applyMuteBlock` は
+	// `blockingRepo != nil` で全体を gate している。#2708)。
 	blockingRepo repository.BlockingRepository
-	instanceRepo repository.InstanceRepository
+	// relationCache は閲覧者のミュート・ブロック・フォローの一覧を、
+	// 要求をまたいで持つ (#3607)。nil なら repository から読む。
+	relationCache *repository.RelationCache
+	instanceRepo  repository.InstanceRepository
 	// metaRepo は list endpoint の blocked-host filter で meta.blockedHosts を
-	// 引く (#1783)。未配線時は blocked-host filter を skip。
-	metaRepo        repository.MetaRepository
-	emojiRepo       repository.EmojiRepository
-	driveFolderRepo repository.DriveFolderRepository
-	userRepo        repository.UserRepository
-	userListRepo    repository.UserListRepository
+	// 引く (#1783、upstream generateBlockedHostQueryForNote)。nil だと blocked-host
+	// filter を skip し、blocked-host の note が post-fetch 経路で漏れる (#2708)。
+	//
+	// 上の driveFileRepo・channelMutingRepo・userFollowingRepo・mutingRepo・
+	// renoteMutingRepo・blockingRepo と、この metaRepo の 7 つは、以前は setter で
+	// 入れて起動時に検査していた (#2708、#2709 review) が、#3831 で構築子の必須の
+	// 引数にした。
+	metaRepo                repository.MetaRepository
+	emojiRepo               repository.EmojiRepository
+	driveFolderRepo         repository.DriveFolderRepository
+	userRepo                repository.UserRepository
+	localFederationObserver activitypub.LocalFederationObserver
+	userListRepo            repository.UserListRepository
 	// clipRepo / clipNoteRepo / clipFavoriteRepo は notes/clips で「この note を
 	// 含む public clip」を Clip entity として返すのに使う (#1554)。未配線時は
 	// 空配列 fallback (旧 stub 互換)。
@@ -88,21 +122,30 @@ type Handler struct {
 	// myNoteFavorited1 を付与するのに使う (#1762)。未配線時は付与しない。
 	achievementGranter AchievementGranter
 	bufReader          entity.BufferedReactionsReader
-	// ugcVisibilityFn controls what unauthenticated visitors can see.
+	// ugcVisibilityFn returns meta.ugcVisibilityForVisitor, which controls what
+	// unauthenticated visitors can see: "all", "local" or "none". nil and ""
+	// mean "all".
 	//
 	// **毎回読む。** 起動時に文字列を焼き込むと、運営者が管理画面で締めても
 	// プロセスを再起動するまで反映されない。`/api/meta` と管理画面は新しい値を
 	// 返し、robots.txt と SSR も毎回 meta を読むので「ブラウザで見ると効いて
 	// いる」ように見えるのに、API は匿名に本文を返し続ける。
+	//
+	// nil か空文字だと、匿名 visitor への露出を `ugcVisibilityForVisitor` で gate
+	// できない (空文字は "none" でも "local" でもないので素通し)。列は
+	// `NOT NULL DEFAULT 'local'` なので、空になるのは配線が漏れたときだけ。以前は
+	// setter で入れて起動時に検査していた (#2708) が、#3831 で構築子の必須の引数にした。
 	ugcVisibilityFn func() string
-	// ugcVisibility controls what unauthenticated visitors can see.
-	// "all" (default), "local", "none"
-	ugcVisibility string
-	translator    *translate.DeepLClient
+	translator      translate.Translator
 	// policyProvider は LocalTimeline / GlobalTimeline / HybridTimeline で
 	// ltlAvailable / gtlAvailable policy を gate するために使う (#1026)。
 	// 匿名 viewer (userID="") に対しても base policies を返す upstream 互換
 	// semantics で、middleware ではなく handler 内で gate する。
+	//
+	// nil だと timeline の可視性 gate (`timelineAvailable`) に加え、
+	// `canSearchNotes` (`handler.go`)・`canUseTranslator` (`handler_extra.go`)・
+	// `noteDraftLimit` / `scheduledNoteLimit` (`handler_drafts.go`) も同時に素通しになる。
+	// 以前は setter で入れて起動時に検査していた (#2683) が、#3831 で構築子の必須の引数にした。
 	policyProvider role.PolicyProvider
 	// scheduledNoteEnqueuer は drafts/create で `isActuallyScheduled=true`
 	// の draft を delayed queue に enqueue するための narrow interface (#1040)。
@@ -110,14 +153,51 @@ type Handler struct {
 	scheduledNoteEnqueuer ScheduledNoteEnqueuer
 	// timelineCache は config flag enableTimelineCache (MK_ENABLETIMELINECACHE)
 	// 有効時のみ non-nil。first-page timeline 応答を per-viewer で短期キャッシュする。
-	timelineCache *timelineJSONCache
+	timelineCache *TimelineJSONCache
 	// featuredRanking は notes/featured の engagement ランキング (#1687)。nil 時
 	// (= 未配線 / test) は SQL count-DESC fallback を使う。
 	featuredRanking FeaturedRankingReader
 	// featuredGlobalCache は global ranking の 30分 in-memory cache
 	// (upstream featured.ts の globalNotesRankingCache)。channel ranking は cache
 	// しない (channel ごとなので)。
-	featuredGlobalCache featuredGlobalRankingCache
+	featuredGlobalCache FeaturedRankingCache
+	// noteHider applies the per-viewer hideNote gate to the notes this handler
+	// packs (#3786). nil だと匿名の閲覧者に ugcVisibilityForVisitor が効かない
+	// (fail-open)。以前は setter で入れて起動時に検査していたが、#3831 で構築子の
+	// 必須の引数にした。
+	noteHider *notehide.Hider
+	// entityPacker は投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3790)。mediaURL を持たない Packer だと、リモートのメディアの URL を生の
+	// まま返し、閲覧者の IP がリモートへ漏れる。#3831 で構築子の必須の引数にした。
+	// Packer の mediaURL は #3834 から entity.NewPacker の必須の引数で、組み立てた
+	// Packer が持つことは server の TestBuiltHandlersHaveNoNilDependencies が見る。
+	entityPacker *entity.Packer
+}
+
+func (h *Handler) SetLocalFederationObserver(observer activitypub.LocalFederationObserver) {
+	h.localFederationObserver = observer
+}
+
+func (h *Handler) gateRemoteNoteAction(c echo.Context, user *model.User, noteID string) bool {
+	if h.localFederationObserver == nil || user == nil || !user.IsLocal() || h.noteRepo == nil {
+		return true
+	}
+	n, err := h.noteRepo.FindByID(noteID)
+	if err != nil {
+		if repository.IsNotFound(err) {
+			return true
+		}
+		_ = apierr.JSONInternalError(c)
+		return false
+	}
+	if n == nil || n.UserHost == nil || *n.UserHost == "" {
+		return true
+	}
+	if !h.localFederationObserver.IsExternallyAvailable(user) {
+		_ = c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_DISABLED", "This account cannot perform remote actions.", "abdc2832-1f6d-4a33-8a10-b5731ca33884"))
+		return false
+	}
+	return true
 }
 
 // SetPiningRepo wires the repository used to verify that a notes/show target
@@ -133,11 +213,33 @@ type FeaturedRankingReader interface {
 	GetInChannelNotesRanking(ctx context.Context, channelID string, threshold int) ([]string, error)
 }
 
-// featuredGlobalRankingCache holds the 30-min global ranking cache.
-type featuredGlobalRankingCache struct {
+// FeaturedRankingCache holds the 30-min global ranking cache.
+type FeaturedRankingCache struct {
 	mu        sync.Mutex
 	ids       []string
 	fetchedAt time.Time
+}
+
+// DropLocal drops the cached global ranking held by this process (#3736).
+// 読み込みの間も mu を握るので (cachedGlobalRanking)、捨てる前に始まった読み込みは
+// 待ってから捨てる。
+func (c *FeaturedRankingCache) DropLocal() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ids = nil
+	c.fetchedAt = time.Time{}
+}
+
+// FeaturedRankingCache returns the cache of the global featured ranking, for
+// the server's cache list (#3736).
+func (h *Handler) FeaturedRankingCache() *FeaturedRankingCache {
+	return &h.featuredGlobalCache
+}
+
+// TimelineJSONCache returns the first-page timeline response cache, or nil
+// when EnableTimelineJSONCache was not called (#3736).
+func (h *Handler) TimelineJSONCache() *TimelineJSONCache {
+	return h.timelineCache
 }
 
 // SetFeaturedRanking wires the engagement ranking reader so notes/featured uses
@@ -167,76 +269,25 @@ func (h *Handler) SetScheduledNoteEnqueuer(e ScheduledNoteEnqueuer) {
 	h.scheduledNoteEnqueuer = e
 }
 
-// SetPolicyProvider wires a role policy source so timeline endpoints gate
-// access by ltlAvailable / gtlAvailable (#1026). nil 時は gate を skip する
-// (= test 経路 / 旧挙動互換)。匿名 viewer (userID="") には base policies を
-// 返す upstream 互換 semantics を要求する。
-func (h *Handler) SetPolicyProvider(p role.PolicyProvider) {
-	h.policyProvider = p
-}
-
-// SetChannelMutingRepo attaches a ChannelMutingRepository so timeline handlers
-// can exclude notes posted to channels the viewer has muted.
-func (h *Handler) SetChannelMutingRepo(r repository.ChannelMutingRepository) {
-	h.channelMutingRepo = r
-}
-
-// SetUserFollowingRepo attaches a FollowingRepository used by the home timeline
-// followers-only-reply guard.
-func (h *Handler) SetUserFollowingRepo(r repository.FollowingRepository) {
-	h.userFollowingRepo = r
-}
-
 // SetChannelFollowingRepo attaches a ChannelFollowingRepository so the home
 // timeline includes notes from channels the viewer follows (#1686).
 func (h *Handler) SetChannelFollowingRepo(r repository.ChannelFollowingRepository) {
 	h.channelFollowingRepo = r
 }
 
-// SetMutingRepo attaches a MutingRepository so timeline handlers can exclude
-// notes whose author / renote-source the viewer has muted (= upstream Misskey
-// TS の muting JOIN と同 semantics、#874)。
-func (h *Handler) SetMutingRepo(r repository.MutingRepository) {
-	h.mutingRepo = r
-}
-
-// SetRenoteMutingRepo attaches a RenoteMutingRepository so timeline handlers
-// can exclude pure renotes by users the viewer has renote-muted (#903)。
-// upstream Misskey TS の generateMutedUserRelatedRenotesQuery と同 semantics。
-func (h *Handler) SetRenoteMutingRepo(r repository.RenoteMutingRepository) {
-	h.renoteMutingRepo = r
-}
-
-// SetBlockingRepo attaches a BlockingRepository so notes/children・replies・
-// renotes can exclude notes authored by users who block the viewer (#1554)。
-func (h *Handler) SetBlockingRepo(r repository.BlockingRepository) {
-	h.blockingRepo = r
-}
-
-// SetTranslator attaches a DeepL translator for /api/notes/translate.
-func (h *Handler) SetTranslator(t *translate.DeepLClient) {
+// SetTranslator attaches the translator for /api/notes/translate. A translator
+// that returns translate.ErrNotConfigured makes the endpoint answer UNAVAILABLE.
+func (h *Handler) SetTranslator(t translate.Translator) {
 	h.translator = t
 }
 
-// SetUGCVisibility sets the visitor content visibility policy from meta.
-//
-// Deprecated: 固定値を焼き込む形。`SetUGCVisibilityLookup` を使うこと。
-// テストの利便のために残してある。
-func (h *Handler) SetUGCVisibility(v string) {
-	h.ugcVisibility = v
-}
-
-// SetUGCVisibilityLookup wires a live lookup of the policy.
-func (h *Handler) SetUGCVisibilityLookup(fn func() string) {
-	h.ugcVisibilityFn = fn
-}
-
-// ugcVisibilityNow resolves the current policy.
+// ugcVisibilityNow resolves the current policy. It returns "" (= "all") when
+// no lookup is wired.
 func (h *Handler) ugcVisibilityNow() string {
 	if h.ugcVisibilityFn != nil {
 		return h.ugcVisibilityFn()
 	}
-	return h.ugcVisibility
+	return ""
 }
 
 // visitorHidesAll reports whether viewer is an anonymous visitor who must get
@@ -267,11 +318,6 @@ func (h *Handler) filterVisitorUGC(viewer *model.User, notes []*model.Note) []*m
 		}
 	}
 	return out
-}
-
-// SetDriveFileRepo attaches a DriveFileRepository for file resolution.
-func (h *Handler) SetDriveFileRepo(r repository.DriveFileRepository) {
-	h.driveFileRepo = r
 }
 
 // ModeratorChecker reports whether a user holds moderator / administrator
@@ -376,6 +422,13 @@ func (h *Handler) emojiLookup() entity.EmojiLookup {
 // queryService/timelineService/reactionService/pollService/searchService が
 // nil の場合、それぞれの依存に対応するエンドポイントは利用不可となる
 // (テストで一部だけ初期化する用途を許容する)。
+//
+// noteHider, entityPacker, policyProvider and ugcVisibility gate what a
+// viewer may see. ugcVisibility is called on every request, so a change in
+// the admin panel takes effect without a restart. The repositories from
+// driveFileRepo to userFollowingRepo back the per-viewer filters (blocked
+// hosts, blocks, mutes, renote mutes, channel mutes and the followers-only
+// reply guard) and attached-file resolution.
 func NewHandler(
 	noteRepo repository.NoteRepository,
 	createService *note.CreateService,
@@ -386,7 +439,22 @@ func NewHandler(
 	pollService *poll.Service,
 	searchService *search.Service,
 	idGen id.Generator,
+	noteHider *notehide.Hider,
+	entityPacker *entity.Packer,
+	policyProvider role.PolicyProvider,
+	ugcVisibility func() string,
+	driveFileRepo repository.DriveFileRepository,
+	metaRepo repository.MetaRepository,
+	blockingRepo repository.BlockingRepository,
+	mutingRepo repository.MutingRepository,
+	renoteMutingRepo repository.RenoteMutingRepository,
+	channelMutingRepo repository.ChannelMutingRepository,
+	userFollowingRepo repository.FollowingRepository,
 ) *Handler {
+	// 入れ忘れると黙って劣化する依存は、構築子の必須の引数で受ける (#3831)。以前は
+	// setter で後から入れ、recordCriticalWiring が起動時に入れ忘れを見ていた。
+	// nil は渡せるので、本番の組み立てで nil が残らないことは internal/server の
+	// TestBuiltHandlersHaveNoNilDependencies が見る。
 	return &Handler{
 		noteRepo:        noteRepo,
 		createService:   createService,
@@ -397,6 +465,18 @@ func NewHandler(
 		pollService:     pollService,
 		searchService:   searchService,
 		idGen:           idGen,
+		noteHider:       noteHider,
+		entityPacker:    entityPacker,
+		policyProvider:  policyProvider,
+		ugcVisibilityFn: ugcVisibility,
+
+		driveFileRepo:     driveFileRepo,
+		metaRepo:          metaRepo,
+		blockingRepo:      blockingRepo,
+		mutingRepo:        mutingRepo,
+		renoteMutingRepo:  renoteMutingRepo,
+		channelMutingRepo: channelMutingRepo,
+		userFollowingRepo: userFollowingRepo,
 	}
 }
 
@@ -422,11 +502,14 @@ type CreateRequest struct {
 }
 
 // PollRequest is the poll part of a create note request.
+//
+// expiresAt と expiredAfter は宣言で integer なので、本家の ajv と同じく 10.0 も
+// 受ける (#3884。下書きの handler_drafts.go と同じ)。
 type PollRequest struct {
-	Choices      []string `json:"choices"`
-	Multiple     bool     `json:"multiple"`
-	ExpiresAt    *int64   `json:"expiresAt"`
-	ExpiredAfter *int64   `json:"expiredAfter"`
+	Choices      []string   `json:"choices"`
+	Multiple     bool       `json:"multiple"`
+	ExpiresAt    *jsnum.Int `json:"expiresAt"`
+	ExpiredAfter *jsnum.Int `json:"expiredAfter"`
 }
 
 // Create handles POST /api/notes/create.
@@ -477,12 +560,30 @@ func (h *Handler) Create(c echo.Context) error {
 		// X 後」の 3 択で、相対指定時は expiredAfter のみが入る。
 		// #2106 L6: 両方来た時は upstream create.ts:230 と同じく expiredAfter (相対) を優先する
 		// (旧コメントの『TS PollService』は誤り、endpoint の create.ts が expiry を決定する)。
+		//
+		// 期限が上限 (9999-12-30T23:59:59.999Z) を超える値は 400 INVALID_PARAM で
+		// 弾く。upstream は JS の Date の上限 (+275760 年) まで受け付け、それを
+		// 超えると Invalid Date で保存に失敗する (500)。上限の理由は
+		// note.MaxPollExpiresAtUnixMilli にある (#3443)。
+		var (
+			t      time.Time
+			hasExp bool
+			expErr error
+		)
 		switch {
 		case req.Poll.ExpiredAfter != nil:
-			t := time.Now().Add(time.Duration(*req.Poll.ExpiredAfter) * time.Millisecond)
-			in.Poll.ExpiresAt = &t
-		case req.Poll.ExpiresAt != nil:
-			t := time.UnixMilli(*req.Poll.ExpiresAt)
+			t, expErr = note.PollExpiresAtAfter(time.Now(), int64(*req.Poll.ExpiredAfter))
+			hasExp = true
+		// 本家は `ps.poll.expiresAt ? new Date(...) : null` なので、0 (と -0) は偽として
+		// 期限なしになる。0 を時刻として読むと過去なので、期限切れで断っていた (#3884)。
+		case req.Poll.ExpiresAt != nil && *req.Poll.ExpiresAt != 0:
+			t, expErr = note.PollExpiresAtFromUnixMilli(int64(*req.Poll.ExpiresAt))
+			hasExp = true
+		}
+		if expErr != nil {
+			return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", expErr.Error(), apierr.UUIDInvalidParam))
+		}
+		if hasExp {
 			in.Poll.ExpiresAt = &t
 		}
 	}
@@ -492,6 +593,8 @@ func (h *Handler) Create(c echo.Context) error {
 		switch {
 		case errors.Is(err, note.ErrNoteContentRequired):
 			return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Text, fileIds, or renoteId is required.", apierr.UUIDInvalidParam))
+		case errors.Is(err, note.ErrFederationDisabled):
+			return c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_DISABLED", "This account cannot perform remote actions.", "abdc2832-1f6d-4a33-8a10-b5731ca33884"))
 		case errors.Is(err, note.ErrReplyTargetNotFound):
 			return apierr.JSONNoSuchReplyTarget(c)
 		case errors.Is(err, note.ErrRenoteTargetNotFound):
@@ -524,10 +627,10 @@ func (h *Handler) Create(c echo.Context) error {
 		return apierr.JSONInternalError(c)
 	}
 
-	packed := entity.PackNoteWithInstance(c.Request().Context(), created, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	packed := h.entityPacker.PackNoteWithInstance(c.Request().Context(), created, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	s := []entity.NoteEntity{packed}
 	h.fieldResolver().Apply(s, user)
-	notehide.HideEmbeds(user, s)
+	h.noteHider.HideEmbeds(user, s)
 	return c.JSON(http.StatusOK, map[string]any{
 		"createdNote": s[0],
 	})
@@ -542,11 +645,14 @@ const maxNoteTextLength = 3000
 // Returns a non-nil error (its message becomes the INVALID_PARAM body) on the
 // first violation, matching upstream's 400 rejection (#1538)。
 func validateCreateInput(req *CreateRequest, fileIDs []string) error {
-	if req.Text != nil && len([]rune(*req.Text)) > maxNoteTextLength {
-		return errors.New("text is too long")
+	// **NUL と不正な UTF-8 も落とす。** note.text / cw は text 列で、そのまま INSERT
+	// すると PostgreSQL が SQLSTATE 22021 で落ち、認証済みの利用者が 1 文字で 500 を
+	// 起こせた (#3025 と同じ型)。既存の 400 に畳む。
+	if req.Text != nil && !colfit.Fits(*req.Text, maxNoteTextLength) {
+		return errors.New("text is too long or contains characters that cannot be stored")
 	}
 	if req.CW != nil {
-		if n := len([]rune(*req.CW)); n < 1 || n > 100 {
+		if n := len([]rune(*req.CW)); n < 1 || n > 100 || !colfit.Storable(*req.CW) {
 			return errors.New("cw must be between 1 and 100 characters")
 		}
 	}
@@ -559,7 +665,7 @@ func validateCreateInput(req *CreateRequest, fileIDs []string) error {
 		}
 		seen := make(map[string]bool, len(req.Poll.Choices))
 		for _, ch := range req.Poll.Choices {
-			if n := len([]rune(ch)); n < 1 || n > 50 {
+			if n := len([]rune(ch)); n < 1 || n > 50 || !colfit.Storable(ch) {
 				return errors.New("each poll choice must be between 1 and 50 characters")
 			}
 			// upstream notes/create.ts poll.choices は uniqueItems:true (#2027)。
@@ -575,9 +681,11 @@ func validateCreateInput(req *CreateRequest, fileIDs []string) error {
 	}
 	// text のみで成立する note (renote/file/poll 無し) は空白だけの text を弾く
 	// (upstream の pattern '[^\\s]+')。text=nil の content-less は service 側の
-	// ErrNoteContentRequired に委ねる。
+	// ErrNoteContentRequired に委ねる。空白は JavaScript の \s で数える。Go の
+	// strings.TrimSpace は U+0085 を削り U+FEFF を削らないので、本家と判定が分かれた
+	// (#3884)。
 	if req.RenoteID == nil && len(fileIDs) == 0 && req.Poll == nil && req.Text != nil {
-		if strings.TrimSpace(*req.Text) == "" {
+		if !jsstr.HasNonSpace(*req.Text) {
 			return errors.New("text must contain at least one non-whitespace character")
 		}
 	}
@@ -639,13 +747,13 @@ func (h *Handler) Show(c echo.Context) error {
 		}
 	}
 
-	packed := entity.PackNoteWithInstance(c.Request().Context(), n, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	packed := h.entityPacker.PackNoteWithInstance(c.Request().Context(), n, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	s := []entity.NoteEntity{packed}
 	h.fieldResolver().Apply(s, viewer)
 	if h.isCurrentlyPinned(n) {
-		notehide.HidePinnedNotes(viewer, s)
+		h.noteHider.HidePinnedNotes(viewer, s)
 	} else {
-		notehide.HideEmbeds(viewer, s)
+		h.noteHider.HideEmbeds(viewer, s)
 	}
 	// #2106 H1: ID-known doctrine (#799) で note は 200 で返すが、follower/specified を
 	// 見られない viewer (非フォロワー/匿名/非対象) には upstream NoteEntityService.hideNote
@@ -718,26 +826,27 @@ func (h *Handler) Delete(c echo.Context) error {
 
 // listRequest is the common pagination request shared by renotes/replies/children.
 type listRequest struct {
-	NoteID    string `json:"noteId"`
-	Limit     *int   `json:"limit"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	NoteID    string     `json:"noteId"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // normalize validates limit and resolves the date cursors. ok=false は
 // limit が upstream paramDef の範囲外で、呼び出し側は 400 を返す。
 func (r *listRequest) normalize() bool {
-	limit, ok := pagination.ResolveLimit(r.Limit, 10, 100)
+	limit, ok := pagination.ResolveLimit(r.Limit.IntPtr(), 10, 100)
 	if !ok {
 		return false
 	}
-	r.Limit = &limit
+	v := jsnum.Int(limit)
+	r.Limit = &v
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。serveList から
 	// 呼ばれて Renotes / Replies / Children の 3 handler で一括適用される。
 	// **列に入らないカーソルもここで ok=false にする (#3025)。**
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(r.SinceID, r.UntilID, r.SinceDate, r.UntilDate)
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(r.SinceID, r.UntilID, r.SinceDate.Int64Ptr(), r.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return false
 	}
@@ -748,21 +857,21 @@ func (r *listRequest) normalize() bool {
 // Renotes handles POST /api/notes/renotes.
 func (h *Handler) Renotes(c echo.Context) error {
 	return h.serveList(c, "12908022-2e21-46cd-ba6a-3edaf6093f46", func(viewer *model.User, req listRequest) ([]*model.Note, error) {
-		return h.queryService.ListRenotes(viewer, req.NoteID, req.UntilID, req.SinceID, *req.Limit)
+		return h.queryService.ListRenotes(viewer, req.NoteID, req.UntilID, req.SinceID, int(*req.Limit))
 	})
 }
 
 // Replies handles POST /api/notes/replies.
 func (h *Handler) Replies(c echo.Context) error {
 	return h.serveList(c, apierr.UUIDNoSuchNote, func(viewer *model.User, req listRequest) ([]*model.Note, error) {
-		return h.queryService.ListReplies(viewer, req.NoteID, req.UntilID, req.SinceID, *req.Limit)
+		return h.queryService.ListReplies(viewer, req.NoteID, req.UntilID, req.SinceID, int(*req.Limit))
 	})
 }
 
 // Children handles POST /api/notes/children.
 func (h *Handler) Children(c echo.Context) error {
 	return h.serveList(c, apierr.UUIDNoSuchNote, func(viewer *model.User, req listRequest) ([]*model.Note, error) {
-		return h.queryService.ListChildren(viewer, req.NoteID, req.UntilID, req.SinceID, *req.Limit)
+		return h.queryService.ListChildren(viewer, req.NoteID, req.UntilID, req.SinceID, int(*req.Limit))
 	})
 }
 
@@ -799,7 +908,7 @@ func (h *Handler) serveList(c echo.Context, noSuchNoteID string, fn func(*model.
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
-	return c.JSON(http.StatusOK, h.packMany(c.Request().Context(), notes, viewer))
+	return c.JSON(http.StatusOK, h.packManyWithoutHardMute(c.Request().Context(), notes, viewer))
 }
 
 // applyMuteBlock filters out notes the viewer should not see per the mute/block
@@ -814,38 +923,99 @@ func (h *Handler) serveList(c echo.Context, noSuchNoteID string, fn func(*model.
 // blocked-host / suspended は別 follow-up。blockingRepo 未配線 / viewer nil なら
 // no-op。fail-closed: lookup / filter エラーは呼び出し側で 500 にする。
 func (h *Handler) applyMuteBlock(viewer *model.User, notes []*model.Note) ([]*model.Note, error) {
-	// muted-user / blocked-user / muted-channel / muted-instances は viewer 視点
-	// なので anonymous では対象外。
-	if viewer != nil && h.blockingRepo != nil {
-		// channelMutingRepo を渡さないと MutedChannelIDs が空のままになり、
-		// チャンネルミュートが post-fetch 側で一切効かない。
-		sets, err := notesfilter.LoadMuteBlockSets(viewer, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
-		if err != nil {
-			return nil, err
-		}
-		notes, err = notesfilter.ApplyMuteBlockChannel(notes, sets, h.noteRepo)
-		if err != nil {
-			return nil, err
-		}
-	}
-	// suspended-user / blocked-host は upstream generateBaseNoteFilteringQuery と
-	// 同じく viewer 不問で常に除外する (#1783。children/replies/renotes/mentions/
-	// search-by-tag/featured の post-fetch 経路で漏れていた)。
-	notes = notesfilter.ApplySuspended(notes)
-	if h.metaRepo != nil {
-		blocked, err := h.blockedHosts()
-		if err != nil {
-			return nil, err
-		}
-		notes = notesfilter.ApplyBlockedHosts(notes, blocked)
-	}
-	return notes, nil
+	return h.newMuteBlockFilter(viewer)(notes)
 }
 
-// SetMetaRepo wires a MetaRepository used for the blocked-host filter on the
-// post-fetch list endpoints (#1783, upstream generateBlockedHostQueryForNote)。
-func (h *Handler) SetMetaRepo(r repository.MetaRepository) {
-	h.metaRepo = r
+// newMuteBlockFilter returns applyMuteBlock for one viewer with its lookups
+// (mute / block sets and meta.blockedHosts) loaded at most once, on first use.
+// Notes that already passed an earlier call are not checked again. The
+// returned func is not safe for concurrent use.
+//
+// timeline は Redis を読み進める回ごとにこれを呼び (TimelineFilter.PageFilter、
+// #3448)、service から戻った後にもう一度通す。どちらも 1 リクエストの中で
+// 使い回すので、mute / block / meta の読み込みは 1 回で済む。
+//
+// **通過済みの note は判定し直さない。** 2 回目の呼び出しで実際に落とす対象は
+// DB fallback の行だけで、Redis の行は 1 回目で通過している。全件に掛け直すと、
+// リノート先の入れ子検査 (FindManyByIDsWithUser) がリクエストごとに 1 本余計に
+// 走る。判定は ID で覚える (DB と Redis で同じ note でも別のポインタになりうる)。
+// 同じ ID を判定し直さなくてよいのは、DB fallback の範囲が fallbackRange で
+// Redis から解決した範囲と重ならず、同じ ID が別の内容で来ないため。
+// fallbackRange を変えるときはこの前提も見直すこと。
+func (h *Handler) newMuteBlockFilter(viewer *model.User) func([]*model.Note) ([]*model.Note, error) {
+	return h.newMuteBlockFilterWith(viewer, h.newRequestRelations(viewer))
+}
+
+// newMuteBlockFilterWith is newMuteBlockFilter reading the mute / block /
+// channel-mute lists from rel, so a timeline shares them with its
+// TimelineFilter instead of loading them a second time (#3607).
+func (h *Handler) newMuteBlockFilterWith(viewer *model.User, rel *requestRelations) func([]*model.Note) ([]*model.Note, error) {
+	var (
+		loaded  bool
+		sets    notesfilter.MuteBlockSets
+		blocked []string
+		passed  = make(map[string]struct{})
+	)
+	return func(notes []*model.Note) ([]*model.Note, error) {
+		if !loaded {
+			// muted-user / blocked-user / muted-channel / muted-instances は viewer 視点
+			// なので anonymous では対象外。
+			if viewer != nil && h.blockingRepo != nil {
+				// channelMutingRepo を渡さないと MutedChannelIDs が空のままになり、
+				// チャンネルミュートが post-fetch 側で一切効かない。
+				muting, blocking, channelMuting := rel.listers()
+				s, err := notesfilter.LoadMuteBlockSets(viewer, muting, blocking, channelMuting, h.userRepo)
+				if err != nil {
+					return nil, err
+				}
+				sets = s
+			}
+			b, err := h.blockedHosts()
+			if err != nil {
+				return nil, err
+			}
+			blocked = b
+			loaded = true
+		}
+		fresh := make([]*model.Note, 0, len(notes))
+		for _, n := range notes {
+			if n == nil {
+				continue
+			}
+			if _, ok := passed[n.ID]; !ok {
+				fresh = append(fresh, n)
+			}
+		}
+		// sets が空 (anonymous / 未配線) か fresh が空なら、ApplyMuteBlockChannel は
+		// 何も引かずに返す。
+		kept, err := notesfilter.ApplyMuteBlockChannel(fresh, sets, h.noteRepo)
+		if err != nil {
+			return nil, err
+		}
+		// suspended-user / blocked-host は upstream generateBaseNoteFilteringQuery と
+		// 同じく viewer 不問で常に除外する (#1783。children/replies/renotes/mentions/
+		// search-by-tag/featured の post-fetch 経路で漏れていた)。blockedHosts が
+		// 空 (metaRepo 未配線) なら ApplyBlockedHosts は no-op。
+		for _, n := range notesfilter.ApplyBlockedHosts(notesfilter.ApplySuspended(kept), blocked) {
+			passed[n.ID] = struct{}{}
+		}
+		return keepPassed(notes, passed), nil
+	}
+}
+
+// keepPassed returns the notes whose id is in passed, in input order. 空でも
+// 非 nil を返す (TimelineFilter.PageFilter の契約)。
+func keepPassed(notes []*model.Note, passed map[string]struct{}) []*model.Note {
+	out := make([]*model.Note, 0, len(notes))
+	for _, n := range notes {
+		if n == nil {
+			continue
+		}
+		if _, ok := passed[n.ID]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // blockedHosts returns meta.blockedHosts, or nil when the meta repo is unwired.
@@ -880,20 +1050,20 @@ func (h *Handler) applyThreadMute(viewer *model.User, notes []*model.Note) ([]*m
 // が指定されたときは ID generator で対応する note ID に変換し、`sinceId` /
 // `untilId` のフォールバックとして使う。`host == "."` はローカル限定検索。
 type SearchRequest struct {
-	Query     string `json:"query"`
-	Limit     *int   `json:"limit"`
-	Offset    int    `json:"offset"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
-	UserID    string `json:"userId"`
-	ChannelID string `json:"channelId"`
-	Host      string `json:"host"`
+	Query     string     `json:"query"`
+	Limit     *jsnum.Int `json:"limit"`
+	Offset    jsnum.Int  `json:"offset"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
+	UserID    string     `json:"userId"`
+	ChannelID string     `json:"channelId"`
+	Host      string     `json:"host"`
 	// rangeStartAt / rangeEndAt は投稿日時範囲 (epoch ms、upstream #16119 #2069)。
 	// sinceDate/untilDate (cursor 正規化用) とは別物で、cursor と独立に AND される。
-	RangeStartAt *int64 `json:"rangeStartAt"`
-	RangeEndAt   *int64 `json:"rangeEndAt"`
+	RangeStartAt *jsnum.Int `json:"rangeStartAt"`
+	RangeEndAt   *jsnum.Int `json:"rangeEndAt"`
 }
 
 // Search handles POST /api/notes/search.
@@ -905,13 +1075,13 @@ func (h *Handler) Search(c echo.Context) error {
 	if h.searchService == nil {
 		return apierr.JSONInternalError(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -946,24 +1116,30 @@ func (h *Handler) Search(c echo.Context) error {
 		localUsersOnly = policy == ugcvisibility.Local
 	}
 
-	notes, err := h.searchService.SearchNote(
-		viewer,
-		req.Query,
-		search.SearchOpts{
-			UserID:         req.UserID,
-			ChannelID:      req.ChannelID,
-			Host:           req.Host,
-			Offset:         req.Offset,
-			RangeStartAt:   req.RangeStartAt,
-			RangeEndAt:     req.RangeEndAt,
-			LocalUsersOnly: localUsersOnly,
-		},
-		search.Pagination{
-			UntilID: untilID,
-			SinceID: sinceID,
-			Limit:   limit,
-		},
-	)
+	opts := search.SearchOpts{
+		UserID:         req.UserID,
+		ChannelID:      req.ChannelID,
+		Host:           req.Host,
+		RangeStartAt:   req.RangeStartAt.Int64Ptr(),
+		RangeEndAt:     req.RangeEndAt.Int64Ptr(),
+		LocalUsersOnly: localUsersOnly,
+	}
+	// upstream searchNoteByLike / searchNoteByMeilisearch は generateBaseNoteFilteringQuery
+	// で suspended-user / blocked-host (匿名でも) と被block/mute/renote-mute user の note を
+	// 除外する。provider は visibility しか掛けないため、search-by-tag 等と同じく post-fetch で
+	// applyMuteBlock を適用する (#1938、searchVisiblePage の中)。upstream search は
+	// thread-mute を掛けないため applyThreadMute は不要。
+	packed, err := h.searchVisiblePage(c.Request().Context(), viewer, limit,
+		searchPage{sinceID: sinceID, untilID: untilID, offset: int(req.Offset)},
+		func(p searchPage) ([]*model.Note, error) {
+			o := opts
+			o.Offset = p.offset
+			return h.searchService.SearchNote(viewer, req.Query, o, search.Pagination{
+				UntilID: p.untilID,
+				SinceID: p.sinceID,
+				Limit:   limit,
+			})
+		})
 	if err != nil {
 		// 空クエリは invalidParam として返す。
 		// それ以外のエラー (DB障害など) はinternalErrorで返す。
@@ -977,16 +1153,92 @@ func (h *Handler) Search(c echo.Context) error {
 		}
 		return apierr.JSONInternalError(c)
 	}
-	// upstream searchNoteByLike / searchNoteByMeilisearch は generateBaseNoteFilteringQuery
-	// で suspended-user / blocked-host (匿名でも) と被block/mute/renote-mute user の note を
-	// 除外する。provider は visibility しか掛けないため、search-by-tag 等と同じく post-fetch で
-	// applyMuteBlock を適用する (#1938)。upstream search は thread-mute を掛けないため
-	// applyThreadMute は不要。
-	notes, err = h.applyMuteBlock(viewer, notes)
-	if err != nil {
-		return apierr.JSONInternalError(c)
+	return c.JSON(http.StatusOK, packed)
+}
+
+// maxSearchRefills caps the extra fetches searchVisiblePage makes to refill a
+// page whose notes were hidden from the viewer.
+const maxSearchRefills = 3
+
+// searchPage is the cursor of one fetch made by searchVisiblePage.
+type searchPage struct {
+	sinceID string
+	untilID string
+	offset  int
+}
+
+// searchVisiblePage runs a note search for notes/search and
+// notes/search-by-tag and returns up to limit notes whose own content the
+// viewer can read.
+//
+// fetch must return the notes of one page in the backend's order, before the
+// mute / block filter. When the notes left after the filters are fewer than
+// limit and the fetch returned a full page, it fetches the following page (at
+// most maxSearchRefills times). It never returns hidden notes, even when that
+// leaves the page empty.
+//
+// 本文を見せないノートは、検索の結果にも載せない。本文の検索は本文を読める
+// ノートだけを対象にするため。除くのは LIMIT の後なので、除いて空いた分は続きを
+// 取って埋める。空のページを返すと、本家の frontend (paginator.ts) は続きを
+// 読むのをやめ、それより古いノートに辿り着けなくなるため。
+// 続きは、最後に取得したノートを cursor にして取る。向きは取得したページの並び
+// から決める (SQL の backend は sinceId だけのとき昇順、Meilisearch は常に降順)。
+// offset で読んでいる要求は、cursor ではなく offset を進めて続きを取る。
+// 上限まで取っても 1 件も残らないときも、隠れるノートは返さない (空で返す)。
+// isHidden の形で返すと、そのノートが検索語に一致したことが分かるため。
+// 埋め込み (renote / reply) だけが隠れたノートは、本文が見えているので残す。
+func (h *Handler) searchVisiblePage(ctx context.Context, viewer *model.User, limit int, first searchPage, fetch func(searchPage) ([]*model.Note, error)) ([]entity.NoteEntity, error) {
+	muteBlock := h.newMuteBlockFilter(viewer)
+	out := []entity.NoteEntity{}
+	page := first
+	for attempt := 0; attempt <= maxSearchRefills; attempt++ {
+		raw, err := fetch(page)
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) == 0 {
+			break
+		}
+		filtered, err := muteBlock(raw)
+		if err != nil {
+			return nil, err
+		}
+		packed := h.packMany(ctx, filtered, viewer)
+		for _, n := range packed {
+			if n.IsHidden {
+				continue
+			}
+			out = append(out, n)
+			if len(out) == limit {
+				return out, nil
+			}
+		}
+		if len(raw) < limit {
+			// 結果の終わりまで読んだ。隠れるノートしか無くても空で返してよい。
+			return out, nil
+		}
+		page = nextSearchPage(page, raw)
 	}
-	return c.JSON(http.StatusOK, h.packMany(c.Request().Context(), notes, viewer))
+	return out, nil
+}
+
+// nextSearchPage returns the cursor of the page that follows raw.
+func nextSearchPage(page searchPage, raw []*model.Note) searchPage {
+	if page.offset > 0 {
+		page.offset += len(raw)
+		return page
+	}
+	last := raw[len(raw)-1].ID
+	ascending := page.sinceID != "" && page.untilID == ""
+	if len(raw) >= 2 {
+		ascending = raw[0].ID < last
+	}
+	if ascending {
+		page.sinceID = last
+	} else {
+		page.untilID = last
+	}
+	return page
 }
 
 // State handles POST /api/notes/state.
@@ -1010,9 +1262,9 @@ func (h *Handler) State(c echo.Context) error {
 
 // ConversationRequest is the request body for notes/conversation.
 type ConversationRequest struct {
-	NoteID string `json:"noteId"`
-	Limit  *int   `json:"limit"`
-	Offset int    `json:"offset"`
+	NoteID string     `json:"noteId"`
+	Limit  *jsnum.Int `json:"limit"`
+	Offset jsnum.Int  `json:"offset"`
 }
 
 // Conversation handles POST /api/notes/conversation.
@@ -1021,7 +1273,7 @@ func (h *Handler) Conversation(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.NoteID == "" {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -1035,7 +1287,7 @@ func (h *Handler) Conversation(c echo.Context) error {
 	if h.visitorHidesAll(viewer) {
 		return c.JSON(http.StatusOK, []any{})
 	}
-	notes, err := h.queryService.Conversation(viewer, req.NoteID, limit, req.Offset)
+	notes, err := h.queryService.Conversation(viewer, req.NoteID, limit, int(req.Offset))
 	if err != nil {
 		// **DB 障害を not-found に丸めない** (#2799)。`Conversation` は #2799 で
 		// raw DB error も返すようになったので、sentinel かどうかで分ける。
@@ -1046,14 +1298,14 @@ func (h *Handler) Conversation(c echo.Context) error {
 	}
 	// Conversation は非可視な祖先も raw に返すので、ここで CanSee 判定して
 	// 非可視 note を hideNote stub する (upstream packMany(_, me) の hideNote 挙動、
-	// #1948-17)。index ずれ (ApplyHardMute の drop) に強いよう note ID で突合する。
+	// #1948-17)。note ID で突合する。
 	hidden := make(map[string]struct{})
 	for _, n := range notes {
 		if !h.queryService.CanSee(viewer, n) {
 			hidden[n.ID] = struct{}{}
 		}
 	}
-	packed := h.packMany(c.Request().Context(), notes, viewer)
+	packed := h.packManyWithoutHardMute(c.Request().Context(), notes, viewer)
 	if len(hidden) > 0 {
 		for i := range packed {
 			if _, ok := hidden[packed[i].ID]; ok {
@@ -1077,16 +1329,16 @@ func (h *Handler) BulkShow(c echo.Context) error {
 	var req struct {
 		NoteIDs []string `json:"noteIds"`
 		// upstream notes.ts public-note timeline params (noteIds 不在時に使用)。
-		Local     bool   `json:"local"`
-		Reply     *bool  `json:"reply"`
-		Renote    *bool  `json:"renote"`
-		WithFiles *bool  `json:"withFiles"`
-		Poll      *bool  `json:"poll"`
-		Limit     *int   `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		Local     bool       `json:"local"`
+		Reply     *bool      `json:"reply"`
+		Renote    *bool      `json:"renote"`
+		WithFiles *bool      `json:"withFiles"`
+		Poll      *bool      `json:"poll"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
@@ -1107,17 +1359,18 @@ func (h *Handler) BulkShow(c echo.Context) error {
 		// mk-go 独自の noteIds 経路にも、一覧側と同じ ugcVisibilityForVisitor の
 		// 方針を掛ける (upstream には該当する経路が無い)。
 		notes = h.filterVisitorUGC(viewer, notes)
-		return c.JSON(http.StatusOK, h.packMany(c.Request().Context(), notes, viewer))
+		// ID を指定して引く経路は notes/show と同じ単体の取得なので、ハードミュートを掛けない。
+		return c.JSON(http.StatusOK, h.packManyWithoutHardMute(c.Request().Context(), notes, viewer))
 	}
 
 	// noteIds 不在時は upstream notes.ts の public note 一覧。public note のみなので追加の
 	// visibility filter は不要 (upstream も requireCredential:false)。未ログインの閲覧者
 	// 向けの ugcVisibilityForVisitor は下で掛ける。
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -1155,9 +1408,9 @@ func (h *Handler) BulkShow(c echo.Context) error {
 // (upstream shouldHideNote→hideNote)。draft は owner-only だが、replyId/renoteId に
 // 任意の note ID を入れて非可視 note の本文を読み出す leak を塞ぐ (#1948-19)。
 func (h *Handler) packReferencedNote(ctx context.Context, n *model.Note, viewer *model.User, detail bool) entity.NoteEntity {
-	packed := entity.PackNotes(ctx, []*model.Note{n}, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	packed := h.entityPacker.PackNotes(ctx, []*model.Note{n}, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldResolver().Apply(packed, viewer)
-	notehide.HideEmbeds(viewer, packed)
+	h.noteHider.HideEmbeds(viewer, packed)
 	out := packed[0]
 	// queryService 未配線時は fail-closed で hide (= 検証不能なら隠す)。
 	if h.queryService == nil || !h.queryService.CanSee(viewer, n) {
@@ -1184,20 +1437,32 @@ func (h *Handler) packReferencedNote(ctx context.Context, n *model.Note, viewer 
 // あり、他の PackNotes 利用 handler (antennas / users / pinned 等) と共通化
 // している (#426)。
 //
-// 全 list endpoint (TL / Search / Conversation / Mentions / UserList /
-// SearchByTag) が本関数を経由するので、hardMutedWords の filter (#787) は
+// hardMutedWords の filter (#787) は、本家の frontend が `withHardMute` で
+// 描画する一覧 (タイムライン、検索、メンションなど) に当たる endpoint だけで、
 // PackNotes に渡す前に一括で適用する。viewer == nil / userRepo 未配線 /
 // 規則無し のいずれも no-op に倒す best-effort 設計。
 //
+// **詳細画面が読む endpoint (children / replies / renotes / conversation /
+// show-partial-bulk、noteIds を指定した notes) には掛けない** (#3369)。本家は
+// そこを `MkNoteSub` などで描画し、ハードミュートしない。掛けると、ミュートの語を
+// 含むノートの詳細画面で返信やリノートが 1 件も出なくなる。これらは
+// packManyWithoutHardMute を使う。
+//
 // 注意: filter を意図的に bypass したい admin 系 path (例: モデレーション目的で
-// 隠さず全件を見せたい / pinned notes 等) は本関数を経由せず entity.PackNotes
+// 隠さず全件を見せたい / pinned notes 等) は本関数を経由せず (*entity.Packer).PackNotes
 // を直接呼ぶ慣習。pinned (i/show, users/show) と i/favorites は upstream に
 // 揃えて既に packMany を経由していない。
 func (h *Handler) packMany(ctx context.Context, notes []*model.Note, viewer *model.User) []entity.NoteEntity {
-	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes)
-	out := entity.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes, h.idGen)
+	return h.packManyWithoutHardMute(ctx, notes, viewer)
+}
+
+// packManyWithoutHardMute is packMany without the hardMutedWords filter, for
+// the endpoints the note detail view reads (see packMany).
+func (h *Handler) packManyWithoutHardMute(ctx context.Context, notes []*model.Note, viewer *model.User) []entity.NoteEntity {
+	out := h.entityPacker.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldResolver().Apply(out, viewer)
-	notehide.HideEmbeds(viewer, out)
+	h.noteHider.HideEmbeds(viewer, out)
 	return out
 }
 
@@ -1206,6 +1471,7 @@ func (h *Handler) packMany(ctx context.Context, notes []*model.Note, viewer *mod
 // configured)。
 func (h *Handler) fieldResolver() *entity.NoteFieldResolver {
 	return entity.NewNoteFieldResolver(
+		h.entityPacker,
 		nilOrDriveFile(h.driveFileRepo),
 		nilOrDriveFolder(h.driveFolderRepo),
 		nilOrUser(h.userRepo),
@@ -1261,65 +1527,3 @@ func nilOrChannel(r repository.ChannelRepository) entity.ChannelLookup {
 func (h *Handler) PackForEmbed(ctx context.Context, n *model.Note) entity.NoteEntity {
 	return h.packReferencedNote(ctx, n, nil, true)
 }
-
-// HasPolicyProvider reports whether the role policy provider was wired.
-//
-// 未配線だと timeline の可視性 gate (`timelineAvailable`) に加え、
-// `canSearchNotes` (`handler.go`)・`canUseTranslator` (`handler_extra.go`)・
-// `noteDraftLimit` (`handler_drafts.go`) も同時に素通しになる。**1 つの nil で
-// 4 箇所**。起動時検査に使う (#2683)。
-func (h *Handler) HasPolicyProvider() bool { return h.policyProvider != nil }
-
-// HasDriveFileRepo / HasMetaRepo / HasBlockingRepo / HasMutingRepo /
-// HasChannelMutingRepo / HasUserFollowingRepo / HasUGCVisibility report whether
-// the visibility gates were wired (#2708).
-//
-// 未配線時にそれぞれ:
-//
-//   - driveFileRepo: 下書きの添付で他人の drive ファイル ID を指定でき
-//     (`handler_drafts.go` の所有権検査が nil で true を返す)、加えて
-//     `fieldResolver()` が drive を引けなくなるので **全 note の files が
-//     空配列**になる。下書きから note への昇格は `note.driveFileRepo` の
-//     checkFileIDs を通るので、他人のファイルの実体までは出ない
-//   - metaRepo: blocked-host の note が post-fetch 経路で漏れる
-//   - blockingRepo: ブロック / ミュート / チャンネルミュートの post-fetch
-//     filter が丸ごと skip される (`applyMuteBlock` は `blockingRepo != nil`
-//     で全体を gate している)
-//   - mutingRepo: post-fetch filter のミュート集合と、
-//     `notes/polls/recommendation` が SQL へ渡す除外集合が空になる。timeline の
-//     SQL 側は `UseMutingSubquery` が別に効くので残る
-//   - channelMutingRepo: チャンネルミュートが**一切**効かない。別ソースが
-//     無いので in-memory・SQL (`TimelineFilter.MutedChannelIDs`)・user-list
-//     timeline・HTL の followed-channel 差し引き の全経路が死ぬ
-//   - userFollowingRepo: followers 限定投稿への返信が非フォロワーの HTL / STL
-//     に出る
-//   - ugcVisibility: 匿名 visitor への露出を `ugcVisibilityForVisitor` で
-//     gate できない
-func (h *Handler) HasDriveFileRepo() bool { return h.driveFileRepo != nil }
-
-// HasMetaRepo reports whether the meta repository was wired.
-func (h *Handler) HasMetaRepo() bool { return h.metaRepo != nil }
-
-// HasBlockingRepo reports whether the blocking repository was wired.
-func (h *Handler) HasBlockingRepo() bool { return h.blockingRepo != nil }
-
-// HasMutingRepo reports whether the muting repository was wired.
-func (h *Handler) HasMutingRepo() bool { return h.mutingRepo != nil }
-
-// HasChannelMutingRepo reports whether the channel muting repository was wired.
-func (h *Handler) HasChannelMutingRepo() bool { return h.channelMutingRepo != nil }
-
-// HasRenoteMutingRepo reports whether the renote muting repository was wired.
-//
-// 未配線だと `loadRenoteMutedUserIDs` が nil を返し、renote ミュートが read 時に
-// 一切効かない (#2709 review)。
-func (h *Handler) HasRenoteMutingRepo() bool { return h.renoteMutingRepo != nil }
-
-// HasUserFollowingRepo reports whether the following repository was wired.
-func (h *Handler) HasUserFollowingRepo() bool { return h.userFollowingRepo != nil }
-
-// HasUGCVisibility reports whether the visitor content visibility policy was set.
-//
-// **空文字は gate 無効**と同義 (`"none"` でも `"local"` でもないので素通し)。
-// 列は `NOT NULL DEFAULT 'local'` なので、空になるのは配線が漏れたときだけ。
-func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibilityNow() != "" }

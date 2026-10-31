@@ -90,18 +90,18 @@ func TestInstanceResolver_FillUserLite(t *testing.T) {
 	r := NewInstanceResolver(lookup, remoteUser("u1", "a.example"))
 
 	// remote user: Instance populated
-	remote := PackUserLite(remoteUser("u1", "a.example"))
+	remote := currentPacker().PackUserLite(remoteUser("u1", "a.example"))
 	r.FillUserLite(&remote)
 	require.NotNil(t, remote.Instance)
 	assert.Equal(t, "Foo", *remote.Instance.Name)
 
 	// local user: Instance remains nil
-	local := PackUserLite(localUser("u2"))
+	local := currentPacker().PackUserLite(localUser("u2"))
 	r.FillUserLite(&local)
 	assert.Nil(t, local.Instance)
 
 	// unknown host: Instance remains nil
-	unknown := PackUserLite(remoteUser("u3", "unknown.example"))
+	unknown := currentPacker().PackUserLite(remoteUser("u3", "unknown.example"))
 	r.FillUserLite(&unknown)
 	assert.Nil(t, unknown.Instance)
 
@@ -124,7 +124,7 @@ func TestPackNotes_PopulatesRemoteUserInstance(t *testing.T) {
 		{ID: "n2", UserID: "u2", User: &model.User{ID: "u2", Username: "bob"}}, // local
 	}
 
-	out := PackNotes(context.Background(), notes, idGen, lookup, nil, nil)
+	out := currentPacker().PackNotes(context.Background(), notes, idGen, lookup, nil, nil)
 	require.Len(t, out, 2)
 	require.NotNil(t, out[0].User.Instance)
 	assert.Equal(t, "Remote HQ", *out[0].User.Instance.Name)
@@ -140,7 +140,7 @@ func TestPackNotes_NilLookup_InstanceRemainsNil(t *testing.T) {
 	notes := []*model.Note{
 		{ID: "n1", UserID: "u1", User: &model.User{ID: "u1", Username: "alice", Host: &host}},
 	}
-	out := PackNotes(context.Background(), notes, idGen, nil, nil, nil)
+	out := currentPacker().PackNotes(context.Background(), notes, idGen, nil, nil, nil)
 	require.Len(t, out, 1)
 	assert.Nil(t, out[0].User.Instance)
 }
@@ -155,7 +155,7 @@ func TestPackNoteWithInstance(t *testing.T) {
 	host := "solo.example"
 	n := &model.Note{ID: "n1", UserID: "u1", User: &model.User{ID: "u1", Username: "alice", Host: &host}}
 
-	packed := PackNoteWithInstance(context.Background(), n, idGen, lookup, nil, nil)
+	packed := currentPacker().PackNoteWithInstance(context.Background(), n, idGen, lookup, nil, nil)
 	require.NotNil(t, packed.User.Instance)
 	assert.Equal(t, "Solo", *packed.User.Instance.Name)
 }

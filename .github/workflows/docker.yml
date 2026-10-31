@@ -78,7 +78,7 @@ jobs:
           package_json_file: frontend/package.json
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: frontend/.node-version
 
@@ -98,7 +98,7 @@ jobs:
       # 使えないケースでも build だけは回せるようにしておく。
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -136,7 +136,7 @@ jobs:
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
           labels: |
             org.opencontainers.image.title=${{ github.event.repository.name }}
-            org.opencontainers.image.description=Misskey rewritten in Go
+            org.opencontainers.image.description=ActivityPub server born from Misskey, rebuilt in Go
             org.opencontainers.image.source=${{ github.event.repository.html_url }}
 
       - name: Build and push
@@ -179,7 +179,7 @@ jobs:
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -206,7 +206,7 @@ jobs:
             type=raw,value=${{ inputs.tag }},suffix=-bundled,enable=${{ inputs.tag != '' }}
           labels: |
             org.opencontainers.image.title=${{ github.event.repository.name }}
-            org.opencontainers.image.description=Misskey rewritten in Go (frontend assets bundled)
+            org.opencontainers.image.description=ActivityPub server born from Misskey, rebuilt in Go (frontend assets bundled)
             org.opencontainers.image.source=${{ github.event.repository.html_url }}
 
       - name: Build and push

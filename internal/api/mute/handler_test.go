@@ -9,6 +9,7 @@ import (
 
 	"github.com/elythia-network/elythia/internal/api/userrelation"
 	coremuting "github.com/elythia-network/elythia/internal/core/muting"
+	"github.com/elythia-network/elythia/internal/core/userpack"
 	"github.com/elythia-network/elythia/internal/entitycompat/shapetest"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
@@ -21,11 +22,17 @@ import (
 
 func newHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	t.Helper()
+	return newHandlerWithExtras(t, nil)
+}
+
+// newHandlerWithExtras builds the handler with extras as the detail extras filler.
+func newHandlerWithExtras(t *testing.T, extras userpack.DetailExtrasMany) (*Handler, *testutil.MockUserRepository) {
+	t.Helper()
 	userRepo := testutil.NewMockUserRepository()
 	mutingRepo := testutil.NewMockMutingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coremuting.NewService(userRepo, mutingRepo, idGen)
-	return NewHandler(svc, userRepo, idGen), userRepo
+	return NewHandler(svc, userRepo, idGen, nil, extras), userRepo
 }
 
 func newReq(t *testing.T, body string) (echo.Context, *httptest.ResponseRecorder) {
@@ -128,7 +135,7 @@ func TestCreate_RepoError(t *testing.T) {
 	addUser(userRepo, "bob")
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coremuting.NewService(userRepo, &failingMutingRepo{MockMutingRepository: testutil.NewMockMutingRepository()}, idGen)
-	h := NewHandler(svc, nil, nil)
+	h := NewHandler(svc, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{"userId":"bob"}`)
 	setUser(c, "alice")
@@ -167,11 +174,27 @@ func TestDelete_Self(t *testing.T) {
 }
 
 func TestDelete_NotMuting(t *testing.T) {
-	h, _ := newHandler(t)
+	h, repo := newHandler(t)
+	addUser(repo, "alice")
+	addUser(repo, "bob")
 	c, rec := newReq(t, `{"userId":"bob"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Delete(c))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "NOT_MUTING")
+}
+
+// A user that does not exist is NO_SUCH_USER, not NOT_MUTING: upstream looks up
+// the user before the relation (#3760).
+func TestDelete_NoSuchUser(t *testing.T) {
+	h, repo := newHandler(t)
+	addUser(repo, "alice")
+	c, rec := newReq(t, `{"userId":"nosuchuser1"}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Delete(c))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"NO_SUCH_USER"`)
+	assert.Contains(t, rec.Body.String(), "b851d00b-8ab1-4a56-8b1b-e24187cb48ef")
 }
 
 // failingDeleteMutingRepo lets us trigger Delete error.
@@ -191,7 +214,7 @@ func TestDelete_RepoError(t *testing.T) {
 	mock.Mutings["m1"] = &model.Muting{ID: "m1", MuterID: "alice", MuteeID: "bob"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coremuting.NewService(userRepo, &failingDeleteMutingRepo{MockMutingRepository: mock}, idGen)
-	h := NewHandler(svc, nil, nil)
+	h := NewHandler(svc, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{"userId":"bob"}`)
 	setUser(c, "alice")
@@ -225,7 +248,7 @@ func TestList_EmbedsRelationFlags(t *testing.T) {
 	mutingRepo := testutil.NewMockMutingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coremuting.NewService(userRepo, mutingRepo, idGen)
-	h := NewHandler(svc, userRepo, idGen)
+	h := NewHandler(svc, userRepo, idGen, nil, nil)
 	h.SetRelationRepos(userrelation.Repos{
 		Following:     testutil.NewMockFollowingRepository(),
 		Blocking:      testutil.NewMockBlockingRepository(),
@@ -266,7 +289,7 @@ func newGatedHandler(t *testing.T, mod ModeratorChecker) (*Handler, *httptest.Re
 	mutingRepo := testutil.NewMockMutingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coremuting.NewService(userRepo, mutingRepo, idGen)
-	h := NewHandler(svc, userRepo, idGen)
+	h := NewHandler(svc, userRepo, idGen, nil, nil)
 	h.SetRelationRepos(userrelation.Repos{
 		Following: testutil.NewMockFollowingRepository(),
 		Muting:    mutingRepo,
@@ -344,7 +367,7 @@ func TestList_RepoError(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coremuting.NewService(userRepo, &failingListMutingRepo{MockMutingRepository: testutil.NewMockMutingRepository()}, idGen)
-	h := NewHandler(svc, nil, nil)
+	h := NewHandler(svc, nil, nil, nil, nil)
 
 	c, rec := newReq(t, `{}`)
 	setUser(c, "alice")
@@ -388,4 +411,85 @@ func TestList_AcceptsOrdinaryCursor(t *testing.T) {
 	setUser(c, "alice")
 	require.NoError(t, h.List(c))
 	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// expiresAt: 0 は無期限のミュートを作ること (upstream は 0 を falsy として null に倒す)。
+//
+// 0 を 1970 年として扱うと「失効済み」の no-op 分岐に入り、204 なのにミュートが
+// 作られなかった。
+func TestCreate_ExpiresAtZeroIsPermanent(t *testing.T) {
+	userRepo := testutil.NewMockUserRepository()
+	mutingRepo := testutil.NewMockMutingRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	h := NewHandler(coremuting.NewService(userRepo, mutingRepo, idGen), userRepo, idGen, nil, nil)
+	addUser(userRepo, "alice")
+	addUser(userRepo, "bob")
+
+	c, rec := newReq(t, `{"userId":"bob","expiresAt":0}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Create(c))
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	ok, err := mutingRepo.Exists("alice", "bob")
+	require.NoError(t, err)
+	require.True(t, ok, "expiresAt: 0 でミュートが作られなかった")
+	m, err := mutingRepo.FindByPair("alice", "bob")
+	require.NoError(t, err)
+	assert.Nil(t, m.ExpiresAt, "無期限のはず")
+}
+
+// listAfterTwoCreates makes alice target bob and carol, then lists with body.
+func listAfterTwoCreates(t *testing.T, body string) []map[string]any {
+	t.Helper()
+	h, repo := newHandler(t)
+	addUser(repo, "alice")
+	addUser(repo, "bob")
+	addUser(repo, "carol")
+	for _, target := range []string{"bob", "carol"} {
+		c, rec := newReq(t, `{"userId":"`+target+`"}`)
+		setUser(c, "alice")
+		require.NoError(t, h.Create(c))
+		require.Less(t, rec.Code, 300, rec.Body.String())
+	}
+	c, rec := newReq(t, body)
+	setUser(c, "alice")
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	return resp
+}
+
+// list accepts an integer-valued fraction for limit / sinceDate / untilDate,
+// as upstream's ajv does for an integer (#3760).
+func TestList_AcceptsIntegerValuedFractions(t *testing.T) {
+	assert.Len(t, listAfterTwoCreates(t, `{"limit":1.0,"untilDate":1e15}`), 1)
+	assert.Len(t, listAfterTwoCreates(t, `{"sinceDate":1e1}`), 2)
+	assert.Empty(t, listAfterTwoCreates(t, `{"sinceDate":1e15}`), "sinceDate is read, not just accepted")
+}
+
+// list does not read offset, which upstream's paramDef does not have:
+// upstream ignores it and answers from the top (#3760).
+func TestList_IgnoresOffset(t *testing.T) {
+	assert.Len(t, listAfterTwoCreates(t, `{"offset":1}`), 2)
+	assert.Len(t, listAfterTwoCreates(t, `{"offset":"x"}`), 2)
+}
+
+// expiresAt accepts an integer-valued fraction, as upstream's ajv does for an
+// integer (#3760).
+func TestCreate_ExpiresAtAcceptsIntegerValuedFraction(t *testing.T) {
+	h, repo := newHandler(t)
+	addUser(repo, "alice")
+	addUser(repo, "bob")
+	c, rec := newReq(t, `{"userId":"bob","expiresAt":2e12}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Create(c))
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+
+	c, rec = newReq(t, `{}`)
+	setUser(c, "alice")
+	require.NoError(t, h.List(c))
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp, 1)
+	assert.Equal(t, "2033-05-18T03:33:20.000Z", resp[0]["expiresAt"])
 }

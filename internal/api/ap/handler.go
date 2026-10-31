@@ -9,17 +9,21 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/api/userrelation"
+	corefederation "github.com/elythia-network/elythia/internal/core/federation"
+	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	coreuser "github.com/elythia-network/elythia/internal/core/user"
 	"github.com/elythia-network/elythia/internal/core/userpack"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/idnhost"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
@@ -75,6 +79,15 @@ type Handler struct {
 	// (nil) なら gate 無効 = 全 host 許可 (legacy 挙動)。
 	hostBlocker HostBlockChecker
 	localHost   string
+	// allowExternalRedirect は meta.allowExternalApRedirect を返す (未配線なら許す)。
+	allowExternalRedirect func() bool
+	// selfOrigin は config.url。外部への転送かどうかを scheme とポートまで見て決める。
+	selfOrigin *url.URL
+	// softwareBlocker は受信を拒否するソフトウェア (meta.inboxSuspendedSoftware) の
+	// 判定。ドメインブロックと同じく FEDERATION_NOT_ALLOWED にする (#3563)。resolver
+	// も取り込みを拒むが、ここで止めないと取得した生の AP JSON をそのまま返す。
+	softwareBlocker         SoftwareSuspensionChecker
+	localFederationObserver activitypub.LocalFederationObserver
 	// backfillGroup collapses parallel lazy-backfill 経路の Generate +
 	// InsertIfAbsent を同 user ID で 1 回に集約する。多 goroutine が
 	// 同時に backfill しても entropy / CPU を浪費しない (#1081 review #1)。
@@ -91,6 +104,125 @@ type Handler struct {
 	noteRepo repository.NoteRepository
 	// quoteAuthorizations は引用の承認の実体を配る (FEP-044f、#3234)。
 	quoteAuthorizations QuoteAuthorizationStore
+	// noteHider は閲覧者が見てはいけない投稿の中身を隠す (#3786)。未配線だと
+	// 匿名の閲覧者への ugcVisibilityForVisitor が効かないので、NewHandler の
+	// 必須の引数で受ける (#3817)。
+	noteHider *notehide.Hider
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3790、#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
+}
+
+// SetLocalFederationObserver wires account-level availability and first-reference tracking.
+func (h *Handler) SetLocalFederationObserver(observer activitypub.LocalFederationObserver) {
+	h.localFederationObserver = observer
+}
+
+func (h *Handler) observeLocalUser(user *model.User, reason string) (bool, error) {
+	if user == nil || !user.IsLocal() || h.localFederationObserver == nil {
+		return true, nil
+	}
+	if !h.localFederationObserver.IsExternallyAvailable(user) {
+		return false, nil
+	}
+	if user.FirstExternalReferenceAt != nil {
+		return true, nil
+	}
+	_, err := h.localFederationObserver.ObserveExternalReference(user.ID, reason, "")
+	if errors.Is(err, corelocalfederation.ErrFederationDisabled) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+const apReferenceMemoContextKey = "apLocalReferenceMemo"
+
+type apReferenceMemo struct {
+	users         map[string]*model.User
+	notes         map[string]*model.Note
+	observedUsers map[string]bool
+}
+
+func (h *Handler) referenceMemo(c echo.Context) *apReferenceMemo {
+	if memo, ok := c.Get(apReferenceMemoContextKey).(*apReferenceMemo); ok {
+		return memo
+	}
+	memo := &apReferenceMemo{
+		users:         make(map[string]*model.User),
+		notes:         make(map[string]*model.Note),
+		observedUsers: make(map[string]bool),
+	}
+	c.Set(apReferenceMemoContextKey, memo)
+	return memo
+}
+
+func (h *Handler) seedAPUser(c echo.Context, user *model.User) {
+	if user != nil {
+		h.referenceMemo(c).users[user.ID] = user
+	}
+}
+
+func (h *Handler) seedAPNote(c echo.Context, note *model.Note) {
+	if note != nil {
+		h.referenceMemo(c).notes[note.ID] = note
+	}
+}
+
+func (h *Handler) resolveAPUser(c echo.Context, userID string) (*model.User, error) {
+	memo := h.referenceMemo(c)
+	if user := memo.users[userID]; user != nil {
+		return user, nil
+	}
+	bundle, err := h.userService.ShowByID(userID)
+	if err != nil {
+		return nil, err
+	}
+	memo.users[userID] = bundle.User
+	return bundle.User, nil
+}
+
+func (h *Handler) resolveAPNote(c echo.Context, noteID string) (*model.Note, error) {
+	memo := h.referenceMemo(c)
+	if note := memo.notes[noteID]; note != nil {
+		return note, nil
+	}
+	if h.noteRepo == nil {
+		return nil, errors.New("ap: note repository is not wired")
+	}
+	note, err := h.noteRepo.FindByID(noteID)
+	if err != nil {
+		return nil, err
+	}
+	memo.notes[noteID] = note
+	return note, nil
+}
+
+func (h *Handler) observeLocalUserOnce(c echo.Context, user *model.User, reason string) (bool, error) {
+	if user == nil || !user.IsLocal() || h.localFederationObserver == nil {
+		return true, nil
+	}
+	memo := h.referenceMemo(c)
+	h.seedAPUser(c, user)
+	if memo.observedUsers[user.ID] {
+		return true, nil
+	}
+	available, err := h.observeLocalUser(user, reason)
+	if err == nil && available {
+		memo.observedUsers[user.ID] = true
+	}
+	return available, err
+}
+
+func (h *Handler) requireAPUser(c echo.Context, user *model.User, reason string) (bool, error) {
+	available, err := h.observeLocalUserOnce(c, user, reason)
+	if errors.Is(err, corelocalfederation.ErrFederationDisabled) || !available && err == nil {
+		return false, nil
+	}
+	if err != nil {
+		slog.Error("ap: local federation reference observation failed", "userId", user.ID, "reason", reason, "err", err)
+		return false, err
+	}
+	return true, nil
 }
 
 // SetFollowingRepo wires the repository used by the followers/following AP
@@ -117,11 +249,10 @@ func (h *Handler) SetRemote(fetcher RemoteFetcher, resolver RemoteResolver) {
 	h.remoteResolver = resolver
 }
 
-// SetFederationGate wires the federation-policy checker and the local hostname
-// used by APIShow to reject lookups of blocked / non-federated hosts (#1557)。
-func (h *Handler) SetFederationGate(c HostBlockChecker, localHost string) {
-	h.hostBlocker = c
-	h.localHost = localHost
+// SoftwareSuspensionChecker reports whether a host runs software listed in
+// meta.inboxSuspendedSoftware (#3362)。実装は core/federation.NewInboxSuspendedChecker。
+type SoftwareSuspensionChecker interface {
+	IsSuspended(host string) bool
 }
 
 // federationDisabled reports whether the instance is fully isolated
@@ -154,19 +285,39 @@ func (h *Handler) serveNonAP(c echo.Context) error {
 }
 
 // NewHandler constructs a Handler.
+//
+// noteHider applies the per-viewer hideNote gate to the notes this handler
+// packs (#3786) and entityPacker is the Packer it packs entities with (#3790).
+// hostBlocker and localHost are the federation-policy checker and the local
+// hostname APIShow uses to reject lookups of blocked / non-federated hosts
+// (#1557). softwareBlocker is the meta.inboxSuspendedSoftware checker APIShow
+// uses (#3563). detailExtras fills pinnedNotes / pinnedPage / movedTo /
+// alsoKnownAs for ap/show (#3330).
 func NewHandler(
 	renderer *activitypub.Renderer,
 	userService *coreuser.Service,
 	queryService *corenote.QueryService,
 	keypairRepo repository.UserKeypairRepository,
 	idGen id.Generator,
+	noteHider *notehide.Hider,
+	entityPacker *entity.Packer,
+	hostBlocker HostBlockChecker,
+	localHost string,
+	softwareBlocker SoftwareSuspensionChecker,
+	detailExtras userpack.DetailExtras,
 ) *Handler {
 	return &Handler{
-		renderer:     renderer,
-		userService:  userService,
-		queryService: queryService,
-		keypairRepo:  keypairRepo,
-		idGen:        idGen,
+		renderer:        renderer,
+		userService:     userService,
+		queryService:    queryService,
+		keypairRepo:     keypairRepo,
+		idGen:           idGen,
+		noteHider:       noteHider,
+		entityPacker:    entityPacker,
+		hostBlocker:     hostBlocker,
+		localHost:       localHost,
+		softwareBlocker: softwareBlocker,
+		detailExtras:    detailExtras,
 	}
 }
 
@@ -191,8 +342,15 @@ func (h *Handler) SetKeypairExtraRepo(r repository.UserKeypairExtraRepository) {
 //
 // DB error (= ErrRecordNotFound 以外) と PEM parse error は診断のため
 // slog.Warn を出す。
-func (h *Handler) lookupEd25519PublicKey(userID string) ed25519.PublicKey {
+func (h *Handler) lookupEd25519PublicKey(user *model.User) ed25519.PublicKey {
+	if user == nil {
+		return nil
+	}
+	userID := user.ID
 	if h.keypairExtraRepo == nil {
+		return nil
+	}
+	if h.localFederationObserver != nil && !h.localFederationObserver.IsExternallyAvailable(user) {
 		return nil
 	}
 	row, err := h.keypairExtraRepo.FindByUserID(userID)
@@ -334,6 +492,7 @@ func (h *Handler) User(c echo.Context) error {
 // apUserInfo serves the AP branch shared by User (/users/:id) and UserByAcct
 // (/@:acct)。upstream ActivityPubServerService.userInfo に相当する。
 func (h *Handler) apUserInfo(c echo.Context, bundle *coreuser.UserWithProfile) error {
+	c.Response().Header().Set("Cache-Control", "no-store")
 	// suspended は upstream の route query (isSuspended: false) 相当で、
 	// ローカル・リモートを問わず 404 (Person も redirect も返さない)。retention
 	// した local deleted user も隠すが、remote deleted actor の redirect は維持する。
@@ -351,16 +510,37 @@ func (h *Handler) apUserInfo(c echo.Context, bundle *coreuser.UserWithProfile) e
 			(h.localHost != "" && strings.EqualFold(*bundle.User.Host, h.localHost)) {
 			return c.NoContent(http.StatusInternalServerError)
 		}
-		return c.Redirect(http.StatusMovedPermanently, *bundle.User.URI)
+		return h.redirectAP(c, http.StatusMovedPermanently, *bundle.User.URI)
+	}
+	available, err := h.requireAPUser(c, bundle.User, "actor")
+	if err != nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if !available {
+		return c.NoContent(http.StatusNotFound)
 	}
 	keypair, err := h.keypairRepo.FindByUserID(bundle.User.ID)
 	if err != nil {
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	// upstream と同じキャッシュ指示 (public, max-age=180)。
-	c.Response().Header().Set("Cache-Control", "public, max-age=180")
-	person := h.renderer.RenderPerson(bundle.User, bundle.Profile, keypair.PublicKey, h.lookupEd25519PublicKey(bundle.User.ID))
-	return writeActivityJSON(c, person)
+	actorUser, err := h.filterActorLocalReferences(c, bundle.User)
+	if err != nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	person := h.renderer.RenderPerson(actorUser, bundle.Profile, keypair.PublicKey, h.lookupEd25519PublicKey(bundle.User))
+	return h.writeAPJSON(c, person)
+}
+
+func (h *Handler) filterActorLocalReferences(c echo.Context, user *model.User) (*model.User, error) {
+	return corefederation.FilterLocalActorReferences(user, h.renderer.URLs(), func(id string) (*model.User, error) {
+		target, err := h.resolveAPUser(c, id)
+		if errors.Is(err, coreuser.ErrUserNotFound) {
+			return nil, nil
+		}
+		return target, err
+	}, h.localFederationObserver, "actor", func(target *model.User, reason string) (bool, error) {
+		return h.observeLocalUserOnce(c, target, reason)
+	})
 }
 
 // UserByAcct handles GET /@:acct with ActivityPub content negotiation.
@@ -421,6 +601,103 @@ func writeActivityJSON(c echo.Context, v any) error {
 	return c.Blob(http.StatusOK, `application/activity+json; charset=utf-8`, mustMarshal(v))
 }
 
+type localAPReferences struct {
+	users []string
+	notes []string
+}
+
+// extractLocalAPReferences serializes the API object before delegating to the
+// shared semantic ActivityPub reference extractor. Human-readable content is ignored.
+func extractLocalAPReferences(v any, urls *activitypub.URLBuilder) (localAPReferences, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return localAPReferences{}, err
+	}
+	users, notes := activitypub.ExtractLocalAPReferences(urls.BaseURL(), string(data))
+	return localAPReferences{users: users, notes: notes}, nil
+}
+
+func (h *Handler) validateAPReferences(c echo.Context, v any) (bool, error) {
+	if h.localFederationObserver == nil {
+		return true, nil
+	}
+	refs, err := extractLocalAPReferences(v, h.renderer.URLs())
+	if err != nil {
+		return false, err
+	}
+	users := make(map[string]*model.User, len(refs.users)+len(refs.notes))
+	reasons := make(map[string]string, len(refs.users)+len(refs.notes))
+	for _, userID := range refs.users {
+		user, err := h.resolveAPUser(c, userID)
+		if err != nil {
+			if errors.Is(err, coreuser.ErrUserNotFound) {
+				continue
+			}
+			return false, err
+		}
+		users[userID] = user
+		reasons[userID] = "actor"
+	}
+	for _, noteID := range refs.notes {
+		note, err := h.resolveAPNote(c, noteID)
+		if err != nil {
+			if repository.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		if note == nil {
+			continue
+		}
+		if note.UserHost != nil || note.LocalOnly {
+			return false, nil
+		}
+		user, err := h.resolveAPUser(c, note.UserID)
+		if err != nil {
+			if errors.Is(err, coreuser.ErrUserNotFound) {
+				continue
+			}
+			return false, err
+		}
+		if _, ok := users[note.UserID]; !ok {
+			users[note.UserID] = user
+			reasons[note.UserID] = "note"
+		}
+	}
+	userIDs := make([]string, 0, len(users))
+	for userID := range users {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Strings(userIDs)
+	// Resolve and preflight every reference before recording any new external
+	// reference. A later known-off note must not lock an unrelated actor on.
+	for _, userID := range userIDs {
+		user := users[userID]
+		if user == nil || !user.IsLocal() || !h.localFederationObserver.IsExternallyAvailable(user) {
+			return false, nil
+		}
+	}
+	for _, userID := range userIDs {
+		available, err := h.observeLocalUserOnce(c, users[userID], reasons[userID])
+		if err != nil || !available {
+			return available, err
+		}
+	}
+	return true, nil
+}
+
+func (h *Handler) writeAPJSON(c echo.Context, v any) error {
+	available, err := h.validateAPReferences(c, v)
+	if err != nil {
+		slog.Error("ap: validate response references", "err", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if !available {
+		return c.NoContent(http.StatusNotFound)
+	}
+	return writeActivityJSON(c, v)
+}
+
 // wantsActivityJSON reports whether the caller prefers an AP document.
 // Any occurrence of application/activity+json or application/ld+json in
 // the Accept header is treated as a positive signal.
@@ -432,21 +709,24 @@ func wantsActivityJSON(accept string) bool {
 // APIGet handles POST /api/ap/get — Admin専用。URIからActivityPubオブジェクトを取得。
 func (h *Handler) APIGet(c echo.Context) error {
 	var req struct {
-		URI string `json:"uri"`
+		URI *string `json:"uri"`
 	}
-	if err := c.Bind(&req); err != nil || req.URI == "" {
+	// 空の uri は本家の paramDef を通り、本家では new URL が投げて 500 になる。
+	// Elythia は他の解決できない URI と同じく NO_SUCH_OBJECT を返す (#3768)。
+	if err := c.Bind(&req); err != nil || req.URI == nil {
 		return apierr.JSONInvalidParam(c)
 	}
+	uri := *req.URI
 
 	// ローカルURIからオブジェクトを解決
-	obj, err := h.resolveLocal(req.URI)
+	obj, err := h.resolveLocal(uri)
 	if err == nil {
 		return c.JSON(http.StatusOK, obj)
 	}
 
 	// リモートフェッチ
 	if h.remoteFetcher != nil {
-		data, err := h.remoteFetcher.FetchObject(req.URI)
+		data, err := h.remoteFetcher.FetchObject(uri)
 		if err == nil {
 			var parsed map[string]any
 			if json.Unmarshal(data, &parsed) == nil {
@@ -461,29 +741,31 @@ func (h *Handler) APIGet(c echo.Context) error {
 // APIShow handles POST /api/ap/show — URIからUser/Noteを解決して返す。
 func (h *Handler) APIShow(c echo.Context) error {
 	var req struct {
-		URI string `json:"uri"`
+		URI *string `json:"uri"`
 	}
-	if err := c.Bind(&req); err != nil || req.URI == "" {
+	// 空の uri は本家の paramDef を通り、本家では new URL が投げて 500 になる。
+	// Elythia は他の解析できない URI と同じく URI_INVALID を返す (#3768)。
+	if err := c.Bind(&req); err != nil || req.URI == nil {
 		return apierr.JSONInvalidParam(c)
 	}
+	uri := *req.URI
 
 	// URI を解析して host を得る。http(s) でない / host 無しは URI_INVALID
 	// (upstream uriInvalid 1a5eab56)。
-	host, hostErr := apShowURIHost(req.URI)
+	_, hostErr := apShowURIHost(uri)
 	if hostErr != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("URI_INVALID", "URI is invalid.", "1a5eab56-e47b-48c2-8d5e-217b897d70db"))
 	}
 	// federation-allow gate (upstream isFederationAllowedUri、#1557)。自 host は
-	// skip し、remote host が blocked / 非 federation なら FEDERATION_NOT_ALLOWED
-	// (974b799e) を返す。gate 未配線なら全許可 (legacy)。
-	if host != "" && host != h.localHost && h.hostBlocker != nil {
-		if h.hostBlocker.IsBlocked(host) || !h.hostBlocker.IsAllowed(host) {
-			return c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_NOT_ALLOWED", "Federation for this host is not allowed.", "974b799e-1a29-4889-b706-18d4dd93e266"))
-		}
+	// skip し、remote host が blocked / 非 federation、または受信を拒否する
+	// ソフトウェア (Elythia 独自、#3563) なら FEDERATION_NOT_ALLOWED (974b799e) を
+	// 返す。gate 未配線なら全許可 (legacy)。
+	if h.federationDenied(uri) {
+		return c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_NOT_ALLOWED", "Federation for this host is not allowed.", "974b799e-1a29-4889-b706-18d4dd93e266"))
 	}
 
 	// ローカルのノートURIかチェック (/notes/ を含む)
-	if noteID := extractLocalID(req.URI, "/notes/"); noteID != "" {
+	if noteID := extractLocalID(uri, "/notes/"); noteID != "" {
 		n, err := h.queryService.Show(nil, noteID)
 		if err == nil && n.UserHost == nil {
 			return c.JSON(http.StatusOK, map[string]any{
@@ -494,7 +776,7 @@ func (h *Handler) APIShow(c echo.Context) error {
 	}
 
 	// ローカルのユーザーURIかチェック (/users/ を含む)
-	if userID := extractLocalID(req.URI, "/users/"); userID != "" {
+	if userID := extractLocalID(uri, "/users/"); userID != "" {
 		bundle, err := h.userService.ShowByID(userID)
 		if err == nil && bundle.User.Host == nil {
 			return c.JSON(http.StatusOK, map[string]any{
@@ -513,7 +795,7 @@ func (h *Handler) APIShow(c echo.Context) error {
 	// NO_SUCH_OBJECT ではなく REQUEST_FAILED (81b539cf) を返すための記録。
 	fetchRequestFailed := false
 	if h.remoteFetcher != nil {
-		data, fetchErr := h.remoteFetcher.FetchObject(req.URI)
+		data, fetchErr := h.remoteFetcher.FetchObject(uri)
 		switch {
 		case fetchErr != nil:
 			// 404 / 410 は「不在」なので NO_SUCH_OBJECT 経路へ。それ以外は
@@ -547,21 +829,27 @@ func (h *Handler) APIShow(c echo.Context) error {
 			// #2662)。
 			case "Note", "Question", "Article", "Audio", "Document", "Image", "Page", "Video", "Event":
 				if h.remoteResolver != nil {
-					if remoteNote, err := h.remoteResolver.ResolveNoteAllowCrossHost(req.URI); err == nil {
+					if remoteNote, err := h.remoteResolver.ResolveNoteAllowCrossHost(uri); err == nil {
 						return c.JSON(http.StatusOK, map[string]any{
 							"type":   "Note",
 							"object": h.packNoteForAPI(middleware.GetUser(c), remoteNote),
 						})
 					}
 				}
-				// Resolver 無し or ResolveNote 失敗時は raw AP JSON を返す
+				// Resolver 無し or ResolveNote 失敗時は raw AP JSON を返す。**返す前に、
+				// 取得した文書の id のホストにも同じ判定を当てる** (#3563)。リダイレクトで
+				// 別のホストの文書が返ると、入口の判定 (要求した URI) をすり抜けた
+				// 拒否中のホストの中身を、resolver が取り込みを拒んだ後でそのまま返す。
+				if objID, _ := parsed["id"].(string); h.federationDenied(objID) {
+					return c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_NOT_ALLOWED", "Federation for this host is not allowed.", "974b799e-1a29-4889-b706-18d4dd93e266"))
+				}
 				return c.JSON(http.StatusOK, map[string]any{
 					"type":   "Note",
 					"object": parsed,
 				})
 			case "Person", "Service", "Application", "Organization", "Group":
 				if h.remoteResolver != nil {
-					if remoteUser, err := h.remoteResolver.ResolveActorAllowCrossHost(req.URI); err == nil {
+					if remoteUser, err := h.remoteResolver.ResolveActorAllowCrossHost(uri); err == nil {
 						return c.JSON(http.StatusOK, map[string]any{
 							"type":   "User",
 							"object": h.packUserForAPI(middleware.GetUser(c), remoteUser, h.userService.GetProfile(remoteUser.ID)),
@@ -575,7 +863,7 @@ func (h *Handler) APIShow(c echo.Context) error {
 	// フェッチ失敗 or Type 不明の場合は ResolveActor を試す (webfinger 経由の
 	// /@user URL に対する fetch が失敗するケースがあるため)。
 	if h.remoteResolver != nil {
-		if remoteUser, err := h.remoteResolver.ResolveActorAllowCrossHost(req.URI); err == nil {
+		if remoteUser, err := h.remoteResolver.ResolveActorAllowCrossHost(uri); err == nil {
 			return c.JSON(http.StatusOK, map[string]any{
 				"type":   "User",
 				"object": h.packUserForAPI(middleware.GetUser(c), remoteUser, h.userService.GetProfile(remoteUser.ID)),
@@ -600,6 +888,35 @@ func apShowURIHost(uri string) (string, error) {
 		return "", errors.New("ap: invalid uri")
 	}
 	return u.Hostname(), nil
+}
+
+// federationDenied reports whether uri points at a remote host that ap/show
+// must not show: blocked / outside the federation allowlist, or running
+// software listed in meta.inboxSuspendedSoftware. 解析できない URI と自ホストは
+// false (呼び出し側が別に扱う)。
+//
+// 受信を拒否するソフトウェアの判定は、**instance の行と同じ形 (punycode の小文字、
+// 既定でないポートは残す。idnhost.HostPort) にしてから引く。** Hostname() のままだと、
+// IDN 表記や既定でないポートの URI が素通りする。
+func (h *Handler) federationDenied(uri string) bool {
+	host, err := apShowURIHost(uri)
+	if err != nil || host == "" || host == h.localHost {
+		return false
+	}
+	if h.hostBlocker != nil && (h.hostBlocker.IsBlocked(host) || !h.hostBlocker.IsAllowed(host)) {
+		return true
+	}
+	return h.softwareBlocker != nil && h.softwareBlocker.IsSuspended(apShowGateHost(uri))
+}
+
+// apShowGateHost returns the host of uri in the form instance rows use
+// (punycode, lower case, non-default port kept). 解析できなければ空文字。
+func apShowGateHost(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	return idnhost.HostPort(u)
 }
 
 // resolveLocal attempts to resolve a local URI to an AP object.
@@ -633,7 +950,7 @@ func (h *Handler) resolveLocal(uri string) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return h.renderer.RenderPerson(bundle.User, bundle.Profile, keypair.PublicKey, h.lookupEd25519PublicKey(bundle.User.ID)), nil
+		return h.renderer.RenderPerson(bundle.User, bundle.Profile, keypair.PublicKey, h.lookupEd25519PublicKey(bundle.User)), nil
 	}
 	return nil, http.ErrNotSupported
 }
@@ -676,8 +993,8 @@ func (h *Handler) packNoteForAPI(viewer *model.User, n *model.Note) entity.NoteE
 	// 欠くと followers/specified note を引用/返信した note 経由で非可視本文が ap/show
 	// から漏れる IDOR になる。ap/show は RequireAuth なので viewer は通常非 nil だが、
 	// nil でも notehide が fail-closed (followers/specified embed を hide) する。
-	arr := []entity.NoteEntity{entity.PackNote(n, h.idGen)}
-	notehide.HideEmbeds(viewer, arr)
+	arr := []entity.NoteEntity{h.entityPacker.PackNote(n, h.idGen)}
+	h.noteHider.HideEmbeds(viewer, arr)
 	return arr[0]
 }
 
@@ -689,7 +1006,7 @@ func (h *Handler) packUserForAPI(viewer *model.User, u *model.User, profile *mod
 	if u == nil {
 		return map[string]any{}
 	}
-	d := entity.PackUserDetailed(u, profile, h.idGen)
+	d := h.entityPacker.PackUserDetailed(u, profile, h.idGen)
 	// ピン留めと移行先は users/show と同じ規則で埋める (#3330)。
 	if h.detailExtras != nil {
 		h.detailExtras.FillDetailedExtras(context.Background(), viewer, u, profile, &d)
@@ -711,6 +1028,7 @@ func (h *Handler) Note(c echo.Context) error {
 	// (upstream も /notes/:note の先頭で立てる)。302 が加わったことで、これが
 	// 無いと中間キャッシュが AP 向け 302 をブラウザに配る混線が現実になる。
 	c.Response().Header().Set("Vary", "Accept")
+	c.Response().Header().Set("Cache-Control", "no-store")
 	if !wantsActivityJSON(c.Request().Header.Get("Accept")) {
 		return h.serveNonAP(c)
 	}
@@ -727,6 +1045,7 @@ func (h *Handler) Note(c echo.Context) error {
 	if err != nil {
 		return c.NoContent(http.StatusNotFound)
 	}
+	h.seedAPNote(c, n)
 	// **localOnly は AP で serve しない** (upstream は query で localOnly: false
 	// を強制)。CanSeeNote は可視性しか見ず、連合可否である localOnly を
 	// 通してしまうため、ここで明示的に弾く。
@@ -752,13 +1071,26 @@ func (h *Handler) Note(c echo.Context) error {
 			return c.NoContent(http.StatusInternalServerError)
 		}
 		// fastify の reply.redirect 既定と同じ 302。
-		return c.Redirect(http.StatusFound, *n.URI)
+		return h.redirectAP(c, http.StatusFound, *n.URI)
 	}
-	// upstream と同じキャッシュ指示 (public, max-age=180)。Vary: Accept を
-	// 立てているので AP 変種としてキャッシュされる。
-	c.Response().Header().Set("Cache-Control", "public, max-age=180")
+	if h.localFederationObserver != nil {
+		author, err := h.userService.ShowByID(n.UserID)
+		if err != nil {
+			if errors.Is(err, coreuser.ErrUserNotFound) {
+				return c.NoContent(http.StatusNotFound)
+			}
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		available, err := h.requireAPUser(c, author.User, "note")
+		if err != nil {
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		if !available {
+			return c.NoContent(http.StatusNotFound)
+		}
+	}
 	note := h.renderer.RenderNote(n, h.idGen)
-	return writeActivityJSON(c, note)
+	return h.writeAPJSON(c, note)
 }
 
 // Featured handles GET /users/:id/collections/featured, serving the local
@@ -770,6 +1102,7 @@ func (h *Handler) Note(c echo.Context) error {
 // followers/specified/localOnly な pinned note を unauthenticated AP へ leak させない。
 func (h *Handler) Featured(c echo.Context) error {
 	c.Response().Header().Set("Vary", "Accept")
+	c.Response().Header().Set("Cache-Control", "no-store")
 	if h.federationDisabled() {
 		return c.NoContent(http.StatusForbidden)
 	}
@@ -782,17 +1115,33 @@ func (h *Handler) Featured(c echo.Context) error {
 	if !bundle.User.IsLocal() {
 		return c.NoContent(http.StatusNotFound)
 	}
+	available, err := h.requireAPUser(c, bundle.User, "collection")
+	if err != nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if !available {
+		return c.NoContent(http.StatusNotFound)
+	}
 	notes, err := h.userService.ListPinnedNotes(id)
 	if err != nil {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	items := make([]any, 0, len(notes))
 	for _, n := range notes {
+		h.seedAPNote(c, n)
 		// upstream featured の filter: !localOnly && visibility ∈ {public, home}。
 		if n.LocalOnly || (n.Visibility != model.NoteVisibilityPublic && n.Visibility != model.NoteVisibilityHome) {
 			continue
 		}
 		rn := h.renderer.RenderNote(n, h.idGen)
+		available, err := h.validateAPReferences(c, rn)
+		if err != nil {
+			slog.Error("ap: validate featured note references", "noteId", n.ID, "err", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		if !available {
+			continue
+		}
 		// collection 直下に embed するので per-note @context は外す
 		// (upstream renderNote は bare object を返し、@context は collection 側のみ)。
 		rn.Context = nil
@@ -801,7 +1150,7 @@ func (h *Handler) Featured(c echo.Context) error {
 	// totalItems は filter 後の件数 (upstream は renderedNotes.length)。
 	col := h.renderer.RenderOrderedCollection(h.renderer.URLs().UserFeatured(id), len(items), "", "", items)
 	activitypub.AddContext(col)
-	return writeActivityJSON(c, col)
+	return h.writeAPJSON(c, col)
 }
 
 // Followers handles GET /users/:id/followers (#1877)。
@@ -824,6 +1173,7 @@ func (h *Handler) Following(c echo.Context) error {
 // 相手側の actor URI を返す。
 func (h *Handler) serveFollowCollection(c echo.Context, followers bool) error {
 	c.Response().Header().Set("Vary", "Accept")
+	c.Response().Header().Set("Cache-Control", "no-store")
 	if h.federationDisabled() {
 		return c.NoContent(http.StatusForbidden)
 	}
@@ -838,6 +1188,13 @@ func (h *Handler) serveFollowCollection(c echo.Context, followers bool) error {
 	if !bundle.User.IsLocal() {
 		return c.NoContent(http.StatusNotFound)
 	}
+	available, err := h.requireAPUser(c, bundle.User, "collection")
+	if err != nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if !available {
+		return c.NoContent(http.StatusNotFound)
+	}
 
 	// privacy gate: public 以外 (followers / private) は unauthenticated には出さない。
 	// profile を引けない (transient DB error 等で ShowByID が Profile=nil を返す) 場合は
@@ -845,7 +1202,6 @@ func (h *Handler) serveFollowCollection(c echo.Context, followers bool) error {
 	// 一時的に leak し、しかも max-age=180 で 3 分 cache されてしまう (#1877 review、
 	// upstream は findOneByOrFail で 500 = fail-closed)。
 	if bundle.Profile == nil {
-		c.Response().Header().Set("Cache-Control", "public, max-age=30")
 		return c.NoContent(http.StatusForbidden)
 	}
 	vis := bundle.Profile.FollowersVisibility
@@ -853,7 +1209,6 @@ func (h *Handler) serveFollowCollection(c echo.Context, followers bool) error {
 		vis = bundle.Profile.FollowingVisibility
 	}
 	if vis != model.FollowingVisibilityPublic {
-		c.Response().Header().Set("Cache-Control", "public, max-age=30")
 		return c.NoContent(http.StatusForbidden)
 	}
 
@@ -869,8 +1224,7 @@ func (h *Handler) serveFollowCollection(c echo.Context, followers bool) error {
 	if c.QueryParam("page") != "true" {
 		col := h.renderer.RenderOrderedCollection(partOf, totalItems, partOf+"?page=true", "", nil)
 		activitypub.AddContext(col)
-		c.Response().Header().Set("Cache-Control", "public, max-age=180")
-		return writeActivityJSON(c, col)
+		return h.writeAPJSON(c, col)
 	}
 
 	// paginated page: cursor (= Following row id) で id DESC ページング。
@@ -911,7 +1265,10 @@ func (h *Handler) serveFollowCollection(c echo.Context, followers bool) error {
 			counterpartIDs = append(counterpartIDs, f.FolloweeID)
 		}
 	}
-	items := h.resolveActorURIs(counterpartIDs)
+	items, err := h.resolveActorURIs(c, counterpartIDs)
+	if err != nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
 
 	// cursor は client 由来なので URL-encode して reflect する (upstream encodeURIComponent
 	// 相当)。aidx id は URL-safe だが、不正な cursor で id field が壊れないようにする。
@@ -925,31 +1282,42 @@ func (h *Handler) serveFollowCollection(c echo.Context, followers bool) error {
 	}
 	page := h.renderer.RenderOrderedCollectionPage(pageID, totalItems, items, partOf, "", next)
 	activitypub.AddContext(page)
-	return writeActivityJSON(c, page)
+	return h.writeAPJSON(c, page)
 }
 
 // resolveActorURIs maps a list of user IDs to their actor URIs (local:
 // /users/<id>, remote: user.uri), preserving order and dropping unresolved /
 // URI-less users. upstream renderFollowUser → getUserUri 相当 (#1877)。
-func (h *Handler) resolveActorURIs(ids []string) []any {
+func (h *Handler) resolveActorURIs(c echo.Context, ids []string) ([]any, error) {
 	if len(ids) == 0 {
-		return []any{}
+		return []any{}, nil
 	}
 	bundles, err := h.userService.ShowManyByIDs(ids)
 	if err != nil {
-		return []any{}
+		return nil, err
 	}
-	uriByID := make(map[string]string, len(bundles))
+	userByID := make(map[string]*model.User, len(bundles))
 	for _, b := range bundles {
-		uriByID[b.User.ID] = h.actorURI(b.User)
+		userByID[b.User.ID] = b.User
 	}
 	out := make([]any, 0, len(ids))
 	for _, uid := range ids {
-		if uri := uriByID[uid]; uri != "" {
+		u := userByID[uid]
+		if u == nil {
+			continue
+		}
+		available, err := h.observeLocalUserOnce(c, u, "collection")
+		if err != nil {
+			return nil, err
+		}
+		if !available {
+			continue
+		}
+		if uri := h.actorURI(u); uri != "" {
 			out = append(out, uri)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // actorURI returns the canonical actor URI for a user: local → /users/<id>,
@@ -969,6 +1337,7 @@ func (h *Handler) actorURI(u *model.User) string {
 // (upstream ActivityPubServerService.outbox, #1878)。
 func (h *Handler) Outbox(c echo.Context) error {
 	c.Response().Header().Set("Vary", "Accept")
+	c.Response().Header().Set("Cache-Control", "no-store")
 	if h.federationDisabled() {
 		return c.NoContent(http.StatusForbidden)
 	}
@@ -983,6 +1352,13 @@ func (h *Handler) Outbox(c echo.Context) error {
 	if !bundle.User.IsLocal() {
 		return c.NoContent(http.StatusNotFound)
 	}
+	available, err := h.requireAPUser(c, bundle.User, "collection")
+	if err != nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if !available {
+		return c.NoContent(http.StatusNotFound)
+	}
 
 	partOf := h.renderer.URLs().UserOutbox(userID)
 	totalItems := bundle.User.NotesCount
@@ -993,8 +1369,7 @@ func (h *Handler) Outbox(c echo.Context) error {
 	if c.QueryParam("page") != "true" {
 		col := h.renderer.RenderOrderedCollection(partOf, totalItems, partOf+"?page=true", "", nil)
 		activitypub.AddContext(col)
-		c.Response().Header().Set("Cache-Control", "public, max-age=180")
-		return writeActivityJSON(c, col)
+		return h.writeAPJSON(c, col)
 	}
 
 	// **カーソルは列に入る値だけ通す (#3025 と同じ判断)。** outbox も未認証で
@@ -1022,7 +1397,16 @@ func (h *Handler) Outbox(c echo.Context) error {
 
 	items := make([]any, 0, len(notes))
 	for _, n := range notes {
-		items = append(items, h.packOutboxActivity(bundle.User, n))
+		h.seedAPNote(c, n)
+		item := h.packOutboxActivity(c, bundle.User, n)
+		available, err := h.validateAPReferences(c, item)
+		if err != nil {
+			slog.Error("ap: validate outbox item references", "noteId", n.ID, "err", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		if available {
+			items = append(items, item)
+		}
 	}
 
 	pageID := partOf + "?page=true"
@@ -1039,7 +1423,7 @@ func (h *Handler) Outbox(c echo.Context) error {
 	}
 	page := h.renderer.RenderOrderedCollectionPage(pageID, totalItems, items, partOf, prev, next)
 	activitypub.AddContext(page)
-	return writeActivityJSON(c, page)
+	return h.writeAPJSON(c, page)
 }
 
 // NoteActivity handles GET /notes/:id/activity (upstream
@@ -1052,6 +1436,7 @@ func (h *Handler) NoteActivity(c echo.Context) error {
 	// upstream も vary(Accept) を立てる。この route は AP 専用で HTML 変種は
 	// 無く、Accept で分岐しない点も upstream と同じ。
 	c.Response().Header().Set("Vary", "Accept")
+	c.Response().Header().Set("Cache-Control", "no-store")
 	if h.federationDisabled() {
 		return c.NoContent(http.StatusForbidden)
 	}
@@ -1059,6 +1444,7 @@ func (h *Handler) NoteActivity(c echo.Context) error {
 	if err != nil {
 		return c.NoContent(http.StatusNotFound)
 	}
+	h.seedAPNote(c, n)
 	// upstream は userHost: IsNull で**ローカル専用** (リモートノートの activity
 	// はこのサーバーの発行物ではないので、redirect でなく 404)。visibility ∈
 	// {public, home} は CanSeeNote(nil) が担保し、localOnly はここで弾く
@@ -1066,24 +1452,39 @@ func (h *Handler) NoteActivity(c echo.Context) error {
 	if n.UserHost != nil || n.LocalOnly {
 		return c.NoContent(http.StatusNotFound)
 	}
+	if h.localFederationObserver != nil {
+		authorBundle, err := h.userService.ShowByID(n.UserID)
+		if err != nil {
+			if errors.Is(err, coreuser.ErrUserNotFound) {
+				return c.NoContent(http.StatusNotFound)
+			}
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		available, err := h.requireAPUser(c, authorBundle.User, "note")
+		if err != nil {
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		if !available {
+			return c.NoContent(http.StatusNotFound)
+		}
+	}
 	author := n.User
 	if author == nil {
 		// preload が無い経路でも activity は author の ID しか使わない。
 		author = &model.User{ID: n.UserID}
 	}
-	activity := h.packOutboxActivity(author, n)
+	activity := h.packOutboxActivity(c, author, n)
 	// 単体で返すので @context を付け直す (outbox 埋め込みでは外している)。
 	activitypub.AddContext(activity)
-	c.Response().Header().Set("Cache-Control", "public, max-age=180")
-	return writeActivityJSON(c, activity)
+	return h.writeAPJSON(c, activity)
 }
 
 // packOutboxActivity renders an outbox item: a pure renote becomes an Announce,
 // everything else a Create (upstream packActivity, #1878)。embed するので
 // per-activity @context は外す (collection 側が持つ)。
-func (h *Handler) packOutboxActivity(author *model.User, n *model.Note) any {
+func (h *Handler) packOutboxActivity(c echo.Context, author *model.User, n *model.Note) any {
 	if corenote.IsPureRenote(n) && n.RenoteID != nil && *n.RenoteID != "" {
-		if targetURI := h.renoteTargetURI(*n.RenoteID); targetURI != "" {
+		if targetURI := h.renoteTargetURI(c, *n.RenoteID); targetURI != "" {
 			ann := h.renderer.RenderAnnounce(author, n.ID, targetURI, n.Visibility, h.idGen)
 			ann.Context = nil
 			return ann
@@ -1097,7 +1498,7 @@ func (h *Handler) packOutboxActivity(author *model.User, n *model.Note) any {
 
 // renoteTargetURI resolves a renote target note id to its AP URI
 // (local → /notes/<id>, remote → stored uri)。
-func (h *Handler) renoteTargetURI(targetID string) string {
+func (h *Handler) renoteTargetURI(c echo.Context, targetID string) string {
 	// 未配線なら解決不能として扱う (呼び出し側が Create にフォールバックする)。
 	// panic で 500 になるより shape の valid な Create を返す方が良い。
 	if h.noteRepo == nil {
@@ -1107,6 +1508,7 @@ func (h *Handler) renoteTargetURI(targetID string) string {
 	if err != nil || t == nil {
 		return ""
 	}
+	h.seedAPNote(c, t)
 	if t.UserHost == nil || *t.UserHost == "" {
 		return h.renderer.URLs().NoteURI(t.ID)
 	}
@@ -1115,10 +1517,3 @@ func (h *Handler) renoteTargetURI(targetID string) string {
 	}
 	return ""
 }
-
-// HasHostBlockChecker reports whether the federation gate was wired.
-//
-// 未配線だと `FederationDisabled` が常に false になり `federation: none` でも
-// Person を AP serve するうえ、`ap/show` の FEDERATION_NOT_ALLOWED gate ごと
-// skip される。起動時検査に使う (#2708)。
-func (h *Handler) HasHostBlockChecker() bool { return h.hostBlocker != nil }

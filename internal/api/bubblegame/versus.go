@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/core/bubbleversus"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/model"
@@ -29,11 +30,16 @@ type VersusHandler struct {
 	users   UserFinder
 	records repository.BubbleVersusRepository
 	blocks  bubbleversus.BlockChecker
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// NewVersusHandler constructs a VersusHandler.
-func NewVersusHandler(svc *bubbleversus.Service, users UserFinder) *VersusHandler {
-	return &VersusHandler{svc: svc, users: users}
+// NewVersusHandler constructs a VersusHandler. entityPacker is the Packer this
+// VersusHandler packs entities with (#3794); 無いとメディアの URL を生のまま返すので、
+// 構築子の必須の引数で受ける (#3823)。
+func NewVersusHandler(svc *bubbleversus.Service, users UserFinder, entityPacker *entity.Packer) *VersusHandler {
+	return &VersusHandler{svc: svc, users: users, entityPacker: entityPacker}
 }
 
 // 対戦 ID は id.Generator の出力 (英数字。ulid は大文字を使う)。Redis のキーに
@@ -126,7 +132,7 @@ func (h *VersusHandler) packMatch(m *bubbleversus.Match, known map[string]*model
 		}
 		out[n+"Id"] = p.UserID
 		if u != nil {
-			out[n] = entity.PackUserLite(u)
+			out[n] = h.entityPacker.PackUserLite(u)
 		} else {
 			out[n] = nil
 		}
@@ -271,19 +277,20 @@ func (h *VersusHandler) Cancel(c echo.Context) error {
 func (h *VersusHandler) Report(c echo.Context) error {
 	me := middleware.GetUser(c)
 	var req struct {
-		MatchID string  `json:"matchId"`
-		Score   int64   `json:"score"`
-		Frame   int64   `json:"frame"`
-		Reason  string  `json:"reason"`
-		Logs    [][]any `json:"logs"`
+		MatchID string `json:"matchId"`
+		// 本家のajvと同じく、整数を小数の形で書いた値(10.0)も受ける(#3875)。
+		Score  jsnum.Int `json:"score"`
+		Frame  jsnum.Int `json:"frame"`
+		Reason string    `json:"reason"`
+		Logs   [][]any   `json:"logs"`
 		// エンジンの版 (#3232)。古いクライアントは送らないので省略できる。
-		GameVersion *int `json:"gameVersion"`
+		GameVersion *jsnum.Int `json:"gameVersion"`
 	}
 	if ok, err := bindMatchID(c, &req, &req.MatchID); !ok {
 		return err
 	}
 	m, err := h.svc.SubmitReport(c.Request().Context(), me.ID, req.MatchID, bubbleversus.Report{
-		Score: req.Score, Frame: req.Frame, Reason: req.Reason, Logs: req.Logs, GameVersion: req.GameVersion,
+		Score: int64(req.Score), Frame: int64(req.Frame), Reason: req.Reason, Logs: req.Logs, GameVersion: req.GameVersion.IntPtr(),
 	})
 	if err != nil {
 		return h.fail(c, err)

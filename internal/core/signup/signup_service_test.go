@@ -24,7 +24,7 @@ func newTestService(t *testing.T) (*signup.Service, *testutil.MockUserRepository
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := signup.NewService(userRepo, metaRepo, idGen)
+	svc := signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil)
 	return svc, userRepo, metaRepo
 }
 
@@ -44,7 +44,35 @@ func TestSignup_Success(t *testing.T) {
 	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte("password123")))
 	cost, err := bcrypt.Cost([]byte(*profile.Password))
 	require.NoError(t, err)
-	assert.Equal(t, password.Cost(), cost)
+	assert.Equal(t, password.DefaultCost, cost)
+}
+
+// 登録のパスワードは配線したHasherのcostでハッシュする(#3780)。
+// 本登録(Signup)と仮登録(CreatePending)の両方を見る。
+func TestSignup_UsesWiredHasher(t *testing.T) {
+	const configured = bcrypt.MinCost + 1
+	hasher, err := password.NewHasher(configured)
+	require.NoError(t, err)
+
+	t.Run("signup", func(t *testing.T) {
+		svc, userRepo, _ := newTestService(t)
+		svc.SetPasswordHasher(hasher)
+		result, err := svc.Signup("testuser", "password123", false, signup.UsernamePolicyPublic)
+		require.NoError(t, err)
+		cost, err := bcrypt.Cost([]byte(*userRepo.Profiles[result.User.ID].Password))
+		require.NoError(t, err)
+		assert.Equal(t, configured, cost)
+	})
+	t.Run("create pending", func(t *testing.T) {
+		svc, _, _ := newTestService(t)
+		svc.SetPasswordHasher(hasher)
+		svc.SetUserPendingRepo(testutil.NewMockUserPendingRepository())
+		row, err := svc.CreatePending("alice", "alice@example.com", "secret123", nil)
+		require.NoError(t, err)
+		cost, err := bcrypt.Cost([]byte(row.Password))
+		require.NoError(t, err)
+		assert.Equal(t, configured, cost)
+	})
 }
 
 func TestSignup_InitialSetup_SetsRootUser(t *testing.T) {
@@ -192,7 +220,7 @@ func TestSignup_UserCreateError(t *testing.T) {
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := signup.NewService(repo, metaRepo, idGen)
+	svc := signup.NewService(repo, metaRepo, idGen, nil, nil, nil)
 	_, err := svc.Signup("user1", "pass", false, signup.UsernamePolicyPublic)
 	assert.Error(t, err)
 }
@@ -202,7 +230,7 @@ func TestSignup_ProfileCreateError(t *testing.T) {
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := signup.NewService(repo, metaRepo, idGen)
+	svc := signup.NewService(repo, metaRepo, idGen, nil, nil, nil)
 	_, err := svc.Signup("user1", "pass", false, signup.UsernamePolicyPublic)
 	assert.Error(t, err)
 }
@@ -362,7 +390,7 @@ func TestCreatePending_Success(t *testing.T) {
 	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(row.Password), []byte("secret123")))
 	cost, err := bcrypt.Cost([]byte(row.Password))
 	require.NoError(t, err)
-	assert.Equal(t, password.Cost(), cost)
+	assert.Equal(t, password.DefaultCost, cost)
 	assert.Len(t, pendingRepo.Rows, 1)
 }
 

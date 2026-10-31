@@ -17,7 +17,7 @@ func TestOptionalSetters(t *testing.T) {
 
 	assert.Nil(t, h.instanceLookup(), "未配線なら lookup は nil")
 
-	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(nil, nil, nil, nil, nil, nil))
+	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(nil, nil, nil, nil, nil, nil, nil))
 	assert.NotNil(t, h.fieldRes)
 
 	h.SetInstanceRepo(testutil.NewMockInstanceRepository())
@@ -37,13 +37,13 @@ func TestBlockedHosts(t *testing.T) {
 
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x", BlockedHosts: []string{"bad.example"}}
-	h.SetMetaRepo(metaRepo)
+	h.metaRepo = metaRepo
 	hosts, err = h.blockedHosts()
 	require.NoError(t, err)
 	assert.Equal(t, []string{"bad.example"}, hosts)
 
 	// Meta 未設定の mock は Fetch でエラーを返す。握り潰さず伝播すること。
-	h.SetMetaRepo(testutil.NewMockMetaRepository())
+	h.metaRepo = testutil.NewMockMetaRepository()
 	_, err = h.blockedHosts()
 	assert.Error(t, err)
 }

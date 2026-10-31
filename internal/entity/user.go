@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/remoteurl"
 	"github.com/elythia-network/elythia/internal/model"
 	"gorm.io/datatypes"
 )
@@ -46,13 +47,14 @@ type UserLite struct {
 	// AvatarURL は upstream Misskey TS 互換で常に non-null。
 	// avatarId が無い / DB の avatarUrl が空のときは IdenticonURL() が
 	// /identicon/<username>(@<host>) にフォールバックする (#710)。
-	AvatarURL         string                 `json:"avatarUrl"`
-	AvatarBlurhash    *string                `json:"avatarBlurhash"`
-	AvatarDecorations []AvatarDecorationItem `json:"avatarDecorations"`
-	IsBot             bool                   `json:"isBot"`
-	IsCat             bool                   `json:"isCat"`
-	Emojis            map[string]string      `json:"emojis"`
-	OnlineStatus      string                 `json:"onlineStatus"`
+	AvatarURL         string                  `json:"avatarUrl"`
+	AvatarBlurhash    *string                 `json:"avatarBlurhash"`
+	AvatarDecorations []AvatarDecorationItem  `json:"avatarDecorations"`
+	IsBot             bool                    `json:"isBot"`
+	IsCat             bool                    `json:"isCat"`
+	Emojis            map[string]string       `json:"emojis"`
+	OnlineStatus      string                  `json:"onlineStatus"`
+	FederationStatus  *model.FederationStatus `json:"federationStatus,omitempty"`
 	// BadgeRoles は local user では常に present (空でも `[]`)、remote user では
 	// meta.showRoleBadgesOfRemoteUsers が off なら省略する (upstream: undefined)。
 	// 「空配列 present」と「absent」を区別するため *[]any + omitempty を使う
@@ -123,6 +125,15 @@ type UserDetailed struct {
 	CreatedAt     string  `json:"createdAt"`
 	UpdatedAt     *string `json:"updatedAt"`
 	LastFetchedAt *string `json:"lastFetchedAt"`
+	// AccountCreatedAt はリモートの人がアカウントを作った日時 (#3465、Elythia
+	// 独自の additive field)。createdAt はリモートでは「このサーバーが初めて
+	// 知った日時」なので、本家互換のため値と意味を変えずに別の field で出す。
+	//
+	// **分からないときは null ではなく key ごと出さない (omitempty)。** 本家の
+	// backend e2e (users.ts) は UserDetailed / MeDetailed を「キーが過不足なく
+	// 入っている」かで deepStrictEqual するので、ローカルの人に null の key を
+	// 足すだけで落ちる。ローカルの人には出ない。
+	AccountCreatedAt *string `json:"accountCreatedAt,omitempty"`
 	// MovedTo / AlsoKnownAs はアカウント移行 (Mastodon 互換 Move) のフィールド。
 	// upstream UserEntityService は movedToUri / alsoKnownAs (URI 群) をローカル
 	// ユーザー ID に解決した上で返す (resolvePerson(...).then(u => u.id))。
@@ -198,19 +209,28 @@ type MeDetailed struct {
 	FollowedMessage *string `json:"followedMessage"`
 	// avatarId / bannerId は self view 専用 (#1251)。misskey_dart の dispatch が
 	// `avatarId` key の存在で MeDetailed を判別するため、MeDetailed のみが出す。
-	AvatarID                 *string `json:"avatarId"`
-	BannerID                 *string `json:"bannerId"`
-	IsExplorable             bool    `json:"isExplorable"`
-	IsDeleted                bool    `json:"isDeleted"`
-	HideOnlineStatus         bool    `json:"hideOnlineStatus"`
-	NoCrawle                 bool    `json:"noCrawle"`
-	PreventAiLearning        bool    `json:"preventAiLearning"`
-	AutoSensitive            bool    `json:"autoSensitive"`
-	CarefulBot               bool    `json:"carefulBot"`
-	AutoAcceptFollowed       bool    `json:"autoAcceptFollowed"`
-	AlwaysMarkNsfw           bool    `json:"alwaysMarkNsfw"`
-	ReceiveAnnouncementEmail bool    `json:"receiveAnnouncementEmail"`
-	InjectFeaturedNote       bool    `json:"injectFeaturedNote"`
+	AvatarID           *string `json:"avatarId"`
+	BannerID           *string `json:"bannerId"`
+	IsExplorable       bool    `json:"isExplorable"`
+	IsDeleted          bool    `json:"isDeleted"`
+	HideOnlineStatus   bool    `json:"hideOnlineStatus"`
+	NoCrawle           bool    `json:"noCrawle"`
+	PreventAiLearning  bool    `json:"preventAiLearning"`
+	AutoSensitive      bool    `json:"autoSensitive"`
+	CarefulBot         bool    `json:"carefulBot"`
+	AutoAcceptFollowed bool    `json:"autoAcceptFollowed"`
+	// FollowApprovalLocalSeconds / FollowApprovalRemoteSeconds は本家 2026.10.1
+	// (PR 17998) の MeDetailed の項目 (#3466)。本家の schema では nullable で
+	// optional ではないので、未設定 (NULL) でも null で必ず出す (#3809)。
+	FollowApprovalLocalSeconds  *int `json:"followApprovalLocalSeconds"`
+	FollowApprovalRemoteSeconds *int `json:"followApprovalRemoteSeconds"`
+	// FollowApprovalAction は止め方 (#3466、Elythia 独自の追加)。本家の e2e
+	// (users.ts) は MeDetailed の key の過不足を完全一致で見るので、既定
+	// (request) のときは出さず、本家と同じ key のままにする。
+	FollowApprovalAction     string `json:"followApprovalAction,omitempty"`
+	AlwaysMarkNsfw           bool   `json:"alwaysMarkNsfw"`
+	ReceiveAnnouncementEmail bool   `json:"receiveAnnouncementEmail"`
+	InjectFeaturedNote       bool   `json:"injectFeaturedNote"`
 	// 以下は misskey_dart の MeDetailed.fromJson が非null bool として cast する
 	// ため、self-view (users/show me) でも必ず値を出す必要がある (#1237)。
 	// /api/i は handler 層でこれらを正確な値に上書きするが、users/show の
@@ -256,7 +276,7 @@ type MeDetailed struct {
 	// Policies は role 依存で AsMeDetailed (entity 層) では nil のまま。omitempty で
 	// 「未設定なら省略」にするのが重要 (#1240): PackMeDetailed を override 無しで
 	// 直接返す i/update / meUpdated 経路で nil を `null` として出すと frontend の
-	// updateCurrentAccountPartial が `$i.policies` を null 上書きして policy 判定が
+	// updateCurrentAccount が `$i.policies` を null 上書きして policy 判定が
 	// 壊れる。users/show self-view は handler が DefaultPolicies() を明示セットする
 	// ので含まれ、/api/i は handler が実 policies で override する。
 	Policies map[string]any `json:"policies,omitempty"`
@@ -312,11 +332,11 @@ func (d *UserDetailed) EnsureRelationFlags() {
 // PackMeDetailed packs a self-view user payload, extending PackUserDetailed
 // with MeDetailed fields. Self-mutation handlers (i/update, i/2fa/*)
 // should use this instead of PackUserDetailed so frontend's
-// updateCurrentAccountPartial receives the full $i shape; otherwise
+// updateCurrentAccount receives the full $i shape; otherwise
 // privacy-scoped fields like isExplorable / noCrawle stay stale in the
 // session (#968).
-func PackMeDetailed(u *model.User, profile *model.UserProfile, idGens ...id.Generator) MeDetailed {
-	return AsMeDetailed(PackUserDetailed(u, profile, idGens...), u, profile)
+func (pkr *Packer) PackMeDetailed(u *model.User, profile *model.UserProfile, idGens ...id.Generator) MeDetailed {
+	return AsMeDetailed(pkr.PackUserDetailed(u, profile, idGens...), u, profile)
 }
 
 // AsMeDetailed promotes a pre-built UserDetailed payload into MeDetailed by
@@ -367,6 +387,11 @@ func AsMeDetailed(d UserDetailed, u *model.User, profile *model.UserProfile) MeD
 		out.AutoSensitive = profile.AutoSensitive
 		out.CarefulBot = profile.CarefulBot
 		out.AutoAcceptFollowed = profile.AutoAcceptFollowed
+		out.FollowApprovalLocalSeconds = profile.FollowApprovalLocalSeconds
+		out.FollowApprovalRemoteSeconds = profile.FollowApprovalRemoteSeconds
+		if a := model.NormalizeFollowApprovalAction(profile.FollowApprovalAction); a != model.FollowApprovalActionRequest {
+			out.FollowApprovalAction = a
+		}
 		out.AlwaysMarkNsfw = profile.AlwaysMarkNsfw
 		out.ReceiveAnnouncementEmail = profile.ReceiveAnnouncementEmail
 		out.InjectFeaturedNote = profile.InjectFeaturedNote
@@ -446,15 +471,23 @@ type InstanceLite struct {
 // `/identicon/<username>(@<host>)` route when the user has no explicit
 // avatarUrl. Mirrors upstream Misskey TS の identicon URL 規則。
 //
-// 共有 helper として切り出してあるので、UserLite 以外のレスポンス
-// (e.g. internal/api/chat の packUser / internal/core/chat の packUserStream)
-// も同じ規則を使える (#692 / #708 review)。
-func IdenticonURL(u *model.User) string {
-	if u.AvatarURL != nil && *u.AvatarURL != "" {
+// 共有 helper として切り出してあるので、UserLite 以外のレスポンスも同じ規則を
+// 使える (#692 / #708 review)。chat の利用者は #3438 から PackUserLite を通る。
+func (pkr *Packer) IdenticonURL(u *model.User) string {
+	avatar := ""
+	if u.AvatarURL != nil {
+		avatar = *u.AvatarURL
+	}
+	// リモートの人の avatarUrl は相手が決めた文字列。プロキシで包めない形のもの
+	// (取り込みで確かめる前に保存された行) は使わず identicon にする。
+	if avatar != "" && u.Host != nil && *u.Host != "" {
+		avatar, _ = remoteurl.Media(avatar)
+	}
+	if avatar != "" {
 		// remote user の avatarUrl は remote origin を指すため proxy 経由に
 		// 書き換えて閲覧者の IP 漏洩を防ぐ (#1529)。local / identicon は素通し
 		// (ProxyAvatarURL は同一オリジン・相対 URL を wrap しない)。
-		return currentMediaURLContext().ProxyAvatarURL(*u.AvatarURL)
+		return pkr.currentMediaURLContext().ProxyAvatarURL(avatar)
 	}
 	// upstream getIdenticonUrl (UserEntityService.ts:386-391): local かつ
 	// username に '.' を含むユーザー (= system account relay.actor /
@@ -462,7 +495,7 @@ func IdenticonURL(u *model.User) string {
 	// identicon ではなくインスタンスアイコンを avatarUrl に使う (#1781)。
 	if u.Host == nil || *u.Host == "" {
 		if strings.Contains(u.Username, ".") {
-			if icon := resolveInstanceIconURL(); icon != "" {
+			if icon := pkr.resolveInstanceIconURL(); icon != "" {
 				return icon
 			}
 		}
@@ -479,7 +512,7 @@ func IdenticonURL(u *model.User) string {
 // via InstanceRepository and assigned to the returned UserLite.Instance.
 // PackUserLite itself performs no DB access on the steady-state hot path
 // (designed for timeline packing). 例外として avatarDecorations の url 解決
-// は entity.SetAvatarDecorationLookup() 経由の resolver を引く — 通常実装は
+// は Packer の avatarDecoration の resolver を引く — 通常実装は
 // 30s TTL の in-memory cache (core/avatardecoration.Resolver) で hit 時は
 // DB を叩かない。cache miss / TTL 切れでのみ admin catalog の List を 1 回
 // 引く (#521 / #524 review)。
@@ -494,32 +527,57 @@ func blurhashIfPresent(mediaID, blurhash *string) *string {
 	return blurhash
 }
 
-// bannerURLIfPresent returns the proxied banner URL only when bannerId is set,
-// mirroring upstream's `bannerId == null ? null : bannerUrl` (#1558)。
-func bannerURLIfPresent(bannerID, bannerURL *string) *string {
-	if bannerID == nil {
+// bannerURLIfPresent returns the proxied banner URL. For a local user it
+// mirrors upstream's `bannerId == null ? null : bannerUrl` (#1558); for a
+// remote user it returns bannerUrl when it is a well-formed absolute http(s)
+// URL.
+//
+// 本家はリモートの人のバナーもドライブのファイルとして取り込み bannerId を持つが、
+// Elythia はファイルを作らず bannerUrl だけを保存する (federation の resolver)。
+// bannerId で判定すると、リモートの人は常にバナー無しになる (#3526)。
+func (pkr *Packer) bannerURLIfPresent(host, bannerID, bannerURL *string) *string {
+	if host == nil || *host == "" {
+		if bannerID == nil {
+			return nil
+		}
+		return pkr.currentMediaURLContext().ProxyBannerURL(bannerURL)
+	}
+	// リモートの人の bannerUrl は相手が決めた文字列。取り込みで確かめる前に保存された
+	// 行もあるので、返すときにも形を確かめる (アイコンの IdenticonURL と同じ)。
+	if bannerURL == nil {
 		return nil
 	}
-	return currentMediaURLContext().ProxyBannerURL(bannerURL)
+	clean, ok := remoteurl.Media(*bannerURL)
+	if !ok {
+		return nil
+	}
+	return pkr.currentMediaURLContext().ProxyBannerURL(&clean)
 }
 
-func PackUserLite(u *model.User) UserLite {
+func (pkr *Packer) PackUserLite(u *model.User) UserLite {
 	out := UserLite{
 		ID:        u.ID,
 		Name:      u.Name,
 		Username:  u.Username,
 		Host:      u.Host,
-		AvatarURL: IdenticonURL(u),
+		AvatarURL: pkr.IdenticonURL(u),
 		// avatarId が null のとき avatarBlurhash も null にする (upstream
 		// `user.avatarId == null ? null : user.avatarBlurhash`、#1558)。avatarUrl
 		// 自体は IdenticonURL fallback があるので gate しない (TS も `?? identicon`)。
 		AvatarBlurhash:    blurhashIfPresent(u.AvatarID, u.AvatarBlurhash),
-		AvatarDecorations: resolveAvatarDecorations(u.AvatarDecorations),
+		AvatarDecorations: pkr.resolveAvatarDecorations(u.AvatarDecorations),
 		IsBot:             u.IsBot,
 		IsCat:             u.IsCat,
 		Emojis:            make(map[string]string),
 		OnlineStatus:      computeOnlineStatus(u),
-		BadgeRoles:        packBadgeRoles(u),
+		BadgeRoles:        pkr.packBadgeRoles(u),
+	}
+	if u.IsLocal() {
+		status := u.FederationStatus
+		if status == "" {
+			status = model.FederationStatusOn
+		}
+		out.FederationStatus = &status
 	}
 	// requireSigninToViewContents: true のときだけ出す (TS は false→undefined)
 	if u.RequireSigninToViewContents {
@@ -537,19 +595,20 @@ func PackUserLite(u *model.User) UserLite {
 }
 
 // PackUserDetailed converts a model.User and optional profile to UserDetailed.
-func PackUserDetailed(u *model.User, profile *model.UserProfile, idGens ...id.Generator) UserDetailed {
+func (pkr *Packer) PackUserDetailed(u *model.User, profile *model.UserProfile, idGens ...id.Generator) UserDetailed {
 	d := UserDetailed{
-		UserLite: PackUserLite(u),
+		UserLite: pkr.PackUserLite(u),
 		// upstream `chatAvailability === 'available'` 互換 (#988)。
 		// 旧実装は `u.ChatScope != "none"` で user 自身の受信設定を返して
 		// いたが、upstream は role policy の chatAvailability を見る
 		// (admin が role に設定する権限)。lookup が wire されていない
 		// path (= 既存 unit test 等) は default true で fallback する。
-		CanChat: resolveCanChat(u.ID),
-		// bannerId が null のとき bannerUrl / bannerBlurhash も null にする
-		// (upstream `user.bannerId == null ? null : ...`、#1558)。remote user の
-		// bannerUrl は remote origin を指すため proxy 経由に書き換える (#1529)。
-		BannerURL:           bannerURLIfPresent(u.BannerID, u.BannerURL),
+		CanChat: pkr.resolveCanChat(u.ID),
+		// ローカルの利用者は bannerId が null のとき bannerUrl / bannerBlurhash も
+		// null にする (upstream `user.bannerId == null ? null : ...`、#1558)。
+		// リモートの人は bannerId を持たないので bannerUrl の有無で決める (#3526)。
+		// remote user の bannerUrl は remote origin を指すため proxy 経由に書き換える (#1529)。
+		BannerURL:           pkr.bannerURLIfPresent(u.Host, u.BannerID, u.BannerURL),
 		BannerBlurhash:      blurhashIfPresent(u.BannerID, u.BannerBlurhash),
 		IsLocked:            u.IsLocked,
 		IsSuspended:         u.IsSuspended,
@@ -564,10 +623,10 @@ func PackUserDetailed(u *model.User, profile *model.UserProfile, idGens ...id.Ge
 		URI:                 u.URI,
 		PinnedNoteIDs:       []string{},
 		PinnedNotes:         []any{},
-		Roles:               packPublicRoles(u),
+		Roles:               pkr.packPublicRoles(u),
 		// isSilenced は role policy 由来 (canPublicNote を否定する role を持つか)。
 		// router で wire される lookup から解決する。unwired なら false。
-		IsSilenced: resolveSilenced(u.ID),
+		IsSilenced: pkr.resolveSilenced(u.ID),
 		// DBデフォルト値 (user_profileのpublicReactions DEFAULT true)
 		PublicReactions: true,
 	}
@@ -584,6 +643,12 @@ func PackUserDetailed(u *model.User, profile *model.UserProfile, idGens ...id.Ge
 	if u.LastFetchedAt != nil {
 		s := u.LastFetchedAt.UTC().Format("2006-01-02T15:04:05.000Z")
 		d.LastFetchedAt = &s
+	}
+
+	// ローカルの人は createdAt が登録日なので出さない (列も書かない)。
+	if !u.IsLocal() && u.AccountCreatedAt != nil {
+		s := u.AccountCreatedAt.UTC().Format("2006-01-02T15:04:05.000Z")
+		d.AccountCreatedAt = &s
 	}
 
 	// updatedAt は upstream UserEntityService.ts:536 と同じく user.updatedAt を
@@ -798,8 +863,8 @@ func (d *UserDetailed) ResolveMoveTargets(u *model.User, resolve MoveTargetResol
 // idGen で createdAt を有効にし、EnsureRelationFlags で未設定 relation bool を
 // false 補完して shape を完備する。idGen が nil の場合 createdAt は空になるため
 // caller は必ず idGen を渡すこと。
-func PackUserForFollowStreamEvent(u *model.User, isFollowing, hasPendingFollowRequestFromYou bool, idGen id.Generator) UserDetailed {
-	d := PackUserDetailed(u, nil, idGen)
+func (pkr *Packer) PackUserForFollowStreamEvent(u *model.User, isFollowing, hasPendingFollowRequestFromYou bool, idGen id.Generator) UserDetailed {
+	d := pkr.PackUserDetailed(u, nil, idGen)
 	d.IsFollowing = &isFollowing
 	d.HasPendingFollowRequestFromYou = &hasPendingFollowRequestFromYou
 	d.EnsureRelationFlags()

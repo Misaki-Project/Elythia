@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
+	"github.com/elythia-network/elythia/internal/api/optional"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
@@ -118,9 +120,9 @@ func (h *Handler) AuthorizedApps(c echo.Context) error {
 	}
 	u := middleware.GetUser(c)
 	var req struct {
-		Limit  *int   `json:"limit"`
-		Offset int    `json:"offset"`
-		Sort   string `json:"sort"`
+		Limit  *jsnum.Int `json:"limit"`
+		Offset jsnum.Int  `json:"offset"`
+		Sort   string     `json:"sort"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
@@ -128,7 +130,7 @@ func (h *Handler) AuthorizedApps(c echo.Context) error {
 	// limit: default 10, clamp 1..100 (authorized-apps.ts paramDef)。
 	limit := 10
 	if req.Limit != nil {
-		limit = *req.Limit
+		limit = int(*req.Limit)
 	}
 	if limit < 1 {
 		limit = 1
@@ -136,7 +138,7 @@ func (h *Handler) AuthorizedApps(c echo.Context) error {
 	if limit > 100 {
 		limit = 100
 	}
-	offset := req.Offset
+	offset := int(req.Offset)
 	if offset < 0 {
 		offset = 0
 	}
@@ -188,32 +190,38 @@ func (h *Handler) RevokeToken(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, apierr.Error("CREDENTIAL_REQUIRED", "Credential required.", "6f1f0d3a-3d5b-4b1f-9c3e-2a6d1e5b8c47"))
 	}
 	// repo 未配線は認証の**後**に見る。前に置くと未認証リクエストにも 204 を返す
-	// (起動時の HasAccessTokenRepo 検査があるので production には届かないが、
+	// (accessTokenRepo は構築子の必須の引数なので production には届かないが、
 	// 認証を handler に移した以上、順序で守るべきもの)。
 	if h.accessTokenRepo == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
 	var req struct {
-		TokenID string `json:"tokenId"`
-		Token   string `json:"token"`
+		TokenID *string                   `json:"tokenId"`
+		Token   optional.Nullable[string] `json:"token"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	if req.TokenID == "" && req.Token == "" {
+	if req.TokenID == nil && !req.Token.Present {
 		return apierr.JSONInvalidParam(c)
 	}
 	var tok *model.AccessToken
 	var err error
-	if req.TokenID != "" {
-		tok, err = h.accessTokenRepo.FindByID(req.TokenID)
-	} else {
+	switch {
+	case req.TokenID != nil:
+		tok, err = h.accessTokenRepo.FindByID(*req.TokenID)
+	case req.Token.Value == nil || *req.Token.Value == "":
+		// 本家と同じく、nullや空のtokenは何もせずに204を返す
+		// (revoke-token.tsの`if (ps.token == null || ps.token === '') return;`)。
+		// 以前は400にしていた(#3851)。
+		return c.NoContent(http.StatusNoContent)
+	default:
 		// hash 列 (miauth: sha256(token)) と token 列 (raw, app/auth) を 1 query
 		// で OR 検索する。middleware と同じ pattern (#910 / #913)。これにより
 		// app/auth flow で発行された access token も raw token 文字列で revoke
 		// できる。
-		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.Token)))
-		tok, err = h.accessTokenRepo.FindByHashOrToken(hash, req.Token)
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(*req.Token.Value)))
+		tok, err = h.accessTokenRepo.FindByHashOrToken(hash, *req.Token.Value)
 	}
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を「失効した」(204) に丸めない** (#2792)。呼び出し側は成功と
@@ -245,7 +253,15 @@ func (h *Handler) RevokeToken(c echo.Context) error {
 	// cache TTL (= 30 秒) 遅延して上流互換でなくなるため、regenerate-token
 	// (#884) と同じく invalidator が wire されている場合は即時削除する。
 	if h.authInvalidator != nil && tok.Token != "" {
-		h.authInvalidator.InvalidateToken(tok.Token)
+		h.authInvalidator.InvalidateUserToken(u.ID, tok.Token)
+	}
+	// **hash の形で認証された分も消す (#3490)。** 本家の app 認証のクライアントは
+	// i = sha256(accessToken + appSecret) (= 保存した hash) を送るので、cache の
+	// 鍵がそちらになる。本番では下の stream revoke が利用者単位で cache を消す
+	// (`OnStreamRevoke` → `InvalidateTokensForUser`) ので大文字の形も含めて消えるが、
+	// revoker を配線しない構成でも小文字の形は即時に消えるよう、ここでも消す。
+	if h.authInvalidator != nil && tok.Hash != "" {
+		h.authInvalidator.InvalidateUserToken(u.ID, tok.Hash)
 	}
 	// その token で張られた WebSocket も閉じる (mk-go 独自)。アプリ連携の解除も
 	// この endpoint を通る。

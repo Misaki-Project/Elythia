@@ -17,7 +17,7 @@
 # ので、tag だけだと「どの builder で作ったか」を再現できない。digest があると
 # BuildKit は digest で pull する。tag は読む人向けと CI の版照合用に残す。
 # 更新は dependabot (`.github/dependabot.yml` の `docker`) が digest ごと上げる。
-FROM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS builder
+FROM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
 
 # Step 2 (#618) で chai2010/webp → gen2brain/webp (libwebp on wazero/WASM) に
 # 切替えたので cgo 依存はゼロ。build-base (gcc + musl libc) は不要になった。
@@ -80,6 +80,58 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w $REVISION_LDFLAGS" -o /out/bin/elythia ./cmd/elythia && \
     ln -s elythia /out/bin/migrate
 
+# Stage: backup (#3458)
+#
+# DB のバックアップを取る image。`docker build --target backup` で作る。本体の image
+# (下の runtime) は distroless で pg_dump を持たないので、postgres の公式 image に
+# elythia を足す。**pg_dump の版を DB のサーバーと揃えるため**で、DB と同じ
+# postgres:18-alpine を使う (古い pg_dump は新しいサーバーから取れない)。
+#
+# builder とは別の stage でビルドする。builder は frontend/ の node_modules が無いと
+# 落ちるが、バックアップの image に frontend は要らない。命令は builder と同じ並びに
+# してあるので、BuildKit は go mod download までの layer を共有する。
+FROM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS backup-builder
+RUN apk add --no-cache git
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+COPY . .
+ARG MKGO_COMMIT=
+ENV REVISION_LDFLAGS="-X github.com/elythia-network/elythia/internal/config.MkGoCommit=${MKGO_COMMIT}"
+# プラグインも本体と同じく組み込む。設定ファイルの plugins: の節を本体と同じ
+# 意味で読むため (pluginembed-check も全ての builder に求めている)。
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOWORK=off go run ./tools/pluginbuild && \
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w $REVISION_LDFLAGS" -o /out/bin/elythia ./cmd/elythia
+
+# digest で固定する (理由は builder と同じ)。DB のサーバーの版を上げたら、ここも
+# 同じメジャーバージョンへ上げる。
+FROM postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 AS backup
+# pg_bigm を入れておく。UDS の構成の DB (deploy/postgres-bigm) は pg_bigm 入りで、
+# CREATE EXTENSION した DB の dump を戻すには、戻す側にも拡張が要る。verify (#3459) は
+# この image の中で使い捨ての PostgreSQL に戻すので、無いと CREATE EXTENSION pg_bigm で
+# 落ちる。入れるだけなら、使わない DB の dump にも戻す処理にも影響しない。
+# **版は deploy/postgres-bigm/Dockerfile と揃える** (同じ commit SHA)。
+ARG PG_BIGM_COMMIT=735dceba0ecdd8ac1aaaaa207226a7102b6bbd71
+RUN apk add --no-cache --virtual .build-deps build-base curl icu-dev \
+ && curl -fsSL "https://github.com/pgbigm/pg_bigm/archive/${PG_BIGM_COMMIT}.tar.gz" -o /tmp/pg_bigm.tar.gz \
+ && tar xzf /tmp/pg_bigm.tar.gz -C /tmp \
+ && make -C "/tmp/pg_bigm-${PG_BIGM_COMMIT}" USE_PGXS=1 with_llvm=no install \
+ && rm -rf /tmp/pg_bigm* \
+ && apk del .build-deps
+COPY --from=backup-builder /out/bin/elythia /usr/local/bin/elythia
+# verify (#3459) と restore (#3461) が、バイナリの同梱の migration の番号と比べる。
+COPY --from=backup-builder /app/migration /app/migration
+WORKDIR /app
+# postgres の公式 image の entrypoint (initdb を走らせる docker-entrypoint.sh) は
+# 使わない。サーバーを立てる image ではないため。root では動かさず、image に
+# 元からある postgres (UID 70) で動かす。
+USER postgres
+ENTRYPOINT ["/usr/local/bin/elythia", "backup"]
+CMD ["list", "-config", ".config/default.yml"]
+
 # Stage 2: Runtime
 #
 # distroless/static-debian13 (#621) を採用。Step 3 で binary が完全 static に
@@ -93,7 +145,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #
 # tag を省くと `latest` になり、いつ build したかで中身が変わる。builder と
 # 同じく digest で固定する (distroless の更新は dependabot が digest ごと上げる)。
-FROM gcr.io/distroless/static-debian13:latest@sha256:58133991db06659feaabe0f4e97a35cebf15ef4ea08f8a4c6d2ee5f75e4aa6a0
+FROM gcr.io/distroless/static-debian13:latest@sha256:15f8637509792e05b97d83451b0b6ccfa4abd548f997e406ac1e72c87fe1fa78
 
 WORKDIR /app
 

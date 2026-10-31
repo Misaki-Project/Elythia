@@ -7,6 +7,8 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
+	"github.com/elythia-network/elythia/internal/api/meself"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	corefederation "github.com/elythia-network/elythia/internal/core/federation"
 	coreinstance "github.com/elythia-network/elythia/internal/core/instance"
@@ -62,11 +64,24 @@ type Handler struct {
 	// capabilities は instance ごとの署名方式観測 (#2393)。未配線なら
 	// signatureCapability は null。
 	capabilities SignatureCapabilityLookup
+	// selfPacker は閲覧者自身を MeDetailed へ昇格させ、/api/i の handler で未読・
+	// role・ピン留めを埋める (#3784)。未配線なら補完せずに昇格だけする。
+	selfPacker *meself.Packer
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
+// SetSelfPacker wires the Packer that promotes the viewer's own entry into
+// MeDetailed. Unset promotes without the handler-only fields.
+func (h *Handler) SetSelfPacker(p *meself.Packer) { h.selfPacker = p }
+
 // NewHandler creates a new federation Handler.
-func NewHandler(svc *coreinstance.Service) *Handler {
-	return &Handler{svc: svc}
+// entityPacker is the Packer this handler packs entities with (#3792); packer
+// packs the users embedded in federation/users, federation/followers and
+// federation/following (#1957-a, #3330).
+func NewHandler(svc *coreinstance.Service, entityPacker *entity.Packer, packer userpack.ListPacker) *Handler {
+	return &Handler{svc: svc, entityPacker: entityPacker, packer: packer}
 }
 
 // SetFollowingRepo attaches a FollowingRepository for followers/following lookup.
@@ -89,18 +104,6 @@ func (h *Handler) SetIDGen(g id.Generator) {
 func (h *Handler) SetResolver(r ActorResolver) {
 	h.resolver = r
 }
-
-// SetListPacker wires the packer of the users embedded in federation/users,
-// federation/followers and federation/following (#1957-a, #3330).
-func (h *Handler) SetListPacker(p userpack.ListPacker) {
-	h.packer = p
-}
-
-// HasListPacker reports whether the list packer was wired.
-//
-// 未配線だと federation/users・followers・following の利用者に関係・ピン留め・
-// 移行先・instance・絵文字が載らない。起動時検査に使う。
-func (h *Handler) HasListPacker() bool { return h.packer != nil }
 
 // SetSignatureCapabilityLookup wires the store that reports which signature
 // scheme each remote host uses (#2393).
@@ -135,21 +138,21 @@ func (h *Handler) requesterIsModerator(c echo.Context) bool {
 // 束縛しない。frontend welcome.entrance.classic.vue は misskeyApiGet で sort/limit/blocked
 // 等を渡すため、これらが無いと表示順・件数・block 除外が全て効かなくなる。
 type InstancesRequest struct {
-	Host          string `json:"host" query:"host"`
-	Suspended     *bool  `json:"suspended" query:"suspended"`
-	NotResponding *bool  `json:"notResponding" query:"notResponding"`
-	Blocked       *bool  `json:"blocked" query:"blocked"`
-	Silenced      *bool  `json:"silenced" query:"silenced"`
-	Federating    *bool  `json:"federating" query:"federating"`
-	Subscribing   *bool  `json:"subscribing" query:"subscribing"`
-	Publishing    *bool  `json:"publishing" query:"publishing"`
-	Sort          string `json:"sort" query:"sort"`
-	Limit         *int   `json:"limit" query:"limit"`
-	Offset        int    `json:"offset" query:"offset"`
-	SinceID       string `json:"sinceId" query:"sinceId"`
-	UntilID       string `json:"untilId" query:"untilId"`
-	SinceDate     *int64 `json:"sinceDate" query:"sinceDate"`
-	UntilDate     *int64 `json:"untilDate" query:"untilDate"`
+	Host          string     `json:"host" query:"host"`
+	Suspended     *bool      `json:"suspended" query:"suspended"`
+	NotResponding *bool      `json:"notResponding" query:"notResponding"`
+	Blocked       *bool      `json:"blocked" query:"blocked"`
+	Silenced      *bool      `json:"silenced" query:"silenced"`
+	Federating    *bool      `json:"federating" query:"federating"`
+	Subscribing   *bool      `json:"subscribing" query:"subscribing"`
+	Publishing    *bool      `json:"publishing" query:"publishing"`
+	Sort          string     `json:"sort" query:"sort"`
+	Limit         *jsnum.Int `json:"limit" query:"limit"`
+	Offset        *jsnum.Int `json:"offset" query:"offset"`
+	SinceID       string     `json:"sinceId" query:"sinceId"`
+	UntilID       string     `json:"untilId" query:"untilId"`
+	SinceDate     *jsnum.Int `json:"sinceDate" query:"sinceDate"`
+	UntilDate     *jsnum.Int `json:"untilDate" query:"untilDate"`
 }
 
 // Instances handles POST /api/federation/instances.
@@ -161,7 +164,7 @@ func (h *Handler) Instances(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -172,9 +175,13 @@ func (h *Handler) Instances(c echo.Context) error {
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 30, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 30, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
+	}
+	offset := 0
+	if p := req.Offset.IntPtr(); p != nil {
+		offset = *p
 	}
 	filter := model.InstanceListFilter{
 		Host:          req.Host,
@@ -189,7 +196,7 @@ func (h *Handler) Instances(c echo.Context) error {
 		Publishing:    req.Publishing,
 		SortBy:        req.Sort,
 		Limit:         limit,
-		Offset:        req.Offset,
+		Offset:        offset,
 		SinceID:       sinceID,
 		UntilID:       untilID,
 	}
@@ -210,16 +217,18 @@ func (h *Handler) Instances(c echo.Context) error {
 
 // ShowInstanceRequest is the request body for federation/show-instance.
 type ShowInstanceRequest struct {
-	Host string `json:"host"`
+	Host *string `json:"host"`
 }
 
 // ShowInstance handles POST /api/federation/show-instance.
 func (h *Handler) ShowInstance(c echo.Context) error {
 	var req ShowInstanceRequest
-	if err := c.Bind(&req); err != nil || req.Host == "" {
+	// 空の host は本家と同じく受け、該当が無いので 204 を返す (#3770)。
+	if err := c.Bind(&req); err != nil || req.Host == nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	inst, err := h.svc.FindByHost(req.Host)
+	host := *req.Host
+	inst, err := h.svc.FindByHost(host)
 	if err != nil {
 		// upstream Misskey TS は該当 instance 行がないとき 204 No Content を
 		// 返す (= null 相当)。frontend admin の lookup UI も 204 を「未知 host」
@@ -228,12 +237,12 @@ func (h *Handler) ShowInstance(c echo.Context) error {
 		if errors.Is(err, coreinstance.ErrInstanceNotFound) {
 			return c.NoContent(http.StatusNoContent)
 		}
-		slog.Error("federation/show-instance: FindByHost failed", "host", req.Host, "err", err)
+		slog.Error("federation/show-instance: FindByHost failed", "host", host, "err", err)
 		return apierr.JSONInternalError(c)
 	}
 	hosts, err := h.svc.FederationHostLists()
 	if err != nil {
-		slog.Error("federation/show-instance: FederationHostLists failed", "host", req.Host, "err", err)
+		slog.Error("federation/show-instance: FederationHostLists failed", "host", host, "err", err)
 		return apierr.JSONInternalError(c)
 	}
 	return c.JSON(http.StatusOK, instanceToMap(inst, hosts, h.requesterIsModerator(c), h.lookupCapability(inst.Host)))
@@ -288,18 +297,21 @@ func instanceToMap(inst *model.Instance, hosts coreinstance.FederationHostSets, 
 		"isBlocked":               coreinstance.HostMatchesAny(hosts.Blocked, inst.Host),
 		"isSilenced":              coreinstance.HostMatchesAny(hosts.Silenced, inst.Host),
 		"isMediaSilenced":         coreinstance.HostMatchesAny(hosts.MediaSilenced, inst.Host),
-		"softwareName":            inst.SoftwareName,
-		"softwareVersion":         inst.SoftwareVersion,
-		"openRegistrations":       inst.OpenRegistrations,
-		"name":                    inst.Name,
-		"description":             inst.Description,
-		"maintainerName":          inst.MaintainerName,
-		"maintainerEmail":         inst.MaintainerEmail,
-		"iconUrl":                 inst.IconURL,
-		"faviconUrl":              inst.FaviconURL,
-		"themeColor":              inst.ThemeColor,
-		"infoUpdatedAt":           entity.ISOMillisPtr(inst.InfoUpdatedAt),
-		"moderationNote":          moderationNote,
+		// 受信を拒否するソフトウェアに当たるか (Elythia 独自の追加、#3362)。
+		// suspensionState / isSuspended は配送の停止だけを表す本家の意味のまま。
+		"isInboxSuspended":  corefederation.MatchSuspendedSoftware(inst.SoftwareName, inst.SoftwareVersion, hosts.InboxSuspendedSoftware),
+		"softwareName":      inst.SoftwareName,
+		"softwareVersion":   inst.SoftwareVersion,
+		"openRegistrations": inst.OpenRegistrations,
+		"name":              inst.Name,
+		"description":       inst.Description,
+		"maintainerName":    inst.MaintainerName,
+		"maintainerEmail":   inst.MaintainerEmail,
+		"iconUrl":           inst.IconURL,
+		"faviconUrl":        inst.FaviconURL,
+		"themeColor":        inst.ThemeColor,
+		"infoUpdatedAt":     entity.ISOMillisPtr(inst.InfoUpdatedAt),
+		"moderationNote":    moderationNote,
 		// mk-go 独自の additive field (#2393)。upstream の InstanceEntityService には
 		// 無いので misskey-js の型にも載らない。fork frontend はローカル型で受ける。
 		"signatureCapability": signatureCapabilityToMap(sigCap),

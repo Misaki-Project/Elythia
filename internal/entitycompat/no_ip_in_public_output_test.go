@@ -138,7 +138,7 @@ func TestResponseAndFederationShapesHaveNoIPField(t *testing.T) {
 var ipShapeAllowlist = map[string]string{
 	// --- admin/ip/* (#3104 / #3105 / #3106) ---
 	//
-	// 3 段で守られている (`internal/server/router.go`): `RequireModerator` +
+	// 3 段で守られている (`internal/server/routes_admin.go`): `RequireModerator` +
 	// `RequireRolePolicy(canSearchIpHistory)` + `RequireScope("read:admin:user-ips")`。
 	// policy の既定は false で admin は bypass するので、既定の挙動は upstream と
 	// 同じ「管理者のみ」。
@@ -483,11 +483,18 @@ func TestCustomJSONMarshalersAreKnown(t *testing.T) {
 	assert.Equal(t, []string{
 		// `[]Multikey` をそのまま出すだけ。IP は持たない。
 		"internal/activitypub/types.go#MultikeyList.MarshalJSON",
+		// /api.jsonの項目の順を保つためのJSONのobject (#3810)。中身は埋め込みの
+		// 本家のgoldenとEchoのルートから組み、利用者のデータは入らない。
+		"internal/api/openapi/ordered.go#object.MarshalJSON",
 		// 以下は走査そのものを固定するための人工ソース。
 		"internal/entitycompat/marshalerfixture/marshalers.go#Generic.MarshalJSON",
 		"internal/entitycompat/marshalerfixture/marshalers.go#Plain.MarshalJSON",
 		"internal/entitycompat/marshalerfixture/marshalers.go#Pointer.MarshalJSON",
 		"internal/entitycompat/marshalerfixture/marshalers.go#Text.MarshalText",
+		// job の payload (#3614)。struct の field (タグ付き) をそのまま書き、本文
+		// (activity) の形だけを変える。field は増やしていないので IP は持たない。
+		"internal/queue/activity_body.go#DeliverPayload.MarshalJSON",
+		"internal/queue/activity_body.go#InboxPayload.MarshalJSON",
 	}, found,
 		"自前の marshaler を持つ型が増減した。**タグ走査では中身が見えない**ので、"+
 			"新しい型が IP を吐かないことを人が確かめてから一覧を更新すること")

@@ -1665,10 +1665,96 @@ func TestNoteRepository_ListFeatured_ChannelFilter(t *testing.T) {
 	require.NoError(t, testDB.Create(otherNote).Error)
 	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, otherNote.ID)
 
+	// 本家はチャンネルの返信をランキングへ入れず、pure renote にはリアクションも
+	// リノートもできないので、fallback の候補にもしない (#3369)。
+	chReply := &model.Note{ID: "feat_chrp", UserID: user.ID, Visibility: "public", RenoteCount: 20, ChannelID: &chPtr, ReplyID: &chNote.ID}
+	require.NoError(t, testDB.Create(chReply).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, chReply.ID)
+	chRenote := &model.Note{ID: "feat_chrn", UserID: user.ID, Visibility: "public", RenoteCount: 20, ChannelID: &chPtr, RenoteID: &chNote.ID}
+	require.NoError(t, testDB.Create(chRenote).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, chRenote.ID)
+
 	rows, err := repo.ListFeatured(chID, "", 10, 0)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, chNote.ID, rows[0].ID)
+}
+
+// Without a channel, the fallback returns only notes upstream could put into
+// the global ranking: public, local, outside channels, not a reply, and not a
+// pure renote. A quote renote, including one carrying only a CW, files, or a
+// poll, stays a candidate (#3369).
+func TestNoteRepository_ListFeatured_GlobalCandidates(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	user := insertTestUser(t, "feat_gu", "featgu")
+	defer cleanupUser(t, user.ID)
+	chID := "feat_gch"
+	require.NoError(t, testDB.Exec(`INSERT INTO channel (id, name, "userId") VALUES (?, ?, ?)`, chID, "feat-gch", user.ID).Error)
+	defer testDB.Exec(`DELETE FROM channel WHERE id = ?`, chID)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id LIKE 'feat_g%'`)
+
+	text := "quote"
+	host := "remote.example"
+	root := "feat_groot"
+	notes := []*model.Note{
+		{ID: root, UserID: user.ID, Visibility: "public", RenoteCount: 30000},
+		{ID: "feat_gquote", UserID: user.ID, Visibility: "public", RenoteCount: 30000, RenoteID: &root, Text: &text},
+		// 本文が無くても CW・添付・投票のどれかがあれば引用 (pure renote ではない)。
+		{ID: "feat_gqcw", UserID: user.ID, Visibility: "public", RenoteCount: 30000, RenoteID: &root, CW: &text},
+		{ID: "feat_gqfile", UserID: user.ID, Visibility: "public", RenoteCount: 30000, RenoteID: &root, FileIDs: []string{"feat_gfile"}},
+		{ID: "feat_gqpoll", UserID: user.ID, Visibility: "public", RenoteCount: 30000, RenoteID: &root, HasPoll: true},
+		{ID: "feat_gpure", UserID: user.ID, Visibility: "public", RenoteCount: 30000, RenoteID: &root},
+		{ID: "feat_greply", UserID: user.ID, Visibility: "public", RenoteCount: 30000, ReplyID: &root, Text: &text},
+		{ID: "feat_gchan", UserID: user.ID, Visibility: "public", RenoteCount: 30000, ChannelID: &chID},
+		{ID: "feat_gremote", UserID: user.ID, Visibility: "public", RenoteCount: 30000, UserHost: &host},
+		{ID: "feat_ghome", UserID: user.ID, Visibility: "home", RenoteCount: 30000},
+	}
+	for _, n := range notes {
+		require.NoError(t, testDB.Create(n).Error)
+	}
+
+	rows, err := repo.ListFeatured("", "", 100, 0)
+	require.NoError(t, err)
+	got := []string{}
+	for _, n := range rows {
+		if strings.HasPrefix(n.ID, "feat_g") {
+			got = append(got, n.ID)
+		}
+	}
+	sort.Strings(got)
+	assert.Equal(t, []string{"feat_gqcw", "feat_gqfile", "feat_gqpoll", "feat_gquote", "feat_groot"}, got)
+}
+
+// The fallback orders candidates by renoteCount + repliesCount descending,
+// then id descending. Neither id order nor renoteCount alone gives the same
+// order for these rows (#3369).
+func TestNoteRepository_ListFeatured_OrdersByRenotesPlusReplies(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	user := insertTestUser(t, "feat_ou", "featou")
+	defer cleanupUser(t, user.ID)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id LIKE 'feat_ord%'`)
+
+	// 他のテストの行より上に来るよう count を大きくしておく。
+	notes := []*model.Note{
+		{ID: "feat_ord1", UserID: user.ID, Visibility: "public", RenoteCount: 20005},
+		{ID: "feat_ord2", UserID: user.ID, Visibility: "public", RenoteCount: 20001, RepliesCount: 10},
+		{ID: "feat_ord3", UserID: user.ID, Visibility: "public", RenoteCount: 20003},
+		{ID: "feat_ord4", UserID: user.ID, Visibility: "public", RenoteCount: 20003},
+	}
+	for _, n := range notes {
+		require.NoError(t, testDB.Create(n).Error)
+	}
+
+	rows, err := repo.ListFeatured("", "", 100, 0)
+	require.NoError(t, err)
+	got := []string{}
+	for _, n := range rows {
+		if strings.HasPrefix(n.ID, "feat_ord") {
+			got = append(got, n.ID)
+		}
+	}
+	// 合計 20011 > 20005 > 20003 (同点は id の降順)。
+	assert.Equal(t, []string{"feat_ord2", "feat_ord1", "feat_ord4", "feat_ord3"}, got)
 }
 
 func TestNoteRepository_ListFeatured_Error(t *testing.T) {
@@ -1833,6 +1919,90 @@ func TestNoteRepository_ListFeaturedByUser_Error(t *testing.T) {
 	repo := NewNoteRepository(testDB.WithContext(ctx))
 	_, err := repo.ListFeaturedByUser("u", "", "", 10)
 	assert.Error(t, err)
+}
+
+// #3612: SQL fallback は、見せてよいノートの新しい方から
+// FeaturedNotesPerUserCandidateWindow 件だけを候補にする。窓の外の古いノートは
+// engagement が最大でも選ばれない。窓のいちばん古い端のノートは選ばれる。
+func TestNoteRepository_ListFeaturedByUser_CandidateWindow(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	author := insertTestUser(t, "feat_win_u", "featwinu")
+	defer cleanupUser(t, author.ID)
+	defer testDB.Exec(`DELETE FROM "note" WHERE "userId" = ?`, author.ID)
+
+	const oldID = "feat_win_0000"
+	require.NoError(t, testDB.Create(&model.Note{
+		ID: oldID, UserID: author.ID, Visibility: "public", RenoteCount: 100,
+	}).Error)
+	recent := make([]*model.Note, 0, FeaturedNotesPerUserCandidateWindow)
+	for i := 1; i <= FeaturedNotesPerUserCandidateWindow; i++ {
+		recent = append(recent, &model.Note{
+			ID: fmt.Sprintf("feat_win_%04d", i), UserID: author.ID, Visibility: "public",
+		})
+	}
+	// 窓のいちばん古い端。窓が 1 件でも短いと選ばれなくなる。
+	const edgeID = "feat_win_0001"
+	recent[0].RenoteCount = 50
+	require.NoError(t, testDB.CreateInBatches(recent, 500).Error)
+
+	got, err := repo.ListFeaturedByUser(author.ID, "", "", 100)
+	require.NoError(t, err)
+	require.Len(t, got, FeaturedNotesPerUserPoolSize)
+	for _, n := range got {
+		assert.NotEqual(t, oldID, n.ID, "a note older than the candidate window must not be selected")
+		require.NotNil(t, n.User, "relations must still be preloaded")
+	}
+	// 窓の端 (0001) が engagement で選ばれ、残りの 49 件は同点 (engagement 0) なので
+	// id DESC の先頭 (0952〜1000) が選ばれる。表示は id DESC なので 0001 が末尾に来る。
+	assert.Equal(t, "feat_win_1000", got[0].ID)
+	assert.Equal(t, "feat_win_0952", got[len(got)-2].ID)
+	assert.Equal(t, edgeID, got[len(got)-1].ID, "the oldest note inside the candidate window must be selectable")
+}
+
+// #3612: 窓は、可視性・チャンネル・凍結の条件を満たしたノートで数える。
+// 新しい方の見えないノートが窓を埋めて、その奥の見えるノートが消えてはいけない。
+func TestNoteRepository_ListFeaturedByUser_CandidateWindowCountsOnlyEligibleNotes(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	author := insertTestUser(t, "feat_wel_u", "featwelu")
+	defer cleanupUser(t, author.ID)
+	suspended := insertTestUser(t, "feat_wel_s", "featwels")
+	defer cleanupUser(t, suspended.ID)
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, suspended.ID).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE "userId" = ?`, author.ID)
+	chID := "feat_wel_ch"
+	require.NoError(t, testDB.Exec(`INSERT INTO channel (id, name, "userId") VALUES (?, ?, ?)`, chID, "feat-wel-ch", author.ID).Error)
+	defer testDB.Exec(`DELETE FROM channel WHERE id = ?`, chID)
+
+	const oldID = "feat_wel_0000"
+	require.NoError(t, testDB.Create(&model.Note{
+		ID: oldID, UserID: author.ID, Visibility: "public",
+	}).Error)
+	// 匿名には出せないノートを、条件ごとに窓 1 つぶんずつ新しい方へ置く。
+	// どれか 1 つの条件を窓の外へ出すと、その条件のノートだけで窓が埋まり、
+	// 古いノートが候補から外れる。
+	suspendedID := suspended.ID
+	recent := make([]*model.Note, 0, 4*FeaturedNotesPerUserCandidateWindow)
+	for i := 1; i <= 4*FeaturedNotesPerUserCandidateWindow; i++ {
+		n := &model.Note{ID: fmt.Sprintf("feat_wel_%04d", i), UserID: author.ID, Visibility: "public", RenoteCount: 10}
+		switch i % 4 {
+		case 0:
+			n.Visibility = "followers"
+		case 1:
+			n.ChannelID = &chID
+		case 2:
+			n.ReplyUserID = &suspendedID
+		case 3:
+			// 凍結した第三者へのリノート・引用。
+			n.RenoteUserID = &suspendedID
+		}
+		recent = append(recent, n)
+	}
+	require.NoError(t, testDB.CreateInBatches(recent, 500).Error)
+
+	got, err := repo.ListFeaturedByUser(author.ID, "", "", 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, oldID, got[0].ID)
 }
 
 // #1452: notes/user-list-timeline の visibility SQL push-down を覆う。
@@ -3593,6 +3763,20 @@ func TestApplyTimelineFilter_HideFollowersOnlyReply(t *testing.T) {
 		ReplyID: &src, ReplyUserID: &targetID,
 	}))
 	require.NoError(t, repo.Create(&model.Note{ID: "hfr_plain", UserID: author.ID, Visibility: model.NoteVisibilityPublic}))
+	// 未フォローの人の public な投稿への返信は、公開範囲の判定で弾かれない。
+	require.NoError(t, repo.Create(&model.Note{ID: "hfr_pub_src", UserID: target.ID, Visibility: model.NoteVisibilityPublic}))
+	pubSrc := "hfr_pub_src"
+	require.NoError(t, repo.Create(&model.Note{
+		ID: "hfr_pub_reply", UserID: author.ID, Visibility: model.NoteVisibilityPublic,
+		ReplyID: &pubSrc, ReplyUserID: &targetID,
+	}))
+	// 返信先が消えている (note の自己参照に FK は無い、000080) 返信は、返信先の
+	// 公開範囲が分からないので弾かない。NOT EXISTS で書いていたときと同じ扱い。
+	gone := "hfr_gone_src"
+	require.NoError(t, repo.Create(&model.Note{
+		ID: "hfr_orphan_reply", UserID: author.ID, Visibility: model.NoteVisibilityPublic,
+		ReplyID: &gone, ReplyUserID: &targetID,
+	}))
 
 	f := model.TimelineDBFilter{ViewerID: viewer.ID, HideFollowersOnlyReplyFromNonFollowee: true}
 	got, err := repo.ListGlobalTimeline(50, "", "", f)
@@ -3603,6 +3787,8 @@ func TestApplyTimelineFilter_HideFollowersOnlyReply(t *testing.T) {
 	}
 	assert.True(t, ids["hfr_plain"], "通常の投稿は残る")
 	assert.False(t, ids["hfr_reply"], "未フォローの followers 投稿への返信は弾く")
+	assert.True(t, ids["hfr_pub_reply"], "未フォローでも public な投稿への返信は残る")
+	assert.True(t, ids["hfr_orphan_reply"], "返信先が消えている返信は残る")
 
 	// viewer が target をフォローしていれば出る。
 	require.NoError(t, testDB.Create(&model.Following{
@@ -4137,4 +4323,143 @@ func TestNoteRepository_ListFeaturedByUser_ExcludesSuspendedAuthor(t *testing.T)
 	got, err = repo.ListFeaturedByUser(author.ID, "", "", 10)
 	require.NoError(t, err)
 	require.Empty(t, got, "凍結後は返さないこと")
+}
+
+// users/notes は、凍結された第三者への返信・リノート・引用を返さない。投稿者
+// 自身の凍結と、自分のノートへの返信・リノートは見ない (upstream users/notes.ts
+// の generateBaseNoteFilteringQuery に excludeAuthor: true)。
+func TestNoteRepository_ListByUserIDFiltered_ExcludesSuspendedEmbedAuthor(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	owner := insertTestUser(t, "u_unsus_o", "unsusowner")
+	other := insertTestUser(t, "u_unsus_x", "unsusother")
+	defer cleanupUser(t, owner.ID)
+	defer cleanupUser(t, other.ID)
+
+	txt := "hi"
+	mkNote := func(n *model.Note) *model.Note {
+		n.Text = &txt
+		n.Visibility = model.NoteVisibilityPublic
+		n.Reactions = datatypes.JSON([]byte("{}"))
+		require.NoError(t, repo.Create(n))
+		t.Cleanup(func() { cleanupNote(t, n.ID) })
+		return n
+	}
+	otherNote := mkNote(&model.Note{ID: "n_unsus_other", UserID: other.ID})
+	ownBase := mkNote(&model.Note{ID: "n_unsus_base", UserID: owner.ID})
+	replyToOther := mkNote(&model.Note{ID: "n_unsus_rep", UserID: owner.ID, ReplyID: &otherNote.ID, ReplyUserID: &other.ID})
+	renoteOfOther := mkNote(&model.Note{ID: "n_unsus_rnt", UserID: owner.ID, RenoteID: &otherNote.ID, RenoteUserID: &other.ID})
+	quoteOfOther := mkNote(&model.Note{ID: "n_unsus_qt", UserID: owner.ID, RenoteID: &otherNote.ID, RenoteUserID: &other.ID})
+	selfReply := mkNote(&model.Note{ID: "n_unsus_self", UserID: owner.ID, ReplyID: &ownBase.ID, ReplyUserID: &owner.ID})
+	selfRenote := mkNote(&model.Note{ID: "n_unsus_selfrn", UserID: owner.ID, RenoteID: &ownBase.ID, RenoteUserID: &owner.ID})
+
+	list := func() map[string]bool {
+		rows, err := repo.ListByUserIDFiltered(owner.ID, "", "", "", 50, false, true, true, false)
+		require.NoError(t, err)
+		ids := map[string]bool{}
+		for _, n := range rows {
+			ids[n.ID] = true
+		}
+		return ids
+	}
+
+	// 凍結前は全部返る (対照)。
+	ids := list()
+	for _, n := range []*model.Note{replyToOther, renoteOfOther, quoteOfOther, ownBase, selfReply, selfRenote} {
+		require.True(t, ids[n.ID], "before suspension %s must be listed", n.ID)
+	}
+
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, other.ID).Error)
+	ids = list()
+	assert.False(t, ids[replyToOther.ID], "reply to a suspended user is excluded")
+	assert.False(t, ids[renoteOfOther.ID], "renote of a suspended user is excluded")
+	assert.False(t, ids[quoteOfOther.ID], "quote of a suspended user is excluded")
+	assert.True(t, ids[ownBase.ID], "own plain note is kept")
+
+	// 投稿者自身の凍結では、自分への返信・リノートを落とさない。
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, owner.ID).Error)
+	ids = list()
+	assert.True(t, ids[ownBase.ID], "author suspension is not checked here (excludeAuthor)")
+	assert.True(t, ids[selfReply.ID], "self reply is kept")
+	assert.True(t, ids[selfRenote.ID], "self renote is kept")
+}
+
+// SearchByFilter は、凍結 (投稿者・返信先・リノート先) と、未ログインの閲覧者に
+// 対する作者の requireSigninToViewContents を LIMIT の前に除く (ページが欠けない)。
+func TestNoteRepository_SearchByFilter_ExcludesHiddenBeforeLimit(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	plainUser := insertTestUser(t, "u_shl_p", "shlplain")
+	signinUser := insertTestUser(t, "u_shl_r", "shlsignin")
+	suspUser := insertTestUser(t, "u_shl_s", "shlsusp")
+	defer cleanupUser(t, plainUser.ID)
+	defer cleanupUser(t, signinUser.ID)
+	defer cleanupUser(t, suspUser.ID)
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "requireSigninToViewContents" = true WHERE id = ?`, signinUser.ID).Error)
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, suspUser.ID).Error)
+
+	text := "shlneedle"
+	mk := func(n *model.Note) {
+		n.Text = &text
+		n.Visibility = model.NoteVisibilityPublic
+		n.Reactions = datatypes.JSON([]byte("{}"))
+		require.NoError(t, repo.Create(n))
+		t.Cleanup(func() { cleanupNote(t, n.ID) })
+	}
+	// ID の昇順 = 古い順。最新が隠れるノートなので、後から除く方式では limit=1 の
+	// 結果が空になる。
+	mk(&model.Note{ID: "n_shl_1_plain", UserID: plainUser.ID})
+	mk(&model.Note{ID: "n_shl_2_susp", UserID: suspUser.ID})
+	mk(&model.Note{ID: "n_shl_3_reply", UserID: plainUser.ID, ReplyID: strPtr2("n_shl_2_susp"), ReplyUserID: &suspUser.ID})
+	mk(&model.Note{ID: "n_shl_4_signin", UserID: signinUser.ID})
+
+	search := func(viewerID string, limit int) []string {
+		rows, err := repo.SearchByFilter(model.NoteSearchFilter{Query: text, ViewerID: viewerID, Limit: limit})
+		require.NoError(t, err)
+		ids := make([]string, 0, len(rows))
+		for _, n := range rows {
+			ids = append(ids, n.ID)
+		}
+		return ids
+	}
+	assert.Equal(t, []string{"n_shl_1_plain"}, search("", 1), "anonymous: hidden notes must not take the LIMIT slot")
+	assert.Equal(t, []string{"n_shl_4_signin", "n_shl_1_plain"}, search(plainUser.ID, 10), "signed in: requireSignin author is searchable, suspended are not")
+}
+
+// SearchByTag も、凍結 (投稿者・返信先・リノート先) と、未ログインの閲覧者に
+// 対する作者の requireSigninToViewContents を LIMIT の前に除く。
+func TestNoteRepository_SearchByTag_ExcludesHiddenBeforeLimit(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	plainUser := insertTestUser(t, "u_sth_p", "sthplain")
+	signinUser := insertTestUser(t, "u_sth_r", "sthsignin")
+	suspUser := insertTestUser(t, "u_sth_s", "sthsusp")
+	defer cleanupUser(t, plainUser.ID)
+	defer cleanupUser(t, signinUser.ID)
+	defer cleanupUser(t, suspUser.ID)
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "requireSigninToViewContents" = true WHERE id = ?`, signinUser.ID).Error)
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, suspUser.ID).Error)
+
+	mk := func(n *model.Note) {
+		n.Tags = model.StringArray{"sthtag"}
+		n.Visibility = model.NoteVisibilityPublic
+		n.Reactions = datatypes.JSON([]byte("{}"))
+		require.NoError(t, repo.Create(n))
+		t.Cleanup(func() { cleanupNote(t, n.ID) })
+	}
+	// ID の昇順 = 古い順。新しい側が隠れるノートなので、後から除く方式では
+	// limit=1 の結果が空になる。
+	mk(&model.Note{ID: "n_sth_1_plain", UserID: plainUser.ID})
+	mk(&model.Note{ID: "n_sth_2_susp", UserID: suspUser.ID})
+	mk(&model.Note{ID: "n_sth_3_reply", UserID: plainUser.ID, ReplyID: strPtr2("n_sth_2_susp"), ReplyUserID: &suspUser.ID})
+	mk(&model.Note{ID: "n_sth_4_signin", UserID: signinUser.ID})
+
+	search := func(viewerID string, limit int) []string {
+		rows, err := repo.SearchByTag([][]string{{"sthtag"}}, viewerID, limit, "", "", model.NoteSearchTagFilter{})
+		require.NoError(t, err)
+		ids := make([]string, 0, len(rows))
+		for _, n := range rows {
+			ids = append(ids, n.ID)
+		}
+		return ids
+	}
+	assert.Equal(t, []string{"n_sth_1_plain"}, search("", 1), "anonymous: hidden notes must not take the LIMIT slot")
+	assert.Equal(t, []string{"n_sth_4_signin", "n_sth_1_plain"}, search(plainUser.ID, 10), "signed in: requireSignin author is listed, suspended are not")
 }

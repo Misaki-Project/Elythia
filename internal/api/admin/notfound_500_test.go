@@ -53,10 +53,10 @@ func handlerWithFailingUserLookupOnly(t *testing.T, err error) *apiadmin.Handler
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
 	idGen, _ := id.NewGenerator("aidx")
 	return apiadmin.NewHandler(
-		signup.NewService(userRepo, metaRepo, idGen),
+		signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil),
 		role.NewService(roleRepo, assignRepo, metaRepo, idGen),
-		metaRepo, userRepo, idGen,
-	)
+		metaRepo, userRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
 }
 
 // handlerWithFailingUserRepo builds an admin handler whose user lookups fail
@@ -74,10 +74,10 @@ func handlerWithFailingUserRepo(t *testing.T, err error) *apiadmin.Handler {
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
 	idGen, _ := id.NewGenerator("aidx")
 	return apiadmin.NewHandler(
-		signup.NewService(userRepo, metaRepo, idGen),
+		signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil),
 		role.NewService(roleRepo, assignRepo, metaRepo, idGen),
-		metaRepo, userRepo, idGen,
-	)
+		metaRepo, userRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
 }
 
 // **DB 障害を not-found に丸めないこと** (#2792)。

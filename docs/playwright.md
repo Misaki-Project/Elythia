@@ -1,7 +1,7 @@
 # Playwright e2e
 
 Elythia のフロントエンド / API を実ブラウザから検証する e2e。spec は
-`tests/playwright/specs/` にあり、現在 298 ファイル
+`tests/playwright/specs/` にあり、現在 299 ファイル
 (`find tests/playwright/specs -name '*.spec.ts' | wc -l`)。
 
 Cypress からの移行完了に伴い、frontend e2e はこちらに一本化した (#2437)。本家も
@@ -44,9 +44,9 @@ upstream と食い違っていても気付けない**。
 `workflow_dispatch` で発火する。nightly から PR トリガーへ移行済み (#2291)。
 
 **4 シャード並列** (`--shard=i/4`、`fail-fast: false`)。check 名は
-`spec (mk-go 1/4)` 〜 `4/4`。
+`spec (Elythia 1/4)` 〜 `4/4`。
 
-**1 スタックあたりは直列でしか回せない。** 298 spec のうち 179 が共有の root (alice) で
+**1 スタックあたりは直列でしか回せない。** 299 spec のうち 179 が共有の root (alice) で
 **ブラウザからサインイン**し (数え方は `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`。
 `uiSigninAsRoot` helper が 178 で、`signin.spec.ts` だけ signin フォームを直接駆動する)、
 さらに 32 がサインインせず root の token で API を叩く (`root.json` を読むのが 211 で、その差分)。
@@ -77,7 +77,7 @@ handler が hash では通らない (`'unsafe-hashes'` が要る、#2786) のよ
 ブラウザに実行させないと分からない挙動がある。
 
 **`report-only` では駄目。** あちらは違反を報告するだけで script は動くので、
-壊れた状態でも spec は緑になる。`specs/mkgo/ui/csp_enforce.spec.ts` は
+壊れた状態でも spec は緑になる。`specs/elythia/ui/csp_enforce.spec.ts` は
 header が `Content-Security-Policy` (report-only でない) であることを先に確認する
 — この確認が無いと `instance.yml` から設定が消えても violation ゼロで緑になり、
 「CSP を検査していないのに通る」状態に落ちる。
@@ -132,7 +132,7 @@ $L 2>&1 | grep msg=csp-report | grep -oE 'documentUri=\S+' | sort | uniq -c
 の枚数と一致する (contributor 6 + sponsors 6 + patron 50)。`loading="lazy"` も
 `v-if` も折りたたみも無いので、ページを開いた時点で全部読まれる。上の 124 件は
 spec が `/about-misskey` を 2 回開いた時点の実測で、**#2700 の
-`specs/mkgo/ui/about_elythia.spec.ts` が 2 回開くようになったので現在は 4 回**
+`specs/elythia/ui/about_elythia.spec.ts` が 2 回開くようになったので現在は 4 回**
 (件数は 248 前後になる)。**開く回数を変えたらこの数も動く** — 内訳の妥当性は
 「62 × 開いた回数」で確かめること。
 
@@ -152,7 +152,7 @@ host を読ませる経路は開かない。**上の内訳と件数は #2892 よ
 なぜ CSP 側で解いたか。#2700 が `/about-mkgo` を作ったときに `about-misskey.vue` を
 作り直す案もあったが、**upstream のプロジェクトメンバー・スポンサー・パトロンは
 消さない**方針を採った (upstream が頻繁に更新するファイルなので、書き換えると追従の
-たびにコンフリクトを手で解くことになる。[乖離一覧](divergence.md) の `2026.9.0-mk.3`
+たびにコンフリクトを手で解くことになる。[乖離一覧](divergence/frontend.md) の `2026.9.0-mk.3`
 の行)。**media proxy 経由にも落とせない** — Elythia の proxy は upstream と違い open
 proxy ではなく、allowlist は DB に実在する URL だけを通すので、静的にハードコード
 された URL は 403 になる (実測)。謝辞を残す以上、CSP を足す以外に表示させる道が無い。
@@ -195,7 +195,7 @@ vite の hash class を selector に使わない (`[class*="_button_"]` 等)。p
 必須 `details` と任意 `evidence` の 2 textarea）。`data-testid` を付けるか、
 ラベル文字列から親要素を辿って `textarea` を取る。
 
-Playwright は **required check ではない**（`spec (mk-go …)` は PR で走り、落ちれば
+Playwright は **required check ではない**（`spec (Elythia …)` は PR で走り、落ちれば
 check に fail が出るが、マージはブロックされない）。paths フィルタ外の変更だけだと
 workflow が発火しないので、fixture を触った PR では check を見る。手元では
 `make playwright-check` でも再現できる。spec 追加時は上の規約を守る。

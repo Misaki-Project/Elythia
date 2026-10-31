@@ -7,13 +7,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// #3293: Misakiでは000108が、それより前に作ったページが参照するノートの pageCount を
+// #3293: migration 000107 が、それより前に作ったページが参照するノートの pageCount を
 // ページの content から数え直して埋める。増やす向きにしか直さない。
 //
 // **migration をテストの中で流す。** 適用済みの schema を見るだけでは、
 // migration の中身を変えても緑のまま通る。
 func TestMigration000107_BackfillsNotePageCount(t *testing.T) {
-	up := migrationSQL(t, "000108_note_page_count_backfill.up.sql")
+	up := migrationSQL(t, "000107_note_page_count_backfill.up.sql")
 	user := insertTestUser(t, "u_m107", "m107user")
 	defer cleanupUser(t, user.ID)
 	for _, id := range []string{"n_m107_a", "n_m107_b", "n_m107_c", "n_m107_d", "n_m107_e", "3"} {

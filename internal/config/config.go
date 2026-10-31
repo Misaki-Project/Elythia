@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,13 +15,13 @@ import (
 
 // MkGoVersion is the mk-go version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MkGoVersion=2.0.0"
-var MkGoVersion = "2.0.0-misaki.1"
+//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MkGoVersion=2.1.0"
+var MkGoVersion = "2.1.0-misaki.1"
 
 // MisskeyVersion is the compatible Misskey version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MisskeyVersion=2026.10.0"
-var MisskeyVersion = "2026.10.0"
+//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MisskeyVersion=2026.10.1"
+var MisskeyVersion = "2026.10.1"
 
 // MkGoCommit is the source revision this binary was built from (short hash).
 //
@@ -184,6 +186,13 @@ type Source struct {
 	Socket      string `mapstructure:"socket"`
 	ChmodSocket string `mapstructure:"chmodSocket"`
 	DisableHSTS bool   `mapstructure:"disableHsts"`
+	// DisableParamShadow stops running upstream's paramDef validation in
+	// front of the API handlers to count disagreements (#3677). The
+	// endpoints that reject with it (#3742) keep validating.
+	DisableParamShadow bool `mapstructure:"disableParamShadow"`
+	// ParamShadowLogSeconds is the interval of the summary the param shadow
+	// validation writes to the log. Unset or non-positive means 600.
+	ParamShadowLogSeconds int `mapstructure:"paramShadowLogSeconds"`
 	// BcryptCost は account password のハッシュ強度 (work factor)。
 	// 未設定なら password.DefaultCost。範囲外の値は警告して既定に落とす。
 	BcryptCost *int `mapstructure:"bcryptCost"`
@@ -227,6 +236,8 @@ type Source struct {
 	RedisForReactions         *RedisOptions          `mapstructure:"redisForReactions"`
 	FulltextSearch            *FulltextSearchOptions `mapstructure:"fulltextSearch"`
 	Meilisearch               *MeilisearchOptions    `mapstructure:"meilisearch"`
+	Backup                    *BackupOptions         `mapstructure:"backup"`
+	Maintenance               *MaintenanceSource     `mapstructure:"maintenance"`
 	SetupPassword             string                 `mapstructure:"setupPassword"`
 	Proxy                     string                 `mapstructure:"proxy"`
 	ProxySMTP                 string                 `mapstructure:"proxySmtp"`
@@ -404,6 +415,11 @@ type Source struct {
 	// distribution rather than pointing at the source repository URL. Exposed
 	// via /api/meta.providesTarball.
 	PublishTarballInsteadOfProvideRepositoryURL bool `mapstructure:"publishTarballInsteadOfProvideRepositoryUrl"`
+
+	// PluginSecretKey encrypts server plugins' secret values (#3470): 32
+	// random bytes in base64 (`openssl rand -base64 32`). 未設定なら秘密の値の
+	// 機能は使えない (保存を断る)。
+	PluginSecretKey string `mapstructure:"pluginSecretKey"`
 }
 
 // Config represents the resolved application configuration.
@@ -436,6 +452,10 @@ type Config struct {
 
 	DisableHSTS bool
 	BcryptCost  int
+	// DisableParamShadow: true なら本家のparamDefでの検証だけの実行 (#3677) を止める。
+	DisableParamShadow bool
+	// ParamShadowLogSeconds: 検証だけの実行の件数をログに出す間隔 (秒)。既定 600。
+	ParamShadowLogSeconds int
 	// NoteHookConcurrency: 0 なら実行時に既定 (GOMAXPROCS x 2) を使う。
 	NoteHookConcurrency int
 	// MediaProxyConcurrency: 0 なら実行時に既定 (GOMAXPROCS / 2、最低 1) を使う。
@@ -453,6 +473,10 @@ type Config struct {
 	DB             DBOptions
 	DBReplications bool
 	DBSlaves       []DBSlaveOptions
+	// DBApplicationName is sent as application_name on every PostgreSQL
+	// connection built from DSN / SlaveDSN / DatabaseURL. It is not read
+	// from the config file: the process sets it at startup (#3463).
+	DBApplicationName string
 
 	Redis             RedisOptions
 	RedisForPubsub    RedisOptions
@@ -462,6 +486,11 @@ type Config struct {
 
 	FulltextSearch *FulltextSearchOptions
 	Meilisearch    *MeilisearchOptions
+	// Backup is nil when the config file has no `backup:` section (#3457).
+	Backup *BackupOptions
+	// Maintenance holds the maintenance mode settings, with the defaults
+	// filled when the section is absent (#3463).
+	Maintenance MaintenanceOptions
 
 	ID string
 
@@ -564,6 +593,10 @@ type Config struct {
 	// PublishTarballInsteadOfProvideRepositoryURL is exposed to clients via
 	// /api/meta.providesTarball. See the Source struct for details.
 	PublishTarballInsteadOfProvideRepositoryURL bool
+
+	// PluginSecretKey is the decoded pluginSecretKey (#3470), or nil when it is
+	// not configured. 長さは resolve で PluginSecretKeySize に揃えてある。
+	PluginSecretKey []byte
 }
 
 // ProvidesTarball reports whether this server serves a source tarball at
@@ -585,6 +618,10 @@ func (c *Config) ProvidesTarball() bool {
 }
 
 const defaultMaxFileSize int64 = 262144000
+
+// DefaultParamShadowLogSeconds is the default paramShadowLogSeconds: the
+// param shadow validation (#3677) writes its summary every 10 minutes.
+const DefaultParamShadowLogSeconds = 600
 
 // Load reads the Misskey YAML configuration and returns a resolved Config.
 // Environment variables with the prefix MK_ override YAML values.
@@ -620,6 +657,9 @@ func bindEnvKeys(v *viper.Viper) {
 		"url", "port", "socket",
 		"frontendContentSecurityPolicy",
 		"db.host", "db.port", "db.db", "db.user", "db.pass",
+		// 本家 (node-postgres) の pool option。db.extra の他のキーと違い、
+		// ファイルに書かなくても MK_ だけで区切りを変えられるようにする (#3632)。
+		"db.extra.connectionTimeoutMillis",
 		"redis.host", "redis.path", "redis.port", "redis.pass", "redis.db", "redis.username",
 		"redis.family", "redis.prefix",
 		"redisForPubsub.host", "redisForPubsub.path", "redisForPubsub.port", "redisForPubsub.pass",
@@ -638,12 +678,15 @@ func bindEnvKeys(v *viper.Viper) {
 		"redisForReactions.poolSize",
 		"id", "maxFileSize",
 		"mediaProxySecret",
+		"pluginSecretKey",
 		"testMode",
 		"dev",
 		"effectivePolicyProviderCacheEntries",
 		// 運用/セキュリティ系: 既存ymlから環境変数オーバーライドできるようにする
 		"trustProxy",
 		"disableHsts",
+		"disableParamShadow",
+		"paramShadowLogSeconds",
 		"bcryptCost",
 		"noteHookConcurrency",
 		"mediaProxyConcurrency",
@@ -668,6 +711,8 @@ func bindEnvKeys(v *viper.Viper) {
 		"minWorkers",
 		"maxWorkersGlobal",
 		"autoScaleCooldownSeconds",
+		"maintenance.maintenanceDb",
+		"maintenance.drainTimeout",
 	}
 	for _, k := range keys {
 		_ = v.BindEnv(k)
@@ -694,6 +739,10 @@ func resolve(src *Source) (*Config, error) {
 	// ハッシュを量産すると、気づいた時点で全員のパスワードが弱い。
 	bcryptCost := password.DefaultCost
 	// 0 以下は「未設定」として driver 既定に委ねる。
+	paramShadowLogSeconds := DefaultParamShadowLogSeconds
+	if src.ParamShadowLogSeconds > 0 {
+		paramShadowLogSeconds = src.ParamShadowLogSeconds
+	}
 	queueIdlePollSeconds := 0
 	if src.QueueIdlePollSeconds != nil && *src.QueueIdlePollSeconds > 0 {
 		queueIdlePollSeconds = *src.QueueIdlePollSeconds
@@ -787,6 +836,11 @@ func resolve(src *Source) (*Config, error) {
 
 	mediaProxySecret := deriveMediaProxySecret(src)
 
+	pluginSecretKey, err := decodePluginSecretKey(src.PluginSecretKey)
+	if err != nil {
+		return nil, err
+	}
+
 	jobQueueDriver, err := resolveJobQueueDriver(src.JobQueueDriver)
 	if err != nil {
 		return nil, err
@@ -800,6 +854,20 @@ func resolve(src *Source) (*Config, error) {
 	// DSN() は Config から毎回導出するので、誤った db.extra はここで起動を
 	// 止める (DSN 側で黙って既定に倒すと、平文 / 無検証で繋がってしまう)。
 	if _, err := ResolveDBTLS(src.DB.Extra); err != nil {
+		return nil, err
+	}
+	if _, err := ResolveDBConnectTimeout(src.DB.Extra); err != nil {
+		return nil, err
+	}
+
+	maintenance, err := resolveMaintenance(src.Maintenance, src.DB.DB)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateProxyURL("proxy", src.Proxy, httpProxySchemes); err != nil {
+		return nil, err
+	}
+	if err := validateProxyURL("proxySmtp", src.ProxySMTP, smtpProxySchemes); err != nil {
 		return nil, err
 	}
 
@@ -819,6 +887,8 @@ func resolve(src *Source) (*Config, error) {
 		DriveURL:    fmt.Sprintf("%s://%s/files", scheme, host),
 
 		DisableHSTS:                 src.DisableHSTS,
+		DisableParamShadow:          src.DisableParamShadow,
+		ParamShadowLogSeconds:       paramShadowLogSeconds,
 		BcryptCost:                  bcryptCost,
 		NoteHookConcurrency:         noteHookConcurrency,
 		MediaProxyConcurrency:       mediaProxyConcurrency,
@@ -841,6 +911,8 @@ func resolve(src *Source) (*Config, error) {
 
 		FulltextSearch: src.FulltextSearch,
 		Meilisearch:    src.Meilisearch,
+		Backup:         src.Backup,
+		Maintenance:    maintenance,
 
 		ID: src.ID,
 
@@ -878,6 +950,7 @@ func resolve(src *Source) (*Config, error) {
 		MediaProxy:                   mediaProxy,
 		ExternalMediaProxyEnabled:    externalMediaProxyEnabled,
 		MediaProxySecret:             mediaProxySecret,
+		PluginSecretKey:              pluginSecretKey,
 		VideoThumbnailGenerator:      strings.TrimRight(src.VideoThumbnailGenerator, "/"),
 		VideoThumbnailGeneratorMode:  normalizeVideoThumbMode(src.VideoThumbnailGeneratorMode),
 		NSFWDetectorURL:              strings.TrimRight(src.NSFWDetectorURL, "/"),
@@ -984,6 +1057,39 @@ func (r RedisOptions) KeyPrefix() string {
 	return r.Prefix + ":"
 }
 
+// PluginSecretKeySize is the length of pluginSecretKey after decoding.
+const PluginSecretKeySize = 32
+
+// decodePluginSecretKey decodes pluginSecretKey (#3470).
+//
+// **書き間違いは起動を止める。** 黙って「未設定」に倒すと、運営者は鍵を置いた
+// つもりなのに秘密の値を保存できず、原因が設定にあると気付きにくい。短い鍵を
+// 通さないのも同じ理由で、弱い鍵で暗号化された値が溜まってから気付いても
+// 入れ直すしかない。
+//
+// 標準の base64 と URL 用の base64 のどちらも、padding の有無を問わず受ける
+// (どのツールで作ったかで形が変わるため)。
+func decodePluginSecretKey(raw string) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		key, err := enc.DecodeString(raw)
+		if err != nil {
+			continue
+		}
+		if len(key) != PluginSecretKeySize {
+			return nil, fmt.Errorf("pluginSecretKey は %d バイトを base64 で書いたものにしてください (%d バイトでした。`openssl rand -base64 32` で作れます)",
+				PluginSecretKeySize, len(key))
+		}
+		return key, nil
+	}
+	return nil, fmt.Errorf("pluginSecretKey を base64 として読めません (`openssl rand -base64 32` で作れます)")
+}
+
 // deriveMediaProxySecret returns the configured secret for HMAC-signed media
 // proxy URLs, or nil when the operator did not set one.
 //
@@ -1011,6 +1117,36 @@ func resolveRedisOrDefault(opts *RedisOptions, fallback RedisOptions, host strin
 	return resolveRedis(*opts, host)
 }
 
+// Proxy schemes each consumer can use: net/http's Transport.Proxy for
+// `proxy`, internal/misc/smtp's dialSMTP for `proxySmtp`.
+var (
+	httpProxySchemes = []string{"http", "https", "socks5", "socks5h"}
+	smtpProxySchemes = []string{"http", "https", "socks5", "socks5h"}
+)
+
+// validateProxyURL rejects a proxy setting the consumer cannot use.
+//
+// **起動時に止める。** 以前は解釈できない値 (scheme の無い `http//x`、未対応の
+// `socks4://`) を、HTTP 側はログも出さずに、SMTP 側は警告だけ出して、proxy を
+// 使わない直結に倒していた。proxy で送信元の IP を隠す運用では、設定したつもり
+// のまま素の IP で外へ出る。example も未対応の socks4 を例示していた。
+//
+// エラーには値そのものを出さない (`socks5://user:pass@host` の形で認証情報を
+// 含みうる)。
+func validateProxyURL(key, raw string, schemes []string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("invalid %s: not a URL with a host (expected e.g. http://proxy.example:3128)", key)
+	}
+	if !slices.Contains(schemes, strings.ToLower(u.Scheme)) {
+		return fmt.Errorf("invalid %s: unsupported scheme %q (supported: %s)", key, u.Scheme, strings.Join(schemes, ", "))
+	}
+	return nil
+}
+
 // resolveJobQueueDriver normalises the jobQueueDriver config value.
 // Empty / whitespace falls back to "mkq", the only driver (#2985)。
 // Unknown non-empty values return an error: silently swapping a typo
@@ -1029,6 +1165,7 @@ func resolveRedisOrDefault(opts *RedisOptions, fallback RedisOptions, host strin
 // に居り mkq (`bull:*`) からは見えない。新しいビルドは起動を拒むので、
 // **後から捌く手段が無い** — 旧ビルドで空にしてから上げるしかない。それを
 // 知らせる機会はこのエラーしか無いので、案内をここに入れる。
+
 func resolveJobQueueDriver(raw string) (string, error) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	switch v {

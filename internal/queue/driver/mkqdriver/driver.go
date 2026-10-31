@@ -24,7 +24,7 @@ import (
 // 管理画面のジョブキュータブは API 応答ではなくその定数から生成されるため、
 // ずれると存在しない queue のタブが常時ゼロ表示になり、実在する queue が
 // 画面から見えなくなる (#2323)。upstream との対応表は
-// docs/divergence.md の「4-3. job queue の構成差分」。
+// docs/divergence/config.md の「4-3. job queue の構成差分」。
 var QueueNames = []string{
 	"deliver",
 	"inbox",
@@ -130,6 +130,12 @@ type Config struct {
 	// Workers. Zero applies defaultSuperviseInterval; a negative value
 	// disables the periodic check (Resize still reconciles).
 	SuperviseInterval time.Duration
+
+	// StalledInterval is how often each queue scans for stalled jobs (jobs
+	// left in active by a worker that died). Zero applies mkq's default
+	// (30 seconds, as BullMQ). Only one Worker per queue runs the scan
+	// (#3592).
+	StalledInterval time.Duration
 }
 
 // defaultMaxMetricsDataPoints mirrors BullMQ TS's
@@ -474,6 +480,7 @@ func (d *Driver) Server() driver.Server {
 			stuckAfter:         d.cfg.StuckWorkerAfter,
 			handlerDeadline:    d.cfg.HandlerDeadline,
 			superviseInterval:  d.cfg.SuperviseInterval,
+			stalledInterval:    d.cfg.StalledInterval,
 			handlers:           make(map[string]driver.HandlerFunc),
 		}
 	}

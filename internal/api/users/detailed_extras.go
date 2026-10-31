@@ -3,8 +3,6 @@ package users
 import (
 	"context"
 
-	"github.com/elythia-network/elythia/internal/api/meself"
-	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/core/notesfilter"
 	"github.com/elythia-network/elythia/internal/core/userpack"
 	"github.com/elythia-network/elythia/internal/entity"
@@ -53,7 +51,7 @@ func (h *Handler) listPacker() *userpack.Packer {
 	if h.moderatorChecker != nil {
 		l.Moderators = h.moderatorChecker
 	}
-	return userpack.New(l, h.idGen)
+	return userpack.New(h.entityPacker, l, h.idGen)
 }
 
 // packDetailedMany packs users as upstream packMany(users, me, {schema:
@@ -62,14 +60,14 @@ func (h *Handler) packDetailedMany(ctx context.Context, viewer *model.User, user
 	return h.listPacker().DetailedMany(ctx, viewer, users, profiles)
 }
 
-// packDetailedAll is packDetailedMany serialized like meself.Pack: the
+// packDetailedAll is packDetailedMany serialized like meself.Packer.Pack: the
 // viewer's own entry becomes MeDetailed (upstream pack returns MeDetailed when
 // isDetailed && isMe).
 func (h *Handler) packDetailedAll(ctx context.Context, viewer *model.User, users []*model.User, profiles map[string]*model.UserProfile) []any {
 	packed := h.packDetailedMany(ctx, viewer, users, profiles)
 	out := make([]any, len(users))
 	for i, u := range users {
-		out[i] = meself.Pack(ctx, packed[i], u, profiles[u.ID], viewer)
+		out[i] = h.selfPacker.Pack(ctx, packed[i], u, profiles[u.ID], viewer)
 	}
 	return out
 }
@@ -86,7 +84,7 @@ func (h *Handler) packLites(users []*model.User) []entity.UserLite {
 	out := make([]entity.UserLite, len(users))
 	lites := make([]*entity.UserLite, len(users))
 	for i, u := range users {
-		out[i] = entity.PackUserLite(u)
+		out[i] = h.entityPacker.PackUserLite(u)
 		lites[i] = &out[i]
 	}
 	h.fillUserLites(users, lites)
@@ -213,7 +211,7 @@ func (h *Handler) fillPinnedNotes(ctx context.Context, viewer *model.User, targe
 		return
 	}
 	notes = notesfilter.FilterVisible(viewer, notes, h.followingRepo)
-	entities := entity.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	entities := h.entityPacker.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(entities, viewer)
 	byID := make(map[string]entity.NoteEntity, len(entities))
 	for _, e := range entities {
@@ -230,7 +228,7 @@ func (h *Handler) fillPinnedNotes(ctx context.Context, viewer *model.User, targe
 				mine = append(mine, e)
 			}
 		}
-		notehide.HideProfilePinnedNotes(viewer, mine, t.User.ID)
+		h.noteHider.HideProfilePinnedNotes(viewer, mine, t.User.ID)
 		packed := make([]any, 0, len(mine))
 		for _, pn := range mine {
 			packed = append(packed, pn)
@@ -252,23 +250,41 @@ func (h *Handler) fillPinnedPages(viewer *model.User, targets []userpack.DetailT
 		return
 	}
 	pages := map[string]*model.Page{}
+	// 読み出しに失敗したときは、private かどうかが分からない。ID を残すと
+	// private の Page の ID が出うるので、そのときは他人には ID も出さない (#3479)。
+	lookupFailed := false
 	if len(pageIDs) == 1 {
-		if p, err := h.pageRepo.FindByID(pageIDs[0]); err == nil && p != nil {
+		p, err := h.pageRepo.FindByID(pageIDs[0])
+		switch {
+		case err == nil && p != nil:
 			pages[p.ID] = p
+		case err != nil && !repository.IsNotFound(err):
+			lookupFailed = true
 		}
 	} else if rows, err := h.pageRepo.FindManyByIDs(pageIDs); err == nil {
 		for _, p := range rows {
 			pages[p.ID] = p
 		}
+	} else {
+		lookupFailed = true
 	}
 	for _, t := range targets {
 		if t.Detailed.PinnedPageID == nil {
 			continue
 		}
-		if p := pages[*t.Detailed.PinnedPageID]; pinnedPageVisibleTo(p, viewer) {
+		p := pages[*t.Detailed.PinnedPageID]
+		if pinnedPageVisibleTo(p, viewer) {
 			// golden Page は user 必須。pinnedPage は profile user 自身の page
 			// なので owner=u を渡して user (UserLite) を埋める (#1266 follow-up)。
-			t.Detailed.PinnedPage = entity.PackPageWithContext(p, entity.PackPageContext{IDGen: h.idGen, Owner: t.User})
+			t.Detailed.PinnedPage = h.entityPacker.PackPageWithContext(p, entity.PackPageContext{IDGen: h.idGen, Owner: t.User})
+		} else if p != nil || (lookupFailed && (viewer == nil || t.User == nil || viewer.ID != t.User.ID)) {
+			// private の Page は ID も出さない (#3479)。ID が出ると、作者以外に
+			// private の Page を持っていることと、その ID が分かる。
+			//
+			// Page が無いときは ID を残す。本家は pinnedPageId に FK
+			// (ON DELETE SET NULL) があり削除済みの ID は残らないが、Elythia で作った
+			// DB には FK が無く ID が残る (#3479 より前からの差)。
+			t.Detailed.PinnedPageID = nil
 		}
 	}
 }

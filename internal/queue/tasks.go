@@ -83,6 +83,15 @@ const TaskTypeChartClean = "chart:clean"
 // 残るため hygiene)。channel-mute erase は mk-go に expiresAt 列が無いため別 issue。
 const TaskTypeCheckExpiredMutings = "maintenance:checkExpiredMutings"
 
+// TaskTypeArchiveAnnouncements is the task type for the per-minute job that
+// sets isActive to false on announcements whose autoArchiveAt has passed
+// (#3809).
+//
+// 本家 2026.10.1 は system queue の遅延ジョブ (archiveAnnouncement) をお知らせごとに
+// 予約するが、Elythia はそれを消費しないので、期限を過ぎた行をまとめて落とす定期処理に
+// した。読むときに期限を見ているので、落とすのが遅れても API の見え方は変わらない。
+const TaskTypeArchiveAnnouncements = "maintenance:archiveAnnouncements"
+
 // TaskTypeResendQuoteRequests is the task type for the per-minute resend of
 // QuoteRequests that are still pending (FEP-044f、#3238)。Mastodon が取り込みと
 // 競合して黙って捨てた QuoteRequest を、保留中か確かめてから送り直す。
@@ -152,6 +161,9 @@ const TaskTypeInbox = "ap:inbox"
 // Host fields はレガシー互換 (Headers が無い旧 payload では Host を
 // 信頼してチャート / instance 更新する)。新 payload では Headers から
 // 抽出するため通常空。
+//
+// Body の JSON での形 (#3614。base64 にせず埋め込む) は activity_body.go を
+// 参照。
 type InboxPayload struct {
 	Body    []byte            `json:"body"`
 	Host    string            `json:"host,omitempty"`
@@ -170,7 +182,8 @@ func NewInboxTask(payload InboxPayload) driver.Task {
 // DecodeInboxPayload extracts an InboxPayload from a task body.
 func DecodeInboxPayload(body []byte) (InboxPayload, error) {
 	var p InboxPayload
-	if err := json.Unmarshal(body, &p); err != nil {
+	// json.Unmarshal を通さずに直接呼ぶ (通すと本文をもう 2 回走査する、#3614)。
+	if err := p.UnmarshalJSON(body); err != nil {
 		return InboxPayload{}, err
 	}
 	return p, nil
@@ -181,7 +194,9 @@ func DecodeInboxPayload(body []byte) (InboxPayload, error) {
 type DeliverPayload struct {
 	// Inbox is the absolute URL of the recipient inbox to POST to.
 	Inbox string `json:"inbox"`
-	// Body is the JSON-serialized AP activity to deliver.
+	// Body is the JSON-serialized AP activity to deliver. Its wire shape is
+	// embedded JSON while driver.CompactJobPayloads is enabled, base64
+	// otherwise (see activity_body.go, #3614).
 	Body []byte `json:"body"`
 	// KeyID is the HTTP Signature keyId
 	// (e.g. https://example.com/users/u1#main-key).
@@ -221,8 +236,8 @@ type DeliverPayload struct {
 }
 
 // NewDeliverTask serializes the payload into a driver.Task ready to
-// pass into a HandlerFunc (used in tests). DeliverPayload はすべて
-// marshal 可能な型 (string と []byte) のみで構成されるため
+// pass into a HandlerFunc (used in tests). DeliverPayload.MarshalJSON は
+// どの本文にも書ける形を選ぶ (読めない本文は base64 に倒す) ので、
 // json.Marshal は失敗しない。
 func NewDeliverTask(payload DeliverPayload) driver.Task {
 	body, _ := json.Marshal(payload)
@@ -232,7 +247,8 @@ func NewDeliverTask(payload DeliverPayload) driver.Task {
 // DecodeDeliverPayload extracts a DeliverPayload from a task body.
 func DecodeDeliverPayload(body []byte) (DeliverPayload, error) {
 	var p DeliverPayload
-	if err := json.Unmarshal(body, &p); err != nil {
+	// json.Unmarshal を通さずに直接呼ぶ (通すと本文をもう 2 回走査する、#3614)。
+	if err := p.UnmarshalJSON(body); err != nil {
 		return DeliverPayload{}, err
 	}
 	return p, nil

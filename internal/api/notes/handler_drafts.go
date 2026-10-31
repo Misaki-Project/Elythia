@@ -2,14 +2,18 @@ package notes
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
@@ -37,21 +41,21 @@ func (h *Handler) DraftsList(c echo.Context) error {
 	// aidx で時刻を内包するので、sinceDate/untilDate は id cursor に正規化して
 	// keyset pagination に乗せる (#1948-19)。
 	var req struct {
-		Limit     *int   `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
-		Scheduled *bool  `json:"scheduled"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
+		Scheduled *bool      `json:"scheduled"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 30, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 30, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -96,7 +100,7 @@ func (h *Handler) DraftsCreate(c echo.Context) error {
 		ChannelID           *string    `json:"channelId"`
 		Hashtag             *string    `json:"hashtag"`
 		Poll                *draftPoll `json:"poll"`
-		ScheduledAt         *int64     `json:"scheduledAt"`
+		ScheduledAt         *jsnum.Int `json:"scheduledAt"`
 		IsActuallyScheduled bool       `json:"isActuallyScheduled"`
 	}
 	if err := c.Bind(&req); err != nil {
@@ -106,6 +110,9 @@ func (h *Handler) DraftsCreate(c echo.Context) error {
 	// draft 経由でも upstream drafts/create.ts:161,168 の enum 制約に揃え、不正値が
 	// scheduled-note 処理経由で投稿されるのを防ぐ。
 	if err := validateNoteEnums(req.Visibility, req.ReactionAcceptance); err != nil {
+		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", err.Error(), apierr.UUIDInvalidParam))
+	}
+	if err := validateDraftLengths(req.Text, req.CW, req.Hashtag, req.FileIDs, req.Poll); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", err.Error(), apierr.UUIDInvalidParam))
 	}
 	if req.Visibility == "" {
@@ -118,7 +125,7 @@ func (h *Handler) DraftsCreate(c echo.Context) error {
 	now := time.Now()
 	var scheduledAt *time.Time
 	if req.ScheduledAt != nil {
-		t := time.UnixMilli(*req.ScheduledAt)
+		t := time.UnixMilli(int64(*req.ScheduledAt))
 		scheduledAt = &t
 	}
 	if req.IsActuallyScheduled {
@@ -134,7 +141,8 @@ func (h *Handler) DraftsCreate(c echo.Context) error {
 	// 配線済 (timeline gate と共用)。CountByUser で current 件数を取得。
 	if h.policyProvider != nil {
 		policies := h.policyProvider.GetUserPolicies(user.ID)
-		if limit, ok := role.PolicyNumber(policies["noteDraftLimit"]); ok && limit >= 0 {
+		// 負の値は upstream と同じく「1 件も作れない」になる (`count >= limit` が常に真)。
+		if limit, ok := role.PolicyNumber(policies["noteDraftLimit"]); ok {
 			count, err := h.draftRepo.CountByUser(user.ID)
 			if err != nil {
 				return apierr.JSONInternalError(c)
@@ -146,7 +154,8 @@ func (h *Handler) DraftsCreate(c echo.Context) error {
 		// scheduledNoteLimit gate (#1040)。isActuallyScheduled draft の数を
 		// 集計して上限と比較する。upstream `NoteDraftService.create` と同 logic。
 		if req.IsActuallyScheduled {
-			if limit, ok := role.PolicyNumber(policies["scheduledNoteLimit"]); ok && limit >= 0 {
+			// 負の値は upstream と同じく「1 件も作れない」になる (`count >= limit` が常に真)。
+			if limit, ok := role.PolicyNumber(policies["scheduledNoteLimit"]); ok {
 				count, err := h.draftRepo.CountScheduledByUser(user.ID)
 				if err != nil {
 					return apierr.JSONInternalError(c)
@@ -239,7 +248,7 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 		ChannelID           *string    `json:"channelId"`
 		Hashtag             *string    `json:"hashtag"`
 		Poll                *draftPoll `json:"poll"`
-		ScheduledAt         *int64     `json:"scheduledAt"`
+		ScheduledAt         *jsnum.Int `json:"scheduledAt"`
 		IsActuallyScheduled *bool      `json:"isActuallyScheduled"`
 	}
 	if err := c.Bind(&req); err != nil || req.DraftID == "" {
@@ -249,6 +258,9 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 	// nil は「変更しない」セマンティクスなので許容し、非空の不正値のみ弾く。paramDef
 	// 相当なので draft 不在 (404) より先に 400 を返す。
 	if err := validateNoteEnums(req.Visibility, req.ReactionAcceptance); err != nil {
+		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", err.Error(), apierr.UUIDInvalidParam))
+	}
+	if err := validateDraftLengths(req.Text, req.CW, req.Hashtag, req.FileIDs, req.Poll); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", err.Error(), apierr.UUIDInvalidParam))
 	}
 	draft, err := h.draftRepo.FindByIDAndUser(req.DraftID, user.ID)
@@ -321,11 +333,25 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 		applyDraftPoll(draft, req.Poll)
 	}
 	if req.ScheduledAt != nil {
-		t := time.UnixMilli(*req.ScheduledAt)
+		t := time.UnixMilli(int64(*req.ScheduledAt))
 		draft.ScheduledAt = &t
 		scheduleChanged = true
 	}
 	if req.IsActuallyScheduled != nil {
+		// **予約していない下書きを予約にするときも scheduledNoteLimit を見る**
+		// (upstream NoteDraftService.update)。見ないと、予約していない下書きを
+		// 作ってから更新で予約にするだけで、上限を超えて予約できた。
+		if *req.IsActuallyScheduled && !draft.IsActuallyScheduled && h.policyProvider != nil {
+			if limit, ok := role.PolicyNumber(h.policyProvider.GetUserPolicies(user.ID)["scheduledNoteLimit"]); ok {
+				count, err := h.draftRepo.CountScheduledByUser(user.ID)
+				if err != nil {
+					return apierr.JSONInternalError(c)
+				}
+				if float64(count) >= limit {
+					return c.JSON(http.StatusBadRequest, apierr.Error("TOO_MANY_SCHEDULED_NOTES", "You cannot create scheduled notes any more.", "02f5df79-08ae-4a33-8524-f1503c8f6212"))
+				}
+			}
+		}
 		draft.IsActuallyScheduled = *req.IsActuallyScheduled
 		scheduleChanged = true
 	}
@@ -369,12 +395,49 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"updatedDraft": h.packDraft(c.Request().Context(), user, draft, nil)})
 }
 
+// validateDraftLengths enforces the length limits of upstream
+// notes/drafts/create.ts and update.ts paramDef: text up to
+// MAX_NOTE_TEXT_LENGTH, cw 1 to 100, hashtag up to 200, at most 16 fileIds,
+// and at most 10 poll choices of 1 to 50 characters each.
+//
+// 下書きは予約投稿で notes/create の検査を通らずにノートになるので、ここで
+// notes/create と同じ上限を掛けないと、長い本文がそのまま解析・配送される。
+func validateDraftLengths(text, cw, hashtag *string, fileIDs []string, poll *draftPoll) error {
+	// 列に入らない値 (NUL や不正な UTF-8) は notes/create と同じく INVALID_PARAM
+	// にする。素通しすると保存で 500 になる。
+	if text != nil && !colfit.Fits(*text, maxNoteTextLength) {
+		return errors.New("text is too long or not storable")
+	}
+	if cw != nil {
+		if n := utf8.RuneCountInString(*cw); n < 1 || n > 100 || !colfit.Storable(*cw) {
+			return errors.New("cw must be between 1 and 100 characters")
+		}
+	}
+	if hashtag != nil && !colfit.Fits(*hashtag, 200) {
+		return errors.New("hashtag is too long")
+	}
+	if len(fileIDs) > 16 {
+		return errors.New("too many files (max 16)")
+	}
+	if poll != nil {
+		if len(poll.Choices) > 10 {
+			return errors.New("poll must have at most 10 choices")
+		}
+		for _, choice := range poll.Choices {
+			if n := utf8.RuneCountInString(choice); n < 1 || n > 50 || !colfit.Storable(choice) {
+				return errors.New("each poll choice must be between 1 and 50 characters")
+			}
+		}
+	}
+	return nil
+}
+
 // draftPoll mirrors the upstream notes/drafts poll param object.
 type draftPoll struct {
-	Choices      []string `json:"choices"`
-	Multiple     bool     `json:"multiple"`
-	ExpiresAt    *int64   `json:"expiresAt"`
-	ExpiredAfter *int64   `json:"expiredAfter"`
+	Choices      []string   `json:"choices"`
+	Multiple     bool       `json:"multiple"`
+	ExpiresAt    *jsnum.Int `json:"expiresAt"`
+	ExpiredAfter *jsnum.Int `json:"expiredAfter"`
 }
 
 // draftReplyRenoteErrs holds the 4 reply/renote error responses that differ
@@ -531,7 +594,7 @@ func (h *Handler) allDraftFilesOwned(fileIDs []string, userID string) bool {
 
 // pollAlreadyExpired reports whether the poll's expiresAt is in the past.
 func pollAlreadyExpired(p *draftPoll, now time.Time) bool {
-	return p != nil && p.ExpiresAt != nil && time.UnixMilli(*p.ExpiresAt).Before(now)
+	return p != nil && p.ExpiresAt != nil && time.UnixMilli(int64(*p.ExpiresAt)).Before(now)
 }
 
 // applyDraftPoll writes poll fields into the draft. nil clears the poll
@@ -548,9 +611,9 @@ func applyDraftPoll(d *model.NoteDraft, p *draftPoll) {
 	d.HasPoll = true
 	d.PollChoices = model.StringArray(p.Choices)
 	d.PollMultiple = p.Multiple
-	d.PollExpiredAfter = p.ExpiredAfter
+	d.PollExpiredAfter = p.ExpiredAfter.Int64Ptr()
 	if p.ExpiresAt != nil {
-		t := time.UnixMilli(*p.ExpiresAt)
+		t := time.UnixMilli(int64(*p.ExpiresAt))
 		d.PollExpiresAt = &t
 	} else {
 		d.PollExpiresAt = nil
@@ -710,8 +773,8 @@ func (h *Handler) ThreadMutingDelete(c echo.Context) error {
 func (h *Handler) PollsRecommendation(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req struct {
-		Limit  *int `json:"limit"`
-		Offset int  `json:"offset"`
+		Limit  *jsnum.Int `json:"limit"`
+		Offset jsnum.Int  `json:"offset"`
 		// upstream recommendation.ts:35 は excludeChannels を boolean で受け、
 		// true のとき全 channel poll を除外する (#1765。以前は []string だった)。
 		ExcludeChannels bool `json:"excludeChannels"`
@@ -722,7 +785,7 @@ func (h *Handler) PollsRecommendation(c echo.Context) error {
 	if h.pollRepo == nil || h.noteRepo == nil {
 		return c.JSON(http.StatusOK, []entity.NoteEntity{})
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -730,7 +793,7 @@ func (h *Handler) PollsRecommendation(c echo.Context) error {
 	if h.mutingRepo != nil {
 		muted, _ = h.mutingRepo.ListMuteeIDs(user.ID)
 	}
-	noteIDs, err := h.pollRepo.ListRecommendation(user.ID, muted, req.ExcludeChannels, limit, req.Offset)
+	noteIDs, err := h.pollRepo.ListRecommendation(user.ID, muted, req.ExcludeChannels, limit, int(req.Offset))
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -831,7 +894,7 @@ func (h *Handler) packDraft(ctx context.Context, viewer *model.User, d *model.No
 		result["poll"] = nil
 	}
 	if d.User != nil {
-		result["user"] = entity.PackUserLite(d.User)
+		result["user"] = h.entityPacker.PackUserLite(d.User)
 	}
 	return result
 }
@@ -904,7 +967,7 @@ func (h *Handler) resolveDraftFileMap(fileIDs []string) map[string]entity.DriveF
 		return m
 	}
 	for _, f := range rows {
-		m[f.ID] = entity.PackDriveFile(f, h.idGen)
+		m[f.ID] = h.entityPacker.PackDriveFile(f, h.idGen)
 	}
 	return m
 }

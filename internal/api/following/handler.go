@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	corefollowing "github.com/elythia-network/elythia/internal/core/following"
 	coreuser "github.com/elythia-network/elythia/internal/core/user"
@@ -28,23 +30,33 @@ type Handler struct {
 	// following/requests/* の follower / followee (UserLite) を本家 packMany と
 	// 同じ形に組む (#1912、#3330)。未配線なら関係・ピン留め・instance などを欠く。
 	packer userpack.ListPacker
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker            *entity.Packer
+	localFederationObserver activitypub.LocalFederationObserver
 }
 
-// SetListPacker wires the packer of the users embedded in following/list and
-// following/requests/{list,sent} (#1912, #3330).
-func (h *Handler) SetListPacker(p userpack.ListPacker) {
-	h.packer = p
+func (h *Handler) SetLocalFederationObserver(observer activitypub.LocalFederationObserver) {
+	h.localFederationObserver = observer
 }
 
-// HasListPacker reports whether the list packer was wired.
-//
-// 未配線だと following/list の followee に関係・ピン留め・移行先・instance・絵文字が
-// 載らず、following/requests/* の利用者に instance・絵文字が載らない。起動時検査に使う。
-func (h *Handler) HasListPacker() bool { return h.packer != nil }
+func (h *Handler) gateExternalAction(c echo.Context, me *model.User, _ string) bool {
+	if h.localFederationObserver == nil || me == nil || !me.IsLocal() {
+		return true
+	}
+	if !h.localFederationObserver.IsExternallyAvailable(me) {
+		_ = c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_DISABLED", "This account cannot perform remote actions.", "abdc2832-1f6d-4a33-8a10-b5731ca33884"))
+		return false
+	}
+	return true
+}
 
 // NewHandler creates a new following Handler.
-func NewHandler(followingService *corefollowing.Service, userService *coreuser.Service) *Handler {
-	return &Handler{followingService: followingService, userService: userService}
+// entityPacker is the Packer this handler packs entities with (#3792); packer
+// packs the users of following/list and following/requests/{list,sent} (#1912,
+// #3330).
+func NewHandler(followingService *corefollowing.Service, userService *coreuser.Service, entityPacker *entity.Packer, packer userpack.ListPacker) *Handler {
+	return &Handler{followingService: followingService, userService: userService, entityPacker: entityPacker, packer: packer}
 }
 
 // SetIDGen wires an id.Generator so /api/following/list can derive Following.createdAt
@@ -72,6 +84,9 @@ func (h *Handler) Create(c echo.Context) error {
 	bundle, err := h.userService.ShowByID(req.UserID)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "fcd2eef9-a9b2-4c4f-8624-038099e90aa5"))
+	}
+	if bundle.User.Host != nil && *bundle.User.Host != "" && !h.gateExternalAction(c, me, *bundle.User.Host) {
+		return nil
 	}
 
 	// withReplies 引数を Service に伝搬する (#1056)。upstream Misskey TS の
@@ -101,7 +116,7 @@ func (h *Handler) Create(c echo.Context) error {
 		}
 	}
 
-	return c.JSON(http.StatusOK, entity.PackUserLite(bundle.User))
+	return c.JSON(http.StatusOK, h.entityPacker.PackUserLite(bundle.User))
 }
 
 // DeleteRequest is the request body for following/delete.
@@ -122,6 +137,9 @@ func (h *Handler) Delete(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "5b12c78d-2b28-4dca-99d2-f56139b42ff8"))
 	}
+	if bundle.User.Host != nil && *bundle.User.Host != "" && !h.gateExternalAction(c, me, *bundle.User.Host) {
+		return nil
+	}
 
 	if err := h.followingService.Unfollow(me.ID, req.UserID); err != nil {
 		switch {
@@ -134,7 +152,7 @@ func (h *Handler) Delete(c echo.Context) error {
 		}
 	}
 
-	return c.JSON(http.StatusOK, entity.PackUserLite(bundle.User))
+	return c.JSON(http.StatusOK, h.entityPacker.PackUserLite(bundle.User))
 }
 
 // RequestActionRequest is the shared request body for following/requests/{accept,reject,cancel}.
@@ -223,7 +241,7 @@ func (h *Handler) CancelRequest(c echo.Context) error {
 		}
 		return apierr.JSONInternalError(c)
 	}
-	return c.JSON(http.StatusOK, entity.PackUserLite(bundle.User))
+	return c.JSON(http.StatusOK, h.entityPacker.PackUserLite(bundle.User))
 }
 
 // ListRequestsResponseItem represents a single received follow request.
@@ -234,16 +252,17 @@ type ListRequestsResponseItem struct {
 }
 
 // ListRequest is the request body for /api/following/list (upstream 2026.5.2
-// #17385 + #17416)。`sinceDate` / `untilDate` は upstream paramDef にあるが
-// mk-go の他 endpoint と同じく現状未対応で、bind は受けるが silent ignore
-// (= 上流仕様の subset、別 issue で全 endpoint 横断対応)。
+// #17385 + #17416). sinceDate / untilDate are read as cursors (#1166).
+//
+// limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が整数の
+// 小数(10.0)を受ける。following/requests/list・sent・silent/list も同じ (#3756)。
 type ListRequest struct {
-	Notification bool   `json:"notification"`
-	SinceID      string `json:"sinceId"`
-	UntilID      string `json:"untilId"`
-	SinceDate    *int64 `json:"sinceDate"`
-	UntilDate    *int64 `json:"untilDate"`
-	Limit        *int   `json:"limit"`
+	Notification bool       `json:"notification"`
+	SinceID      string     `json:"sinceId"`
+	UntilID      string     `json:"untilId"`
+	SinceDate    *jsnum.Int `json:"sinceDate"`
+	UntilDate    *jsnum.Int `json:"untilDate"`
+	Limit        *jsnum.Int `json:"limit"`
 }
 
 // List handles POST /api/following/list (upstream 2026.5.2 #17385 + #17416)。
@@ -255,14 +274,14 @@ func (h *Handler) List(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate (Unix ms) を aidx prefix に正規化して sinceID /
 	// untilID と同 SQL cursor で扱う (#1166)。sinceID が指定されている場合
 	// upstream 同様 sinceDate は無視される。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -299,7 +318,7 @@ func (h *Handler) List(c echo.Context) error {
 
 	out := make([]entity.Following, 0, len(rows))
 	for _, r := range rows {
-		packed := entity.PackFollowing(r, false, false, lookup, h.idGen)
+		packed := h.entityPacker.PackFollowing(r, false, false, lookup, h.idGen)
 		packed.Followee = packedByID[r.FolloweeID]
 		out = append(out, packed)
 	}
@@ -315,7 +334,7 @@ func (h *Handler) packDetailed(c echo.Context, viewer *model.User, users []*mode
 	}
 	out := make([]entity.UserDetailed, len(users))
 	for i, u := range users {
-		out[i] = entity.PackUserDetailed(u, profiles[u.ID], h.idGen)
+		out[i] = h.entityPacker.PackUserDetailed(u, profiles[u.ID], h.idGen)
 	}
 	return out
 }
@@ -341,7 +360,7 @@ func (h *Handler) packRequests(rows []*model.FollowRequest) []ListRequestsRespon
 	users := make([]*model.User, 0, len(bundles))
 	for _, b := range bundles {
 		if b != nil && b.User != nil {
-			lites = append(lites, entity.PackUserLite(b.User))
+			lites = append(lites, h.entityPacker.PackUserLite(b.User))
 			users = append(users, b.User)
 		}
 	}
@@ -367,22 +386,22 @@ func (h *Handler) packRequests(rows []*model.FollowRequest) []ListRequestsRespon
 func (h *Handler) ListRequests(c echo.Context) error {
 	me := middleware.GetUser(c)
 	var req struct {
-		Limit     *int   `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
 
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}

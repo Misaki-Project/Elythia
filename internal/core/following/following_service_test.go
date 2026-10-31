@@ -10,6 +10,7 @@ import (
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/testutil"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -99,7 +100,7 @@ func (f *failingFollowRequestRepo) Delete(r *model.FollowRequest) error {
 // newSvcWith builds a Service from explicit repositories.
 func newSvcWith(userRepo repository.UserRepository, fRepo repository.FollowingRepository, frRepo repository.FollowRequestRepository) *following.Service {
 	idGen, _ := id.NewGenerator("aidx")
-	return following.NewService(userRepo, fRepo, frRepo, idGen)
+	return following.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
 }
 
 func newSvc(t *testing.T) (*following.Service, *testutil.MockUserRepository, *testutil.MockFollowingRepository, *testutil.MockFollowRequestRepository) {
@@ -108,7 +109,7 @@ func newSvc(t *testing.T) (*following.Service, *testutil.MockUserRepository, *te
 	fRepo := testutil.NewMockFollowingRepository()
 	frRepo := testutil.NewMockFollowRequestRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := following.NewService(userRepo, fRepo, frRepo, idGen)
+	svc := following.NewService(userRepo, fRepo, frRepo, idGen, nil, nil, nil, nil)
 	return svc, userRepo, fRepo, frRepo
 }
 
@@ -266,6 +267,63 @@ func (h *stubFederationHook) OnLocalUnfollowed(follower, followee *model.User) {
 }
 func (h *stubFederationHook) OnLocalFollowAccepted(follower, followee *model.User) {
 	h.accepted = append(h.accepted, follower.ID+"->"+followee.ID)
+}
+
+// ローカルからリモート (鍵でない) へのフォローは、相手の Accept が届くまで申請に
+// なる (#3491、本家 UserFollowingService.follow の 3 つ目の OR 条件)。Follow は
+// 送り、Accept (AcceptRequest) で成立する。
+func TestFollow_LocalToRemote_WaitsForAccept(t *testing.T) {
+	svc, userRepo, fRepo, frRepo := newSvc(t)
+	addUser(t, userRepo, "alice", false)
+	remote := addUser(t, userRepo, "remote_bob", false)
+	host := "remote.example"
+	remote.Host = &host
+	fed := &stubFederationHook{}
+	svc.SetFederationHook(fed)
+
+	res, err := svc.Follow("alice", "remote_bob", following.FollowOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, res.Request, "a follow to a remote user did not become a request")
+	exists, err := fRepo.Exists("alice", "remote_bob")
+	require.NoError(t, err)
+	assert.False(t, exists, "following was created before the remote Accept")
+	assert.Equal(t, []string{"alice->remote_bob"}, fed.followed, "the Follow activity is still delivered")
+
+	require.NoError(t, svc.AcceptRequest("remote_bob", "alice"))
+	exists, err = fRepo.Exists("alice", "remote_bob")
+	require.NoError(t, err)
+	assert.True(t, exists, "the Accept did not establish the follow")
+	pending, err := frRepo.Exists("alice", "remote_bob")
+	require.NoError(t, err)
+	assert.False(t, pending, "the request was left behind after the Accept")
+}
+
+// 本家の backend e2e と同じ切り替え (FORCE_FOLLOW_REMOTE_USER_FOR_TESTING=true) の
+// ときは即座に成立する。ローカル同士は今までどおり即座に成立する。
+func TestFollow_LocalToRemote_ForceSwitchAndLocalControl(t *testing.T) {
+	t.Run("force switch", func(t *testing.T) {
+		t.Setenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING", "true")
+		svc, userRepo, fRepo, _ := newSvc(t)
+		addUser(t, userRepo, "alice", false)
+		remote := addUser(t, userRepo, "remote_bob", false)
+		host := "remote.example"
+		remote.Host = &host
+		res, err := svc.Follow("alice", "remote_bob", following.FollowOptions{})
+		require.NoError(t, err)
+		assert.Nil(t, res.Request)
+		exists, _ := fRepo.Exists("alice", "remote_bob")
+		assert.True(t, exists)
+	})
+	t.Run("local to local (control)", func(t *testing.T) {
+		svc, userRepo, fRepo, _ := newSvc(t)
+		addUser(t, userRepo, "alice", false)
+		addUser(t, userRepo, "bob", false)
+		res, err := svc.Follow("alice", "bob", following.FollowOptions{})
+		require.NoError(t, err)
+		assert.Nil(t, res.Request)
+		exists, _ := fRepo.Exists("alice", "bob")
+		assert.True(t, exists)
+	})
 }
 
 func TestFollow_LockedUser_InvokesFederationHook(t *testing.T) {
@@ -1390,6 +1448,9 @@ func TestFollow_RemoteFollower_BumpsInstanceFollowing(t *testing.T) {
 // local follower → remote followee: instance(remote).followersCount += 1
 // (本家 insertFollowingDoc の isRemoteUser(followee) 分岐、#3330)。
 func TestFollow_LocalFollowsRemote_BumpsInstanceFollowers(t *testing.T) {
+	// ローカルからリモートへのフォローは Accept まで申請になる (#3491)。このテストは
+	// 成立した後を見るので、本家の backend e2e と同じ切り替えで即座に成立させる。
+	t.Setenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING", "true")
 	svc, userRepo, _, _ := newSvc(t)
 	instanceRepo := testutil.NewMockInstanceRepository()
 	host := "remote.example"
@@ -1409,6 +1470,9 @@ func TestFollow_LocalFollowsRemote_BumpsInstanceFollowers(t *testing.T) {
 
 // Unfollow で counter -1
 func TestUnfollow_DecrementsInstanceCounters(t *testing.T) {
+	// ローカルからリモートへのフォローは Accept まで申請になる (#3491)。このテストは
+	// 成立した後を見るので、本家の backend e2e と同じ切り替えで即座に成立させる。
+	t.Setenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING", "true")
 	svc, userRepo, _, _ := newSvc(t)
 	instanceRepo := testutil.NewMockInstanceRepository()
 	host := "remote.example"
@@ -1474,6 +1538,9 @@ func TestAcceptRequest_BumpsInstanceCounters(t *testing.T) {
 // meta.enableStatsForFederatedInstances gate: when it is false, follow and
 // unfollow in either direction do not touch the instance counters.
 func TestFollow_InstanceStatsGateOff_LeavesCounters(t *testing.T) {
+	// ローカルからリモートへのフォローは Accept まで申請になる (#3491)。このテストは
+	// 成立した後を見るので、本家の backend e2e と同じ切り替えで即座に成立させる。
+	t.Setenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING", "true")
 	svc, userRepo, _, _ := newSvc(t)
 	instanceRepo := testutil.NewMockInstanceRepository()
 	host := "remote.example"
@@ -1706,21 +1773,6 @@ func TestUnfollow_SkipsCountAdjustmentWhenMoved(t *testing.T) {
 	}
 }
 
-// **述語が配線を見ていること。** 起動時の critical wiring 検査はこれを読むので、
-// 常に true を返すようになると未配線を検出できなくなる。
-func TestHasSilencedHostChecker(t *testing.T) {
-	idGen, _ := id.NewGenerator("aidx")
-	svc := following.NewService(testutil.NewMockUserRepository(), testutil.NewMockFollowingRepository(),
-		testutil.NewMockFollowRequestRepository(), idGen)
-	assert.False(t, svc.HasSilencedHostChecker(), "未配線では false")
-	svc.SetSilencedHostChecker(silencedHostFunc(func(string) bool { return false }))
-	assert.True(t, svc.HasSilencedHostChecker(), "配線後は true")
-}
-
-type silencedHostFunc func(string) bool
-
-func (f silencedHostFunc) IsSilenced(host string) bool { return f(host) }
-
 // #3067: UnfollowQuiet は upstream の silent と同じく、main stream と利用者の
 // webhook を出さず、Undo(Follow) も配送しない。数と集計は通常どおり減らす。
 func TestUnfollowQuiet_NoDeliveryNoNotification(t *testing.T) {
@@ -1804,4 +1856,37 @@ func TestFollow_SkipsCountsWhenMoved(t *testing.T) {
 			assert.Len(t, chart.follows, tc.want)
 		})
 	}
+}
+
+// uniqueFollowingRepo reports a unique violation on Create, as when a
+// concurrent request inserted the same pair after the Exists check.
+type uniqueFollowingRepo struct {
+	*testutil.MockFollowingRepository
+}
+
+func (uniqueFollowingRepo) Create(*model.Following) error { return &pgconn.PgError{Code: "23505"} }
+
+type uniqueFollowRequestRepo struct {
+	*testutil.MockFollowRequestRepository
+}
+
+func (uniqueFollowRequestRepo) Create(*model.FollowRequest) error {
+	return &pgconn.PgError{Code: "23505"}
+}
+
+// 並行のフォローで一意制約に当たったら、既にフォロー済み / 申請済みとして返すこと
+// (500 にしない。upstream の insertFollowingDoc も一意制約の違反を握る)。
+func TestFollow_ConcurrentDuplicateIsAlreadyFollowing(t *testing.T) {
+	userRepo := testutil.NewMockUserRepository()
+	setupUsers(userRepo, "alice", "bob")
+	svc := newSvcWith(userRepo, uniqueFollowingRepo{testutil.NewMockFollowingRepository()}, testutil.NewMockFollowRequestRepository())
+	_, err := svc.Follow("alice", "bob", following.FollowOptions{})
+	assert.ErrorIs(t, err, following.ErrAlreadyFollowing)
+
+	userRepo2 := testutil.NewMockUserRepository()
+	setupUsers(userRepo2, "alice")
+	setupLockedUser(userRepo2, "bob")
+	svc2 := newSvcWith(userRepo2, testutil.NewMockFollowingRepository(), uniqueFollowRequestRepo{testutil.NewMockFollowRequestRepository()})
+	_, err = svc2.Follow("alice", "bob", following.FollowOptions{})
+	assert.ErrorIs(t, err, following.ErrAlreadyRequested)
 }

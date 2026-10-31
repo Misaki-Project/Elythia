@@ -23,9 +23,9 @@
 
 | ファイル | 責務 |
 |---|---|
-| `resolver.go` | リモートアクター/ノートの取得・永続化。公開鍵の2層キャッシュ (メモリ+DB, TTL 24h) |
+| `resolver.go` / `resolver_*.go` | リモートアクター/ノートの取得・永続化。公開鍵の2層キャッシュ (メモリ+DB, TTL 24h)。`Resolver`の定義と設定は`resolver.go`、アクターは`resolver_actor*.go`、公開鍵は`resolver_publickey.go`、ノートは`resolver_note*.go` |
 | `deliver_service.go` | 配信ジョブのエンキュー。フォロワーのInbox収集、ホストブロック判定 |
-| `processor.go` | 受信Activityのディスパッチ (Follow, Create, Like, Announce, Delete, Update等) |
+| `processor.go` / `processor_*.go` | 受信Activityのディスパッチ (Follow, Create, Like, Announce, Delete, Update等)。振り分けは`processor.go`、種類ごとの処理は`processor_follow.go`・`processor_create.go`など |
 | `published_time.go` | AP `published` を parse + clock skew (5min) / 過去 10 年 floor で fallback (#940) |
 | `remote_stats.go` | リモート user の notesCount/followersCount/followingCount を origin の `/api/users/show` から取得 (Elythia 独自拡張、#943)。LRU cache size cap 10000 (#945)、SSRF guard 経由 |
 | `note_delivery_hook.go` | ノート公開時にCreate/Announceを配信 |
@@ -35,7 +35,7 @@
 | `mention_resolver.go` | メンション → AS Mentionタグ変換 |
 | `fetcher.go` | リモートオブジェクト取得。**既定は instance actor による署名付き GET**で、401/403 のときだけ unsigned にフォールバックする (authorized-fetch 対応、#419) |
 | `ld_signature_verifier.go` | inbound activity の LD-Signature 検証 |
-| `activity_unwrap.go` | **1 要素の JSON 配列**になっている body を剥がす (Foundkey 系、#1185)。ネストした activity の actor 正規化は `processor.go` の `normalizeActor` |
+| `activity_unwrap.go` | **1 要素の JSON 配列**になっている body を剥がす (Foundkey 系、#1185)。ネストした activity の actor 正規化は `processor_read.go` の `normalizeActor` |
 | `pin_delivery_hook.go` | ピン留め時に Add/Remove を配信 (#2024) |
 | `poll_delivery_hook.go` | 投票関連の配信 |
 | `blocking_delivery_hook.go` / `user_moderation_delivery_hook.go` | ブロック・モデレーション操作の配信 |
@@ -43,7 +43,7 @@
 | `chat_room_inbox.go` / `reversi_inbox.go` | cherrypick 由来 activity の受信 |
 | `featured.go` | **リモート** actor の featured を取り込んで `user_note_pining` に反映 (upstream `ApPersonService.updateFeatured` 相当)。ローカルの featured を返すのは `internal/api/ap/handler.go` |
 | `permanent_error.go` | リトライしない失敗の判定 |
-| `suspended.go` | 配送先インスタンスの software 名 / 版で**送信をスキップ**するかの判定 (`meta.deliverSuspendedSoftware`) |
+| `suspended.go` | インスタンスの software 名 / 版で、**送信をスキップ**するか (`meta.deliverSuspendedSoftware`) と、**受信を拒否**するか (`meta.inboxSuspendedSoftware`、#3362) の判定。範囲は本家と同じ semver (`internal/misc/semverrange`) と、Elythia 独自の `/.../` (正規表現) |
 | `remote_user_resolver.go` | `acct:` からのリモートユーザー解決 |
 | `attachment_probe.go` | リモート添付の先頭取得 (形式・名前・画像の寸法) |
 
@@ -113,7 +113,7 @@ HTTP Signature からは言えない。これを埋めるのが LD-Signature。
 
 ## リモートオブジェクト解決
 
-`resolver.go`がリモートのアクターとノートを取得し、ローカルDBに永続化する。
+`resolver.go` / `resolver_*.go`がリモートのアクターとノートを取得し、ローカルDBに永続化する。
 
 **公開鍵キャッシュ:**
 1. インメモリ (`map[userID]publicKeyEntry`, TTL 24h)
@@ -279,6 +279,8 @@ upstream Misskey TS の `users/show` は **自インスタンスで観測した�
 | `GET /users/:id/collections/featured` | ピン留めノートコレクション |
 | `POST /inbox` | Shared Inbox |
 | `POST /users/:id/inbox` | ユーザー Inbox |
+
+ローカルアカウントの連合状態は `pending` / `off` / `on`。`pending` はElythia公式クライアントが登録時に明示する状態で、引数を省略する既存Misskey互換クライアント/API利用者は `on` となる。`pending` 中は外部参照と連合操作を拒否するが、投稿は通常保存して配送だけを抑止する。`off` 確定時に既存投稿を一括で `localOnly` にし、OFF中の新規投稿も `localOnly` とする。再度 `on` にしても維持する。外部参照を観測した `on` は `off` に戻せない。公開プロフィールとOGPのHTMLは閲覧できる。本人向け状態取得・変更APIは `i/federation` と `i/update-federation`。WebFinger / ActivityPub応答を配信するCDN・リバースプロキシはキャッシュを無効にし、`no-store` を尊重する。詳細は[連合挙動の差分](divergence/federation.md)と[設計書](design/local-only-accounts.md)を参照。
 
 **ピン留めは `/users/:id/featured` ではない。** upstream と同じく
 `/users/:id/collections/featured` に登録されており、前者は AP ハンドラに

@@ -4,7 +4,7 @@ Elythia の `frontend/` は、本家 Misskey の monorepo から `packages/backe
 
 本書は **本家の版を上げた PR がマージされた後、各開発者 / operator が必要な手順** (1 章) と、**本家の新しい release が出た時の取り込み手順** (2 章) を説明する。
 
-> **#3379 より前の運用。** frontend は submodule が指す fork (アーカイブ済み) から供給していて、追従は fork の上での載せ替えと tag の採番、gitlink の bump だった。fork の tag の採番規則と、その頃の独自変更の一覧は凍結した記録として [divergence.md §4-2](divergence.md#4-2-fork-frontend-の独自変更) に残っている。今の独自変更は §4-2b に PR 番号で書く (2-4)。
+> **#3379 より前の運用。** frontend は submodule が指す fork (アーカイブ済み) から供給していて、追従は fork の上での載せ替えと tag の採番、gitlink の bump だった。fork の tag の採番規則と、その頃の独自変更の一覧は凍結した記録として [divergence/frontend.md §4-2](divergence/frontend.md#4-2-fork-frontend-の独自変更) に残っている。今の独自変更は §4-2b に PR 番号で書く (2-4)。
 
 ---
 
@@ -84,7 +84,7 @@ migration 連番は `migration/00NNNN_*.up.sql` の命名規則に従う (= 各 
 
 ### 2-2. triage doc を作成
 
-release ごとの差分 doc `docs/update/<yyyymm><nn>diff.md` (命名は 3 章。直近は [`20261000diff.md`](./update/20261000diff.md)) を新規作成する。古い前例には `docs/update/yyyymmdd-<tracker-issue>-triage.md` (`docs/update/20260512-947-triage.md`) の形もある。
+release ごとの差分 doc `docs/update/<yyyymm><nn>diff.md` (命名は 3 章。直近は [`20261001diff.md`](./update/20261001diff.md)) を新規作成する。古い前例には `docs/update/yyyymmdd-<tracker-issue>-triage.md` (`docs/update/20260512-947-triage.md`) の形もある。
 
 各 upstream commit について:
 - `git -C .cache/misskey/mirror.git show <sha>` で diff 精読
@@ -127,7 +127,9 @@ mirror (`.cache/misskey/mirror.git`、無ければ作る) に今の版 (`UPSTREA
 
 **どの区分にも当たらないパスがあると、何も当てずに止まる。** 本家が直下に新しく足したファイルや、submodule の gitlink の変更が該当する。「取り込む」で絞るだけだと新しいパスが黙って落ちるため。止まったら、そのパスの区分を決めて `tools/upstreamsync/main.go` の表 (`importFiles` / `importDirs` / `skipFiles` / `skipDirs`) と設計 D1 の表の両方に足し、`go test ./tools/upstreamsync/` を通してからやり直す。
 
-2.0.0以降は本体の`frontend/`へ取り込む。以前のMisaki frontend forkとsubmoduleは履歴として保持し、新releaseの取り込みには使わない。取り込み手順:
+**2. 当てる。**
+
+Misakiでも2.0.0以降は本体の`frontend/`へ取り込む。以前のMisaki frontend forkとsubmoduleは履歴として保持し、新releaseの取り込みには使わない。独自差分は[Misaki固有の記録](divergence/misaki.md)も確認する。
 
 ```bash
 make upstream-sync TO=<新しい版>
@@ -139,7 +141,7 @@ make upstream-sync TO=<新しい版>
 
 衝突しなかったファイルは index に載る。衝突したテキストのファイルは衝突マーカー付きで作業ツリーに残り、index では unmerged になる (`git diff --name-only --diff-filter=U` で一覧できる)。**バイナリが衝突したときはマーカーが付かず、Elythia 側の内容のまま unmerged になる**ので、本家の版を採るなら `git checkout --theirs -- <パス>` で入れ替える。最後に「次にやること」が表示され、衝突が残っていれば終了コードは 0 にならない。
 
-**3. 衝突を解く。** Elythia 独自の frontend の変更は [divergence.md §4-2b](divergence.md#4-2b-frontend-の独自変更-3379-で取り込んだ後) に PR 番号で記録している。衝突したら、その箇所がどの行の変更かを §4-2b で引いて判断する。
+**3. 衝突を解く。** Elythia 独自の frontend の変更は [divergence/frontend.md §4-2b](divergence/frontend.md#4-2b-frontend-の独自変更-3379-で取り込んだ後) に PR 番号で記録している。衝突したら、その箇所がどの行の変更かを §4-2b で引いて判断する。
 
 - **本家が同じことを直していたら、Elythia の変更を落として本家の形を採り、§4-2b の行を更新する** (消すか、落とした経緯を書く)。§4-2b は「純正へ還元できない差分の一覧」として読むので、本家に入ったものを残さない
 - 本家の変更と Elythia の変更が両立するなら、両方を残す形に解く
@@ -152,10 +154,9 @@ make upstream-sync TO=<新しい版>
 make upstream-sync-lock
 ```
 
-**過去のタグは振り直さない。** タグは push 済みで、fork 側の
-`Publish frontend assets image` workflow が `*-mk.*` で発火して
-`ghcr.io/misaki-project/misskey-ts-assets:<tag>` を publish しているため、打ち直すと配布物との
-対応が壊れる。
+`frontend/pnpm-lock.yaml` を、**直前の lock を基点に** `pnpm install --lockfile-only` で作り直す (node の container の中で実行する。docker daemon が必要)。本家の lock は使わない。backend を外した lock は本家の lock と大きく違い、本家の lock の差分は毎回衝突するため。
+
+**過去のMisaki frontend tagは振り直さない。** 旧forkの`*-mk.*` tagは公開済みの`ghcr.io/misaki-project/misskey-ts-assets:<tag>`に対応する。旧assets workflowを今回の更新のために再実行しない。修正前のworkflowは暗黙に`latest`も更新するため、過去の配布物との対応が壊れる。現在の同梱imageは本体とプラグインのfrontendを同時にビルドし、外部プラグインは[固定コミット](divergence/misaki.md#外部プラグインの固定コミット)から取得する。
 
 **作り直した lock の差分を目で見る。** `package.json` で変わった依存以外が動いていないことを確かめる。`--lockfile-only` は、lock に無い依存と範囲が変わった依存をその時点の最新に解決するので、本家が試した組とずれうる。`frontend/pnpm-workspace.yaml` の `minimumReleaseAge` (公開から 7 日) に満たない版は選ばれないので、本家が出たばかりの版を指定していると解決に失敗するか、古い版に落ちる。
 
@@ -167,7 +168,7 @@ make frontend-lint
 make frontend-test    # 先に cd frontend && pnpm install && pnpm build
 ```
 
-mfm-js か emoji-data の版が変わっていたら、下の「MFM の絵文字の正規表現」の手順も要る。
+`@elythia-network/mfm` を上げて、それが持つ絵文字の正規表現か版が変わっていたら、下の「MFM の絵文字の正規表現」の手順も要る。
 
 `tools/upstreamsync` が本体に置いた `refs/upstream/<版>` は branch でも tag でもないので push されない。要らなくなったら `git update-ref -d refs/upstream/<版>` で消してよい (次の追従でも、今の版の ref は取り直す)。
 
@@ -221,6 +222,46 @@ git add internal/entitycompat/testdata/
 
 詳細は [shape-drift.md](./shape-drift.md)。
 
+### 本家の版を上げた後に必須: 引数のschema(paramDef)のgoldenとajvの照合corpus
+
+本家の各endpointの`paramDef`(引数のJSON Schema)と、本家がajvに渡す設定(ajvの版、`new Ajv({...})`の引数、`addFormat`)は`internal/api/paramschema/upstream_paramdefs.json`に、その全endpointについて本家と同じ版・同じ設定のajvで判定した照合のcorpusは`internal/api/paramschema/testdata/ajv_corpus.jsonl`にある(#3673)。`internal/api/paramschema`の検証器は、corpusの全件と、判定・最初のエラー(`schemaPath`と`message`)・defaultを入れた後の値が一致することを`TestConformsToAJVCorpus`で守る。どちらも生成物なので手で直さない。
+
+```bash
+make upstream-fetch                    # UPSTREAM_MISSKEY_VERSION の本家を取得
+make paramdef-gen                      # 抜き出し (extract.mjs) → corpus (corpus.mjs) → Elythia の宣言の corpus
+go test ./internal/api/paramschema/... # 検証器が新しい paramDef と corpus に合うか
+git add internal/api/paramschema/upstream_paramdefs.json internal/api/paramschema/testdata/ajv_corpus.jsonl internal/api/paramschema/testdata/ajv_corpus_elythia.jsonl
+```
+
+- **`frontend/node_modules`が要る。** 抜き出しは本家の`.ts`を`frontend/node_modules/typescript`のパーサーで読み(実行はしない)、corpusは`frontend/node_modules/.pnpm/ajv@<版>`のajvで判定する。ajvの版は本家の`packages/backend/package.json`から読む。frontendはajvに直接依存しておらず、推移的に入っている版を名指しして読むので、本家がajvを上げてその版が`frontend/`の依存に無いと`paramdef-gen`が落ちる。そのときは`frontend/package.json`のdevDependenciesにその版のajvを足し、`make upstream-sync-lock`でlockを作り直す
+- **抜き出しは、評価できない式が1つでもあれば落ちる**(`unresolved values`)。本家のparamDefが新しい書き方を使い始めたら、`tools/paramdefspec/extract.mjs`の`ev`にその式の評価を足す。推測の値で埋めない
+- **解くのはトップレベルの`const`だけ。** 宣言の後に書き換えられる名前も解かずに落とす。実行時の値が宣言の初期値と違うかもしれないため。`unresolved values`の行の読み方は次のとおり
+  - `<名前> is not a const in <ファイル>`: paramDefが`let` / `var`の名前を参照している。宣言の初期値をそのまま使わず、実行時の値を確かめてから`extract.mjs`での扱いを決める
+  - `<名前> is written after its declaration in <ファイル>`: そのファイルの中に、その名前への代入・`++` / `--`・`delete`・`Object.assign`などの書き換える関数・`push`などの書き換えるメソッドがある。名前の有効範囲は見ないので、同じ名前の局所変数への代入や、書き換えに見える読み取り(`[...X].sort()`、分割代入の既定値やキー)でも落ちる。本当の書き換えなら実行時の値を確かめて扱いを決める。書き換えでなければ、`extract.mjs`の`writtenNames`の判定を直す
+- **書き換えの検出は名前で見るので、見つけられないものがある。** 別名を通した書き換え(`const p = paramDef.properties; p.limit.maximum = 7`)、関数やcallbackの引数として渡した先での書き換え、`Object['assign']`のように名前で書かない呼び出し、定義のファイルとendpointのファイル以外(第3のファイル)からの書き換えは、落ちずにgoldenが実行時の値と違ったままになる。本家の版を上げたときは、本家の差分にparamDefやそれが参照する定数への書き換えが無いかを読む
+- **corpusは決定的に作る。** 同じgoldenと同じajvからは同じバイト列になる。endpointごとに、正しい入力と、1か所ずつ壊した入力(型の取り違え、制限の前後の値、必須の欠落、2か所の同時の違反など)を作る。`tools/paramdefspec/synthetic.json`には、本家のparamDefに無い形でkeywordの順や境界を確かめる手書きのschemaと入力を置いてあり、これもajvに判定させる。ajvが受理した入力のうち、受理した後の値にInfinity(`1e400`)が残るものはJSONに書けないので記録しない(2026.10.0では1件)
+- 落ちたテストの読み方
+  - `TestGoldenMatchesPinnedUpstream`: goldenが`UPSTREAM_MISSKEY_VERSION`の版から作られていない。`make paramdef-gen`を流す
+  - `TestConformsToAJVCorpus`の`was not built from the current`: goldenだけを作り直し、corpusを作り直していない(corpusのヘッダーにgoldenのsha256がある)
+  - `TestElythiaConformsToAJVCorpus`の`was not built from the current`: Elythia独自のendpointの宣言(`elythia_paramdefs.json`、#3869)のcorpusを作り直していない。ajvの版と設定を本家のgoldenから読むので、ヘッダーに本家のgoldenと宣言の両方のsha256がある。`paramdef-gen`は続けて`make elythia-paramdef-gen`を回すので、手で回すのは宣言だけを変えたとき([param-shadow.md](param-shadow.md#elythia独自のendpointの宣言3869))
+  - `TestEveryUpstreamParamDefCompiles`: 本家が、検証器の扱わないkeyword・format・正規表現の構文を使い始めた。enumのobject・配列の値と、型の無い(またはobject・配列の)itemsへの`uniqueItems`もここで落ちる。ajvはこれらをfast-deep-equalで比べ、比べるobjectの`constructor` / `toString` / `valueOf`キーで判定が変わる(または例外を投げる)ので、検証器は写さずに拒んでいる。`internal/api/paramschema`に足し、ajvでの挙動を`synthetic.json`に足してcorpusで確かめる
+  - `TestGoldenAJVConfigIsWhatThisPackageImplements`: 本家がajvの版・設定・formatを変えた。ajvの変更点を読み、検証器の挙動を合わせてからテストの期待値を更新する
+  - `TestCorpusRejectsAtEveryReachableKeyword`: 本家のparamDefのkeywordの位置のうち、corpusにそのschemaPathで拒否されたcaseが無いものがある。新しい形のparamDefに生成器(`corpus.mjs`の`mutate`)が届いていない。生成器を直す。errors[0]にならない位置なら、`coverage_test.go`の規則か個別の項目に理由と一緒に足す(使われなくなった規則や項目があっても落ちる)
+  - `TestConformsToAJVCorpus`の個々の不一致: 検証器とajvの判定が食い違った。不一致を例外にして通さず、検証器を直す
+- **goldenはバイナリに埋め込まれる。** 本番で検証だけを走らせて本家と判定が分かれる件数を数える仕組み(#3677、[param-shadow.md](param-shadow.md))が、このgoldenで判定する。作り直したgoldenは、次のビルドから数え方に効く
+- CIでは、`apicompat` workflowの`make upstream-check`が`paramdef-gen`を流して差分が無いことを見る。corpusとの一致は、nodeの要らない`go test`として`test`(`test-shards`)で走る
+- **goldenには`/api.json`の材料も入る**(#3810)。endpointごとの`doc`(metaの`description` / `tags` / `errors` / `res`と、`limit`の有無)、応答の型の定義の`refs`(本家の`misc/json-schema.ts`)、`endpoint-list.ts`の外で登録されるrouteの名前の`directRoutes`(本家の`ApiServerService.ts`)。chartの`res`は本家の`getJsonSchema`を`extract.mjs`の`chartJsonSchema`で同じように組み立てる。本家がこれらに新しい書き方を使い始めたときも、`unresolved values`で落ちる
+- **`paramdef-gen`の後に`make openapi-upstream-check`を流す**(Dockerが要る)。本家の公式image(`misskey/misskey:<版>`)の中で本家の`genOpenapiSpec`を呼んで`/api.json`を書き出し、`internal/api/openapi`が作る文書の本家互換の部分(全endpointのpathと`components`)と項目の順まで比べる。goldenの抜き出しかGoへの移植(`internal/api/openapi`)のどちらかがずれると、`TestSpecMatchesUpstreamAPIJSON`が落ちる。本家の`gen-spec.ts` / `schemas.ts` / `errors.ts`が変わっていたら、`internal/api/openapi`を合わせる。imageをpullするので`make gates`にもCIにも入れていない
+
+### `/api-doc`のScalarの版を上げるとき
+
+`/api-doc`は`internal/server/apidoc.go`の`scalarVersion`の版のScalarを、SRI(`scalarIntegrity`)で照合してjsdelivrから読む(#3810)。本家の版とは独立に上げる。
+
+1. 公開から2週間以上経った版を選ぶ
+2. `https://cdn.jsdelivr.net/npm/@scalar/api-reference@<版>/dist/browser/standalone.js`を取り、npmのtarballの同じファイルと同じであることを確かめてから、`openssl dgst -sha384 -binary standalone.js | openssl base64 -A`でhashを出す
+3. `scalarVersion`と`scalarIntegrity`を変え、手元で`/api-doc`を開いて表示と、CSPを`enforce`にしたときに違反が出ないことを確かめる。Scalarの設定の名前(`theme` / `withDefaultFonts` / `telemetry` / `proxyUrl` / `hideClientButton`など)や色の変数(`--scalar-*`)が変わっていないかも見る
+4. **「Test Request」の宛先が自分のoriginで、`proxy.scalar.com`など外へ出ていないことを確かめる。** localhostでないホスト名で開く(chromiumなら`--host-resolver-rules="MAP <名前> 127.0.0.1"`で向け、`config.url`もその名前にする)。`.test` / `.example` / `.invalid` / `localhost`はScalarがローカル扱いにして中継しないので、確かめたことにならない。認証付きのリクエストを送り、ページから出たリクエストの宛先を全部見る。`proxyUrl: ""`で中継が止まるのは、bundleの実装に頼っている(`$x`が未指定(`undefined`)のときだけ既定のproxyに置き換え、`Py`が空の`proxyUrl`を「中継しない」と扱う)。版を上げてこの扱いが変わると、何も言わずに中継が始まる
+
 ### 本家の版を上げた後に必須: TypeORM migrations seed の追加
 
 upstream に新しい migration が入った場合、`migrations` テーブルへの seed も追加する。
@@ -228,7 +269,7 @@ upstream に新しい migration が入った場合、`migrations` テーブル�
 migration を未実行と判定して**再実行**し、適用済み DDL への `ADD COLUMN` 重複や
 `DROP COLUMN` によるデータ喪失につながりうる (#2244)。
 
-復路は保証しない (#3191) が、この seed は `mkgo-born` で戻れる範囲を測る前提なので引き続き足す。
+復路は保証しない (#3191) が、この seed は `elythia-born` で戻れる範囲を測る前提なので引き続き足す。
 `TestMigrationSeed_CoversUpstream` が漏れを検出するので、落ちたら
 `migration/000067_migrations_typeorm_names.up.sql` と同じ形式で seed を足す。
 
@@ -244,24 +285,25 @@ TypeORM の decorator から正規形を再現できないため **実 DB から
 
 撮り直したら `TestIndexNaming_NoNewUpstreamDuplicates` を走らせる。Elythia 側に
 同内容・別名の index があれば検出されるので、upstream 名に揃えるか
-`known_duplicate_indexes.json` に追加して `000068` の扱いを見直す (#2246)。
+`known_duplicate_indexes.json` に追加して `000068` の扱いを見直す (#2246)。意図して並べる部分 index は
+`intended_partial_indexes.json` に理由と一緒に載せる (#3590)。
 
 ### 本家の版を上げた後に必須: MFM の絵文字の正規表現
 
-Elythia の MFM パーサは、mfm-js が依存する `@misskey-dev/emoji-data` の `emojiRegex` を Go の正規表現へ移したもの (`internal/activitypub/mfm/emoji_regex_gen.go`) で Unicode 絵文字を読む (#3324)。frontend の mfm-js の版か、それが依存する emoji-data の版が変わると、`emoji-regex-check` (CI では `frontend` workflow の `frontend-lint`、手元では `make frontend-check` から呼ばれる) が落ちる (正規表現が同じでも、snapshot に記録した版と食い違うため)。mfm-js の `unicodeEmoji` の書き方が変わったときも、生成ツールが前提の形を見つけられずに落ちる (下記)。
+Elythia の MFM の解析器は、サーバーが Go のモジュール `github.com/elythia-network/mfm` (#3514)、frontend が `@elythia-network/mfm` (#3515) で、どちらも Elythia-Network/mfm から出ている。Unicode 絵文字は、mfm-js が依存する `@misskey-dev/emoji-data` の `emojiRegex` で読む (#3324。Go のモジュールは Go の正規表現へ移したもの (`emoji_regex_gen.go`) を、frontend は `built/emoji-regex.gen.js` を同梱している)。どちらも mfm-js を使わないので、本家が mfm-js を上げてもここは変わらない。片方だけを上げて、正規表現か、記録された emoji-data / mfm-js の版が食い違うと、`emoji-regex-check` (CI では `frontend` workflow の `frontend-lint`、手元では `make frontend-check` から呼ばれる) が落ちる (正規表現が同じでも、snapshot に記録した版と食い違うため)。解析器を上げるときは、`go get` と `frontend/` の依存を同じリリースへ揃える。
 
 ```bash
-make emoji-regex     # 生成物と tools/emojiregex/testdata/source.txt を作り直す
-node internal/activitypub/mfm/testdata/emoji_mfmjs.mjs frontend \
-  > internal/activitypub/mfm/testdata/emoji_mfmjs.json   # mfm-js の期待値を作り直す
-GOWORK=off go test ./internal/activitypub/mfm/ ./tools/emojiregex/
+make emoji-regex     # tools/emojiregex/testdata/source.txt を書き写す (Go のモジュールと食い違えば落ちる)
+GOWORK=off go test ./tools/emojiregex/
 ```
 
-生成ツールは、mfm-js の `unicodeEmoji` の書き方 (`regexp(RegExp(emojiRegex.source))` と、U+FE0F だけのときに文字を返す `map`) と、正規表現が使う構文 (`?` だけの量指定・サロゲートペア・決まった位置の否定の先読み) を前提にしている。前提が崩れると生成の時点で落ちるので、その場合は生成ツールを直す。
+emoji-data か mfm-js の版が変わったときの mfm-js の期待値の作り直しは、Elythia-Network/mfm の側で行う。
+
+検査ツールは、解析器の書き出す形 (`emojiDataVersion` / `emojiMfmJsVersion` / `emojiRegex` の宣言が 1 つずつ、`emojiRegex` は `u` を付けない sticky (`y`) の `RegExp`) と、正規表現が使う構文 (`?` だけの量指定・サロゲートペア・決まった位置の否定の先読み) を前提にしている。前提が崩れると変換の時点で落ちるので、その場合は検査ツールを直す。
 
 ### 本家の版を上げた後に必須: divergence doc の件数
 
-`golden_upstream_columns.json` を撮り直すと `TestDivergenceDoc_ColumnCountMatchesSchema` が動く。**upstream が列を DROP すると、その列は「Elythia 独自カラム」に転じる**ので `docs/divergence.md` §2-2 の件数が増える (`note_favorite.createdAt` がその経緯で独自列になっている)。
+`golden_upstream_columns.json` を撮り直すと `TestDivergenceDoc_ColumnCountMatchesSchema` が動く。**upstream が列を DROP すると、その列は「Elythia 独自カラム」に転じる**ので `docs/divergence/db.md` §2-2 の件数が増える (`note_favorite.createdAt` がその経緯で独自列になっている)。
 
 落ちたら doc の件数・内訳・冒頭サマリ・表の行をまとめて直す。gate は 4 箇所すべてを見るので、どれか 1 つを直し忘れると通らない (#2634)。
 
@@ -296,7 +338,7 @@ server/api/endpoints/admin/promo/create.ts     ← 表示経路はここに無�
 
 **件数ではなくリストが一致するかを見る** (加減が相殺すると件数だけでは素通りする)。
 違っていたら中身を見て、`docs/api-compatibility.md` の「既知の制限」と
-`docs/divergence.md` §7 の promo 行を更新する。増えていれば表示経路が入った可能性、
+`docs/divergence/security.md` §7 の promo 行を更新する。増えていれば表示経路が入った可能性、
 減っていれば endpoint が削除された可能性。
 
 **0 件や `No such file or directory` が出たら、まず本家の取得を疑う**
@@ -323,19 +365,20 @@ Elythia と Misskey TS を並べて比較するハーネスは、**比較対象�
 | `.github/workflows/diff-e2e.yml` | diff ハーネスの pre-pull。**compose 側だけ上げて忘れやすい** (#2877 で実際に残した) |
 | `tests/dropin/compose.yml` / `tests/dropin-frontend/compose.yml` / `tests/federation/compose.misskey.yml` | drop-in / 実連合の TS インスタンス |
 | `.github/workflows/dropin-e2e.yml` / `dropin-frontend-e2e.yml` | 上記の pre-pull と matrix |
-| `tests/bench/` / `tests/queue-bench/` の compose | 性能比較の対象 |
-| 1.5.0以前の`MISSKEY_ASSETS_IMAGE` | 履歴上の外部assets image。2.0.0では本体の`frontend/`をビルドするため使用しない。過去のtagとdigestは変更しない。 |
+| `tests/bench/http/` / `tests/bench/queue/` の compose | 性能比較の対象 |
 
 **古い tag でも image は問題なくビルドできる**ので、腐っても CI は落ちない —
-落ちるのは配った先だけ。`tests/bench/` も同じ性質で、こちらはどの workflow からも
-参照されていない (`tests/queue-bench/` は nightly の `queue-bench-smoke.yml` が引く)。
-1.5.0以前は外部assets imageの公開確認も必要だったが、2.0.0では本体とプラグインのfrontendを同じimageでビルドする。旧assets workflowを2.0.0更新のために再実行しない。
+落ちるのは配った先だけ。`tests/bench/http/` の compose (本家と並べるスタック) はどの workflow からも
+参照されていない (`tests/bench/queue/` は nightly の `queue-bench-smoke.yml` が引く。
+`bench-compare.yml` が使うのは seed と k6 の共通部品だけで、本家の image は使わない)。
+毎週の本家との性能比較 (`bench-upstream.yml`、#3654) は本家の image の版を
+`UPSTREAM_MISSKEY_VERSION` から作るので、この表に載せる tag は無い (版を上げる PR で自動で流れる)。
 
-**表に載せただけでは止まらなかった。** #2877 で表へ載せた後も `Dockerfile.bundled` の
-pin は `2026.9.0-mk.0` に置き去りのままで、**リリースした `1.3.0-bundled` は既に 2 世代**
-(submodule は `2026.9.0-mk.2`)、当時のdevelopでは29世代ずれていた。この経緯は履歴として残す。2.0.0にはsubmoduleも外部assetsのpinも無く、同じ問題を防ぐため本体と4プラグインの同梱ビルドをPRのCIで確認する。Misakiでは過去のassets workflowに暗黙の`latest`更新があったため、修正前の過去タグのworkflowは再実行しない。
+以前は `Dockerfile.bundled` の `MISSKEY_ASSETS_IMAGE` (fork が publish する assets image)
+もこの表に入っていて、表に載せた後も実際に置き去りになった (#2877 / #3011)。#3379 で
+frontend を image の中でビルドするようになったので、その pin は無くなった。
 
-**探し方は `grep -rn 'misskey/misskey:' --include='*.yml' --include='*.yaml' --include='*.md' . | grep -v third_party`。**
+**探し方は `git grep -n 'misskey/misskey:' -- '*.yml' '*.yaml' '*.md'`。**
 表を手で追うより確実で、doc の散文に埋まった版数 (`docs/dropin-e2e.md` のトラブルシュート等) も拾える。
 
 **除外リストの「version-gap」注記は、版を揃えたら必ず読み直す。** 実例として、

@@ -13,15 +13,23 @@
 # (#3378)。本家から golden を作り直して差分が無いことと、本家を読むテストが skip
 # されずに通ることを確かめる。
 #
+# **本家のparamDefのgoldenとajvの照合corpus (#3673)もここで見る。**本家の.tsを
+# TypeScriptのパーサーで読み、本家と同じ版のajvで判定するので、nodeとfrontend/の
+# 依存が要る。本家の取得を前提にする検査なので、frontend workflowではなく
+# こちらに置く。
+#
 # **required check には含めない。** 判定材料に本家の内容が入るので、こちらの
 # コードを触っていない PR でも upstream の bump で赤くなりうる (`vulncheck` と同じ理由)。
 name: apicompat
 
 on:
   pull_request:
+    # **internal/server はディレクトリごと見る (#3672)。** route の登録は
+    # router.go だけにあるとは限らない (plugin_wiring.go が /api 配下を生やす)。
+    # 組み立てを別のファイルへ移した PR で発火しなくなるのを防ぐ。
     paths:
       - 'internal/api/**'
-      - 'internal/server/router.go'
+      - 'internal/server/**'
       - 'UPSTREAM_MISSKEY_VERSION'
       - 'tools/**'
       - 'internal/upstreamsrc/**'
@@ -29,6 +37,7 @@ on:
       - 'internal/misc/achievement/**'
       - 'docs/api-compat.md'
       - 'Makefile'
+      - 'frontend/pnpm-lock.yaml'
       - '.github/workflows/apicompat.yml'
   workflow_dispatch:
 
@@ -79,8 +88,9 @@ jobs:
       MK_REDIS_PORT: '6379'
 
     steps:
-      # 本家は下で別に取得する。`make build` の
-      # pluginbuild は同梱プラグインが既定無効なので frontend が無くても通る。
+      # 本家は下で別に取得する。`make build` のpluginbuildは、Misakiで既定有効の
+      # role-levelを含め、disabled: trueのstatus / trustlevelはskipする。
+      # role-levelはbackendだけなので、このビルドにfrontendのビルド成果物は要らない。
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read upstream version
@@ -101,6 +111,23 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # upstream-checkのparamdef-genは、本家の.tsをfrontend/のTypeScriptで読み、
+      # 照合のcorpusをfrontend/のajvで作る(#3673)。frontend workflowと同じ手順で
+      # 依存だけを入れる(buildはしない)。
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: frontend/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: frontend/.node-version
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm i --frozen-lockfile
+
       - name: Check golden against upstream
         run: make upstream-check
 
@@ -108,9 +135,10 @@ jobs:
       - name: Apply migrations
         run: go run ./cmd/elythia migrate -config tests/upstream-e2e/mkgo.yml -direction up
 
-      # **プラグインは入らない前提。** 同梱の 2 つは `disabled: true` なので
-      # `pluginbuild` が skip する (#2701)。自前プラグインを `plugins/` に置いた
-      # 手元で回すと 19 行混入するが、clean checkout では起きない。
+      # **既定有効のrole-levelも集計する。** clean checkoutの`make build`は
+      # role-levelを含み、そのPOSTルート13件もAPI一覧に載る。
+      # status / trustlevelはdisabled: trueなのでpluginbuildがskipする。
+      # 手元で別のプラグインを有効にすると生成結果も変わるため、同じ構成で再生成する。
       - name: Regenerate api-compat.md
         run: make apicompat APICOMPAT_CONFIG=tests/upstream-e2e/mkgo.yml
 
@@ -120,7 +148,7 @@ jobs:
             echo ""
             echo "docs/api-compat.md が実態とずれています。"
             echo "生成物なので手で直さず、再生成してコミットしてください。"
-            echo "手順は docs/development.md の apicompat を参照 (プラグイン抜き + testMode が要ります)。"
+            echo "手順は docs/development.md の apicompat を参照 (既定のrole-level構成 + testMode が要ります)。"
             exit 1
           fi
           echo "docs/api-compat.md は最新です。"

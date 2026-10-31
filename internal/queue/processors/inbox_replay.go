@@ -21,11 +21,31 @@ import (
 //
 // 署名の Date に窓 (activitypub.InboxDateSkew) を入れたことで再投函できる時間は
 // 有限になったが、窓の内側はまだ通る。ここはその内側を塞ぐ。
+//
+// **鍵は activity.id ではなく、署名が覆った時刻と本文のダイジェスト**
+// (activityReplayKey)。id を鍵にすると、同じ id で中身の違う活動 (本家 Misskey の
+// Undo(Follow) は `<Follow の id>/undo` で決定的、違うのは `published` だけ) を
+// 2 つ目から捨てる。本文だけを鍵にしても、Elythia 自身の Follow は決定的な id で
+// `published` も無いので、解除してから 15 分以内の再フォローが同じバイト列になり
+// 捨てられる。時刻は受付と同じ InboxDateHeader で、署名済みの X-Date を Date より
+// 優先する。未署名の X-Date は後付けできるので使わない。署名された値は改変できず、
+// 捕まえたリクエストの再投函では同じ値、正当な送り直しでは新しい値になる。これが
+// 「同じリクエスト」の過不足ない定義になる (2026-10-31 の監査とそのレビュー)。
 type InboxReplayGuard interface {
-	// Seen reports whether activityID was already processed.
-	Seen(ctx context.Context, activityID string) (bool, error)
-	// Remember records activityID as processed.
-	Remember(ctx context.Context, activityID string) error
+	// Seen reports whether a request with this replay key was already processed.
+	Seen(ctx context.Context, key string) (bool, error)
+	// Remember records the replay key as processed.
+	Remember(ctx context.Context, key string) error
+}
+
+// activityReplayKey derives the replay guard's key from the verified inbox date
+// (signed X-Date preferred over Date) and the signed request body.
+func activityReplayKey(date string, body []byte) string {
+	h := sha256.New()
+	h.Write([]byte(date))
+	h.Write([]byte{'\n'})
+	h.Write(body)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // inboxReplayTTL is how long a processed activity is remembered.

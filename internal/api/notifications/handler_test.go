@@ -18,6 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gorm.io/datatypes"
 
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/core/notification"
 	"github.com/elythia-network/elythia/internal/entity"
@@ -51,10 +52,10 @@ func TestMain(m *testing.M) {
 func newTestHandler(t *testing.T) (*Handler, *notification.Service) {
 	t.Helper()
 	testRedis.FlushAll(context.Background())
-	svc := notification.NewService(testRedis.Client, idGen, "")
+	svc := notification.NewService(testRedis.Client, idGen, "", nil)
 	// テストは AfterFunc 待ちを避けるため同期 publish にする。
 	svc.SetUnreadPublishDelay(0)
-	return NewHandler(svc, idGen), svc
+	return NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil), svc
 }
 
 func newJSONRequest(t *testing.T, path, body string) (echo.Context, *httptest.ResponseRecorder) {
@@ -157,6 +158,33 @@ func TestShow_SinceDate_EpochIncludesAll(t *testing.T) {
 	require.Len(t, resp, 1, "sinceDate=0 (= 1970) で全件含まれること")
 }
 
+// i/notifications・i/notifications-grouped の整数は、本家の ajv と同じく 10.0 や
+// 1e1 も受ける (#3851)。
+func TestShowAndGrouped_IntegerParamsAcceptFractionForms(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	for _, notifier := range []string{"bob", "carol"} {
+		_, err := svc.Create(ctx, notification.CreateInput{
+			NotifieeID: "alice", NotifierID: notifier, Type: notification.TypeFollow,
+		})
+		require.NoError(t, err)
+	}
+	for name, fn := range map[string]func(echo.Context) error{"i/notifications": h.Show, "i/notifications-grouped": h.Grouped} {
+		for body, want := range map[string]int{
+			`{"limit":1e1,"sinceDate":0.0,"untilDate":4102444800000.0}`: 2,
+			`{"limit":1.0}`: 1,
+		} {
+			c, rec := newJSONRequest(t, "/api/"+name, body)
+			setAuth(c, &model.User{ID: "alice"})
+			require.NoError(t, fn(c))
+			require.Equal(t, http.StatusOK, rec.Code, "%s %s: %s", name, body, rec.Body.String())
+			var resp []map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			assert.Len(t, resp, want, "%s %s", name, body)
+		}
+	}
+}
+
 // untilDate を未来に設定したら全 notification が post-fetch filter を通過する
 // (= untilID は exclusive upper bound、未来 ms に対する aidx prefix は全 ID
 // より大きいので全件含まれる)。
@@ -213,8 +241,8 @@ func TestShow_InvalidJSON(t *testing.T) {
 func TestShow_RedisError(t *testing.T) {
 	closed := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	_ = closed.Close()
-	svc := notification.NewService(closed, idGen, "")
-	h := NewHandler(svc, idGen)
+	svc := notification.NewService(closed, idGen, "", nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil)
 
 	c, rec := newJSONRequest(t, "/api/i/notifications", `{}`)
 	setAuth(c, &model.User{ID: "alice"})
@@ -362,8 +390,8 @@ func TestShow_ImplicitMarkAsReadDoesNotForce(t *testing.T) {
 func TestMarkAllAsRead_RedisError(t *testing.T) {
 	closed := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	_ = closed.Close()
-	svc := notification.NewService(closed, idGen, "")
-	h := NewHandler(svc, idGen)
+	svc := notification.NewService(closed, idGen, "", nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil)
 
 	c, rec := newJSONRequest(t, "/api/notifications/mark-all-as-read", `{}`)
 	setAuth(c, &model.User{ID: "alice"})
@@ -501,7 +529,7 @@ func TestCreate_EmptyBodyAccepted(t *testing.T) {
 
 func TestCreate_NilService(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(nil, idGen)
+	h := NewHandler(nil, idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newJSONRequest(t, "/api/notifications/create", `{"body":"x"}`)
 	setAuth(c, &model.User{ID: "alice"})
 	require.NoError(t, h.Create(c))
@@ -531,7 +559,7 @@ func TestFlush_Success(t *testing.T) {
 
 func TestFlush_NilService(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(nil, idGen)
+	h := NewHandler(nil, idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newJSONRequest(t, "/api/notifications/flush", `{}`)
 	setAuth(c, &model.User{ID: "alice"})
 	require.NoError(t, h.Flush(c))
@@ -541,8 +569,8 @@ func TestFlush_NilService(t *testing.T) {
 func TestFlush_RedisError(t *testing.T) {
 	closed := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	_ = closed.Close()
-	svc := notification.NewService(closed, idGen, "")
-	h := NewHandler(svc, idGen)
+	svc := notification.NewService(closed, idGen, "", nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil)
 
 	c, rec := newJSONRequest(t, "/api/notifications/flush", `{}`)
 	setAuth(c, &model.User{ID: "alice"})
@@ -1043,7 +1071,7 @@ func TestShow_ResolvesNoteFiles(t *testing.T) {
 	}
 	h.SetRepos(userRepo, noteRepo)
 	h.SetQueryService(corenote.NewQueryService(noteRepo, testutil.NewMockFollowingRepository()))
-	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(driveRepo, nil, nil, nil, nil, idGen))
+	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(nil, driveRepo, nil, nil, nil, nil, idGen))
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
 		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeMention, NoteID: "n1",
@@ -1102,7 +1130,7 @@ func TestShow_HiddenEmbedKeepsFilesEmpty(t *testing.T) {
 	}
 	h.SetRepos(userRepo, noteRepo)
 	h.SetQueryService(corenote.NewQueryService(noteRepo, testutil.NewMockFollowingRepository()))
-	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(driveRepo, nil, nil, nil, nil, idGen))
+	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(nil, driveRepo, nil, nil, nil, nil, idGen))
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
 		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeMention, NoteID: "n1",
@@ -1161,7 +1189,7 @@ func TestShow_VisibleEmbedCarriesFiles(t *testing.T) {
 	}
 	h.SetRepos(userRepo, noteRepo)
 	h.SetQueryService(corenote.NewQueryService(noteRepo, testutil.NewMockFollowingRepository()))
-	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(driveRepo, nil, nil, nil, nil, idGen))
+	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(nil, driveRepo, nil, nil, nil, nil, idGen))
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
 		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeMention, NoteID: "n1",
@@ -1495,7 +1523,7 @@ func TestCollectNotificationsWithDropped_ExplicitEmptyIncludeTypesReturnsNothing
 	})
 	require.NoError(t, err)
 
-	limit := 10
+	limit := jsnum.Int(10)
 	c, _ := newJSONRequest(t, "/api/i/notifications", `{}`)
 	user := &model.User{ID: "alice"}
 

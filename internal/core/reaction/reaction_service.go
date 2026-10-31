@@ -13,7 +13,9 @@ import (
 	"github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/idnhost"
 	"github.com/elythia-network/elythia/internal/misc/reactionlegacy"
+	"github.com/elythia-network/elythia/internal/misc/remoteurl"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/forPelevin/gomoji"
@@ -96,6 +98,13 @@ type NotificationHook interface {
 	// OnReactionRemoved removes the notification the reaction left (#3201).
 	// 取り消しと、別のリアクションへの付け替えの両方で呼ぶ。
 	OnReactionRemoved(notifieeID, notifierID, noteID string)
+}
+
+// NoteLoadingNotificationHook is implemented by a NotificationHook that can
+// take the reacted note from the caller instead of reading it again (#3611).
+// load returns the note as it is after the reaction was written.
+type NoteLoadingNotificationHook interface {
+	OnReactionCreatedWithNote(notifieeID, notifierID, noteID, reaction string, load func() (*model.Note, error))
 }
 
 // FederationHook is invoked after a reaction is created or removed so that
@@ -192,16 +201,6 @@ func (s *Service) SetFeaturedRanking(r FeaturedRanking) {
 	s.featuredRanking = r
 }
 
-// SetUserRolesProvider wires role lookup for role-gated emoji reaction gating (#1538).
-func (s *Service) SetUserRolesProvider(p UserRolesProvider) {
-	s.userRoles = p
-}
-
-// SetMediaSilenceChecker wires the media-silence host check for reaction gating (#1538).
-func (s *Service) SetMediaSilenceChecker(c MediaSilenceChecker) {
-	s.mediaSilence = c
-}
-
 // SetCountWriter replaces the default direct writer with a buffered one.
 func (s *Service) SetCountWriter(w ReactionCountWriter) {
 	s.countWriter = w
@@ -213,32 +212,42 @@ func (s *Service) CountWriter() ReactionCountWriter {
 }
 
 // NewService constructs a new ReactionService.
+//
+// userRoles gates role-limited custom emoji (#1538). mediaSilence turns custom
+// emoji reactions from media-silenced hosts into the fallback (#1538).
+// blockingChecker refuses reactions to notes of users who block the reactor.
+//
+// 3 つとも無いと黙って緩む側に倒れる (ロール限定の絵文字を誰でも使える /
+// media-silenced な host の絵文字がそのまま出る / 自分をブロックしている相手の
+// 投稿にリアクションできる。blockingChecker の判定は IsBlocked(target.UserID,
+// user.ID) で、blocker が投稿の著者) ので、構築子の必須の引数で受ける (#3825)。
 func NewService(
 	noteRepo repository.NoteRepository,
 	reactionRepo repository.NoteReactionRepository,
 	emojiRepo repository.EmojiRepository,
 	followingRepo repository.FollowingRepository,
 	idGen id.Generator,
+	userRoles UserRolesProvider,
+	mediaSilence MediaSilenceChecker,
+	blockingChecker BlockingChecker,
 ) *Service {
 	return &Service{
-		noteRepo:      noteRepo,
-		reactionRepo:  reactionRepo,
-		emojiRepo:     emojiRepo,
-		followingRepo: followingRepo,
-		idGen:         idGen,
-		countWriter:   NewDirectWriter(noteRepo),
-		randFn:        rand.Float64,
+		noteRepo:        noteRepo,
+		reactionRepo:    reactionRepo,
+		emojiRepo:       emojiRepo,
+		followingRepo:   followingRepo,
+		idGen:           idGen,
+		userRoles:       userRoles,
+		mediaSilence:    mediaSilence,
+		blockingChecker: blockingChecker,
+		countWriter:     NewDirectWriter(noteRepo),
+		randFn:          rand.Float64,
 	}
 }
 
 // SetNotificationHook attaches a NotificationHook used after Create succeeds.
 func (s *Service) SetNotificationHook(h NotificationHook) {
 	s.notificationHook = h
-}
-
-// SetBlockingChecker attaches a BlockingChecker used by Create.
-func (s *Service) SetBlockingChecker(c BlockingChecker) {
-	s.blockingChecker = c
 }
 
 // SetFederationHook attaches a FederationHook used after Create / Delete
@@ -288,6 +297,10 @@ func (s *Service) materializeIfMissing(noteID string, lookupErr error) bool {
 func (s *Service) SetNoteStreamHook(h NoteStreamHook) {
 	s.noteStreamHook = h
 }
+
+// maxReplaceAttempts bounds how often Create re-reads the existing reaction
+// after losing a race while replacing it.
+const maxReplaceAttempts = 3
 
 // Create attaches a reaction by user to the target note.
 // 同じユーザーが既に同じリアクションをしている場合は ErrAlreadyReacted。
@@ -346,7 +359,18 @@ func (s *Service) Create(user *model.User, noteID, rawReaction string) (string, 
 	reaction = s.applyReactionAcceptance(user, target, reaction, reactionEmoji)
 
 	// 既存リアクションを確認
-	if existing, err := s.reactionRepo.FindByPair(user.ID, target.ID); err == nil {
+	//
+	// **付け替えで Delete が 0 行なら、読み直してやり直す。** 読んだ後に並行の
+	// 要求が外した (リモートの付け替えは Undo と Like が別々に届き、並行に処理
+	// されうる) なら、読み直すと何も無いので新しいリアクションを足せる。並行の
+	// 付け替えが先に勝ったなら、勝った方を読んで同じ規則で決める。負けを
+	// ErrAlreadyReacted で返して終えると、連合の Like は受け取ったことになり、
+	// 新しいリアクションが保存されないまま再送もされない。
+	for attempt := 0; ; attempt++ {
+		existing, err := s.reactionRepo.FindByPair(user.ID, target.ID)
+		if err != nil {
+			break
+		}
 		if existing.Reaction == reaction {
 			return "", ErrAlreadyReacted
 		}
@@ -356,7 +380,12 @@ func (s *Service) Create(user *model.User, noteID, rawReaction string) (string, 
 			return "", err
 		}
 		if affected == 0 {
-			return "", ErrReactionNotFound
+			if attempt < maxReplaceAttempts-1 {
+				continue
+			}
+			// 何度読み直しても競合に負け続けるなら、他の要求が付け替え続けて
+			// いる。以前は ErrReactionNotFound が handler で 500 になっていた。
+			return "", ErrAlreadyReacted
 		}
 		// 集計列も古いリアクションを-1
 		_ = s.countWriter.Increment(target.ID, existing.Reaction, -1)
@@ -376,6 +405,7 @@ func (s *Service) Create(user *model.User, noteID, rawReaction string) (string, 
 		if s.noteStreamHook != nil {
 			s.noteStreamHook.OnUnreacted(target.ID, user.ID, decodeReactionForStream(existing.Reaction))
 		}
+		break
 	}
 
 	rec := &model.NoteReaction{
@@ -406,7 +436,11 @@ func (s *Service) Create(user *model.User, noteID, rawReaction string) (string, 
 
 	// 通知発行 (自分自身へのリアクションは内部で抑制される)
 	if s.notificationHook != nil && target.UserID != user.ID {
-		s.notificationHook.OnReactionCreated(target.UserID, user.ID, target.ID, reaction)
+		if nh, ok := s.notificationHook.(NoteLoadingNotificationHook); ok {
+			nh.OnReactionCreatedWithNote(target.UserID, user.ID, target.ID, reaction, s.reactedNoteLoader(target))
+		} else {
+			s.notificationHook.OnReactionCreated(target.UserID, user.ID, target.ID, reaction)
+		}
 	}
 	// AP配信もベストエフォート。
 	if s.federationHook != nil {
@@ -429,6 +463,34 @@ func (s *Service) Create(user *model.User, noteID, rawReaction string) (string, 
 	s.updateFeaturedOnReaction(target, user.ID)
 
 	return reaction, nil
+}
+
+// reactedNoteLoader returns a loader for target as it is after the reaction
+// was written: the note row is read again, and the relations are taken from
+// target.
+//
+// 通知の pack は、書き込みの後の値 (reactions の数) を出す。以前は
+// FindByIDWithRelations で relation ごと読み直していたが、リアクションが変える
+// のは note の行 (reactions) だけで、作者・投票・リノート先・返信先は変えない。
+// なので行だけを 1 本で読み直し、relation は同じ要求の最初に読んだものを使う
+// (#3611)。行の読み直しを省いて手元で数を足すことはしない — buffered な
+// writer では DB の行に足されないので、手元で足すと従来 (DB の行を読む) と値が
+// 変わる。並行の別のリアクションも、従来どおり読んだ時点の行に入る。
+func (s *Service) reactedNoteLoader(target *model.Note) func() (*model.Note, error) {
+	return func() (*model.Note, error) {
+		row, err := s.noteRepo.FindByID(target.ID)
+		if err != nil {
+			return nil, err
+		}
+		// 読んだ値を書き換えずに写してから relation を付ける (repository が
+		// キャッシュした値を返す実装でも、それを壊さない)。
+		fresh := *row
+		fresh.User = target.User
+		fresh.Poll = target.Poll
+		fresh.Renote = target.Renote
+		fresh.Reply = target.Reply
+		return &fresh, nil
+	}
 }
 
 // updateFeaturedOnReaction boosts the reacted note's featured engagement ranking
@@ -620,6 +682,19 @@ func (s *Service) resolveReactionValue(raw string, actorHost *string) (string, *
 		if host == "." {
 			host = ""
 		}
+		// **リモートの利用者は、自分のホストの絵文字しか指せない。** upstream は
+		// `(?:@\.)?` しか受けず (`:name@otherhost:` は ❤ に倒れる)、名前を
+		// リアクションした人のホストで引く。他のホストを指させると、リモートの
+		// actor がリアクションの欄に第三のサーバーの絵文字 (公式マーク風のものなど)
+		// を出せた。ローカルの利用者が `:name@host:` で送る形は、frontend の相乗り
+		// (#2697) と揃えるために受ける (docs/divergence/frontend.md の mk.9)。
+		if host != "" && actorHost != nil && *actorHost != "" {
+			if !strings.EqualFold(host, *actorHost) {
+				return FallbackReaction, nil
+			}
+			// 大文字小文字の違いは、保存してある actor のホストの綴りで引く。
+			host = *actorHost
+		}
 		// reaction 文字列に @host が含まれず reactor が remote なら、
 		// 文字列 host が省略されているだけで実体はリモート絵文字。
 		// upstream ReactionService.create がやっているのと同じく
@@ -679,6 +754,13 @@ func (s *Service) applyReactionAcceptance(user *model.User, target *model.Note, 
 	if emoji == nil {
 		return reaction
 	}
+	// ローカル限定の絵文字は、投稿者 (renote なら renote 元の投稿者も) が
+	// リアクションした人と同じサーバーのときだけ使える。そうでなければ ❤
+	// (本家 ReactionService.create の canUseLocalOnlyEmoji)。他のサーバーへ
+	// 配送される投稿に、配らない絵文字を付けないため。
+	if emoji.LocalOnly && !canUseLocalOnlyEmoji(user, target) {
+		return FallbackReaction
+	}
 	// role-gated emoji: 使用可能 role を持たなければ ❤。
 	if len(emoji.RoleIDsThatCanBeUsedThisEmojiAsReaction) > 0 && !s.reactorHasAllowedRole(user.ID, emoji.RoleIDsThatCanBeUsedThisEmojiAsReaction) {
 		return FallbackReaction
@@ -692,6 +774,29 @@ func (s *Service) applyReactionAcceptance(user *model.User, target *model.Note, 
 		return FallbackReaction
 	}
 	return reaction
+}
+
+// canUseLocalOnlyEmoji reports whether the reacter may use a local-only emoji
+// on target: the note's author and, for a renote, the renoted note's author
+// must be on the reacter's host. Mirrors upstream
+// `note.userHost === reacterHost && (note.renoteUserHost == null || note.renoteUserHost === reacterHost)`.
+func canUseLocalOnlyEmoji(user *model.User, target *model.Note) bool {
+	if !sameHost(target.UserHost, user.Host) {
+		return false
+	}
+	return target.RenoteUserHost == nil || sameHost(target.RenoteUserHost, user.Host)
+}
+
+// sameHost compares two hosts the way upstream compares userHost columns with
+// toPunyNullable(user.host): nil (or empty) is this server, and remote hosts
+// are compared in their punycode form.
+func sameHost(a, b *string) bool {
+	aLocal := a == nil || *a == ""
+	bLocal := b == nil || *b == ""
+	if aLocal || bLocal {
+		return aLocal && bLocal
+	}
+	return idnhost.Puny(*a) == idnhost.Puny(*b)
 }
 
 // reactorHasAllowedRole reports whether the user holds any of the roles allowed
@@ -784,9 +889,10 @@ func (s *Service) resolveStreamEmoji(reaction string) *NoteStreamEmoji {
 	if err != nil || emoji == nil {
 		return nil
 	}
-	url := emoji.PublicURL
-	if url == "" {
-		url = emoji.OriginalURL
+	// リモートの絵文字の、形の崩れた URL は使わず、絵文字が無いときと同じにする。
+	url, ok := remoteurl.EmojiURL(emoji.PublicURL, emoji.OriginalURL, host != "")
+	if !ok {
+		return nil
 	}
 	suffix := host
 	if suffix == "" {
@@ -821,22 +927,3 @@ func isPureRenote(n *model.Note) bool {
 	}
 	return true
 }
-
-// HasUserRolesProvider reports whether the user roles provider was wired.
-//
-// 未配線だとロール限定カスタム絵文字の gate が素通しになり、誰でも使える。
-// 起動時検査に使う (#2683)。
-func (s *Service) HasUserRolesProvider() bool { return s.userRoles != nil }
-
-// HasMediaSilenceChecker reports whether the media-silence checker was wired.
-//
-// 未配線だと media-silenced な host からのカスタム絵文字リアクションがそのまま
-// 出る (フォールバックの ❤ にならない)。起動時検査に使う (#2708)。
-func (s *Service) HasMediaSilenceChecker() bool { return s.mediaSilence != nil }
-
-// HasBlockingChecker reports whether the blocking checker was wired.
-//
-// 未配線だと**自分をブロックしている**相手の投稿にリアクションできる。gate は
-// `IsBlocked(target.UserID, user.ID)` (blocker が note 著者) なので、自分が
-// ブロックした相手への操作はそもそもここを通らない。起動時検査に使う (#2708)。
-func (s *Service) HasBlockingChecker() bool { return s.blockingChecker != nil }

@@ -91,8 +91,8 @@ func TestGrouped_ReactionsGroupOnSameNote(t *testing.T) {
 
 // TestGrouped_NonVisibleEmbedHidden locks in the #1546/#1570 fix: a followers-only
 // renote embedded in a notifications-grouped note must be blanked for a viewer who
-// cannot see it. notehide.HideNotificationNotes fail-closes on the unset
-// package-level following repo, so a non-follower viewer never sees the embed body.
+// cannot see it. Hider.HideNotificationNotes fail-closes on an unwired Hider
+// (no following repo), so a non-follower viewer never sees the embed body.
 func TestGrouped_NonVisibleEmbedHidden(t *testing.T) {
 	h, svc, userRepo, noteRepo := groupedHandler(t)
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
@@ -515,7 +515,7 @@ func TestGrouped_ResolvesNoteFiles(t *testing.T) {
 	}
 	h.SetRepos(userRepo, noteRepo)
 	h.SetQueryService(corenote.NewQueryService(noteRepo, testutil.NewMockFollowingRepository()))
-	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(driveRepo, nil, nil, nil, nil, idGen))
+	h.SetNoteFieldResolver(entity.NewNoteFieldResolver(nil, driveRepo, nil, nil, nil, nil, idGen))
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
 		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeMention, NoteID: "n1",

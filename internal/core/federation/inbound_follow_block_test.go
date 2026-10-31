@@ -1,6 +1,7 @@
 package federation_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
@@ -16,7 +17,7 @@ import (
 
 // newProcessorForInboundFollowBlock wires the processor the same way as
 // production (router.go): followingSvc.SetBlockingChecker(blockingSvc) +
-// processor.SetBlockingService(blockingSvc)。remote alice / local bob を
+// NewProcessor の blockingService (テストでは SetBlockingServiceForTest)。remote alice / local bob を
 // pre-seed して resolver の fetch を回避する (#1631)。
 func newProcessorForInboundFollowBlock(t *testing.T) (
 	*federation.Processor,
@@ -31,14 +32,13 @@ func newProcessorForInboundFollowBlock(t *testing.T) (
 	blockingRepo := testutil.NewMockBlockingRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	blockingSvc := coreblocking.NewService(repo, blockingRepo, idGen)
-	blockingSvc.SetUnfollower(followingSvc)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	blockingSvc := coreblocking.NewService(repo, blockingRepo, idGen, followingSvc, nil, nil, nil)
 	followingSvc.SetBlockingChecker(blockingSvc)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	p.SetBlockingService(blockingSvc)
-	p.SetLocalBaseURL("https://example.com")
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p.SetBlockingServiceForTest(blockingSvc)
+	p.SetLocalBaseURLForTest("https://example.com")
 
 	// remote alice を URI 付きで pre-seed (resolver は FindByURI hit で再利用)
 	aliceURI := "https://remote.example/users/alice"
@@ -58,6 +58,82 @@ var inboundFollowBody = []byte(`{
 	"actor": "https://remote.example/users/alice",
 	"object": "https://example.com/users/bob"
 }`)
+
+type inboundLocalReferenceObserver struct{ recorded []string }
+
+func (o *inboundLocalReferenceObserver) IsExternallyAvailable(user *model.User) bool {
+	return user != nil && user.FederationStatus == model.FederationStatusOn && !user.IsSuspended && !user.IsDeleted
+}
+func (o *inboundLocalReferenceObserver) ObserveExternalReference(userID, reason, host string) (bool, error) {
+	o.recorded = append(o.recorded, userID+":"+reason+":"+host)
+	return true, nil
+}
+
+func newProcessorForLocalReferenceTest(t *testing.T, status model.FederationStatus) (*federation.Processor, *testutil.MockFollowingRepository, *testutil.MockNoteRepository, *inboundLocalReferenceObserver) {
+	t.Helper()
+	users := testutil.NewMockUserRepository()
+	notes := testutil.NewMockNoteRepository()
+	followings := testutil.NewMockFollowingRepository()
+	urls := activitypub.NewURLBuilder("https://example.com")
+	idGen, err := id.NewGenerator("aidx")
+	require.NoError(t, err)
+	observer := &inboundLocalReferenceObserver{}
+	resolver := federation.NewResolverNilDeps(users, notes, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	resolver.SetLocalFederationObserver(observer)
+	followingSvc := corefollowing.NewService(users, followings, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, users, notes)
+	p.SetLocalBaseURLForTest("https://example.com")
+	aliceURI, remoteHost := "https://remote.example/users/alice", "remote.example"
+	users.Users["alice1"] = &model.User{ID: "alice1", Username: "alice", UsernameLower: "alice", URI: &aliceURI, Host: &remoteHost}
+	users.Users["bob"] = &model.User{ID: "bob", Username: "bob", UsernameLower: "bob", FederationStatus: status}
+	return p, followings, notes, observer
+}
+
+func TestProcess_FollowChecksTheWorkerResolvedLocalUser(t *testing.T) {
+	uris := []string{
+		"https://example.com/users/bob/extra",
+		"https://example.com/users/bob?x=1",
+		"http://example.com/users/bob",
+		"https://example.com/users/bob/",
+	}
+	for _, status := range []model.FederationStatus{model.FederationStatusOff, model.FederationStatusPending, model.FederationStatusOn} {
+		for _, uri := range uris {
+			t.Run(string(status)+"/"+uri, func(t *testing.T) {
+				p, followings, _, observer := newProcessorForLocalReferenceTest(t, status)
+				body := []byte(strings.Replace(string(inboundFollowBody), "https://example.com/users/bob", uri, 1))
+				err := p.Process(body)
+				if status == model.FederationStatusOn {
+					require.NoError(t, err)
+					assert.Len(t, followings.Followings, 1)
+					assert.Equal(t, []string{"bob:inbox:remote.example"}, observer.recorded)
+				} else {
+					require.ErrorIs(t, err, federation.ErrInboundLocalReferenceUnavailable)
+					assert.Empty(t, followings.Followings)
+					assert.Empty(t, observer.recorded)
+				}
+			})
+		}
+	}
+}
+
+func TestProcess_CreateGuardsResolvedMentionBeforeSavingNote(t *testing.T) {
+	for _, status := range []model.FederationStatus{model.FederationStatusOff, model.FederationStatusPending, model.FederationStatusOn} {
+		t.Run(string(status), func(t *testing.T) {
+			p, _, notes, observer := newProcessorForLocalReferenceTest(t, status)
+			body := []byte(`{"type":"Create","id":"https://remote.example/activities/c1","actor":"https://remote.example/users/alice","object":{"id":"https://remote.example/notes/n1","type":"Note","attributedTo":"https://remote.example/users/alice","to":["https://www.w3.org/ns/activitystreams#Public"],"content":"hello","tag":[{"type":"Mention","href":"https://example.com/x/bob","name":"@bob@example.com"}]}}`)
+			err := p.Process(body)
+			if status != model.FederationStatusOn {
+				require.ErrorIs(t, err, federation.ErrInboundLocalReferenceUnavailable)
+				assert.Empty(t, notes.Notes, "the rejected body must not create its Note")
+				assert.Empty(t, observer.recorded)
+			} else {
+				require.NoError(t, err)
+				require.Len(t, notes.Notes, 1)
+				assert.Equal(t, []string{"bob:inbox:remote.example"}, observer.recorded)
+			}
+		})
+	}
+}
 
 // local followee が remote follower を block している場合、エラーではなく
 // Reject を配送して正常終了する (#1631、upstream UserFollowingService.follow)。
@@ -112,13 +188,12 @@ func TestProcess_FollowBlockingWithoutBlockingServiceErrors(t *testing.T) {
 	blockingRepo := testutil.NewMockBlockingRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	blockingSvc := coreblocking.NewService(repo, blockingRepo, idGen)
-	blockingSvc.SetUnfollower(followingSvc)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	blockingSvc := coreblocking.NewService(repo, blockingRepo, idGen, followingSvc, nil, nil, nil)
 	followingSvc.SetBlockingChecker(blockingSvc)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	p.SetLocalBaseURL("https://example.com")
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p.SetLocalBaseURLForTest("https://example.com")
 	aliceURI := "https://remote.example/users/alice"
 	host := "remote.example"
 	repo.Users["alice1"] = &model.User{ID: "alice1", Username: "alice", UsernameLower: "alice", URI: &aliceURI, Host: &host}
@@ -140,10 +215,10 @@ func TestProcess_FollowRemoteFolloweeSkipped(t *testing.T) {
 	followingRepo := testutil.NewMockFollowingRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	p.SetLocalBaseURL("https://example.com")
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p.SetLocalBaseURLForTest("https://example.com")
 	acceptor := &stubInboundFollowAcceptor{}
 	p.SetInboundFollowAcceptor(acceptor)
 

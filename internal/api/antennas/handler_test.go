@@ -49,8 +49,8 @@ func newHandler(t *testing.T) (*Handler, *testutil.MockAntennaRepository, *testu
 	testRedis.FlushAll(context.Background())
 	repo := testutil.NewMockAntennaRepository()
 	noteRepo := testutil.NewMockNoteRepository()
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen)
-	return NewHandler(svc, noteRepo, idGen), repo, noteRepo
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen, nil)
+	return NewHandler(svc, noteRepo, idGen, nil, nil, nil, nil, nil, nil), repo, noteRepo
 }
 
 func newReq(t *testing.T, body string) (echo.Context, *httptest.ResponseRecorder) {
@@ -139,8 +139,8 @@ func (r *failingAntennaRepo) Create(_ *model.Antenna) error { return errors.New(
 func TestCreate_RepoError(t *testing.T) {
 	mock := testutil.NewMockAntennaRepository()
 	repo := &failingAntennaRepo{MockAntennaRepository: mock}
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen)
-	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen)
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen, nil)
+	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"name":"alpha","src":"all","keywords":[["foo"]],"excludeKeywords":[],"users":[],"caseSensitive":false,"withReplies":false,"withFile":false}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Create(c))
@@ -154,9 +154,9 @@ func newHandlerWithUserList(t *testing.T) (*Handler, *testutil.MockAntennaReposi
 	testRedis.FlushAll(context.Background())
 	repo := testutil.NewMockAntennaRepository()
 	lists := testutil.NewMockUserListRepository()
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen)
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen, nil)
 	svc.SetUserListRepo(lists)
-	return NewHandler(svc, testutil.NewMockNoteRepository(), idGen), repo, lists
+	return NewHandler(svc, testutil.NewMockNoteRepository(), idGen, nil, nil, nil, nil, nil, nil), repo, lists
 }
 
 // upstream create.ts: keywords と excludeKeywords が両方空なら EMPTY_KEYWORD (#1544)。
@@ -332,8 +332,8 @@ func TestUpdate_RepoError(t *testing.T) {
 	mock := testutil.NewMockAntennaRepository()
 	mock.Antennas["a1"] = &model.Antenna{ID: "a1", UserID: "alice"}
 	repo := &failingUpdateRepo{MockAntennaRepository: mock}
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen)
-	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen)
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen, nil)
+	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"antennaId":"a1","name":"x"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Update(c))
@@ -433,8 +433,8 @@ func TestDelete_RepoError(t *testing.T) {
 	mock := testutil.NewMockAntennaRepository()
 	mock.Antennas["a1"] = &model.Antenna{ID: "a1", UserID: "alice"}
 	repo := &failingDeleteRepo{MockAntennaRepository: mock}
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen)
-	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen)
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen, nil)
+	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"antennaId":"a1"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Delete(c))
@@ -469,8 +469,8 @@ func (r *listFailRepo) ListByUser(_ string) ([]*model.Antenna, error) {
 
 func TestList_RepoError(t *testing.T) {
 	repo := &listFailRepo{MockAntennaRepository: testutil.NewMockAntennaRepository()}
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen)
-	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen)
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen, nil)
+	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newReq(t, `{}`)
 	setUser(c, "alice")
 	require.NoError(t, h.List(c))
@@ -524,8 +524,8 @@ func TestNotes_RedisError(t *testing.T) {
 	repo.Antennas["a1"] = &model.Antenna{ID: "a1", UserID: "alice"}
 	closed := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	_ = closed.Close()
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), closed, idGen)
-	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen)
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), closed, idGen, nil)
+	h := NewHandler(svc, testutil.NewMockNoteRepository(), idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"antennaId":"a1"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Notes(c))
@@ -580,9 +580,9 @@ func TestNotes_PagingUntilId(t *testing.T) {
 func TestNotes_NoteRepoError(t *testing.T) {
 	repo := testutil.NewMockAntennaRepository()
 	repo.Antennas["a1"] = &model.Antenna{ID: "a1", UserID: "alice"}
-	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen)
+	svc := coreantenna.NewService(repo, testutil.NewMockUserRepository(), testRedis.Client, idGen, nil)
 	noteRepo := &failingNoteRepo{MockNoteRepository: testutil.NewMockNoteRepository()}
-	h := NewHandler(svc, noteRepo, idGen)
+	h := NewHandler(svc, noteRepo, idGen, nil, nil, nil, nil, nil, nil)
 	c, rec := newReq(t, `{"antennaId":"a1"}`)
 	setUser(c, "alice")
 	require.NoError(t, h.Notes(c))
@@ -703,7 +703,7 @@ func TestNotes_MuteBlockChannelFiltered(t *testing.T) {
 	require.NoError(t, blocking.Create(&model.Blocking{ID: "b1", BlockerID: "blocker", BlockeeID: "alice"}))
 	channelMuting := testutil.NewMockChannelMutingRepository()
 	require.NoError(t, channelMuting.Create(&model.ChannelMuting{UserID: "alice", ChannelID: "ch-muted"}))
-	h.SetMuteBlockRepos(muting, blocking, channelMuting)
+	h.mutingRepo, h.blockingRepo, h.channelMutingRepo = muting, blocking, channelMuting
 
 	mutedCh := "ch-muted"
 	notes := map[string]*model.Note{
@@ -739,7 +739,7 @@ func TestNotes_MuteBlockLoadError(t *testing.T) {
 
 	blocking := testutil.NewMockBlockingRepository()
 	blocking.ExistsErr = errors.New("block boom") // ListBlockerIDs もこのエラーで失敗する
-	h.SetMuteBlockRepos(testutil.NewMockMutingRepository(), blocking, testutil.NewMockChannelMutingRepository())
+	h.mutingRepo, h.blockingRepo, h.channelMutingRepo = testutil.NewMockMutingRepository(), blocking, testutil.NewMockChannelMutingRepository()
 
 	c, rec := newReq(t, `{"antennaId":"a-err"}`)
 	setUser(c, "alice")
@@ -814,7 +814,7 @@ func TestNotes_FiltersBlockedHostAndSuspended(t *testing.T) {
 
 	meta := testutil.NewMockMetaRepository()
 	meta.Meta = &model.Meta{ID: "x", BlockedHosts: []string{"blocked.example"}}
-	h.SetMetaRepo(meta)
+	h.metaRepo = meta
 
 	host := "blocked.example"
 	noteRepo.Notes["n-blocked"] = &model.Note{ID: "n-blocked", UserID: "remote1", UserHost: &host}
@@ -888,4 +888,79 @@ func TestCreate_MissingRequiredParams(t *testing.T) {
 func seedAntennaNote(t *testing.T, key, noteID string) {
 	t.Helper()
 	require.NoError(t, testRedis.Client.ZAdd(context.Background(), key, redis.Z{Score: 0, Member: noteID}).Err())
+}
+
+// userListId: null は、本家と同じくリストの指定を外す。省略は今の値を残す
+// (#3748)。
+func TestUpdate_NullUserListIDClearsTheList(t *testing.T) {
+	h, repo, lists := newHandlerWithUserList(t)
+	require.NoError(t, lists.Create(&model.UserList{ID: "ul1", UserID: "alice", Name: "mine"}))
+	ul := "ul1"
+	repo.Antennas["a1"] = &model.Antenna{ID: "a1", UserID: "alice", Name: "alpha", Src: model.AntennaSourceList, UserListID: &ul}
+
+	c, rec := newReq(t, `{"antennaId":"a1","name":"beta"}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Update(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	_, touched := repo.LastUpdates["userListId"]
+	assert.False(t, touched, "an absent userListId must leave the list as it is")
+
+	c, rec = newReq(t, `{"antennaId":"a1","userListId":null}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Update(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	v, touched := repo.LastUpdates["userListId"]
+	require.True(t, touched, "userListId: null must clear the list")
+	assert.Nil(t, v)
+}
+
+// limit と sinceDate / untilDate は、本家(ajv の integer)と同じく値が整数の
+// 小数を受ける (#3748)。
+func TestNotes_AcceptsIntegerValuedFractions(t *testing.T) {
+	h, repo, _ := newHandler(t)
+	repo.Antennas["a1"] = &model.Antenna{ID: "a1", UserID: "alice"}
+	for _, body := range []string{`{"antennaId":"a1","limit":10.0}`, `{"antennaId":"a1","sinceDate":1e1}`, `{"antennaId":"a1","untilDate":4102444800000.0}`} {
+		c, rec := newReq(t, body)
+		setUser(c, "alice")
+		require.NoError(t, h.Notes(c))
+		assert.Equal(t, http.StatusOK, rec.Code, body)
+	}
+}
+
+// 名前は本家の paramDef と同じく 100 文字 (code point) まで。本家に揃えた検証の
+// 上限を超える body は handler に届くので、handler でも見る (#3748)。
+func TestNameLength(t *testing.T) {
+	createBody := func(name string) string {
+		return `{"name":"` + name + `","src":"all","keywords":[["a"]],"excludeKeywords":[],"users":[],"caseSensitive":false,"withReplies":false,"withFile":false}`
+	}
+	for _, tc := range []struct {
+		name string
+		ok   bool
+	}{
+		{strings.Repeat("a", 100), true},
+		{strings.Repeat("😀", 100), true},
+		{strings.Repeat("a", 101), false},
+	} {
+		h, repo, _ := newHandler(t)
+		c, rec := newReq(t, createBody(tc.name))
+		setUser(c, "alice")
+		require.NoError(t, h.Create(c))
+		if !tc.ok {
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), `"param":"#/properties/name/maxLength"`)
+		} else {
+			assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		}
+
+		repo.Antennas["a1"] = &model.Antenna{ID: "a1", UserID: "alice", Name: "alpha"}
+		c, rec = newReq(t, `{"antennaId":"a1","name":"`+tc.name+`"}`)
+		setUser(c, "alice")
+		require.NoError(t, h.Update(c))
+		if !tc.ok {
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), `"param":"#/properties/name/maxLength"`)
+		} else {
+			assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		}
+	}
 }

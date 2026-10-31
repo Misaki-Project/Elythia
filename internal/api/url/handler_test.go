@@ -13,6 +13,7 @@ import (
 	apiurl "github.com/elythia-network/elythia/internal/api/url"
 	"github.com/elythia-network/elythia/internal/core/urlpreview"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,7 @@ func doPreview(h *apiurl.Handler, rawURL string) *httptest.ResponseRecorder {
 // url query param が空のとき 400 INVALID_PARAM を返す。
 func TestPreview_EmptyURL(t *testing.T) {
 	// fetcher は呼ばれない経路なので disabled で十分。
-	h := apiurl.NewHandler(urlpreview.NewFetcher(urlpreview.Config{Enabled: false}, nil, "", nil))
+	h := apiurl.NewHandler(urlpreview.NewFetcher(urlpreview.Config{Enabled: false}, nil), nil)
 	rec := doPreview(h, "")
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -51,7 +52,7 @@ func TestPreview_EmptyURL(t *testing.T) {
 // #2106 N18: url preview が disabled のとき、handler は 403 + URL_PREVIEW_DISABLED
 // を返す (以前は 200 + null degrade body で frontend の !res.ok 分岐が機能しなかった)。
 func TestPreview_Disabled_Returns403(t *testing.T) {
-	h := apiurl.NewHandler(urlpreview.NewFetcher(urlpreview.Config{Enabled: false}, nil, "", nil))
+	h := apiurl.NewHandler(urlpreview.NewFetcher(urlpreview.Config{Enabled: false}, nil), nil)
 	rec := doPreview(h, "https://example.com/article")
 
 	assert.Equal(t, http.StatusForbidden, rec.Code)
@@ -65,15 +66,14 @@ func TestPreview_Disabled_Returns403(t *testing.T) {
 
 // #2106 N18: enabled fetcher が取得失敗すると 422 + URL_PREVIEW_FAILED を返す。
 func TestPreview_FetchFailed_Returns422(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	failURL := srv.URL
-	srv.Close() // close して connection refused にし fetch を失敗させる
+	// 誰も応えないポートへ向け、connection refused で fetch を失敗させる。
+	failURL := "http://" + testutil.DeadAddr(t)
 
 	f := urlpreview.NewFetcher(urlpreview.Config{
 		Enabled: true, TimeoutMs: 2000, MaxContentLength: 1 << 20,
-	}, nil, "", nil)
+	}, nil)
 	f.SetHTTPClient(&http.Client{})
-	h := apiurl.NewHandler(f)
+	h := apiurl.NewHandler(f, nil)
 
 	rec := doPreview(h, failURL)
 	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
@@ -102,11 +102,11 @@ func TestPreview_Success(t *testing.T) {
 		AllowRedirect:    true,
 		TimeoutMs:        5000,
 		MaxContentLength: 1 << 20,
-	}, nil, "", nil)
+	}, nil)
 	// SetHTTPClient で SSRF-safe transport を上書きし、httptest (127.0.0.1) へ
 	// 到達できるようにする (= urlpreview/fetcher_test.go の既存パターン)。
 	f.SetHTTPClient(&http.Client{})
-	h := apiurl.NewHandler(f)
+	h := apiurl.NewHandler(f, nil)
 
 	rec := doPreview(h, srv.URL)
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -128,9 +128,9 @@ func TestPreview_Success(t *testing.T) {
 // リモートの og:image (thumbnail) / favicon (icon) は proxy 経由に書き換えられ、
 // 閲覧者 IP が外部サイトへ漏洩しない (issue #1529)。
 func TestPreview_RemoteThumbnailProxied(t *testing.T) {
-	entity.SetMediaURLContext(entity.NewMediaURLContext(
-		"https://mk.test", "https://mk.test/proxy", []byte("url-preview-secret"), false, true))
-	defer entity.SetMediaURLContext(nil)
+	// プレビューの画像は handler に渡した Packer で proxy へ通す (#3798)。
+	pk := entity.NewPacker(entity.NewMediaURLContext(
+		"https://mk.test", "https://mk.test/proxy", []byte("url-preview-secret"), false, true), entity.PackerDeps{})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -143,9 +143,9 @@ func TestPreview_RemoteThumbnailProxied(t *testing.T) {
 
 	f := urlpreview.NewFetcher(urlpreview.Config{
 		Enabled: true, AllowRedirect: true, TimeoutMs: 5000, MaxContentLength: 1 << 20,
-	}, nil, "", nil)
+	}, nil)
 	f.SetHTTPClient(&http.Client{})
-	h := apiurl.NewHandler(f)
+	h := apiurl.NewHandler(f, pk)
 
 	rec := doPreview(h, srv.URL)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -170,9 +170,8 @@ func TestPreview_RemoteThumbnailProxied(t *testing.T) {
 // proxy の allowlist を恒久的に迂回できる。
 func TestPreview_ProxySignatureExpires(t *testing.T) {
 	secret := []byte("url-preview-secret")
-	entity.SetMediaURLContext(entity.NewMediaURLContext(
-		"https://mk.test", "https://mk.test/proxy", secret, false, true))
-	defer entity.SetMediaURLContext(nil)
+	pk := entity.NewPacker(entity.NewMediaURLContext(
+		"https://mk.test", "https://mk.test/proxy", secret, false, true), entity.PackerDeps{})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -185,10 +184,11 @@ func TestPreview_ProxySignatureExpires(t *testing.T) {
 
 	f := urlpreview.NewFetcher(urlpreview.Config{
 		Enabled: true, AllowRedirect: true, TimeoutMs: 5000, MaxContentLength: 1 << 20,
-	}, nil, "", nil)
+	}, nil)
 	f.SetHTTPClient(&http.Client{})
 
-	rec := doPreview(apiurl.NewHandler(f), srv.URL)
+	h := apiurl.NewHandler(f, pk)
+	rec := doPreview(h, srv.URL)
 	require.Equal(t, http.StatusOK, rec.Code)
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
@@ -211,4 +211,26 @@ func TestPreview_ProxySignatureExpires(t *testing.T) {
 		assert.LessOrEqual(t, sec, time.Now().Add(entity.UserSuppliedProxyTTL).Unix()+1,
 			"%s の署名の期限が長すぎる", key)
 	}
+}
+
+// **長い url は取りに行く前に 400 にする (2026-10-31 の監査)。** 応答が HTML でない
+// とき fetcher は入力の URL をそのまま結果に載せ、結果は 1000 件の LRU に 1 時間
+// 残る。上限が無いと約 1MiB の URL を 1000 回送るだけで約 1GiB の heap を積めた。
+// fetcher は disabled にしてあるので、取りに行けば 403 になって区別できる。
+func TestPreview_TooLongURLIsRejectedBeforeFetching(t *testing.T) {
+	h := apiurl.NewHandler(urlpreview.NewFetcher(urlpreview.Config{Enabled: false}, nil), nil)
+	long := "https://example.com/" + strings.Repeat("a", apiurl.MaxPreviewURLBytes)
+	rec := doPreview(h, url.QueryEscape(long))
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	errObj := body["error"].(map[string]any)
+	assert.Equal(t, "INVALID_PARAM", errObj["code"])
+
+	// 上限ちょうどは fetcher まで届く (disabled なので 403)。
+	exact := "https://example.com/" + strings.Repeat("a", apiurl.MaxPreviewURLBytes-len("https://example.com/"))
+	require.Len(t, exact, apiurl.MaxPreviewURLBytes)
+	rec = doPreview(h, url.QueryEscape(exact))
+	assert.Equal(t, http.StatusForbidden, rec.Code, "上限ちょうどの URL を拒否している")
 }

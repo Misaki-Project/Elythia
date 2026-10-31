@@ -162,7 +162,8 @@ var (
 	ErrApplicationNotApproved = errors.New("signup application is not approved")
 	// ErrRegistrationClosed is returned while the server accepts no
 	// registrations at all (meta.registrationClosed, #3186).
-	ErrRegistrationClosed = errors.New("registration is closed")
+	ErrRegistrationClosed      = errors.New("registration is closed")
+	ErrInvalidFederationStatus = errors.New("invalid federation status")
 	// ErrInvitationAlreadyUsed is returned when the invitation ticket linked to
 	// a pending signup has already been consumed by another user. transaction
 	// 経路で SELECT FOR UPDATE 後に usedById を確認することで concurrent burst
@@ -221,19 +222,39 @@ type Service struct {
 	db          *gorm.DB
 	webhookHook WebhookHook
 	idGen       id.Generator
+	// passwordHasherは登録のときのパスワードをハッシュする(#3780)。零値は既定のcost。
+	passwordHasher passwordpkg.Hasher
 }
 
 // NewService creates a new SignupService.
-func NewService(userRepo repository.UserRepository, metaRepo repository.MetaRepository, idGen id.Generator) *Service {
-	return &Service{userRepo: userRepo, metaRepo: metaRepo, idGen: idGen}
+//
+// db runs PromotePending and SignupForApplication inside a transaction.
+// ticketRepo locks the invitation ticket (SELECT FOR UPDATE) and marks it used
+// in the same transaction (#604). appRepo settles the approved signup
+// application in the same transaction as the user creation (#2576). With a
+// nil db the service falls back to the repo-based path without a transaction
+// (mock tests).
+//
+// db と ticketRepo の片方でも無いと、招待 ticket の行ロックが飛び、1 枚から
+// 複数アカウントを作る TOCTOU の窓が開く (handler 側が非 tx 経路で best-effort に
+// MarkUsed するので、消費そのものは失われない)。db と appRepo の片方でも無いと、
+// 承認済みの申請の行ロックが飛び、1 承認から複数アカウントを作る窓が開く。
+// どちらも黙って劣化するので、構築子の必須の引数で受ける (#3825)。2 つは別の
+// 話で、片方が揃っていてももう片方は保証されない (#2682 review M-3)。
+func NewService(
+	userRepo repository.UserRepository,
+	metaRepo repository.MetaRepository,
+	idGen id.Generator,
+	db *gorm.DB,
+	ticketRepo repository.RegistrationTicketRepository,
+	appRepo repository.SignupApplicationRepository,
+) *Service {
+	return &Service{userRepo: userRepo, metaRepo: metaRepo, idGen: idGen, db: db, ticketRepo: ticketRepo, appRepo: appRepo}
 }
 
-// SetDB wires the GORM database handle so PromotePending can run inside a
-// transaction. production の router 配線時に呼ぶ。設定しない場合は repo-based
-// 非 tx パスで動作する (mock テスト用)。
-func (s *Service) SetDB(db *gorm.DB) {
-	s.db = db
-}
+// SetPasswordHasher sets the Hasher that signup hashes passwords with. Unset,
+// the default cost is used.
+func (s *Service) SetPasswordHasher(h passwordpkg.Hasher) { s.passwordHasher = h }
 
 // SetUsedUsernameRepo wires the UsedUsernameRepository so Signup / CreatePending
 // reject usernames of deleted accounts (#2080)。未設定なら used_usernames チェックを
@@ -264,21 +285,6 @@ func (s *Service) isUsedUsername(lower string) bool {
 	}
 	used, err := s.usedUsernameRepo.Exists(lower)
 	return err == nil && used
-}
-
-// SetTicketRepo wires the RegistrationTicketRepository so PromotePending tx
-// path で invitation ticket を SELECT FOR UPDATE ロックして MarkUsed まで
-// 同一 transaction で完結できる。emailRequiredForSignup + DisableRegistration
-// 併用時の race fix (#604) に必須。
-func (s *Service) SetTicketRepo(r repository.RegistrationTicketRepository) {
-	s.ticketRepo = r
-}
-
-// SetSignupApplicationRepo wires the approval application repository so
-// PromotePending can settle the application inside the same transaction
-// (#2576)。未配線なら handler 側の best-effort な MarkCompleted に委ねる。
-func (s *Service) SetSignupApplicationRepo(r repository.SignupApplicationRepository) {
-	s.appRepo = r
 }
 
 // SetUserPendingRepo wires the user_pending repository so CreatePending /
@@ -387,7 +393,11 @@ type SignupResult struct {
 // isInitialSetup=true の場合、作成したユーザーを rootUser に設定する。
 // policy は meta 由来の username 制限のどれを適用するかを選ぶ (#3015)。
 func (s *Service) Signup(username, password string, isInitialSetup bool, policy UsernamePolicy) (*SignupResult, error) {
-	return s.SignupWithHost(username, password, isInitialSetup, nil, policy)
+	return s.SignupWithFederationStatus(username, password, isInitialSetup, policy, model.FederationStatusOn)
+}
+
+func (s *Service) SignupWithFederationStatus(username, password string, isInitialSetup bool, policy UsernamePolicy, status model.FederationStatus) (*SignupResult, error) {
+	return s.SignupWithHostAndFederationStatus(username, password, isInitialSetup, nil, policy, status)
 }
 
 // SignupWithHost creates a user attributed to the given remote host.
@@ -398,6 +408,16 @@ func (s *Service) Signup(username, password string, isInitialSetup bool, policy 
 // host=nil なら従来どおりローカルユーザー。呼び出し側で TestMode を確認する
 // こと。
 func (s *Service) SignupWithHost(username, password string, isInitialSetup bool, host *string, policy UsernamePolicy) (*SignupResult, error) {
+	return s.SignupWithHostAndFederationStatus(username, password, isInitialSetup, host, policy, model.FederationStatusOn)
+}
+
+func (s *Service) SignupWithHostAndFederationStatus(username, password string, isInitialSetup bool, host *string, policy UsernamePolicy, status model.FederationStatus) (*SignupResult, error) {
+	if status != model.FederationStatusPending && status != model.FederationStatusOff && status != model.FederationStatusOn {
+		return nil, ErrInvalidFederationStatus
+	}
+	if host != nil {
+		status = model.FederationStatusOn
+	}
 	username, err := normalizeAndValidateUsername(username)
 	if err != nil {
 		return nil, err
@@ -444,7 +464,7 @@ func (s *Service) SignupWithHost(username, password string, isInitialSetup bool,
 	// bcrypt が silent truncation するのと異なり、Go の bcrypt は error にする
 	// ため、ここで拾わないと空 hash が DB に書かれて user が永久 login 不能に
 	// なる (#1075)。
-	hash, err := passwordpkg.Hash(password)
+	hash, err := s.passwordHasher.Hash(password)
 	if err != nil {
 		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
 			return nil, ErrPasswordTooLong
@@ -468,8 +488,12 @@ func (s *Service) SignupWithHost(username, password string, isInitialSetup bool,
 		// isRoot=true でマークしておく。mk-go pure 経路では meta.rootUserId
 		// で root を判定するので冗長だが、TS から引き継いだ DB の root と同じ
 		// 形に揃えておく。
-		IsRoot: isInitialSetup,
-		Host:   host,
+		IsRoot:           isInitialSetup,
+		Host:             host,
+		FederationStatus: status,
+	}
+	if host == nil && status == model.FederationStatusOn {
+		user.FederationEnabledAt = &now
 	}
 	if err := s.userRepo.Create(user); err != nil {
 		return nil, err
@@ -496,24 +520,27 @@ func (s *Service) SignupWithHost(username, password string, isInitialSetup bool,
 	// 削除後も同名 username の再取得を恒久的に防ぐ (SignupService.ts:151-154)。
 	s.recordUsedUsername(lower)
 
-	// RSA keypair (federation 用)。keypairRepo が未設定の場合はスキップする
-	// (従来の単体テストのため)。
-	if s.keypairRepo != nil {
-		privPEM, pubPEM, err := activitypub.GenerateRSAKeypair()
-		if err != nil {
+	// Federation keys are created only for accounts enabled at signup.
+	if status == model.FederationStatusOn {
+		// RSA keypair (federation 用)。keypairRepo が未設定の場合はスキップする
+		// (従来の単体テストのため)。
+		if s.keypairRepo != nil {
+			privPEM, pubPEM, err := activitypub.GenerateRSAKeypair()
+			if err != nil {
+				return nil, err
+			}
+			if err := s.keypairRepo.Create(&model.UserKeypair{
+				UserID:     userID,
+				PublicKey:  pubPEM,
+				PrivateKey: privPEM,
+			}); err != nil {
+				return nil, err
+			}
+		}
+		// Ed25519 keypair (FEP-521a Multikey 用)。keypairExtraRepo wire 時のみ。
+		if err := s.maybeCreateEd25519Keypair(nil, userID); err != nil {
 			return nil, err
 		}
-		if err := s.keypairRepo.Create(&model.UserKeypair{
-			UserID:     userID,
-			PublicKey:  pubPEM,
-			PrivateKey: privPEM,
-		}); err != nil {
-			return nil, err
-		}
-	}
-	// Ed25519 keypair (FEP-521a Multikey 用)。keypairExtraRepo wire 時のみ。
-	if err := s.maybeCreateEd25519Keypair(nil, userID); err != nil {
-		return nil, err
 	}
 
 	// 初回セットアップの場合は rootUserId を設定
@@ -527,6 +554,76 @@ func (s *Service) SignupWithHost(username, password string, isInitialSetup bool,
 	}
 
 	return &SignupResult{User: user, Token: token, Profile: profile}, nil
+}
+
+// CreatePluginManaged creates a local account that the named plugin manages
+// (#3468). The account has no password, is always a bot, and records
+// pluginName in user.managedByPlugin.
+//
+// username の検査は運営者の経路 (UsernamePolicyOperator) と同じにする。
+// プラグインを組み込むのは運営者なので最小文字数は見ないが、予約語
+// (preservedUsernames)・禁止語・削除済みアカウントの名前は通常の登録と同じく
+// 弾く。
+//
+// **meta を読めないときは作らない。** 通常の登録は可用性を優先して素通しするが、
+// こちらはプラグインが後で作り直せるので、予約語の検査を飛ばした名前を残す
+// 方を避ける。
+//
+// **tx の中で作る** (createUserTx)。プラグインが同じ名前で並行に呼んでも、
+// usernameLower の一意制約で片方だけが残る。
+func (s *Service) CreatePluginManaged(pluginName, username string) (*model.User, error) {
+	if pluginName == "" {
+		return nil, errors.New("signup: plugin name is required")
+	}
+	if s.db == nil {
+		return nil, errors.New("signup: plugin-managed accounts need the database handle (NewService db)")
+	}
+	username, err := normalizeAndValidateUsername(username)
+	if err != nil {
+		return nil, err
+	}
+	lower := strings.ToLower(username)
+	if s.isUsedUsername(lower) {
+		return nil, ErrUsernameUsed
+	}
+	meta, err := s.metaRepo.Fetch()
+	if err != nil {
+		return nil, fmt.Errorf("signup: fetch meta: %w", err)
+	}
+	if isReservedUsername(lower, meta.PreservedUsernames) {
+		return nil, ErrUsernameReserved
+	}
+	if keyword.IsKeyWordIncluded(lower, meta.ProhibitedWordsForNameOfUser) {
+		return nil, ErrUsernameUsed
+	}
+
+	name := pluginName
+	var user *model.User
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		u, _, err := s.createUserTx(tx, createUserInput{
+			userID:          s.idGen.Generate(time.Now()),
+			username:        username,
+			lower:           lower,
+			token:           generateToken(),
+			managedByPlugin: &name,
+		})
+		if err != nil {
+			return err
+		}
+		user = u
+		return nil
+	})
+	if err != nil {
+		// 並行に同じ名前で作られたときは、一意制約の違反が返る。重複として扱う。
+		if errors.Is(err, ErrUsernameAlreadyExists) || repository.IsUniqueViolation(err) {
+			return nil, ErrUsernameAlreadyExists
+		}
+		return nil, err
+	}
+	if s.webhookHook != nil {
+		s.webhookHook.OnUserCreated(user)
+	}
+	return user, nil
 }
 
 // generateToken creates a native session token.
@@ -553,7 +650,11 @@ func generatePendingCode() string {
 // 成功時に SignupResult.InvitationTicketID 経由で handler に伝える
 // (招待制 + email 確認制併用時の MarkUsed 用)。
 func (s *Service) CreatePending(username, email, password string, invitationTicketID *string) (*model.UserPending, error) {
-	return s.CreatePendingForApplication(username, email, password, invitationTicketID, nil)
+	return s.CreatePendingWithFederationStatus(username, email, password, invitationTicketID, nil, model.FederationStatusOn)
+}
+
+func (s *Service) CreatePendingWithFederationStatus(username, email, password string, invitationTicketID, signupApplicationID *string, status model.FederationStatus) (*model.UserPending, error) {
+	return s.createPending(username, email, password, invitationTicketID, signupApplicationID, status)
 }
 
 // CreatePendingForApplication is CreatePending carrying the approval
@@ -562,6 +663,13 @@ func (s *Service) CreatePending(username, email, password string, invitationTick
 // 承認制 + メール必須のとき、確認完了まではアカウントが無いので申請を completed
 // にできない。pending row に申請 ID を持たせ、PromotePending の戻り値で返す。
 func (s *Service) CreatePendingForApplication(username, email, password string, invitationTicketID, signupApplicationID *string) (*model.UserPending, error) {
+	return s.createPending(username, email, password, invitationTicketID, signupApplicationID, model.FederationStatusOn)
+}
+
+func (s *Service) createPending(username, email, password string, invitationTicketID, signupApplicationID *string, status model.FederationStatus) (*model.UserPending, error) {
+	if status != model.FederationStatusPending && status != model.FederationStatusOff && status != model.FederationStatusOn {
+		return nil, ErrInvalidFederationStatus
+	}
 	username, err := normalizeAndValidateUsername(username)
 	if err != nil {
 		return nil, err
@@ -592,7 +700,7 @@ func (s *Service) CreatePendingForApplication(username, email, password string, 
 		}
 	}
 
-	hash, err := passwordpkg.Hash(password)
+	hash, err := s.passwordHasher.Hash(password)
 	if err != nil {
 		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
 			return nil, ErrPasswordTooLong
@@ -608,6 +716,7 @@ func (s *Service) CreatePendingForApplication(username, email, password string, 
 		Password:            hash,
 		InvitationTicketID:  invitationTicketID,
 		SignupApplicationID: signupApplicationID,
+		FederationStatus:    status,
 	}
 	if err := s.pendingRepo.Create(row); err != nil {
 		return nil, err
@@ -619,7 +728,7 @@ func (s *Service) CreatePendingForApplication(username, email, password string, 
 // row hasn't expired, then creates the user using the stored hashed password
 // (再 hash しない)。成功時に user_pending row を delete する。
 //
-// db が SetDB で wire されている場合は GORM transaction 内で処理し、partial
+// db が NewService で渡されている場合は GORM transaction 内で処理し、partial
 // failure を rollback で巻き戻す (#600 item 2)。さらに invitation 経由なら
 // ticket を SELECT FOR UPDATE で lock して concurrent burst による「1 招待で
 // 複数 user 作成」 race を完全に閉じる (#604)。MarkUsed も同 tx で完了する。
@@ -716,8 +825,9 @@ func (s *Service) checkApprovalGate(pending *model.UserPending) error {
 	if pending.SignupApplicationID != nil {
 		// 本番経路 (promotePendingTx) は settleApplicationTx で申請を確定させる
 		// (#2576)。noTx 経路は申請に触らないが、これは db 未配線の mock 用で、
-		// 本番では router の配線検査 (signup.applicationSettlement) が通ることを
-		// 保証している。
+		// 本番では router が NewService に db と appRepo を渡し、
+		// TestBuiltHandlersHaveNoNilDependencies (internal/server) がどちらも nil で
+		// ないことを見ている (#3825。以前は起動時の配線検査 signup.applicationSettlement)。
 		return nil
 	}
 	meta, err := s.metaRepo.Fetch()
@@ -790,13 +900,14 @@ func (s *Service) promotePendingTx(pending *model.UserPending) (*SignupResult, e
 
 		verified := true
 		user, profile, err := s.createUserTx(tx, createUserInput{
-			userID:        userID,
-			username:      pending.Username,
-			lower:         lower,
-			token:         token,
-			passwordHash:  pending.Password,
-			email:         &pending.Email,
-			emailVerified: verified,
+			userID:           userID,
+			username:         pending.Username,
+			lower:            lower,
+			token:            token,
+			passwordHash:     pending.Password,
+			email:            &pending.Email,
+			emailVerified:    verified,
+			federationStatus: pending.FederationStatus,
 		})
 		if err != nil {
 			return err
@@ -841,7 +952,7 @@ func (s *Service) promotePendingTx(pending *model.UserPending) (*SignupResult, e
 }
 
 // promotePendingNoTx は db 未配線の mock テスト経路 (transaction 無し)。
-// production では使わない (router 配線時に SetDB 必須)。
+// production では使わない (router は NewService に db を必ず渡す)。
 //
 // IMPORTANT: promotePendingTx と mirror で維持すること。詳細は
 // promotePendingTx の doc コメント参照 (#610 item 3)。
@@ -857,6 +968,10 @@ func (s *Service) promotePendingNoTx(pending *model.UserPending) (*SignupResult,
 	token := generateToken()
 	now := time.Now()
 	userID := s.idGen.Generate(now)
+	status := pending.FederationStatus
+	if status == "" {
+		status = model.FederationStatusOn
+	}
 	user := &model.User{
 		ID:                userID,
 		Username:          pending.Username,
@@ -864,6 +979,7 @@ func (s *Service) promotePendingNoTx(pending *model.UserPending) (*SignupResult,
 		Token:             &token,
 		IsExplorable:      true,
 		AvatarDecorations: []byte("[]"),
+		FederationStatus:  status,
 	}
 	if err := s.userRepo.Create(user); err != nil {
 		return nil, err
@@ -887,7 +1003,7 @@ func (s *Service) promotePendingNoTx(pending *model.UserPending) (*SignupResult,
 	}
 	// #2106 N23: used_username に記録 (non-tx 経路。Signup と mirror)。
 	s.recordUsedUsername(lower)
-	if s.keypairRepo != nil {
+	if status == model.FederationStatusOn && s.keypairRepo != nil {
 		privPEM, pubPEM, err := activitypub.GenerateRSAKeypair()
 		if err != nil {
 			return nil, err
@@ -900,8 +1016,10 @@ func (s *Service) promotePendingNoTx(pending *model.UserPending) (*SignupResult,
 			return nil, err
 		}
 	}
-	if err := s.maybeCreateEd25519Keypair(nil, userID); err != nil {
-		return nil, err
+	if status == model.FederationStatusOn {
+		if err := s.maybeCreateEd25519Keypair(nil, userID); err != nil {
+			return nil, err
+		}
 	}
 	_ = s.pendingRepo.Delete(pending.ID)
 
@@ -927,9 +1045,13 @@ func (s *Service) promotePendingNoTx(pending *model.UserPending) (*SignupResult,
 // db / 申請 repo が未配線なら通常の Signup にフォールバックし、
 // SignupApplicationCompleted=false を返す (呼び出し側が従来どおり完了記録する)。
 func (s *Service) SignupForApplication(username, password, applicationID, ticketID string) (*SignupResult, error) {
+	return s.SignupForApplicationWithFederationStatus(username, password, applicationID, ticketID, model.FederationStatusOn)
+}
+
+func (s *Service) SignupForApplicationWithFederationStatus(username, password, applicationID, ticketID string, status model.FederationStatus) (*SignupResult, error) {
 	if s.db == nil || s.appRepo == nil {
 		// 申請経由なので公開登録と同じ制限を適用する (#3015)。
-		return s.Signup(username, password, false, UsernamePolicyPublic)
+		return s.SignupWithFederationStatus(username, password, false, UsernamePolicyPublic, status)
 	}
 
 	username, err := normalizeAndValidateUsername(username)
@@ -959,7 +1081,7 @@ func (s *Service) SignupForApplication(username, password, applicationID, ticket
 		}
 	}
 
-	hash, err := passwordpkg.Hash(password)
+	hash, err := s.passwordHasher.Hash(password)
 	if err != nil {
 		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
 			return nil, ErrPasswordTooLong
@@ -979,11 +1101,12 @@ func (s *Service) SignupForApplication(username, password, applicationID, ticket
 			return err
 		}
 		user, profile, err := s.createUserTx(tx, createUserInput{
-			userID:       userID,
-			username:     username,
-			lower:        lower,
-			token:        token,
-			passwordHash: hash,
+			userID:           userID,
+			username:         username,
+			lower:            lower,
+			token:            token,
+			passwordHash:     hash,
+			federationStatus: status,
 			// メール確認を通っていないので、プロフィールにメールは持たせない
 			// (Signup と同じ)。
 		})
@@ -1019,6 +1142,10 @@ type createUserInput struct {
 	passwordHash  string
 	email         *string
 	emailVerified bool
+	// managedByPlugin が non-nil なら、プラグインが管理するアカウント (#3468)
+	// として作る。passwordHash は使わず (パスワードを持たせない)、isBot を立てる。
+	managedByPlugin  *string
+	federationStatus model.FederationStatus
 }
 
 // createUserTx creates the user, profile, used_username entry and keypairs
@@ -1040,6 +1167,10 @@ func (s *Service) createUserTx(tx *gorm.DB, in createUserInput) (*model.User, *m
 		return nil, nil, err
 	}
 
+	status := in.federationStatus
+	if status == "" {
+		status = model.FederationStatusOn
+	}
 	user := &model.User{
 		ID:                in.userID,
 		Username:          in.username,
@@ -1047,18 +1178,35 @@ func (s *Service) createUserTx(tx *gorm.DB, in createUserInput) (*model.User, *m
 		Token:             &in.token,
 		IsExplorable:      true,
 		AvatarDecorations: []byte("[]"),
+		ManagedByPlugin:   in.managedByPlugin,
+		FederationStatus:  status,
+		// 管理するアカウントは必ず bot として作る (#3468)。人が中に入らない
+		// アカウントなので、相手に bot であることを示す。
+		IsBot: in.managedByPlugin != nil,
+	}
+	if status == model.FederationStatusOn {
+		enabledAt := time.Now()
+		user.FederationEnabledAt = &enabledAt
 	}
 	if err := tx.Create(user).Error; err != nil {
 		return nil, nil, err
 	}
 
 	// profile 作成 (failure 時は user 含めて tx rollback で消える)
-	storedHash := in.passwordHash
+	//
+	// **管理するアカウントにはパスワードを持たせない (#3468)。** 空文字の hash を
+	// 入れると「パスワードはあるが一致しない」状態になり、パスワードを要する
+	// endpoint の分岐が経路ごとにずれる。NULL なら全経路が「未設定」で揃う。
+	var storedHash *string
+	if in.managedByPlugin == nil {
+		h := in.passwordHash
+		storedHash = &h
+	}
 	profile := &model.UserProfile{
 		UserID:             in.userID,
 		Email:              in.email,
 		EmailVerified:      in.emailVerified,
-		Password:           &storedHash,
+		Password:           storedHash,
 		AutoAcceptFollowed: true,
 		PreventAiLearning:  true,
 		PublicReactions:    true,
@@ -1077,23 +1225,28 @@ func (s *Service) createUserTx(tx *gorm.DB, in createUserInput) (*model.User, *m
 		return nil, nil, err
 	}
 
-	// keypair (federation 用) — keypairRepo が wire されているときのみ
-	if s.keypairRepo != nil {
-		privPEM, pubPEM, err := activitypub.GenerateRSAKeypair()
-		if err != nil {
-			return nil, nil, err
+	// Keys exist only when federation is enabled.
+	if status == model.FederationStatusOn {
+		// keypair (federation 用) — keypairRepo が wire されているときのみ
+		if s.keypairRepo != nil {
+			privPEM, pubPEM, err := activitypub.GenerateRSAKeypair()
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := tx.Create(&model.UserKeypair{
+				UserID:     in.userID,
+				PublicKey:  pubPEM,
+				PrivateKey: privPEM,
+			}).Error; err != nil {
+				return nil, nil, err
+			}
 		}
-		if err := tx.Create(&model.UserKeypair{
-			UserID:     in.userID,
-			PublicKey:  pubPEM,
-			PrivateKey: privPEM,
-		}).Error; err != nil {
-			return nil, nil, err
+		// Ed25519 keypair も同 tx 内で発行 (#1067 / #1068)
+		if status == model.FederationStatusOn {
+			if err := s.maybeCreateEd25519Keypair(tx, in.userID); err != nil {
+				return nil, nil, err
+			}
 		}
-	}
-	// Ed25519 keypair も同 tx 内で発行 (#1067 / #1068)
-	if err := s.maybeCreateEd25519Keypair(tx, in.userID); err != nil {
-		return nil, nil, err
 	}
 	return user, profile, nil
 }
@@ -1172,33 +1325,3 @@ func EffectiveMinimumUsernameLength(meta *model.Meta) int {
 func ViolatesMinimumUsernameLength(username string, meta *model.Meta, policy UsernamePolicy) bool {
 	return violatesMinimumUsernameLength(username, meta, policy)
 }
-
-// HasTicketConsumption reports whether the transactional promote path is wired.
-//
-// 未配線だと promotePending が `promotePendingNoTx` を選ぶ。**失われるのは
-// 消費そのものではなく直列化**: handler 側が非 tx 経路を検知して
-// best-effort に MarkUsed するので (`internal/api/signup/handler.go`)、
-// ticket は最終的に消費される。落ちるのは tx 内の `SELECT FOR UPDATE` と
-// usedById の再確認 (#604) で、その結果 promote 前に作られた複数の pending が
-// 全て通る TOCTOU の窓が開く。ErrInvitationAlreadyUsed も返らなくなる。
-// 本番では必ず配線される (#2682 review M-B)。
-//
-// **承認制 (#2571) の申請とは別の話**。こちらが見るのは
-// registration_ticket で、申請側は appRepo が要る
-// ([Service.HasApplicationSettlement])。片方が配線されていても
-// もう片方は保証されない (#2682 review M-3)。
-func (s *Service) HasTicketConsumption() bool { return s.db != nil && s.ticketRepo != nil }
-
-// HasApplicationSettlement reports whether approved signup applications are
-// settled in the same transaction as user creation.
-//
-// 未配線だと 2 経路が同時に緩む。PromotePending は申請行の
-// `FOR UPDATE` を飛ばし、SignupForApplication は通常の Signup へ落ちて
-// トランザクションの主張ごと捨てる。どちらも**承認 1 件から複数
-// アカウント**を作れる窓が開く (コードのコメントは
-// promotePendingTx / SignupForApplication の両方にある)。
-//
-// handler 側の事後 MarkCompleted が残るので不可逆な取り放題ではなく
-// TOCTOU に留まるが、承認制は「1 承認 = 1 アカウント」を売りにする機能
-// なので一回性の tier として検査する (#2682 review M-3)。
-func (s *Service) HasApplicationSettlement() bool { return s.db != nil && s.appRepo != nil }

@@ -17,6 +17,7 @@ import (
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/testutil"
 )
 
 type fakeUsers struct {
@@ -66,7 +67,7 @@ func newVersus(t *testing.T) *versusEnv {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	svc.SetClockForTest(func() time.Time { return now })
 	users := &fakeUsers{users: map[string]*model.User{"alice": vAlice, "bob": vBob, "carol": vCarol}}
-	return &versusEnv{h: NewVersusHandler(svc, users), svc: svc, users: users, now: &now, mr: mr}
+	return &versusEnv{h: NewVersusHandler(svc, users, nil), svc: svc, users: users, now: &now, mr: mr}
 }
 
 func decode(t *testing.T, body []byte) map[string]any {
@@ -249,7 +250,7 @@ func TestVersusPack_MissingUser(t *testing.T) {
 func TestVersus_RedisDown(t *testing.T) {
 	e := newVersus(t)
 	mid := e.invite(t)
-	e.mr.Close()
+	testutil.MiniredisDown(e.mr)
 	for name, h := range map[string]func() int{
 		"show":        func() int { return post(e.h.Show, matchBody(mid), vAlice).Code },
 		"invitations": func() int { return post(e.h.Invitations, `{}`, vBob).Code },
@@ -273,7 +274,7 @@ func TestVersus_ULIDMatchID(t *testing.T) {
 	t.Cleanup(func() { rdb.Close() })
 	gen, err := id.NewGenerator("ulid")
 	require.NoError(t, err)
-	e.h = NewVersusHandler(bubbleversus.NewService(rdb, nopPub{}, nil, gen), e.users)
+	e.h = NewVersusHandler(bubbleversus.NewService(rdb, nopPub{}, nil, gen), e.users, nil)
 	mid := e.invite(t)
 	require.Regexp(t, `[A-Z]`, mid)
 	assert.Equal(t, http.StatusOK, post(e.h.Show, matchBody(mid), vAlice).Code)
@@ -317,4 +318,28 @@ func TestVersusReport_GameVersion(t *testing.T) {
 	require.NotNil(t, recs.versions[0])
 	assert.Equal(t, 4, *recs.versions[0])
 	assert.Nil(t, recs.versions[1], "版を送らない報告は nil のまま")
+}
+
+// 本家のajvと同じく、整数を小数の形で書いた score・frame・gameVersion も受ける
+// (#3875)。
+func TestVersusReport_AcceptsIntegerForms(t *testing.T) {
+	e := newVersus(t)
+	recs := &versionRecords{}
+	e.svc.SetRecordStore(recs)
+	mid := e.invite(t)
+	require.Equal(t, http.StatusOK, post(e.h.Accept, matchBody(mid), vBob).Code)
+	ctx := t.Context()
+	_, err := e.svc.Ready(ctx, "alice", mid, true)
+	require.NoError(t, err)
+	_, err = e.svc.Ready(ctx, "bob", mid, true)
+	require.NoError(t, err)
+	*e.now = e.now.Add(bubbleversus.Countdown)
+
+	rec := post(e.h.Report, fmt.Sprintf(`{"matchId":%q,"score":12.0,"frame":9e2,"reason":"gameOver","logs":[[40,0,200]],"gameVersion":4.0}`, mid), vBob)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	body := decode(t, rec.Body.Bytes())
+	assert.Equal(t, map[string]any{"score": float64(12), "frame": float64(900), "reason": "gameOver"}, body["user2Result"])
+	require.Len(t, recs.versions, 1)
+	require.NotNil(t, recs.versions[0])
+	assert.Equal(t, 4, *recs.versions[0])
 }

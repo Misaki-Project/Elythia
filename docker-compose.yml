@@ -57,6 +57,10 @@ services:
       # 設定ファイルを上書きする場合 (cp .config/docker.yml.example
       # .config/docker.yml して編集後にコメントを外す):
       # - ./.config/docker.yml:/app/.config/default.yml:ro
+      # バックアップの保存先をディレクトリにするときは、管理画面 (#3462) が読む
+      # ので、backup サービスと同じホストのパスを同じ場所に mount する。本体は
+      # GID 991 のグループとして読む (docs/backup.md の「ディレクトリ」)。
+      # - /mnt/nas/elythia-backup:/backup
     restart: unless-stopped
 
   # DB マイグレーションを適用する one-shot サービス。新規構築では DB が空のため、
@@ -104,6 +108,84 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  # DB のバックアップ (#3458)。**普段は動かさない** (profiles に入れてあるので
+  # `docker compose up` では起動しない)。使うときだけ呼ぶ:
+  #   docker compose run --rm --no-deps backup take    # 取って保存先へ送る
+  #   docker compose run --rm --no-deps backup list    # 保存先の世代を一覧する
+  #   docker compose run --rm --no-deps backup verify latest  # 使い捨ての PostgreSQL へ戻して確かめる
+  #   docker compose run --rm --no-deps backup restore ...  # 戻す (docs/deployment.md)
+  # 本体の image は pg_dump を持たないので、postgres:18-alpine に elythia を足した
+  # image (Dockerfile の target backup) で動かす。設定は本体と同じファイルを読む
+  # (db: と backup: の節)。保存先と暗号化の設定は docs/backup.md を参照。
+  # **同じホストのディスクはバックアップに数えない。** 保存先は S3 互換か、別の
+  # 機器を mount したディレクトリにする。docker.sock は渡さない。
+  backup: &backup-service
+    logging: *default-logging
+    build:
+      context: .
+      target: backup
+      # meta.json の elythiaCommit に入る revision。Dockerfile の中では git を呼べない
+      # ので build-arg で渡す (docs/backup.md)。
+      args:
+        MKGO_COMMIT: ${MKGO_COMMIT:-}
+    profiles: ["backup"]
+    # depends_on を書かない。書くと `run` が DB のコンテナの設定の差分を見て作り直す
+    # ことがある。DB は動いている前提で、`run --no-deps` で呼ぶ。
+    # 本体 (GID 991) と同じグループを補助グループに持つ。ディレクトリの保存先で、
+    # 根に付けた setgid を作ったディレクトリに残し、本体が一覧・ダウンロード・
+    # 削除できるようにするため (docs/backup.md の「ディレクトリ」)。
+    group_add:
+      - "991"
+    volumes:
+      - ./.config/docker.yml:/app/.config/default.yml:ro
+      # 保存先をディレクトリにするときは、別の機器を mount したホストのパスを渡し、
+      # backup.storage.dir.path に /backup を書く。コンテナは UID 70 (postgres) で
+      # 動く。根の所有者とグループを 70:991、mode を 2770 にする (docs/backup.md)。
+      # - /mnt/nas/elythia-backup:/backup
+      # 保存先をディレクトリにするときは、mount 先の根に目印 .elythia-backup が要る
+      # (mount が外れたときにホストのディスクへ書かないため。docs/backup.md)。
+      # db.extra.sslrootcert で CA ファイルを指すときは、同じパスに mount する。
+      # - /etc/elythia/db-ca.crt:/etc/elythia/db-ca.crt:ro
+      # 暗号化した世代を確かめる・戻すときだけ、age の秘密鍵を渡す (取るだけなら不要)。
+      # 秘密鍵はリポジトリの外 (.config にも置かない) に置き、取る側のホストには
+      # 置かないのが望ましい。
+      # - /etc/elythia/backup-identity.txt:/run/secrets/backup-identity.txt:ro
+      # backup.integrityKeyFile を使うときは、署名の鍵を渡す (取る・確かめる・戻す
+      # すべてで使う)。保存先には置かない。
+      # - /etc/elythia/backup-integrity.key:/run/secrets/backup-integrity.key:ro
+      # verify は復号した dump と戻した DB を TMPDIR (既定は書き込み層の /tmp) に置く。
+      # 本番の DB の volume と同じディスクを埋めないよう、別のディスクを mount して
+      # 下の environment の TMPDIR をそこへ向ける (UID 70 が書けるようにする。docs/backup.md)。
+      # - /mnt/scratch/elythia-verify:/scratch
+    # environment:
+    #   TMPDIR: /scratch
+    restart: "no"
+
+  # バックアップを常駐させる形 (#3460)。上の backup と同じ image・volumes で、
+  # `elythia backup daemon` を動かす。設定の backup.schedule の間隔で取って・確かめて・
+  # 古い世代を消し、失敗・食い違い・遅れを backup.notify へ知らせる。手順は
+  # docs/backup.md の「定期実行」。使うときだけ profile を有効にする:
+  #   docker compose --profile backup-daemon up -d --no-deps backup-daemon
+  # backup と別のサービスにしているのは、backup が `run --rm` で呼ぶ 1 回きりの
+  # もの (restart: "no") で、常駐には restart: unless-stopped が要るため。名前が
+  # 固定なので、本体の backup.server.serviceUrl に http://backup-daemon:3010 と書ける。
+  # 制御 API (backup.schedule.listen) は compose の内部ネットワークだけで待ち受け、
+  # **ports を書かない** (TLS を持たない)。
+  backup-daemon:
+    <<: *backup-service
+    profiles: ["backup-daemon"]
+    command: ["daemon"]
+    # depends_on を書かない (backup と同じ理由で、`up` が DB のコンテナを作り直しうる)。
+    # DB の起動は daemon が取る前に待つ (最大 5 分)。`up -d --no-deps` で起動する。
+    # backup.schedule.at はプロセスのタイムゾーンで読む。既定は UTC。変えるときは
+    # 次のコメントを外す。environment を書くと上の backup の environment を丸ごと
+    # 置き換えるので、backup で TMPDIR を設定したときは、ここにも同じ行を書く
+    # (定期実行の検証も TMPDIR を使う)。
+    # environment:
+    #   TZ: Asia/Tokyo
+    #   TMPDIR: /scratch
     restart: unless-stopped
 
   # Video thumbnail generator (#637 M2). mk-go の media proxy が video/* を

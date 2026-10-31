@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/config"
 	"github.com/elythia-network/elythia/internal/core/userpack"
 	"github.com/elythia-network/elythia/internal/entity"
@@ -23,6 +24,9 @@ import (
 
 // Handler handles MiAuth endpoints.
 type Handler struct {
+	// background は応答の後の処理 (token 作成の通知) を起動する箱 (#3661)。世代の停止で
+	// 待つ。nil なら素の goroutine で起動する (テスト)。
+	background *bgwork.Group
 	// detailExtras は UserDetailed のピン留め・移行先を users/show と同じ規則で埋める (#3330)。
 	detailExtras userpack.DetailExtras
 	repo         repository.AuthSessionRepository
@@ -34,6 +38,9 @@ type Handler struct {
 	// tokenNotifier は gen-token で access token を生成した時に本人へ
 	// 'createToken' 通知を送る (#1559)。未配線なら通知しない。
 	tokenNotifier TokenNotifier
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // TokenNotifier records a 'createToken' notification when a token is generated
@@ -44,8 +51,13 @@ type TokenNotifier interface {
 }
 
 // NewHandler creates a new auth handler.
-func NewHandler(repo repository.AuthSessionRepository, cfg *config.Config, idGen id.Generator) *Handler {
-	return &Handler{repo: repo, cfg: cfg, idGen: idGen}
+// entityPacker is the Packer this handler packs entities with (#3792);
+// detailExtras fills pinnedNotes / pinnedPage / movedTo / alsoKnownAs for
+// auth/session/userkey and the miauth check (#3330); background is the group
+// the work after a response runs in, so stopping the server generation waits
+// for it (#3661).
+func NewHandler(repo repository.AuthSessionRepository, cfg *config.Config, idGen id.Generator, entityPacker *entity.Packer, detailExtras userpack.DetailExtras, background *bgwork.Group) *Handler {
+	return &Handler{repo: repo, cfg: cfg, idGen: idGen, entityPacker: entityPacker, detailExtras: detailExtras, background: background}
 }
 
 // SetUserRepo wires the user repository used by MiAuthCheck to pack the
@@ -59,13 +71,14 @@ func (h *Handler) SetTokenNotifier(n TokenNotifier) { h.tokenNotifier = n }
 // SessionGenerate handles POST /api/auth/session/generate.
 func (h *Handler) SessionGenerate(c echo.Context) error {
 	var req struct {
-		AppSecret string `json:"appSecret"`
+		AppSecret *string `json:"appSecret"`
 	}
-	if err := c.Bind(&req); err != nil || req.AppSecret == "" {
+	// 空文字は本家と同じく、見つからないアプリとして扱う(#3764)。
+	if err := c.Bind(&req); err != nil || req.AppSecret == nil {
 		return apierr.JSONInvalidParam(c)
 	}
 
-	app, err := h.repo.FindAppBySecret(req.AppSecret)
+	app, err := h.repo.FindAppBySecret(*req.AppSecret)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
@@ -93,13 +106,14 @@ func (h *Handler) SessionGenerate(c echo.Context) error {
 // SessionShow handles POST /api/auth/session/show.
 func (h *Handler) SessionShow(c echo.Context) error {
 	var req struct {
-		Token string `json:"token"`
+		Token *string `json:"token"`
 	}
-	if err := c.Bind(&req); err != nil || req.Token == "" {
+	// 空文字は本家と同じく、見つからないセッションとして扱う(#3764)。
+	if err := c.Bind(&req); err != nil || req.Token == nil {
 		return apierr.JSONInvalidParam(c)
 	}
 
-	session, err := h.repo.FindSessionByToken(req.Token)
+	session, err := h.repo.FindSessionByToken(*req.Token)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
@@ -124,13 +138,21 @@ func (h *Handler) SessionShow(c echo.Context) error {
 func (h *Handler) Accept(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req struct {
-		Token string `json:"token"`
+		Token *string `json:"token"`
 	}
-	if err := c.Bind(&req); err != nil || req.Token == "" {
+	// 空文字は本家と同じく、見つからないセッションとして扱う(#3764)。
+	if err := c.Bind(&req); err != nil || req.Token == nil {
 		return apierr.JSONInvalidParam(c)
 	}
+	// **プラグインが管理するアカウントには app token を発行しない (#3468)。**
+	// 外からはそのアカウントの native token が通らないので、ここに来るのは
+	// プラグインの AsUser だけ。通すと、外で使える資格情報をプラグインが
+	// 作れてしまう。
+	if user.IsPluginManaged() {
+		return c.JSON(http.StatusBadRequest, apierr.PluginManagedAccount())
+	}
 
-	session, err := h.repo.FindSessionByToken(req.Token)
+	session, err := h.repo.FindSessionByToken(*req.Token)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
@@ -171,14 +193,15 @@ func (h *Handler) Accept(c echo.Context) error {
 // SessionUserkey handles POST /api/auth/session/userkey.
 func (h *Handler) SessionUserkey(c echo.Context) error {
 	var req struct {
-		AppSecret string `json:"appSecret"`
-		Token     string `json:"token"`
+		AppSecret *string `json:"appSecret"`
+		Token     *string `json:"token"`
 	}
-	if err := c.Bind(&req); err != nil || req.AppSecret == "" || req.Token == "" {
+	// 空文字は本家と同じく、見つからないアプリかセッションとして扱う(#3764)。
+	if err := c.Bind(&req); err != nil || req.AppSecret == nil || req.Token == nil {
 		return apierr.JSONInvalidParam(c)
 	}
 
-	app, err := h.repo.FindAppBySecret(req.AppSecret)
+	app, err := h.repo.FindAppBySecret(*req.AppSecret)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
@@ -187,7 +210,7 @@ func (h *Handler) SessionUserkey(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_APP", "No such app.", "fcab192a-2c5a-43b7-8ad8-9b7054d8d40d"))
 	}
 
-	session, err := h.repo.FindSessionByTokenAndAppID(req.Token, app.ID)
+	session, err := h.repo.FindSessionByTokenAndAppID(*req.Token, app.ID)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
@@ -198,6 +221,12 @@ func (h *Handler) SessionUserkey(c echo.Context) error {
 
 	if session.UserID == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("PENDING_SESSION", "This session is not yet approved.", "8c8a4145-02cc-4cca-8e66-29ba60445a8e"))
+	}
+	// プラグインが管理するアカウント (#3468) の token は払い出さない。accept が
+	// 承認させないので本来ここには来ないが、それより前のデータなどで承認済みの
+	// session があっても資格情報を外へ出さない。居ない session と同じ応答にする。
+	if session.User != nil && session.User.IsPluginManaged() {
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_SESSION", "No such session.", "5b5a1503-8bc8-4bd0-8054-dc189e8cdcb3"))
 	}
 
 	accessToken, err := h.repo.FindAccessTokenByAppAndUser(app.ID, *session.UserID)
@@ -235,7 +264,7 @@ func (h *Handler) packUserDetailed(u *model.User, userID string) any {
 // 'UserDetailedNotMe'}): the pinned notes / page and move targets are filled
 // as seen by an anonymous viewer.
 func (h *Handler) packDetailedNotMe(u *model.User, profile *model.UserProfile) entity.UserDetailed {
-	d := entity.PackUserDetailed(u, profile, h.idGen)
+	d := h.entityPacker.PackUserDetailed(u, profile, h.idGen)
 	if h.detailExtras != nil {
 		h.detailExtras.FillDetailedExtras(context.Background(), nil, u, profile, &d)
 	}
@@ -255,6 +284,10 @@ func (h *Handler) GenToken(c echo.Context) error {
 	}
 	if err := c.Bind(&req); err != nil || req.Permission == nil {
 		return apierr.JSONInvalidParam(c)
+	}
+	// auth/accept と同じ理由で、管理するアカウントには発行しない (#3468)。
+	if user.IsPluginManaged() {
+		return c.JSON(http.StatusBadRequest, apierr.PluginManagedAccount())
 	}
 
 	tokenStr := misc.SecureRandomHex(32)
@@ -277,7 +310,8 @@ func (h *Handler) GenToken(c echo.Context) error {
 
 	// createToken 通知を本人へ送る (upstream miauth/gen-token、#1559)。
 	if h.tokenNotifier != nil {
-		go h.tokenNotifier.OnCreateToken(user.ID)
+		uid := user.ID
+		h.background.Go(func(context.Context) { h.tokenNotifier.OnCreateToken(uid) })
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{"token": tokenStr})
@@ -300,6 +334,23 @@ func (h *Handler) MiAuthCheck(c echo.Context) error {
 		// session 不在 / 既に取得済 (one-time) は ok:false。
 		return c.JSON(http.StatusOK, map[string]any{"ok": false})
 	}
+	// **持ち主は、取得済みにする前に確かめる。** プラグインが管理するアカウント
+	// (#3468) の token は、gen-token / accept が作らないので本来ここには無い。
+	// それでも行があれば (それより前のデータや手で入れた行) 払い出さない。外では
+	// 使えない token だが、資格情報を外へ出す口を残さない。持ち主を読めない障害の
+	// ときも払い出さず、取得済みにもしない (クライアントは polling で取り直せる)。
+	var owner *model.User
+	if h.userRepo != nil {
+		u, uerr := h.userRepo.FindByID(tok.UserID)
+		switch {
+		case uerr != nil && !repository.IsNotFound(uerr):
+			return c.JSON(http.StatusOK, map[string]any{"ok": false})
+		case uerr == nil && u != nil && u.IsPluginManaged():
+			return c.JSON(http.StatusOK, map[string]any{"ok": false})
+		case uerr == nil:
+			owner = u
+		}
+	}
 	// one-time 取得: fetched=false→true の遷移をアトミックに行い、勝った
 	// リクエストだけが token を払い出す。並行 polling で同じ token が二重に
 	// 渡ることを防ぐ (上の Fetched チェックは fast path で、ここが真の関門)。
@@ -309,13 +360,11 @@ func (h *Handler) MiAuthCheck(c echo.Context) error {
 	}
 
 	resp := map[string]any{"ok": true, "token": tok.Token}
-	if h.userRepo != nil {
-		if u, uerr := h.userRepo.FindByID(tok.UserID); uerr == nil && u != nil {
-			profile, _ := h.userRepo.FindProfileByUserID(u.ID)
-			// 本家 ApiServerService の miauth check も pack(token.userId, null,
-			// {schema: 'UserDetailedNotMe'}) (#3330)。
-			resp["user"] = h.packDetailedNotMe(u, profile)
-		}
+	if owner != nil {
+		profile, _ := h.userRepo.FindProfileByUserID(owner.ID)
+		// 本家 ApiServerService の miauth check も pack(token.userId, null,
+		// {schema: 'UserDetailedNotMe'}) (#3330)。
+		resp["user"] = h.packDetailedNotMe(owner, profile)
 	}
 	return c.JSON(http.StatusOK, resp)
 }

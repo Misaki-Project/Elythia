@@ -1,0 +1,342 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+)
+
+// lifecyclePart is one named part of a server generation that has to be
+// stopped when the generation stops (#3699), and started by StartBackground
+// when it has a start (#3703).
+type lifecyclePart struct {
+	// name identifies the part. It is unique within one generation and stays
+	// the same across releases, so tests and logs can refer to it.
+	name string
+	// part is the value stop acts on (a buffer, a publisher, a service), or
+	// nil for a worker added by addWorker, which has no value of its own.
+	// Production code never reads it. Only tests read it, to check that
+	// stopping the generation stopped that value and that each name holds a
+	// value of the expected type.
+	//
+	// For a part added from its value (addStartCloser and the others,
+	// #3701), stop is built from part itself, so the two cannot disagree.
+	// Production adds every part that has a value that way (#3717); the only
+	// registration that takes a stop of its own, addWorker, has no value.
+	//
+	// 停止の関数が名前どおりの部品を止めているかは、名前の並びだけでは
+	// 分からない (#3699 のレビュー L-1)。テストが部品そのものを引けるようにする。
+	part any
+	// start starts the part, or is nil for a part that has nothing to start
+	// (a part that only has to be stopped). StartBackground calls it once,
+	// in list order (lifecycle.startAll).
+	start func()
+	// stop stops the part. It receives the shutdown ctx, which bounds any
+	// graceful drain the part does. It must be safe to call when start has
+	// not run: a generation whose construction or StartBackground failed is
+	// stopped with parts that never started (#3703). A panic of stop is
+	// recovered by stopAll, which goes on with the next part (#3707).
+	stop func(context.Context)
+	// fromValue reports that the part was added by a registration that
+	// builds its stop from part (addStartCloser and the others, #3701),
+	// not with a stop of its own. Production code never reads it; tests use
+	// it to check that every part with a value was added from it (#3717).
+	fromValue bool
+}
+
+// lifecycle is the ordered list of the named parts of one server generation
+// (#3666 stage 3, #3699). Parts are started in the order they were added, by
+// StartBackground before the queue worker (#3703), and stopped in the same
+// order (FIFO), after the queue worker and the goroutines of the generation
+// and before the chart management, the queue driver and the Redis
+// subscriptions (see Server.StartBackground, Server.shutdown and
+// docs/architecture.md 4.3). A panic of a start or a stop is recovered per
+// part and turned into an error (startAll, #3703; stopAll, #3707).
+//
+// The zero value is an empty list ready to use. Building a generation only
+// adds the parts; no part runs until startAll. emojiInvalidationQueue, the
+// last part that construction used to run in a go statement, is started by
+// startAll as well (#3705).
+//
+// 構築では作って登録するだけにし、起動はStartBackgroundに寄せる(#3703)。構築だけして
+// 起動しない使い方(dump-routes、テストのnewServer)で部品が動かないよう、作ることと
+// 動かすことを分ける。
+type lifecycle struct {
+	parts []lifecyclePart
+	// err is the first invalid registration (an empty name, a nil stop or a
+	// name added twice). newServer fails the construction with it.
+	err error
+
+	// mu guards started and stopped, so that the parts are started at most
+	// once and no part is started after stopAll has begun.
+	//
+	// 止め始めた後に起動すると、止める人の居ないgoroutineが残る。起動(startAll)は
+	// goroutineを立てるだけで短いので、起動の間は握ったままでよい。
+	mu      sync.Mutex
+	started bool
+	stopped bool
+}
+
+// errLifecyclePart is wrapped by every registration error of lifecycle.
+var errLifecyclePart = errors.New("server: invalid lifecycle part")
+
+// add appends a part named name whose stop is stop. part is the value stop
+// acts on, or nil.
+//
+// 不正な登録 (名前が空、stop が nil、名前の重複) は構築の失敗にする (constructionError)。
+// その場で panic しないのは、プラグインの store の名前のように実行時の値から作る
+// 名前もあるため。重複した部品も一覧には入れる。構築に失敗した世代の後始末
+// (cleanupConstruction) で、その部品も止めるため。
+func (l *lifecycle) add(name string, part any, stop func(context.Context)) {
+	l.addWithStart(name, part, nil, stop)
+}
+
+// addWithStart appends a part named name, started by start (nil when there is
+// nothing to start) and stopped by stop, with the checks of add. It reports
+// whether the part was appended (a part with a nil stop is not).
+func (l *lifecycle) addWithStart(name string, part any, start func(), stop func(context.Context)) bool {
+	switch {
+	case name == "":
+		l.fail(fmt.Errorf("%w: a part has no name", errLifecyclePart))
+	case stop == nil:
+		l.fail(fmt.Errorf("%w: part %q has no stop", errLifecyclePart, name))
+	case l.has(name):
+		l.fail(fmt.Errorf("%w: part %q is added twice", errLifecyclePart, name))
+	}
+	if stop == nil {
+		return false
+	}
+	l.parts = append(l.parts, lifecyclePart{name: name, part: part, start: start, stop: stop})
+	return true
+}
+
+func (l *lifecycle) fail(err error) {
+	if l.err == nil {
+		l.err = err
+	}
+}
+
+func (l *lifecycle) has(name string) bool {
+	for _, p := range l.parts {
+		if p.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// names returns the names of the parts in stop order.
+func (l *lifecycle) names() []string {
+	names := make([]string, len(l.parts))
+	for i, p := range l.parts {
+		names[i] = p.name
+	}
+	return names
+}
+
+// errLifecycleStart is wrapped by the error of a part whose start panicked.
+var errLifecycleStart = errors.New("server: a lifecycle part failed to start")
+
+// startAll starts every part that has a start, in the order it was added.
+// Only the first call starts anything, and none does once stopAll has begun.
+// When a start panics, startAll recovers it, starts none of the parts after
+// it and returns an error wrapping errLifecycleStart; the caller then stops
+// the generation, which stops every part, started or not.
+//
+// panicを回収してエラーにするのは、StartBackgroundの失敗としてSupervisorに世代を
+// 止めさせるため(#3703)。構築の中で起動していた頃は、panicは構築ごとプロセスを
+// 落としていた。後の部品を起動しないのは、失敗した世代はすぐに止めるので、動かしても
+// 止めるだけになるから。
+func (l *lifecycle) startAll() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.started || l.stopped {
+		return nil
+	}
+	l.started = true
+	for _, p := range l.parts {
+		if p.start == nil {
+			continue
+		}
+		if err := startPart(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// startPart calls the start of p, turning a panic into an error.
+func startPart(p lifecyclePart) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: part %q panicked: %v", errLifecycleStart, p.name, r)
+		}
+	}()
+	p.start()
+	return nil
+}
+
+// errLifecycleStop is wrapped by the error of a part whose stop panicked.
+var errLifecycleStop = errors.New("server: a lifecycle part failed to stop")
+
+// stopAll stops every part in the order it was added, passing ctx to each,
+// whether it was started or not. Once it has begun, startAll starts nothing.
+//
+// When the stop of a part panics, stopAll recovers it, logs the part's name,
+// the panic value and the stack, and goes on with the next part (#3707). It
+// returns nil when no stop panicked, and otherwise the errors.Join of one
+// error per panicked part, each wrapping errLifecycleStop and naming the part.
+// A part whose stop panicked is not stopped again and may be left half
+// stopped.
+//
+// 停止はどれも呼び出し元のgoroutineで同期に走るので、ここで回収できる。回収しないと、
+// 1つの部品のpanicで後ろの部品の停止(バッファのflushなど)がすべて飛ぶ(#3707)。
+// #3707の前は呼び出し元の残りの手順(chartの保存、queueのdriverと購読を閉じる処理)も
+// 飛び、panicはSupervisorまで抜けてプロセスを落としていた。今は停止の段ごとの回収
+// (runShutdownSteps。#3711)が残りの段を続けるが、一覧の中の後ろの部品は、ここで
+// 回収しないと止まらない。
+func (l *lifecycle) stopAll(ctx context.Context) error {
+	l.mu.Lock()
+	l.stopped = true
+	parts := l.parts
+	l.mu.Unlock()
+	var errs []error
+	for _, p := range parts {
+		if err := stopPart(ctx, p); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// stopPart calls the stop of p with ctx, turning a panic into an error after
+// logging it with the stack.
+//
+// スタックはrecoverの中でしか取れないので、ここで記録する。エラーには値だけを載せる。
+func stopPart(ctx context.Context, p lifecyclePart) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("server: a lifecycle part panicked while stopping; stopping the rest",
+				"part", p.name, "panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("%w: part %q panicked: %v", errLifecycleStop, p.name, r)
+		}
+	}()
+	p.stop(ctx)
+	return nil
+}
+
+// addFromValue adds a part whose start (nil when it has none) and stop are
+// built from part itself, and marks it so (lifecyclePart.fromValue).
+func (l *lifecycle) addFromValue(name string, part any, start func(), stop func(context.Context)) {
+	if l.addWithStart(name, part, start, stop) {
+		l.parts[len(l.parts)-1].fromValue = true
+	}
+}
+
+// The shapes of a part whose start and stop are its own methods (#3701).
+// A part registered through one of the functions below is added with its
+// stop built from the value itself, so the stop cannot act on another value.
+type (
+	// startCloser is started with a ctx and stopped by Close, which takes
+	// no ctx (the instance buffers).
+	startCloser interface {
+		Start(ctx context.Context)
+		Close()
+	}
+	// startStopper is started with a ctx and stopped by Stop with the
+	// shutdown ctx (deliveryhealth.Service).
+	startStopper interface {
+		Start(ctx context.Context)
+		Stop(ctx context.Context)
+	}
+	// plainStartStopper is started and stopped without a ctx (the stats
+	// publishers of the stream).
+	plainStartStopper interface {
+		Start()
+		Stop()
+	}
+	// ctxCloser is stopped by Close with the shutdown ctx and has no start
+	// of its own (instance.MetadataRefresher).
+	ctxCloser interface {
+		Close(ctx context.Context)
+	}
+	// errCloser is stopped by Close, whose error is dropped, and has no start
+	// of its own (pluginstore.Store).
+	errCloser interface {
+		Close() error
+	}
+)
+
+// addStartCloser adds p as a part named name, started by p.Start(ctx)
+// when StartBackground starts the parts, and stopped by p.Close(). The
+// shutdown ctx is not passed to Close. It does not start p itself.
+//
+// ctxは登録の時に受け取り、起動の時に渡す(#3703より前は、登録したその場で起動していた)。
+func (s *Server) addStartCloser(ctx context.Context, name string, p startCloser) {
+	s.lifecycle.addFromValue(name, p, func() { p.Start(ctx) }, func(context.Context) { p.Close() })
+}
+
+// addStartStopper adds p as a part named name, started by p.Start(ctx)
+// when StartBackground starts the parts, and stopped by p.Stop with the
+// shutdown ctx. It does not start p itself.
+func (s *Server) addStartStopper(ctx context.Context, name string, p startStopper) {
+	s.lifecycle.addFromValue(name, p, func() { p.Start(ctx) }, p.Stop)
+}
+
+// addPlainStartStopper adds p as a part named name, started by p.Start() when
+// StartBackground starts the parts, and stopped by p.Stop(). Neither takes a
+// ctx. It does not start p itself.
+func (s *Server) addPlainStartStopper(name string, p plainStartStopper) {
+	s.lifecycle.addFromValue(name, p, p.Start, func(context.Context) { p.Stop() })
+}
+
+// addCloser adds p as a part named name, stopped by p.Close with the
+// shutdown ctx. It has nothing to start.
+func (s *Server) addCloser(name string, p ctxCloser) {
+	s.lifecycle.addFromValue(name, p, nil, p.Close)
+}
+
+// addErrCloser adds p as a part named name, stopped by p.Close(). The
+// error of Close is dropped, and the shutdown ctx is not passed. It does not
+// start p.
+//
+// エラーを捨てるのは #3699 の前の hook と同じ。部品の停止はエラーを返す口を持たない
+// (一覧が返すのは停止のpanicだけ。#3707)。
+func (s *Server) addErrCloser(name string, p errCloser) {
+	s.lifecycle.addFromValue(name, p, nil, func(context.Context) { _ = p.Close() })
+}
+
+// addWorker adds a part named name that, when StartBackground starts the
+// parts, runs run in a goroutine. Its stop cancels run's ctx and waits for
+// run to return (at most until the shutdown ctx is done); when run was never
+// started, the stop returns at once. It does not run run itself.
+//
+// 同じ関数から複数の部品を登録するので、名前は呼び出し元が渡す(#3699)。起動していない
+// workerの停止は待たずに返す。doneは起動しないと閉じないので、待つと停止のctxが切れる
+// まで固まる。
+func (s *Server) addWorker(name string, run func(context.Context)) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var started atomic.Bool
+	var once sync.Once
+	s.lifecycle.addWithStart(name, nil, func() {
+		started.Store(true)
+		go func() {
+			defer close(done)
+			run(ctx)
+		}()
+	}, func(shutdownCtx context.Context) {
+		once.Do(cancel)
+		if !started.Load() {
+			return
+		}
+		select {
+		case <-done:
+		case <-shutdownCtx.Done():
+		}
+	})
+}

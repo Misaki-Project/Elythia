@@ -35,7 +35,8 @@ Misskey互換クライアント(Miria等)は、misskey-jsの型に従ってレ�
 | `tools/shapediff/` | snapshot再生成 + 全family drift report |
 | `internal/entitycompat/plugin_surface_test.go` | 公開プラグイン API の面 (`TestPluginSurfaceDrift`) |
 | `internal/entitycompat/plugin_doc_test.go` | `docs/plugins/authoring.md` の一覧 ↔ 公開面 golden (`TestPluginDoc_*` 5 本) |
-| `internal/entitycompat/divergence_doc_test.go` | `docs/divergence.md` ↔ 実 schema / 生成物 / router.go (`TestDivergenceDoc_*` 6 本)、`docs/api-compat.md` ↔ router.go (`TestAPICompatDoc_MatchesRouter`) |
+| `internal/entitycompat/elythiajs_endpoints_test.go` | Elythia 独自の POST のエンドポイント (`docs/api-compat.md`) ↔ `frontend/packages/elythia-js` の型と `pending-endpoints.txt` (`TestElythiaJS_EndpointsMatchRouter`、#3417) |
+| `internal/entitycompat/divergence_doc_test.go` | `docs/divergence.md` と `docs/divergence/` ↔ 実 schema / 生成物 / `internal/server` の登録 / 目次 (`TestDivergenceDoc_*` 7 本)、`docs/api-compat.md` ↔ `internal/server` の登録 (`TestAPICompatDoc_MatchesRouter`) |
 | `internal/entitycompat/schema_drift_test.go` | migration の列 ↔ upstream entity (`TestSchemaDrift_CreateOnlyColumns`) |
 | `internal/entitycompat/migration_seed_test.go` | TypeORM `migrations` seed の網羅 (`TestMigrationSeed_CoversUpstream`) |
 
@@ -239,7 +240,7 @@ Misskeyのエラーは`{code, message, id}`形式で、クライアントは`cod
 
 echo wrapperはhandlerの最頻送出経路なので外すとgateが大半のrouteを素通しする(実例: これを足すと解決数が577→652に増え、未検出だったdrift 25件が露出した)。
 
-**`internal/server/router.go`のインラインendpointは0件**。#2791で全14件を`internal/api`配下へ移設したので、上のapi walkがそのまま拾う。
+**`internal/server`のインラインendpointは0件**(gateは`internal/server`の非テストの`.go`を全部読む。#3672)。#2791で全14件を`internal/api`配下へ移設したので、上のapi walkがそのまま拾う。
 
 gateは「golden と突合できた数の下限」から**「inlineが復活したら落とす」向きに反転**させた。判定に使うのは`countInlineHandlers`で、`/api` group tree配下のroute登録のうち**`handlerVar.Method`で解決できない形**を数える:
 
@@ -312,19 +313,19 @@ gateは2方向:
 
 `TestLimitSpecDrift`は、list endpointの`limit`の**default / maximum**をMisskeyの`paramDef`と整合させるgate。
 
-Misskeyは`limit: { type:'integer', minimum, maximum, default }`を宣言し、ajvが**default補完 + 範囲外reject**する。Elythiaはhandlerでimperativeにclampしていたため、default/max値がupstreamとずれると「limit省略時の件数」や「上限」が変わる(`limit`省略時に10件返すべきが30件返る等)。
+Misskeyは`limit: { type:'integer', minimum, maximum, default }`を宣言し、ajvが**default補完 + 範囲外reject**する。Elythiaはhandlerで同じ値を持つので、default/max値がupstreamとずれると「limit省略時の件数」や「上限」が変わる(`limit`省略時に10件返すべきが30件返る等)。
 
 ### 仕組み
 
-handlerは`pagination.ClampLimit(limit, def, max)`でlimitを正規化する。gateは各call siteの`def`/`max`**リテラル**を読み、`router.go`で囲むmethodをendpointに解決し、Misskey paramDefから生成したgolden(`golden_limit_specs.json`、`tools/limitspec`が生成)と突合する。L3と同様**段階的**で、`ClampLimit`へ移行済みのcall siteだけがgate対象(未移行は素通し)。
+handlerは`pagination.ResolveLimit(limit, def, max)`でlimitを決める。省略ならdefを返し、1..maxの範囲の外なら`INVALID_PARAM`(400)にする。gateは各call siteの`def`/`max`**リテラル**を読み、`internal/server`のrouteの登録で囲むmethodをendpointに解決し、本家の`paramDef`のgolden(`internal/api/paramschema/upstream_paramdefs.json`の`limit`。最上位の`allOf`などの分岐の中もたどる)と突合する。#3890より前は、`tools/limitspec`が本家の`.ts`を正規表現で読んで作った別のgolden(`golden_limit_specs.json`)と突合していた。limitを持つ113件のdefaultとmaximumが`upstream_paramdefs.json`とすべて一致したので、goldenを1つにした。gateが読むのは`ResolveLimit`のcall siteで、本家の`paramDef`に`limit`があるendpointに解決できたものだけを突合する。
 
-clampロジック自体(mk=clamp / Misskey=範囲外reject)は揃えない — mk側のclampの方が寛容で、揃えると既存クライアントを壊しうる。**default/max値のみ**が契約として gate される。
+範囲外の扱いは本家と同じく400で、以前は黙って丸めていた(`ClampLimit`、`internal/api/pagination/pagination.go`のコメント)。また、本家の`paramDef`で拒否するendpointでは、範囲外の`limit`は検証器が先に400にする。このgateが守るのは、検証器が見ない**default**と、handlerの持つmaxの値の一致。
 
 ### 運用
 
 ```bash
-make limitspec-check  # gate をローカル実行
-make shapecheck-gen   # golden_limit_specs.json も再生成
+go test ./internal/entitycompat/ -run TestLimitSpecDrift  # gate をローカル実行 (CI では test で走る)
+make paramdef-gen     # upstream_paramdefs.json を再生成
 ```
 
 ## Permission drift gate（アクセス制御）
@@ -377,10 +378,22 @@ Elythiaは全認証がtoken経由(session無し)で、native token = `users.toke
 ### 運用
 
 ```bash
-make perm-check       # permission / secure / OAuth scope の 3 gate をローカル実行
+make perm-check       # permission / secure / OAuth scope / cacheSec の 4 gate をローカル実行
 make shapecheck-gen   # golden_permissions.json / golden_secure_endpoints.json /
-                      # golden_oauth_kinds.json をまとめて再生成
+                      # golden_oauth_kinds.json / golden_cache_sec.json をまとめて再生成
 ```
+
+## GET と cacheSec の drift gate（allowGet / cacheSec）
+
+本家は`allowGet: true`のendpointをGETでも受け、そのうち`cacheSec`を持つものは、資格情報の無いGETの成功応答に`Cache-Control: public, max-age=<cacheSec>`を付ける(`ApiCallService.handleRequest`)。Elythiaでは秒数の表を`middleware.APICacheSec`の1か所に置き、`/api`のgroupに付けた`middleware.APICacheControl`が付ける(#3593)。それまではhandlerごとに書いていて、GETのrouteが無いもの2本(`users/featured-notes`、`retention`)と、ヘッダーが付かないもの8本があった。
+
+`tools/permspec`が`allowGet: true`のendpointと`cacheSec`(`60 * 60`のような整数の積を計算した値、無ければ0)を`golden_cache_sec.json`に出し、`TestCacheSecDrift`が次を見る。
+
+- goldenの全endpointに、`internal/server`のGETのroute(`api.GET`、またはGETを含む`api.Match`)がある
+- `middleware.APICacheSec`がgoldenの`cacheSec`と過不足なく一致する
+- `internal/server`が`/api`のgroupに`api.Use(middleware.APICacheControl())`を付けている
+
+数え方: 2026.10.0では`allowGet: true`が24本で、24本とも`cacheSec`を持つ。`allowGet`の無い`cacheSec`は本家でも意味を持たないので、`tools/permspec`はそれを見つけたら形式の変化を疑って止まる。`cacheSec:`の行があるのに整数の積として読めない(`ONE_HOUR`のような識別子)ときも止まる。読めないものを0として通すと、そのendpointだけ黙って検査から外れるため。
 
 ## Schema drift gate（drop-in で生えない列）
 
@@ -408,7 +421,7 @@ make shapecheck-gen                                     # golden_upstream_column
 
 ## Migration seed gate（drop-in 復路）
 
-**復路は保証しない(#3191)が、このgateはrequiredのまま残す。** seedは、どこまで戻れるかを測る`mkgo-born`の前提で、足す手間も小さいため。
+**復路は保証しない(#3191)が、このgateはrequiredのまま残す。** seedは、どこまで戻れるかを測る`elythia-born`の前提で、足す手間も小さいため。
 
 `TestMigrationSeed_CoversUpstream`は、TypeORMのbookkeepingテーブル`migrations`へのseedが、upstreamの全migrationを網羅していることを検証する。
 
@@ -441,6 +454,10 @@ make shapecheck-gen                                        # golden_upstream_mig
 
 実際に 3 箇所が静かにずれていた (#2634)。#2313 で分割アップロードの endpoint 4 件を足したときに冒頭サマリだけ更新して §1-1 の内訳表を更新せず、#2332 / #2340 / `instance_secret` でも同じことが起きた。§2-2 に至っては見出しの「実使用 14」と直後の散文の「15 件」が**隣接 2 行で矛盾**していた。どれも人が数え直さない限り気付けない。
 
+### `TestDivergenceDoc_IndexListsEveryAreaFile`
+
+`docs/divergence.md` は #3414 から目次で、中身は `docs/divergence/` の領域ごとのファイルにある。下のゲートはどれも、目次と、目次がリンクするファイルを続けて読む。**目次に載らないファイルはどのゲートからも読まれない**ので、目次のリンクと `git ls-files docs/divergence/` を突き合わせる (ディスクでなく git で数えるのは、add し忘れたファイルが手元でだけ通らないようにするため)。領域のファイルを足したら目次の表に行を足す。
+
 ### `TestDivergenceDoc_EndpointCountMatchesTable`
 
 §1-1 の見出しの件数 == 表の件数列の合計 == 冒頭サマリの和の式。
@@ -453,7 +470,7 @@ make shapecheck-gen                                        # golden_upstream_mig
 
 upstream の endpoint 一覧を `tools/apicompat` から直接引くことはできない (**本家のソースは `make upstream-fetch` で取る `.cache/misskey` にしか無く、`test-shards` job は取得しない**。#3378 / #3379)。ただし `make apicompat` の生成物は commit されているので、そちらを経由すれば本家のソース無しで突き合わせられる。
 
-この gate が落ちたとき**どちらが古いかは中身を見ないと決まらない**。api-compat.md 側が古いなら `make apicompat` で再生成する (route dump に stack が要る)。divergence.md 側が古いなら §1-1 の表・見出し・冒頭サマリの 3 箇所すべてを直す。
+この gate が落ちたとき**どちらが古いかは中身を見ないと決まらない**。api-compat.md 側が古いなら `make apicompat` で再生成する (route dump に stack が要る)。divergence/api.md 側が古いなら §1-1 の表・見出し・冒頭サマリの 3 箇所すべてを直す。
 
 ### `TestDivergenceDoc_ForkFrontendTagsMatchTable`
 
@@ -463,7 +480,7 @@ upstream の endpoint 一覧を `tools/apicompat` から直接引くことはで
 
 ### `TestDivergenceDoc_StreamChannelsMatchRegistry`
 
-§4-1 のチャンネル一覧 == `router.go` の `streamRegistry.Register*` の登録名。
+§4-1 のチャンネル一覧 == `internal/server` の登録名 (`builtinStreamChannels()` の一覧、#3692)。
 
 **チャンネル名はソースのファイル名と違う。** upstream のソースは `chat-room.ts` だが
 wire 上の名前 (`chName`) は `chatRoom`。#2640 の初稿はファイル名をそのまま
@@ -471,28 +488,29 @@ wire 上の名前 (`chName`) は `chatRoom`。#2640 の初稿はファイル名�
 しない名前**だった。人が目で照合すると通る類の誤り。
 
 doc 側は §4-1 の表 (Elythia 独自) と ```text フェンス (upstream 由来) の和を母集団に、
-実装側は `internal/server/` 非テスト `.go` 全体の `streamRegistry.Register*` を見る。
-呼び出しの総数と抽出できた数が一致することも見る (名前が定数経由だったり英字以外を
-含むと registry から丸ごと消えるため)。
+実装側は `internal/server/` 非テスト `.go` 全体から、`builtinStreamChannels()` の項目の名前を
+構文木で読み (名前が文字列リテラルでない項目は落とす)、一覧の外の
+`streamRegistry.Register*` の直接の登録も拾う。直接の登録は、呼び出しの総数と抽出できた数が
+一致することも見る (名前が定数経由だったり英字以外を含むと registry から丸ごと消えるため)。
 
 **固定できるのは「doc の一覧 == Elythia の登録」だけ。** §4-1 のもう半分の主張
-「upstream は 18」「名前も upstream に揃えてある」は検証していない — `test-shards`
+「upstream は 19」「名前も upstream に揃えてある」は検証していない — `test-shards`
 job は本家のソースを取得しないため。doc と実装を同時に間違った名前へ変えれば
-この gate は通る。upstream が 19 個目を足した / 名前を変えた場合も検出できないので、
+この gate は通る。upstream が 20 個目を足した / 名前を変えた場合も検出できないので、
 **本家の版を上げる PR で人が見る**。
 
 ### `TestAPICompatDoc_MatchesRouter`
 
-`docs/api-compat.md` の endpoint 行 == `router.go` が静的登録する `/api/*`。POST と GET の
+`docs/api-compat.md` の endpoint 行 == `internal/server` が静的登録する `/api/*`。POST と GET の
 両方を見る (「endpoint を足す操作は必ず POST を伴う」は成り立たない —
 `/api/v1/instance/peers` は upstream 側も `get()` 直登録で Elythia も `api.GET` 一本)。
 
 **錨そのものが腐ると、それを見る gate も一緒に無力化する。** 上の
-`EndpointCountMatchesAPICompat` は divergence.md と api-compat.md の一致しか見ないので、
+`EndpointCountMatchesAPICompat` は divergence/api.md (§1-1) と api-compat.md の一致しか見ないので、
 endpoint を足して**どちらも更新しない**と両方が古いまま緑になる (develop では
 `mk-go version: 1.1.2` / `mk-go only: 49` のまま腐っていた)。
 
-route dump には stack が要るのでテストからは呼べない。代わりに router.go の
+route dump には stack が要るのでテストからは呼べない。代わりに `internal/server` の
 `api.POST(` / `api.GET(` / `api.Match(chartMethods, ` を静的に抽出して突き合わせる。
 同梱プラグインのルート (`/api/plugin/*`) は literal で現れないので母集団から外す。
 生成物側は「`mk-go 側にしかない`」「両方に存在する」の 2 セクションだけを見る
@@ -511,7 +529,8 @@ route dump には stack が要るのでテストからは呼べない。代わ�
 
 **0 件チェックだけでは足りない** — 部分的な取りこぼしは router 側の集合が小さく
 なるだけで、生成物との差が出ずに黙って一致する。走査は `internal/server/` の
-非テスト `.go` 全体で、router.go だけを見ると別ファイルからの登録を取りこぼす。
+非テスト `.go` 全体 (`git ls-files` で列挙する。#3672) で、router.go だけを見ると
+別ファイルからの登録を取りこぼす。
 
 3 は「正当な理由でその形を使うことになったら、抽出をそちらへ拡張してから固定を
 解除する」という運用。`Static` / `File` / `RouteNotFound` も対象に含める
@@ -575,7 +594,7 @@ Elythia は `IDX_<table>_<col>`、upstream (TypeORM) は `IDX_e5848eac4940934e23
 
 **新しく index を足すとき、upstream に同じ (table, unique, method, columns) の index があるなら upstream の index 名をそのまま使うこと。** `000058_channel_muting_expires_at.up.sql` が前例。そうすれば `IF NOT EXISTS` が効いて二重化しない。
 
-既存の 167 本は `testdata/known_duplicate_indexes.json` に記録し、`000068` が実行時に落とす。意図的に定義を変えている場合 (partial 化等) も同ファイルに追加する。
+既存の 167 本は `testdata/known_duplicate_indexes.json` に記録し、`000068` が実行時に落とす。upstream と同じ列に、意図して部分 index を並べる場合 (#3590 の `IDX_following_followeeId_notify_normal`) は、`000068` の対象ではないので `testdata/intended_partial_indexes.json` に理由と一緒に載せる。gate は、そこに載っていて実際に `WHERE` を持つものだけを許し、migration に現れなくなった項目があると落ちる。
 
 ### golden の再生成
 

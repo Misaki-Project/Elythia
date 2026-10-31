@@ -4,6 +4,8 @@
 package db
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	stdlog "log"
 	"log/slog"
@@ -31,6 +33,9 @@ func New(cfg *config.Config) (*gorm.DB, error) {
 	})
 	if err != nil {
 		if hint := cfg.DBTLSErrorHint(err); hint != "" {
+			return nil, fmt.Errorf("failed to connect to database (%s): %w", hint, err)
+		}
+		if hint := cfg.DBConnectTimeoutHint(err); hint != "" {
 			return nil, fmt.Errorf("failed to connect to database (%s): %w", hint, err)
 		}
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
@@ -95,12 +100,61 @@ func New(cfg *config.Config) (*gorm.DB, error) {
 			SetConnMaxLifetime(connMaxLifetime).
 			SetConnMaxIdleTime(connMaxIdleTime),
 		); err != nil {
+			if hint := cfg.DBReplicaConnectTimeoutHint(err); hint != "" {
+				return nil, fmt.Errorf("failed to register db replicas (%s): %w", hint, err)
+			}
 			return nil, fmt.Errorf("failed to register db replicas: %w", err)
 		}
 		slog.Info("registered PostgreSQL read replicas", "count", len(cfg.DBSlaves))
 	}
 
 	return gdb, nil
+}
+
+// Close closes every connection pool behind gdb: the primary and, when
+// dbresolver is registered, each replica pool. Closing an already closed pool
+// is a no-op, so calling Close twice is safe.
+//
+// gdb.DB() で取れるのは primary のプールだけで、dbresolver が持つ replica の
+// プールは別にある。メンテナンスに入るときは DB への接続を 0 にする必要があり
+// (#3463)、primary だけを閉じると replica への接続が残る。
+func Close(gdb *gorm.DB) error {
+	if gdb == nil {
+		return nil
+	}
+	var errs []error
+	if p, ok := gdb.Config.Plugins[(&dbresolver.DBResolver{}).Name()]; ok {
+		if dr, ok := p.(*dbresolver.DBResolver); ok {
+			errs = append(errs, dr.Call(func(pool gorm.ConnPool) error {
+				return closeConnPool(pool)
+			}))
+		}
+	}
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		errs = append(errs, fmt.Errorf("get underlying sql.DB: %w", err))
+	} else {
+		errs = append(errs, sqlDB.Close())
+	}
+	return errors.Join(errs...)
+}
+
+// closeConnPool closes the *sql.DB behind one GORM connection pool.
+func closeConnPool(pool gorm.ConnPool) error {
+	switch p := pool.(type) {
+	case *sql.DB:
+		return p.Close()
+	case gorm.GetDBConnector:
+		// PrepareStmt を有効にしているので、プールは *gorm.PreparedStmtDB に
+		// 包まれて渡ってくる。
+		sqlDB, err := p.GetDBConn()
+		if err != nil {
+			return fmt.Errorf("get replica sql.DB: %w", err)
+		}
+		return sqlDB.Close()
+	default:
+		return fmt.Errorf("close connection pool: unsupported type %T", pool)
+	}
 }
 
 // newGormLogger builds the GORM logger used for SQL logging.

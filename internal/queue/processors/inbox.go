@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
@@ -36,6 +37,16 @@ type FederationProcessor interface {
 // 実装 / テスト fake を壊さないよう optional interface にしてある。
 type SignerAwareProcessor interface {
 	ProcessWithSigner(body []byte, signer *model.User) error
+}
+
+// NormalizedActivityProcessor is an optional extension that accepts the
+// activity the inbox gate already normalized (#3610).
+//
+// gate は actor / id を読むために本文を Normalize しているので、同じ結果を
+// 渡して処理側でもう一度 Normalize しない。未実装の processor (テストの fake)
+// には今どおり本文を渡す。
+type NormalizedActivityProcessor interface {
+	ProcessNormalized(activity federation.NormalizedActivity, signer *model.User) error
 }
 
 // RelayAwareVerifier is an optional extension of SignatureVerifier that can
@@ -81,11 +92,26 @@ type HostBlockChecker interface {
 	IsAllowed(host string) bool
 }
 
+// SoftwareSuspensionChecker reports whether activities from a host must be
+// refused because the instance runs software listed in
+// meta.inboxSuspendedSoftware (Elythia 独自、#3362)。実装は
+// core/federation.NewInboxSuspendedChecker。
+type SoftwareSuspensionChecker interface {
+	IsSuspended(host string) bool
+}
+
 // InstanceTracker is invoked after a successfully verified inbound
 // activity so that the instance row's latestRequestReceivedAt can be
 // updated. nil なら no-op。
 type InstanceTracker interface {
 	MarkRequestReceived(host string) error
+}
+
+// InstanceMetadataRefresher refetches a remote instance's nodeinfo in the
+// background when it is older than 24 hours (#3564). 実装は
+// core/instance.MetadataRefresher。
+type InstanceMetadataRefresher interface {
+	MaybeRefresh(host string)
 }
 
 // InboxChartHook is invoked after a successfully verified inbound
@@ -135,21 +161,46 @@ type SignatureCapabilityRecorder interface {
 }
 
 type InboxProcessor struct {
-	processor  FederationProcessor
+	processor FederationProcessor
+	// verifier は受信の HTTP 署名を worker で検証し直す。**無くても payload は落ちない。**
+	// Handle の `len(payload.Headers) > 0 && p.verifier != nil` が偽になり、署名検証・
+	// 連合ブロック・actor 一致 (authorizeActor)・replay 判定を**まとめて飛ばしたまま
+	// dispatch へ進む** (#2682)。連合ブロック・replay・LD-Signature はそれぞれ別の依存も
+	// 持つので、どれか 1 つだけを外しても個別に無効化される。LD-Signature の検証器
+	// (SetLDSignatureVerifier) は setter のまま残っていて、外すと大半は fail-closed
+	// (signer != actor で error) だが、JSON-LD の term 再定義検査
+	// (CheckForbiddenDirectivesIfPresent) と Headers 無しの経路の検証が黙って飛ぶ
+	// (#2682 review L-E)。
 	verifier   SignatureVerifier
 	ldVerifier LDSignatureVerifier
 	// relayChecker は LD-Signature 検証で解決する著者に「リレー由来」の印を
 	// 付けるかどうかの判定に使う (#2340)。
-	relayChecker    RelayActorChecker
-	hostBlocker     HostBlockChecker
+	relayChecker RelayActorChecker
+	// hostBlocker は署名検証の後で、連合をブロックした host / 許可外の host からの
+	// activity を弾く。無いと isBlocked が常に false になる (#2683)。
+	hostBlocker HostBlockChecker
+	// softwareBlocker は meta.inboxSuspendedSoftware の判定。設定は判定のたびに読む
+	// ので、設定が空でも常に渡す (#3362)。
+	softwareBlocker SoftwareSuspensionChecker
 	instanceTracker InstanceTracker
-	chartHook       InboxChartHook
-	capabilities    SignatureCapabilityRecorder
+	// metadataRefresher は受信のたびに相手の nodeinfo を 24 時間より古ければ
+	// 取り直す (#3564)。未配線なら取り直さない。
+	metadataRefresher InstanceMetadataRefresher
+	chartHook         InboxChartHook
+	capabilities      SignatureCapabilityRecorder
 	// telemetry は受信結果をホストごとに記録する (#2471)。未配線なら記録
 	// しないだけで、inbox 処理そのものには影響しない。
 	telemetry DeliveryTelemetry
-	// replayGuard は処理済み activity を覚えて再投函を弾く。未配線なら
-	// 保護しないだけ (従来どおり冪等性に委ねる)。
+	// replayGuard は処理済み activity を覚えて再投函を弾く。未配線だと isReplay が
+	// 常に false を返し (fail-open)、**一度処理した activity を Date skew の窓の内側で
+	// 何度でも再投函できる**。各 activity handler は冪等な前提で書かれているが、
+	// 冪等性は handler ごとの性質であって保証ではない。signin / i の TOTP guard と
+	// 同じ一回性の tier なので、構築子の必須の引数にした (#2682 review M-4、#3829)。
+	//
+	// **署名検証を通った経路にしか効かせない。** activity.id は body の値なので、
+	// 署名で本文が縛られていて、かつ authorizeActor が id の host と actor の host の
+	// 一致を確かめた後でなければ信用できない。信用できない id を覚えると、他人の
+	// activity id を先に登録して**本物を落とす**ことができてしまう。
 	replayGuard InboxReplayGuard
 	// keyCache は受信 HTTP Signature verify の公開鍵パースをメモ化する (#1426)。
 	// InboxProcessor は worker 間共有の単一インスタンス (router.go:616) なので、
@@ -159,10 +210,26 @@ type InboxProcessor struct {
 }
 
 // NewInboxProcessor constructs an InboxProcessor wrapping the supplied
-// federation.Processor. Set* メソッドで verify / block / track / chart の
-// 各 dep を別途配線する。未配線の dep は no-op として扱われる。
-func NewInboxProcessor(p FederationProcessor) *InboxProcessor {
-	return &InboxProcessor{processor: p, keyCache: activitypub.NewPublicKeyCache(0)}
+// federation.Processor.
+//
+// verifier re-verifies the inbound HTTP signature in the worker. hostBlocker
+// rejects activities from federation-blocked hosts after signature
+// verification. softwareBlocker is the checker for meta.inboxSuspendedSoftware
+// (#3362). metadataRefresher refetches the sender's nodeinfo in the background
+// (#3564). replayGuard drops re-posted activities. The remaining dependencies
+// (LD-Signature verifier, relay checker, instance tracker, chart hook,
+// telemetry, capability recorder) are wired with setters; an unwired one is a
+// no-op.
+func NewInboxProcessor(p FederationProcessor, verifier SignatureVerifier, hostBlocker HostBlockChecker, softwareBlocker SoftwareSuspensionChecker, metadataRefresher InstanceMetadataRefresher, replayGuard InboxReplayGuard) *InboxProcessor {
+	return &InboxProcessor{
+		processor:         p,
+		verifier:          verifier,
+		hostBlocker:       hostBlocker,
+		softwareBlocker:   softwareBlocker,
+		metadataRefresher: metadataRefresher,
+		replayGuard:       replayGuard,
+		keyCache:          activitypub.NewPublicKeyCache(0),
+	}
 }
 
 // SetLDSignatureVerifier wires an optional LD-Signature verifier that runs
@@ -171,35 +238,6 @@ func NewInboxProcessor(p FederationProcessor) *InboxProcessor {
 // queue を ack するが Process は呼ばない)。
 func (p *InboxProcessor) SetLDSignatureVerifier(v LDSignatureVerifier) {
 	p.ldVerifier = v
-}
-
-// SetInboxReplayGuard wires the guard that drops re-posted activities.
-//
-// **署名検証を通った経路にしか効かせない。** activity.id は body の値なので、
-// 署名で本文が縛られていて、かつ authorizeActor が id の host と actor の host の
-// 一致を確かめた後でなければ信用できない。信用できない id を覚えると、他人の
-// activity id を先に登録して**本物を落とす**ことができてしまう。
-func (p *InboxProcessor) SetInboxReplayGuard(g InboxReplayGuard) {
-	p.replayGuard = g
-}
-
-// SetSignatureVerifier wires a verifier used to re-verify the inbound
-// HTTP signature in the worker.
-//
-// **未配線でも payload は落ちない。** Handle の
-// `if len(payload.Headers) > 0 && p.verifier != nil` が偽になり、
-// 署名検証・連合ブロック・actor 一致 (authorizeActor)・replay 判定を
-// **まとめて飛ばしたまま dispatch へ進む**。以前ここには "payloads carrying
-// Headers are dropped" と書いてあったが誤りで、fail-closed に読める分だけ
-// 危険だった (#2682)。起動時の配線検査は HasSignatureVerifier を見る。
-func (p *InboxProcessor) SetSignatureVerifier(v SignatureVerifier) {
-	p.verifier = v
-}
-
-// SetHostBlockChecker wires a checker used to reject activities from
-// federation-blocked hosts after signature verification.
-func (p *InboxProcessor) SetHostBlockChecker(c HostBlockChecker) {
-	p.hostBlocker = c
 }
 
 // SetInstanceTracker wires the InstanceTracker used to update
@@ -307,11 +345,37 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 	// 未署名の body から採った id は相手の申告でしかなく、覚えると他人の id を
 	// 先に登録して本物を落とせる。
 	activityID := ""
+	// replayKey は再投函ガードの鍵 (署名が覆った時刻と本文のダイジェスト)。activityID と
+	// 同じく、署名検証と actor の認可を通った経路でだけ埋まる。
+	replayKey := ""
 	// body は dispatch する本文。転送経路では authorizeActor が署名済みの内容へ
 	// 差し替える。
 	body := payload.Body
+	// normalized は body を NormalizeActivity にかけた結果で、authorizeActor を
+	// 通った経路でだけ埋まる (#3610)。埋まっていれば dispatch はこちらを渡し、
+	// 処理側で同じ本文を正規化し直さない。body と必ず同時に差し替える。
+	var normalized *federation.NormalizedActivity
+	// **署名を検証する前に、keyId のホストで受信の拒否を見る (#3362)。** 検証は
+	// 署名者の actor を解決して保存し、プロフィールや nodeinfo も取りに行くので、
+	// 拒否する相手の分まで行と通信が増える。ドメインブロックが resolver の手前で
+	// 止まるのと同じく、先に止める。keyId は検証前で信用できない値だが、拒否の
+	// 向きにしか使わないので、偽れば送った本人の要求が落ちるだけ。当たらなければ
+	// 検証の後に DB で正規化したホストでもう一度見る (isBlocked)。
+	if keyHost := strings.ToLower(host); len(payload.Headers) > 0 && p.softwareBlocker != nil && keyHost != "" && p.softwareBlocker.IsSuspended(keyHost) {
+		// 記録も小文字にしたホストで残す (大文字混じりの keyId で別のホストとして
+		// 数えないため)。
+		p.recordInboxTelemetry(keyHost, deliveryhealth.ClassBlocked, started, "")
+		// **拒否した相手の nodeinfo も取り直す (#3564)。** 拒否の判定は保存済みの
+		// softwareVersion で行うので、ここで取り直さないと、相手が版を上げても
+		// 拒否が続く (受信で状態を戻す MarkRequestReceived はこの後にあり、届かない)。
+		// keyId は未検証なので、偽れば第三者が、登録済みで受信を拒否している
+		// ホストへの nodeinfo の取得を起こせる。取りに行くのは登録済みの相手だけで、
+		// 1 ホスト 1 日 1 回までに間引く。
+		p.refreshMetadata(keyHost)
+		return nil
+	}
 	if len(payload.Headers) > 0 && p.verifier != nil {
-		actor, keyType, err := p.verifyPayload(payload)
+		actor, keyType, verifiedDate, err := p.verifyPayload(payload)
 		if errors.Is(err, federation.ErrLookupUnavailable) {
 			// **「確かめられなかった」は ack しない** (#3121)。署名が合わない body を
 			// retry しても結果は変わらないので既定は ack だが、検証は DB も読むので
@@ -340,6 +404,9 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 			// どれだけ来ているか」が一切見えない (#2471)。
 			if actor != nil && actor.Host != nil {
 				host = *actor.Host
+				// 受信を拒否するソフトウェアで止めた相手は取り直す (#3564)。
+				// ドメインブロックの相手は refreshMetadata が除く。
+				p.refreshMetadata(host)
 			}
 			p.recordInboxTelemetry(host, deliveryhealth.ClassBlocked, started, "")
 			return nil
@@ -348,7 +415,8 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 		// (actor spoofing 対策)。一致しない場合は転送活動とみなし LD-Signature が
 		// body actor を認証している場合のみ許可する。LD-Signature の hardening
 		// (forbidden directive 等) も本 gate に集約する。
-		fields, authorizedBody, err := p.authorizeActor(payload.Body, actor)
+		authorized, err := p.authorizeActor(payload.Body, actor)
+		fields := authorized.Fields()
 		if err != nil {
 			if errors.Is(err, federation.ErrLookupUnavailable) {
 				// **ここも ack しない** (#3121)。転送 activity の認可は
@@ -380,20 +448,38 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 		// **以降は authorizeActor が返した本文を使う。** 転送経路では LD-Signature が
 		// 覆う内容だけに compact した文書で、生 body には署名外のキー
 		// (`_misskey_content` 等) を転送者が足せる。
-		body = authorizedBody
+		body = authorized.Source()
+		normalized = &authorized
 		if actor != nil && actor.Host != nil {
 			host = *actor.Host
 		}
 		// **ここまで来て初めて activity.id を信用できる。** 署名が本文を縛って
-		// いて、authorizeActor が id の host と actor の host の一致を見た後。
-		activityID = federation.ExtractActivityID(body)
-		if p.isReplay(activityID) {
+		// いて、authorizeActor が actor を読め、id の host と actor の host の一致を
+		// 見た後。
+		//
+		// id は authorizeActor が読んだものをそのまま使う (#3610)。authorized は
+		// 処理に渡す本文 (転送経路では compact 済みの文書) から読んだ値なので、
+		// 以前の ExtractActivityID(body) と同じ値で、正規化をもう 1 回しない。
+		activityID = fields.ID
+		// **再投函の鍵は署名が覆った時刻と本文。** id だけを鍵にすると、同じ id で
+		// 中身の違う活動を 2 つ目から捨てる。本家 Misskey の Undo(Follow) は
+		// `<Follow の id>/undo` の決定的な id で `published` だけが変わるので、
+		// 15 分以内の 2 回目のフォロー解除が届かず、フォロワーのまま残っていた
+		// (2026-10-31 の監査)。本文だけでも、Elythia 自身の Follow (決定的な id で
+		// `published` 無し) の再フォローを捨てる。再投函は捕まえた署名付きリクエストを
+		// そのまま投げ直す形なので、受付と同じ時刻 (署名済み X-Date を Date より優先)
+		// を足す。署名されていない X-Date は捕まえた要求に後付けできるので使わない。
+		replayKey = activityReplayKey(verifiedDate, payload.Body)
+		if p.isReplay(replayKey) {
 			slog.Debug("inbox: activity already processed, dropping replay",
 				"host", host, "activityId", activityID)
 			p.recordInboxTelemetry(host, deliveryhealth.ClassDuplicate, started, "")
 			return nil
 		}
 		p.touchInstance(actor)
+		if actor != nil && actor.Host != nil {
+			p.refreshMetadata(*actor.Host)
+		}
 		p.recordSignatureCapability(actor, keyType, payload.Body)
 		p.commitChart(actor)
 		signer = actor
@@ -427,7 +513,12 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 			body = verified.Body
 		}
 	}
-	if err := p.dispatch(body, signer); err != nil {
+	if err := p.dispatch(body, normalized, signer); err != nil {
+		if errors.Is(err, federation.ErrInboundLocalReferenceUnavailable) {
+			slog.Debug("inbox: unavailable local reference, dropped", "host", host)
+			p.recordInboxTelemetry(host, deliveryhealth.ClassUnsupported, started, "")
+			return nil
+		}
 		if errors.Is(err, federation.ErrUnsupportedActivity) {
 			slog.Debug("inbox: unsupported activity, dropped", "host", host)
 			// 異常ではない (相手は正しく送っており、こちらが対応していない
@@ -440,20 +531,20 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 	}
 	// **成功してから覚える。** 先に覚えると、処理が落ちてキューが再試行した
 	// ときに自分の再試行を再投函として捨ててしまう。
-	p.rememberActivity(activityID)
+	p.rememberActivity(replayKey, activityID)
 	p.recordInboxTelemetry(host, deliveryhealth.ClassAccepted, started, "")
 	return nil
 }
 
-// isReplay reports whether this activity was already processed.
+// isReplay reports whether a request with this replay key was already processed.
 //
 // guard の障害では**落とさない** (fail-open)。Redis が不調なだけで連合の受信が
 // 止まると、再投函を防ぐより害が大きい。
-func (p *InboxProcessor) isReplay(activityID string) bool {
-	if p.replayGuard == nil || activityID == "" {
+func (p *InboxProcessor) isReplay(replayKey string) bool {
+	if p.replayGuard == nil || replayKey == "" {
 		return false
 	}
-	seen, err := p.replayGuard.Seen(context.Background(), activityID)
+	seen, err := p.replayGuard.Seen(context.Background(), replayKey)
 	if err != nil {
 		slog.Warn("inbox: replay guard degraded, accepting without the check", "err", err)
 		return false
@@ -461,12 +552,13 @@ func (p *InboxProcessor) isReplay(activityID string) bool {
 	return seen
 }
 
-// rememberActivity records a successfully processed activity.
-func (p *InboxProcessor) rememberActivity(activityID string) {
-	if p.replayGuard == nil || activityID == "" {
+// rememberActivity records a successfully processed request by its replay key.
+// activityID is only for the log.
+func (p *InboxProcessor) rememberActivity(replayKey, activityID string) {
+	if p.replayGuard == nil || replayKey == "" {
 		return
 	}
-	if err := p.replayGuard.Remember(context.Background(), activityID); err != nil {
+	if err := p.replayGuard.Remember(context.Background(), replayKey); err != nil {
 		slog.Warn("inbox: failed to record processed activity", "activityId", activityID, "err", err)
 	}
 }
@@ -479,33 +571,34 @@ func (p *InboxProcessor) rememberActivity(activityID string) {
 // 小文字混在不可なので handler 側で normalize 済前提)、Path、`(request-
 // target)` を含む header 集合だけが必要なので、これで足りる。
 // 戻り値の KeyType は検証に成功した鍵の種別で、署名方式の観測記録に使う
-// (#2393、err != nil のとき無意味)。
-func (p *InboxProcessor) verifyPayload(payload queue.InboxPayload) (*model.User, activitypub.KeyType, error) {
+// (#2393)。時刻は検証済みのヘッダーから、受付と同じ InboxDateHeader で選ぶ。
+// KeyType と時刻は err != nil のとき無意味。
+func (p *InboxProcessor) verifyPayload(payload queue.InboxPayload) (*model.User, activitypub.KeyType, string, error) {
 	parsed, err := activitypub.ParseSignatureHeader(payload.Headers["Signature"])
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	actorURI := activitypub.ResolveKeyURL(parsed.KeyID)
 	actor, err := p.verifier.ResolveActor(actorURI)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	// keyId fragment ベースで Ed25519 / RSA を dispatch する (#1067 / #1070)。
 	pem, err := p.verifier.PublicKeyForKeyID(actor.ID, parsed.KeyID)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	req, err := buildSignedRequest(payload)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	// keyCache 経由で verify することで、同一 (keyId, PEM) の x509 パースを
 	// worker 横断で 1 回に集約する (#1426)。挙動は VerifyRequest と等価。
 	kt, err := p.keyCache.VerifyRequestCached(req, parsed.KeyID, pem)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
-	return actor, kt, nil
+	return actor, kt, activitypub.InboxDateHeader(req.Header, parsed.Headers), nil
 }
 
 // authorizeActor enforces that the HTTP-signature signer is authorized to
@@ -524,24 +617,36 @@ func (p *InboxProcessor) verifyPayload(payload queue.InboxPayload) (*model.User,
 // so the caller can log **who** was dropped without re-parsing the body
 // (#2716 / #2724 review MEDIUM-4)。
 //
-// It also returns the body the caller must process from here on: the raw body
-// when the HTTP signature covers it (signer == actor), or the LD-Signature's
-// compacted document when the activity was forwarded, so that properties the
-// LD-Signature does not cover never reach the handlers.
-func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federation.ActivityFields, []byte, error) {
+// On success the returned activity is the one the caller must process from
+// here on (its Source is the body): the raw body when the HTTP signature
+// covers it (signer == actor), or the LD-Signature's compacted document when
+// the activity was forwarded, so that properties the LD-Signature does not
+// cover never reach the handlers. On error it is the raw body's, for logging.
+func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federation.NormalizedActivity, error) {
 	// gate は Process と同じ unwrap+Normalize を経た actor を見る必要がある。
 	// raw body を直接 parse すると `as:actor` / `{"@id":...}` / 配列 wrap で
 	// gate を空 actor にすり抜けさせ、Process だけが本当の actor で動く
 	// なりすまし経路が残る (#parity review AUTH-1)。
 	//
 	// actor / id / type を **1 パス**で読む。個別に取ると同じ body を normalize
-	// し直すことになる。
-	fields := federation.ExtractActivityFields(body)
+	// し直すことになる。その結果は処理にもそのまま渡す (#3610)。
+	//
+	// **署名に関わる検査 (CheckForbiddenDirectivesIfPresent / extractLDCreator /
+	// VerifyAndCompact) には生の body を渡す。** raw.Source() は body と同じ
+	// バイト列だが、正規化した結果 (act.raw) を渡してはいけない。正規化は
+	// @context を落とし、キーを書き換える。
+	raw := federation.NormalizeActivity(body)
+	fields := raw.Fields()
 	bodyActor := fields.Actor
 	if bodyActor == "" {
-		// actor 欠落は Process 側 ("activity missing actor") が弾く。ここでは
-		// 判定不能なので素通しし、なりすまし対象が無い状態にする。
-		return fields, body, nil
+		// **actor の読めない本文はここで落とす (upstream InboxProcessorService と
+		// 同じ)。** 以前は「Process 側が弾く」として素通ししていたが、素通しした
+		// 本文は下の id の host の検査も受けずに呼び出し元へ戻り、Process が actor
+		// 無しを成功として捨てるので、**他ホストの任意の id が再投函ガードに
+		// 覚えられた**。有効な鍵を持つ任意のリモートが `"actor": ""` の本文に
+		// 被害者の将来の id を付けて 1 本送るだけで、本物の活動が重複として
+		// 捨てられる (2026-10-31 の監査)。
+		return raw, fmt.Errorf("activity has no actor")
 	}
 	// activity.id host gate (upstream InboxProcessorService): activity.id は文字列
 	// 必須で、その host は actor の host と一致しなければならない。これが無いと、
@@ -550,10 +655,10 @@ func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federa
 	// (#1779)。署名検証後 (= 認証済み actor) に評価する。
 	activityID := fields.ID
 	if activityID == "" {
-		return fields, nil, fmt.Errorf("activity id is not a string")
+		return raw, fmt.Errorf("activity id is not a string")
 	}
 	if idHost, actorHost := uriHost(activityID), uriHost(bodyActor); idHost == "" || idHost != actorHost {
-		return fields, nil, fmt.Errorf("signerHost != activity.id host: actor=%q id=%q", bodyActor, activityID)
+		return raw, fmt.Errorf("signerHost != activity.id host: actor=%q id=%q", bodyActor, activityID)
 	}
 	signerURI := signerURIOf(signer)
 
@@ -565,21 +670,21 @@ func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federa
 		// activity を drop しないようにする。
 		if p.ldVerifier != nil {
 			if err := p.ldVerifier.CheckForbiddenDirectivesIfPresent(body); err != nil {
-				return fields, nil, err
+				return raw, err
 			}
-			return fields, body, nil
+			return raw, nil
 		}
-		return fields, body, nil
+		return raw, nil
 	}
 
 	// 署名者 != actor: 転送活動の可能性。LD-Signature による actor 認証が必須。
 	if p.ldVerifier == nil {
-		return fields, nil, fmt.Errorf("actor mismatch and no LD verifier: signer=%q actor=%q", signerURI, bodyActor)
+		return raw, fmt.Errorf("actor mismatch and no LD verifier: signer=%q actor=%q", signerURI, bodyActor)
 	}
 	// LD-Signature の creator (鍵 URI) を body から読む。
 	creatorKeyID := extractLDCreator(body)
 	if creatorKeyID == "" {
-		return fields, nil, fmt.Errorf("actor mismatch and no LD-signature: signer=%q actor=%q", signerURI, bodyActor)
+		return raw, fmt.Errorf("actor mismatch and no LD-signature: signer=%q actor=%q", signerURI, bodyActor)
 	}
 	// 検証より先に creator actor を解決して鍵を取得/永続化する。VerifyAndCompact
 	// は FindByKeyID の純粋 DB read で、先に解決しておかないと未知 origin actor
@@ -587,7 +692,7 @@ func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federa
 	// getAuthUserFromKeyId は未知 actor を fetch する挙動と整合)。
 	ldUser, err := p.resolveLDCreator(activitypub.ResolveKeyURL(creatorKeyID), signer)
 	if err != nil {
-		return fields, nil, fmt.Errorf("resolve ld-signature creator %q: %w", creatorKeyID, err)
+		return raw, fmt.Errorf("resolve ld-signature creator %q: %w", creatorKeyID, err)
 	}
 	// 鍵が DB に載った状態で LD-Signature 本体を検証する。
 	verified, present, err := p.ldVerifier.VerifyAndCompact(body)
@@ -596,9 +701,9 @@ func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federa
 		// 重ねる必要が無い。重ねると `LastError.Message` の 200 rune 切り詰めで
 		// **原因 (crypto/rsa: verification error) が落ちる** — 診断のための PR が
 		// 別の診断面を下げることになる (#2724 review MEDIUM-1)。
-		return fields, nil, fmt.Errorf("ld-signature verify failed (creator=%q): %w", creatorKeyID, err)
+		return raw, fmt.Errorf("ld-signature verify failed (creator=%q): %w", creatorKeyID, err)
 	} else if !present {
-		return fields, nil, fmt.Errorf("actor mismatch and no LD-signature: signer=%q actor=%q", signerURI, bodyActor)
+		return raw, fmt.Errorf("actor mismatch and no LD-signature: signer=%q actor=%q", signerURI, bodyActor)
 	}
 	// LD-Signature の creator (鍵) の owner URI が activity.actor と一致するか
 	// 確認する。一致しなければ「自分の鍵で署名したが他人を actor に詐称」した
@@ -608,18 +713,19 @@ func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federa
 		ldURI = *ldUser.URI
 	}
 	if ldURI == "" || ldURI != bodyActor {
-		return fields, nil, fmt.Errorf("ld-signature signer %q != activity.actor %q", ldURI, bodyActor)
+		return raw, fmt.Errorf("ld-signature signer %q != activity.actor %q", ldURI, bodyActor)
 	}
 	// **以降は compact 済みの文書で判定し直す** (upstream の「もう一度actorチェック」)。
 	// 処理に渡すのは verified.Body なので、ゲートが見た actor / id と handler が
 	// 見る actor / id を一致させる。生 body の値は creator 解決と早期の足切りに
 	// 使っただけで、署名が覆っているのは compact 後の値のほう。
-	compactFields := federation.ExtractActivityFields(verified.Body)
+	compact := federation.NormalizeActivity(verified.Body)
+	compactFields := compact.Fields()
 	if compactFields.Actor != ldURI {
-		return fields, nil, fmt.Errorf("ld-signature signer %q != compacted activity.actor %q", ldURI, compactFields.Actor)
+		return raw, fmt.Errorf("ld-signature signer %q != compacted activity.actor %q", ldURI, compactFields.Actor)
 	}
 	if idHost := uriHost(compactFields.ID); idHost == "" || idHost != uriHost(compactFields.Actor) {
-		return fields, nil, fmt.Errorf("signerHost != compacted activity.id host: actor=%q id=%q", compactFields.Actor, compactFields.ID)
+		return raw, fmt.Errorf("signerHost != compacted activity.id host: actor=%q id=%q", compactFields.Actor, compactFields.ID)
 	}
 	// **転送された actor 側の連合可否も見る。**
 	//
@@ -633,9 +739,9 @@ func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federa
 	// upstream は署名者側 (`InboxProcessorService.ts:76-80`) と LD-Signature 側
 	// (`:207-211`) の 2 箇所で `isFederationAllowedHost` を見る。
 	if p.isBlocked(ldUser) {
-		return fields, nil, fmt.Errorf("blocked ld-signature actor host: %q", ldURI)
+		return raw, fmt.Errorf("blocked ld-signature actor host: %q", ldURI)
 	}
-	return compactFields, verified.Body, nil
+	return compact, nil
 }
 
 // uriHost returns the normalized hostname of a URI (idnhost.Puny, port
@@ -731,7 +837,31 @@ func (p *InboxProcessor) isBlocked(actor *model.User) bool {
 	if p.hostBlocker.IsBlocked(host) {
 		return true
 	}
-	return !p.hostBlocker.IsAllowed(host)
+	if !p.hostBlocker.IsAllowed(host) {
+		return true
+	}
+	// **受信を拒否するソフトウェア (#3362)。** ドメインブロックと同じ場所で見る
+	// ので、HTTP 署名の署名者と、LD 署名で転送された actor の両方に効き、
+	// Delete / Undo も含めて拒否する。ソフトウェアが分からない相手は拒否しない
+	// (配送停止と同じ)。
+	return p.softwareBlocker != nil && p.softwareBlocker.IsSuspended(host)
+}
+
+// refreshMetadata schedules a background nodeinfo refetch for host unless the
+// host is domain-blocked or outside the federation allowlist (#3564).
+//
+// 本家はドメインブロックした相手には受信でも配送でも取りに行かない
+// (InboxProcessorService はブロックの判定で return した後に
+// fetchInstanceMetadata を呼ぶ)。受信を拒否するソフトウェアは Elythia 独自で、
+// 判定を更新するために取り直す。
+func (p *InboxProcessor) refreshMetadata(host string) {
+	if p.metadataRefresher == nil || host == "" {
+		return
+	}
+	if p.hostBlocker != nil && (p.hostBlocker.IsBlocked(host) || !p.hostBlocker.IsAllowed(host)) {
+		return
+	}
+	p.metadataRefresher.MaybeRefresh(host)
 }
 
 func (p *InboxProcessor) touchInstance(actor *model.User) {
@@ -768,7 +898,15 @@ func (p *InboxProcessor) commitChart(actor *model.User) {
 
 // dispatch hands the activity to the federation processor, passing the
 // verified HTTP signer when the processor accepts it (#2338).
-func (p *InboxProcessor) dispatch(body []byte, signer *model.User) error {
+//
+// normalized, when non-nil, must be NormalizeActivity(body); the processor
+// then reuses it instead of normalizing body again (#3610).
+func (p *InboxProcessor) dispatch(body []byte, normalized *federation.NormalizedActivity, signer *model.User) error {
+	if normalized != nil {
+		if np, ok := p.processor.(NormalizedActivityProcessor); ok {
+			return np.ProcessNormalized(*normalized, signer)
+		}
+	}
 	if sp, ok := p.processor.(SignerAwareProcessor); ok {
 		return sp.ProcessWithSigner(body, signer)
 	}
@@ -791,41 +929,6 @@ func (p *InboxProcessor) resolveLDCreator(uri string, signer *model.User) (*mode
 	}
 	return p.verifier.ResolveActor(uri)
 }
-
-// HasSignatureVerifier reports whether the inbound signature verifier is wired.
-//
-// 未配線だと Handle の `len(payload.Headers) > 0 && p.verifier != nil` が偽になり、
-// **署名検証・連合ブロック・actor 一致 (authorizeActor)・replay 判定が
-// まとめて飛ぶ**。本番では必ず配線されるので、起動時にここを検査する (#2682)。
-//
-// **この検査が見るのは「4 つがまとめて飛ぶ」場合だけ。** 連合ブロック・replay・
-// LD-Signature は `SetHostBlockChecker` / `SetInboxReplayGuard` /
-// `SetLDSignatureVerifier` という独立の setter も持っており、そちらだけを
-// 消すと本検査は通ったまま個別に無効化できる。replay 側は
-// [InboxProcessor.HasInboxReplayGuard] で個別に検査する。連合ブロック側は
-// moderation の tier なので #2683。LD-Signature は大半が fail-closed
-// (signer != actor で error) だが、JSON-LD の term 再定義検査
-// (CheckForbiddenDirectivesIfPresent) と Headers 無し経路の検証が黙って
-// 飛ぶ (#2682 review L-E)。
-func (p *InboxProcessor) HasSignatureVerifier() bool { return p.verifier != nil }
-
-// HasInboxReplayGuard reports whether the inbound activity replay guard is
-// wired.
-//
-// 未配線だと isReplay が常に false を返す (fail-open)。**一度処理した
-// activity を何度でも再投函できる**。各 activity handler は冪等な前提で
-// 書かれているので単純な二重適用にはならないが、冪等性は handler ごとの
-// 性質であって保証ではなく、Date skew の窓の内側で好きなだけ再送できる
-// 状態は一回性の tier そのもの。signin / i の TOTP guard を検査しながら
-// inbox の replay guard だけ外すのは筋が通らないので載せる
-// (#2682 review M-4)。
-func (p *InboxProcessor) HasInboxReplayGuard() bool { return p.replayGuard != nil }
-
-// HasHostBlockChecker reports whether the host block checker was wired.
-//
-// 未配線だと `isBlocked` が常に false になり、ブロック済み host / 許可外 host
-// からの activity を受け入れる。起動時検査に使う (#2683)。
-func (p *InboxProcessor) HasHostBlockChecker() bool { return p.hostBlocker != nil }
 
 // signerURIOf returns the signer's actor URI, or "" when unresolved.
 //

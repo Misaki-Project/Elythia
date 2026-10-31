@@ -39,9 +39,9 @@ func newProcessor(t *testing.T, fetcherBody string) (*federation.Processor, *tes
 	followingRepo := testutil.NewMockFollowingRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(fetcherBody)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(fetcherBody)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	processor := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
 	return processor, repo, followingRepo, noteRepo
 }
 
@@ -94,7 +94,7 @@ func TestProcess_FollowInvokesAcceptorWithOriginalRaw(t *testing.T) {
 	// そのまま InboundFollowAcceptor に渡す。相手は自分の送った Follow.id と
 	// 照合できるようになる。
 	p, repo, _, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
 	acceptor := &stubInboundFollowAcceptor{}
 	p.SetInboundFollowAcceptor(acceptor)
@@ -117,7 +117,7 @@ func TestProcess_FollowAlreadyFollowingStillSendsAccept(t *testing.T) {
 	// Accept を見逃したなど) も Accept を再送する。remote 側の pending
 	// 状態を idempotent に解消するため。
 	p, repo, followingRepo, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
 	// 事前に Following を作っておく (remote alice → local bob)
 	// alice の ID は aliceActor の ResolveActor 結果に依存するので一旦
@@ -152,7 +152,7 @@ func TestProcess_FollowAlreadyRequestedStillSucceeds(t *testing.T) {
 	// エラーを返さない (相手が retry を続けるのを防ぐ)。Accept は送らない
 	// (まだ承認されていないので)。
 	p, repo, _, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	// locked local user
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", IsLocked: true}
 	acceptor := &stubInboundFollowAcceptor{}
@@ -177,7 +177,7 @@ func TestProcess_FollowLocalUserByIDResolution(t *testing.T) {
 	// "{baseURL}/users/{id}" 形式の URI から ID を抜き出して FindByID で
 	// lookup する経路が通るはず。
 	p, repo, followingRepo, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	// URI を持たないローカルユーザー
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
 
@@ -277,10 +277,10 @@ func TestProcess_UndoFollowCancelsPendingRequest(t *testing.T) {
 	followReqRepo := testutil.NewMockFollowRequestRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, followReqRepo, idGen)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	p.SetLocalBaseURL("https://example.com")
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, followReqRepo, idGen, nil, nil, nil, nil)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p.SetLocalBaseURLForTest("https://example.com")
 	p.SetInboundFollowAcceptor(&stubInboundFollowAcceptor{})
 	// locked local user → Follow は FollowRequest を作る。
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", IsLocked: true}
@@ -430,9 +430,10 @@ func TestProcess_BadJSON(t *testing.T) {
 }
 
 func TestProcess_MissingActor(t *testing.T) {
-	p, _, _, _ := newProcessor(t, aliceActor)
-	err := p.Process([]byte(`{"type":"Follow"}`))
-	assert.Error(t, err)
+	p, _, followingRepo, _ := newProcessor(t, aliceActor)
+	// actor の無い activity は送り直しても直らない。error にせず受け取って捨てる。
+	require.NoError(t, p.Process([]byte(`{"type":"Follow","object":"https://example.com/users/bob"}`)))
+	assert.Empty(t, followingRepo.Followings)
 }
 
 // failingFollowingService isn't easy to construct since it's a concrete type;
@@ -497,7 +498,7 @@ func TestProcess_UndoFollow_InnerActorEmbeddedObject(t *testing.T) {
 	p, repo, followingRepo, _ := newProcessor(t, aliceActor)
 	// **local user は本番と同じく uri NULL。** `userFromAPID` の
 	// local-ID 分岐を通すために base URL を配線する。
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	// remote follower alice が local followee bob をフォロー済み。
 	aliceURI := "https://remote.example/users/alice"
 	host := "remote.example"
@@ -555,9 +556,9 @@ func TestProcess_UndoFollowDeleteError(t *testing.T) {
 	followingRepo := &failingFollowingRepo{MockFollowingRepository: mockFR}
 
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
 
 	// Setup followee bob
 	bobURI := "https://example.com/users/bob"
@@ -606,12 +607,11 @@ func newProcessorWithBlocking(t *testing.T) (*federation.Processor, *testutil.Mo
 	blockingRepo := testutil.NewMockBlockingRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	blockingSvc := coreblocking.NewService(repo, blockingRepo, idGen)
-	blockingSvc.SetUnfollower(followingSvc)
-	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	processor.SetBlockingService(blockingSvc)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	blockingSvc := coreblocking.NewService(repo, blockingRepo, idGen, followingSvc, nil, nil, nil)
+	processor := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
+	processor.SetBlockingServiceForTest(blockingSvc)
 	return processor, repo, blockingRepo
 }
 
@@ -619,7 +619,7 @@ func TestProcess_BlockHappyPath(t *testing.T) {
 	p, repo, blockingRepo := newProcessorWithBlocking(t)
 	// 実本番のローカルユーザー row は user.uri が NULL なので、この条件で
 	// test する (handleBlock が userFromAPID で ID 解決することを検証)。
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
 
 	body := []byte(`{
@@ -933,9 +933,9 @@ func newProcessorWithPinning(t *testing.T) (*federation.Processor, *testutil.Moc
 	piningRepo := testutil.NewMockUserNotePiningRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	processor := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
 	processor.SetPinningRepo(piningRepo, idGen)
 	return processor, repo, noteRepo, piningRepo
 }
@@ -1273,9 +1273,9 @@ func TestProcess_AcceptFollow_InnerActorEmbeddedObject(t *testing.T) {
 	reqRepo := testutil.NewMockFollowRequestRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, reqRepo, idGen)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, reqRepo, idGen, nil, nil, nil, nil)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
 
 	// remote followee alice と local follower bob。**承認待ちの request を
 	// 置いて「承認された」ことを観測可能にする。** nil 返却だけを見る形だと
@@ -1320,10 +1320,10 @@ func TestProcess_AcceptFollow_BlockedSwallowsError(t *testing.T) {
 	reqRepo := testutil.NewMockFollowRequestRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, reqRepo, idGen)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, reqRepo, idGen, nil, nil, nil, nil)
 	followingSvc.SetBlockingChecker(&stubAcceptBlockingChecker{blockerID: "bob", blockeeID: "alice1"})
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
 
 	aliceURI := "https://remote.example/users/alice"
 	host := "remote.example"
@@ -1677,10 +1677,10 @@ func TestProcess_CreateQuestion(t *testing.T) {
 	followingRepo := testutil.NewMockFollowingRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen2, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen2)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen2)
 	resolver.SetPollRepo(pollRepo)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen2)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen2, nil, nil, nil, nil)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
 
 	body := []byte(`{
 		"type": "Create",
@@ -1718,10 +1718,10 @@ func TestProcess_CreateQuestionAnyOf(t *testing.T) {
 	followingRepo := testutil.NewMockFollowingRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen2, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen2)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen2)
 	resolver.SetPollRepo(pollRepo)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen2)
-	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen2, nil, nil, nil, nil)
+	p := federation.NewProcessorNilDeps(resolver, followingSvc, nil, nil, repo, noteRepo)
 
 	body := []byte(`{
 		"type": "Create",
@@ -1756,7 +1756,7 @@ func TestExtractLocalUserID(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, _ := id.NewGenerator("aidx")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	resolver := federation.NewResolverNilDeps(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
 
 	assert.Equal(t, "abc123", resolver.ExtractLocalUserID("https://example.com/users/abc123"))
 	assert.Equal(t, "", resolver.ExtractLocalUserID("https://remote.example/users/abc123"))
@@ -1849,7 +1849,7 @@ func seedRelayActor(repo *testutil.MockUserRepository, uri, inbox, sharedInbox s
 
 func TestProcess_AcceptFollowRelay_MarksAccepted(t *testing.T) {
 	p, repo, _, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
 	p.SetRelayMarker(marker)
 	seedRelayActor(repo, "https://relay.example/actor", "https://relay.example/inbox", "")
@@ -1864,7 +1864,7 @@ func TestProcess_AcceptFollowRelay_MarksAccepted(t *testing.T) {
 
 func TestProcess_RejectFollowRelay_MarksRejected(t *testing.T) {
 	p, repo, _, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	marker := newFakeRelayMarker("rel456", "https://relay.example/inbox")
 	p.SetRelayMarker(marker)
 	seedRelayActor(repo, "https://relay.example/actor", "https://relay.example/inbox", "")
@@ -1876,11 +1876,36 @@ func TestProcess_RejectFollowRelay_MarksRejected(t *testing.T) {
 	assert.Empty(t, marker.accepted)
 }
 
+// relay の Accept の object が Follow の id だけでも、relay 本人からなら accepted
+// にする (#3491)。他の actor からは状態を変えない (relayStatusChangeAllowed)。
+func TestProcess_AcceptFollowRelay_IDOnlyObject(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		actor string
+		want  []string
+	}{
+		{"from the relay", "https://relay.example/actor", []string{"relID"}},
+		{"from another host", "https://evil.example/actor", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, repo, _, _ := newProcessor(t, aliceActor)
+			p.SetLocalBaseURLForTest("https://example.com")
+			marker := newFakeRelayMarker("relID", "https://relay.example/inbox")
+			p.SetRelayMarker(marker)
+			seedRelayActor(repo, "https://relay.example/actor", "https://relay.example/inbox", "")
+			seedRelayActor(repo, "https://evil.example/actor", "https://evil.example/inbox", "")
+			body := []byte(`{"type":"Accept","actor":"` + tc.actor + `","object":"https://example.com/activities/follow-relay/relID"}`)
+			require.NoError(t, p.Process(body))
+			assert.Equal(t, tc.want, marker.accepted)
+		})
+	}
+}
+
 // TestProcess_FollowRelay_HostNormalizedMatch は host 比較が punycode / 大小文字を
 // 揃えてから行われることを固定する (素の文字列比較へ退行すると落ちる)。
 func TestProcess_FollowRelay_HostNormalizedMatch(t *testing.T) {
 	p, repo, _, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	marker := newFakeRelayMarker("rel1", "https://xn--eckve.example/inbox")
 	p.SetRelayMarker(marker)
 	seedRelayActor(repo, "https://パイ.Example/actor", "https://xn--eckve.example/inbox", "")
@@ -1898,7 +1923,7 @@ func TestProcess_AcceptFollowRelay_ForeignActorDropped(t *testing.T) {
 	for _, kind := range []string{"Accept", "Reject"} {
 		t.Run(kind, func(t *testing.T) {
 			p, _, _, _ := newProcessor(t, aliceActor)
-			p.SetLocalBaseURL("https://example.com")
+			p.SetLocalBaseURLForTest("https://example.com")
 			marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
 			p.SetRelayMarker(marker)
 
@@ -1934,7 +1959,7 @@ func TestProcess_FollowRelay_ExactInboxMatch(t *testing.T) {
 		for _, kind := range []string{"Accept", "Reject"} {
 			t.Run(tc.name+"/"+kind, func(t *testing.T) {
 				p, repo, _, _ := newProcessor(t, aliceActor)
-				p.SetLocalBaseURL("https://example.com")
+				p.SetLocalBaseURLForTest("https://example.com")
 				marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
 				p.SetRelayMarker(marker)
 				seedRelayActor(repo, "https://relay.example/users/other", tc.inbox, tc.sharedInbox)
@@ -1966,7 +1991,7 @@ func TestProcess_AcceptFollowRelay_ForeignActivityIDIgnored(t *testing.T) {
 	} {
 		t.Run(activityID, func(t *testing.T) {
 			p, _, _, _ := newProcessor(t, aliceActor)
-			p.SetLocalBaseURL("https://example.com")
+			p.SetLocalBaseURLForTest("https://example.com")
 			marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
 			p.SetRelayMarker(marker)
 
@@ -1992,7 +2017,7 @@ func TestProcess_AcceptFollowRelay_UnparsableHostDropped(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			p, _, _, _ := newProcessor(t, aliceActor)
-			p.SetLocalBaseURL("https://example.com")
+			p.SetLocalBaseURLForTest("https://example.com")
 			// inbox が空の行も「存在はする」状態として作る。
 			marker := &fakeRelayMarker{relays: map[string]*model.Relay{
 				"rel123": {ID: "rel123", Inbox: tc.inbox, Status: "requesting"},
@@ -2011,7 +2036,7 @@ func TestProcess_AcceptFollowRelay_UnparsableHostDropped(t *testing.T) {
 // 指す Accept が status を触らないことを固定する。
 func TestProcess_AcceptFollowRelay_UnknownRelayDropped(t *testing.T) {
 	p, _, _, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	marker := newFakeRelayMarker("rel123", "")
 	p.SetRelayMarker(marker)
 
@@ -2026,7 +2051,7 @@ func TestProcess_AcceptFollowRelay_UnknownRelayDropped(t *testing.T) {
 // ときに status を書き換えないこと (fail-closed) を固定する。
 func TestProcess_AcceptFollowRelay_LookupErrorDropped(t *testing.T) {
 	p, _, _, _ := newProcessor(t, aliceActor)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 	marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
 	marker.findErr = errors.New("db down")
 	p.SetRelayMarker(marker)
@@ -3052,7 +3077,7 @@ func TestProcess_FollowRelay_UnresolvableActorIsRetried(t *testing.T) {
 	for _, kind := range []string{"Accept", "Reject"} {
 		t.Run(kind, func(t *testing.T) {
 			p, _, _, _ := newProcessor(t, aliceActor)
-			p.SetLocalBaseURL("https://example.com")
+			p.SetLocalBaseURLForTest("https://example.com")
 			marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
 			p.SetRelayMarker(marker)
 

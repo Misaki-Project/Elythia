@@ -10,11 +10,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -60,11 +63,43 @@ func (f *fakeServer) DumpRoutes(w io.Writer) error {
 type harness struct {
 	e              env
 	stdout, stderr bytes.Buffer
-	log            bytes.Buffer
+	log            syncBuffer
 	steps          []string
 	srv            *fakeServer
 	files          map[string]*bytes.Buffer
 	cancel         context.CancelFunc
+	// appName は newSupervisor に渡った cfg の DBApplicationName。
+	appName string
+}
+
+// syncBuffer is the log sink of the harness. serve logs a Start error from
+// the goroutine that runs Start, which may still be writing after serve has
+// returned, so the buffer is locked and a test can wait for a line.
+//
+// fake の Start は started を閉じてからエラーを返すので、serve が終わった後に
+// "server error" が書かれることがある。素の bytes.Buffer だと、それとテストの
+// 読み出しが -race で競合して落ちた (#3369)。
+type syncBuffer struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	changed chan struct{}
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n, err := b.buf.Write(p)
+	if b.changed != nil {
+		close(b.changed)
+		b.changed = nil
+	}
+	return n, err
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 type nopCloser struct{ *bytes.Buffer }
@@ -107,6 +142,11 @@ func newHarness() *harness {
 		},
 		newServer: func(*config.Config, *gorm.DB, *cache.RedisClients) (httpServer, error) {
 			h.steps = append(h.steps, "server")
+			return h.srv, nil
+		},
+		newSupervisor: func(cfg *config.Config, _ *cache.RedisClients) (supervisor, error) {
+			h.steps = append(h.steps, "supervisor")
+			h.appName = cfg.DBApplicationName
 			return h.srv, nil
 		},
 		signalContext: func() (context.Context, context.CancelFunc) {
@@ -153,9 +193,11 @@ func TestServe_StartsAndShutsDownOnSignal(t *testing.T) {
 	code := h.runServe(t, []string{"-config", "x.yml"})
 	assert.Equal(t, 0, code)
 	assert.Equal(t, []string{
-		"log:stdout", "config:x.yml", "pid:/run/x.pid", "sentry", "db", "redis", "server",
+		"log:stdout", "config:x.yml", "pid:/run/x.pid", "sentry", "redis", "supervisor",
 		"redis-close", "sentry-flush", "pid-cleanup",
 	}, h.steps)
+	// DB の接続には、このプロセスを表す名前が付く (#3463)。
+	assert.Regexp(t, `^elythia/both/.+-[0-9]+-[0-9a-f]{8}$`, h.appName)
 	assert.True(t, h.srv.shutdown)
 	assert.Contains(t, h.stdout.String(), "Elythia stopped.")
 	assert.Contains(t, h.log.String(), "shutting down server")
@@ -167,12 +209,31 @@ func TestServe_DefaultConfigPath(t *testing.T) {
 	assert.Contains(t, h.steps, "config:.config/default.yml")
 }
 
-func TestServe_LogsStartAndShutdownErrors(t *testing.T) {
+func TestServe_LogsShutdownError(t *testing.T) {
 	h := newHarness()
-	h.srv.startErr = errors.New("bind failed")
 	h.srv.shutdownErr = errors.New("still busy")
 	assert.Equal(t, 0, h.runServe(t, nil))
 	assert.Contains(t, h.log.String(), "server shutdown error")
+	// Start の失敗のログは serve_start_test.go が確かめる (#3633 で起動の失敗は
+	// シグナルを待たずに終わるようになり、このテストの形と両立しない)。
+}
+
+// TestServe_KeepsRedisOpenWhileHooksMayRun checks #3463 review L-7: when
+// Shutdown returned at its deadline, the shutdown hooks may still be running
+// in the background, so Redis is left open for the process exit to close.
+func TestServe_KeepsRedisOpenWhileHooksMayRun(t *testing.T) {
+	for _, err := range []error{context.DeadlineExceeded, fmt.Errorf("wrapped: %w", context.Canceled)} {
+		h := newHarness()
+		h.srv.shutdownErr = err
+		assert.Equal(t, 0, h.runServe(t, nil))
+		assert.NotContains(t, h.steps, "redis-close", "hook が走っているかもしれないのに Redis を閉じた")
+		assert.Contains(t, h.log.String(), "leaving Redis open")
+	}
+	// それ以外の失敗では、今までどおり閉じる。
+	h := newHarness()
+	h.srv.shutdownErr = errors.New("still busy")
+	assert.Equal(t, 0, h.runServe(t, nil))
+	assert.Contains(t, h.steps, "redis-close")
 }
 
 func TestServe_StartupFailures(t *testing.T) {
@@ -206,28 +267,23 @@ func TestServe_StartupFailures(t *testing.T) {
 			wantSteps: []string{"log:stdout", "config:.config/default.yml", "pid:/run/x.pid", "pid-cleanup"},
 		},
 		{
-			name:    "database",
-			break_:  func(h *harness) { h.e.openDB = func(*config.Config) (*gorm.DB, error) { return nil, boom } },
-			wantLog: "failed to connect to database",
-			wantSteps: []string{"log:stdout", "config:.config/default.yml", "pid:/run/x.pid", "sentry",
-				"sentry-flush", "pid-cleanup"},
-		},
-		{
 			name: "redis",
 			break_: func(h *harness) {
 				h.e.openRedis = func(*config.Config) (*cache.RedisClients, func(), error) { return nil, nil, boom }
 			},
 			wantLog: "failed to connect to Redis",
-			wantSteps: []string{"log:stdout", "config:.config/default.yml", "pid:/run/x.pid", "sentry", "db",
+			wantSteps: []string{"log:stdout", "config:.config/default.yml", "pid:/run/x.pid", "sentry",
 				"sentry-flush", "pid-cleanup"},
 		},
 		{
-			name: "server",
+			// DB に繋がらない場合も、Server を作れない場合も、Supervisor の構築の
+			// 失敗として返る。
+			name: "supervisor",
 			break_: func(h *harness) {
-				h.e.newServer = func(*config.Config, *gorm.DB, *cache.RedisClients) (httpServer, error) { return nil, boom }
+				h.e.newSupervisor = func(*config.Config, *cache.RedisClients) (supervisor, error) { return nil, boom }
 			},
 			wantLog: "failed to construct server",
-			wantSteps: []string{"log:stdout", "config:.config/default.yml", "pid:/run/x.pid", "sentry", "db", "redis",
+			wantSteps: []string{"log:stdout", "config:.config/default.yml", "pid:/run/x.pid", "sentry", "redis",
 				"redis-close", "sentry-flush", "pid-cleanup"},
 		},
 	}
@@ -288,6 +344,20 @@ func TestDumpRoutes_Failures(t *testing.T) {
 		h := newHarness()
 		h.e.openDB = func(*config.Config) (*gorm.DB, error) { return nil, boom }
 		assert.Equal(t, 1, dumpRoutes(h.e, nil))
+		assert.Contains(t, h.log.String(), "failed to connect to database")
+	})
+	t.Run("build redis", func(t *testing.T) {
+		h := newHarness()
+		h.e.openRedis = func(*config.Config) (*cache.RedisClients, func(), error) { return nil, nil, boom }
+		assert.Equal(t, 1, dumpRoutes(h.e, nil))
+		assert.Contains(t, h.log.String(), "failed to connect to Redis")
+	})
+	t.Run("build server", func(t *testing.T) {
+		h := newHarness()
+		h.e.newServer = func(*config.Config, *gorm.DB, *cache.RedisClients) (httpServer, error) { return nil, boom }
+		assert.Equal(t, 1, dumpRoutes(h.e, nil))
+		assert.Contains(t, h.log.String(), "failed to construct server")
+		assert.Contains(t, h.steps, "redis-close", "構築に失敗したのに Redis を閉じていない")
 	})
 	t.Run("output file", func(t *testing.T) {
 		h := newHarness()
@@ -319,6 +389,7 @@ func TestDefaultEnv(t *testing.T) {
 	assert.NotNil(t, e.initSentry)
 	assert.NotNil(t, e.openDB)
 	assert.NotNil(t, e.newServer)
+	assert.NotNil(t, e.newSupervisor)
 
 	ctx, cancel := e.signalContext()
 	cancel()
@@ -330,12 +401,9 @@ func TestDefaultEnv(t *testing.T) {
 	require.NoError(t, f.Close())
 	assert.FileExists(t, path)
 
-	// 誰も listen していない宛先へ繋ぐと、Redis の接続確認で失敗して閉じる関数を
+	// 繋いでもすぐ切られる宛先へ繋ぐと、Redis の接続確認で失敗して閉じる関数を
 	// 返さない。
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
+	port := refusingPort(t)
 	cfg := &config.Config{}
 	cfg.Redis.Host = "127.0.0.1"
 	cfg.Redis.Port = port
@@ -347,6 +415,77 @@ func TestDefaultEnv(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, clients)
 	assert.Nil(t, closeFn)
+
+	// 繋がる宛先なら、クライアントと閉じる関数を返す。
+	live := miniredis.RunT(t)
+	livePort, err := strconv.Atoi(live.Port())
+	require.NoError(t, err)
+	liveCfg := &config.Config{}
+	liveCfg.Redis = config.RedisOptions{Host: live.Host(), Port: livePort}
+	liveCfg.RedisForPubsub, liveCfg.RedisForJobQueue = liveCfg.Redis, liveCfg.Redis
+	liveCfg.RedisForTimelines, liveCfg.RedisForReactions = liveCfg.Redis, liveCfg.Redis
+	clients, closeFn, err = e.openRedis(liveCfg)
+	require.NoError(t, err)
+	require.NotNil(t, clients)
+	closeFn()
+
+	// 既定の Supervisor は DB を開くところから始める。繋いでもすぐ切られる
+	// 宛先なら、DB の接続の失敗として返る。
+	// その前にメンテナンスの状態を Redis から読む (#3463)。
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rc.Close() })
+	cfg.DB = config.DBOptions{Host: "127.0.0.1", Port: port, DB: "x", User: "x", Pass: "x"}
+	sup, err := e.newSupervisor(cfg, &cache.RedisClients{Default: rc, Pubsub: rc})
+	assert.ErrorContains(t, err, "connect to database")
+	assert.Nil(t, sup)
+	// Redis が読めなければ、DB を開く前に失敗する。miniredis を閉じず、エラーを
+	// 返させる (閉じた port は並行する別のテストに取り直されうる。refusingPort と
+	// 同じ理由)。
+	mr.SetError("LOADING Redis is loading the dataset in memory")
+	_, err = e.newSupervisor(cfg, &cache.RedisClients{Default: rc, Pubsub: rc})
+	// 最初に Redis へ書くのは「起動中」の報告 (#3463 のレビュー M1')。
+	assert.ErrorContains(t, err, "write the starting report")
+}
+
+// refusingPort returns a local port that stays bound for the whole test and
+// closes every connection as soon as it is accepted.
+//
+// 以前は listen して閉じた port を「誰も listen していない宛先」として使って
+// いた。閉じた port は、並行して走る別のテストの miniredis などがすぐに取り直し
+// うる。取り直した相手は PostgreSQL の起動要求に応えないので、DB の接続が返らず
+// テストが止まった (#3369 の調査で、-race を 12 本並べて 1 回起きた)。テストの
+// 間ずっと port を持ち、受けた接続はすぐ切る。
+func refusingPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = l.Close()
+		<-done
+	})
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func TestDBApplicationName(t *testing.T) {
+	t.Setenv(config.EnvOnlyServer, "1")
+	t.Setenv(config.EnvOnlyQueue, "")
+	assert.Regexp(t, fmt.Sprintf(`^elythia/server/.+-%d-[0-9a-f]{8}$`, os.Getpid()), dbApplicationName())
+	assert.Equal(t, processID(), processID(), "同じプロセスで ID が変わった")
+	// 矛盾した役割の指定は Server の構築で落ちるが、名前の段では止めない。
+	t.Setenv(config.EnvOnlyQueue, "1")
+	assert.Regexp(t, `^elythia/invalid/`, dbApplicationName())
 }
 
 func TestExportedEntryPoints_StopOnFlagErrors(t *testing.T) {
@@ -366,4 +505,19 @@ func TestSetupLogging_InstallsDefault(t *testing.T) {
 	assert.Same(t, logger, slog.Default())
 	slog.Info("hello")
 	assert.True(t, strings.Contains(buf.String(), "msg=hello"), fmt.Sprintf("got %q", buf.String()))
+}
+
+// TestBuildProcessID checks #3463 review round 2 item 5: the process ID
+// carries a random part, and a long host is shortened so that the pid and
+// the random part survive PostgreSQL's 63-byte truncation of
+// application_name.
+func TestBuildProcessID(t *testing.T) {
+	assert.Equal(t, "web-1-0a1b2c3d", buildProcessID("web", 1, "0a1b2c3d"))
+	long := strings.Repeat("h", 255)
+	id := buildProcessID(long, 1234567, "0a1b2c3d")
+	assert.True(t, strings.HasSuffix(id, "-1234567-0a1b2c3d"), id)
+	for _, role := range []string{"server", "queue", "both", "invalid"} {
+		app := "elythia/" + role + "/" + id
+		assert.LessOrEqual(t, len(app), 63, "乱数の部分が PostgreSQL に切り詰められる: %s", app)
+	}
 }

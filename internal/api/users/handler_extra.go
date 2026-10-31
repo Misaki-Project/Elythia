@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
-	"github.com/elythia-network/elythia/internal/api/notehide"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/notesfilter"
 	"github.com/elythia-network/elythia/internal/core/reaction"
@@ -36,7 +36,7 @@ func (h *Handler) SetAbuseRepo(r repository.AbuseReportRepository) {
 // server/api/common/getRelation.ts) と同 semantics で viewer と target の
 // follow / follow-request / block / mute / renote-mute の関係性を返す。
 //
-// 認証は router.go の `middleware.RequireAuth()` で前段強制されているため
+// 認証はルートの登録 (internal/server の routes_users.go) の `middleware.RequireAuth()` で前段強制されているため
 // production では viewer == nil は到達不可。下の `viewer == nil` branch は
 // defensive guard + 単体テスト用 (= handler を直接叩く test path)。
 //
@@ -67,13 +67,74 @@ func (h *Handler) Relation(c echo.Context) error {
 	}
 	var arr []string
 	if err := json.Unmarshal(req.UserID, &arr); err == nil {
-		out := make([]map[string]any, 0, len(arr))
-		for _, id := range arr {
-			out = append(out, h.computeRelation(viewer, id))
-		}
-		return c.JSON(http.StatusOK, out)
+		return c.JSON(http.StatusOK, h.computeRelations(viewer, arr))
 	}
 	return invalidParam()
+}
+
+// relationChunkSize is how many distinct targets one batched relation lookup
+// covers. A variable so tests can shrink it.
+//
+// 本家と同じく件数に上限は無いが、IN の要素が多すぎると PostgreSQL の
+// バインド変数の上限 (65535) を超えるので、一定数ごとに分けて引く。
+var relationChunkSize = 1000
+
+// computeRelations builds the relation objects for the userId array form,
+// matching upstream getRelations: duplicated ids collapse into one entry kept
+// at its first position (upstream returns the values of a Map keyed by id),
+// and unknown ids get an all-false entry.
+//
+// 問い合わせの回数が配列の長さに比例しないよう、要素ごとに computeRelation を
+// 呼ばず、userrelation.Repos.ApplyMany で関係ごとにまとめて引く。
+func (h *Handler) computeRelations(viewer *model.User, ids []string) []map[string]any {
+	uniq := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniq = append(uniq, id)
+	}
+	out := make([]map[string]any, 0, len(uniq))
+	repos := h.viewerRelationRepos()
+	// メモは relation の応答に含まれないので引かない。
+	repos.Memo = nil
+	for start := 0; start < len(uniq); start += relationChunkSize {
+		chunk := uniq[start:min(start+relationChunkSize, len(uniq))]
+		details := make([]*entity.UserDetailed, len(chunk))
+		targets := make([]*model.User, len(chunk))
+		profiles := make([]*model.UserProfile, len(chunk))
+		for i, id := range chunk {
+			details[i] = &entity.UserDetailed{}
+			targets[i] = &model.User{ID: id}
+		}
+		if viewer != nil {
+			repos.ApplyMany(viewer.ID, details, targets, profiles)
+		}
+		for i, id := range chunk {
+			out = append(out, relationFromDetailed(id, details[i]))
+		}
+	}
+	return out
+}
+
+// relationFromDetailed converts the relation block ApplyMany wrote onto d into
+// the users/relation response object. Fields ApplyMany left unset (repository
+// not wired, anonymous viewer, or the viewer itself) are false.
+func relationFromDetailed(id string, d *entity.UserDetailed) map[string]any {
+	b := func(p *bool) bool { return p != nil && *p }
+	return map[string]any{
+		"id":                             id,
+		"isFollowing":                    b(d.IsFollowing),
+		"isFollowed":                     b(d.IsFollowed),
+		"hasPendingFollowRequestFromYou": b(d.HasPendingFollowRequestFromYou),
+		"hasPendingFollowRequestToYou":   b(d.HasPendingFollowRequestToYou),
+		"isBlocking":                     b(d.IsBlocking),
+		"isBlocked":                      b(d.IsBlocked),
+		"isMuted":                        b(d.IsMuted),
+		"isRenoteMuted":                  b(d.IsRenoteMuted),
+	}
 }
 
 // computeRelation builds the relation object for a single target user, matching
@@ -233,23 +294,23 @@ func (h *Handler) ReportAbuse(c echo.Context) error {
 func (h *Handler) Reactions(c echo.Context) error {
 	viewer := middleware.GetUser(c)
 	var req struct {
-		UserID    string `json:"userId"`
-		Limit     *int   `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		UserID    string     `json:"userId"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil || req.UserID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "userId is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	req.SinceID, req.UntilID = cursorSince, cursorUntil
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -333,7 +394,7 @@ func (h *Handler) Reactions(c echo.Context) error {
 	// reaction 先 note の author/reply/renote author を viewer が mute / 自分を
 	// block している場合は除外する (upstream reactions.ts:115-121 の isUserRelated、
 	// #1547)。ApplyMuteBlockChannel で生き残った note id のみ残す。
-	sets, err := notesfilter.LoadMuteBlockSets(viewer, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
+	sets, err := notesfilter.LoadMuteBlockSetsCached(h.relationCache, viewer, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
@@ -382,8 +443,8 @@ func (h *Handler) Reactions(c echo.Context) error {
 			notes = append(notes, r.Note)
 		}
 	}
-	packed := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
-	notehide.HideEmbeds(viewer, packed)
+	packed := h.entityPacker.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	h.noteHider.HideEmbeds(viewer, packed)
 	noteByID := make(map[string]entity.NoteEntity, len(packed))
 	for _, ne := range packed {
 		noteByID[ne.ID] = ne
@@ -428,21 +489,29 @@ func (h *Handler) Reactions(c echo.Context) error {
 //   - selection: `ListFeaturedByUser` が `("renoteCount" + "repliesCount") DESC,
 //     id DESC` + visibility push-down + channel 除外 + LIMIT 50 で SQL から
 //     プールを取る (post-fetch FilterVisible のページ過少充填と followers 判定
-//     N+1 を回避)。
+//     N+1 を回避)。候補は新しい方から 1,000 件に限る (#3612)。
 //   - display: 同 repo 内で id DESC sort → untilId filter → 先頭 limit 件。
 //     id cursor とソート順が一致するので untilId ページングで重複/欠落しない。
 //   - hard mute は packing 前に post-fetch で適用 (visibility と独立な viewer 個別
 //     filter なので SQL push-down 対象外)。
+//   - ミュート・ブロックは本家の isUserRelated と同じ判定 (ミュートは著者を
+//     見ない、#3369)。
 func (h *Handler) FeaturedNotes(c echo.Context) error {
 	var req struct {
-		UserID  string `json:"userId"`
-		Limit   *int   `json:"limit"`
-		UntilID string `json:"untilId"`
+		// GET でも受ける (本家は allowGet: true) ので query の名前も付ける (#3593)。
+		UserID  string     `json:"userId" query:"userId"`
+		Limit   *jsnum.Int `json:"limit" query:"limit"`
+		UntilID string     `json:"untilId" query:"untilId"`
 	}
-	if err := c.Bind(&req); err != nil || req.UserID == "" {
+	if err := c.Bind(&req); err != nil {
+		// GET の query で数値に読めない値 (limit=abc) は、本家と同じ cast の
+		// エラーにする (binder が印を付けている)。
+		return apierr.JSONInvalidParam(c)
+	}
+	if req.UserID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "userId is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -464,17 +533,21 @@ func (h *Handler) FeaturedNotes(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
-	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes)
-	// viewer が mute した user / viewer を block している user が note/reply/renote
-	// の author なら除外する (upstream featured-notes.ts:93-98 の isUserRelated、#1547)。
-	sets, err := notesfilter.LoadMuteBlockSets(viewer, h.mutingRepo, h.blockingRepo, h.channelMutingRepo, h.userRepo)
+	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes, h.idGen)
+	// upstream featured-notes.ts:93-98 と同じく、閲覧者をブロックしている人は
+	// 著者・返信先・リノート元の著者を、閲覧者がミュートした人は返信先・
+	// リノート元の著者だけを見る (isUserRelated の第 3 引数 ignoreAuthor)。
+	// 著者は userId の本人なので、ミュートした相手のプロフィールを開いても
+	// その人の注目ノートは出る。#3369 より前は他の一覧と同じ
+	// ApplyMuteBlockChannel を通していて、著者のミュートで全部消えていた。
+	// 本家はこの endpoint でチャンネル・インスタンスのミュートも、リノート元の
+	// 返信先・リノート元 (2 段目) も見ないので、それらの集合は読まない。
+	sets, err := notesfilter.LoadMuteBlockSetsCached(h.relationCache, viewer, h.mutingRepo, h.blockingRepo, nil, nil)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
-	notes, err = notesfilter.ApplyMuteBlockChannel(notes, sets, h.noteRepo)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
-	}
+	notes = notesfilter.DropUserRelated(notes, sets.BlockerIDs, false)
+	notes = notesfilter.DropUserRelated(notes, sets.MutedUserIDs, true)
 	// **ブロック済みインスタンスのノートを落とす** (upstream
 	// generateBlockedHostQueryForNote)。ランキング / SQL のどちらの経路にも
 	// 入っていないので post-fetch で落とす。
@@ -483,9 +556,9 @@ func (h *Handler) FeaturedNotes(c echo.Context) error {
 		return apierr.JSONInternalError(c)
 	}
 	notes = notesfilter.ApplyBlockedHosts(notes, blockedHosts)
-	result := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
+	result := h.entityPacker.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(result, viewer)
-	notehide.HideEmbeds(viewer, result)
+	h.noteHider.HideEmbeds(viewer, result)
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -509,7 +582,24 @@ func (h *Handler) featuredNotesByUser(ctx context.Context, userID, viewerID, unt
 	if len(ids) == 0 {
 		return []*model.Note{}, nil
 	}
-	return h.noteRepo.FindManyByIDsWithUser(ids)
+	notes, err := h.noteRepo.FindManyByIDsWithUser(ids)
+	if err != nil {
+		return nil, err
+	}
+	// **凍結された利用者のノートを落とす** (upstream featured-notes.ts の
+	// generateSuspendedUserQueryForNote。著者と、返信先・リノート元の著者)。
+	// SQL の経路 (ListFeaturedByUser) は、著者を userID の bind 変数で、返信先・
+	// リノート元を applySuspendedEmbedAuthorExclusion で判定して落とすが、
+	// ランキングの経路には無く、凍結の後もランキングの窓 (最大 2 週間) の間、
+	// users/show が NO_SUCH_USER を返す利用者の注目ノートが匿名で本文ごと読めた。
+	out := notes[:0]
+	for _, n := range notes {
+		if notesfilter.HasSuspendedAuthor(n, nil) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 // sortAndPageFeaturedIDs sorts note IDs DESC, drops IDs >= untilID, and caps to
@@ -539,9 +629,9 @@ func (h *Handler) SearchByUsernameAndHost(c echo.Context) error {
 		// upstream の paramDef は username / host の anyOf で、どちらか一方の
 		// キーがあればよい (値は null 可)。username 省略時は username で
 		// 絞らずに host だけで検索する。両方欠けたときだけ 400。
-		Username *string `json:"username"`
-		Host     *string `json:"host"`
-		Limit    *int    `json:"limit"`
+		Username *string    `json:"username"`
+		Host     *string    `json:"host"`
+		Limit    *jsnum.Int `json:"limit"`
 		// Detail は upstream search-by-username-and-host.ts:52 と同じく default
 		// true。false のとき UserLite を返す (#1547)。
 		Detail *bool `json:"detail"`
@@ -563,7 +653,7 @@ func (h *Handler) SearchByUsernameAndHost(c echo.Context) error {
 	if req.Username != nil {
 		username = *req.Username
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}

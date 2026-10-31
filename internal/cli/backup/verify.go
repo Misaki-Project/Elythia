@@ -1,0 +1,203 @@
+package backup
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/elythia-network/elythia/internal/backup"
+	"github.com/elythia-network/elythia/internal/cli/cliflag"
+	"github.com/elythia-network/elythia/internal/cli/migrate"
+	"github.com/elythia-network/elythia/internal/config"
+)
+
+// verifyEnv carries the dependencies of runVerify so tests can replace them.
+type verifyEnv struct {
+	stdout, stderr io.Writer
+	loadConfig     func(path string) (*config.Config, error)
+	openStorage    func(config.BackupStorageOptions) (backup.Storage, error)
+	newSandbox     func(*config.BackupOptions) backup.Sandbox
+	verify         func(context.Context, backup.Storage, string, backup.VerifyOptions) (backup.VerifyResult, error)
+	// coreDir / localDir are the bundled migration directories, the same
+	// ones `elythia migrate` and `elythia doctor` read.
+	coreDir, localDir string
+	// getenv reads the environment; nil means os.Getenv.
+	getenv func(string) string
+}
+
+func (e verifyEnv) env(key string) string {
+	if e.getenv == nil {
+		return os.Getenv(key)
+	}
+	return e.getenv(key)
+}
+
+func defaultVerifyEnv() verifyEnv {
+	return verifyEnv{
+		stdout:      os.Stdout,
+		stderr:      os.Stderr,
+		loadConfig:  config.Load,
+		openStorage: backup.OpenStorage,
+		newSandbox: func(o *config.BackupOptions) backup.Sandbox {
+			return backup.LocalSandbox{Tools: o.Tools}
+		},
+		verify:   backup.Verify,
+		coreDir:  migrate.CoreDir,
+		localDir: migrate.LocalDir,
+	}
+}
+
+// notJudged is printed when verification stopped before every stage had a
+// verdict.
+const notJudged = "This backup was not judged: verification stopped because of the error below (the backup itself may be fine)."
+
+// Verify implements "elythia backup verify <id|latest>": it reads the
+// generation, restores it into a throwaway PostgreSQL server, checks that this
+// binary can serve it and stores verify.json next to meta.json. It returns 0
+// when every stage passed (verify.json is stored by then) and 1 otherwise.
+func Verify(args []string) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runVerify(ctx, defaultVerifyEnv(), args)
+}
+
+func runVerify(ctx context.Context, e verifyEnv, args []string) int {
+	fs := cliflag.New("backup verify", e.stderr)
+	fs.Usage = func() {
+		fmt.Fprintf(e.stderr, "Usage: elythia backup verify [flags] <id|latest>\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	path := fs.String("config", defaultConfigPath, "path to configuration file")
+	// 世代の ID を位置引数で受けるので、cliflag.Parse (位置引数を拒否する) は使わない。
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return 2
+	}
+
+	cfg, err := e.loadConfig(*path)
+	if err != nil {
+		fmt.Fprintf(e.stderr, "elythia backup verify: failed to load config: %v\n", err)
+		return 1
+	}
+	if cfg.Backup == nil {
+		fmt.Fprintln(e.stderr, "elythia backup verify: the config file has no backup: section (see docs/configuration.md)")
+		return 1
+	}
+
+	opts, err := verifyOptions(e, cfg.Backup)
+	if err != nil {
+		fmt.Fprintf(e.stderr, "elythia backup verify: %v\n", err)
+		return 1
+	}
+
+	storage, err := e.openStorage(cfg.Backup.Storage)
+	if err != nil {
+		fmt.Fprintf(e.stderr, "elythia backup verify: failed to open storage: %v\n", err)
+		return 1
+	}
+	id, err := backup.ResolveGenerationID(ctx, storage, fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(e.stderr, "elythia backup verify: %v\n", err)
+		return 1
+	}
+
+	if w := backup.TempDirWarning(opts.TempDir, e.env); w != "" {
+		fmt.Fprintf(e.stderr, "elythia backup verify: warning: %s\n", w)
+	}
+	res, err := e.verify(ctx, storage, id, opts)
+	switch {
+	case len(res.Stages) > 0:
+		printResult(e.stdout, res)
+	case err != nil:
+		// 読めるかの段の途中の環境の誤り (鍵の不一致、読み出しの失敗、空きなど) では
+		// 段が 1 つも残らない。そのときも、世代が壊れているとは言っていないことを示す。
+		fmt.Fprintln(e.stdout, notJudged)
+	}
+	if err != nil {
+		fmt.Fprintf(e.stderr, "elythia backup verify: %v\n", err)
+		return 1
+	}
+	if !res.OK {
+		return 1
+	}
+	return 0
+}
+
+// verifyOptions builds the options of backup.Verify from b. "backup verify"
+// and "backup daemon" share it so that both verify the same way.
+func verifyOptions(e verifyEnv, b *config.BackupOptions) (backup.VerifyOptions, error) {
+	core, _, err := migrate.LatestVersion(e.coreDir)
+	if err != nil || core == 0 {
+		// 同梱の番号が分からないと「進みすぎていないか」を確かめられない。
+		return backup.VerifyOptions{}, fmt.Errorf("cannot read the bundled migrations in %s (run it in /app of the backup image): %v", e.coreDir, err)
+	}
+	local, _, err := migrate.LatestVersion(e.localDir)
+	if err != nil {
+		return backup.VerifyOptions{}, fmt.Errorf("cannot read the fork migrations in %s: %w", e.localDir, err)
+	}
+	opts := backup.VerifyOptions{
+		Sandbox: e.newSandbox(b),
+		Bundled: backup.BundledMigrations{Core: int64(core), Local: int64(local)},
+	}
+	if f := b.Encryption.IdentityFile; f != "" {
+		ids, err := backup.LoadIdentities(f)
+		if err != nil {
+			return backup.VerifyOptions{}, fmt.Errorf("cannot read backup.encryption.identityFile: %w", err)
+		}
+		opts.Identities = ids
+	}
+	if opts.IntegrityKey, err = integrityKey(b); err != nil {
+		return backup.VerifyOptions{}, err
+	}
+	return opts, nil
+}
+
+// printResult writes the human-facing summary.
+func printResult(w io.Writer, res backup.VerifyResult) {
+	fmt.Fprintf(w, "generation %s\n", res.ID)
+	for _, st := range res.Stages {
+		mark := "ok  "
+		switch {
+		case st.Skipped:
+			mark = "skip"
+		case !st.OK:
+			mark = "FAIL"
+		}
+		fmt.Fprintf(w, "  [%s] %s", mark, st.Stage)
+		if st.Error != "" {
+			fmt.Fprintf(w, ": %s", st.Error)
+		}
+		fmt.Fprintln(w)
+		for _, warn := range st.Warnings {
+			fmt.Fprintf(w, "         warning: %s\n", warn)
+		}
+	}
+	for _, m := range res.Mismatches {
+		actual := fmt.Sprint(m.Actual)
+		if m.Actual < 0 {
+			actual = "missing"
+		}
+		fmt.Fprintf(w, "  %s: meta.json %d rows / restored %s\n", m.Table, m.Expected, actual)
+	}
+	// 段が 3 つ揃っていないのは、環境の誤りや中断で判定に至らなかったとき。
+	// そのときに「戻せない」と出すと、世代が壊れていると誤解される。
+	switch {
+	case len(res.Stages) < 3:
+		fmt.Fprintln(w, notJudged)
+	case res.OK:
+		fmt.Fprintln(w, "This backup can be restored.")
+	default:
+		fmt.Fprintln(w, "This backup cannot be restored.")
+	}
+}

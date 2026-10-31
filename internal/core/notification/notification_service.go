@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/redis/go-redis/v9"
@@ -165,6 +166,9 @@ type CreateInput struct {
 	Extra          map[string]any
 	// AppAccessTokenID は 'app' 通知を作った access token の ID (#1557)。
 	AppAccessTokenID string
+	// NoteSource, when set, supplies the note referenced by NoteID to the
+	// packers instead of each of them reading it again (#3611). Not persisted.
+	NoteSource *NoteSource
 }
 
 // StreamingPublisher receives a freshly created notification so that
@@ -195,6 +199,12 @@ type Packer interface {
 	Pack(notifieeID string, n *Notification) any
 }
 
+// NoteSourcePacker is implemented by a Packer that can take the referenced
+// note from a NoteSource instead of reading it by n.NoteID (#3611).
+type NoteSourcePacker interface {
+	PackWithNoteSource(notifieeID string, n *Notification, src *NoteSource) any
+}
+
 // unreadPublishDelay は Notification 永続化から `unreadNotification` を main
 // stream に流すまでの待機時間。本家 TS の 2 秒 setTimeout と同じで、その間
 // に MarkAllAsRead が呼ばれた (= ユーザーが既読化した) 場合は publish を
@@ -215,6 +225,9 @@ type Service struct {
 	noteUnreadRepo      repository.NoteUnreadRepository
 	unreadPublishDelay  time.Duration
 	policyResolver      PolicyResolver
+	// background は unreadNotification と Web Push を遅らせて送る timer を持つ
+	// 箱 (#3661)。nil なら time.AfterFunc で待つ (テスト)。
+	background *bgwork.Group
 }
 
 // PolicyResolver reports the notification types a user has opted out of
@@ -233,18 +246,24 @@ type PolicyResolver interface {
 // keyPrefix (通常は `cfg.Redis.KeyPrefix()` = `<host>:`) は TS 本家と同じキー
 // 名前空間 (`<host>:notificationTimeline:*`, `<host>:latestReadNotification:*`)
 // を使うために全 Redis キーの前に付与される。空文字列ならprefix無し。
-func NewService(client *redis.Client, idGen id.Generator, keyPrefix string) *Service {
+//
+// background is the group the delayed unreadNotification and Web Push run in,
+// so stopping the server generation sends them before it closes the DB and the
+// queue (#3661). 無いと世代を止めても待たれずに閉じた DB と queue を使い、
+// しかも黙って劣化するので、構築子の必須の引数で受ける (#3825)。
+func NewService(client *redis.Client, idGen id.Generator, keyPrefix string, background *bgwork.Group) *Service {
 	return &Service{
 		client:             client,
 		idGen:              idGen,
 		keyPrefix:          keyPrefix,
+		background:         background,
 		unreadPublishDelay: defaultUnreadPublishDelay,
 	}
 }
 
 // SetUnreadPublishDelay overrides the delay between Notification persistence
 // and `unreadNotification` publish. 0 makes the publish synchronous (used by
-// tests so they don't have to wait for time.AfterFunc to fire).
+// tests so they don't have to wait for the delay).
 func (s *Service) SetUnreadPublishDelay(d time.Duration) {
 	s.unreadPublishDelay = d
 }
@@ -565,7 +584,11 @@ func (s *Service) createWithPush(ctx context.Context, in CreateInput, pushFn fun
 	// 未読が食い違うので行は残して note detail だけ落とす。
 	var packed any = n
 	if s.packer != nil {
-		packed = s.packer.Pack(in.NotifieeID, n)
+		if sp, ok := s.packer.(NoteSourcePacker); ok && in.NoteSource != nil && in.NoteID != "" {
+			packed = sp.PackWithNoteSource(in.NotifieeID, n, in.NoteSource)
+		} else {
+			packed = s.packer.Pack(in.NotifieeID, n)
+		}
 		if packed == nil {
 			// packer が通知を drop した (roleAssigned で role 削除済など)。upstream
 			// は stream へ出す前に filter するので、永続化済みの本通知は realtime
@@ -811,7 +834,19 @@ func (s *Service) scheduleUnreadPublish(notifieeID, streamID string, packed any,
 		publish()
 		return
 	}
-	time.AfterFunc(s.unreadPublishDelay, publish)
+	// 遅らせて送るのは世代の箱の timer で行う (#3661)。time.AfterFunc のままだと、
+	// 世代を止めた後に発火し、閉じた DB で利用者とノートを詰められず、閉じた queue に
+	// Web Push を積もうとして失敗する。世代が止まり始めたら、待たずに今送る (箱が
+	// 止め始めに走らせ、その終わりを待つ)。既読の確認を待つ時間は短くなるが、捨てる
+	// より送るほうがよい (通知は再送されない)。
+	//
+	// 止め始めた後に作られた通知 (停止の待ちの間に走る投稿後の hook など) は、
+	// 予約できないので、呼び出し元の goroutine でこの場で送る。呼び出し元が箱の
+	// goroutine なら、停止はその終わりを待つので、DB と queue はまだ開いている
+	// (#3661 のレビュー2周目 L-1)。
+	if !s.background.AfterFunc(s.unreadPublishDelay, publish) {
+		publish()
+	}
 }
 
 // MarkAllAsRead advances the user's notification read marker to the newest
@@ -949,6 +984,30 @@ type UnreadSummary struct {
 // Redis or the note_unread repo are returned unmodified; partial results are
 // preserved when possible.
 func (s *Service) UnreadSummary(ctx context.Context, userID string, mentionTypes []Type) (UnreadSummary, error) {
+	summary, err := s.UnreadStreamSummary(ctx, userID, mentionTypes)
+	if err != nil {
+		return summary, err
+	}
+	if s.noteUnreadRepo != nil {
+		has, err := s.noteUnreadRepo.HasAnySpecified(userID)
+		if err != nil {
+			return summary, err
+		}
+		summary.HasSpecifiedNote = has
+	}
+	return summary, nil
+}
+
+// SpecifiedNoteFromDB reports whether UnreadSummary takes HasSpecifiedNote
+// from the note_unread table (repository.NoteUnreadRepository.HasAnySpecified)
+// rather than from the notification stream.
+func (s *Service) SpecifiedNoteFromDB() bool { return s.noteUnreadRepo != nil }
+
+// UnreadStreamSummary is UnreadSummary without the note_unread read: when
+// SpecifiedNoteFromDB is true, HasSpecifiedNote is left false for the caller
+// to fill (e.g. from repository.MeUnreadFlagsReader, which reads it together
+// with the other /api/i flags in one statement, #3608).
+func (s *Service) UnreadStreamSummary(ctx context.Context, userID string, mentionTypes []Type) (UnreadSummary, error) {
 	var summary UnreadSummary
 	readID, err := s.LatestReadID(ctx, userID)
 	if err != nil {
@@ -996,14 +1055,6 @@ func (s *Service) UnreadSummary(ctx context.Context, userID string, mentionTypes
 				}
 			}
 		}
-	}
-
-	if s.noteUnreadRepo != nil {
-		has, err := s.noteUnreadRepo.HasAnySpecified(userID)
-		if err != nil {
-			return summary, err
-		}
-		summary.HasSpecifiedNote = has
 	}
 
 	return summary, nil

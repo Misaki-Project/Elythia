@@ -8,6 +8,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/bubbleversus"
 	"github.com/elythia-network/elythia/internal/entity"
@@ -67,7 +68,7 @@ func timeISO(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.00
 
 // packRecord renders a stored match. withLogs adds both players' logs, which
 // can be large, so only the detail endpoint sets it.
-func packRecord(rec *model.BubbleGameVersusRecord, withLogs bool) map[string]any {
+func packRecord(pk *entity.Packer, rec *model.BubbleGameVersusRecord, withLogs bool) map[string]any {
 	out := map[string]any{
 		"id":        rec.ID,
 		"gameMode":  rec.GameMode,
@@ -97,7 +98,7 @@ func packRecord(rec *model.BubbleGameVersusRecord, withLogs bool) map[string]any
 	} {
 		out[s.name+"Id"] = s.userID
 		if s.user != nil {
-			out[s.name] = entity.PackUserLite(s.user)
+			out[s.name] = pk.PackUserLite(s.user)
 		} else {
 			out[s.name] = nil
 		}
@@ -129,19 +130,19 @@ func packRecord(rec *model.BubbleGameVersusRecord, withLogs bool) map[string]any
 func (h *VersusHandler) History(c echo.Context) error {
 	me := middleware.GetUser(c)
 	var req struct {
-		UserID    string `json:"userId"`
-		Limit     *int   `json:"limit"`
-		UntilID   string `json:"untilId"`
-		UntilDate *int64 `json:"untilDate"`
+		UserID    string     `json:"userId"`
+		Limit     *jsnum.Int `json:"limit"`
+		UntilID   string     `json:"untilId"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, errVersusInvalidP)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return c.JSON(http.StatusBadRequest, errVersusInvalidP)
 	}
-	_, untilID, cursorOK := id.NormalizeCursor("", req.UntilID, nil, req.UntilDate)
+	_, untilID, cursorOK := id.NormalizeCursor("", req.UntilID, nil, req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return c.JSON(http.StatusBadRequest, errVersusInvalidP)
 	}
@@ -176,7 +177,7 @@ func (h *VersusHandler) History(c echo.Context) error {
 				return h.fail(c, err)
 			}
 			if ok {
-				out = append(out, packRecord(rec, false))
+				out = append(out, packRecord(h.entityPacker, rec, false))
 				if len(out) == limit {
 					break
 				}
@@ -222,7 +223,7 @@ func (h *VersusHandler) ShowRecord(c echo.Context) error {
 		// 見られない対局は、あることも知らせない。
 		return c.JSON(http.StatusNotFound, errNoSuchMatch)
 	}
-	return c.JSON(http.StatusOK, packRecord(rec, true))
+	return c.JSON(http.StatusOK, packRecord(h.entityPacker, rec, true))
 }
 
 // SetPublic handles bubble-game/versus/set-public: the caller's own consent

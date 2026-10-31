@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	corechannel "github.com/elythia-network/elythia/internal/core/channel"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/entitycompat/shapetest"
@@ -22,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 func newTestHandler(t *testing.T) (*Handler, *testutil.MockNoteRepository) {
@@ -29,10 +31,10 @@ func newTestHandler(t *testing.T) (*Handler, *testutil.MockNoteRepository) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 	return h, noteRepo
 }
 
@@ -96,10 +98,10 @@ func TestCreate_WithPoll(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{
 		ID:                "user1",
@@ -216,7 +218,7 @@ func TestShow_AttachmentEmbedsFolderAndUser(t *testing.T) {
 		AvatarDecorations: datatypes.JSON([]byte("[]")),
 	}
 
-	h.SetDriveFileRepo(fileRepo)
+	h.driveFileRepo = fileRepo
 	h.SetDriveFolderRepo(folderRepo)
 	h.SetUserRepo(userRepo)
 
@@ -274,7 +276,7 @@ func TestShow_AttachmentWithoutRepos_OmitsFolderUser(t *testing.T) {
 		URL:    fileURL,
 		Name:   "pic.png",
 	}
-	h.SetDriveFileRepo(fileRepo)
+	h.driveFileRepo = fileRepo
 
 	text := "note with attachment"
 	noteRepo.Notes["n1"] = &model.Note{
@@ -634,10 +636,10 @@ func TestCreate_WithPollExpiresAt(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{
 		ID:                "user1",
@@ -669,10 +671,10 @@ func TestCreate_RepoError(t *testing.T) {
 	noteRepo := &failingNoteRepo{}
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{ID: "user1", Username: "testuser"}
 
@@ -693,10 +695,10 @@ func TestCreate_FindByIDWithRelationsFails(t *testing.T) {
 	noteRepo := &findFailNoteRepo{MockNoteRepository: testutil.NewMockNoteRepository()}
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{
 		ID:                "user1",
@@ -730,10 +732,10 @@ func TestCreate_RenoteTargetNotFound(t *testing.T) {
 	noteRepo := &failingNoteRepo{}
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{ID: "user1", Username: "testuser"}
 
@@ -771,10 +773,10 @@ func TestCreate_CannotReplyToInvisibleNote(t *testing.T) {
 	noteRepo := &fixedNoteRepo{MockNoteRepository: testutil.NewMockNoteRepository(), note: hiddenNote}
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{ID: "user1", Username: "testuser"}
 
@@ -803,11 +805,11 @@ func TestCreate_ChannelNotFound(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	createSvc.SetChannelHook(channelErrHook{err: corechannel.ErrChannelNotFound})
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{ID: "user1", Username: "testuser"}
 
@@ -831,11 +833,11 @@ func TestCreate_ChannelLookupErrorIsInternal(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	createSvc.SetChannelHook(channelErrHook{err: errors.New("connection refused")})
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	body := `{"text": "to channel", "channelId": "c1"}`
 	e := echo.New()
@@ -862,11 +864,11 @@ func TestCreate_ArchivedChannel(t *testing.T) {
 	channelRepo := testutil.NewMockChannelRepository()
 	channelRepo.Channels["ch1"] = &model.Channel{ID: "ch1", Name: "old", IsArchived: true}
 	channelSvc := corechannel.NewService(channelRepo, testutil.NewMockChannelFollowingRepository(), noteRepo, idGen)
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	createSvc.SetChannelHook(corechannel.NewNoteCreateHook(channelSvc))
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{ID: "user1", Username: "testuser"}
 	e := echo.New()
@@ -904,7 +906,8 @@ func TestDelete_InvalidJSON(t *testing.T) {
 // failingNoteRepo always returns errors on Create.
 type failingNoteRepo struct{}
 
-func (f *failingNoteRepo) Create(_ *model.Note) error { return testutil.ErrNotFound }
+func (f *failingNoteRepo) Create(_ *model.Note) error                   { return testutil.ErrNotFound }
+func (f *failingNoteRepo) CreateWithTx(_ *model.Note, _ *gorm.DB) error { return testutil.ErrNotFound }
 func (f *failingNoteRepo) ListRenoteOrReplyRemoteUserIDs(_ string) ([]string, error) {
 	return nil, testutil.ErrNotFound
 }
@@ -943,6 +946,9 @@ func (f *failingNoteRepo) ListLocalByChannelID(_, _, _, _ string, _ int) ([]*mod
 	return nil, nil
 }
 func (f *failingNoteRepo) FindManyByIDsWithUser(_ []string) ([]*model.Note, error) {
+	return nil, nil
+}
+func (f *failingNoteRepo) FindManyLocalReferenceMetadataByIDs(_ []string) ([]*model.Note, error) {
 	return nil, nil
 }
 func (f *failingNoteRepo) ListRenotesOf(_, _, _, _ string, _ int) ([]*model.Note, error) {
@@ -1027,10 +1033,10 @@ func TestDelete_RepoError(t *testing.T) {
 	noteRepo := &deleteFailNoteRepo{MockNoteRepository: mockRepo}
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 
 	user := &model.User{ID: "user1", Username: "testuser"}
 	body := `{"noteId": "note1"}`
@@ -1115,7 +1121,7 @@ func TestValidateCreateInput_PollUniqueAndExpiredAfter(t *testing.T) {
 	ok := &CreateRequest{Poll: &PollRequest{Choices: []string{"a", "b"}}}
 	assert.NoError(t, validateCreateInput(ok, nil), "ユニークな choice は通る")
 
-	bad := int64(0)
+	bad := jsnum.Int(0)
 	badExpire := &CreateRequest{Poll: &PollRequest{Choices: []string{"a", "b"}, ExpiredAfter: &bad}}
 	assert.Error(t, validateCreateInput(badExpire, nil), "expiredAfter<1 は弾く")
 }
@@ -1125,10 +1131,10 @@ func TestCreate_PollExpiredAfterTakesPriority(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	pollRepo := testutil.NewMockPollRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil)
+	createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
 	deleteSvc := corenote.NewDeleteService(noteRepo)
 	querySvc := corenote.NewQueryService(noteRepo, nil)
-	h := NewHandler(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
+	h := newHandlerNilDeps(noteRepo, createSvc, deleteSvc, querySvc, nil, nil, nil, nil, idGen)
 	user := &model.User{ID: "user1", Username: "testuser", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 
 	farFutureMs := time.Now().Add(30 * 24 * time.Hour).UnixMilli() // expiresAt: 30 日後
@@ -1148,6 +1154,137 @@ func TestCreate_PollExpiredAfterTakesPriority(t *testing.T) {
 		require.NotNil(t, poll.ExpiresAt)
 		// expiredAfter (now+1h) を採用 → 30 日後の expiresAt よりずっと前になる。
 		assert.True(t, poll.ExpiresAt.Before(time.Now().Add(2*time.Hour)), "expiredAfter を優先すべき、got %v", poll.ExpiresAt)
+	}
+}
+
+// #3884: poll の expiresAt / expiredAfter は、本家の ajv と同じく小数の形の整数
+// (10.0) も受ける。
+func TestCreate_PollAcceptsIntegerForms(t *testing.T) {
+	for _, field := range []string{"expiredAfter", "expiresAt"} {
+		t.Run(field, func(t *testing.T) {
+			noteRepo := testutil.NewMockNoteRepository()
+			pollRepo := testutil.NewMockPollRepository()
+			idGen, _ := id.NewGenerator("aidx")
+			createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
+			h := newHandlerNilDeps(noteRepo, createSvc, corenote.NewDeleteService(noteRepo), corenote.NewQueryService(noteRepo, nil), nil, nil, nil, nil, idGen)
+			user := &model.User{ID: "user1", Username: "testuser", AvatarDecorations: datatypes.JSON([]byte("[]"))}
+
+			value := "3600000.0"
+			want := time.Now().Add(time.Hour)
+			if field == "expiresAt" {
+				want = time.Now().Add(2 * time.Hour).Truncate(time.Second)
+				value = fmt.Sprintf("%d.0", want.UnixMilli())
+			}
+			body := fmt.Sprintf(`{"text": "Vote!", "poll": {"choices": ["A", "B"], %q: %s}}`, field, value)
+			req := httptest.NewRequest(http.MethodPost, "/api/notes/create", strings.NewReader(body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			rec := httptest.NewRecorder()
+			c := echo.New().NewContext(req, rec)
+			setAuthUser(c, user)
+			require.NoError(t, h.Create(c))
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Len(t, pollRepo.Polls, 1)
+			for _, poll := range pollRepo.Polls {
+				require.NotNil(t, poll.ExpiresAt)
+				assert.WithinDuration(t, want, *poll.ExpiresAt, time.Minute)
+			}
+		})
+	}
+}
+
+// #3884: poll.expiresAt の 0 (と -0) は、本家と同じく期限なしとして扱う。
+func TestCreate_PollExpiresAtZeroMeansNoExpiry(t *testing.T) {
+	for _, value := range []string{"0", "-0", "0.0"} {
+		t.Run(value, func(t *testing.T) {
+			noteRepo := testutil.NewMockNoteRepository()
+			pollRepo := testutil.NewMockPollRepository()
+			idGen, _ := id.NewGenerator("aidx")
+			createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
+			h := newHandlerNilDeps(noteRepo, createSvc, corenote.NewDeleteService(noteRepo), corenote.NewQueryService(noteRepo, nil), nil, nil, nil, nil, idGen)
+			user := &model.User{ID: "user1", Username: "testuser", AvatarDecorations: datatypes.JSON([]byte("[]"))}
+			body := `{"text": "Vote!", "poll": {"choices": ["A", "B"], "expiresAt": ` + value + `}}`
+			req := httptest.NewRequest(http.MethodPost, "/api/notes/create", strings.NewReader(body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			rec := httptest.NewRecorder()
+			c := echo.New().NewContext(req, rec)
+			setAuthUser(c, user)
+			require.NoError(t, h.Create(c))
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Len(t, pollRepo.Polls, 1)
+			for _, poll := range pollRepo.Polls {
+				assert.Nil(t, poll.ExpiresAt)
+			}
+		})
+	}
+}
+
+// #3884: 空白だけの text の判定は、本家の pattern ('[^\\s]+') と同じく JavaScript の
+// \s で数える。U+0085 は \s に入らないので受け、U+FEFF は入るので弾く。
+func TestValidateCreateInput_TextWhitespaceIsJavaScripts(t *testing.T) {
+	text := func(s string) *CreateRequest { return &CreateRequest{Text: &s} }
+	assert.NoError(t, validateCreateInput(text("\u0085"), nil), "U+0085 is not JavaScript whitespace")
+	assert.Error(t, validateCreateInput(text("\ufeff"), nil), "U+FEFF is JavaScript whitespace")
+	assert.Error(t, validateCreateInput(text(" \u3000\u2009\t"), nil))
+	assert.NoError(t, validateCreateInput(text(" a "), nil))
+}
+
+// #3443: expiredAfter が time.Duration の範囲 (約 9.22e12 ms) を超えても期限が
+// 過去へ巻き戻らず、upstream と同じ now + expiredAfter になる。上限
+// (9999-12-30T23:59:59.999Z) を超える期限は 400 INVALID_PARAM で弾く。
+func TestCreate_PollExpiryRange(t *testing.T) {
+	tooFarAfter := corenote.MaxPollExpiresAtUnixMilli - time.Now().UnixMilli() + 60_000
+	tests := []struct {
+		name       string
+		poll       string
+		wantStatus int
+		wantMs     int64 // expected deadline relative to now in ms
+		wantAbsMs  int64 // expected absolute deadline in Unix ms (0 = use wantMs)
+	}{
+		{name: "expiredAfter above duration range", poll: `"expiredAfter": 9300000000000`, wantStatus: http.StatusOK, wantMs: 9_300_000_000_000},
+		{name: "expiredAfter at int64 duration overflow boundary", poll: `"expiredAfter": 9223372036855`, wantStatus: http.StatusOK, wantMs: 9_223_372_036_855},
+		{name: "expiredAfter just past the limit", poll: fmt.Sprintf(`"expiredAfter": %d`, tooFarAfter), wantStatus: http.StatusBadRequest},
+		{name: "expiredAfter int64 max", poll: `"expiredAfter": 9223372036854775807`, wantStatus: http.StatusBadRequest},
+		{name: "expiresAt at the limit", poll: `"expiresAt": 253402214399999`, wantStatus: http.StatusOK, wantAbsMs: corenote.MaxPollExpiresAtUnixMilli},
+		{name: "expiresAt one past the limit", poll: `"expiresAt": 253402214400000`, wantStatus: http.StatusBadRequest},
+		{name: "expiresAt in year 10000", poll: `"expiresAt": 253402300800000`, wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			noteRepo := testutil.NewMockNoteRepository()
+			pollRepo := testutil.NewMockPollRepository()
+			idGen, _ := id.NewGenerator("aidx")
+			createSvc := corenote.NewCreateService(noteRepo, pollRepo, idGen, nil, nil, nil, nil, nil, nil, nil)
+			h := newHandlerNilDeps(noteRepo, createSvc, corenote.NewDeleteService(noteRepo), corenote.NewQueryService(noteRepo, nil), nil, nil, nil, nil, idGen)
+			user := &model.User{ID: "user1", Username: "testuser", AvatarDecorations: datatypes.JSON([]byte("[]"))}
+
+			body := `{"text": "Vote!", "poll": {"choices": ["A", "B"], ` + tt.poll + `}}`
+			req := httptest.NewRequest(http.MethodPost, "/api/notes/create", strings.NewReader(body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			rec := httptest.NewRecorder()
+			c := echo.New().NewContext(req, rec)
+			setAuthUser(c, user)
+			before := time.Now()
+			require.NoError(t, h.Create(c))
+			require.Equal(t, tt.wantStatus, rec.Code, rec.Body.String())
+
+			if tt.wantStatus != http.StatusOK {
+				assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+				assert.Empty(t, pollRepo.Polls)
+				return
+			}
+			require.Len(t, pollRepo.Polls, 1)
+			for _, poll := range pollRepo.Polls {
+				require.NotNil(t, poll.ExpiresAt)
+				assert.True(t, poll.ExpiresAt.After(time.Now()), "deadline must not be in the past, got %v", poll.ExpiresAt)
+				if tt.wantAbsMs != 0 {
+					assert.Equal(t, tt.wantAbsMs, poll.ExpiresAt.UnixMilli())
+					continue
+				}
+				got := poll.ExpiresAt.UnixMilli()
+				assert.GreaterOrEqual(t, got, before.UnixMilli()+tt.wantMs)
+				assert.LessOrEqual(t, got, time.Now().UnixMilli()+tt.wantMs)
+			}
+		})
 	}
 }
 

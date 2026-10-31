@@ -1,7 +1,9 @@
 package i
 
 import (
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/elythia-network/elythia/internal/model"
@@ -18,7 +20,7 @@ func akaHandler(t *testing.T) (*Handler, *model.User) {
 	h, repo, _, _ := newTestHandler(t)
 	h.SetUserRepo(repo)
 	h.SetServerURL("https://mk.example")
-	me := &model.User{ID: "me", Username: "me", UsernameLower: "me"}
+	me := &model.User{ID: "me", Username: "me", UsernameLower: "me", FederationStatus: model.FederationStatusOn}
 	repo.Users["me"] = me
 	return h, me
 }
@@ -183,7 +185,7 @@ func TestUpdate_AlsoKnownAs_LocalURINullWhenNoServerURL(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	h.SetUserRepo(repo)
 	// serverURL を敢えて設定しない。
-	me := &model.User{ID: "me", Username: "me", UsernameLower: "me"}
+	me := &model.User{ID: "me", Username: "me", UsernameLower: "me", FederationStatus: model.FederationStatusOn}
 	repo.Users["me"] = me
 	repo.Users["alias1"] = &model.User{ID: "alias1", Username: "aliasuser", UsernameLower: "aliasuser"}
 
@@ -197,12 +199,51 @@ func TestUpdate_AlsoKnownAs_NoUserRepoFailsClosed(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	// SetUserRepo を呼ばない → h.userRepo == nil。
 	h.SetServerURL("https://mk.example")
-	me := &model.User{ID: "me", Username: "me", UsernameLower: "me"}
+	me := &model.User{ID: "me", Username: "me", UsernameLower: "me", FederationStatus: model.FederationStatusOn}
 	repo.Users["me"] = me
 
 	rec := post(h.Update, `{"alsoKnownAs":["@anyone"]}`, me)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "NO_SUCH_USER")
+}
+
+// Local alias targets must be externally available before they can be saved.
+func TestUpdate_AlsoKnownAs_LocalFederationAvailability(t *testing.T) {
+	for _, status := range []model.FederationStatus{model.FederationStatusOff, model.FederationStatusPending} {
+		t.Run(string(status), func(t *testing.T) {
+			h, me := akaHandler(t)
+			nativeToken := "native-login-token"
+			me.Token = &nativeToken
+			me.FederationStatus = model.FederationStatusOn
+			me.AlsoKnownAs = strPtr("https://mk.example/users/old")
+			target := repoOf(h).addLocal("alias1", "aliasuser")
+			target.FederationStatus = status
+			h.SetLocalFederationObserver(&moveAvailabilityObserver{})
+
+			rec := updateWithToken(h, "{\"alsoKnownAs\":[\"@aliasuser\"]}", me, nativeToken)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), "NO_SUCH_USER")
+			got := repoOf(h).get("me")
+			require.NotNil(t, got.AlsoKnownAs)
+			assert.Equal(t, "https://mk.example/users/old", *got.AlsoKnownAs)
+		})
+	}
+}
+
+func TestUpdate_AlsoKnownAs_LocalFederationEnabled(t *testing.T) {
+	h, me := akaHandler(t)
+	nativeToken := "native-login-token"
+	me.Token = &nativeToken
+	me.FederationStatus = model.FederationStatusOn
+	target := repoOf(h).addLocal("alias1", "aliasuser")
+	target.FederationStatus = model.FederationStatusOn
+	h.SetLocalFederationObserver(&moveAvailabilityObserver{})
+
+	rec := updateWithToken(h, "{\"alsoKnownAs\":[\"@aliasuser\"]}", me, nativeToken)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	got := repoOf(h).get("me")
+	require.NotNil(t, got.AlsoKnownAs)
+	assert.Equal(t, "https://mk.example/users/alias1", *got.AlsoKnownAs)
 }
 
 // #2106 L3: 不正な regex リテラルの mutedWords は INVALID_REGEXP(400) で拒否する。
@@ -211,4 +252,109 @@ func TestUpdate_InvalidMutedWordsRegex(t *testing.T) {
 	rec := post(h.Update, `{"mutedWords":["/[/"]}`, me)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "INVALID_REGEXP")
+}
+
+// hardMutedWords は正規表現の大きさの上限を超えたら INVALID_REGEXP(400)。
+// サーバーがノートごとに評価するので、巨大なパターン 1 件で CPU と配信が止まる。
+// 同じパターンでも mutedWords (クライアントだけが評価する) は受け付ける。
+func TestUpdate_HardMutedWordsRegexTooComplex(t *testing.T) {
+	h, me := akaHandler(t)
+	big := "/" + strings.Repeat(".?", 400) + "b/"
+	body, err := json.Marshal(map[string]any{"hardMutedWords": []string{big}})
+	require.NoError(t, err)
+	rec := post(h.Update, string(body), me)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INVALID_REGEXP")
+
+	body, err = json.Marshal(map[string]any{"mutedWords": []string{big}})
+	require.NoError(t, err)
+	rec = post(h.Update, string(body), me)
+	assert.Equal(t, http.StatusOK, rec.Code, "mutedWords には大きさの上限を掛けない: %s", rec.Body.String())
+
+	body, err = json.Marshal(map[string]any{"hardMutedWords": []string{"/(?i)spam|scam/"}})
+	require.NoError(t, err)
+	rec = post(h.Update, string(body), me)
+	assert.Equal(t, http.StatusOK, rec.Code, "普通の正規表現は通ること: %s", rec.Body.String())
+}
+
+// 負の wordMuteLimit は upstream と同じく、ミュートする語を 1 つも置けないこと
+// (`count > limit` が常に真)。上限なしにしない。
+func TestUpdate_NegativeWordMuteLimitDenies(t *testing.T) {
+	h, me := akaHandler(t)
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"wordMuteLimit": -1}}
+	rec := post(h.Update, `{"hardMutedWords":["spam"]}`, me)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "TOO_MANY_MUTED_WORDS")
+}
+
+// 件数の検査は正規表現の検査より先に行うこと (upstream と同じ順)。件数で断る
+// 入力の正規表現をコンパイルさせない。
+func TestUpdate_MuteWordCountCheckedBeforeRegex(t *testing.T) {
+	h, me := akaHandler(t)
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"wordMuteLimit": 10}}
+	for _, key := range []string{"mutedWords", "hardMutedWords"} {
+		// 11 件 (上限 10 を超える) の、どれも正規表現として読めない語。
+		words := make([]string, 11)
+		for i := range words {
+			words[i] = "/(unclosed/"
+		}
+		body, err := json.Marshal(map[string]any{key: words})
+		require.NoError(t, err)
+		rec := post(h.Update, string(body), me)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, key)
+		assert.Contains(t, rec.Body.String(), "TOO_MANY_MUTED_WORDS", key)
+	}
+}
+
+// wordMuteLimit は upstream と同じく件数ではなく文字数 (UTF-16 の単位) の合計で
+// 数えること。AND の組の中の語も足す。
+func TestUpdate_WordMuteLimitCountsCharacters(t *testing.T) {
+	h, me := akaHandler(t)
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"wordMuteLimit": 10}}
+	for body, want := range map[string]int{
+		`{"hardMutedWords":[["abcdefghijk"]]}`:        http.StatusBadRequest, // 1 件でも 11 文字
+		`{"hardMutedWords":[["abcde"],["fgh","ij"]]}`: http.StatusOK,         // 10 文字
+		`{"hardMutedWords":["/abc/",["fgh","ij"]]}`:   http.StatusOK,         // 正規表現も文字数で数える (/ を含め 5 + 5)
+		`{"mutedWords":[["abcde"],["fgh","ijk"]]}`:    http.StatusBadRequest, // 11 文字
+		`{"mutedWords":[["😀😀😀😀😀"]]}`:                  http.StatusOK,         // サロゲートで 10
+		`{"mutedWords":[["😀😀😀😀😀a"]]}`:                 http.StatusBadRequest, // 11
+	} {
+		rec := post(h.Update, body, me)
+		assert.Equal(t, want, rec.Code, "%s: %s", body, rec.Body.String())
+		if want == http.StatusBadRequest {
+			assert.Contains(t, rec.Body.String(), "TOO_MANY_MUTED_WORDS", body)
+		}
+	}
+}
+
+// **連合 OFF・未確定のアカウントは alsoKnownAs を設定できない** (ローカル専用
+// アカウントの設計 7.8「移行先としても禁止」)。UI だけが止めていて API では通って
+// いた (2026-10-31 の監査)。
+func TestUpdate_AlsoKnownAs_RefusedWhileFederationIsNotOn(t *testing.T) {
+	for _, status := range []model.FederationStatus{model.FederationStatusOff, model.FederationStatusPending} {
+		t.Run(string(status), func(t *testing.T) {
+			h, me := akaHandler(t)
+			repoOf(h).addLocal("alias1", "aliasuser")
+			me.FederationStatus = status
+
+			rec := post(h.Update, `{"alsoKnownAs":["@aliasuser"]}`, me)
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), "FEDERATION_DISABLED")
+			got := repoOf(h).get("me")
+			assert.Nil(t, got.AlsoKnownAs, "拒否したのに保存している")
+		})
+	}
+}
+
+// 連合 OFF でも、空の配列 (解除) は通る。ON のときに設定してから OFF にした利用者が
+// 別名を消せなくなるため (レビュー L-7)。
+func TestUpdate_AlsoKnownAs_ClearingIsAllowedWhileFederationIsOff(t *testing.T) {
+	h, me := akaHandler(t)
+	me.AlsoKnownAs = strPtr("https://other.example/users/rem1")
+	me.FederationStatus = model.FederationStatusOff
+
+	rec := post(h.Update, `{"alsoKnownAs":[]}`, me)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	got := repoOf(h).get("me")
+	assert.Nil(t, got.AlsoKnownAs, "解除が保存されていない")
 }

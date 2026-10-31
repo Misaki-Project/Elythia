@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,10 +68,11 @@ func newHandler(t *testing.T, pubKeyPEM string) (*Handler, *testutil.MockUserRep
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	urls := activitypub.NewURLBuilder("https://example.com")
-	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(actorBody(pubKeyPEM))}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	return NewHandler(resolver, processor), repo, followingRepo
+	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(actorBody(pubKeyPEM))}, idGen,
+		nil, nil, nil, nil, nil, nil)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo, "", nil, nil)
+	return NewHandler(resolver, processor, "", nil, nil), repo, followingRepo
 }
 
 func newPost(t *testing.T, body []byte) (echo.Context, *httptest.ResponseRecorder) {
@@ -78,6 +81,129 @@ func newPost(t *testing.T, body []byte) (echo.Context, *httptest.ResponseRecorde
 	req := httptest.NewRequest(http.MethodPost, "https://example.com/inbox", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	return e.NewContext(req, rec), rec
+}
+
+type localFederationObserverStub struct {
+	available bool
+	err       error
+	recorded  []string
+}
+
+func (s *localFederationObserverStub) IsExternallyAvailable(user *model.User) bool {
+	return s.available
+}
+
+func (s *localFederationObserverStub) ObserveExternalReference(userID, reason, host string) (bool, error) {
+	s.recorded = append(s.recorded, userID+":"+reason+":"+host)
+	return s.err == nil, s.err
+}
+
+func TestInbox_LocalOnlySharedInboxTargetIsNotInspectedBeforeAdmission(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", FederationStatus: model.FederationStatusOff}
+	observer := &localFederationObserverStub{available: false}
+	h.SetLocalFederationObserver(observer)
+	h.SetUserRepo(repo)
+
+	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob","to":"https://example.com/users/bob"}`)
+	c, rec := newPost(t, body)
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Empty(t, observer.recorded)
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+}
+
+func TestInbox_DoesNotRecordBodyTargetBeforeSignatureAdmission(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", FederationStatus: model.FederationStatusOn}
+	observer := &localFederationObserverStub{available: true}
+	h.SetLocalFederationObserver(observer)
+	h.SetUserRepo(repo)
+
+	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob","to":"https://example.com/users/bob"}`)
+	c, rec := newPost(t, body)
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Empty(t, observer.recorded)
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+}
+func TestInbox_LocalOnlyNoteTargetIsNotInspectedBeforeAdmission(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	noteRepo := testutil.NewMockNoteRepository()
+	noteRepo.Notes["locked-note"] = &model.Note{ID: "locked-note", UserID: "bob", LocalOnly: true}
+	h.SetNoteRepo(noteRepo)
+	h.SetUserRepo(repo)
+	observer := &localFederationObserverStub{available: true}
+	h.SetLocalFederationObserver(observer)
+
+	body := []byte(`{"type":"Like","actor":"https://remote.example/users/alice","object":"https://example.com/notes/locked-note"}`)
+	c, rec := newPost(t, body)
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Empty(t, observer.recorded)
+}
+
+func TestInbox_BodyNoteOwnerIsNotObservedBeforeAdmission(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	noteRepo := testutil.NewMockNoteRepository()
+	noteRepo.Notes["public-note"] = &model.Note{ID: "public-note", UserID: "bob"}
+	h.SetNoteRepo(noteRepo)
+	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", FederationStatus: model.FederationStatusOn}
+	h.SetUserRepo(repo)
+	observer := &localFederationObserverStub{available: true}
+	h.SetLocalFederationObserver(observer)
+
+	body := []byte(`{"type":"Like","actor":"https://remote.example/users/alice","object":"https://example.com/notes/public-note"}`)
+	c, rec := newPost(t, body)
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Empty(t, observer.recorded)
+}
+
+func TestInbox_BodyObservationDoesNotRunBeforeAdmission(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", FederationStatus: model.FederationStatusOn}
+	h.SetUserRepo(repo)
+	observer := &localFederationObserverStub{available: true, err: errors.New("observation failed")}
+	h.SetLocalFederationObserver(observer)
+
+	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
+	c, rec := newPost(t, body)
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Empty(t, observer.recorded)
+}
+
+func TestInbox_KnownExternalReferenceIsNotRecordedAgain(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	observedAt := time.Now()
+	repo.Users["bob"] = &model.User{
+		ID: "bob", Username: "bob", FederationStatus: model.FederationStatusOn,
+		FirstExternalReferenceAt: &observedAt,
+	}
+	h.SetUserRepo(repo)
+	observer := &localFederationObserverStub{available: true}
+	h.SetLocalFederationObserver(observer)
+
+	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
+	c, rec := newPost(t, body)
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Empty(t, observer.recorded)
+}
+
+func TestInbox_NoteLookupDoesNotRunBeforeAdmission(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	noteRepo := testutil.NewMockNoteRepository()
+	noteRepo.FindErr = errors.New("note lookup failed")
+	h.SetNoteRepo(noteRepo)
+	h.SetUserRepo(repo)
+	h.SetLocalFederationObserver(&localFederationObserverStub{available: true})
+
+	body := []byte(`{"type":"Like","actor":"https://remote.example/users/alice","object":"https://example.com/notes/missing"}`)
+	c, rec := newPost(t, body)
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
 func TestInbox_HappyPathFollow(t *testing.T) {
@@ -207,10 +333,11 @@ func TestInbox_ResolverError(t *testing.T) {
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	urls := activitypub.NewURLBuilder("https://example.com")
-	resolver := federation.NewResolver(repo, noteRepo, urls, errorFetcher{}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	h := NewHandler(resolver, processor)
+	resolver := federation.NewResolver(repo, noteRepo, urls, errorFetcher{}, idGen,
+		nil, nil, nil, nil, nil, nil)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo, "", nil, nil)
+	h := NewHandler(resolver, processor, "", nil, nil)
 
 	priv, _, _ := activitypub.GenerateRSAKeypair()
 	key, _ := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
@@ -237,10 +364,11 @@ func TestInbox_PublicKeyMissing(t *testing.T) {
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	urls := activitypub.NewURLBuilder("https://example.com")
-	resolver := federation.NewResolver(repo, noteRepo, urls, errorFetcher{}, idGen)
-	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen)
-	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
-	h := NewHandler(resolver, processor)
+	resolver := federation.NewResolver(repo, noteRepo, urls, errorFetcher{}, idGen,
+		nil, nil, nil, nil, nil, nil)
+	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen, nil, nil, nil, nil)
+	processor := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo, "", nil, nil)
+	h := NewHandler(resolver, processor, "", nil, nil)
 
 	priv, _, _ := activitypub.GenerateRSAKeypair()
 	key, _ := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
@@ -277,7 +405,7 @@ func TestInbox_BlockedHost(t *testing.T) {
 	h, repo, _ := newHandler(t, pub)
 	bobURI := "https://example.com/users/bob"
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", URI: &bobURI}
-	h.SetHostBlockChecker(&stubBlocker{blocked: map[string]bool{"remote.example": true}})
+	h.hostBlocker = &stubBlocker{blocked: map[string]bool{"remote.example": true}}
 
 	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
 	c, rec := newPost(t, body)
@@ -305,7 +433,7 @@ func TestInbox_DisallowedHost(t *testing.T) {
 	// blocked は空のまま、disallowed (= specified モードで allowlist 外) を
 	// シミュレート。これだけで 403 reject されること = allowlist enforcement
 	// が deliver path と独立に inbox path にも入ったこと。
-	h.SetHostBlockChecker(&stubBlocker{disallowed: map[string]bool{"remote.example": true}})
+	h.hostBlocker = &stubBlocker{disallowed: map[string]bool{"remote.example": true}}
 
 	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
 	c, rec := newPost(t, body)
@@ -458,7 +586,7 @@ func (r *recordingEnqueuer) EnqueueInbox(_ context.Context, p queue.InboxPayload
 	return nil
 }
 
-// SetEnqueuer 後は Inbox は Process / verifySignature を呼ばずに
+// enqueuer を入れた後は Inbox は Process / verifySignature を呼ばずに
 // EnqueueInbox に委譲する (#565)。followingRepo に書き込みが起きないこと、
 // enqueuer が body と signature 関連 header を受け取ること、HTTP は 202
 // Accepted を返すことを確認する。worker 側の verify に必要な Method /
@@ -472,7 +600,7 @@ func TestInbox_AsyncMode_DispatchesToQueue(t *testing.T) {
 
 	h, repo, followingRepo := newHandler(t, pub)
 	enq := &recordingEnqueuer{}
-	h.SetEnqueuer(enq)
+	h.enqueuer = enq
 
 	bobURI := "https://example.com/users/bob"
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", URI: &bobURI}
@@ -508,7 +636,7 @@ func TestInbox_AsyncMode_PathKeepsQuery(t *testing.T) {
 
 	h, _, _ := newHandler(t, pub)
 	enq := &recordingEnqueuer{}
-	h.SetEnqueuer(enq)
+	h.enqueuer = enq
 
 	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
 	e := echo.New()
@@ -538,7 +666,7 @@ func TestInbox_AsyncMode_RejectsMissingSignatureHeader(t *testing.T) {
 	require.NoError(t, err)
 	h, _, _ := newHandler(t, pub)
 	enq := &recordingEnqueuer{}
-	h.SetEnqueuer(enq)
+	h.enqueuer = enq
 
 	body := []byte(`{"type":"Follow"}`)
 	c, rec := newPost(t, body)
@@ -558,7 +686,7 @@ func TestInbox_AsyncMode_EnqueueFailureReturns500(t *testing.T) {
 	require.NoError(t, err)
 
 	h, repo, _ := newHandler(t, pub)
-	h.SetEnqueuer(&recordingEnqueuer{err: errors.New("redis down")})
+	h.enqueuer = &recordingEnqueuer{err: errors.New("redis down")}
 
 	bobURI := "https://example.com/users/bob"
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", URI: &bobURI}
@@ -620,7 +748,7 @@ func TestInbox_HostMismatchRejected(t *testing.T) {
 	key, err := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
 	require.NoError(t, err)
 	h, _, _ := newHandler(t, pub)
-	h.SetExpectedHost("example.com")
+	h.expectedHost = "example.com"
 
 	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
 	c, rec := newPost(t, body)
@@ -632,13 +760,194 @@ func TestInbox_HostMismatchRejected(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
+func TestInbox_RejectedAdmissionDoesNotObserveBodyTargets(t *testing.T) {
+	for _, mode := range []string{"unsigned", "bad digest", "bad host"} {
+		t.Run(mode, func(t *testing.T) {
+			priv, pub, err := activitypub.GenerateRSAKeypair()
+			require.NoError(t, err)
+			key, err := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
+			require.NoError(t, err)
+			h, repo, _ := newHandler(t, pub)
+			h.expectedHost = "example.com"
+			repo.Users["bob"] = &model.User{ID: "bob", FederationStatus: model.FederationStatusOn}
+			h.SetUserRepo(repo)
+			observer := &localFederationObserverStub{available: true}
+			h.SetLocalFederationObserver(observer)
+			body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
+			c, rec := newPost(t, body)
+			req := c.Request()
+			if mode != "unsigned" {
+				digestBody := body
+				if mode == "bad digest" {
+					digestBody = []byte("different body")
+				}
+				require.NoError(t, activitypub.SignRequest(req, key, activitypub.SHA256Digest(digestBody), []string{"(request-target)", "date", "host", "digest"}))
+			}
+			req.Host = "example.com"
+			if mode == "bad host" {
+				req.Host = "evil.example"
+			}
+			require.NoError(t, h.Inbox(c))
+			assert.Equal(t, http.StatusUnauthorized, rec.Code)
+			assert.Empty(t, observer.recorded)
+		})
+	}
+}
+
+func TestInbox_PathTargetIsObservedBeforeAdmission(t *testing.T) {
+	h, repo, _ := newHandler(t, "")
+	repo.Users["bob"] = &model.User{ID: "bob", FederationStatus: model.FederationStatusOn}
+	h.SetUserRepo(repo)
+	observer := &localFederationObserverStub{available: true}
+	h.SetLocalFederationObserver(observer)
+	c, rec := newPost(t, []byte(`{"type":"Follow"}`))
+	c.SetParamNames("id")
+	c.SetParamValues("bob")
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Equal(t, []string{"bob:inbox:"}, observer.recorded)
+}
+func TestInbox_AdmittedBodyTargetsAreCheckedAndObserved(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		setup      func(*Handler, *testutil.MockUserRepository, *testutil.MockNoteRepository)
+		wantStatus int
+		wantSeen   []string
+	}{
+		{
+			name: "public note observes owner",
+			body: `{"type":"Like","actor":"https://remote.example/users/alice","object":"https://example.com/notes/public-note"}`,
+			setup: func(h *Handler, users *testutil.MockUserRepository, notes *testutil.MockNoteRepository) {
+				notes.Notes["public-note"] = &model.Note{ID: "public-note", UserID: "bob"}
+				users.Users["bob"] = &model.User{ID: "bob", FederationStatus: model.FederationStatusOn}
+			},
+			wantStatus: http.StatusAccepted,
+			wantSeen:   []string{"bob:inbox:remote.example"},
+		},
+		{
+			name: "local-only note rejected",
+			body: `{"type":"Like","actor":"https://remote.example/users/alice","object":"https://example.com/notes/private-note"}`,
+			setup: func(_ *Handler, _ *testutil.MockUserRepository, notes *testutil.MockNoteRepository) {
+				notes.Notes["private-note"] = &model.Note{ID: "private-note", UserID: "bob", LocalOnly: true}
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "note lookup failure is server error",
+			body: `{"type":"Like","actor":"https://remote.example/users/alice","object":"https://example.com/notes/failing-note"}`,
+			setup: func(_ *Handler, _ *testutil.MockUserRepository, notes *testutil.MockNoteRepository) {
+				notes.FindErr = errors.New("database unavailable")
+			},
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name: "off user rejected",
+			body: `{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`,
+			setup: func(_ *Handler, users *testutil.MockUserRepository, _ *testutil.MockNoteRepository) {
+				users.Users["bob"] = &model.User{ID: "bob", FederationStatus: model.FederationStatusOff}
+			},
+			wantStatus: http.StatusNotFound,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			priv, pub, err := activitypub.GenerateRSAKeypair()
+			require.NoError(t, err)
+			key, err := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
+			require.NoError(t, err)
+			h, users, _ := newHandler(t, pub)
+			h.expectedHost = "example.com"
+			enq := &recordingEnqueuer{}
+			h.enqueuer = enq
+			notes := testutil.NewMockNoteRepository()
+			h.SetNoteRepo(notes)
+			h.SetUserRepo(users)
+			observer := &localFederationObserverStub{available: tc.name != "off user rejected"}
+			h.SetLocalFederationObserver(observer)
+			tc.setup(h, users, notes)
+			c, rec := newPost(t, []byte(tc.body))
+			req := c.Request()
+			require.NoError(t, activitypub.SignRequest(req, key, activitypub.SHA256Digest([]byte(tc.body)), []string{"(request-target)", "date", "host", "digest"}))
+			req.Host = "example.com"
+			require.NoError(t, h.Inbox(c))
+			assert.Equal(t, tc.wantStatus, rec.Code)
+			assert.Equal(t, tc.wantSeen, observer.recorded)
+			if tc.wantStatus == http.StatusAccepted {
+				assert.Len(t, enq.calls, 1)
+			} else {
+				assert.Empty(t, enq.calls)
+			}
+		})
+	}
+}
+
+type failingNthInboxUserRepo struct {
+	*testutil.MockUserRepository
+	calls  int
+	failAt int
+}
+
+func (r *failingNthInboxUserRepo) FindByID(id string) (*model.User, error) {
+	r.calls++
+	if r.calls == r.failAt {
+		return nil, errors.New("user lookup failed")
+	}
+	return r.MockUserRepository.FindByID(id)
+}
+
+func (r *failingNthInboxUserRepo) FindManyByIDs(ids []string) ([]*model.User, error) {
+	r.calls++
+	if r.calls == r.failAt {
+		return nil, errors.New("user lookup failed")
+	}
+	return r.MockUserRepository.FindManyByIDs(ids)
+}
+
+func TestInbox_BodyReferencePreflightFinishesBeforeObservation(t *testing.T) {
+	h, baseRepo, _ := newHandler(t, "")
+	baseRepo.Users["bob"] = &model.User{ID: "bob", FederationStatus: model.FederationStatusOn}
+	baseRepo.Users["carol"] = &model.User{ID: "carol", FederationStatus: model.FederationStatusOn}
+	repo := &failingNthInboxUserRepo{MockUserRepository: baseRepo, failAt: 1}
+	h.SetUserRepo(repo)
+	observer := &localFederationObserverStub{available: true}
+	h.SetLocalFederationObserver(observer)
+	body := []byte(`{"actor":"https://example.com/users/bob","object":"https://example.com/users/carol"}`)
+	assert.Error(t, h.observeLocalInboxBodyTargets(body, "remote.example"))
+	assert.Empty(t, observer.recorded, "all body lookups must finish before the first observation")
+}
+func TestInbox_BodyTargetsAreBoundedAndSemantic(t *testing.T) {
+	t.Run("over limit before lookup", func(t *testing.T) {
+		h, repo, _ := newHandler(t, "")
+		repo.FindErr = errors.New("body targets must not be looked up")
+		h.SetUserRepo(repo)
+		h.SetLocalFederationObserver(&localFederationObserverStub{available: true})
+		refs := make([]string, maxInboxBodyReferences+1)
+		for i := range refs {
+			refs[i] = fmt.Sprintf(`"https://example.com/users/user-%d"`, i)
+		}
+		body := []byte(fmt.Sprintf(`{"actor":"https://remote.example/users/alice","object":[%s]}`, strings.Join(refs, ",")))
+		assert.ErrorIs(t, h.observeLocalInboxBodyTargets(body, "remote.example"), errLocalInboxTooManyReferences)
+	})
+
+	t.Run("deduplicate canonical refs and ignore ordinary links", func(t *testing.T) {
+		h, repo, _ := newHandler(t, "")
+		repo.Users["bob"] = &model.User{ID: "bob", FederationStatus: model.FederationStatusOn}
+		repo.Users["channel"] = &model.User{ID: "channel", FederationStatus: model.FederationStatusOff}
+		observer := &localFederationObserverStub{available: true}
+		h.SetUserRepo(repo)
+		h.SetLocalFederationObserver(observer)
+		body := []byte(`{"actor":"https://example.com/users/bob","object":["https://example.com/users/bob","https://example.com/users/bob/followers"],"content":"https://example.com/users/channel https://example.com/notes/missing"}`)
+		assert.NoError(t, h.observeLocalInboxBodyTargets(body, "remote.example"))
+		assert.Equal(t, []string{"bob:inbox:remote.example"}, observer.recorded)
+	})
+}
 func TestInbox_HostSignedAndMatchAccepted(t *testing.T) {
 	priv, pub, err := activitypub.GenerateRSAKeypair()
 	require.NoError(t, err)
 	key, err := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
 	require.NoError(t, err)
 	h, repo, followingRepo := newHandler(t, pub)
-	h.SetExpectedHost("example.com")
+	h.expectedHost = "example.com"
 
 	bobURI := "https://example.com/users/bob"
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", URI: &bobURI}
@@ -667,7 +976,13 @@ func TestBodyHasActor(t *testing.T) {
 		{"null actor", `{"type":"Create","actor":null}`, false},
 		{"not an object (array)", `[{"actor":"x"}]`, false},
 		{"not json", `garbage`, false},
-		{"empty actor string is present", `{"actor":""}`, true},
+		// 空文字列・数値・真偽値は actor を名指せない。worker の authorizeActor が
+		// 落とすのと同じ入力を、enqueue する前に弾く (2026-10-31 の監査)。
+		{"empty actor string", `{"actor":""}`, false},
+		{"numeric actor", `{"actor":123}`, false},
+		{"boolean actor", `{"actor":true}`, false},
+		{"array actor is left to the worker", `{"actor":["https://r/u/a"]}`, true},
+		{"actor with surrounding space", `{"actor": "https://r/u/a" }`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -721,7 +1036,7 @@ func TestInbox_FederationDisabled(t *testing.T) {
 	_, pub, err := activitypub.GenerateRSAKeypair()
 	require.NoError(t, err)
 	h, _, _ := newHandler(t, pub)
-	h.SetHostBlockChecker(&stubBlocker{fedDisabled: true})
+	h.hostBlocker = &stubBlocker{fedDisabled: true}
 
 	// 署名なしの素の body でも、federation gate が先に効いて 403 (401 ではない)。
 	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
@@ -741,7 +1056,7 @@ func TestInbox_FederationEnabled_NotGated(t *testing.T) {
 	h, repo, _ := newHandler(t, pub)
 	bobURI := "https://example.com/users/bob"
 	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", URI: &bobURI}
-	h.SetHostBlockChecker(&stubBlocker{fedDisabled: false})
+	h.hostBlocker = &stubBlocker{fedDisabled: false}
 
 	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
 	c, rec := newPost(t, body)
@@ -856,9 +1171,122 @@ func TestCaptureSignatureHeaders_CarriesXDate(t *testing.T) {
 	req.Header.Set("X-Date", "x")
 	req.Host = "example.com"
 
-	got := captureSignatureHeaders(req)
+	got, _ := captureSignatureHeaders(req)
 
 	assert.Equal(t, "x", got["X-Date"], "署名対象の X-Date が worker へ渡らない")
 	assert.Equal(t, "d", got["Date"])
 	assert.Equal(t, "example.com", got["Host"])
+}
+
+// **署名の headers= に挙がったヘッダーは worker まで運ぶ (#3498)。**
+//
+// Mastodon はフォロワー限定の投稿の配送に `Collection-Synchronization` を付けて
+// 署名する。決め打ちの一覧だけを運ぶと、worker が署名を組み立て直せず
+// `missing required header "collection-synchronization"` で捨てていた。
+// 受付は通るので、worker と同じ形で組み直して検証するところまで見る。
+func TestInbox_AsyncMode_CarriesEverySignedHeader(t *testing.T) {
+	priv, pub, err := activitypub.GenerateRSAKeypair()
+	require.NoError(t, err)
+	key, err := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
+	require.NoError(t, err)
+
+	h, _, _ := newHandler(t, pub)
+	enq := &recordingEnqueuer{}
+	h.enqueuer = enq
+
+	body := []byte(`{"type":"Create","actor":"https://remote.example/users/alice","object":{"type":"Note","id":"https://remote.example/notes/1","attributedTo":"https://remote.example/users/alice","to":["https://remote.example/users/alice/followers"],"content":"x"}}`)
+	c, rec := newPost(t, body)
+	req := c.Request()
+	req.Header.Set("Content-Type", "application/activity+json")
+	req.Header.Set("Collection-Synchronization",
+		`collectionId="https://remote.example/users/alice/followers", url="https://remote.example/users/alice/followers_synchronization", digest="abc"`)
+	require.NoError(t, activitypub.SignRequest(req, key, activitypub.SHA256Digest(body),
+		[]string{"(request-target)", "host", "date", "digest", "content-type", "collection-synchronization"}))
+	req.Host = "example.com"
+
+	require.NoError(t, h.Inbox(c))
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.Len(t, enq.calls, 1)
+	got := enq.calls[0]
+	assert.NotEmpty(t, got.Headers["Collection-Synchronization"], "署名対象の Collection-Synchronization が worker へ渡らない")
+
+	rebuilt, err := http.NewRequest(got.Method, "http://placeholder"+got.Path, bytes.NewReader(got.Body))
+	require.NoError(t, err)
+	for k, v := range got.Headers {
+		rebuilt.Header.Set(k, v)
+	}
+	require.NoError(t, activitypub.VerifyRequest(rebuilt, pub), "worker と同じ形で組み直した要求の署名が通らない")
+}
+
+// 署名の headers= は相手の申告なので、運ぶ数と大きさに上限を付ける (#3498)。
+// 疑似ヘッダー ((request-target) など) と、署名に挙がっていないヘッダーは運ばない。
+func TestCaptureSignatureHeaders_BoundsExtraHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/inbox", nil)
+	req.Host = "example.com"
+	names := []string{"(request-target)", "(created)", "date"}
+	for i := 0; i < 40; i++ {
+		name := fmt.Sprintf("x-extra-%02d", i)
+		names = append(names, name)
+		req.Header.Set(name, "v")
+	}
+	req.Header.Set("X-Not-Signed", "v")
+	req.Header.Set("Date", "d")
+	req.Header.Set("Signature", `keyId="https://remote.example/users/alice#main-key",algorithm="rsa-sha256",headers="`+
+		strings.Join(names, " ")+`",signature="c2ln"`)
+
+	got, _ := captureSignatureHeaders(req)
+
+	extra := 0
+	for k := range got {
+		if strings.HasPrefix(k, "X-Extra-") {
+			extra++
+		}
+	}
+	assert.Equal(t, maxSignedExtraHeaders, extra, "署名に挙がった追加のヘッダーの数が上限で止まっていない")
+	assert.Equal(t, "v", got["X-Extra-00"], "先頭の追加のヘッダーが運ばれていない")
+	assert.NotContains(t, got, "X-Not-Signed", "署名に挙がっていないヘッダーまで運んでいる")
+
+	// 大きさの上限: 1 つで上限を超える値は運ばない。
+	big := httptest.NewRequest(http.MethodPost, "/inbox", nil)
+	big.Header.Set("X-Huge", strings.Repeat("a", maxSignedExtraHeaderBytes+1))
+	big.Header.Set("Signature", `keyId="k",headers="date x-huge",signature="c2ln"`)
+	gotBig, complete := captureSignatureHeaders(big)
+	assert.NotContains(t, gotBig, "X-Huge", "大きさの上限を超える値を運んでいる")
+	assert.False(t, complete, "積みきれなかったことを返していない")
+
+	// 上限に収まれば complete。
+	small := httptest.NewRequest(http.MethodPost, "/inbox", nil)
+	small.Header.Set("X-Small", "v")
+	small.Header.Set("Signature", `keyId="k",headers="date x-small",signature="c2ln"`)
+	_, complete = captureSignatureHeaders(small)
+	assert.True(t, complete)
+}
+
+// 署名に挙がったヘッダーを積みきれないときは、受付で 401 にする (#3498)。
+// 202 で受けると worker が必ず検証に失敗し、相手には成功に見えたまま捨てる。
+func TestInbox_AsyncMode_RejectsSignatureOverHeaderLimits(t *testing.T) {
+	priv, pub, err := activitypub.GenerateRSAKeypair()
+	require.NoError(t, err)
+	key, err := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
+	require.NoError(t, err)
+
+	h, _, _ := newHandler(t, pub)
+	enq := &recordingEnqueuer{}
+	h.enqueuer = enq
+
+	body := []byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/bob"}`)
+	c, rec := newPost(t, body)
+	req := c.Request()
+	names := []string{"(request-target)", "date", "host", "digest"}
+	for i := 0; i <= maxSignedExtraHeaders; i++ {
+		name := fmt.Sprintf("x-extra-%02d", i)
+		names = append(names, name)
+		req.Header.Set(name, "v")
+	}
+	require.NoError(t, activitypub.SignRequest(req, key, activitypub.SHA256Digest(body), names))
+	req.Host = "example.com"
+
+	require.NoError(t, h.Inbox(c))
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Empty(t, enq.calls, "積みきれない署名をキューに積んでいる")
 }

@@ -8,13 +8,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/elythia-network/elythia/internal/activitypub/mfm"
+	apmfm "github.com/elythia-network/elythia/internal/activitypub/mfm"
 	"github.com/elythia-network/elythia/internal/config"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/core/ugcvisibility"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
+
+	"github.com/elythia-network/mfm"
 )
 
 // feedNoteLimit mirrors upstream FeedService (take: 20).
@@ -255,6 +257,37 @@ type feedHandler struct {
 	now func() time.Time
 }
 
+// newFeedHandler builds the feed handler setupRoutes registers on /@:acct.
+//
+// ugcVisibility is the live meta.ugcVisibilityForVisitor lookup. 無いと
+// ugcVisibilityNow が既定の `local` に倒れ、`none` にしても feed が 404 にならない。
+// 以前は構造体リテラルで組み、入れ忘れを起動時の検査 (criticalWiring) が見ていた。
+// 渡し忘れをコンパイルで落とすため、構築子の必須の引数で受ける (#3827)。ほかの欄も
+// 同じく引数で受ける。now はテストが時刻を固定する seam なので受けない (nil のとき
+// time.Now)。パッケージ内のテストは、要る欄だけを書いた構造体リテラルで組む。
+func newFeedHandler(
+	baseURL, host string,
+	users FeedUserResolver,
+	notes FeedNoteLister,
+	parseTime func(id string) (time.Time, error),
+	ugcVisibility func() string,
+	profiles func(userID string) *model.UserProfile,
+	avatarURL func(u *model.User) string,
+	toHTML func(text, mentionedRemoteUsers string) string,
+) *feedHandler {
+	return &feedHandler{
+		baseURL:       baseURL,
+		host:          host,
+		users:         users,
+		notes:         notes,
+		parseTime:     parseTime,
+		ugcVisibility: ugcVisibility,
+		profiles:      profiles,
+		avatarURL:     avatarURL,
+		toHTML:        toHTML,
+	}
+}
+
 // serve builds the feed for the requested user and hands it to render.
 //
 // upstream は存在しないユーザーに 404 を返す。SPA catchall より前に登録して
@@ -301,11 +334,6 @@ func (h *feedHandler) serve(c echo.Context, username string, render func(*feedDa
 	}
 	return c.Blob(http.StatusOK, contentType, out)
 }
-
-// HasUGCVisibility reports whether the meta.ugcVisibilityForVisitor lookup
-// was wired. 未配線だと ugcVisibilityNow が既定の `local` に倒れ、`none` に
-// しても feed が 404 にならないので、起動時検査で拾う。
-func (h *feedHandler) HasUGCVisibility() bool { return h.ugcVisibility != nil }
 
 // ugcVisibilityNow resolves the current meta.ugcVisibilityForVisitor.
 func (h *feedHandler) ugcVisibilityNow() string {
@@ -455,6 +483,6 @@ func (r feedUserResolver) FindLocalByUsername(username string) (*model.User, err
 // JSON.parse(note.mentionedRemoteUsers) to MfmService.toHtml.
 func feedNoteHTML(host string) func(text, mentionedRemoteUsers string) string {
 	return func(text, mentionedRemoteUsers string) string {
-		return mfm.ToHTMLWithMentions(mfm.Parse(text), host, mfm.ParseMentionedRemoteUsers(mentionedRemoteUsers))
+		return apmfm.ToHTMLWithMentions(mfm.Parse(text), host, apmfm.ParseMentionedRemoteUsers(mentionedRemoteUsers))
 	}
 }

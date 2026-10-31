@@ -17,6 +17,7 @@ import (
 	"github.com/elythia-network/elythia/internal/misc/id"
 	miscsmtp "github.com/elythia-network/elythia/internal/misc/smtp"
 	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/labstack/echo/v4"
@@ -51,8 +52,8 @@ func newHandlerWithFailingUnpinDelete(t *testing.T) (*Handler, *testutil.MockUse
 	mock := testutil.NewMockUserNotePiningRepository()
 	piningRepo := &failingPiningDeleteRepo{MockUserNotePiningRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	return NewHandler(svc, idGen), mock
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	return NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil), mock
 }
 
 func newHandlerWithFailingPiningCount(t *testing.T) (*Handler, *testutil.MockUserRepository, *testutil.MockNoteRepository) {
@@ -61,8 +62,8 @@ func newHandlerWithFailingPiningCount(t *testing.T) (*Handler, *testutil.MockUse
 	noteRepo := testutil.NewMockNoteRepository()
 	piningRepo := &failingPiningRepo{MockUserNotePiningRepository: testutil.NewMockUserNotePiningRepository()}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	return NewHandler(svc, idGen), userRepo, noteRepo
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	return NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil), userRepo, noteRepo
 }
 
 // failingUserRepoForUpdate forces user.UpdateUser to fail.
@@ -84,8 +85,8 @@ func newHandlerWithFailingUpdate(t *testing.T) (*Handler, *testutil.MockUserRepo
 	noteRepo := testutil.NewMockNoteRepository()
 	piningRepo := testutil.NewMockUserNotePiningRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	return NewHandler(svc, idGen), mockUR
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	return NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil), mockUR
 }
 
 // post is a small helper to invoke a handler with an authenticated request.
@@ -108,8 +109,8 @@ func newTestHandler(t *testing.T) (*Handler, *testutil.MockUserRepository, *test
 	noteRepo := testutil.NewMockNoteRepository()
 	piningRepo := testutil.NewMockUserNotePiningRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	return h, userRepo, noteRepo, piningRepo
 }
 
@@ -253,8 +254,7 @@ func TestMe_AppTokenOmitsSecrets(t *testing.T) {
 func TestMe_CanChatFromRolePolicy(t *testing.T) {
 	h, userRepo, _, _ := newTestHandler(t)
 
-	t.Cleanup(func() { entity.SetCanChatLookup(nil) })
-	entity.SetCanChatLookup(&stubMeCanChatLookup{result: false})
+	h.entityPacker = entity.NewPacker(nil, entity.PackerDeps{CanChat: &stubMeCanChatLookup{result: false}})
 
 	user := &model.User{
 		ID:                "user-canchat",
@@ -592,7 +592,7 @@ func (s *stubRoleProvider) HasRolePolicy(_, policyKey string) bool {
 
 func TestMe_WithRoleProvider(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		admin:     true,
 		moderator: true,
 		roles: []*model.Role{
@@ -602,7 +602,7 @@ func TestMe_WithRoleProvider(t *testing.T) {
 			{ID: "r3", Name: "Supporter", IsPublic: true, DisplayOrder: 30},
 		},
 		policies: map[string]any{"gtlAvailable": true, "driveCapacityMb": 500},
-	})
+	}
 
 	user := &model.User{
 		ID:                "user1",
@@ -635,8 +635,7 @@ func TestMe_WithRoleProvider(t *testing.T) {
 }
 
 // 他の経路 (users/show 等) で自分を表示したときも、非公開ロールを出さない (#3240)。
-// EnrichSelf は呼び出し元が絞った roles を上書きするので、ここで絞っていないと
-// 呼び出し元の絞り込みが失われる。
+// EnrichSelf は呼び出し元が公開範囲やプロフィール設定で絞った roles を保つ。
 func TestEnrichSelf_HidesPrivateRoles(t *testing.T) {
 	h := &Handler{roleProvider: &stubRoleProvider{roles: []*model.Role{
 		{ID: "pub", Name: "public-role", IsPublic: true},
@@ -755,9 +754,9 @@ func TestUpdate_AvatarID_RestrictedByRole(t *testing.T) {
 
 	// policies map で canUpdateBioMedia=false を設定 (admin/moderator フラグ
 	// なし → HasRolePolicy が false を返す stub)。
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"canUpdateBioMedia": false},
-	})
+	}
 
 	rec := post(h.Update, `{"avatarId":"file1"}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "policy=false で 403")
@@ -770,9 +769,9 @@ func TestUpdate_AvatarID_AllowedWhenPolicyTrue(t *testing.T) {
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
 
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"canUpdateBioMedia": true},
-	})
+	}
 
 	rec := post(h.Update, `{"avatarId":"file1"}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code, "policy=true なら通常成功")
@@ -784,9 +783,9 @@ func TestUpdate_AvatarID_NullClearAllowedRegardlessOfPolicy(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"canUpdateBioMedia": false},
-	})
+	}
 
 	rec := post(h.Update, `{"avatarId":null}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code, "null clear は gate 対象外")
@@ -968,9 +967,9 @@ func TestUpdate_BannerID_RestrictedByRole(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"canUpdateBioMedia": false},
-	})
+	}
 
 	rec := post(h.Update, `{"bannerId":"file2"}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -982,7 +981,7 @@ func TestUpdate_AvatarID_NoRoleProviderSkipsGate(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	// SetRoleProvider を呼ばない
+	// roleProvider を入れない
 	rec := post(h.Update, `{"avatarId":"file1"}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
@@ -992,10 +991,10 @@ func TestUpdate_AvatarID_AdminBypass(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		admin:    true,
 		policies: map[string]any{"canUpdateBioMedia": false},
-	})
+	}
 
 	rec := post(h.Update, `{"avatarId":"file1"}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code, "admin は policy=false でもバイパス")
@@ -1007,9 +1006,9 @@ func TestUpdate_AlwaysMarkNsfw_RestrictedByRole(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"alwaysMarkNsfw": true},
-	})
+	}
 
 	rec := post(h.Update, `{"alwaysMarkNsfw":false}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "policy=true で 403")
@@ -1025,9 +1024,9 @@ func TestUpdate_AlwaysMarkNsfw_RestrictedEvenForTrue(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"alwaysMarkNsfw": true},
-	})
+	}
 
 	rec := post(h.Update, `{"alwaysMarkNsfw":true}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -1037,9 +1036,9 @@ func TestUpdate_AlwaysMarkNsfw_AllowedWhenPolicyFalse(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"alwaysMarkNsfw": false},
-	})
+	}
 
 	rec := post(h.Update, `{"alwaysMarkNsfw":true}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code, "policy=false なら通常成功")
@@ -1050,10 +1049,10 @@ func TestUpdate_AlwaysMarkNsfw_AdminBypass(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		admin:    true,
 		policies: map[string]any{"alwaysMarkNsfw": true},
-	})
+	}
 
 	rec := post(h.Update, `{"alwaysMarkNsfw":false}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code, "admin は policy=true でもバイパス")
@@ -1064,9 +1063,9 @@ func TestUpdate_AlwaysMarkNsfw_OmittedSkipsGate(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies: map[string]any{"alwaysMarkNsfw": true},
-	})
+	}
 
 	rec := post(h.Update, `{"name":"new name"}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code, "省略時は gate 通過")
@@ -1087,7 +1086,7 @@ func TestUpdate_Success(t *testing.T) {
 
 // #968: i/update の response は MeDetailed shape (= isExplorable / noCrawle /
 // preventAiLearning など self-view-only field を含む) を返すこと。
-// フロントの updateCurrentAccountPartial が key 名で merge するため、
+// フロントの updateCurrentAccount が key 名で merge するため、
 // 欠損があると保存後も session が stale なまま残る regression を防ぐ。
 func TestUpdate_ResponseContainsMeDetailedFields(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
@@ -1433,6 +1432,79 @@ func TestUpdate_MakeNotesBeforeSetAndClear(t *testing.T) {
 	require.NotNil(t, repo.Users["user1"].MakeNotesHiddenBefore)
 }
 
+// makeNotes*Before are `type: integer` in upstream's paramDef, and ajv takes
+// an integral number written with a fraction or an exponent as an integer
+// (#3886).
+func TestUpdate_MakeNotesBeforeAcceptsIntegerForms(t *testing.T) {
+	h, repo, _, _ := newTestHandler(t)
+	user := newProfileUser(repo)
+	rec := post(h.Update, `{"makeNotesFollowersOnlyBefore":1700000000.0,"makeNotesHiddenBefore":17e8}`, user)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotNil(t, repo.Users["user1"].MakeNotesFollowersOnlyBefore)
+	assert.Equal(t, 1700000000, *repo.Users["user1"].MakeNotesFollowersOnlyBefore)
+	require.NotNil(t, repo.Users["user1"].MakeNotesHiddenBefore)
+	assert.Equal(t, 1700000000, *repo.Users["user1"].MakeNotesHiddenBefore)
+
+	for _, body := range []string{`{"makeNotesFollowersOnlyBefore":1.5}`, `{"makeNotesHiddenBefore":"1"}`} {
+		rec := post(h.Update, body, user)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, body)
+	}
+}
+
+// The display name is trimmed like JavaScript's String.prototype.trim, as
+// upstream's i/update does: U+FEFF is whitespace and U+0085 is not (#3886).
+func TestUpdate_NameTrimmedLikeJavaScript(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want *string
+	}{
+		{name: "bom trimmed", body: `{"name":"\ufeffb\ufeff"}`, want: strPtr("b")},
+		{name: "nel kept", body: `{"name":"\u0085a\u0085"}`, want: strPtr("\u0085a\u0085")},
+		{name: "nel only is a name", body: `{"name":"\u0085"}`, want: strPtr("\u0085")},
+		{name: "spaces only clears", body: `{"name":"\u3000\ufeff "}`, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, repo, _, _ := newTestHandler(t)
+			user := newProfileUser(repo)
+			before := "before"
+			repo.Users["user1"].Name = &before
+			rec := post(h.Update, tc.body, user)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			assert.Equal(t, tc.want, repo.Users["user1"].Name)
+		})
+	}
+}
+
+// null clears description, location, followedMessage and lang, as upstream
+// does; the bundled frontend sends null for an emptied field. An omitted key
+// leaves the value as it is (#3886).
+func TestUpdate_ProfileTextsClearedByNull(t *testing.T) {
+	h, repo, _, _ := newTestHandler(t)
+	user := newProfileUser(repo)
+	p := repo.Profiles["user1"]
+	p.Description, p.Location, p.FollowedMessage, p.Lang = strPtr("bio"), strPtr("here"), strPtr("thanks"), strPtr("ja")
+
+	rec := post(h.Update, `{"description":null,"location":null}`, user)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	p = repo.Profiles["user1"]
+	assert.Nil(t, p.Description)
+	assert.Nil(t, p.Location)
+	assert.Equal(t, strPtr("thanks"), p.FollowedMessage)
+	assert.Equal(t, strPtr("ja"), p.Lang)
+
+	rec = post(h.Update, `{"followedMessage":null,"lang":null}`, user)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	p = repo.Profiles["user1"]
+	assert.Nil(t, p.FollowedMessage)
+	assert.Nil(t, p.Lang)
+
+	for _, body := range []string{`{"description":1}`, `{"location":true}`, `{"lang":[]}`, `{"followedMessage":{}}`} {
+		rec := post(h.Update, body, user)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, body)
+	}
+}
+
 func TestUpdate_PinnedPageOwned(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := newProfileUser(repo)
@@ -1483,16 +1555,15 @@ func TestUpdate_FieldsEmptyClears(t *testing.T) {
 }
 
 // #960: Update が成功した後に auth middleware の tokenCache を invalidate
-// する。同じ token の次 request で stale な user object が返るのを防ぐ。
-// invalidator が wire されており request context に token がある場合のみ
-// invalidate を呼ぶ — どちらが欠けても panic / 不正呼び出しにならない。
+// する。stale な user object が返るのを防ぐ。#3664 からは本 request の token
+// ではなく利用者の全 token を (全プロセスで) 捨てる。
 func TestUpdate_InvalidatesTokenCacheOnSuccess(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "user1", Username: "user1", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["user1"] = user
 
 	inv := &stubTokenInvalidator{}
-	h.SetAuthInvalidator(inv)
+	h.authInvalidator = inv
 
 	// middleware が context に詰める想定の auth token を直接 set する。
 	e := echo.New()
@@ -1505,8 +1576,9 @@ func TestUpdate_InvalidatesTokenCacheOnSuccess(t *testing.T) {
 
 	require.NoError(t, h.Update(c))
 	assert.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, []string{"the-current-request-token"}, inv.calls,
-		"成功した i/update は本 request の token を invalidate するべき")
+	require.Equal(t, []string{"user1"}, inv.userCalls,
+		"成功した i/update は利用者の token を全部 invalidate するべき")
+	assert.Empty(t, inv.calls)
 }
 
 // /api/i は middleware が渡す user (tokenCache 由来、30 秒 TTL) ではなく
@@ -1536,7 +1608,7 @@ func TestMe_ReturnsFreshUserNotCachedOne(t *testing.T) {
 }
 
 // i/update の応答は MeDetailed をそのまま返すので policies / roles を含む。
-// フロントは応答を updateCurrentAccountPartial で `$i` にマージするため、
+// フロントは応答を updateCurrentAccount で `$i` にマージするため、
 // 欠けているとプロフィール更新のたびに role 由来の権限が消える。
 //
 // meUpdated (ストリーミング) は逆に policies を含めてはいけない (#1240)。
@@ -1576,20 +1648,19 @@ func TestUpdate_NoInvalidatorIsNoop(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestUpdate_NoTokenInContextIsNoop(t *testing.T) {
-	// invalidator は wire 済みだが context に token が無いケース (= 認証
-	// pipeline が新旧混在している過渡期や unit test 直叩き)。invalidate
-	// 呼び出しは skip し、handler は 200 で完了する。
+func TestUpdate_NoTokenInContextStillInvalidatesUser(t *testing.T) {
+	// invalidator は wire 済みだが context に token が無いケース (= unit test
+	// 直叩きなど)。利用者単位で捨てるので token は要らない (#3664)。
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "user1", Username: "user1", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["user1"] = user
 
 	inv := &stubTokenInvalidator{}
-	h.SetAuthInvalidator(inv)
+	h.authInvalidator = inv
 
 	rec := post(h.Update, `{"name":"updated"}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Empty(t, inv.calls, "token が context に無いとき invalidate は呼ばれない")
+	assert.Equal(t, []string{"user1"}, inv.userCalls)
 }
 
 // upstream paramDef は maxItems 16。それ超えは INVALID_PARAM (400)。
@@ -1627,7 +1698,10 @@ func TestUpdate_InternalError(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
-func TestUpdate_RoomAccepted(t *testing.T) {
+// room is not a param of upstream's i/update and nothing reads it, so the
+// handler ignores it like any unknown key instead of writing the column
+// (#3886).
+func TestUpdate_RoomIsNotWritten(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{
 		ID:                "user1",
@@ -1635,18 +1709,22 @@ func TestUpdate_RoomAccepted(t *testing.T) {
 		AvatarDecorations: datatypes.JSON([]byte("[]")),
 	}
 	repo.Users["user1"] = user
-	repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]"))}
+	repo.Profiles["user1"] = &model.UserProfile{
+		UserID: "user1",
+		Room:   datatypes.JSON([]byte(`{"keep":true}`)),
+		Fields: datatypes.JSON([]byte("[]")),
+	}
 
-	rec := post(h.Update, `{"room":{"furnitures":[{"id":"bed1"}],"seed":42}}`, user)
-	assert.Equal(t, http.StatusOK, rec.Code)
+	rec := post(h.Update, `{"room":{"furnitures":[{"id":"bed1"}],"seed":42},"name":"renamed"}`, user)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
-	// profile 側に反映されていること。
 	got := repo.Profiles["user1"]
 	require.NotNil(t, got)
-	assert.JSONEq(t, `{"furnitures":[{"id":"bed1"}],"seed":42}`, string(got.Room))
+	assert.JSONEq(t, `{"keep":true}`, string(got.Room))
+	assert.Equal(t, "renamed", *repo.Users["user1"].Name)
 }
 
-func TestUpdate_RoomMalformedOuterJSONRejected(t *testing.T) {
+func TestUpdate_MalformedJSONRejected(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{
 		ID:                "user1",
@@ -1756,7 +1834,7 @@ func TestUpdate_HardMutedWordsTriggersReload(t *testing.T) {
 	repo.Users["user1"] = user
 	repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]"))}
 
-	rec := post(h.Update, `{"hardMutedWords":["spoiler"]}`, user)
+	rec := post(h.Update, `{"hardMutedWords":[["spoiler"]]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, []string{"user1"}, pub.published)
 }
@@ -1792,7 +1870,7 @@ func TestUpdate_HardMutedWordsNoPublisherIsNoOp(t *testing.T) {
 	repo.Users["user1"] = user
 	repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]"))}
 
-	rec := post(h.Update, `{"hardMutedWords":["x"]}`, user)
+	rec := post(h.Update, `{"hardMutedWords":[["x"]]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
@@ -1806,13 +1884,61 @@ func TestUpdate_MutedWordsAccepted(t *testing.T) {
 	repo.Users["user1"] = user
 	repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]"))}
 
-	rec := post(h.Update, `{"mutedWords":[["foo"],["bar","baz"]],"hardMutedWords":["spoiler"]}`, user)
+	rec := post(h.Update, `{"mutedWords":[["foo"],["bar","baz"]],"hardMutedWords":[["spoiler"],"/spo+iler/i"]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
 
 	got := repo.Profiles["user1"]
 	require.NotNil(t, got)
 	assert.JSONEq(t, `[["foo"],["bar","baz"]]`, string(got.MutedWords))
-	assert.JSONEq(t, `["spoiler"]`, string(got.HardMutedWords))
+	assert.JSONEq(t, `[["spoiler"],"/spo+iler/i"]`, string(got.HardMutedWords))
+}
+
+// #3369: `/.../` の形でない文字列の要素は、本家 i/update と同じく INVALID_REGEXP
+// (同じ code / id / message) で拒否し、保存しない。
+func TestUpdate_MutedWordsRejectsNonRegexString(t *testing.T) {
+	for _, body := range []string{
+		`{"hardMutedWords":["spoiler"]}`,
+		`{"hardMutedWords":[["ok"],"plain"]}`,
+		`{"mutedWords":["plain"]}`,
+		`{"mutedWords":[""]}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			h, repo, _, _ := newTestHandler(t)
+			user := &model.User{ID: "user1", Username: "user1", AvatarDecorations: datatypes.JSON([]byte("[]"))}
+			repo.Users["user1"] = user
+			repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]")), MutedWords: datatypes.JSON([]byte("[]")), HardMutedWords: datatypes.JSON([]byte("[]"))}
+			rec := post(h.Update, body, user)
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			var resp struct {
+				Error struct {
+					Code    string `json:"code"`
+					ID      string `json:"id"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			assert.Equal(t, "INVALID_REGEXP", resp.Error.Code)
+			assert.Equal(t, "0d786918-10df-41cd-8f33-8dec7d9a89a5", resp.Error.ID)
+			assert.Equal(t, "Invalid Regular Expression.", resp.Error.Message)
+			got := repo.Profiles["user1"]
+			assert.JSONEq(t, `[]`, string(got.MutedWords))
+			assert.JSONEq(t, `[]`, string(got.HardMutedWords))
+		})
+	}
+}
+
+// #3369: 本家 i/update (node-re2) は flags を問わず受け付けるので、fork の frontend
+// で書ける `/foo/v` や `/foo/d` を拒否しない。
+func TestUpdate_MutedWordsAcceptsAnyRegexFlags(t *testing.T) {
+	h, repo, _, _ := newTestHandler(t)
+	user := &model.User{ID: "user1", Username: "user1", AvatarDecorations: datatypes.JSON([]byte("[]"))}
+	repo.Users["user1"] = user
+	repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]"))}
+	rec := post(h.Update, `{"mutedWords":["/foo/v","/foo/d"],"hardMutedWords":["/foo/v","/foo/d",["x"]]}`, user)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	got := repo.Profiles["user1"]
+	assert.JSONEq(t, `["/foo/v","/foo/d"]`, string(got.MutedWords))
+	assert.JSONEq(t, `["/foo/v","/foo/d",["x"]]`, string(got.HardMutedWords))
 }
 
 func TestUpdate_MutedWordsEmptyArrayClears(t *testing.T) {
@@ -1936,7 +2062,7 @@ func TestUpdate_AvatarDecorations_Success(t *testing.T) {
 	deco := testutil.NewMockAvatarDecorationRepository()
 	deco.Decorations["dec1"] = &model.AvatarDecoration{ID: "dec1", Name: "Hat", URL: "https://e/x.png"}
 	h.SetAvatarDecorationRepo(deco)
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}}
 
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"dec1","angle":0.5,"flipH":true,"offsetX":0.1,"offsetY":-0.2}]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -1956,7 +2082,7 @@ func TestUpdate_AvatarDecorations_EmptyArrayClears(t *testing.T) {
 	repo.Users["user1"] = user
 	repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]"))}
 
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}}
 
 	rec := post(h.Update, `{"avatarDecorations":[]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -1977,7 +2103,7 @@ func TestUpdate_AvatarDecorations_DefaultsAppliedWhenFieldsOmitted(t *testing.T)
 	deco := testutil.NewMockAvatarDecorationRepository()
 	deco.Decorations["dec1"] = &model.AvatarDecoration{ID: "dec1"}
 	h.SetAvatarDecorationRepo(deco)
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}}
 
 	// id だけ指定 — 残り全フィールドは 0 / false で埋まる。
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"dec1"}]}`, user)
@@ -1997,7 +2123,7 @@ func TestUpdate_AvatarDecorations_ExceedsLimit(t *testing.T) {
 	deco.Decorations["dec1"] = &model.AvatarDecoration{ID: "dec1"}
 	deco.Decorations["dec2"] = &model.AvatarDecoration{ID: "dec2"}
 	h.SetAvatarDecorationRepo(deco)
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}}
 
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"dec1"},{"id":"dec2"}]}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -2014,7 +2140,7 @@ func TestUpdate_AvatarDecorations_UnknownIDRejected(t *testing.T) {
 	repo.Users["user1"] = user
 	deco := testutil.NewMockAvatarDecorationRepository()
 	h.SetAvatarDecorationRepo(deco)
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}}
 
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"missing"}]}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -2033,10 +2159,10 @@ func TestUpdate_AvatarDecorations_RestrictedByRole(t *testing.T) {
 	deco.Decorations["dec1"] = &model.AvatarDecoration{ID: "dec1", RoleIDs: model.StringArray{"role-vip"}}
 	h.SetAvatarDecorationRepo(deco)
 	// ユーザーは role-other のみ所持 → role-vip 必須の dec1 は弾かれる。
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		roles:    []*model.Role{{ID: "role-other"}},
 		policies: map[string]any{"avatarDecorationLimit": 1},
-	})
+	}
 
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"dec1"}]}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -2055,10 +2181,10 @@ func TestUpdate_AvatarDecorations_RoleAllowed(t *testing.T) {
 	deco := testutil.NewMockAvatarDecorationRepository()
 	deco.Decorations["dec1"] = &model.AvatarDecoration{ID: "dec1", RoleIDs: model.StringArray{"role-vip"}}
 	h.SetAvatarDecorationRepo(deco)
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		roles:    []*model.Role{{ID: "role-vip"}, {ID: "role-other"}},
 		policies: map[string]any{"avatarDecorationLimit": 1},
-	})
+	}
 
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"dec1"}]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -2068,7 +2194,7 @@ func TestUpdate_AvatarDecorations_EmptyIDRejected(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := &model.User{ID: "user1", Username: "user1", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["user1"] = user
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 5}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 5}}
 
 	rec := post(h.Update, `{"avatarDecorations":[{"id":""}]}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -2091,7 +2217,7 @@ func TestUpdate_AvatarDecorations_NoRepoSkipsCatalogCheck(t *testing.T) {
 	user := &model.User{ID: "user1", Username: "user1", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["user1"] = user
 	repo.Profiles["user1"] = &model.UserProfile{UserID: "user1", Fields: datatypes.JSON([]byte("[]"))}
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": 1}}
 
 	// AvatarDecorationRepo 未配線 → catalog 検証 skip。任意 id を受け付ける fallback。
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"anything"}]}`, user)
@@ -2112,7 +2238,7 @@ func TestUpdate_AvatarDecorations_RoleOverrideFloatLimitAccepted(t *testing.T) {
 	deco.Decorations["c"] = &model.AvatarDecoration{ID: "c"}
 	h.SetAvatarDecorationRepo(deco)
 	// jsonb override 経由を模倣して float64 を渡す。
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": float64(3)}})
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{"avatarDecorationLimit": float64(3)}}
 
 	rec := post(h.Update, `{"avatarDecorations":[{"id":"a"},{"id":"b"},{"id":"c"}]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -2819,7 +2945,7 @@ func TestMe_ModerationNote_ModeratorGated(t *testing.T) {
 
 	t.Run("moderator sees moderationNote", func(t *testing.T) {
 		h, userRepo, _, _ := newTestHandler(t)
-		h.SetRoleProvider(&stubRoleProvider{moderator: true})
+		h.roleProvider = &stubRoleProvider{moderator: true}
 		user := &model.User{ID: "u1", Username: "u1", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 		userRepo.Users["u1"] = user
 		userRepo.Profiles["u1"] = &model.UserProfile{UserID: "u1", ModerationNote: &mn, Fields: datatypes.JSON([]byte("[]"))}
@@ -2829,7 +2955,7 @@ func TestMe_ModerationNote_ModeratorGated(t *testing.T) {
 
 	t.Run("non-moderator omits moderationNote", func(t *testing.T) {
 		h, userRepo, _, _ := newTestHandler(t)
-		h.SetRoleProvider(&stubRoleProvider{moderator: false})
+		h.roleProvider = &stubRoleProvider{moderator: false}
 		user := &model.User{ID: "u2", Username: "u2", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 		userRepo.Users["u2"] = user
 		userRepo.Profiles["u2"] = &model.UserProfile{UserID: "u2", ModerationNote: &mn, Fields: datatypes.JSON([]byte("[]"))}
@@ -2846,7 +2972,7 @@ func TestUpdate_ReturnsRoleFlags(t *testing.T) {
 	user := &model.User{ID: "u1", Username: "alice", AvatarDecorations: datatypes.JSON([]byte("[]"))}
 	repo.Users["u1"] = user
 	repo.Profiles["u1"] = &model.UserProfile{UserID: "u1", Fields: datatypes.JSON([]byte("[]"))}
-	h.SetRoleProvider(&stubRoleProvider{admin: true, moderator: true})
+	h.roleProvider = &stubRoleProvider{admin: true, moderator: true}
 
 	rec := post(h.Update, `{"name":"updated"}`, user)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -2888,7 +3014,6 @@ func TestRegistryRejectsUnstorableKeyAndDomain(t *testing.T) {
 func TestUpdate_UnstorableJSONBFieldsAre400(t *testing.T) {
 	esc := `\u0000`
 	for name, body := range map[string]string{
-		"room":                      `{"room":{"a":"x` + esc + `y"}}`,
 		"mutedWords":                `[["x` + esc + `y"]]`,
 		"notificationRecieveConfig": `{"notificationRecieveConfig":{"x` + esc + `y":{"type":"all"}}}`,
 		"mutedInstances":            `{"mutedInstances":["x` + esc + `y"]}`,
@@ -2912,7 +3037,7 @@ func TestUpdate_UnstorableJSONBFieldsAre400(t *testing.T) {
 func TestUpdate_OrdinaryJSONBFieldsStillPass(t *testing.T) {
 	h, repo, _, _ := newTestHandler(t)
 	user := updateUser(repo)
-	rec := post(h.Update, `{"room":{"あ":"絵文字"},"mutedInstances":["example.com"]}`, user)
+	rec := post(h.Update, `{"mutedWords":[["絵文字"]],"mutedInstances":["example.com"]}`, user)
 	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }
 
@@ -2949,17 +3074,181 @@ func TestUpdate_OrdinaryFieldsStillPass(t *testing.T) {
 // ロールのアイコンは entity (meUpdated の経路) と同じく media proxy を通す。
 // 通さないと $i.roles[].iconUrl が /api/i とストリーミングで食い違う。
 func TestRolePayload_ProxiesRoleIcon(t *testing.T) {
-	entity.SetMediaURLContext(entity.NewMediaURLContext(
-		"https://mk.test", "https://mk.test/proxy", []byte("role-icon-secret"), false, true))
-	defer entity.SetMediaURLContext(nil)
+	// アイコンは handler に渡した Packer で proxy へ通す (#3798)。
+	pk := entity.NewPacker(entity.NewMediaURLContext(
+		"https://mk.test", "https://mk.test/proxy", []byte("role-icon-secret"), false, true), entity.PackerDeps{})
 	icon := "https://cdn.example.test/role.png"
 	h := &Handler{roleProvider: &stubRoleProvider{roles: []*model.Role{
 		{ID: "pub", Name: "public-role", IsPublic: true, IconURL: &icon},
-	}}}
+	}}, entityPacker: pk}
 	_, _, _, roles := h.rolePayload("u1")
 	require.Len(t, roles, 1)
 	got := roles[0].(map[string]any)["iconUrl"].(*string)
 	require.NotNil(t, got)
-	assert.Equal(t, *entity.ProxyMediaURLPtr(&icon), *got)
+	assert.Equal(t, *pk.ProxyMediaURLPtr(&icon), *got)
 	assert.NotEqual(t, icon, *got, "a remote icon goes through the proxy")
+}
+
+// 保存できない文字 (NUL / 不正な UTF-8) を含むプロフィールの文字列は 400 にすること
+// (SQLSTATE 22021 で 500 になっていた)。
+func TestUpdate_ProfileTextWithNUL(t *testing.T) {
+	h, repo, _, _ := newTestHandler(t)
+	user := updateUser(repo)
+	for _, field := range []string{"name", "description", "location", "followedMessage"} {
+		rec := post(h.Update, `{"`+field+`":"a\u0000b"}`, user)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, field)
+		assert.Contains(t, rec.Body.String(), "INVALID_PARAM", field)
+	}
+}
+
+// stubUnreadFlags is a MeUnreadFlagsReader returning fixed flags.
+type stubUnreadFlags struct {
+	flags  repository.MeUnreadFlags
+	err    error
+	gotIDs []string
+}
+
+func (s *stubUnreadFlags) ReadMeUnreadFlags(userID string) (repository.MeUnreadFlags, error) {
+	s.gotIDs = append(s.gotIDs, userID)
+	return s.flags, s.err
+}
+
+// With a MeUnreadFlagsReader wired, the four yes/no unread fields come from
+// its single read (not from the per-table repositories, whose answers here
+// are the opposite), and each is still written only when its repository is
+// wired (#3608).
+func TestMe_UnreadFlagsReader(t *testing.T) {
+	// 表ごとの repo はどれも「ある」と答えるよう仕込む。reader の答えと
+	// 食い違わせ、どちらが使われたかを見分ける。
+	wireAll := func(h *Handler) {
+		frRepo := testutil.NewMockFollowRequestRepository()
+		require.NoError(t, frRepo.Create(&model.FollowRequest{ID: "fr1", FollowerID: "other", FolloweeID: "u1"}))
+		h.SetFollowRequestRepo(frRepo)
+		h.SetChatRepo(&stubChatRepo{n: 1})
+		h.SetAntennaUnreadRepo(&stubUnreadSource{has: true})
+		h.SetChannelUnreadRepo(&stubUnreadSource{has: true})
+	}
+
+	t.Run("fields come from the reader", func(t *testing.T) {
+		for _, flags := range []repository.MeUnreadFlags{
+			{},
+			{HasPendingReceivedFollowRequest: true},
+			{HasUnreadChatMessages: true},
+			{HasUnreadAntenna: true},
+			{HasUnreadChannel: true},
+		} {
+			h, userRepo, _, _ := newTestHandler(t)
+			wireAll(h)
+			reader := &stubUnreadFlags{flags: flags}
+			h.SetMeUnreadFlagsReader(reader)
+			resp := runMe(t, h, userRepo, "u1")
+			assert.Equal(t, []string{"u1"}, reader.gotIDs)
+			assert.Equal(t, flags.HasPendingReceivedFollowRequest, resp["hasPendingReceivedFollowRequest"], "%+v", flags)
+			assert.Equal(t, flags.HasUnreadChatMessages, resp["hasUnreadChatMessages"], "%+v", flags)
+			assert.Equal(t, flags.HasUnreadAntenna, resp["hasUnreadAntenna"], "%+v", flags)
+			assert.Equal(t, flags.HasUnreadChannel, resp["hasUnreadChannel"], "%+v", flags)
+		}
+	})
+
+	t.Run("unwired repositories keep their field false", func(t *testing.T) {
+		all := repository.MeUnreadFlags{
+			HasPendingReceivedFollowRequest: true, HasUnreadChatMessages: true,
+			HasUnreadAntenna: true, HasUnreadChannel: true,
+		}
+		for _, wire := range []struct {
+			name string
+			set  func(*Handler)
+			key  string
+		}{
+			{"follow request", func(h *Handler) { h.SetFollowRequestRepo(testutil.NewMockFollowRequestRepository()) }, "hasPendingReceivedFollowRequest"},
+			{"chat", func(h *Handler) { h.SetChatRepo(&stubChatRepo{}) }, "hasUnreadChatMessages"},
+			{"antenna", func(h *Handler) { h.SetAntennaUnreadRepo(&stubUnreadSource{}) }, "hasUnreadAntenna"},
+			{"channel", func(h *Handler) { h.SetChannelUnreadRepo(&stubUnreadSource{}) }, "hasUnreadChannel"},
+		} {
+			h, userRepo, _, _ := newTestHandler(t)
+			wire.set(h)
+			h.SetMeUnreadFlagsReader(&stubUnreadFlags{flags: all})
+			resp := runMe(t, h, userRepo, "u1")
+			for _, k := range []string{"hasPendingReceivedFollowRequest", "hasUnreadChatMessages", "hasUnreadAntenna", "hasUnreadChannel"} {
+				assert.Equal(t, k == wire.key, resp[k], "%s wired: %s", wire.name, k)
+			}
+		}
+	})
+
+	t.Run("a failed read leaves every field false", func(t *testing.T) {
+		h, userRepo, _, _ := newTestHandler(t)
+		wireAll(h)
+		h.SetMeUnreadFlagsReader(&stubUnreadFlags{
+			flags: repository.MeUnreadFlags{HasPendingReceivedFollowRequest: true, HasUnreadChannel: true},
+			err:   errors.New("db down"),
+		})
+		resp := runMe(t, h, userRepo, "u1")
+		assert.Equal(t, false, resp["hasPendingReceivedFollowRequest"])
+		assert.Equal(t, false, resp["hasUnreadChatMessages"])
+		assert.Equal(t, false, resp["hasUnreadAntenna"])
+		assert.Equal(t, false, resp["hasUnreadChannel"])
+	})
+}
+
+// stubStreamNotification is an UnreadNotificationSource that also implements
+// UnreadStreamSource. UnreadSummary answers hasSpecified=true so that a call
+// to it (instead of UnreadStreamSummary) shows in the response.
+type stubStreamNotification struct {
+	fromDB        bool
+	streamErr     error
+	summaryCalled bool
+	streamCalled  bool
+}
+
+func (s *stubStreamNotification) UnreadSummary(context.Context, string, []notification.Type) (notification.UnreadSummary, error) {
+	s.summaryCalled = true
+	return notification.UnreadSummary{TotalCount: 2, HasMentions: true, HasSpecifiedNote: true}, nil
+}
+
+func (s *stubStreamNotification) SpecifiedNoteFromDB() bool { return s.fromDB }
+
+func (s *stubStreamNotification) UnreadStreamSummary(context.Context, string, []notification.Type) (notification.UnreadSummary, error) {
+	s.streamCalled = true
+	if s.streamErr != nil {
+		return notification.UnreadSummary{}, s.streamErr
+	}
+	return notification.UnreadSummary{TotalCount: 2, HasMentions: true}, nil
+}
+
+// When the notification service reads note_unread and a MeUnreadFlagsReader
+// is wired, hasUnreadSpecifiedNotes comes from the reader's single statement
+// and the service only scans the stream (#3608). A failed stream scan keeps
+// it false, as UnreadSummary does.
+func TestMe_UnreadSpecifiedNotesFromReader(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		svc         *stubStreamNotification
+		reader      *stubUnreadFlags
+		want        bool
+		wantStream  bool
+		wantSummary bool
+	}{
+		{"reader true", &stubStreamNotification{fromDB: true}, &stubUnreadFlags{flags: repository.MeUnreadFlags{HasUnreadSpecifiedNotes: true}}, true, true, false},
+		{"reader false", &stubStreamNotification{fromDB: true}, &stubUnreadFlags{}, false, true, false},
+		{"reader failed", &stubStreamNotification{fromDB: true}, &stubUnreadFlags{flags: repository.MeUnreadFlags{HasUnreadSpecifiedNotes: true}, err: errors.New("db down")}, false, true, false},
+		{"stream failed", &stubStreamNotification{fromDB: true, streamErr: errors.New("redis down")}, &stubUnreadFlags{flags: repository.MeUnreadFlags{HasUnreadSpecifiedNotes: true}}, false, true, false},
+		{"service reads the stream only", &stubStreamNotification{fromDB: false}, &stubUnreadFlags{}, true, false, true},
+		{"no reader", &stubStreamNotification{fromDB: true}, nil, true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, userRepo, _, _ := newTestHandler(t)
+			h.SetNotificationService(tc.svc)
+			if tc.reader != nil {
+				h.SetMeUnreadFlagsReader(tc.reader)
+			}
+			resp := runMe(t, h, userRepo, "u1")
+			assert.Equal(t, tc.want, resp["hasUnreadSpecifiedNotes"])
+			assert.Equal(t, tc.wantStream, tc.svc.streamCalled)
+			assert.Equal(t, tc.wantSummary, tc.svc.summaryCalled)
+			if tc.svc.streamErr == nil {
+				assert.Equal(t, float64(2), resp["unreadNotificationsCount"])
+				assert.Equal(t, true, resp["hasUnreadMentions"])
+			}
+		})
+	}
 }

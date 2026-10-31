@@ -154,8 +154,8 @@ type UpdateInput struct {
 	Color       *string
 	IsArchived  *bool
 	IsSensitive *bool
-	// BannerID: nil = 変更なし、非 nil で "" = banner 解除(null)、値 = 設定。
-	BannerID *string
+	// BannerID: nil = 変更なし、*が nil = banner 解除(null)、値 = 設定 (#3758)。
+	BannerID **string
 	// PinnedNoteIDs: nil = 変更なし、非 nil = その配列で置換。
 	PinnedNoteIDs *[]string
 	// AllowRenoteToExternal: nil = 変更なし、非 nil でその値に更新。
@@ -201,15 +201,12 @@ func (s *Service) Update(userID, channelID string, in UpdateInput) (*model.Chann
 		fields["isSensitive"] = *in.IsSensitive
 	}
 	if in.BannerID != nil {
-		// "" は banner 解除 (null)、それ以外は設定。なお upstream の TS
-		// update.ts は bannerId:null を送っても解除しない (banner は外せない既知
-		// 制約) ので、"" 解除は mk-go 独自の利便機能。stock frontend は解除時
-		// bannerId:null を送るが、Go の *string は null/absent を区別できず
-		// 「変更なし」に落ちるため、この "" 解除分岐は API 直叩き専用。
-		if *in.BannerID == "" {
+		// upstream の update.ts は bannerId: null を送っても解除しない。同梱の
+		// frontend は解除に null を送るので、Elythia は null で解除する (#3758)。
+		if *in.BannerID == nil {
 			fields["bannerId"] = nil
 		} else {
-			fields["bannerId"] = *in.BannerID
+			fields["bannerId"] = **in.BannerID
 		}
 	}
 	if in.PinnedNoteIDs != nil {
@@ -279,8 +276,8 @@ func (s *Service) Unfollow(userID, channelID string) error {
 // 各 follow row の channel 実体は FindByIDs で一括解決して N+1 を回避する。
 // 元 followings の order は frontend cursor 整合のため保持する必要があるため
 // channelByID map を介して並び順を保つ。
-func (s *Service) ListFollowed(userID, sinceID, untilID string, limit, offset int) ([]*model.Channel, error) {
-	rows, err := s.followingRepo.ListFollowed(userID, sinceID, untilID, limit, offset)
+func (s *Service) ListFollowed(userID, sinceID, untilID string, limit int) ([]*model.Channel, error) {
+	rows, err := s.followingRepo.ListFollowed(userID, sinceID, untilID, limit, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -309,8 +306,8 @@ func (s *Service) ListFollowed(userID, sinceID, untilID string, limit, offset in
 }
 
 // ListOwned returns channels owned by the user with cursor (sinceID/untilID)
-// or offset pagination.
-func (s *Service) ListOwned(userID, sinceID, untilID string, limit, offset int) ([]*model.Channel, error) {
+// pagination.
+func (s *Service) ListOwned(userID, sinceID, untilID string, limit int) ([]*model.Channel, error) {
 	// upstream owned.ts は isArchived=FALSE を AND し、cursor 無し時は id DESC で
 	// 並べる (makePaginationQuery, #1540)。
 	notArchived := false
@@ -319,7 +316,6 @@ func (s *Service) ListOwned(userID, sinceID, untilID string, limit, offset int) 
 		IsArchived: &notArchived,
 		SortBy:     "-id",
 		Limit:      limit,
-		Offset:     offset,
 		SinceID:    sinceID,
 		UntilID:    untilID,
 	})
@@ -341,7 +337,7 @@ func (s *Service) ListFeatured() ([]*model.Channel, error) {
 // Search returns channels whose name matches the query.
 // Search finds channels by name (and description when searchType is
 // "nameAndDescription", the upstream default). "nameOnly" matches name only.
-func (s *Service) Search(query, searchType, sinceID, untilID string, limit, offset int) ([]*model.Channel, error) {
+func (s *Service) Search(query, searchType, sinceID, untilID string, limit int) ([]*model.Channel, error) {
 	// upstream channels/search は常に isArchived=FALSE を AND し、cursor 無し時は
 	// id DESC で並べる (makePaginationQuery, #1540)。
 	notArchived := false
@@ -351,7 +347,6 @@ func (s *Service) Search(query, searchType, sinceID, untilID string, limit, offs
 		IsArchived:        &notArchived,
 		SortBy:            "-id",
 		Limit:             limit,
-		Offset:            offset,
 		SinceID:           sinceID,
 		UntilID:           untilID,
 	})

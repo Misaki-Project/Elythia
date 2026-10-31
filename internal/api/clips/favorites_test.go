@@ -23,8 +23,8 @@ func newStubHandler(t *testing.T) (*Handler, *testutil.MockClipRepository, *test
 	noteRepo := testutil.NewMockClipNoteRepository()
 	notes := testutil.NewMockNoteRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreclip.NewService(repo, noteRepo, notes, idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreclip.NewService(repo, noteRepo, notes, idGen, nil, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil)
 	favRepo := testutil.NewMockClipFavoriteRepository()
 	h.SetFavoriteRepo(favRepo)
 	return h, repo, favRepo

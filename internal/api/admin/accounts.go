@@ -1,11 +1,14 @@
 package admin
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
+	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
@@ -33,9 +36,9 @@ func (h *Handler) AccountsDelete(c echo.Context) error {
 	if err := h.userRepo.UpdateUser(req.UserID, map[string]any{"isSuspended": true, "isDeleted": true}); err == nil {
 		// **モデレーターの判断として刻む** (#2973)。刻まないと、発信元由来の
 		// 凍結が `remote` のまま残っている行では、発信元が `toot:suspended` を
-		// 下ろした時点で tombstone の凍結が解除される。inbound の gate は
-		// `isSuspended` しか見ないので、削除済みアカウントからの activity が
-		// 再び通ることになる。
+		// 下ろした時点で tombstone の凍結が解除される。削除済みの行は inbound の
+		// gate (`isDeleted`) で捨てられるが、読み取り側は `isSuspended` を見て
+		// 隠すので、凍結が外れると削除したアカウントが見えるようになる。
 		h.recordLocalSuspensionOrigin(req.UserID)
 		// 論理削除直後の auth bypass 防止 (#965)。target の全 token cache
 		// entry を即時 invalidate して 30s stale window を消す。DB 更新が
@@ -53,18 +56,24 @@ func (h *Handler) AccountsDelete(c echo.Context) error {
 // admin/accounts/find-by-email と同等。
 func (h *Handler) AccountsFindByEmail(c echo.Context) error {
 	var req struct {
-		Email string `json:"email"`
+		Email *string `json:"email"`
 	}
-	if err := c.Bind(&req); err != nil || req.Email == "" {
+	if err := c.Bind(&req); err != nil || req.Email == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "email is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	profile, err := h.userRepo.FindProfileByEmail(req.Email)
+	// 空のemailは、本家と同じくUSER_NOT_FOUNDにする (#3861)。本家のparamDefは
+	// minLengthを持たず、空文字で引いて見つからない。emailが空の利用者には
+	// 当てない。
+	if *req.Email == "" {
+		return c.JSON(http.StatusBadRequest, apierr.Error("USER_NOT_FOUND", "No such user who has the email address.", "cb865949-8af5-4062-a88c-ef55e8786d1d"))
+	}
+	profile, err := h.userRepo.FindProfileByEmail(*req.Email)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, apierr.Error("USER_NOT_FOUND", "User not found.", "cb865949-8af5-4062-a88c-ef55e8786d1d"))
+		return c.JSON(http.StatusBadRequest, apierr.Error("USER_NOT_FOUND", "No such user who has the email address.", "cb865949-8af5-4062-a88c-ef55e8786d1d"))
 	}
 	user, err := h.userRepo.FindByID(profile.UserID)
 	if err != nil && !repository.IsNotFound(err) {
@@ -72,7 +81,7 @@ func (h *Handler) AccountsFindByEmail(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, apierr.Error("USER_NOT_FOUND", "User not found.", "cb865949-8af5-4062-a88c-ef55e8786d1d"))
+		return c.JSON(http.StatusBadRequest, apierr.Error("USER_NOT_FOUND", "No such user who has the email address.", "cb865949-8af5-4062-a88c-ef55e8786d1d"))
 	}
 	// upstream admin/accounts/find-by-email.ts は pack(user, null,
 	// {schema:'UserDetailedNotMe'}) (includeSecrets 無し) を返すため email /
@@ -109,9 +118,9 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 	if err := h.userRepo.UpdateUser(req.UserID, map[string]any{"isSuspended": true, "isDeleted": true}); err == nil {
 		// **モデレーターの判断として刻む** (#2973)。刻まないと、発信元由来の
 		// 凍結が `remote` のまま残っている行では、発信元が `toot:suspended` を
-		// 下ろした時点で tombstone の凍結が解除される。inbound の gate は
-		// `isSuspended` しか見ないので、削除済みアカウントからの activity が
-		// 再び通ることになる。
+		// 下ろした時点で tombstone の凍結が解除される。削除済みの行は inbound の
+		// gate (`isDeleted`) で捨てられるが、読み取り側は `isSuspended` を見て
+		// 隠すので、凍結が外れると削除したアカウントが見えるようになる。
 		h.recordLocalSuspensionOrigin(req.UserID)
 		// AccountsDelete と同じ。target の全 token cache entry を即時
 		// invalidate (#965)。
@@ -132,6 +141,40 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 	soft := user != nil && user.Host != nil
 	h.scheduleAccountCascade(req.UserID, soft)
 	return c.NoContent(http.StatusNoContent)
+}
+
+// DeletePluginManagedAccount deletes an account that a plugin manages (#3468),
+// with the same effects as admin/delete-account: the account is flagged
+// deleted, its tokens and streams are dropped, Delete(actor) is delivered, and
+// the cascade deletion is queued.
+//
+// **管理画面からの削除と同じ流れを通す。** プラグインの経路だけ別に書くと、
+// 片方だけ直したときに「この経路で消したアカウントだけ連合に Delete が届かない」
+// 類のずれが生まれる。
+//
+// モデレーションログには残さない。操作したのはモデレーターではなく、
+// プラグイン (=運営者が組み込んだコード) なので、誰の判断として記録するかが
+// 無い。代わりに slog に残す。
+//
+// 管理していないアカウントを渡されたら何もせずエラーを返す。呼び出し側
+// (core/pluginaccount) が所有を確かめてから呼ぶが、root や普通の利用者を
+// この経路で消せないことを、ここでも保証する。
+func (h *Handler) DeletePluginManagedAccount(user *model.User) error {
+	if user == nil || !user.IsPluginManaged() || !user.IsLocal() {
+		return errors.New("admin: not a plugin-managed local account")
+	}
+	if err := h.userRepo.UpdateUser(user.ID, map[string]any{"isSuspended": true, "isDeleted": true}); err != nil {
+		return fmt.Errorf("admin: flag the account deleted: %w", err)
+	}
+	h.recordLocalSuspensionOrigin(user.ID)
+	h.invalidateUserTokenCache(user.ID)
+	h.revokeUserStreams(user.ID)
+	slog.Info("plugin-managed account deleted", "userId", user.ID, "plugin", *user.ManagedByPlugin)
+	if h.userModerationFed != nil {
+		h.userModerationFed.OnUserDeleted(user)
+	}
+	h.scheduleAccountCascade(user.ID, false)
+	return nil
 }
 
 // isProtectedAccount reports whether the given user ID is an account that must

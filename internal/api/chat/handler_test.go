@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,7 +41,7 @@ var errMock = assert.AnError
 func newTestHandler() (*Handler, *testutil.MockChatRepository) {
 	repo := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(repo, idGen)
+	h := NewHandler(repo, idGen, nil, nil, nil)
 	// **利用者表も配線する。** `rooms/transfer-ownership` は譲渡先がローカル利用者か
 	// を見る (#2994)。router は必ず配線するので、未配線のまま試すと本番と違う枝を
 	// 通ることになる。
@@ -57,8 +58,8 @@ func newTestHandler() (*Handler, *testutil.MockChatRepository) {
 func newTestHandlerWithService() (*Handler, *testutil.MockChatRepository) {
 	repo := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(repo, idGen)
-	svc := corechat.NewService(repo, idGen)
+	h := NewHandler(repo, idGen, nil, nil, nil)
+	svc := corechat.NewService(repo, idGen, nil, nil, nil)
 	h.SetService(svc)
 	return h, repo
 }
@@ -85,8 +86,8 @@ func seedMember(t *testing.T, repo *testutil.MockChatRepository, userID, roomID 
 	}))
 }
 
-var u1 = &model.User{ID: "u1", Username: "alice"}
-var u2 = &model.User{ID: "u2", Username: "bob"}
+var u1 = &model.User{ID: "u1", Username: "alice", FederationStatus: model.FederationStatusOn}
+var u2 = &model.User{ID: "u2", Username: "bob", FederationStatus: model.FederationStatusOn}
 
 // assertErrorCode unmarshals an error response and asserts the Misskey error
 // code + id (body shape is {"error": {code, id, message}}).
@@ -210,7 +211,7 @@ func TestRoomsUpdate_Error(t *testing.T) {
 	base := testutil.NewMockChatRepository()
 	base.Rooms["r1"] = &model.ChatRoom{ID: "r1", Name: "x", OwnerID: "u1"}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&failUpdateRoomRepo{base}, idGen)
+	h := NewHandler(&failUpdateRoomRepo{base}, idGen, nil, nil, nil)
 	rec := post(h.RoomsUpdate, `{"roomId":"r1","name":"y"}`, u1)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -510,7 +511,7 @@ func (m *mockJoinedRepo) ListJoinedRooms(_, _, _ string, _ int) ([]*model.ChatRo
 func TestRoomsJoined_WithRooms(t *testing.T) {
 	base := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&mockJoinedRepo{base}, idGen)
+	h := NewHandler(&mockJoinedRepo{base}, idGen, nil, nil, nil)
 	rec := post(h.RoomsJoined, `{}`, u1)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var resp []any
@@ -527,10 +528,31 @@ func (m *mockMsgRepo) SearchMessages(_, _ string, _ int, _, _ string) ([]*model.
 	return []*model.ChatMessage{{ID: "m1", FromUserID: "u1", Reads: model.StringArray{}, Reactions: model.StringArray{}}}, nil
 }
 
+// limitRecordingRepo records the limit chat/messages passes to the repository.
+type limitRecordingRepo struct {
+	*testutil.MockChatRepository
+	gotLimit int
+}
+
+func (m *limitRecordingRepo) ListMessagesByUser(_, _, _, _ string, limit int) ([]*model.ChatMessage, error) {
+	m.gotLimit = limit
+	return nil, nil
+}
+
+// 本家のajvと同じく、整数を小数の形で書いた limit も受ける (#3872)。
+func TestMessages_AcceptsIntegerFormOfLimit(t *testing.T) {
+	repo := &limitRecordingRepo{MockChatRepository: testutil.NewMockChatRepository()}
+	idGen, _ := id.NewGenerator("aidx")
+	h := NewHandler(repo, idGen, nil, nil, nil)
+	rec := post(h.Messages, `{"userId":"u2","limit":1e2}`, u1)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, 100, repo.gotLimit)
+}
+
 func TestMessages_WithData(t *testing.T) {
 	base := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&mockMsgRepo{base}, idGen)
+	h := NewHandler(&mockMsgRepo{base}, idGen, nil, nil, nil)
 	// room 発言の閲覧には member であることが必要 (u1 を owner にする)。
 	base.Rooms["r1"] = &model.ChatRoom{ID: "r1", OwnerID: u1.ID}
 	rec := post(h.Messages, `{"roomId":"r1"}`, u1)
@@ -559,7 +581,7 @@ func TestMessages_RoomPermission(t *testing.T) {
 func TestMessagesSearch_WithData(t *testing.T) {
 	base := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&mockMsgRepo{base}, idGen)
+	h := NewHandler(&mockMsgRepo{base}, idGen, nil, nil, nil)
 	rec := post(h.MessagesSearch, `{"query":"test"}`, u1)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var resp []any
@@ -651,8 +673,8 @@ func newHandlerWithService(t *testing.T) (*Handler, *testutil.MockChatRepository
 	t.Helper()
 	repo := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(repo, idGen)
-	svc := corechat.NewService(repo, idGen)
+	h := NewHandler(repo, idGen, nil, nil, nil)
+	svc := corechat.NewService(repo, idGen, nil, nil, nil)
 	h.SetService(svc)
 	return h, repo
 }
@@ -761,7 +783,7 @@ func TestMessagesCreate_FileOnly_NoContentRequired(t *testing.T) {
 	fileRepo := testutil.NewMockDriveFileRepository()
 	owner := u1.ID
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner}
-	h.SetDriveFileRepo(fileRepo)
+	h.fileRepo = fileRepo
 	rec := post(h.MessagesCreate, `{"toUserId":"u2","fileId":"f1"}`, u1)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Len(t, repo.Messages, 1)
@@ -778,7 +800,7 @@ func TestMessagesCreate_RecipientIsYourself(t *testing.T) {
 // NO_SUCH_FILE は存在しない fileId を弾く (create-to-user golden)。
 func TestMessagesCreate_NoSuchFile_ToUser(t *testing.T) {
 	h, _ := newHandlerWithService(t)
-	h.SetDriveFileRepo(testutil.NewMockDriveFileRepository())
+	h.fileRepo = testutil.NewMockDriveFileRepository()
 	rec := post(h.MessagesCreate, `{"text":"hi","toUserId":"u2","fileId":"ghost"}`, u1)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assertErrorCode(t, rec, "NO_SUCH_FILE", "4372b8e2-185d-4146-8749-2f68864a3e5f")
@@ -791,7 +813,7 @@ func TestMessagesCreate_NoSuchFile_ToRoom_NotOwner(t *testing.T) {
 	fileRepo := testutil.NewMockDriveFileRepository()
 	other := "otherUser"
 	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &other}
-	h.SetDriveFileRepo(fileRepo)
+	h.fileRepo = fileRepo
 	rec := post(h.MessagesCreate, `{"text":"hi","toRoomId":"r1","fileId":"f1"}`, u1)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assertErrorCode(t, rec, "NO_SUCH_FILE", "b6accbd3-1d7b-4d9f-bdb7-eb185bac06db")
@@ -911,7 +933,7 @@ func (m *mockUserMsgRepo) ListMessagesByUser(_, _, _, _ string, _ int) ([]*model
 func TestMessages_ListByUser(t *testing.T) {
 	base := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(&mockUserMsgRepo{base}, idGen)
+	h := NewHandler(&mockUserMsgRepo{base}, idGen, nil, nil, nil)
 	rec := post(h.Messages, `{"userId":"u2"}`, u1)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	var resp []any
@@ -990,6 +1012,10 @@ func TestReactionsCreate(t *testing.T) {
 	repo.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "sender", ToUserID: &to, Reads: model.StringArray{}, Reactions: model.StringArray{}}
 	rec := post(h.ReactionsCreate, `{"messageId":"m1","reaction":"👍"}`, u1)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
+	// 絵文字でないリアクションは 400 (利用者の入力の誤り)。
+	rec = post(h.ReactionsCreate, `{"messageId":"m1","reaction":"plain text"}`, u1)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
 }
 
 func TestReactionsDelete(t *testing.T) {
@@ -1034,8 +1060,8 @@ func TestReactions_AccessErrorIsIndistinguishable(t *testing.T) {
 		t.Helper()
 		repo := testutil.NewMockChatRepository()
 		idGen, _ := id.NewGenerator("aidx")
-		h := NewHandler(repo, idGen)
-		svc := corechat.NewService(repo, idGen)
+		h := NewHandler(repo, idGen, nil, nil, nil)
+		svc := corechat.NewService(repo, idGen, nil, nil, nil)
 		pub := &recordingPublisher{}
 		svc.SetStreamingPublisher(pub)
 		h.SetService(svc)
@@ -1371,6 +1397,43 @@ func TestInvitationsAccept(t *testing.T) {
 	assert.Len(t, repo.Memberships, 1)
 }
 
+// 満員 (50 人) の room には招待を承諾しても入れないこと。招待は残す。
+//
+// 招待の作成は今の人数しか数えないので、承諾で数えないと、招待を並べるだけで
+// 上限を超えて参加させられた (rooms/join は数えている)。
+func TestInvitationsAccept_RoomFull(t *testing.T) {
+	h, repo := newTestHandler()
+	repo.Rooms["r1"] = &model.ChatRoom{ID: "r1", OwnerID: "someoneElse"}
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("m%02d", i)
+		repo.Memberships[id] = &model.ChatRoomMembership{ID: id, UserID: "member" + id, RoomID: "r1"}
+	}
+	repo.Invitations["i1"] = &model.ChatRoomInvitation{ID: "i1", UserID: "u1", RoomID: "r1"}
+	rec := post(h.InvitationsAccept, `{"roomId":"r1"}`, u1)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code, "rooms/join と同じ 'room is full'")
+	assert.Len(t, repo.Memberships, 50, "満員の room に入れた")
+	assert.Contains(t, repo.Invitations, "i1", "満員で断った招待を消した")
+
+	// 1 人空けば承諾できる (対照)。
+	delete(repo.Memberships, "m00")
+	rec = post(h.InvitationsAccept, `{"roomId":"r1"}`, u1)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Len(t, repo.Memberships, 50)
+}
+
+// 参加済みかの確認が DB 障害で失敗したら 500 にし、参加も招待の消費もしない
+// こと (#2792)。
+func TestInvitationsAccept_MembershipLookupFailure(t *testing.T) {
+	h, repo := newTestHandler()
+	repo.Rooms["r1"] = &model.ChatRoom{ID: "r1", OwnerID: "someoneElse"}
+	repo.Invitations["i1"] = &model.ChatRoomInvitation{ID: "i1", UserID: "u1", RoomID: "r1"}
+	repo.FindMembershipErr = errors.New("db down")
+	rec := post(h.InvitationsAccept, `{"roomId":"r1"}`, u1)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Empty(t, repo.Memberships)
+	assert.Contains(t, repo.Invitations, "i1")
+}
+
 func TestInvitationsAccept_InvalidParam(t *testing.T) {
 	h, _ := newTestHandler()
 	rec := post(h.InvitationsAccept, `{}`, u1)
@@ -1473,9 +1536,9 @@ func TestHistory(t *testing.T) {
 	// room=true → ListRoomHistory に dispatch (#692)
 	rec3 := post(h.History, `{"room":true,"limit":3}`, u1)
 	assert.Equal(t, http.StatusOK, rec3.Code)
-	// limit clamp: 0 → 10, 9999 → 100 (内部分岐の coverage 確保)
-	assert.Equal(t, http.StatusOK, post(h.History, `{"limit":0}`, u1).Code)
-	assert.Equal(t, http.StatusOK, post(h.History, `{"limit":9999}`, u1).Code)
+	// 本家の paramDef は limit を 1〜100 とし、範囲外は丸めずに拒否する (#3841)。
+	assert.Equal(t, http.StatusBadRequest, post(h.History, `{"limit":0}`, u1).Code)
+	assert.Equal(t, http.StatusBadRequest, post(h.History, `{"limit":9999}`, u1).Code)
 }
 
 // historyRepo overrides ListUserHistory / ListRoomHistory to return seeded
@@ -1484,12 +1547,32 @@ type historyRepo struct {
 	*testutil.MockChatRepository
 	userHistory []*model.ChatMessage
 	roomHistory []*model.ChatMessage
+	untilIDs    []string
 }
 
-func (r *historyRepo) ListUserHistory(string, int) ([]*model.ChatMessage, error) {
+// #3653: untilId (Elythia の追加の引数) を repository まで渡し、列に入らない値は弾く。
+func TestHistory_UntilID(t *testing.T) {
+	base := testutil.NewMockChatRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	hr := &historyRepo{MockChatRepository: base}
+	h := NewHandler(hr, idGen, nil, nil, nil)
+
+	assert.Equal(t, http.StatusOK, post(h.History, `{"untilId":"m5"}`, u1).Code)
+	assert.Equal(t, http.StatusOK, post(h.History, `{"room":true,"untilId":"r3"}`, u1).Code)
+	assert.Equal(t, http.StatusOK, post(h.History, `{}`, u1).Code)
+	assert.Equal(t, []string{"m5", "r3", ""}, hr.untilIDs)
+
+	assert.Equal(t, http.StatusBadRequest, post(h.History, `{"untilId":"a\u0000b"}`, u1).Code)
+	assert.Equal(t, http.StatusBadRequest, post(h.History, `{"untilId":5}`, u1).Code)
+	assert.Len(t, hr.untilIDs, 3, "a rejected request must not reach the repository")
+}
+
+func (r *historyRepo) ListUserHistory(_ string, _ int, untilID string) ([]*model.ChatMessage, error) {
+	r.untilIDs = append(r.untilIDs, untilID)
 	return r.userHistory, nil
 }
-func (r *historyRepo) ListRoomHistory(string, int) ([]*model.ChatMessage, error) {
+func (r *historyRepo) ListRoomHistory(_ string, _ int, untilID string) ([]*model.ChatMessage, error) {
+	r.untilIDs = append(r.untilIDs, untilID)
 	return r.roomHistory, nil
 }
 
@@ -1500,7 +1583,7 @@ func TestHistory_IsRead_DM(t *testing.T) {
 	to := u1.ID
 	base.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "u2", ToUserID: &to, Reads: model.StringArray{}, Reactions: model.StringArray{}}
 	hr := &historyRepo{MockChatRepository: base, userHistory: []*model.ChatMessage{base.Messages["m1"]}}
-	h := NewHandler(hr, idGen)
+	h := NewHandler(hr, idGen, nil, nil, nil)
 
 	// 未読: u1 が cm を読んでいない → isRead=false
 	var resp []map[string]any
@@ -1523,7 +1606,7 @@ func TestHistory_IsRead_Room(t *testing.T) {
 	roomID := "r1"
 	base.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "u2", ToRoomID: &roomID, Reads: model.StringArray{}, Reactions: model.StringArray{}}
 	hr := &historyRepo{MockChatRepository: base, roomHistory: []*model.ChatMessage{base.Messages["m1"]}}
-	h := NewHandler(hr, idGen)
+	h := NewHandler(hr, idGen, nil, nil, nil)
 
 	var resp []map[string]any
 	require.NoError(t, json.Unmarshal(post(h.History, `{"room":true}`, u1).Body.Bytes(), &resp))
@@ -1608,7 +1691,7 @@ func (m *readMarkSpyRepo) MarkAllReadInRoom(reader, room string) error {
 func TestUserTimeline_MarksReadOnOpen(t *testing.T) {
 	spy := &readMarkSpyRepo{MockChatRepository: testutil.NewMockChatRepository()}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(spy, idGen)
+	h := NewHandler(spy, idGen, nil, nil, nil)
 	rec := post(h.UserTimeline, `{"userId":"u_other"}`, u1)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "u1", spy.markFromUserCalled.reader)
@@ -1637,7 +1720,7 @@ func TestUserTimeline_UserExists(t *testing.T) {
 func TestRoomTimeline_MarksReadOnOpen(t *testing.T) {
 	spy := &readMarkSpyRepo{MockChatRepository: testutil.NewMockChatRepository()}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(spy, idGen)
+	h := NewHandler(spy, idGen, nil, nil, nil)
 	// u1 を owner にして閲覧権限を満たす。
 	spy.Rooms["r_x"] = &model.ChatRoom{ID: "r_x", OwnerID: u1.ID}
 	rec := post(h.RoomTimeline, `{"roomId":"r_x"}`, u1)
@@ -1657,7 +1740,7 @@ func (m *readMarkErrRepo) MarkAllReadInRoom(_, _ string) error   { return errMoc
 func TestTimeline_BestEffortReadMark(t *testing.T) {
 	r := &readMarkErrRepo{MockChatRepository: testutil.NewMockChatRepository()}
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(r, idGen)
+	h := NewHandler(r, idGen, nil, nil, nil)
 	r.Rooms["r1"] = &model.ChatRoom{ID: "r1", OwnerID: u1.ID}
 	assert.Equal(t, http.StatusOK, post(h.UserTimeline, `{"userId":"u2"}`, u1).Code)
 	assert.Equal(t, http.StatusOK, post(h.RoomTimeline, `{"roomId":"r1"}`, u1).Code)
@@ -1685,12 +1768,11 @@ func TestMessagesCreateToUser(t *testing.T) {
 func TestMessagesCreateToUser_Blocked(t *testing.T) {
 	repo := testutil.NewMockChatRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	h := NewHandler(repo, idGen)
-	svc := corechat.NewService(repo, idGen)
+	h := NewHandler(repo, idGen, nil, nil, nil)
 	blocks := testutil.NewMockBlockingRepository()
 	// blocker=u2 (recipient), blockee=u1 (sender)。
 	require.NoError(t, blocks.Create(&model.Blocking{ID: "b1", BlockerID: "u2", BlockeeID: "u1"}))
-	svc.SetBlockingRepo(blocks)
+	svc := corechat.NewService(repo, idGen, nil, nil, blocks)
 	h.SetService(svc)
 
 	rec := post(h.MessagesCreateToUser, `{"text":"hi","toUserId":"u2"}`, u1)
@@ -1804,9 +1886,9 @@ func TestPackMessageDetailed_FieldsPresent(t *testing.T) {
 	assert.NotNil(t, out["room"])
 	// fromUser に avatarUrl の identicon fallback が入る (assertion 失敗時は
 	// require.IsType がテスト終了させるので panic せずに見やすいエラーになる)。
-	require.IsType(t, map[string]any{}, out["fromUser"])
-	from := out["fromUser"].(map[string]any)
-	assert.Equal(t, "/identicon/from@remote.example", from["avatarUrl"])
+	require.IsType(t, &chatUser{}, out["fromUser"])
+	from := out["fromUser"].(*chatUser)
+	assert.Equal(t, "/identicon/from@remote.example", from.AvatarURL)
 }
 
 func TestInvitationsIgnore(t *testing.T) {
@@ -2028,7 +2110,7 @@ func attachedHandler(t *testing.T) (*Handler, *testutil.MockChatRepository, *tes
 	t.Helper()
 	h, repo := newTestHandler()
 	fileRepo := testutil.NewMockDriveFileRepository()
-	h.SetDriveFileRepo(fileRepo)
+	h.fileRepo = fileRepo
 	h.SetModeratorChecker(fakeModeratorChecker{mods: map[string]bool{"mod1": true}})
 	return h, repo, fileRepo
 }
@@ -2052,6 +2134,36 @@ func TestAttachedChatMessages_OwnerSeesMessages(t *testing.T) {
 	var out []map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
 	assert.Len(t, out, 2)
+}
+
+// 本家の paramDef は整数の値を持つ小数 (1e0、10.0) を integer として通す。
+// limit の値もそのまま効く (#3839)。
+func TestAttachedChatMessages_AcceptsIntegerValuedFractions(t *testing.T) {
+	h, repo, fileRepo := attachedHandler(t)
+	owner := u1.ID
+	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner}
+	seedFileMsg(repo, "m1", "f1")
+	seedFileMsg(repo, "m2", "f1")
+
+	rec := post(h.AttachedChatMessages, `{"fileId":"f1","limit":1e0,"sinceDate":10.0,"untilDate":4102444800000.0}`, u1)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var out []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
+	assert.Len(t, out, 1)
+}
+
+// 本家は limit の範囲外を丸めずに拒否する。検証器が飛ばす入力でも handler が
+// 同じに見る (#3839)。
+func TestAttachedChatMessages_RejectsOutOfRangeLimit(t *testing.T) {
+	h, repo, fileRepo := attachedHandler(t)
+	owner := u1.ID
+	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner}
+	seedFileMsg(repo, "m1", "f1")
+	for _, limit := range []string{"0", "-1", "101"} {
+		rec := post(h.AttachedChatMessages, `{"fileId":"f1","limit":`+limit+`}`, u1)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, limit)
+		assert.Contains(t, rec.Body.String(), "INVALID_PARAM", limit)
+	}
 }
 
 func TestAttachedChatMessages_NonOwnerRejected(t *testing.T) {
@@ -2112,9 +2224,9 @@ func TestPackMessageDetailed_RoomReactionsIncludeUser(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, reactions, 1, "u1 は解決され、ghost (未解決) は drop")
 	assert.Equal(t, "👍", reactions[0]["reaction"])
-	user, ok := reactions[0]["user"].(map[string]any)
+	user, ok := reactions[0]["user"].(*chatUser)
 	require.True(t, ok, "room reaction は user (UserLite) を含む")
-	assert.Equal(t, "u1", user["id"])
+	assert.Equal(t, "u1", user.ID)
 }
 
 // 1on1 (lite) message の reactions は user を含まない。

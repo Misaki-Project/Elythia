@@ -29,7 +29,7 @@ func newAPService(t *testing.T) (*corechat.Service, *testutil.MockUserRepository
 	t.Helper()
 	chatRepo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(chatRepo, idGen)
+	svc := corechat.NewService(chatRepo, idGen, nil, nil, nil)
 	userRepo := testutil.NewMockUserRepository()
 	urls := activitypub.NewURLBuilder("https://local.example")
 	renderer := activitypub.NewRenderer(urls)
@@ -42,7 +42,7 @@ func TestCreateMessageToUser_DeliversToRemoteUser(t *testing.T) {
 	svc, userRepo, deliverer := newAPService(t)
 	remoteHost := "remote.example"
 	remoteURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &remoteURI}
 
 	msg, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hello remote", "")
@@ -61,7 +61,7 @@ func TestCreateMessageToUser_DeliversToRemoteUser(t *testing.T) {
 
 func TestCreateMessageToUser_SkipsLocalRecipient(t *testing.T) {
 	svc, userRepo, deliverer := newAPService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "local msg", "")
@@ -74,7 +74,7 @@ func TestCreateMessageToUser_DeliveryFailureIsSwallowed(t *testing.T) {
 	deliverer.returnErr = assert.AnError
 	remoteHost := "remote.example"
 	remoteURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &remoteURI}
 
 	msg, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
@@ -86,7 +86,7 @@ func TestCreateMessageToUser_DeliveryFailureIsSwallowed(t *testing.T) {
 func TestCreateMessageViaAP(t *testing.T) {
 	chatRepo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(chatRepo, idGen)
+	svc := corechat.NewService(chatRepo, idGen, nil, nil, nil)
 	sender := &model.User{ID: "remote1", Username: "remote1"}
 
 	msg, err := svc.CreateMessageViaAP(context.Background(), "https://remote.example/chat-messages/1", sender, "local1", "hello from remote", "")
@@ -102,7 +102,7 @@ func TestCreateMessageViaAP(t *testing.T) {
 func TestCreateMessageViaAP_InvalidTarget(t *testing.T) {
 	chatRepo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(chatRepo, idGen)
+	svc := corechat.NewService(chatRepo, idGen, nil, nil, nil)
 
 	_, err := svc.CreateMessageViaAP(context.Background(), "", nil, "local1", "hi", "")
 	assert.Error(t, err)
@@ -120,7 +120,7 @@ func newScopeService(t *testing.T) (*corechat.Service, *testutil.MockUserReposit
 	t.Helper()
 	chatRepo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(chatRepo, idGen)
+	svc := corechat.NewService(chatRepo, idGen, nil, nil, nil)
 	userRepo := testutil.NewMockUserRepository()
 	followingRepo := testutil.NewMockFollowingRepository()
 	urls := activitypub.NewURLBuilder("https://local.example")
@@ -132,7 +132,7 @@ func newScopeService(t *testing.T) (*corechat.Service, *testutil.MockUserReposit
 
 func TestCreateMessageToUser_ScopeNone_Rejected(t *testing.T) {
 	svc, userRepo, _ := newScopeService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "none"}
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "blocked", "")
@@ -141,7 +141,7 @@ func TestCreateMessageToUser_ScopeNone_Rejected(t *testing.T) {
 
 func TestCreateMessageToUser_ScopeEveryone_Allowed(t *testing.T) {
 	svc, userRepo, _ := newScopeService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "everyone"}
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "ok", "")
@@ -150,7 +150,7 @@ func TestCreateMessageToUser_ScopeEveryone_Allowed(t *testing.T) {
 
 func TestCreateMessageToUser_ScopeFollowers_OnlyFollowers(t *testing.T) {
 	svc, userRepo, followingRepo := newScopeService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "followers"}
 	// alice is NOT a follower of bob → rejected
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "x", "")
@@ -163,7 +163,7 @@ func TestCreateMessageToUser_ScopeFollowers_OnlyFollowers(t *testing.T) {
 
 func TestCreateMessageToUser_ScopeFollowing_OnlyFollowing(t *testing.T) {
 	svc, userRepo, followingRepo := newScopeService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "following"}
 	// bob does NOT follow alice → rejected
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "x", "")
@@ -176,7 +176,7 @@ func TestCreateMessageToUser_ScopeFollowing_OnlyFollowing(t *testing.T) {
 
 func TestCreateMessageToUser_ScopeMutual(t *testing.T) {
 	svc, userRepo, followingRepo := newScopeService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "mutual"}
 
 	// 0 directions → rejected
@@ -198,7 +198,7 @@ func TestCreateMessageToUser_RemoteRecipient_ScopeNone_Rejected(t *testing.T) {
 	svc, userRepo, _ := newScopeService(t)
 	remoteHost := "remote.example"
 	remoteURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "none", Host: &remoteHost, URI: &remoteURI}
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "x", "")
@@ -211,7 +211,7 @@ func TestCreateMessageToUser_RemoteRecipient_ScopeEveryone_Allowed(t *testing.T)
 	svc, userRepo, _ := newScopeService(t)
 	remoteHost := "remote.example"
 	remoteURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "everyone", Host: &remoteHost, URI: &remoteURI}
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "ok", "")
@@ -225,7 +225,7 @@ func TestCreateMessageToUser_RemoteRecipient_StaleMutualScope_NotRejected(t *tes
 	svc, userRepo, _ := newScopeService(t)
 	remoteHost := "remote.example"
 	remoteURI := "https://remote.example/users/bob"
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "mutual", Host: &remoteHost, URI: &remoteURI}
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "ok", "")
@@ -247,14 +247,14 @@ func TestCreateMessageViaAP_ScopeEnforced(t *testing.T) {
 func TestCreateMessageToUser_GranularScope_NoFollowingRepo_FailClosed(t *testing.T) {
 	chatRepo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(chatRepo, idGen)
+	svc := corechat.NewService(chatRepo, idGen, nil, nil, nil)
 	userRepo := testutil.NewMockUserRepository()
 	urls := activitypub.NewURLBuilder("https://local.example")
 	renderer := activitypub.NewRenderer(urls)
 	svc.SetAPDelivery(userRepo, renderer, urls, &fakeAPDeliverer{})
 	// SetFollowingRepo は意図的に呼ばない
 
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	for _, scope := range []string{"followers", "following", "mutual"} {
 		t.Run(scope, func(t *testing.T) {
 			userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: scope}
@@ -269,13 +269,13 @@ func TestCreateMessageToUser_GranularScope_NoFollowingRepo_FailClosed(t *testing
 func TestCreateMessageToUser_NonGranularScope_NoFollowingRepoOK(t *testing.T) {
 	chatRepo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(chatRepo, idGen)
+	svc := corechat.NewService(chatRepo, idGen, nil, nil, nil)
 	userRepo := testutil.NewMockUserRepository()
 	urls := activitypub.NewURLBuilder("https://local.example")
 	renderer := activitypub.NewRenderer(urls)
 	svc.SetAPDelivery(userRepo, renderer, urls, &fakeAPDeliverer{})
 
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "everyone"}
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "ok", "")
 	require.NoError(t, err)
@@ -287,7 +287,7 @@ func newInvitationService(t *testing.T) (*corechat.Service, *testutil.MockChatRe
 	t.Helper()
 	chatRepo := newFakeRepo()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := corechat.NewService(chatRepo, idGen)
+	svc := corechat.NewService(chatRepo, idGen, nil, nil, nil)
 	userRepo := testutil.NewMockUserRepository()
 	urls := activitypub.NewURLBuilder("https://local.example")
 	renderer := activitypub.NewRenderer(urls)
@@ -399,7 +399,7 @@ func TestCreateMessageToUser_ApprovalBypassesScope(t *testing.T) {
 	svc, userRepo, _ := newScopeService(t)
 	approvalRepo := newFakeApprovalRepo()
 	svc.SetApprovalRepo(approvalRepo)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "followers"}
 
 	// approval 無し: alice は follower でないので reject。
@@ -417,7 +417,7 @@ func TestCreateMessageToUser_RecordsApprovalAfterSend(t *testing.T) {
 	svc, userRepo, _ := newScopeService(t)
 	approvalRepo := newFakeApprovalRepo()
 	svc.SetApprovalRepo(approvalRepo)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "everyone"}
 
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
@@ -431,7 +431,7 @@ func TestCreateMessageToUser_ApprovalIdempotent(t *testing.T) {
 	svc, userRepo, _ := newScopeService(t)
 	approvalRepo := newFakeApprovalRepo()
 	svc.SetApprovalRepo(approvalRepo)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "everyone"}
 	approvalRepo.approvals["alice/bob"] = true
 
@@ -443,8 +443,37 @@ func TestCreateMessageToUser_ApprovalIdempotent(t *testing.T) {
 // approvalRepo 未配線なら従来どおり scope のみで判定する (regression)。
 func TestCreateMessageToUser_NoApprovalRepoScopeEnforced(t *testing.T) {
 	svc, userRepo, _ := newScopeService(t)
-	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "followers"}
 	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "x", "")
 	require.ErrorIs(t, err, corechat.ErrChatScopeViolation)
+}
+
+// **連合 OFF・未確定のメンバーは room message の `to` に載せない (2026-10-31 の監査)。**
+// 載せると deliver の preflight がメッセージ全体を止め、ルームのリモート配送が
+// 黙って全部止まっていた。
+func TestCreateMessageToRoom_LeavesUnavailableLocalMembersOutOfTheAudience(t *testing.T) {
+	repo := newFakeRepo()
+	idGen, _ := id.NewGenerator("aidx")
+	svc := corechat.NewService(repo, idGen, nil, nil, nil)
+	userRepo := testutil.NewMockUserRepository()
+	urls := activitypub.NewURLBuilder("https://local.example")
+	deliverer := &fakeAPDeliverer{}
+	svc.SetAPDelivery(userRepo, activitypub.NewRenderer(urls), urls, deliverer)
+	remoteHost := "remote.example"
+	remoteURI := "https://remote.example/users/bob"
+	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice", FederationStatus: model.FederationStatusOn}
+	userRepo.Users["off"] = &model.User{ID: "off", Username: "off", FederationStatus: model.FederationStatusOff}
+	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &remoteURI}
+	repo.Rooms["room"] = &model.ChatRoom{ID: "room", OwnerID: "alice", Name: "r"}
+	repo.Memberships["off:room"] = &model.ChatRoomMembership{ID: "m1", UserID: "off", RoomID: "room"}
+	repo.Memberships["bob:room"] = &model.ChatRoomMembership{ID: "m2", UserID: "bob", RoomID: "room"}
+
+	_, err := svc.CreateMessageToRoom(context.Background(), "alice", "room", "hello room", "")
+	require.NoError(t, err)
+	require.Equal(t, 1, deliverer.called, "リモートのメンバーへは配送すること")
+	body := string(deliverer.lastBody)
+	assert.Contains(t, body, remoteURI)
+	assert.Contains(t, body, "https://local.example/users/alice")
+	assert.NotContains(t, body, "https://local.example/users/off", "連合 OFF のメンバーの URI が外へ出ている")
 }

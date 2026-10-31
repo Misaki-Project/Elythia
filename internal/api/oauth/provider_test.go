@@ -104,10 +104,14 @@ func (s *fakeTokenStore) DeleteByID(id string) error {
 	return nil
 }
 
-// fakeInvalidator records raw tokens dropped from the auth cache.
-type fakeInvalidator struct{ tokens []string }
+// fakeInvalidator records raw tokens dropped from the auth cache and their
+// users.
+type fakeInvalidator struct{ tokens, users []string }
 
-func (f *fakeInvalidator) InvalidateToken(t string) { f.tokens = append(f.tokens, t) }
+func (f *fakeInvalidator) InvalidateUserToken(userID, t string) {
+	f.tokens = append(f.tokens, t)
+	f.users = append(f.users, userID)
+}
 
 type fakeIDGen struct{ n int }
 
@@ -148,11 +152,11 @@ func newHarness(t *testing.T) *testHarness {
 	users := &fakeUserRepo{byToken: map[string]*model.User{}}
 	tokens := &fakeTokenStore{}
 	hn := &testHarness{store: store, users: users, tokens: tokens, clientID: srv.URL + "/", redirect: srv.URL + "/cb"}
-	hn.h = NewHandler(store, srv.Client(), users, tokens, &fakeIDGen{}, "https://mk.example", true,
-		func(c echo.Context, m ConsentMeta) error {
-			hn.consent = &m
-			return c.HTML(http.StatusOK, "<html>consent</html>")
-		})
+	hn.h = NewHandler(store, srv.Client(), users, tokens, &fakeIDGen{}, "https://mk.example", true, func(c echo.Context, m ConsentMeta) error {
+		hn.consent = &m
+		return c.HTML(http.StatusOK, "<html>consent</html>")
+	}, nil, nil)
+
 	return hn
 }
 
@@ -393,7 +397,7 @@ func TestToken_JSONBody(t *testing.T) {
 func TestToken_ReplayRevokesAndRejects(t *testing.T) {
 	hn := newHarness(t)
 	inv := &fakeInvalidator{}
-	hn.h.SetAuthInvalidator(inv)
+	hn.h.authInvalidator = inv
 	seedGrant(hn, "code1")
 	// 1 回目: 成功。
 	rec1 := hn.post(t, hn.h.Token, validTokenForm(hn, "code1"))
@@ -411,6 +415,8 @@ func TestToken_ReplayRevokesAndRejects(t *testing.T) {
 	assert.Contains(t, hn.tokens.deleted, issuedID, "replay は発行済み token を revoke する")
 	// DB から消すだけでは auth cache (30s TTL) が残るので、raw token も落とす。
 	assert.Contains(t, inv.tokens, issuedToken, "replay は auth cache も無効化する")
+	// 他のプロセスへは利用者で伝わる (#3664)。
+	assert.Equal(t, []string{"u1"}, inv.users)
 }
 
 type fakeStreamRevoker struct {
@@ -425,8 +431,7 @@ func (f *fakeStreamRevoker) RevokeAccessTokenStreams(userID, tokenID string) {
 func TestToken_ReplayRevokesStreams(t *testing.T) {
 	hn := newHarness(t)
 	rev := &fakeStreamRevoker{}
-	hn.h.SetStreamRevoker(rev)
-	assert.True(t, hn.h.HasStreamRevoker())
+	hn.h.streamRevoker = rev
 	seedGrant(hn, "code1")
 	rec1 := hn.post(t, hn.h.Token, validTokenForm(hn, "code1"))
 	require.Equal(t, http.StatusOK, rec1.Code)
@@ -570,8 +575,8 @@ func TestAuthorize_DiscoveryFailure(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
-	h := NewHandler(newFakeStore(), srv.Client(), &fakeUserRepo{}, &fakeTokenStore{}, &fakeIDGen{}, "https://mk.example", true,
-		func(c echo.Context, _ ConsentMeta) error { return c.HTML(http.StatusOK, "x") })
+	h := NewHandler(newFakeStore(), srv.Client(), &fakeUserRepo{}, &fakeTokenStore{}, &fakeIDGen{}, "https://mk.example", true, func(c echo.Context, _ ConsentMeta) error { return c.HTML(http.StatusOK, "x") }, nil, nil)
+
 	e := echo.New()
 	q := url.Values{
 		"response_type": {"code"},

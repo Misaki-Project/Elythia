@@ -83,7 +83,7 @@ func validSystemWebhookEvents(on []string) bool {
 
 // errNoSuchSystemWebhook is upstream show.ts noSuchSystemWebhook。mk-go は
 // update / delete でも同じものを返す (本家はそこで findOneByOrFail が投げて 500
-// になる。docs/divergence.md 7、#3262)。
+// になる。docs/divergence/security.md 7、#3262)。
 func errNoSuchSystemWebhook(c echo.Context) error {
 	return c.JSON(http.StatusNotFound, apierr.ErrorWithKind("NO_SUCH_SYSTEM_WEBHOOK", "No such SystemWebhook.", "38dd1ffe-04b4-6ff5-d8ba-4e6a6ae22c9d", apierr.KindServer))
 }
@@ -122,11 +122,11 @@ func dummyWebhookUser(n int, followers, following, notes int) *model.User {
 // WebhookTestService.toPackedUserLite: アバターは空、onlineStatus は active、
 // バッジは無し。実在しない利用者なので、本物の packer の判定 (identicon や
 // ロールの引き当て) をそのまま出さない。
-func dummyWebhookUserLite(u *model.User) *entity.UserLite {
+func dummyWebhookUserLite(pk *entity.Packer, u *model.User) *entity.UserLite {
 	if u == nil {
 		return nil
 	}
-	lite := entity.PackUserLite(u)
+	lite := pk.PackUserLite(u)
 	lite.AvatarURL = ""
 	lite.AvatarBlurhash = nil
 	lite.OnlineStatus = "active"
@@ -137,7 +137,7 @@ func dummyWebhookUserLite(u *model.User) *entity.UserLite {
 // dummySystemWebhookBody builds the test payload per system event type,
 // mirroring upstream WebhookTestService.testSystemWebhook (#3262)。本文の形は
 // 本配送と同じ関数で作る (通報は coreabuse.WebhookPayload)。
-func dummySystemWebhookBody(eventType string) any {
+func dummySystemWebhookBody(pk *entity.Packer, eventType string) any {
 	user1 := dummyWebhookUser(1, 10, 5, 30)
 	user2 := dummyWebhookUser(2, 40, 50, 900)
 	user3 := dummyWebhookUser(3, 60, 70, 15900)
@@ -156,18 +156,18 @@ func dummySystemWebhookBody(eventType string) any {
 			report.AssigneeID = &user3.ID
 			assignee = user3
 		}
-		body := coreabuse.WebhookPayload(report, user2, user1, assignee, coreabuse.UserLookups{}, nil)
-		body["reporter"] = dummyWebhookUserLite(user2)
-		body["targetUser"] = dummyWebhookUserLite(user1)
+		body := coreabuse.WebhookPayload(pk, report, user2, user1, assignee, coreabuse.UserLookups{}, nil)
+		body["reporter"] = dummyWebhookUserLite(pk, user2)
+		body["targetUser"] = dummyWebhookUserLite(pk, user1)
 		if assignee != nil {
-			body["assignee"] = dummyWebhookUserLite(assignee)
+			body["assignee"] = dummyWebhookUserLite(pk, assignee)
 		}
 		// 本配送は通報の id から作成時刻を出す (mk-go の追加の項目)。ダミーの id
 		// からは出せないので、送る時刻を入れる。
 		body["createdAt"] = entity.ISOMillis(time.Now())
 		return body
 	case "userCreated":
-		return dummyWebhookUserLite(user1)
+		return dummyWebhookUserLite(pk, user1)
 	case "inactiveModeratorsWarning":
 		return map[string]any{"remainingTime": map[string]any{
 			"time":    100000,
@@ -354,7 +354,7 @@ func (h *Handler) SystemWebhookTest(c echo.Context) error {
 			overrideSecret = *req.Override.Secret
 		}
 	}
-	h.systemWebhookDispatcher.DispatchSystemTest(sw.ID, req.Type, dummySystemWebhookBody(req.Type), overrideURL, overrideSecret)
+	h.systemWebhookDispatcher.DispatchSystemTest(sw.ID, req.Type, dummySystemWebhookBody(h.entityPacker, req.Type), overrideURL, overrideSecret)
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -390,6 +390,8 @@ func (h *Handler) SystemWebhookUpdate(c echo.Context) error {
 	// mk-go は意図的に partial update (id 以外は省略可) を許す superset 挙動を維持
 	// する (#1772 で確認)。frontend MkSystemWebhookEditor は常に全フィールドを送る
 	// ため drop-in 互換に影響せず、partial 対応は mk-go の追加の柔軟性。
+	// #3859で本家のparamDefで検証して拒否するようになり、HTTPの経路では必須
+	// 項目の欠けとnullはhandlerに届く前に本家と同じ400になる。
 	// 存在確認 (GORM Updates(map) は 0 行影響でも nil を返すため)
 	before, err := h.systemWebhookRepo.FindByID(req.ID)
 	if err != nil && !repository.IsNotFound(err) {

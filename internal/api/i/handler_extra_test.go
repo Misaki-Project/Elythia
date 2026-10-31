@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/elythia-network/elythia/internal/api/apierr"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/core/notification"
 	"github.com/elythia-network/elythia/internal/core/role"
 	coreuser "github.com/elythia-network/elythia/internal/core/user"
@@ -39,8 +39,8 @@ func newExtraHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	noteRepo := testutil.NewMockNoteRepository()
 	piningRepo := testutil.NewMockUserNotePiningRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	h.SetFavoriteRepo(testutil.NewMockNoteFavoriteRepository())
 	return h, userRepo
 }
@@ -55,7 +55,7 @@ func newDeleteAccountHandler(t *testing.T) (*Handler, *testutil.MockUserReposito
 		role.PolicyCanDeleteAccount: true,
 		role.PolicyCanPurgeAccount:  true,
 	}}
-	h.SetRoleProvider(provider)
+	h.roleProvider = provider
 	return h, repo, provider
 }
 
@@ -143,7 +143,56 @@ func TestChangePassword_AcceptsArgon2AndStoresBcrypt(t *testing.T) {
 	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(stored), []byte("newpass")))
 	cost, err := bcrypt.Cost([]byte(stored))
 	require.NoError(t, err)
-	assert.Equal(t, passwordutil.Cost(), cost)
+	assert.Equal(t, passwordutil.DefaultCost, cost)
+}
+
+// 新しいパスワードは配線したHasherのcostでハッシュする(#3780)。
+func TestChangePassword_UsesWiredHasher(t *testing.T) {
+	const configured = bcrypt.MinCost + 1
+	hasher, err := passwordutil.NewHasher(configured)
+	require.NoError(t, err)
+	h, repo := newExtraHandler(t)
+	h.SetPasswordHasher(hasher)
+	user := setupUserWithPassword(repo, "u1", "oldpass")
+
+	rec := postExtra(h.ChangePassword, `{"currentPassword":"oldpass","newPassword":"newpass"}`, user)
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+
+	stored := *repo.Profiles["u1"].Password
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(stored), []byte("newpass")))
+	cost, err := bcrypt.Cost([]byte(stored))
+	require.NoError(t, err)
+	assert.Equal(t, configured, cost)
+}
+
+// 本家のテスト用の素通し(UserAuthService.validateOtp)は、handlerのtestModeの
+// ときだけ効き、MISSKEY_TEST_CHECK_DUPLICATED_TOTP=1なら効かない(#3780)。
+// 2FAを有効にした利用者のi/change-passwordで、正しくないコードを送って見る。
+func TestChangePassword_TOTPBypassOnlyInTestMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		testMode bool
+		env      string
+		wantCode int
+	}{
+		{name: "test mode bypasses the check", testMode: true, env: "", wantCode: http.StatusNoContent},
+		{name: "test mode with the duplicated check env validates", testMode: true, env: "1", wantCode: http.StatusForbidden},
+		{name: "production validates", testMode: false, env: "", wantCode: http.StatusForbidden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MISSKEY_TEST_CHECK_DUPLICATED_TOTP", tt.env)
+			h, repo := newExtraHandler(t)
+			h.SetTestMode(tt.testMode)
+			user := setupUserWithPassword(repo, "u1", "oldpass")
+			secret := "JBSWY3DPEHPK3PXP"
+			repo.Profiles["u1"].TwoFactorSecret = &secret
+			repo.Profiles["u1"].TwoFactorEnabled = true
+
+			rec := postExtra(h.ChangePassword, `{"currentPassword":"oldpass","newPassword":"newpass","token":"000000"}`, user)
+			assert.Equal(t, tt.wantCode, rec.Code, rec.Body.String())
+		})
+	}
 }
 
 func TestChangePassword_RejectsWrongArgon2PasswordWithoutRewrite(t *testing.T) {
@@ -159,8 +208,8 @@ func TestChangePassword_WrongPassword(t *testing.T) {
 	h, repo := newExtraHandler(t)
 	user := setupUserWithPassword(repo, "u1", "correct")
 	rec := postExtra(h.ChangePassword, `{"currentPassword":"wrong","newPassword":"x"}`, user)
-	// upstream Misskey TS は raw `throw new Error` を framework が 401 へ
-	// 変換 (#885)。drop-in 互換のため 401 に揃える (旧 mk-go は 403)。
+	// upstream は素の Error を投げて 500 INTERNAL_ERROR になる。Elythia は
+	// 400 INCORRECT_PASSWORD を返す。
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
@@ -276,7 +325,7 @@ func TestDeleteAccount_InvalidatesAllUserTokens(t *testing.T) {
 	user := setupUserWithPassword(repo, "u1", "pass")
 
 	inv := &stubTokenInvalidator{}
-	h.SetAuthInvalidator(inv)
+	h.authInvalidator = inv
 
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
@@ -313,8 +362,8 @@ func TestFavorites_NilRepo(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	piningRepo := testutil.NewMockUserNotePiningRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreuser.NewService(userRepo, noteRepo, piningRepo, idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	// favoriteRepo not set
 	rec := postExtra(h.Favorites, `{}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusOK, rec.Code)
@@ -424,8 +473,8 @@ func TestRegenerateToken_WrongPassword(t *testing.T) {
 	user := setupUserWithPassword(repo, "u1", "pass")
 	_ = user
 	rec := postExtra(h.RegenerateToken, `{"password":"wrong"}`, repo.Users["u1"])
-	// upstream Misskey TS は raw `throw new Error('incorrect password')` →
-	// framework が 401 (#885)。
+	// upstream は素の Error を投げて 500 INTERNAL_ERROR になる。Elythia は
+	// 400 INCORRECT_PASSWORD を返す。
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
@@ -468,16 +517,18 @@ func TestRegenerateToken_PublishesMyTokenRegenerated(t *testing.T) {
 	assert.Nil(t, pub.calls[0].body)
 }
 
-// stubTokenInvalidator captures InvalidateToken / InvalidateTokensForUser
+// stubTokenInvalidator captures InvalidateUserToken / InvalidateTokensForUser
 // calls for assertion. token-base (#884) と user-base (#965/#967) の両 API
 // を持つ TokenInvalidator interface を test 内で full にスタブ化する。
 type stubTokenInvalidator struct {
-	calls     []string // token-base 履歴
-	userCalls []string // user-base 履歴 (for #967 / i/delete-account)
+	calls      []string // token-base 履歴 (token)
+	tokenUsers []string // token-base 履歴 (その token の利用者)
+	userCalls  []string // user-base 履歴 (for #967 / i/delete-account)
 }
 
-func (s *stubTokenInvalidator) InvalidateToken(token string) {
+func (s *stubTokenInvalidator) InvalidateUserToken(userID, token string) {
 	s.calls = append(s.calls, token)
+	s.tokenUsers = append(s.tokenUsers, userID)
 }
 
 func (s *stubTokenInvalidator) InvalidateTokensForUser(userID string) {
@@ -494,13 +545,14 @@ func TestRegenerateToken_InvalidatesOldToken(t *testing.T) {
 	repo.Users["u1"] = user
 
 	inv := &stubTokenInvalidator{}
-	h.SetAuthInvalidator(inv)
+	h.authInvalidator = inv
 
 	rec := postExtra(h.RegenerateToken, `{"password":"pass"}`, user)
 	require.Equal(t, http.StatusNoContent, rec.Code)
 
 	require.Len(t, inv.calls, 1, "old token must be invalidated exactly once")
 	assert.Equal(t, oldToken, inv.calls[0])
+	assert.Equal(t, []string{"u1"}, inv.tokenUsers, "the other processes drop the user's entries (#3664)")
 }
 
 // --- Error path tests ---
@@ -524,8 +576,8 @@ func TestChangePassword_UpdateError(t *testing.T) {
 	failRepo.Users["u1"] = &model.User{ID: "u1"}
 	failRepo.Profiles["u1"] = &model.UserProfile{UserID: "u1", Password: &hashStr}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	rec := postExtra(h.ChangePassword, `{"currentPassword":"pass","newPassword":"new"}`, failRepo.Users["u1"])
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -537,12 +589,12 @@ func TestDeleteAccount_UpdateError(t *testing.T) {
 	failRepo.Users["u1"] = &model.User{ID: "u1"}
 	failRepo.Profiles["u1"] = &model.UserProfile{UserID: "u1", Password: &hashStr}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
-	h := NewHandler(svc, idGen)
-	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{
+	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	h.roleProvider = &stubRoleProvider{policies: map[string]any{
 		role.PolicyCanDeleteAccount: true,
 		role.PolicyCanPurgeAccount:  true,
-	}})
+	}}
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, failRepo.Users["u1"])
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -554,10 +606,31 @@ func TestRegenerateToken_UpdateError(t *testing.T) {
 	failRepo.Users["u1"] = &model.User{ID: "u1"}
 	failRepo.Profiles["u1"] = &model.UserProfile{UserID: "u1", Password: &hashStr}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	rec := postExtra(h.RegenerateToken, `{"password":"pass"}`, failRepo.Users["u1"])
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// token の書き込みに失敗したら、バックアップコードは焼かない。消費の確定 (Commit) を
+// 書き込みより前に置くと、失敗した操作のためにコードを 1 枚失う。
+func TestRegenerateToken_UpdateErrorKeepsBackupCode(t *testing.T) {
+	failRepo := &failingUpdateUserRepo{testutil.NewMockUserRepository()}
+	hash, _ := bcrypt.GenerateFromPassword([]byte("pass"), bcrypt.MinCost)
+	hashStr := string(hash)
+	token := "oldtoken0000000a"
+	failRepo.Users["u1"] = &model.User{ID: "u1", Token: &token}
+	failRepo.Profiles["u1"] = &model.UserProfile{UserID: "u1", Password: &hashStr}
+	enableTwoFactorWithBackupCodes(failRepo.MockUserRepository, "u1")
+	before := backupCodes(failRepo.MockUserRepository, "u1")
+	idGen, _ := id.NewGenerator("aidx")
+	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	rec := postExtra(h.RegenerateToken, `{"password":"pass","token":"backup1"}`, failRepo.Users["u1"])
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Equal(t, before, backupCodes(failRepo.MockUserRepository, "u1"))
 }
 
 type failingFavListRepo struct {
@@ -571,8 +644,8 @@ func (f *failingFavListRepo) ListByUser(_ string, _, _ string, _ int) ([]*model.
 func TestFavorites_ListError(t *testing.T) {
 	userRepo := testutil.NewMockUserRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(userRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreuser.NewService(userRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	h.SetFavoriteRepo(&failingFavListRepo{testutil.NewMockNoteFavoriteRepository()})
 	rec := postExtra(h.Favorites, `{}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -582,6 +655,83 @@ func TestRegenerateToken_InvalidParam(t *testing.T) {
 	h, _ := newExtraHandler(t)
 	rec := postExtra(h.RegenerateToken, `{}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// 2FA 有効なユーザーは、password が正しくても token 無しでは token を再生成できない。
+// 応答は i/change-password の 2FA gate と同じ (403 INVALID_TOKEN)。
+func TestRegenerateToken_With2FA_RequiresToken(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	before := *user.Token
+	enableTwoFactorWithTOTP(t, repo, "u1")
+
+	rec := postExtra(h.RegenerateToken, `{"password":"pass"}`, user)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, before, *repo.Users["u1"].Token, "token must not rotate without a 2FA code")
+
+	// i/change-password と同じ error (code / id / status) であること。
+	h2, repo2 := newExtraHandler(t)
+	user2 := setupUserWithPassword(repo2, "u1", "pass")
+	enableTwoFactorWithTOTP(t, repo2, "u1")
+	want := postExtra(h2.ChangePassword, `{"currentPassword":"pass","newPassword":"newpass"}`, user2)
+	require.Equal(t, http.StatusForbidden, want.Code)
+	assert.JSONEq(t, want.Body.String(), rec.Body.String())
+}
+
+// null の token (frontend は 2FA 無効時に null を送る) も token 無しとして扱う。
+func TestRegenerateToken_With2FA_NullTokenRejected(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	before := *user.Token
+	enableTwoFactorWithTOTP(t, repo, "u1")
+
+	rec := postExtra(h.RegenerateToken, `{"password":"pass","token":null}`, user)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INVALID_TOKEN")
+	assert.Equal(t, before, *repo.Users["u1"].Token)
+}
+
+// 誤った 2FA コードでは再生成しない。
+func TestRegenerateToken_With2FA_WrongTokenRejected(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	before := *user.Token
+	enableTwoFactorWithBackupCodes(repo, "u1")
+
+	rec := postExtra(h.RegenerateToken, `{"password":"pass","token":"000000"}`, user)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INVALID_TOKEN")
+	assert.Equal(t, before, *repo.Users["u1"].Token)
+	assert.Len(t, backupCodes(repo, "u1"), 2)
+}
+
+// 正しい TOTP コードなら再生成でき、token が入れ替わる。
+func TestRegenerateToken_With2FA_ValidTOTPRotatesToken(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	before := *user.Token
+	secret := enableTwoFactorWithTOTP(t, repo, "u1")
+
+	rec := postExtra(h.RegenerateToken, `{"password":"pass","token":"`+totpCode(t, secret)+`"}`, user)
+
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	require.NotNil(t, repo.Users["u1"].Token)
+	assert.NotEqual(t, before, *repo.Users["u1"].Token)
+}
+
+// 2FA 無効なユーザーは token を見ない (従来どおり password だけで通る)。
+func TestRegenerateToken_Without2FA_IgnoresToken(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	before := *user.Token
+
+	rec := postExtra(h.RegenerateToken, `{"password":"pass","token":"garbage"}`, user)
+
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	assert.NotEqual(t, before, *repo.Users["u1"].Token)
 }
 
 // --- ClaimAchievement ---
@@ -649,8 +799,8 @@ func TestClaimAchievement_UpdateError(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	piningRepo := testutil.NewMockUserNotePiningRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coreuser.NewService(&failingProfileUpdateRepo{baseRepo}, noteRepo, piningRepo, idGen)
-	h := NewHandler(svc, idGen)
+	svc := coreuser.NewService(&failingProfileUpdateRepo{baseRepo}, noteRepo, piningRepo, idGen, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	rec := postExtra(h.ClaimAchievement, `{"name":"notes1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -812,13 +962,13 @@ func TestDeleteAccount_CanDeleteAccountPolicy(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h, repo := newExtraHandler(t)
-			h.SetRoleProvider(tt.provider)
+			h.roleProvider = tt.provider
 			enq := &fakeDeleteEnqueuer{}
 			fed := &fakeAccountDeletionFed{}
 			inv := &stubTokenInvalidator{}
 			h.SetDeleteAccountEnqueuer(enq)
 			h.SetAccountDeletionFederationHook(fed)
-			h.SetAuthInvalidator(inv)
+			h.authInvalidator = inv
 			user := setupUserWithPassword(repo, "u1", "pass")
 
 			rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
@@ -876,13 +1026,13 @@ func TestDeleteAccount_CanPurgeAccountMapsToPreserveAccount(t *testing.T) {
 			for k, v := range tt.policies {
 				provider.policies[k] = v
 			}
-			h.SetRoleProvider(provider)
+			h.roleProvider = provider
 			enq := &fakeDeleteEnqueuer{}
 			fed := &fakeAccountDeletionFed{}
 			inv := &stubTokenInvalidator{}
 			h.SetDeleteAccountEnqueuer(enq)
 			h.SetAccountDeletionFederationHook(fed)
-			h.SetAuthInvalidator(inv)
+			h.authInvalidator = inv
 			user := setupUserWithPassword(repo, "u1", "pass")
 
 			rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
@@ -914,7 +1064,7 @@ func TestDeleteAccount_ResolvesPoliciesOnceForBothGates(t *testing.T) {
 			role.PolicyCanPurgeAccount:  true,
 		},
 	}}
-	h.SetRoleProvider(provider)
+	h.roleProvider = provider
 	h.SetDeleteAccountEnqueuer(&fakeDeleteEnqueuer{})
 	user := setupUserWithPassword(repo, "u1", "pass")
 
@@ -929,16 +1079,16 @@ func TestDeleteAccount_ResolvesPoliciesOnceForBothGates(t *testing.T) {
 // invalidate / enqueue の**どれより前**に 500 として落ちる。
 func TestDeleteAccount_ResolverErrorPrecedesPasswordAndTwoFactor(t *testing.T) {
 	h, repo := newExtraHandler(t)
-	h.SetRoleProvider(&stubRoleProvider{
+	h.roleProvider = &stubRoleProvider{
 		policies:  map[string]any{role.PolicyCanDeleteAccount: true, role.PolicyCanPurgeAccount: true},
 		policyErr: errors.New("resolver failed"),
-	})
+	}
 	enq := &fakeDeleteEnqueuer{}
 	fed := &fakeAccountDeletionFed{}
 	inv := &stubTokenInvalidator{}
 	h.SetDeleteAccountEnqueuer(enq)
 	h.SetAccountDeletionFederationHook(fed)
-	h.SetAuthInvalidator(inv)
+	h.authInvalidator = inv
 	user := setupUserWithPassword(repo, "u1", "pass")
 	// 2FA 有効 + 誤った password + token 無し。全部の gate が 500 より後ろ。
 	enableTwoFactorWithBackupCodes(repo, "u1")
@@ -982,14 +1132,14 @@ func TestDeleteAccount_RealRoleServiceMetaBaseFailureReturns500(t *testing.T) {
 	metaRepo.Meta = &model.Meta{ID: "x", Policies: datatypes.JSON([]byte(`{"canDeleteAccount":false}`))}
 	metaRepo.FetchErr = errors.New("meta unavailable")
 	roleIDGen, _ := id.NewGenerator("aidx")
-	h.SetRoleProvider(role.NewService(roleRepo, testutil.NewMockRoleAssignmentRepository(roleRepo), metaRepo, roleIDGen))
+	h.roleProvider = role.NewService(roleRepo, testutil.NewMockRoleAssignmentRepository(roleRepo), metaRepo, roleIDGen)
 
 	enq := &fakeDeleteEnqueuer{}
 	fed := &fakeAccountDeletionFed{}
 	inv := &stubTokenInvalidator{}
 	h.SetDeleteAccountEnqueuer(enq)
 	h.SetAccountDeletionFederationHook(fed)
-	h.SetAuthInvalidator(inv)
+	h.authInvalidator = inv
 	user := setupUserWithPassword(repo, "u1", "pass")
 
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)

@@ -23,7 +23,7 @@ func newTestHandler(t *testing.T) (*announcements.Handler, *testutil.MockAnnounc
 	t.Helper()
 	repo := testutil.NewMockAnnouncementRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	return announcements.NewHandler(repo, idGen), repo
+	return announcements.NewHandler(repo, idGen, nil), repo
 }
 
 func doPost(h func(echo.Context) error, body string, user *model.User) *httptest.ResponseRecorder {
@@ -510,6 +510,36 @@ func TestAdminList_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
+// 整数の引数は、本家の ajv の "type": "integer" と同じく 10.0 や 1e1 も受ける (#3854)。
+func TestAdminList_IntegerParamsAcceptFractionForms(t *testing.T) {
+	h, repo := newTestHandler(t)
+	repo.Items["a1"] = &model.Announcement{ID: "a1", IsActive: true}
+	repo.Items["a2"] = &model.Announcement{ID: "a2", IsActive: true}
+	rec := doPost(h.AdminList, `{"limit":1.0,"sinceDate":1e1,"untilDate":4102444800000.0}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	rec = doPost(h.AdminList, `{"limit":1e0}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var rows []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &rows))
+	assert.Len(t, rows, 1, "limit 1e0 is 1")
+}
+
+// 本家の admin/announcements/list の paramDef に offset は無い。本家は読まないので、
+// 型の違う値も通し、件数も飛ばさない (#3854)。
+func TestAdminList_OffsetIsNotRead(t *testing.T) {
+	h, repo := newTestHandler(t)
+	for _, id := range []string{"a1", "a2", "a3"} {
+		repo.Items[id] = &model.Announcement{ID: id, IsActive: true}
+	}
+	for _, body := range []string{`{"offset":2}`, `{"offset":"x"}`} {
+		rec := doPost(h.AdminList, body, nil)
+		require.Equal(t, http.StatusOK, rec.Code, body)
+		var rows []map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &rows))
+		assert.Len(t, rows, 3, body)
+	}
+}
+
 // #1967: admin/announcements/list は upstream の生 row 形 (forYou/isRead 無し、
 // imageUrl は raw)。public list 用の packAnnouncement を流用しない。
 func TestAdminList_ShapeMatchesUpstream(t *testing.T) {
@@ -620,28 +650,28 @@ func (f *failingListAnnouncementRepo) List(_ bool, _, _ int, _, _ string) ([]*mo
 	return nil, assert.AnError
 }
 
-func (f *failingListAnnouncementRepo) ListGlobal(_ bool, _, _ int, _, _ string) ([]*model.Announcement, error) {
+func (f *failingListAnnouncementRepo) ListGlobal(_ bool, _ int, _, _ string) ([]*model.Announcement, error) {
 	return nil, assert.AnError
 }
 
-func (f *failingListAnnouncementRepo) ListForUser(_ string, _ bool, _, _ int, _, _ string) ([]*model.Announcement, error) {
+func (f *failingListAnnouncementRepo) ListForUser(_ string, _ bool, _ int, _, _ string) ([]*model.Announcement, error) {
 	return nil, assert.AnError
 }
 
-func (f *failingListAnnouncementRepo) ListForAdmin(_, _ string, _, _ int, _, _ string) ([]*model.Announcement, error) {
+func (f *failingListAnnouncementRepo) ListForAdmin(_, _ string, _, _ int, _, _ string, _ time.Time) ([]*model.Announcement, error) {
 	return nil, assert.AnError
 }
 
 func TestList_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := announcements.NewHandler(&failingListAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen)
+	h := announcements.NewHandler(&failingListAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen, nil)
 	rec := doPost(h.List, `{}`, nil)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
 func TestAdminList_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := announcements.NewHandler(&failingListAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen)
+	h := announcements.NewHandler(&failingListAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen, nil)
 	rec := doPost(h.AdminList, `{}`, nil)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -654,7 +684,7 @@ func (f *failingCreateAnnouncementRepo) Create(_ *model.Announcement) error { re
 
 func TestAdminCreate_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := announcements.NewHandler(&failingCreateAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen)
+	h := announcements.NewHandler(&failingCreateAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen, nil)
 	rec := doPost(h.AdminCreate, `{"title":"x","text":"y","imageUrl":null}`, nil)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -675,7 +705,7 @@ func (f *failingUpdateAnnouncementRepo) UpdateFields(_ string, _ map[string]any)
 
 func TestAdminUpdate_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := announcements.NewHandler(&failingUpdateAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen)
+	h := announcements.NewHandler(&failingUpdateAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen, nil)
 	rec := doPost(h.AdminUpdate, `{"id":"x","title":"y"}`, nil)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
@@ -688,7 +718,7 @@ func (f *failingDeleteAnnouncementRepo) Delete(_ string) error { return assert.A
 
 func TestAdminDelete_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := announcements.NewHandler(&failingDeleteAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen)
+	h := announcements.NewHandler(&failingDeleteAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen, nil)
 	rec := doPost(h.AdminDelete, `{"id":"x"}`, nil)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
@@ -697,7 +727,7 @@ func TestReadAnnouncement_MarkReadError(t *testing.T) {
 	repo := &failingMarkReadRepo{testutil.NewMockAnnouncementRepository()}
 	repo.Items["a1"] = &model.Announcement{ID: "a1"}
 	idGen, _ := id.NewGenerator("aidx")
-	h := announcements.NewHandler(repo, idGen)
+	h := announcements.NewHandler(repo, idGen, nil)
 	rec := doPost(h.ReadAnnouncement, `{"announcementId":"a1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -711,7 +741,7 @@ func attachAnnouncementModLog(t *testing.T, h *announcements.Handler) *testutil.
 	repo := testutil.NewMockModerationLogRepository()
 	gen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	h.SetModLogService(moderationlog.New(repo, gen))
+	h.SetModLogService(moderationlog.New(repo, gen, nil))
 	return repo
 }
 
@@ -828,6 +858,56 @@ func TestAdminCreate_RequiresImageURL(t *testing.T) {
 			h, _ := newTestHandler(t)
 			rec := doPost(h.AdminCreate, tc.body, nil)
 			assert.Equal(t, tc.want, rec.Code)
+		})
+	}
+}
+
+// TestList_AcceptsIntegerValuedFractions pins that limit, sinceDate and
+// untilDate accept integer-valued fractions such as 2.0 and 1.7172e12, which
+// upstream's ajv accepts as integers (#3766).
+func TestList_AcceptsIntegerValuedFractions(t *testing.T) {
+	h, repo := newTestHandler(t)
+	idGen, _ := id.NewGenerator("aidx")
+	for _, d := range []time.Time{
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, 12, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		aid := idGen.Generate(d)
+		repo.Items[aid] = &model.Announcement{ID: aid, Title: "t", Text: "t", IsActive: true}
+	}
+	// 1.7172e12 は 2024-05-31T23:20:00Z。1月より後、6月より前。
+	for body, want := range map[string]int{
+		`{"limit":2.0}`:           2,
+		`{"sinceDate":1.7172e12}`: 2,
+		`{"untilDate":1.7172e12}`: 1,
+	} {
+		t.Run(body, func(t *testing.T) {
+			rec := doPost(h.List, body, nil)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			var resp []map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			assert.Len(t, resp, want)
+		})
+	}
+}
+
+// TestList_IgnoresOffset pins that offset, which upstream's paramDef does
+// not have, is neither read nor validated (#3766).
+func TestList_IgnoresOffset(t *testing.T) {
+	h, repo := newTestHandler(t)
+	idGen, _ := id.NewGenerator("aidx")
+	for i := range 3 {
+		aid := idGen.Generate(time.Date(2024, time.Month(i+1), 1, 0, 0, 0, 0, time.UTC))
+		repo.Items[aid] = &model.Announcement{ID: aid, Title: "t", Text: "t", IsActive: true}
+	}
+	for _, body := range []string{`{"offset":2}`, `{"offset":"x"}`} {
+		t.Run(body, func(t *testing.T) {
+			rec := doPost(h.List, body, nil)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			var resp []map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			assert.Len(t, resp, 3)
 		})
 	}
 }

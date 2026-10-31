@@ -26,7 +26,7 @@ func newService(t *testing.T) (
 	emojiRepo := testutil.NewMockEmojiRepository()
 	followingRepo := testutil.NewMockFollowingRepository()
 	idGen, _ := id.NewGenerator("aidx")
-	svc := reaction.NewService(noteRepo, reactRepo, emojiRepo, followingRepo, idGen)
+	svc := reaction.NewService(noteRepo, reactRepo, emojiRepo, followingRepo, idGen, nil, nil, nil)
 	return svc, noteRepo, reactRepo, emojiRepo, followingRepo
 }
 
@@ -208,6 +208,7 @@ func TestService_Create_RepoError(t *testing.T) {
 		testutil.NewMockEmojiRepository(),
 		testutil.NewMockFollowingRepository(),
 		idGen,
+		nil, nil, nil,
 	)
 	_, err := svc.Create(&model.User{ID: "viewer"}, "n1", "👍")
 	assert.Error(t, err)
@@ -237,6 +238,7 @@ func TestService_Create_ReplaceDeleteError(t *testing.T) {
 		testutil.NewMockEmojiRepository(),
 		testutil.NewMockFollowingRepository(),
 		idGen,
+		nil, nil, nil,
 	)
 	_, err := svc.Create(&model.User{ID: "viewer"}, "n1", "❤")
 	assert.Error(t, err)
@@ -244,7 +246,8 @@ func TestService_Create_ReplaceDeleteError(t *testing.T) {
 
 // #3272: a concurrent replacement may remove the row after FindByPair but
 // before Delete. The loser must stop before decrementing the old count or
-// publishing removal/creation side effects.
+// publishing removal/creation side effects, and reports ErrAlreadyReacted
+// (notes/reactions/create does not map ErrReactionNotFound, which was a 500).
 func TestService_Create_ReplaceConcurrentZeroAffected(t *testing.T) {
 	noteRepo := testutil.NewMockNoteRepository()
 	seedNote(noteRepo, "n1", "author", model.NoteVisibilityPublic)
@@ -262,6 +265,7 @@ func TestService_Create_ReplaceConcurrentZeroAffected(t *testing.T) {
 		testutil.NewMockEmojiRepository(),
 		testutil.NewMockFollowingRepository(),
 		idGen,
+		nil, nil, nil,
 	)
 	notifications := &recordingNotificationHook{}
 	federation := &recordingFederationHook{}
@@ -272,7 +276,7 @@ func TestService_Create_ReplaceConcurrentZeroAffected(t *testing.T) {
 
 	_, err := svc.Create(&model.User{ID: "viewer"}, "n1", "new")
 
-	assert.ErrorIs(t, err, reaction.ErrReactionNotFound)
+	assert.ErrorIs(t, err, reaction.ErrAlreadyReacted)
 	assert.Equal(t, map[string]int{"old": 1}, noteRepo.ReactionCounts["n1"])
 	assert.Equal(t, map[string]*model.NoteReaction{
 		"existing": {ID: "existing", UserID: "viewer", NoteID: "n1", Reaction: "old"},
@@ -335,6 +339,7 @@ func TestService_Delete_RepoError(t *testing.T) {
 		testutil.NewMockEmojiRepository(),
 		testutil.NewMockFollowingRepository(),
 		idGen,
+		nil, nil, nil,
 	)
 	err := svc.Delete(&model.User{ID: "viewer"}, "n1")
 	assert.Error(t, err)
@@ -415,6 +420,7 @@ func TestIsPureRenote_Variants(t *testing.T) {
 		testutil.NewMockEmojiRepository(),
 		testutil.NewMockFollowingRepository(),
 		idGen,
+		nil, nil, nil,
 	)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -489,7 +495,7 @@ func (s *stubBlockingChecker) IsBlocked(_, _ string) (bool, error) {
 func TestService_Create_Blocked(t *testing.T) {
 	svc, repo, _, _, _ := newService(t)
 	seedNote(repo, "n1", "author", model.NoteVisibilityPublic)
-	svc.SetBlockingChecker(&stubBlockingChecker{blocked: true})
+	svc.SetBlockingCheckerForTest(&stubBlockingChecker{blocked: true})
 	_, err := svc.Create(&model.User{ID: "viewer"}, "n1", "👍")
 	require.ErrorIs(t, err, reaction.ErrBlocked)
 }
@@ -497,7 +503,7 @@ func TestService_Create_Blocked(t *testing.T) {
 func TestService_Create_BlockingCheckerError(t *testing.T) {
 	svc, repo, _, _, _ := newService(t)
 	seedNote(repo, "n1", "author", model.NoteVisibilityPublic)
-	svc.SetBlockingChecker(&stubBlockingChecker{err: errStubReaction})
+	svc.SetBlockingCheckerForTest(&stubBlockingChecker{err: errStubReaction})
 	_, err := svc.Create(&model.User{ID: "viewer"}, "n1", "👍")
 	assert.ErrorIs(t, err, errStubReaction)
 }
@@ -506,7 +512,7 @@ func TestService_Create_BlockingCheckerSelfSkipped(t *testing.T) {
 	// 自分自身のノートにはblockチェックが走らない
 	svc, repo, _, _, _ := newService(t)
 	seedNote(repo, "n1", "viewer", model.NoteVisibilityPublic)
-	svc.SetBlockingChecker(&stubBlockingChecker{blocked: true})
+	svc.SetBlockingCheckerForTest(&stubBlockingChecker{blocked: true})
 	_, err := svc.Create(&model.User{ID: "viewer"}, "n1", "👍")
 	require.NoError(t, err)
 }
@@ -837,7 +843,7 @@ func TestService_Create_RoleGatedEmoji(t *testing.T) {
 	t.Run("reactor without role -> heart", func(t *testing.T) {
 		svc, repo, _, emojiRepo, _ := newService(t)
 		seedLocalEmoji(emojiRepo, "vip", false, []string{"role-vip"})
-		svc.SetUserRolesProvider(stubRoles{byUser: map[string][]*model.Role{}})
+		svc.SetUserRolesProviderForTest(stubRoles{byUser: map[string][]*model.Role{}})
 		seedNote(repo, "n1", "author", model.NoteVisibilityPublic)
 		r, err := svc.Create(&model.User{ID: "viewer"}, "n1", ":vip:")
 		require.NoError(t, err)
@@ -846,7 +852,7 @@ func TestService_Create_RoleGatedEmoji(t *testing.T) {
 	t.Run("reactor with role -> kept", func(t *testing.T) {
 		svc, repo, _, emojiRepo, _ := newService(t)
 		seedLocalEmoji(emojiRepo, "vip", false, []string{"role-vip"})
-		svc.SetUserRolesProvider(stubRoles{byUser: map[string][]*model.Role{"viewer": {{ID: "role-vip"}}}})
+		svc.SetUserRolesProviderForTest(stubRoles{byUser: map[string][]*model.Role{"viewer": {{ID: "role-vip"}}}})
 		seedNote(repo, "n1", "author", model.NoteVisibilityPublic)
 		r, err := svc.Create(&model.User{ID: "viewer"}, "n1", ":vip:")
 		require.NoError(t, err)
@@ -858,7 +864,7 @@ func TestService_Create_MediaSilencedHostHeart(t *testing.T) {
 	host := "media.bad"
 	svc, repo, _, emojiRepo, _ := newService(t)
 	emojiRepo.Emojis["custom@media.bad"] = &model.Emoji{ID: "e_m", Name: "custom"}
-	svc.SetMediaSilenceChecker(stubMediaSilence{hosts: map[string]bool{"media.bad": true}})
+	svc.SetMediaSilenceCheckerForTest(stubMediaSilence{hosts: map[string]bool{"media.bad": true}})
 	seedNote(repo, "n1", "author", model.NoteVisibilityPublic)
 	r, err := svc.Create(&model.User{ID: "ruser", Host: &host}, "n1", ":custom:")
 	require.NoError(t, err)
@@ -921,6 +927,7 @@ func TestService_Delete_ConcurrentZeroAffected(t *testing.T) {
 		testutil.NewMockEmojiRepository(),
 		testutil.NewMockFollowingRepository(),
 		idGen,
+		nil, nil, nil,
 	)
 	err := svc.Delete(&model.User{ID: "viewer"}, "n1")
 	assert.ErrorIs(t, err, reaction.ErrReactionNotFound)
@@ -977,4 +984,66 @@ func TestService_NotificationHook_SelfReactionIsNotTouched(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, svc.Delete(author, "n1"))
 	assert.Empty(t, hook.events)
+}
+
+// リモートの絵文字の、形の崩れた URL は stream に載せず、絵文字が無いときと
+// 同じく emoji=nil にする。括弧などは符号化した値を載せる。
+func TestService_NoteStreamHook_OnCreate_RemoteEmojiURLForm(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https:///remote.example/emoji/smile.webp":    "",
+		"/emoji/smile.webp":                           "",
+		"https://remote.example/emoji/smile (1).webp": "https://remote.example/emoji/smile%20%281%29.webp",
+	} {
+		svc, repo, _, emojiRepo, _ := newService(t)
+		seedNote(repo, "n1", "author", model.NoteVisibilityPublic)
+		host := "remote.example"
+		emojiRepo.Emojis["smile@remote.example"] = &model.Emoji{Name: "smile", Host: &host, PublicURL: raw}
+		hook := &recordingNoteStreamHook{}
+		svc.SetNoteStreamHook(hook)
+
+		_, err := svc.Create(&model.User{ID: "viewer"}, "n1", ":smile@remote.example:")
+		require.NoError(t, err)
+		require.Len(t, hook.reacted, 1)
+		if want == "" {
+			assert.Nil(t, hook.reacted[0].emoji, raw)
+			continue
+		}
+		require.NotNil(t, hook.reacted[0].emoji, raw)
+		assert.Equal(t, want, hook.reacted[0].emoji.URL)
+	}
+}
+
+// undoRacingDeleteRepo simulates a concurrent Undo that removes the row
+// between FindByPair and Delete: the first Delete removes it and reports 0.
+type undoRacingDeleteRepo struct {
+	*testutil.MockNoteReactionRepository
+	raced bool
+}
+
+func (u *undoRacingDeleteRepo) Delete(r *model.NoteReaction) (int64, error) {
+	if !u.raced {
+		u.raced = true
+		delete(u.Reactions, r.ID)
+		return 0, nil
+	}
+	return u.MockNoteReactionRepository.Delete(r)
+}
+
+// 付け替えの途中で並行の Undo が古いリアクションを外したときは、読み直して
+// 新しいリアクションを保存すること (連合の Like を落とさない)。
+func TestService_Create_ReplaceAfterConcurrentUndoStoresNew(t *testing.T) {
+	noteRepo := testutil.NewMockNoteRepository()
+	seedNote(noteRepo, "n1", "author", model.NoteVisibilityPublic)
+	mock := testutil.NewMockNoteReactionRepository()
+	mock.Reactions["existing"] = &model.NoteReaction{ID: "existing", UserID: "viewer", NoteID: "n1", Reaction: "👍"}
+	idGen, _ := id.NewGenerator("aidx")
+	svc := reaction.NewService(noteRepo, &undoRacingDeleteRepo{MockNoteReactionRepository: mock},
+		testutil.NewMockEmojiRepository(), testutil.NewMockFollowingRepository(), idGen, nil, nil, nil)
+	got, err := svc.Create(&model.User{ID: "viewer"}, "n1", "🎉")
+	require.NoError(t, err)
+	assert.Equal(t, "🎉", got)
+	require.Len(t, mock.Reactions, 1)
+	for _, r := range mock.Reactions {
+		assert.Equal(t, "🎉", r.Reaction)
+	}
 }

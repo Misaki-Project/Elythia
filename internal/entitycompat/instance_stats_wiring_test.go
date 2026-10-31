@@ -22,27 +22,34 @@ import "testing"
 // instance の notesCount / usersCount (InstanceCounter) と移行の followersCount
 // (SetInstanceStats) も、未配線なら黙って数えないだけなので同じく照合する。
 func TestInstanceStatsGateIsWired(t *testing.T) {
-	assertWired(t, routerGo,
+	assertWired(t, serverPkg,
 		"followingService.SetInstanceStatsGate(corefollowing.MetaInstanceStatsGate(metaRepo))",
 		"enableStatsForFederatedInstances を切っても、フォロー / 解除で instance の\n"+
 			"followersCount / followingCount が増減し続ける (#3330)")
-	assertWired(t, routerGo,
+	assertWired(t, serverPkg,
 		"chartHooks.StatsForFederatedInst = m.EnableStatsForFederatedInstances",
 		"enableStatsForFederatedInstances を切っても、instance chart の\n"+
 			"following / followers が更新され続ける (#3330)")
-	assertWired(t, routerGo,
+	assertWired(t, serverPkg,
 		"chartHooks.SetMetaSource(metaRepo.Fetch)",
 		"admin で enableStatsForFederatedInstances などを切り替えても、chart と\n"+
 			"instance の集計列が再起動まで前の設定のまま動く (#3330)")
-	assertWired(t, routerGo,
+	assertWired(t, serverPkg,
 		"federationResolver.SetNoteChartHook(chartHooks)",
 		"inbound Create や解決のついでに取り込んだリモートの投稿が、notes chart にも\n"+
 			"instance の notesCount にも数えられない (削除だけが引く) (#3330)")
-	assertWired(t, routerGo,
+	assertWired(t, serverPkg,
 		"chartHooks.InstanceCounter = instanceCounterBuffer",
 		"instance の notesCount / usersCount が一切増減しない (#3330)")
-	assertWired(t, routerGo,
+	assertWired(t, serverPkg,
 		"accountMover.SetInstanceStats(instanceRepo, corefollowing.MetaInstanceStatsGate(metaRepo), chartHooks)",
 		"リモートアカウントが移行しても、その instance の followersCount と\n"+
 			"chart が減らない (#3330)")
+	// 配送の nodeinfo の取り直しの判定は、#3829 から deliver の processor の構築子の
+	// 最後の引数。判定を反転させた関数も同じ型で渡せるので、型でも nil の検査でも
+	// 捕まらない。構築子の呼び出しを引数まで照合する。
+	assertWired(t, serverPkg,
+		"deliverProcessor := processors.NewDeliverProcessor(apClient, instanceService, processors.NewRepoSigningKeySource(keypairRepo, keypairExtraRepo), corefederation.NewSuspendedChecker(metaRepo, instanceRepo), metadataRefresher, corefollowing.MetaInstanceStatsGate(metaRepo))",
+		"enableStatsForFederatedInstances を切っても、配送のたびに相手の nodeinfo を\n"+
+			"取り直し続ける (本家は切ると取りに行かない) (#3564)")
 }

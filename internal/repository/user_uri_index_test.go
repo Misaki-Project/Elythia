@@ -67,8 +67,8 @@ func TestUserURIIndex_MatchesUpstream(t *testing.T) {
 		WHERE n.nspname = current_schema() AND c.relname = ?`, upstreamUserURIIndex).Scan(&valid).Error)
 	assert.True(t, valid, "CONCURRENTLY の構築が INVALID のまま残っていない")
 
-	up := readMigration(t, "000109_user_uri_index.up.sql")
-	down := readMigration(t, "000109_user_uri_index.down.sql")
+	up := readMigration(t, "000108_user_uri_index.up.sql")
+	down := readMigration(t, "000108_user_uri_index.down.sql")
 
 	// TS 製 DB 相当 (同名の index が既にある) に up を流しても増えない。
 	require.NoError(t, testDB.Exec(up).Error)

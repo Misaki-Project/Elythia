@@ -35,10 +35,11 @@ type TokenStore interface {
 	DeleteByID(id string) error
 }
 
-// TokenInvalidator drops a raw token from the auth middleware cache. Without
-// it, a revoked token keeps working until the 30s TTL expires.
+// TokenInvalidator drops a raw token of userID from the auth middleware
+// cache (and that user's entries on the other processes, #3664). Without it,
+// a revoked token keeps working until the 30s TTL expires.
 type TokenInvalidator interface {
-	InvalidateToken(token string)
+	InvalidateUserToken(userID, token string)
 }
 
 // IDGenerator generates access-token row IDs (aidx).
@@ -73,8 +74,8 @@ type Handler struct {
 	// auth cache の TTL (30s) の間だけ古い token が通ってしまう。
 	authInvalidator TokenInvalidator
 	// streamRevoker は失効させた token で張られた /streaming 接続を閉じる。
-	// optional。未設定だと、盗んだ code から得た token の WebSocket が
-	// 失効後も開いたまま残る。
+	// 無いと、盗んだ code から得た token の WebSocket が失効後も開いたまま残る
+	// ので、構築子の必須の引数で受ける (#3827)。
 	streamRevoker StreamRevoker
 }
 
@@ -84,42 +85,31 @@ type StreamRevoker interface {
 	RevokeAccessTokenStreams(userID, tokenID string)
 }
 
-// SetStreamRevoker wires the revoker used when a code replay revokes a token.
-func (h *Handler) SetStreamRevoker(r StreamRevoker) {
-	h.streamRevoker = r
-}
-
-// HasStreamRevoker reports whether the stream revoker is wired.
-func (h *Handler) HasStreamRevoker() bool { return h.streamRevoker != nil }
-
-// SetAuthInvalidator wires the auth middleware so code-replay revocation takes
-// effect immediately instead of after the auth cache TTL.
-func (h *Handler) SetAuthInvalidator(inv TokenInvalidator) {
-	h.authInvalidator = inv
-}
-
-// HasAuthInvalidator reports whether the auth cache invalidator is wired.
-//
-// **これが引かれるのは攻撃を検出した瞬間**。RFC 6749 4.1.2 の
-// authorization code 再利用を見つけて token を失効させる経路なので、
-// 未配線だとコードを盗んで再利用した相手の access token が、サーバーが
-// 失効を決めた後も auth cache の TTL (30s) のあいだ通り続ける (#2682)。
-func (h *Handler) HasAuthInvalidator() bool { return h.authInvalidator != nil }
-
 // NewHandler constructs the OAuth provider handler. httpClient must be
 // SSRF-guarded (it fetches attacker-suppliable client_id URLs). allowHTTP
 // permits http client_id schemes (tests only). renderConsent serves the
-// consent page.
-func NewHandler(store Store, httpClient *http.Client, userRepo UserResolver, tokenRepo TokenStore, idGen IDGenerator, issuer string, allowHTTP bool, renderConsent ConsentRenderer) *Handler {
+// consent page. authInvalidator is the auth middleware, so code-replay
+// revocation takes effect immediately instead of after the auth cache TTL.
+//
+// authInvalidator が引かれるのは攻撃を検出した瞬間 (RFC 6749 4.1.2 の
+// authorization code の再利用)。無いと、コードを盗んで再利用した相手の
+// access token が、失効を決めた後も auth cache の TTL のあいだ通り続ける (#2682)。
+//
+// streamRevoker closes the /streaming connections of the token a code replay
+// revokes. 無いと、その token で張られた WebSocket が失効後も開いたまま残るので、
+// authInvalidator と同じく構築子の必須の引数で受ける (#3827)。
+func NewHandler(store Store, httpClient *http.Client, userRepo UserResolver, tokenRepo TokenStore, idGen IDGenerator, issuer string, allowHTTP bool, renderConsent ConsentRenderer, authInvalidator TokenInvalidator, streamRevoker StreamRevoker) *Handler {
 	return &Handler{
-		store:         store,
-		httpClient:    httpClient,
-		userRepo:      userRepo,
-		tokenRepo:     tokenRepo,
-		idGen:         idGen,
-		issuer:        issuer,
-		allowHTTP:     allowHTTP,
-		renderConsent: renderConsent,
+		store:           store,
+		httpClient:      httpClient,
+		userRepo:        userRepo,
+		tokenRepo:       tokenRepo,
+		idGen:           idGen,
+		issuer:          issuer,
+		allowHTTP:       allowHTTP,
+		renderConsent:   renderConsent,
+		authInvalidator: authInvalidator,
+		streamRevoker:   streamRevoker,
 	}
 }
 
@@ -244,6 +234,13 @@ func (h *Handler) Decision(c echo.Context) error {
 	if err != nil || user == nil {
 		return directError(c, "No such user")
 	}
+	// **プラグインが管理するアカウント (#3468) には認可コードを出さない。**
+	// login_token は auth middleware を通らない (form の値なので) ため、
+	// 外からの native token を拒否する gate がここには効かない。居ない利用者と
+	// 同じ応答にする。
+	if user.IsPluginManaged() {
+		return directError(c, "No such user")
+	}
 
 	code := misc.SecureRandomString(tokenLen, misc.AlphanumericChars)
 	g := &grant{
@@ -332,7 +329,7 @@ func (h *Handler) Token(c echo.Context) error {
 				slog.Warn("oauth: failed to revoke token on code replay", "tokenId", tid, "err", derr)
 			} else {
 				if raw != "" && h.authInvalidator != nil {
-					h.authInvalidator.InvalidateToken(raw)
+					h.authInvalidator.InvalidateUserToken(g.UserID, raw)
 				}
 				// その token で既に張られた WebSocket も閉じる (mk-go 独自)。
 				if h.streamRevoker != nil {

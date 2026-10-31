@@ -40,12 +40,17 @@ type Creator struct {
 	idGen     id.Generator
 	publisher MainStreamPublisher
 	broadcast BroadcastPublisher
+	// entityPacker は entity を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3796)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // NewCreator constructs a Creator. publisher / broadcast may be nil to disable
 // the corresponding stream emit (graceful for tests / partial wiring)。
-func NewCreator(repo Repo, idGen id.Generator, publisher MainStreamPublisher, broadcast BroadcastPublisher) *Creator {
-	return &Creator{repo: repo, idGen: idGen, publisher: publisher, broadcast: broadcast}
+// entityPacker is the Packer this Creator packs entities with (#3796); 無いと
+// お知らせの imageUrl を生のまま流すので、構築子の必須の引数で受ける (#3823)。
+func NewCreator(repo Repo, idGen id.Generator, publisher MainStreamPublisher, broadcast BroadcastPublisher, entityPacker *entity.Packer) *Creator {
+	return &Creator{repo: repo, idGen: idGen, publisher: publisher, broadcast: broadcast, entityPacker: entityPacker}
 }
 
 // Create persists the announcement and, for a per-user announcement
@@ -59,7 +64,7 @@ func (c *Creator) Create(a *model.Announcement) error {
 		return err
 	}
 	// #2106 L52: broadcast event は me-less なので viewerID="" (forYou=false)。
-	body := map[string]any{"announcement": entity.PackAnnouncement(a, c.idGen, false, "")}
+	body := map[string]any{"announcement": c.entityPacker.PackAnnouncement(a, c.idGen, false, "")}
 	if a.UserID != nil {
 		if c.publisher != nil {
 			c.publisher.PublishMainEvent(*a.UserID, "announcementCreated", body)

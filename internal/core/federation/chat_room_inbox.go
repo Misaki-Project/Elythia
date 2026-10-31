@@ -10,6 +10,7 @@ import (
 	"github.com/elythia-network/elythia/internal/activitypub"
 	corechat "github.com/elythia-network/elythia/internal/core/chat"
 	"github.com/elythia-network/elythia/internal/model"
+	"github.com/elythia-network/elythia/internal/repository"
 )
 
 // ChatRoomReceiver wires the chat service's room-federation operations into the
@@ -43,8 +44,11 @@ func (p *Processor) SetChatRoomReceiver(r ChatRoomReceiver) {
 // 以前の id 引きは room が無くても no-op で成功していたので、この経路は
 // 無かった。生で返すと、取り込んでいない room への Accept / Reject が retry を
 // 使い切って dead になる。
+//
+// 満員 (ErrRoomFull) も送り直しで直らない (空いたら相手が承諾し直す)。招待を
+// 作る側と同じく受け取って捨てる。ブロックの間柄 (ErrChatBlocked) も同じ。
 func nonRetryableChatRoomErr(err error) error {
-	if errors.Is(err, corechat.ErrNotFound) || errors.Is(err, corechat.ErrInvalidTarget) {
+	if errors.Is(err, corechat.ErrNotFound) || errors.Is(err, corechat.ErrInvalidTarget) || errors.Is(err, corechat.ErrRoomFull) || errors.Is(err, corechat.ErrChatBlocked) {
 		return ErrUnsupportedActivity
 	}
 	return err
@@ -174,8 +178,14 @@ func (p *Processor) handleChatRoomInvite(act genericActivity) error {
 		slog.Warn("chat room invite: missing target", "actor", act.Actor)
 		return ErrUnsupportedActivity
 	}
-	invitee, err := p.resolveTargetUser(env.Target)
-	if err != nil || invitee == nil || !invitee.IsLocal() {
+	invitee, err := p.resolveTargetUser(env.Target, inboundActorHost(act.Actor))
+	if errors.Is(err, ErrInboundLocalReferenceUnavailable) {
+		return err
+	}
+	if err != nil && !repository.IsNotFound(err) {
+		return err
+	}
+	if invitee == nil || !invitee.IsLocal() {
 		slog.Warn("chat room invite: invitee is not a local user", "target", env.Target)
 		return ErrUnsupportedActivity
 	}

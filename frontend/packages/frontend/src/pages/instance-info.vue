@@ -47,6 +47,15 @@ SPDX-License-Identifier: AGPL-3.0-only
 							{{ i18n.ts._delivery._type[suspensionState] }}
 						</template>
 					</MkKeyValue>
+					<!-- isInboxSuspended は Elythia 独自 (#3362)。本家のサーバーでは欠けるので、行ごと出さない。 -->
+					<MkKeyValue v-if="instance.isInboxSuspended != null">
+						<template #key>
+							{{ i18n.ts._mkgoSuspendedSoftware.inboxStatus }}
+						</template>
+						<template #value>
+							{{ instance.isInboxSuspended ? i18n.ts._mkgoSuspendedSoftware.inboxSuspended : i18n.ts._mkgoSuspendedSoftware.inboxNotSuspended }}
+						</template>
+					</MkKeyValue>
 					<MkButton v-if="suspensionState === 'none'" :disabled="!instance" danger @click="stopDelivery">{{ i18n.ts._delivery.stop }}</MkButton>
 					<MkButton v-if="suspensionState !== 'none'" :disabled="!instance || suspensionState == 'softwareSuspended'" @click="resumeDelivery">{{ i18n.ts._delivery.resume }}</MkButton>
 					<MkSwitch v-model="isBlocked" :disabled="!meta || !instance" @update:modelValue="toggleBlock">{{ i18n.ts.blockThisInstance }}</MkSwitch>
@@ -183,6 +192,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 <script lang="ts" setup>
 import { ref, computed, watch, markRaw } from 'vue';
 import * as Misskey from 'misskey-js';
+import type * as Elythia from 'elythia-js';
 import type { ChartSrc } from '@/components/MkChart.vue';
 import MkChart from '@/components/MkChart.vue';
 import MkObjectView from '@/components/MkObjectView.vue';
@@ -237,7 +247,7 @@ const {
 	initialValue: 'instance-requests',
 });
 const meta = ref<Misskey.entities.AdminMetaResponse | null>(null);
-const instance = ref<Misskey.entities.FederationInstance | null>(null);
+const instance = ref<Elythia.FederationInstance | null>(null);
 const suspensionState = ref<'none' | 'manuallySuspended' | 'goneSuspended' | 'autoSuspendedForNotResponding' | 'softwareSuspended'>('none');
 const isBlocked = ref(false);
 const isSilenced = ref(false);
@@ -339,14 +349,8 @@ async function resumeDelivery(): Promise<void> {
 	});
 }
 
-// mk-go: admin/federation/check-host (#3055) の応答。internal/core/remotecheck の
-// Report と同じ形 (misskey-js の型に無いので手で持つ)。
-type CheckStatus = 'ok' | 'warn' | 'fail' | 'skip';
-type CheckReport = {
-	host: string;
-	ok: boolean;
-	results: { name: string; status: CheckStatus; detail: string; hint?: string }[];
-};
+// mk-go: admin/federation/check-host (#3055) の応答。results は self-check と同じ形。
+type CheckReport = Elythia.RemoteCheckReport;
 
 const checkAccount = ref('');
 const checking = ref(false);
@@ -363,8 +367,8 @@ async function runCheck(): Promise<void> {
 	checking.value = true;
 	checkReport.value = null;
 	try {
-		// endpoint 名の cast は misskey-js の型に存在しないため (mk-go 独自)。
-		checkReport.value = await misskeyApi('admin/federation/check-host' as never, { host: props.host, account: checkAccount.value } as never) as unknown as CheckReport;
+		const res = await misskeyApi('admin/federation/check-host', { host: props.host, account: checkAccount.value });
+		checkReport.value = res;
 	} catch (err) {
 		const code = (err as { code?: string } | null)?.code;
 		os.alert({

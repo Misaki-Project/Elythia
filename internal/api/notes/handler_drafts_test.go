@@ -299,7 +299,7 @@ func TestDraftsCreate_BlockedAndChannelValidation(t *testing.T) {
 	h.queryService = corenote.NewQueryService(noteRepo, testutil.NewMockFollowingRepository())
 	blk := testutil.NewMockBlockingRepository()
 	blk.Blockings["b1"] = &model.Blocking{ID: "b1", BlockerID: "blocker", BlockeeID: "u1"}
-	h.SetBlockingRepo(blk)
+	h.blockingRepo = blk
 	chRepo := testutil.NewMockChannelRepository()
 	owner := "owner"
 	chRepo.Channels["ch1"] = &model.Channel{ID: "ch1", Name: "c", UserID: &owner, AllowRenoteToExternal: false}
@@ -544,9 +544,9 @@ func TestDraftsCreate_NoteDraftLimitExceeded(t *testing.T) {
 	h, repo := newDraftHandlerWithRepo()
 	repo.drafts["d1"] = &model.NoteDraft{ID: "d1", UserID: "u1"}
 	repo.drafts["d2"] = &model.NoteDraft{ID: "d2", UserID: "u1"}
-	h.SetPolicyProvider(&draftStubPolicyProvider{policies: map[string]any{
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{
 		"noteDraftLimit": 2,
-	}})
+	}}
 	rec := postDraft(h.DraftsCreate, `{"text":"third"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "TOO_MANY_DRAFTS")
@@ -554,9 +554,9 @@ func TestDraftsCreate_NoteDraftLimitExceeded(t *testing.T) {
 
 func TestDraftsCreate_NoteDraftLimit_PassesUnderLimit(t *testing.T) {
 	h, _ := newDraftHandlerWithRepo()
-	h.SetPolicyProvider(&draftStubPolicyProvider{policies: map[string]any{
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{
 		"noteDraftLimit": 10,
-	}})
+	}}
 	rec := postDraft(h.DraftsCreate, `{"text":"draft"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
@@ -656,7 +656,7 @@ func TestDraftsCreate_UnownedFileRejected(t *testing.T) {
 	h, repo := newDraftHandlerWithRepo()
 	fileRepo := testutil.NewMockDriveFileRepository()
 	seedDraftFile(fileRepo, "f1", "u1")
-	h.SetDriveFileRepo(fileRepo)
+	h.driveFileRepo = fileRepo
 	// f2 は存在しない (= 所有検証で落ちる)。
 	rec := postDraft(h.DraftsCreate, `{"text":"t","fileIds":["f1","f2"]}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -670,7 +670,7 @@ func TestDraftsCreate_OtherUserFileRejected(t *testing.T) {
 	h, _ := newDraftHandlerWithRepo()
 	fileRepo := testutil.NewMockDriveFileRepository()
 	seedDraftFile(fileRepo, "f1", "someone-else")
-	h.SetDriveFileRepo(fileRepo)
+	h.driveFileRepo = fileRepo
 	rec := postDraft(h.DraftsCreate, `{"text":"t","fileIds":["f1"]}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "NO_SUCH_FILE")
@@ -681,7 +681,7 @@ func TestDraftsUpdate_UnownedFileRejected(t *testing.T) {
 	h, repo := newDraftHandlerWithRepo()
 	repo.drafts["d1"] = &model.NoteDraft{ID: "d1", UserID: "u1", Visibility: "public"}
 	fileRepo := testutil.NewMockDriveFileRepository()
-	h.SetDriveFileRepo(fileRepo)
+	h.driveFileRepo = fileRepo
 	rec := postDraft(h.DraftsUpdate, `{"draftId":"d1","fileIds":["ghost"]}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "NO_SUCH_FILE")
@@ -694,7 +694,7 @@ func TestDraftsCreate_OwnedFilesResolvedInOrder(t *testing.T) {
 	fileRepo := testutil.NewMockDriveFileRepository()
 	seedDraftFile(fileRepo, "f1", "u1")
 	seedDraftFile(fileRepo, "f2", "u1")
-	h.SetDriveFileRepo(fileRepo)
+	h.driveFileRepo = fileRepo
 	// fileIds を逆順 [f2,f1] で渡し、その順で files が並ぶことを確認。
 	rec := postDraft(h.DraftsCreate, `{"text":"t","fileIds":["f2","f1"]}`, &model.User{ID: "u1"})
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -945,9 +945,9 @@ func TestDraftsCreate_ScheduledNoteLimitExceeded(t *testing.T) {
 	h, repo := newDraftHandlerWithRepo()
 	repo.drafts["d1"] = &model.NoteDraft{ID: "d1", UserID: "u1", IsActuallyScheduled: true}
 	repo.drafts["d2"] = &model.NoteDraft{ID: "d2", UserID: "u1", IsActuallyScheduled: true}
-	h.SetPolicyProvider(&draftStubPolicyProvider{policies: map[string]any{
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{
 		"scheduledNoteLimit": 2,
-	}})
+	}}
 	body := fmt.Sprintf(`{"text":"third","scheduledAt":%d,"isActuallyScheduled":true}`, futureMs(time.Hour))
 	rec := postDraft(h.DraftsCreate, body, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -1209,4 +1209,166 @@ func TestThreadMutingCreate_ExistsDBFailureIsNot4xx(t *testing.T) {
 	// body も見る。status だけだと Create 失敗側 (kind:client) と取り違えても通る。
 	assert.Contains(t, rec.Body.String(), "INTERNAL_ERROR")
 	assert.Contains(t, rec.Body.String(), `"kind":"server"`)
+}
+
+// draftLengthCases are the upstream drafts/create.ts / update.ts paramDef
+// length limits, each at the boundary: the last accepted value and the first
+// rejected one.
+func draftLengthCases() []struct {
+	name   string
+	params string
+	ok     bool
+} {
+	q := func(s string) string { return strconv.Quote(s) }
+	choices := func(n int, s string) string {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = q(s + strconv.Itoa(i))
+		}
+		return `{"choices":[` + strings.Join(parts, ",") + `]}`
+	}
+	ids := func(n int) string {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = q("f" + strconv.Itoa(i))
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	}
+	return []struct {
+		name   string
+		params string
+		ok     bool
+	}{
+		// 上限は rune で数える (あ は 1 文字)
+		{"text at the limit", `"text":` + q(strings.Repeat("あ", maxNoteTextLength)), true},
+		{"text over the limit", `"text":` + q(strings.Repeat("あ", maxNoteTextLength+1)), false},
+		{"cw at the limit", `"cw":` + q(strings.Repeat("あ", 100)), true},
+		{"cw over the limit", `"cw":` + q(strings.Repeat("あ", 101)), false},
+		{"empty cw", `"cw":""`, false},
+		{"null cw", `"cw":null`, true},
+		{"hashtag at the limit", `"hashtag":` + q(strings.Repeat("あ", 200)), true},
+		{"hashtag over the limit", `"hashtag":` + q(strings.Repeat("あ", 201)), false},
+		{"files at the limit", `"fileIds":` + ids(16), true},
+		{"too many files", `"fileIds":` + ids(17), false},
+		{"poll choices at the limit", `"poll":` + choices(10, strings.Repeat("あ", 49)), true},
+		{"too many poll choices", `"poll":` + choices(11, "c"), false},
+		{"poll choice too long", `"poll":` + choices(2, strings.Repeat("あ", 50)), false},
+		{"empty poll choice", `"poll":{"choices":["a",""]}`, false},
+	}
+}
+
+// TestDraftsCreate_LengthLimits checks that drafts/create rejects what upstream
+// paramDef rejects, before saving anything.
+func TestDraftsCreate_LengthLimits(t *testing.T) {
+	for _, tc := range draftLengthCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h, repo := newDraftHandlerWithRepo()
+			rec := postDraft(h.DraftsCreate, `{`+tc.params+`}`, &model.User{ID: "u1"})
+			if !tc.ok {
+				assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+				assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+				assert.Empty(t, repo.drafts, "rejected drafts are not saved")
+				return
+			}
+			// 長さの検査を通ったものは、他の検査 (ファイルの所有など) の前に落ちない
+			assert.NotContains(t, rec.Body.String(), "INVALID_PARAM")
+		})
+	}
+}
+
+// TestDraftsUpdate_LengthLimits checks the same limits on drafts/update,
+// leaving the draft unchanged when rejected.
+func TestDraftsUpdate_LengthLimits(t *testing.T) {
+	for _, tc := range draftLengthCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			h, repo := newDraftHandlerWithRepo()
+			text := "old"
+			repo.drafts["d1"] = &model.NoteDraft{ID: "d1", UserID: "u1", Text: &text, Visibility: "public"}
+			rec := postDraft(h.DraftsUpdate, `{"draftId":"d1",`+tc.params+`}`, &model.User{ID: "u1"})
+			if !tc.ok {
+				assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+				assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+				assert.Equal(t, "old", *repo.drafts["d1"].Text, "rejected updates leave the draft unchanged")
+				return
+			}
+			assert.NotContains(t, rec.Body.String(), "INVALID_PARAM")
+		})
+	}
+}
+
+// The length limits come before the draft lookup on update, as upstream
+// paramDef is checked before the endpoint runs.
+func TestDraftsUpdate_LengthLimitsBeforeLookup(t *testing.T) {
+	h, _ := newDraftHandlerWithRepo()
+	rec := postDraft(h.DraftsUpdate, `{"draftId":"missing","text":`+strconv.Quote(strings.Repeat("a", maxNoteTextLength+1))+`}`, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+}
+
+// 負の noteDraftLimit / scheduledNoteLimit は「作れない」こと (upstream の `count >= limit`)。
+func TestDraftsCreate_NegativeLimitsDeny(t *testing.T) {
+	h, _ := newDraftHandlerWithRepo()
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{
+		"noteDraftLimit": -1,
+	}}
+	rec := postDraft(h.DraftsCreate, `{"text":"draft"}`, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "TOO_MANY_DRAFTS")
+
+	h2, _ := newDraftHandlerWithRepo()
+	h2.policyProvider = &draftStubPolicyProvider{policies: map[string]any{
+		"noteDraftLimit":     10,
+		"scheduledNoteLimit": -1,
+	}}
+	body := fmt.Sprintf(`{"text":"s","scheduledAt":%d,"isActuallyScheduled":true}`, futureMs(time.Hour))
+	rec = postDraft(h2.DraftsCreate, body, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "TOO_MANY_SCHEDULED_NOTES")
+}
+
+// 予約していない下書きを更新で予約にするときも scheduledNoteLimit を見ること
+// (upstream NoteDraftService.update)。既に予約している下書きの時刻の変更は
+// 数え直さない。
+func TestDraftsUpdate_ScheduledNoteLimit(t *testing.T) {
+	h, repo := newDraftHandlerWithRepo()
+	future := time.Now().Add(time.Hour)
+	repo.drafts["d1"] = &model.NoteDraft{ID: "d1", UserID: "u1", IsActuallyScheduled: true, ScheduledAt: &future}
+	repo.drafts["d2"] = &model.NoteDraft{ID: "d2", UserID: "u1", IsActuallyScheduled: true, ScheduledAt: &future}
+	repo.drafts["d3"] = &model.NoteDraft{ID: "d3", UserID: "u1"}
+	h.policyProvider = &draftStubPolicyProvider{policies: map[string]any{
+		"scheduledNoteLimit": 2,
+	}}
+	body := fmt.Sprintf(`{"draftId":"d3","scheduledAt":%d,"isActuallyScheduled":true}`, futureMs(time.Hour))
+	rec := postDraft(h.DraftsUpdate, body, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "TOO_MANY_SCHEDULED_NOTES")
+	assert.Contains(t, rec.Body.String(), "02f5df79-08ae-4a33-8524-f1503c8f6212")
+	assert.False(t, repo.drafts["d3"].IsActuallyScheduled, "上限を超えて予約にした")
+
+	body = fmt.Sprintf(`{"draftId":"d1","scheduledAt":%d,"isActuallyScheduled":true}`, futureMs(2*time.Hour))
+	rec = postDraft(h.DraftsUpdate, body, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusOK, rec.Code, "予約済みの下書きの時刻の変更は通す: %s", rec.Body.String())
+}
+
+// 列に入らない値 (NUL) を含む下書きは、作成でも更新でも INVALID_PARAM に
+// すること (保存で 500 にしない。notes/create と同じ)。
+func TestDrafts_RejectUnstorableText(t *testing.T) {
+	for _, body := range []string{
+		`{"text":"a\u0000b"}`,
+		`{"text":"ok","cw":"c\u0000w"}`,
+		`{"text":"ok","hashtag":"t\u0000g"}`,
+		`{"text":"ok","poll":{"choices":["x\u0000","y"],"multiple":false}}`,
+	} {
+		h, repo := newDraftHandlerWithRepo()
+		rec := postDraft(h.DraftsCreate, body, &model.User{ID: "u1"})
+		assert.Equal(t, http.StatusBadRequest, rec.Code, body)
+		assert.Contains(t, rec.Body.String(), "INVALID_PARAM", body)
+
+		text := "old"
+		repo.drafts["d1"] = &model.NoteDraft{ID: "d1", UserID: "u1", Text: &text, Visibility: "public"}
+		upd := `{"draftId":"d1",` + body[1:]
+		rec = postDraft(h.DraftsUpdate, upd, &model.User{ID: "u1"})
+		assert.Equal(t, http.StatusBadRequest, rec.Code, upd)
+		assert.Equal(t, "old", *repo.drafts["d1"].Text, upd)
+	}
 }

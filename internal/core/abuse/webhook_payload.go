@@ -25,13 +25,13 @@ type UserLookups struct {
 // とは形が違うので、あちらの packer を流用しない。
 //
 // createdAt は本家に無い。mk-go が前から送っていた項目で、消すと受け取る側が
-// 壊れうるので、追加の項目として残す (docs/divergence.md 1-1b)。
+// 壊れうるので、追加の項目として残す (docs/divergence/api.md 1-1b)。
 //
 // 本家の UserLite はリモートの利用者に instance を付け、emojis を絵文字の URL に
 // 解決する (UserEntityService.pack)。PackUserLite だけではどちらも付かないので、
 // 他の packer と同じ resolver を通す。Flag の通報者は必ずリモートなので、ここを
 // 省くと Flag 経由の通報だけ本文の形が変わる。
-func WebhookPayload(report *model.AbuseUserReport, reporter, target, assignee *model.User, lookups UserLookups, idGen id.Generator) map[string]any {
+func WebhookPayload(pk *entity.Packer, report *model.AbuseUserReport, reporter, target, assignee *model.User, lookups UserLookups, idGen id.Generator) map[string]any {
 	users := make([]*model.User, 0, 3)
 	for _, u := range []*model.User{reporter, target, assignee} {
 		if u != nil {
@@ -50,7 +50,7 @@ func WebhookPayload(report *model.AbuseUserReport, reporter, target, assignee *m
 		if u == nil {
 			return nil
 		}
-		lite := entity.PackUserLite(u)
+		lite := pk.PackUserLite(u)
 		instances.FillUserLite(&lite)
 		emojis.PopulateUserEmojis(u, &lite)
 		return &lite

@@ -25,23 +25,10 @@ import (
 	"github.com/elythia-network/elythia/internal/testutil"
 )
 
-// unreachablePort is a TCP port nothing listens on, so dialing it fails fast.
-//
-// 実際に listen して閉じたポートを使う。固定の 1 番などは環境によって
-// フィルタされ、拒否ではなくタイムアウトになることがある。
-func unreachablePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
-	return port
-}
-
 // writeConfig writes a minimal configuration file and returns its path.
 func writeConfig(t *testing.T, port int, extra string) string {
 	t.Helper()
-	dead := unreachablePort(t)
+	dead := testutil.DeadPort(t)
 	body := fmt.Sprintf(`url: http://127.0.0.1:%d/
 port: %d
 db:
@@ -74,6 +61,7 @@ func TestDefaultEnv_UsesProcessStreamsAndRealDB(t *testing.T) {
 	assert.NotNil(t, e.closeDB)
 	assert.NotNil(t, e.silenceRedis)
 	assert.Equal(t, "migration", e.migrationsDir)
+	assert.Equal(t, "migration/local", e.localMigrationsDir)
 }
 
 func TestSubcommands_FlagHandling(t *testing.T) {
@@ -164,7 +152,7 @@ func TestHealthcheck(t *testing.T) {
 	})
 	t.Run("nothing listening", func(t *testing.T) {
 		e, _, stderr := testEnv()
-		path := writeConfig(t, unreachablePort(t), "")
+		path := writeConfig(t, testutil.DeadPort(t), "")
 		assert.Equal(t, 1, healthcheck(e, []string{"-config", path}))
 		assert.Contains(t, stderr.String(), "healthcheck: ")
 	})
@@ -188,7 +176,7 @@ func TestDoctor_WithDatabaseAndRedis(t *testing.T) {
 	}
 	// Redis は繋がらない宛先にする。接続を作る枝を通すことが目的で、
 	// 検査そのものは FAIL になる。
-	path := writeConfig(t, 3000, fmt.Sprintf("redis:\n  host: 127.0.0.1\n  port: %d\n", unreachablePort(t)))
+	path := writeConfig(t, 3000, fmt.Sprintf("redis:\n  host: 127.0.0.1\n  port: %d\n", testutil.DeadPort(t)))
 	assert.Equal(t, 1, doctor(e, []string{"-config", path}))
 	assert.True(t, closed, "doctor must close the DB it opened")
 	assert.Contains(t, stdout.String(), "FAIL")
@@ -203,6 +191,35 @@ func TestCountMigrations(t *testing.T) {
 	assert.Equal(t, 0, countMigrations(filepath.Join(dir, "absent")))
 	// 不正なパターンは Glob がエラーを返す。数えられないときは 0 に倒す。
 	assert.Equal(t, 0, countMigrations("["))
+}
+
+func TestLatestLocalMigration(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"000001_a.up.sql", "000001_a.down.sql", "900003_b.up.sql", "README.md"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), nil, 0o600))
+	}
+	assert.Equal(t, int64(900003), latestLocalMigration(dir))
+	assert.Zero(t, latestLocalMigration(filepath.Join(dir, "absent")))
+	// ディレクトリでないものは読めない。比較を飛ばす 0 に倒す。
+	assert.Zero(t, latestLocalMigration(filepath.Join(dir, "README.md")))
+}
+
+// fork の系列を同梱しているのに当たっていなければ、doctor は FAIL にする (#3428)。
+func TestDoctor_DetectsUnappliedLocalMigrations(t *testing.T) {
+	e, stdout, _ := testEnv()
+	db := testutil.MustOpenTestDB()
+	testutil.ApplyMigrations(db)
+	require.NoError(t, db.Exec(`DROP TABLE IF EXISTS schema_migrations_local`).Error)
+	e.openDB = func(*config.Config) (*gorm.DB, error) { return db, nil }
+	e.closeDB = func(*gorm.DB) {}
+	// core の本数比較は飛ばす (このテストの関心は local だけ)。
+	e.migrationsDir = filepath.Join(t.TempDir(), "absent")
+	e.localMigrationsDir = t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(e.localMigrationsDir, "000001_fork.up.sql"), nil, 0o600))
+
+	path := writeConfig(t, 3000, "")
+	assert.Equal(t, 1, doctor(e, []string{"-config", path}))
+	assert.Contains(t, stdout.String(), "schema_migrations_local を読めない")
 }
 
 func TestStatusMark(t *testing.T) {

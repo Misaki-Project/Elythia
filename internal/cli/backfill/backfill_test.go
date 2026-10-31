@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,6 +52,7 @@ var commands = map[string]func(env, []string) int{
 	"emoji-system-file": emojiSystemFile,
 	"instance-counts":   instanceCounts,
 	"note-tags":         noteTags,
+	"hashtag-mentions":  hashtagMentions,
 	"remote-host":       remoteHost,
 }
 
@@ -99,6 +99,7 @@ func TestExportedEntryPoints_MissingConfig(t *testing.T) {
 		"instance-counts":   InstanceCounts,
 		"note-tags":         NoteTags,
 		"remote-host":       RemoteHost,
+		"hashtag-mentions":  HashtagMentions,
 	} {
 		assert.Equal(t, 1, run([]string{"-config", missing}), name)
 	}
@@ -126,16 +127,12 @@ func TestDefaultEnv(t *testing.T) {
 	cancel()
 	<-ctx.Done()
 	// 誰も listen していない宛先へは、接続確認の段で失敗する。
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
 	cfg := &config.Config{}
 	cfg.DB.Host = "127.0.0.1"
-	cfg.DB.Port = port
+	cfg.DB.Port = testutil.DeadPort(t)
 	cfg.DB.User = "none"
 	cfg.DB.DB = "none"
-	_, err = e.openDB(cfg)
+	_, err := e.openDB(cfg)
 	assert.Error(t, err)
 }
 
@@ -267,6 +264,45 @@ func TestNoteTags(t *testing.T) {
 			return maintenance.NoteTagsBackfillResult{}, errBoom
 		}
 		assert.Equal(t, 1, noteTags(h.e, []string{"-from", "n9"}))
+		assert.Contains(t, h.log.String(), `backfill batch (cursor="n9"): boom`)
+	})
+}
+
+func TestHashtagMentions(t *testing.T) {
+	t.Run("walks the cursor", func(t *testing.T) {
+		h := newHarness()
+		var cursors []string
+		var seens []maintenance.HashtagMentionsSeen
+		results := []maintenance.HashtagMentionsBackfillResult{{Scanned: 3, Removed: 2, Deleted: 1, LastID: "n3"}, {}}
+		h.e.hashtagMentionsBatch = func(_ *gorm.DB, from string, n int, dry bool, seen maintenance.HashtagMentionsSeen) (maintenance.HashtagMentionsBackfillResult, error) {
+			cursors = append(cursors, from)
+			// 実行全体で同じ seen を渡す。1 回目に入れた組が 2 回目にも見える。
+			require.NotNil(t, seen)
+			if len(seens) == 0 {
+				seen[[2]string{"u", "t"}] = struct{}{}
+			} else {
+				assert.Contains(t, seen, [2]string{"u", "t"})
+			}
+			seens = append(seens, seen)
+			assert.Equal(t, 1000, n)
+			assert.True(t, dry)
+			r := results[0]
+			results = results[1:]
+			return r, nil
+		}
+		assert.Equal(t, 0, hashtagMentions(h.e, []string{"-dry-run"}))
+		assert.Equal(t, []string{"", "n3"}, cursors)
+		assert.Len(t, seens, 2)
+		assert.Contains(t, h.log.String(), "batch scanned=3 removed=2 deleted=1 cursor=n3 (total scanned=3 removed=2 deleted=1)")
+		assert.Contains(t, h.log.String(), "done [dry-run (no writes)]: scanned=3 removed=2 deleted=1")
+		assert.Equal(t, []time.Duration{100 * time.Millisecond}, h.sleeps)
+	})
+	t.Run("error", func(t *testing.T) {
+		h := newHarness()
+		h.e.hashtagMentionsBatch = func(*gorm.DB, string, int, bool, maintenance.HashtagMentionsSeen) (maintenance.HashtagMentionsBackfillResult, error) {
+			return maintenance.HashtagMentionsBackfillResult{}, errBoom
+		}
+		assert.Equal(t, 1, hashtagMentions(h.e, []string{"-from", "n9"}))
 		assert.Contains(t, h.log.String(), `backfill batch (cursor="n9"): boom`)
 	})
 }

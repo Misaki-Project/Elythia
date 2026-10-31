@@ -4,11 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/elythia-network/elythia/internal/safehttp"
@@ -34,6 +39,10 @@ const remoteStatsTTL = 1 * time.Hour
 // instance を 1h 単位で負キャッシュすると stale 期間が長過ぎるため 5 分に短縮
 // (#943 review)。
 const remoteStatsNegativeTTL = 5 * time.Minute
+
+// remoteCreatedAtHostDownTTL は、FetchAccountCreatedAt で時間切れか接続失敗に
+// なったホストへ取りに行かない期間 (#3465)。404 や別人の応答では止めない。
+const remoteCreatedAtHostDownTTL = 5 * time.Minute
 
 // remoteStatsTimeout は remote /api/users/show の単一 fetch timeout。
 const remoteStatsTimeout = 5 * time.Second
@@ -64,9 +73,24 @@ const remoteStatsCacheSize = 10000
 // TTL は per-entry で持ち、read 時に判定する (LRU library 自体は size
 // eviction のみで TTL を扱わない)。
 type RemoteStatsFetcher struct {
-	client    *http.Client
-	cache     *lru.Cache[string, cachedRemoteStats]
-	group     singleflight.Group
+	client *http.Client
+	cache  *lru.Cache[string, cachedRemoteStats]
+	// createdCache は FetchAccountCreatedAt の結果 (#3465)。統計とは別に持つ
+	// (統計は Mastodon 系へも fallback するが、作成日時は Misskey 系だけに
+	// 聞くので、片方の負キャッシュがもう片方を止めないようにする)。
+	createdCache *lru.Cache[string, cachedAccountCreatedAt]
+	// createdHostDown は FetchAccountCreatedAt で応答しなかった (時間切れ・
+	// 接続失敗) ホストと、その時刻 (#3465)。値のキャッシュではなく取得の間引きなので、
+	// DropLocal でも捨てない (#3776)。
+	createdHostDown *lru.Cache[string, time.Time]
+	group           singleflight.Group
+	// dropMu は gen を守る。cache と createdCache は自前で排他するが、番号を比べる
+	// ことと積むことを 1 つのロックの中で行うために使う。
+	dropMu sync.Mutex
+	// gen は DropLocal で進める世代の番号 (#3776)。取得は singleflight の中で
+	// ロックの外を走るので、捨てる前に始めた取得の結果を、捨てた後に積まないために
+	// 使う。
+	gen       uint64
 	userAgent string
 	// hostAllowed は連合ポリシー (blockedHosts / federation モード) の判定。
 	// 未配線なら全ホストへ出す (従来の挙動)。
@@ -79,6 +103,12 @@ type cachedRemoteStats struct {
 	ttl     time.Duration
 }
 
+type cachedAccountCreatedAt struct {
+	createdAt *time.Time
+	fetched   time.Time
+	ttl       time.Duration
+}
+
 // NewRemoteStatsFetcher constructs a fetcher with a SSRF-safe HTTP transport
 // built from allowedPrivateNetworks (= config.AllowedPrivateNetworks 互換) と
 // optional safehttp.Option (e.g. WithProxy)。
@@ -89,31 +119,19 @@ type cachedRemoteStats struct {
 //
 // urlpreview / mediaproxy と同じく safehttp 経由で組み立てる pattern (#943
 // review SSRF guard)。
-func NewRemoteStatsFetcher(allowedPrivateNetworks []string, userAgent string, opts ...safehttp.Option) *RemoteStatsFetcher {
+//
+// hostAllowed is the federation gate: a host it rejects is never asked. nil
+// asks every host (tests only). 無くても統計は取れてしまい、外れても利用者からは
+// 見えないので、構築子の必須の引数で受ける (#3823)。
+func NewRemoteStatsFetcher(allowedPrivateNetworks []string, userAgent string, hostAllowed func(host string) bool, opts ...safehttp.Option) *RemoteStatsFetcher {
 	transport := safehttp.NewSSRFSafeTransport(allowedPrivateNetworks, opts...)
 	f := newFetcherWithClient(&http.Client{
 		Transport: transport,
 		Timeout:   remoteStatsTimeout,
 	}, remoteStatsCacheSize)
 	f.userAgent = userAgent
+	f.hostAllowed = hostAllowed
 	return f
-}
-
-// HasHostAllowedChecker reports whether the federation gate is wired.
-//
-// 未配線でも統計は取れてしまうので、外れても利用者からは見えない。起動時の
-// critical wiring 検査で落とす。
-func (f *RemoteStatsFetcher) HasHostAllowedChecker() bool {
-	return f != nil && f.hostAllowed != nil
-}
-
-// SetHostAllowedChecker wires the federation gate.
-//
-// 未配線なら従来どおり (= 全ホストへ出す)。production では必ず配線する。
-func (f *RemoteStatsFetcher) SetHostAllowedChecker(fn func(host string) bool) {
-	if f != nil {
-		f.hostAllowed = fn
-	}
 }
 
 // newRemoteStatsFetcherWithTransport はテスト専用 constructor。redirectTransport
@@ -142,7 +160,9 @@ func newFetcherWithClient(client *http.Client, cacheSize int) *RemoteStatsFetche
 		cacheSize = 1
 	}
 	cache, _ := lru.New[string, cachedRemoteStats](cacheSize)
-	return &RemoteStatsFetcher{client: client, cache: cache}
+	createdCache, _ := lru.New[string, cachedAccountCreatedAt](cacheSize)
+	createdHostDown, _ := lru.New[string, time.Time](cacheSize)
+	return &RemoteStatsFetcher{client: client, cache: cache, createdCache: createdCache, createdHostDown: createdHostDown}
 }
 
 // Fetch returns cached stats if available and fresh, otherwise fetches from
@@ -176,19 +196,132 @@ func (f *RemoteStatsFetcher) Fetch(ctx context.Context, host, username string) *
 		// (Get で hot 化しないようにする)。
 		f.cache.Remove(key)
 	}
-	v, _, _ := f.group.Do(key, func() (any, error) {
+	// singleflight のキーに世代の番号を含める。捨てた後の呼び出しが、捨てる前に
+	// 始まった取得に相乗りしないようにする。
+	gen := f.currentGen()
+	v, _, _ := f.group.Do(strconv.FormatUint(gen, 10)+"|"+key, func() (any, error) {
 		stats := f.fetchRemote(ctx, host, username)
 		ttl := remoteStatsTTL
 		if stats == nil {
 			ttl = remoteStatsNegativeTTL
 		}
-		f.cache.Add(key, cachedRemoteStats{stats: stats, fetched: time.Now(), ttl: ttl})
+		f.storeIfGen(gen, func() {
+			f.cache.Add(key, cachedRemoteStats{stats: stats, fetched: time.Now(), ttl: ttl})
+		})
 		return stats, nil
 	})
 	if stats, ok := v.(*RemoteUserStats); ok {
 		return stats
 	}
 	return nil
+}
+
+// FetchAccountCreatedAt returns the account creation time (`createdAt`) of a
+// local user of a Misskey-compatible server via its `/api/users/show` (#3465).
+// It returns nil when the host or username is empty / malformed, the host is
+// not allowed by the federation gate, or the remote call fails / returns no
+// readable `createdAt`. Results are cached with the same positive / negative
+// TTLs as Fetch.
+//
+// 呼び出し側 (AccountCreatedAtFiller) が保存済みのソフトウェア名で Misskey 系
+// だと確かめてから呼ぶ前提で、Mastodon 系の API へは fallback しない。
+func (f *RemoteStatsFetcher) FetchAccountCreatedAt(ctx context.Context, host, username string) *time.Time {
+	if f == nil || host == "" || username == "" || !isValidHost(host) {
+		return nil
+	}
+	// Fetch と同じく、連合を切った相手へは出さない。
+	if f.hostAllowed != nil && !f.hostAllowed(host) {
+		return nil
+	}
+	// 応答しなかったホストへは、しばらく誰の分も取りに行かない。人ごとの
+	// 負キャッシュだけだと、Misskey を名乗る相手が知られている人の数だけ
+	// フォローの処理を 5 秒ずつ待たせられる。
+	if downAt, ok := f.createdHostDown.Get(host); ok {
+		if time.Since(downAt) < remoteCreatedAtHostDownTTL {
+			return nil
+		}
+		f.createdHostDown.Remove(host)
+	}
+	key := host + "|" + username
+	if entry, ok := f.createdCache.Get(key); ok {
+		if time.Since(entry.fetched) < entry.ttl {
+			return entry.createdAt
+		}
+		f.createdCache.Remove(key)
+	}
+	gen := f.currentGen()
+	v, _, _ := f.group.Do("createdAt|"+strconv.FormatUint(gen, 10)+"|"+key, func() (any, error) {
+		createdAt, unreachable := f.fetchMisskeyCreatedAt(ctx, host, username)
+		if unreachable {
+			// 応答しなかったことは、捨てた後でも覚える (取得の間引きで、値ではない)。
+			f.createdHostDown.Add(host, time.Now())
+		}
+		ttl := remoteStatsTTL
+		if createdAt == nil {
+			ttl = remoteStatsNegativeTTL
+		}
+		f.storeIfGen(gen, func() {
+			f.createdCache.Add(key, cachedAccountCreatedAt{createdAt: createdAt, fetched: time.Now(), ttl: ttl})
+		})
+		return createdAt, nil
+	})
+	if createdAt, ok := v.(*time.Time); ok {
+		return createdAt
+	}
+	return nil
+}
+
+// currentGen returns the drop generation to pass to storeIfGen.
+func (f *RemoteStatsFetcher) currentGen() uint64 {
+	f.dropMu.Lock()
+	defer f.dropMu.Unlock()
+	return f.gen
+}
+
+// storeIfGen runs store unless the caches were dropped since gen was read.
+func (f *RemoteStatsFetcher) storeIfGen(gen uint64, store func()) {
+	f.dropMu.Lock()
+	defer f.dropMu.Unlock()
+	if f.gen == gen {
+		store()
+	}
+}
+
+// DropLocal drops the stats and the account creation times held by this
+// process (#3776). The hosts that did not answer (createdHostDown) are kept:
+// they throttle the fetches, they are not values. 他のプロセスへは伝えない。
+//
+// createdHostDown を捨てると、応答しない相手に、フォローの処理が 5 秒ずつ
+// 待たされる守りが外れる。
+func (f *RemoteStatsFetcher) DropLocal() {
+	f.dropMu.Lock()
+	defer f.dropMu.Unlock()
+	f.gen++
+	f.cache.Purge()
+	f.createdCache.Purge()
+}
+
+// fetchMisskeyCreatedAt reads `createdAt` from `/api/users/show`.
+//
+// 返ってきた人の username が頼んだ人と違うなら採らない (別の人の作成日時を
+// 保存しないため)。Misskey の username の照合は大文字小文字を区別しない。
+func (f *RemoteStatsFetcher) fetchMisskeyCreatedAt(ctx context.Context, host, username string) (createdAt *time.Time, unreachable bool) {
+	var payload struct {
+		Username  string `json:"username"`
+		CreatedAt string `json:"createdAt"`
+	}
+	ok, unreachable := f.postMisskeyUsersShow(ctx, host, username, &payload)
+	if !ok {
+		return nil, unreachable
+	}
+	if !strings.EqualFold(payload.Username, username) {
+		return nil, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, payload.CreatedAt)
+	if err != nil {
+		return nil, false
+	}
+	return &t, false
 }
 
 // isValidHost checks that host is a plain hostname (optionally with port) and
@@ -232,10 +365,13 @@ func (f *RemoteStatsFetcher) fetchRemote(ctx context.Context, host, username str
 	return nil
 }
 
-// fetchMisskey calls the Misskey-compat `/api/users/show` endpoint.
+// postMisskeyUsersShow calls the Misskey-compat `/api/users/show` endpoint and
+// decodes a 200 response into payload. ok reports whether that succeeded;
+// unreachable reports that the host did not answer in time or the connection
+// failed (as opposed to an HTTP error status or an unreadable body).
 // `{username, host:null}` で origin instance のローカル user lookup を要求する
 // shape は upstream Misskey TS の paramDef と一致。
-func (f *RemoteStatsFetcher) fetchMisskey(ctx context.Context, host, username string) *RemoteUserStats {
+func (f *RemoteStatsFetcher) postMisskeyUsersShow(ctx context.Context, host, username string, payload any) (ok, unreachable bool) {
 	endpoint := fmt.Sprintf("https://%s/api/users/show", host)
 	body, _ := json.Marshal(map[string]any{
 		"username": username,
@@ -243,7 +379,7 @@ func (f *RemoteStatsFetcher) fetchMisskey(ctx context.Context, host, username st
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil
+		return false, false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -253,19 +389,39 @@ func (f *RemoteStatsFetcher) fetchMisskey(ctx context.Context, host, username st
 	resp, err := f.client.Do(req)
 	if err != nil {
 		slog.Debug("remoteStats: misskey fetch failed", "host", host, "username", username, "err", err)
-		return nil
+		return false, true
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		return false, false
 	}
 	limited := io.LimitReader(resp.Body, 1<<20)
+	if err := json.NewDecoder(limited).Decode(payload); err != nil {
+		// ヘッダーだけ返して本文を止める相手も、待たされる点では応答しない
+		// 相手と同じなので、時間切れは unreachable に数える。
+		return false, isTimeout(err)
+	}
+	return true, false
+}
+
+// isTimeout reports whether err is a deadline / timeout error.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// fetchMisskey reads the public counts from the Misskey-compat
+// `/api/users/show` endpoint.
+func (f *RemoteStatsFetcher) fetchMisskey(ctx context.Context, host, username string) *RemoteUserStats {
 	var payload struct {
 		NotesCount     *int `json:"notesCount"`
 		FollowersCount *int `json:"followersCount"`
 		FollowingCount *int `json:"followingCount"`
 	}
-	if err := json.NewDecoder(limited).Decode(&payload); err != nil {
+	if ok, _ := f.postMisskeyUsersShow(ctx, host, username, &payload); !ok {
 		return nil
 	}
 	if payload.NotesCount == nil && payload.FollowersCount == nil && payload.FollowingCount == nil {

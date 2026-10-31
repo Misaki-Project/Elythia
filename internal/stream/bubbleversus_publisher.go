@@ -15,11 +15,16 @@ import (
 // 対局中のやりとりは `bubbleVersusMatch:<matchId>` へ出す。
 type BubbleVersusPublisher struct {
 	pub PubSubPublisher
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// NewBubbleVersusPublisher constructs a BubbleVersusPublisher.
-func NewBubbleVersusPublisher(pub PubSubPublisher) *BubbleVersusPublisher {
-	return &BubbleVersusPublisher{pub: pub}
+// NewBubbleVersusPublisher constructs a BubbleVersusPublisher. entityPacker is
+// the Packer this BubbleVersusPublisher packs entities with (#3794); 無いと
+// 招待者の avatarUrl などを生のまま流すので、構築子の必須の引数で受ける (#3823)。
+func NewBubbleVersusPublisher(pub PubSubPublisher, entityPacker *entity.Packer) *BubbleVersusPublisher {
+	return &BubbleVersusPublisher{pub: pub, entityPacker: entityPacker}
 }
 
 var _ bubbleversus.Publisher = (*BubbleVersusPublisher)(nil)
@@ -38,7 +43,7 @@ func (p *BubbleVersusPublisher) PublishInvited(targetUserID string, inviter *mod
 	p.publish(BubbleVersusUserTopic(targetUserID), "invited", map[string]any{
 		"matchId":  m.ID,
 		"gameMode": m.GameMode,
-		"user":     entity.PackUserLite(inviter),
+		"user":     p.entityPacker.PackUserLite(inviter),
 	})
 }
 

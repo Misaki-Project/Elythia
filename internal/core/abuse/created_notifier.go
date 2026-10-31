@@ -4,7 +4,9 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/elythia-network/elythia/internal/bgwork"
 	corewebhook "github.com/elythia-network/elythia/internal/core/webhook"
+	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 )
@@ -74,12 +76,25 @@ type CreatedNotifier struct {
 	mailRecipients RecipientLister
 	profiles       ProfileFinder
 	meta           MetaFetcher
+
+	// background はメールの送信を起動する箱 (#3661)。世代の停止で待つ。nil なら
+	// 素の goroutine で起動する (テスト)。
+	background *bgwork.Group
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// NewCreatedNotifier constructs a CreatedNotifier. Any nil dependency
-// disables that channel.
-func NewCreatedNotifier(inApp ReportInAppNotifier, mods ModeratorLister, admin AdminEventPublisher) *CreatedNotifier {
-	return &CreatedNotifier{inApp: inApp, mods: mods, admin: admin}
+// NewCreatedNotifier constructs a CreatedNotifier. A nil inApp / mods / admin
+// disables that channel. background is the group the mail is sent in, so
+// stopping the server generation waits for it (#3661); entityPacker is the
+// Packer this CreatedNotifier packs entities with (#3794).
+//
+// background と entityPacker は、無いと黙って劣化する (世代の停止でメールを待たない /
+// webhook の本文の avatarUrl がリモートの生の URL になる) ので、構築子の必須の
+// 引数で受ける (#3823)。
+func NewCreatedNotifier(inApp ReportInAppNotifier, mods ModeratorLister, admin AdminEventPublisher, background *bgwork.Group, entityPacker *entity.Packer) *CreatedNotifier {
+	return &CreatedNotifier{inApp: inApp, mods: mods, admin: admin, background: background, entityPacker: entityPacker}
 }
 
 // SetWebhook wires the system webhook channel.
@@ -119,7 +134,7 @@ func (n *CreatedNotifier) NotifyCreated(ctx context.Context, report *model.Abuse
 	n.dispatchWebhook(report, reporter, target)
 	if n.mail != nil {
 		// SMTP は数秒かかりうるので、通報の API や inbox の処理を待たせない。
-		go n.sendMail(report)
+		n.background.Go(func(context.Context) { n.sendMail(report) })
 	}
 }
 
@@ -231,7 +246,7 @@ func (n *CreatedNotifier) dispatchWebhook(report *model.AbuseUserReport, reporte
 	if n.webhook == nil {
 		return
 	}
-	body := WebhookPayload(report, reporter, target, nil, n.lookups, n.idGen)
+	body := WebhookPayload(n.entityPacker, report, reporter, target, nil, n.lookups, n.idGen)
 	n.webhook.DispatchSystemExcluding(corewebhook.SystemEventAbuseReport, body, n.inactiveWebhookIDs())
 }
 

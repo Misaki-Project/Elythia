@@ -6,7 +6,7 @@ import (
 	"github.com/elythia-network/elythia/internal/model"
 )
 
-// UserRolesLookupAdapter wraps a role.Service so that entity.PackUserLite /
+// UserRolesLookupAdapter wraps a role.Service so that (*entity.Packer).PackUserLite /
 // PackUserDetailed can populate the `roles` / `badgeRoles` JSON fields
 // without entity depending on core/role (= preserves layering: api → core →
 // entity, never reverse). Implements entity.UserRolesLookup (issue #1103).
@@ -22,8 +22,8 @@ type UserRolesProvider interface {
 }
 
 // NewUserRolesLookup returns an entity.UserRolesLookup that resolves a
-// user's assigned roles via the role service. Use entity.SetUserRolesLookup
-// to wire. Passing nil provider yields an adapter that always returns nil
+// user's assigned roles via the role service. Wire it as
+// entity.PackerDeps.UserRoles. Passing nil provider yields an adapter that always returns nil
 // (= entity sees empty roles, behaves like pre-#1103).
 func NewUserRolesLookup(provider UserRolesProvider) *UserRolesLookupAdapter {
 	return &UserRolesLookupAdapter{provider: provider}

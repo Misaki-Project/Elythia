@@ -105,8 +105,8 @@ func TestProcess_QuoteRequestActorUnresolvable(t *testing.T) {
 		notes := testutil.NewMockNoteRepository()
 		gen, _ := id.NewGenerator("aidx")
 		urls := activitypub.NewURLBuilder("https://example.com")
-		resolver := federation.NewResolver(users, notes, urls, &stubFetcher{err: tc.err}, gen)
-		p := federation.NewProcessor(resolver, nil, nil, nil, users, notes)
+		resolver := federation.NewResolverNilDeps(users, notes, urls, &stubFetcher{err: tc.err}, gen)
+		p := federation.NewProcessorNilDeps(resolver, nil, nil, nil, users, notes)
 		resp := &qdResponder{}
 		p.SetQuoteRequestHandler(federation.NewQuoteRequestHandler(federation.QuoteRequestDeps{
 			Notes: notes, Users: users, Blocks: qdAllow{}, Follows: qdAllow{}, Approvals: &qdStore{},
@@ -165,7 +165,7 @@ func TestProcess_QuoteAnswerDispatch(t *testing.T) {
 	// 自分の URL を知らないうちは、id だけの形を自分の QuoteRequest と見なさない。
 	_ = p.Process(answer("Accept", reqURI, "https://remote.example/approvals/0"))
 	assert.Empty(t, answers.got)
-	p.SetLocalBaseURL("https://example.com")
+	p.SetLocalBaseURLForTest("https://example.com")
 
 	require.NoError(t, p.Process(answer("Accept", embedded, "https://remote.example/approvals/1")))
 	require.NoError(t, p.Process(answer("Accept", reqURI, "https://remote.example/approvals/2")))

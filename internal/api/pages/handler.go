@@ -7,6 +7,9 @@ import (
 	"net/http"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
+	"github.com/elythia-network/elythia/internal/api/meself"
+	"github.com/elythia-network/elythia/internal/api/optional"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	corepage "github.com/elythia-network/elythia/internal/core/page"
 	coreuser "github.com/elythia-network/elythia/internal/core/user"
@@ -53,18 +56,26 @@ type Handler struct {
 	// drive file を解決して attachedFiles / eyeCatchingImage を埋めるのに使う
 	// (#1662)。未配線なら両 field は PackPage の default (空配列 / null)。
 	driveFileRepo repository.DriveFileRepository
+	// selfPacker は閲覧者自身を MeDetailed へ昇格させ、/api/i の handler で未読・
+	// role・ピン留めを埋める (#3784)。未配線なら補完せずに昇格だけする。
+	selfPacker *meself.Packer
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
-// SetDriveFileRepo wires the drive file repo used to resolve a page's
-// attachedFiles (image-block files) and eyeCatchingImage (#1662)。
-func (h *Handler) SetDriveFileRepo(r repository.DriveFileRepository) {
-	h.driveFileRepo = r
-}
+// SetSelfPacker wires the Packer that promotes the viewer's own entry into
+// MeDetailed. Unset promotes without the handler-only fields.
+func (h *Handler) SetSelfPacker(p *meself.Packer) { h.selfPacker = p }
 
 // NewHandler creates a new pages Handler. idGen is required so that
 // responses include createdAt derived from the aidx-encoded page ID.
-func NewHandler(svc *corepage.Service, idGen id.Generator) *Handler {
-	return &Handler{svc: svc, idGen: idGen}
+// entityPacker is the Packer this handler packs entities with (#3792);
+// driveFileRepo resolves attachedFiles and eyeCatchingImage and checks that the
+// eyecatching image belongs to the author (#1662, #2683); userPacker packs the
+// user embedded in the page-push pageEvent (#3330).
+func NewHandler(svc *corepage.Service, idGen id.Generator, entityPacker *entity.Packer, driveFileRepo repository.DriveFileRepository, userPacker UserPacker) *Handler {
+	return &Handler{svc: svc, idGen: idGen, entityPacker: entityPacker, driveFileRepo: driveFileRepo, userPacker: userPacker}
 }
 
 // SetMainStreamPublisher attaches a publisher used to emit `pageEvent` on
@@ -89,7 +100,7 @@ func jsonAbsent(r json.RawMessage) bool {
 // CreateRequest is the request body for pages/create. Content / Variables
 // are stored verbatim into jsonb columns; we don't interpret them.
 type CreateRequest struct {
-	Title               string               `json:"title"`
+	Title               *string              `json:"title"`
 	Name                string               `json:"name"`
 	Summary             *string              `json:"summary"`
 	Content             json.RawMessage      `json:"content"`
@@ -106,7 +117,8 @@ type CreateRequest struct {
 func (h *Handler) Create(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req CreateRequest
-	if err := c.Bind(&req); err != nil || req.Title == "" || req.Name == "" {
+	// 空の title は本家と同じく受ける (#3772)。欠けだけを拒否する。
+	if err := c.Bind(&req); err != nil || req.Title == nil || req.Name == "" {
 		return apierr.JSONInvalidParam(c)
 	}
 	// upstream pages/create.ts は required:['title','name','content','variables','script']。
@@ -132,7 +144,7 @@ func (h *Handler) Create(c echo.Context) error {
 	}
 	p, err := h.svc.Create(corepage.CreateInput{
 		OwnerID:             user.ID,
-		Title:               req.Title,
+		Title:               *req.Title,
 		Name:                req.Name,
 		Summary:             req.Summary,
 		AlignCenter:         req.AlignCenter,
@@ -173,15 +185,28 @@ func (h *Handler) eyeCatchingImageOK(imageID *string, userID string) bool {
 	return true
 }
 
-// ShowRequest is the request body for pages/show. upstream Misskey TS の
-// paramDef は anyOf で 3 形を accept する: {pageId} / {userId, name} /
-// {username, name} (#955)。frontend (page.vue) は 3 つ目の {username, name}
-// を投げてくるので、本 struct も同 shape を受ける。
+// ShowRequest is the request body for pages/show. upstream の paramDef は
+// anyOf で {pageId} と {name, username} の 2 形を受ける (#955)。
+//
+// 本家と同じく pageId があればそれで引き、無ければ name と username で引く。
+// 空文字もそのまま引いて NO_SUCH_PAGE にする。以前は本家に無い {userId, name}
+// も受けていたが、本家の paramDef で拒否されるので消した (#3772)。
+//
+// 3 項目は型を決めずに受ける。anyOf は片方の形を満たせば通すので、使わない側の
+// 項目の型が違っても本家は通す ({"pageId":"x","name":1} など、#3772)。
 type ShowRequest struct {
-	PageID   string `json:"pageId"`
-	UserID   string `json:"userId"`
-	Username string `json:"username"`
-	Name     string `json:"name"`
+	PageID   json.RawMessage `json:"pageId"`
+	Username json.RawMessage `json:"username"`
+	Name     json.RawMessage `json:"name"`
+}
+
+// rawString decodes raw as a JSON string. ok is false when raw is absent,
+// null or not a string.
+func rawString(raw json.RawMessage) (s string, ok bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	return s, json.Unmarshal(raw, &s) == nil && string(raw) != "null"
 }
 
 // Show handles POST /api/pages/show.
@@ -199,23 +224,32 @@ func (h *Handler) Show(c echo.Context) error {
 		p   *model.Page
 		err error
 	)
+	username, usernameOK := rawString(req.Username)
+	name, nameOK := rawString(req.Name)
 	switch {
-	case req.PageID != "":
-		p, err = h.svc.Show(requesterID, req.PageID)
-	case req.UserID != "" && req.Name != "":
-		p, err = h.svc.ShowByName(requesterID, req.UserID, req.Name)
-	case req.Username != "" && req.Name != "":
+	// pageId: null は name と username で引く。本家は 'pageId' in ps で pageId の
+	// 経路に入り、TypeORM が null の条件を無視するので、どれか 1 件の Page を
+	// 返してしまう (#3772)。
+	case len(req.PageID) > 0 && string(req.PageID) != "null":
+		pageID, ok := rawString(req.PageID)
+		if !ok {
+			// 文字列でない pageId は anyOf の {name, username} の側で通る。本家は
+			// その値の id で引くので、該当の Page は無い。
+			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_PAGE", "No such page.", "222120c0-3ead-4528-811b-b96f233388d7"))
+		}
+		p, err = h.svc.Show(requesterID, pageID)
+	case usernameOK && nameOK:
 		// {username, name} 経路 (#955): username で local user を引いて
 		// その user.id + name で page を引く。upstream は host=NULL の
 		// local user 縛り (= remote の page は連合経路で配信されない)。
 		if h.userSource == nil {
 			return apierr.JSONInternalError(c)
 		}
-		bundle, ulerr := h.userSource.ShowByUsername(req.Username, nil)
+		bundle, ulerr := h.userSource.ShowByUsername(username, nil)
 		if ulerr != nil || bundle == nil || bundle.User == nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_PAGE", "No such page.", "222120c0-3ead-4528-811b-b96f233388d7"))
 		}
-		p, err = h.svc.ShowByName(requesterID, bundle.User.ID, req.Name)
+		p, err = h.svc.ShowByName(requesterID, bundle.User.ID, name)
 	default:
 		return apierr.JSONInvalidParam(c)
 	}
@@ -251,18 +285,20 @@ func (h *Handler) Show(c echo.Context) error {
 
 // UpdateRequest is the request body for pages/update.
 type UpdateRequest struct {
-	PageID              string                `json:"pageId"`
-	Title               *string               `json:"title"`
-	Name                *string               `json:"name"`
-	Summary             *string               `json:"summary"`
-	Content             json.RawMessage       `json:"content"`
-	Variables           json.RawMessage       `json:"variables"`
-	Script              *string               `json:"script"`
-	EyeCatchingImageID  *string               `json:"eyeCatchingImageId"`
-	Font                *string               `json:"font"`
-	AlignCenter         *bool                 `json:"alignCenter"`
-	HideTitleWhenPinned *bool                 `json:"hideTitleWhenPinned"`
-	Visibility          *model.PageVisibility `json:"visibility"`
+	PageID string  `json:"pageId"`
+	Title  *string `json:"title"`
+	Name   *string `json:"name"`
+	// Summary and EyeCatchingImageID distinguish null (clear, like upstream)
+	// from absent (keep) (#3751).
+	Summary             optional.Nullable[string] `json:"summary"`
+	Content             json.RawMessage           `json:"content"`
+	Variables           json.RawMessage           `json:"variables"`
+	Script              *string                   `json:"script"`
+	EyeCatchingImageID  optional.Nullable[string] `json:"eyeCatchingImageId"`
+	Font                *string                   `json:"font"`
+	AlignCenter         *bool                     `json:"alignCenter"`
+	HideTitleWhenPinned *bool                     `json:"hideTitleWhenPinned"`
+	Visibility          *model.PageVisibility     `json:"visibility"`
 }
 
 // Update handles POST /api/pages/update.
@@ -289,7 +325,7 @@ func (h *Handler) Update(c echo.Context) error {
 	}
 	// upstream update.ts: eyeCatchingImageId 指定時は自分の drive file か検証し、
 	// 不在なら NO_SUCH_FILE (#1548)。
-	if !h.eyeCatchingImageOK(req.EyeCatchingImageID, user.ID) {
+	if !h.eyeCatchingImageOK(req.EyeCatchingImageID.Value, user.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "cfc23c7c-3887-490e-af30-0ed576703c82"))
 	}
 	in := corepage.UpdateInput{
@@ -301,13 +337,13 @@ func (h *Handler) Update(c echo.Context) error {
 		Script:              req.Script,
 		Visibility:          req.Visibility,
 	}
-	if req.Summary != nil {
-		s := req.Summary
-		in.Summary = &s
+	// null は本家と同じく外す (nil を書く)。以前は *string で受けていたので null
+	// が省略と同じになり、外しても元の値が残っていた (#3751)。
+	if req.Summary.Present {
+		in.Summary = &req.Summary.Value
 	}
-	if req.EyeCatchingImageID != nil {
-		s := req.EyeCatchingImageID
-		in.EyeCatchingImageID = &s
+	if req.EyeCatchingImageID.Present {
+		in.EyeCatchingImageID = &req.EyeCatchingImageID.Value
 	}
 	if req.Content != nil {
 		in.Content = req.Content
@@ -322,10 +358,10 @@ func (h *Handler) Update(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_PAGE", "No such page.", "21149b9e-3616-4778-9592-c4ce89f5a864"))
 		// upstream TS pages/update は accessDenied (UUID 3c15cd52) を持つため、
 		// show (存在隠蔽 404) とは異なり 403 を維持する (#1432)。
+		// private の Page は core が ErrPageNotFound にする (#3479)。
 		case errors.Is(err, corepage.ErrAccessDenied):
 			return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Access denied.", "3c15cd52-3b4b-4274-967d-6456fc4f792b"))
 		case errors.Is(err, corepage.ErrPageNameRequired),
-			errors.Is(err, corepage.ErrPageTitleRequired),
 			errors.Is(err, corepage.ErrPageNameInvalid):
 			return apierr.JSONInvalidParam(c)
 		case errors.Is(err, corepage.ErrPageNameConflict):
@@ -354,6 +390,7 @@ func (h *Handler) Delete(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_PAGE", "No such page.", "eb0c6e1d-d519-4764-9486-52a7e1c6392a"))
 		// upstream TS pages/delete は accessDenied (UUID 8b741b3e) を持つため、
 		// show (存在隠蔽 404) とは異なり 403 を維持する (#1432)。
+		// private の Page は core が ErrPageNotFound にする (#3479)。
 		case errors.Is(err, corepage.ErrAccessDenied):
 			return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Access denied.", "8b741b3e-2c22-44b3-a15f-29949aa1601e"))
 		}
@@ -363,13 +400,14 @@ func (h *Handler) Delete(c echo.Context) error {
 }
 
 // MyRequest is the request body for i/pages (own pages list).
+//
+// 本家のparamDefにoffsetは無いので読まない(#3851)。
 type MyRequest struct {
-	Limit     *int   `json:"limit"`
-	Offset    int    `json:"offset"`
-	SinceID   string `json:"sinceId"`
-	UntilID   string `json:"untilId"`
-	SinceDate *int64 `json:"sinceDate"`
-	UntilDate *int64 `json:"untilDate"`
+	Limit     *jsnum.Int `json:"limit"`
+	SinceID   string     `json:"sinceId"`
+	UntilID   string     `json:"untilId"`
+	SinceDate *jsnum.Int `json:"sinceDate"`
+	UntilDate *jsnum.Int `json:"untilDate"`
 }
 
 // My handles POST /api/i/pages.
@@ -384,15 +422,15 @@ func (h *Handler) My(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	rows, err := h.svc.ListByUser(user.ID, sinceID, untilID, limit, req.Offset)
+	rows, err := h.svc.ListByUser(user.ID, sinceID, untilID, limit, 0)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -490,7 +528,7 @@ func (h *Handler) Like(c echo.Context) error {
 // PagePushRequest is the request body for /api/page-push.
 type PagePushRequest struct {
 	PageID string          `json:"pageId"`
-	Event  string          `json:"event"`
+	Event  *string         `json:"event"`
 	Var    json.RawMessage `json:"var"`
 }
 
@@ -501,12 +539,13 @@ type PagePushRequest struct {
 func (h *Handler) PagePush(c echo.Context) error {
 	caller := middleware.GetUser(c)
 	var req PagePushRequest
-	if err := c.Bind(&req); err != nil || req.PageID == "" || req.Event == "" {
+	// 空の event は本家と同じく受ける (#3772)。欠けだけを拒否する。
+	if err := c.Bind(&req); err != nil || req.PageID == "" || req.Event == nil {
 		return apierr.JSONInvalidParam(c)
 	}
 	// TS本家はfindOneByのみで可視性チェックをしないのでFindByIDを
 	// 使って合わせる。見つからなければ404に丸め、存在するIDだけに
-	// emitする。
+	// emitする。private だけは下で作者に限る。
 	p, err := h.svc.FindByID(req.PageID)
 	// **service の sentinel を見る。** page.Service は not-found を
 	// ErrPageNotFound に置き換えるので、repository.IsNotFound では判定できない。
@@ -514,7 +553,9 @@ func (h *Handler) PagePush(c echo.Context) error {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return apierr.JSONInternalError(c)
 	}
-	if err != nil {
+	// private の Page を見られるのは作者だけなので、作者以外からのイベントは
+	// 「無い」として扱う (#3479)。本家には private が無い。
+	if err != nil || (p.Visibility != model.PageVisibilityPublic && p.UserID != caller.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_PAGE", "No such page.", "4a13ad31-6729-46b4-b9af-e86b265c2e74"))
 	}
 	if h.mainStreamPublisher == nil || h.userSource == nil {
@@ -534,7 +575,7 @@ func (h *Handler) PagePush(c echo.Context) error {
 	}
 	body := map[string]any{
 		"pageId": p.ID,
-		"event":  req.Event,
+		"event":  *req.Event,
 		"var":    rawJSONBytes(req.Var),
 		"userId": caller.ID,
 		"user":   user,
@@ -638,8 +679,8 @@ func (h *Handler) pageToMapWithOwner(p *model.Page, owner *model.User, isLiked *
 	// (#1662)。driveFileRepo 未配線なら entity 側が (nil,nil) を返し default 維持。
 	// list 経路 (i/pages, featured) では page ごとに drive lookup が走る (N+1)
 	// が、page list は通常小さいので許容する。
-	attachedFiles, eyeCatchingImage := entity.ResolvePageDriveFiles(p, h.driveFileRepo, h.idGen)
-	return entity.PackPageWithContext(p, entity.PackPageContext{
+	attachedFiles, eyeCatchingImage := h.entityPacker.ResolvePageDriveFiles(p, h.driveFileRepo, h.idGen)
+	return h.entityPacker.PackPageWithContext(p, entity.PackPageContext{
 		IDGen:            h.idGen,
 		Owner:            owner,
 		EyeCatchingImage: eyeCatchingImage,
@@ -648,12 +689,6 @@ func (h *Handler) pageToMapWithOwner(p *model.Page, owner *model.User, isLiked *
 	})
 }
 
-// HasDriveFileRepo reports whether the drive file repository was wired.
-//
-// 未配線だと eyecatching image の所有者チェックが素通しになり、他人の drive
-// ファイルを自分の page に貼れる (IDOR)。起動時検査に使う (#2683)。
-func (h *Handler) HasDriveFileRepo() bool { return h.driveFileRepo != nil }
-
 // validPageVisibility reports whether v is one of the values the
 // `page_visibility_enum` column accepts.
 //
@@ -661,7 +696,7 @@ func (h *Handler) HasDriveFileRepo() bool { return h.driveFileRepo != nil }
 // (`public`) が入る。Go の string では省略と空文字を区別できない。
 func validPageVisibility(v model.PageVisibility) bool {
 	switch v {
-	case "", model.PageVisibilityPublic, model.PageVisibilityFollowers, model.PageVisibilitySpecified:
+	case "", model.PageVisibilityPublic, model.PageVisibilityPrivate:
 		return true
 	}
 	return false

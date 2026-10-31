@@ -77,7 +77,7 @@ func TestResolveNoteOnce_LedgerDoesNotCoverTheFetchWindow(t *testing.T) {
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	r := NewResolver(userRepo, &syncNoteRepo{NoteRepository: noteRepo}, urls, fetcher, idGen)
+	r := NewResolverNilDeps(userRepo, &syncNoteRepo{NoteRepository: noteRepo}, urls, fetcher, idGen)
 
 	// **どの経路で抜けても leader を解放する。** 解放し損ねると leader が
 	// gate で止まったまま singleflight の entry を握り続け、テストバイナリの
@@ -184,17 +184,20 @@ func TestResolveQuoteURI_UsesExistingRowWhenTheKeyIsInFlight(t *testing.T) {
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	r := NewResolver(testutil.NewMockUserRepository(), noteRepo, urls, emptyDocFetcher{}, idGen)
+	r := NewResolverNilDeps(testutil.NewMockUserRepository(), noteRepo, urls, emptyDocFetcher{}, idGen)
 
 	nURI := storedAs
 	require.NoError(t, noteRepo.Create(&model.Note{ID: "9patnote000000000000", UserID: "9patuser000000000000", URI: &nURI}))
 
 	// 台帳に無ければ通常経路。取得 URI では引けないので fetch に行き、
 	// fetcher が失敗するので nil。
-	require.Nil(t, r.resolveQuoteURI(listed, 0, false, nil), "前提: 取得 URI だけでは引けない")
+	got, err := r.resolveQuoteURI(listed, 0, false, nil)
+	require.NoError(t, err, "通常 quote の fetch failure は best-effort")
+	require.Nil(t, got, "前提: 取得 URI だけでは引けない")
 
 	chain := (&resolveChain{}).with(noteGroupKey(listed, false, false), storedAs)
-	got := r.resolveQuoteURI(listed, 0, false, chain)
+	got, err = r.resolveQuoteURI(listed, 0, false, chain)
+	require.NoError(t, err)
 	require.NotNil(t, got, "in-flight でも既存行があれば引用を繋ぐこと")
 	assert.Equal(t, "9patnote000000000000", got.ID)
 }
@@ -209,15 +212,18 @@ func TestResolveQuoteURI_UsesEphemeralRowWhenTheKeyIsInFlight(t *testing.T) {
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	r := NewResolver(testutil.NewMockUserRepository(), testutil.NewMockNoteRepository(), urls, emptyDocFetcher{}, idGen)
+	r := NewResolverNilDeps(testutil.NewMockUserRepository(), testutil.NewMockNoteRepository(), urls, emptyDocFetcher{}, idGen)
 	r.SetEphemeralSink(ledgerSink{byURI: map[string]*model.Note{
 		storedAs: {ID: "9quinnnote0000000000", UserID: "9quinnuser0000000000"},
 	}})
 
-	require.Nil(t, r.resolveQuoteURI(listed, 0, true, nil), "前提: 取得 URI だけでは引けない")
+	got, err := r.resolveQuoteURI(listed, 0, true, nil)
+	require.NoError(t, err, "通常 quote の fetch failure は best-effort")
+	require.Nil(t, got, "前提: 取得 URI だけでは引けない")
 
 	chain := (&resolveChain{}).with(noteGroupKey(listed, false, true), storedAs)
-	got := r.resolveQuoteURI(listed, 0, true, chain)
+	got, err = r.resolveQuoteURI(listed, 0, true, chain)
+	require.NoError(t, err)
 	require.NotNil(t, got, "in-flight でも ephemeral に在れば引用を繋ぐこと")
 	assert.Equal(t, "9quinnnote0000000000", got.ID)
 }
@@ -253,7 +259,7 @@ func TestResolveChain_ConcurrentIngestOfSameTargetStillLinksQuote(t *testing.T) 
 	urls := activitypub.NewURLBuilder("https://example.com")
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	r := NewResolver(testutil.NewMockUserRepository(), &syncNoteRepo{NoteRepository: testutil.NewMockNoteRepository()}, urls, fetcher, idGen)
+	r := NewResolverNilDeps(testutil.NewMockUserRepository(), &syncNoteRepo{NoteRepository: testutil.NewMockNoteRepository()}, urls, fetcher, idGen)
 
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(fetcher.release) }) }

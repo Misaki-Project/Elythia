@@ -9,7 +9,7 @@ import (
 	"github.com/elythia-network/elythia/internal/testutil"
 )
 
-// migration 000117 の書き換えを実 PostgreSQL で固定する (#3394)。
+// migration 000116 の書き換えを実 PostgreSQL で固定する (#3394)。
 //
 // **通常の migration 適用では一度も実行されない。** `ApplyMigrations` が流すのは
 // meta 行の無い fresh schema なので、UPDATE が当たる行が無い。書き換える行と
@@ -17,7 +17,7 @@ import (
 //
 // **`ApplyMigrations` は呼ばない。** 必要なのは meta の 2 列だけで、テーブルごと
 // 作り直す (列を DROP すると 1600 列の枠が減る。#2756)。
-func TestMigration000117_RewritesOnlyPreviousDefaults(t *testing.T) {
+func TestMigration000116_RewritesOnlyPreviousDefaults(t *testing.T) {
 	db, err := testutil.OpenTestDBSchema("repourlmig")
 	require.NoError(t, err)
 	// 呼ぶたびに新しい接続プールが開くので、使い終わったら閉じる。開いたままだと
@@ -71,8 +71,8 @@ func TestMigration000117_RewritesOnlyPreviousDefaults(t *testing.T) {
 		return *p
 	}
 
-	up := migrationSQL(t, "000117_transferred_repository_url.up.sql")
-	require.Contains(t, up, "UPDATE", "000117 の up が読めていない")
+	up := migrationSQL(t, "000116_transferred_repository_url.up.sql")
+	require.Contains(t, up, "UPDATE", "000116 の up が読めていない")
 	require.NoError(t, db.Exec(up).Error)
 	after := read()
 	assert.Equal(t, newRepo, str(after["default"].RepositoryURL))
@@ -89,8 +89,8 @@ func TestMigration000117_RewritesOnlyPreviousDefaults(t *testing.T) {
 	require.NoError(t, db.Exec(up).Error)
 	assert.Equal(t, after, read())
 
-	down := migrationSQL(t, "000117_transferred_repository_url.down.sql")
-	require.Contains(t, down, "UPDATE", "000117 の down が読めていない")
+	down := migrationSQL(t, "000116_transferred_repository_url.down.sql")
+	require.Contains(t, down, "UPDATE", "000116 の down が読めていない")
 	require.NoError(t, db.Exec(down).Error)
 	back := read()
 	assert.Equal(t, oldRepo, str(back["default"].RepositoryURL))

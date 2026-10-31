@@ -1,6 +1,9 @@
 package repository
 
 import (
+	"strings"
+
+	"github.com/elythia-network/elythia/internal/metasecret"
 	"github.com/elythia-network/elythia/internal/model"
 	"gorm.io/gorm"
 )
@@ -241,7 +244,7 @@ func (r *moderationLogRepository) List(filter model.ModerationLogFilter) ([]*mod
 		q = q.Where(`"userId" = ?`, filter.UserID)
 	}
 	if filter.Search != "" {
-		q = q.Where("info::text ILIKE ?", "%"+escapeLike(filter.Search)+"%")
+		q = q.Where(moderationLogSearchExpr+" ILIKE ?", "%"+escapeLike(filter.Search)+"%")
 	}
 	if filter.UntilID != "" {
 		q = q.Where("id < ?", filter.UntilID)
@@ -256,4 +259,29 @@ func (r *moderationLogRepository) List(filter model.ModerationLogFilter) ([]*mod
 		return nil, err
 	}
 	return logs, nil
+}
+
+// moderationLogSearchExpr is the text the moderation log search matches:
+// info without the meta secret fields of updateServerSettings.
+//
+// 秘密の欄を伏せる前に記録された行は、DB の中では平文のまま残る (書き換えると
+// ログの改ざんになる)。返すときと同じく、検索の対象からも外す。
+var moderationLogSearchExpr = buildModerationLogSearchExpr()
+
+func buildModerationLogSearchExpr() string {
+	// 欄名は model の定数で、利用者の入力ではない。
+	names := make([]string, 0, len(metasecret.Fields))
+	for _, f := range metasecret.Fields {
+		names = append(names, "'"+f+"'")
+	}
+	drop := "ARRAY[" + strings.Join(names, ", ") + "]"
+	// `#-` や `-` は文字列などの jsonb に使うと失敗する (クエリごと 500 になる)。
+	// before / after が object のときだけ、その中の秘密の欄を消す。info が object で
+	// ないときは `info->'before'` が NULL になるので、何もしない。
+	before := "(CASE WHEN jsonb_typeof(info->'before') = 'object' " +
+		"THEN jsonb_set(info, '{before}', (info->'before') - " + drop + ") ELSE info END)"
+	both := "(CASE WHEN jsonb_typeof(info->'after') = 'object' " +
+		"THEN jsonb_set(" + before + ", '{after}', (info->'after') - " + drop + ") ELSE " + before + " END)"
+	return "(CASE WHEN type = 'updateServerSettings' " +
+		"THEN " + both + " ELSE info END)::text"
 }

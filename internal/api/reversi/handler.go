@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
+	"github.com/elythia-network/elythia/internal/api/pagination"
+	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
 	corereversi "github.com/elythia-network/elythia/internal/core/reversi"
 	"github.com/elythia-network/elythia/internal/core/userpack"
 	"github.com/elythia-network/elythia/internal/entity"
@@ -49,19 +52,10 @@ type Handler struct {
 	// まとめて埋める (本家 packMany(invitations, me)、#3330)。連合対戦では
 	// リモートの招待者が混ざる。
 	lites userpack.LiteFiller
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
-
-// SetLiteFiller wires the batch resolver of instance / emojis for the
-// inviters of reversi/invitations (#3330).
-func (h *Handler) SetLiteFiller(f userpack.LiteFiller) {
-	h.lites = f
-}
-
-// HasLiteFiller reports whether the lite filler was wired.
-//
-// 未配線だと reversi/invitations のリモートの招待者に instance と絵文字が載らない。
-// 起動時検査に使う。
-func (h *Handler) HasLiteFiller() bool { return h.lites != nil }
 
 // FederationAvailabilityChecker determines whether a remote host advertises
 // a compatible reversiVersion via its nodeinfo.
@@ -78,8 +72,14 @@ type RemoteUserLookup interface {
 }
 
 // NewHandler creates a new reversi handler.
-func NewHandler(repo repository.ReversiRepository, idGen id.Generator) *Handler {
-	return &Handler{repo: repo, idGen: idGen}
+//
+// entityPacker is the Packer this Handler packs entities with (#3794); lites
+// is the batch resolver of instance / emojis for the inviters of
+// reversi/invitations (#3330). どちらも無いと黙って劣化する (メディアの URL が
+// 生のまま / リモートの招待者に instance と絵文字が載らない) ので、構築子の必須の
+// 引数で受ける (#3823)。
+func NewHandler(repo repository.ReversiRepository, idGen id.Generator, entityPacker *entity.Packer, lites userpack.LiteFiller) *Handler {
+	return &Handler{repo: repo, idGen: idGen, entityPacker: entityPacker, lites: lites}
 }
 
 // SetService attaches the core reversi service. 必須ではないが設定されていれば
@@ -124,7 +124,7 @@ func (h *Handler) SetFederation(baseURL string, deliverer FederationDeliverer, f
 	h.userRepo = userRepo
 }
 
-func packGame(g *model.ReversiGame, idGen id.Generator) map[string]any {
+func packGame(pk *entity.Packer, g *model.ReversiGame, idGen id.Generator) map[string]any {
 	result := map[string]any{
 		"id":         g.ID,
 		"user1Id":    g.User1ID,
@@ -164,10 +164,10 @@ func packGame(g *model.ReversiGame, idGen id.Generator) map[string]any {
 		result["createdAt"] = t.UTC().Format("2006-01-02T15:04:05.000Z")
 	}
 	if g.User1 != nil {
-		result["user1"] = entity.PackUserLite(g.User1)
+		result["user1"] = pk.PackUserLite(g.User1)
 	}
 	if g.User2 != nil {
-		result["user2"] = entity.PackUserLite(g.User2)
+		result["user2"] = pk.PackUserLite(g.User2)
 	}
 	// winner は upstream Misskey TS の ReversiGameEntityService.packDetail と
 	// 同じく winnerId から UserLite を派生させる (#649)。frontend は
@@ -177,9 +177,9 @@ func packGame(g *model.ReversiGame, idGen id.Generator) map[string]any {
 	result["winner"] = nil
 	if g.WinnerID != nil {
 		if g.User1 != nil && g.User1.ID == *g.WinnerID {
-			result["winner"] = entity.PackUserLite(g.User1)
+			result["winner"] = pk.PackUserLite(g.User1)
 		} else if g.User2 != nil && g.User2.ID == *g.WinnerID {
-			result["winner"] = entity.PackUserLite(g.User2)
+			result["winner"] = pk.PackUserLite(g.User2)
 		}
 	}
 	return result
@@ -262,33 +262,33 @@ func (h *Handler) resolveAcct(acct string) (string, error) {
 // ページを繰り返しロードするので必須 (#417 P1 UDS 検証で発覚)。
 func (h *Handler) Games(c echo.Context) error {
 	var req struct {
-		Limit     int    `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
-		My        bool   `json:"my"`
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
+		My        bool       `json:"my"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	if req.Limit <= 0 {
-		req.Limit = 10
-	}
-	if req.Limit > 100 {
-		req.Limit = 100
+	// 本家の paramDef は limit を 1〜100 (既定 10) とし、範囲外は丸めずに拒否する。
+	// 検証器が飛ばす入力でも同じに見る (#3843)。
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
+	if !limitOK {
+		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	viewer := middleware.GetUser(c)
 	var games []*model.ReversiGame
 	if req.My && viewer != nil {
-		games, _ = h.repo.ListByUserCursor(viewer.ID, sinceID, untilID, req.Limit)
+		games, _ = h.repo.ListByUserCursor(viewer.ID, sinceID, untilID, limit)
 	} else {
-		games, _ = h.repo.ListStartedCursor(sinceID, untilID, req.Limit)
+		games, _ = h.repo.ListStartedCursor(sinceID, untilID, limit)
 	}
 	// #2106 L15 (cherrypick-lineage divergence): vanilla の reversi/games は ReversiGameLite
 	// (form1/form2/logs/map を含まない) を返すが、mk-go は cherrypick 系統 + 連合対戦拡張
@@ -297,7 +297,7 @@ func (h *Handler) Games(c echo.Context) error {
 	// なく cherrypick + 連合拡張を権威とする (MEMORY: reversi_cherrypick_lineage)。
 	out := make([]map[string]any, len(games))
 	for i, g := range games {
-		out[i] = packGame(g, h.idGen)
+		out[i] = packGame(h.entityPacker, g, h.idGen)
 	}
 	return c.JSON(http.StatusOK, out)
 }
@@ -329,7 +329,7 @@ func (h *Handler) Invitations(c echo.Context) error {
 			continue
 		}
 		seen[g.User1.ID] = struct{}{}
-		inviters = append(inviters, entity.PackUserLite(g.User1))
+		inviters = append(inviters, h.entityPacker.PackUserLite(g.User1))
 		users = append(users, g.User1)
 	}
 	if h.lites != nil {
@@ -367,9 +367,11 @@ func (h *Handler) ShowGame(c echo.Context) error {
 	// する (#417 P1 UDS 検証で発覚)。deliver は idempotent。
 	viewer := middleware.GetUser(c)
 	if viewer != nil && !game.IsStarted && !game.IsEnded && game.User2ID == viewer.ID {
-		h.sendJoinForAcceptedInvite(c, viewer, game)
+		if err := h.sendJoinForAcceptedInvite(c, viewer, game); errors.Is(err, corelocalfederation.ErrFederationDisabled) {
+			return federationDisabledResponse(c)
+		}
 	}
-	return c.JSON(http.StatusOK, packGame(game, h.idGen))
+	return c.JSON(http.StatusOK, packGame(h.entityPacker, game, h.idGen))
 }
 
 // Match handles POST /api/reversi/match — create or join a game.
@@ -421,6 +423,23 @@ func (h *Handler) Match(c echo.Context) error {
 		return h.matchAny(c, user, req.NoIrregularRules, req.Multiple)
 	}
 
+	// target user を一度だけ引いて pre-check と deliver 両方で使い回す
+	// (#417 P3 Devin review: 元実装では pre-check と delivery で 2 回
+	// FindByID していた)。本家 match.ts は相手を引けなければ招待より先に
+	// NO_SUCH_USER を返す。以前は引けないまま game 行を作り、FK 違反の 500 に
+	// なっていた (#3843)。DB の障害は not-found に丸めない (#2792)。
+	var targetUser *model.User
+	if h.userRepo != nil {
+		u, err := h.userRepo.FindByID(req.UserID)
+		if err != nil {
+			if !repository.IsNotFound(err) {
+				return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+			}
+			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "0b4f0559-b484-4e31-9581-3f73cee89b28"))
+		}
+		targetUser = u
+	}
+
 	// 既に相手から招待を受けている pending game があれば、それを accept 扱いで
 	// 再利用する (#417 P1)。CherryPick 本家の matchSpecificUser と同じ動作:
 	// inbound Invite 経由で作成された reversi_game 行 (User1=相手, User2=自分)
@@ -428,8 +447,10 @@ func (h *Handler) Match(c echo.Context) error {
 	// 新しいゲーム + 新しい session_id を作って二重招待になり、state 伝播が
 	// 噛み合わなくなる。
 	if existing := h.findPendingInvitationFrom(user.ID, req.UserID); existing != nil {
-		h.sendJoinForAcceptedInvite(c, user, existing)
-		return c.JSON(http.StatusOK, packGame(existing, h.idGen))
+		if err := h.sendJoinForAcceptedInvite(c, user, existing); errors.Is(err, corelocalfederation.ErrFederationDisabled) {
+			return federationDisabledResponse(c)
+		}
+		return c.JSON(http.StatusOK, packGame(h.entityPacker, existing, h.idGen))
 	}
 
 	// upstream matchSpecificUser: multiple=false なら直近 3 分以内の未開始 pending
@@ -448,16 +469,6 @@ func (h *Handler) Match(c echo.Context) error {
 		}
 	}
 
-	// target user を一度だけ引いて pre-check と deliver 両方で使い回す
-	// (#417 P3 Devin review: 元実装では pre-check と delivery で 2 回
-	// FindByID していた)。
-	var targetUser *model.User
-	if h.userRepo != nil {
-		if u, err := h.userRepo.FindByID(req.UserID); err == nil {
-			targetUser = u
-		}
-	}
-
 	// 新規招待で remote target の場合は reversiVersion 互換性を先に確認する
 	// (#417 P3)。非対応ホストへの招待は silent に握りつぶされるだけで UI が
 	// 「待機中」のまま動かないので、ゲーム行作成前に 400 エラーで弾く。
@@ -468,6 +479,9 @@ func (h *Handler) Match(c echo.Context) error {
 				"The target user's server does not support reversi federation.",
 				"3c9d76c8-8d40-4f6e-9bea-e4e57ae02fed"))
 		}
+	}
+	if targetUser != nil && !targetUser.IsLocal() && !corelocalfederation.IsExternallyAvailable(user) {
+		return federationDisabledResponse(c)
 	}
 
 	now := time.Now()
@@ -542,36 +556,44 @@ func (h *Handler) withinMatchDedupWindow(g *model.ReversiGame) bool {
 // sendJoinForAcceptedInvite delivers a Join activity to the remote inviter so
 // both sides agree the match has started. local-only の招待の場合 (User1 が
 // ローカル) は federation 不要なので何もしない。
-func (h *Handler) sendJoinForAcceptedInvite(c echo.Context, accepter *model.User, game *model.ReversiGame) {
+func (h *Handler) sendJoinForAcceptedInvite(c echo.Context, accepter *model.User, game *model.ReversiGame) error {
 	if h.userRepo == nil || h.deliverer == nil || h.fedCache == nil {
-		return
+		return nil
 	}
 	inviter, err := h.userRepo.FindByID(game.User1ID)
 	if err != nil || inviter == nil || inviter.Host == nil || inviter.URI == nil {
-		return
+		return nil
+	}
+	if !corelocalfederation.IsExternallyAvailable(accepter) {
+		return corelocalfederation.ErrFederationDisabled
 	}
 	ctx := c.Request().Context()
 	sessionID, ok := h.fedCache.GetSessionByGame(ctx, game.ID)
 	if !ok {
-		return
+		return nil
 	}
 	// show-game 経由で User2 が pending game を表示するたびに呼ばれる
 	// 経路があるため、session ごとに 1 回だけ送るよう guard する
 	// (#417 Devin review)。相手側 (CherryPick) でも zset idempotent なので
 	// 重複しても実害は無いが、無駄な deliver job を抑える。
 	if h.fedCache.IsJoinSent(ctx, sessionID) {
-		return
+		return nil
 	}
 	join := corereversi.RenderJoin(h.baseURL, sessionID,
 		h.baseURL+"/users/"+accepter.ID, *inviter.URI, time.Now().UTC().Format(time.RFC3339))
 	body, err := json.Marshal(join)
 	if err != nil {
-		return
+		return nil
 	}
 	if err := h.deliverer.DeliverToUser(accepter.ID, inviter, body); err != nil {
-		return
+		return nil
 	}
 	h.fedCache.MarkJoinSent(ctx, sessionID)
+	return nil
+}
+
+func federationDisabledResponse(c echo.Context) error {
+	return c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_DISABLED", "This account is not available for federation.", "ff6844bb-b2d5-4e8c-a3d1-14e0ac15d5a1"))
 }
 
 // CancelMatch handles POST /api/reversi/cancel-match.
@@ -717,12 +739,14 @@ func surrenderErrorResponse(c echo.Context, err error) error {
 // 走らせる。一致なら `{desynced: false}` のみ。
 func (h *Handler) Verify(c echo.Context) error {
 	var req struct {
-		GameID string `json:"gameId"`
-		CRC32  string `json:"crc32"`
+		GameID string  `json:"gameId"`
+		CRC32  *string `json:"crc32"`
 	}
 	// crc32 は upstream verify.ts:38-41 で required (gameId と同列)。欠落を
 	// 黙って desynced=false にすると client 側の desync が一生検出されない。
-	if err := c.Bind(&req); err != nil || req.GameID == "" || req.CRC32 == "" {
+	// 本家は required の string とするだけなので、空文字は通して保存済みの値と
+	// 比べる (#3843)。
+	if err := c.Bind(&req); err != nil || req.GameID == "" || req.CRC32 == nil {
 		return apierr.JSONInvalidParam(c)
 	}
 	game, err := h.repo.FindByID(req.GameID)
@@ -740,10 +764,10 @@ func (h *Handler) Verify(c echo.Context) error {
 	// なり desync 判定が本家と乖離するため、StartGame / PutStone が更新する
 	// 保存値をそのまま使う (#1553)。保存値が無い (開始前) 場合は本家同様
 	// 不一致 = desynced 扱いになり、client は game から状態を復元する。
-	desynced := game.CRC32 == nil || *game.CRC32 != req.CRC32
+	desynced := game.CRC32 == nil || *game.CRC32 != *req.CRC32
 	resp := map[string]any{"desynced": desynced}
 	if desynced {
-		resp["game"] = packGame(game, h.idGen)
+		resp["game"] = packGame(h.entityPacker, game, h.idGen)
 	}
 	return c.JSON(http.StatusOK, resp)
 }
@@ -774,8 +798,8 @@ func (h *Handler) matchAny(c echo.Context, user *model.User, noIrregularRules, m
 	// 1. 直近の未開始対局の再利用。upstream は multiple=true でこれを飛ばして
 	//    毎回新しく探す (ReversiService.ts:146)。
 	if !multiple {
-		if g := h.findPendingGameFor(user.ID); g != nil {
-			return c.JSON(http.StatusOK, packGame(g, h.idGen))
+		if g := h.findPendingGameFor(user.ID); g != nil && !(g.User2ID == user.ID && g.User1ID != user.ID) {
+			return c.JSON(http.StatusOK, packGame(h.entityPacker, g, h.idGen))
 		}
 	}
 
@@ -783,8 +807,10 @@ func (h *Handler) matchAny(c echo.Context, user *model.User, noIrregularRules, m
 	//    「自分が User2 の未開始 game」がそれにあたる。specific-match の
 	//    accept 経路と同じ扱いにして、相手に Join を返す。
 	if g := h.findPendingInvitationTo(user.ID); g != nil {
-		h.sendJoinForAcceptedInvite(c, user, g)
-		return c.JSON(http.StatusOK, packGame(g, h.idGen))
+		if err := h.sendJoinForAcceptedInvite(c, user, g); errors.Is(err, corelocalfederation.ErrFederationDisabled) {
+			return federationDisabledResponse(c)
+		}
+		return c.JSON(http.StatusOK, packGame(h.entityPacker, g, h.idGen))
 	}
 
 	// 3. 待機列。
@@ -827,7 +853,7 @@ func (h *Handler) matchAny(c echo.Context, user *model.User, noIrregularRules, m
 	if h.streamPub != nil {
 		h.streamPub.PublishInvited(res.OpponentID, user)
 	}
-	return c.JSON(http.StatusOK, packGame(game, h.idGen))
+	return c.JSON(http.StatusOK, packGame(h.entityPacker, game, h.idGen))
 }
 
 // findPendingGameFor returns the caller's most recent unstarted game within the

@@ -28,13 +28,20 @@ var errStub = errors.New("stub error")
 
 func newHandler(t *testing.T) (*Handler, *testutil.MockDriveFileRepository, *testutil.MockDriveFolderRepository) {
 	t.Helper()
+	return newHandlerWithRoleChecker(t, nil)
+}
+
+// newHandlerWithRoleChecker is newHandler whose drive service is built with
+// rc as its role checker (#3825: the role checker is a constructor argument).
+func newHandlerWithRoleChecker(t *testing.T, rc coredrive.RoleChecker) (*Handler, *testutil.MockDriveFileRepository, *testutil.MockDriveFolderRepository) {
+	t.Helper()
 	fileRepo := testutil.NewMockDriveFileRepository()
 	folderRepo := testutil.NewMockDriveFolderRepository()
 	folderRepo.FilesRef = fileRepo
 	storage := coredrive.NewLocalStorage(t.TempDir(), "https://example.com/files")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coredrive.NewService(fileRepo, folderRepo, storage, idGen)
-	return NewHandler(svc, idGen), fileRepo, folderRepo
+	svc := coredrive.NewService(fileRepo, folderRepo, storage, idGen, nil, rc, nil, nil)
+	return NewHandler(svc, idGen, nil, nil, nil), fileRepo, folderRepo
 }
 
 func setUser(c echo.Context, id string) {
@@ -212,8 +219,8 @@ func TestFilesCreate_RepoError(t *testing.T) {
 	folderRepo := testutil.NewMockDriveFolderRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	storage := coredrive.NewLocalStorage(t.TempDir(), "")
-	svc := coredrive.NewService(repo, folderRepo, storage, idGen)
-	h := NewHandler(svc, idGen)
+	svc := coredrive.NewService(repo, folderRepo, storage, idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 
 	c, rec := newMultipartReq(t, "hello.txt", "hello", nil)
 	setUser(c, "u1")
@@ -239,9 +246,8 @@ func newHandlerWithPolicy(t *testing.T, policies map[string]any) (*Handler, *tes
 	folderRepo.FilesRef = fileRepo
 	storage := coredrive.NewLocalStorage(t.TempDir(), "https://example.com/files")
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coredrive.NewService(fileRepo, folderRepo, storage, idGen)
-	svc.SetRoleChecker(&driveRoleStub{policies: policies})
-	return NewHandler(svc, idGen), fileRepo
+	svc := coredrive.NewService(fileRepo, folderRepo, storage, idGen, nil, &driveRoleStub{policies: policies}, nil, nil)
+	return NewHandler(svc, idGen, nil, nil, nil), fileRepo
 }
 
 // maxFileSizeMb 超過は 400 MAX_FILE_SIZE_EXCEEDED で upstream UUID と完全一致。
@@ -471,8 +477,8 @@ func TestFilesUpdate_RepoError(t *testing.T) {
 	mock.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &uid}
 	repo := &failingUpdateFileRepo{MockDriveFileRepository: mock}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coredrive.NewService(repo, testutil.NewMockDriveFolderRepository(), coredrive.NewLocalStorage(t.TempDir(), ""), idGen)
-	h := NewHandler(svc, idGen)
+	svc := coredrive.NewService(repo, testutil.NewMockDriveFolderRepository(), coredrive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 
 	c, rec := newJSONReq(t, `{"fileId":"f1","name":"x"}`)
 	setUser(c, "u1")
@@ -660,8 +666,8 @@ func (f *failingFolderRepo) Create(_ *model.DriveFolder) error {
 func TestFoldersCreate_RepoError(t *testing.T) {
 	repo := &failingFolderRepo{MockDriveFolderRepository: testutil.NewMockDriveFolderRepository()}
 	idGen, _ := id.NewGenerator("aidx")
-	svc := coredrive.NewService(testutil.NewMockDriveFileRepository(), repo, coredrive.NewLocalStorage(t.TempDir(), ""), idGen)
-	h := NewHandler(svc, idGen)
+	svc := coredrive.NewService(testutil.NewMockDriveFileRepository(), repo, coredrive.NewLocalStorage(t.TempDir(), ""), idGen, nil, nil, nil, nil)
+	h := NewHandler(svc, idGen, nil, nil, nil)
 	c, rec := newJSONReq(t, `{"name":"x"}`)
 	setUser(c, "u1")
 	require.NoError(t, h.FoldersCreate(c))
@@ -1457,8 +1463,7 @@ func TestReadMultipartFile_LimitsEvenWhenHeaderSizeLies(t *testing.T) {
 // handler まで通して 413 になること。**`Upload` が返すのと同じ応答**なので、
 // 読む前に落ちたか後で落ちたかで挙動は変わらない。
 func TestFilesCreate_PolicyLimitReturns413(t *testing.T) {
-	h, fileRepo, _ := newHandler(t)
-	h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 0.000001}) // 約 1 バイト
+	h, fileRepo, _ := newHandlerWithRoleChecker(t, roleStub{maxFileSizeMb: 0.000001}) // 約 1 バイト
 
 	c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
 	setUser(c, "u1")
@@ -1472,8 +1477,7 @@ func TestFilesCreate_PolicyLimitReturns413(t *testing.T) {
 // **普通のアップロードは通ったまま。** これが無いと「常に 413 を返す」実装でも
 // 上のテストが通る。
 func TestFilesCreate_UnderPolicyLimitStillUploads(t *testing.T) {
-	h, fileRepo, _ := newHandler(t)
-	h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 30})
+	h, fileRepo, _ := newHandlerWithRoleChecker(t, roleStub{maxFileSizeMb: 30})
 
 	c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
 	setUser(c, "u1")
@@ -1521,8 +1525,7 @@ func TestFilesCreate_DoesNotReadPastPolicyLimit(t *testing.T) {
 			return prev(fh)
 		}
 
-		h, fileRepo, _ := newHandler(t)
-		h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 1.0 / 1024}) // 1KiB
+		h, fileRepo, _ := newHandlerWithRoleChecker(t, roleStub{maxFileSizeMb: 1.0 / 1024}) // 1KiB
 
 		c, rec := newMultipartReq(t, "big.bin", strings.Repeat("x", size), nil)
 		setUser(c, "u1")
@@ -1543,8 +1546,7 @@ func TestFilesCreate_DoesNotReadPastPolicyLimit(t *testing.T) {
 			return seen, nil
 		}
 
-		h, fileRepo, _ := newHandler(t)
-		h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 1.0 / 1024}) // 1KiB
+		h, fileRepo, _ := newHandlerWithRoleChecker(t, roleStub{maxFileSizeMb: 1.0 / 1024}) // 1KiB
 
 		// 申告は 5 バイト (上限内) なので Size の枝は通り抜ける。
 		c, rec := newMultipartReq(t, "small.bin", "hello", nil)
@@ -1572,9 +1574,40 @@ func TestReadAtMost_SaturatedLimitIsTreatedAsUnlimited(t *testing.T) {
 	assert.Equal(t, "hello world", string(body), "飽和した上限で本体が切り詰められている")
 }
 
+// maxFileSizeMb が 0 の利用者は、空でない本体を保存できない (本家と同じ)。
+// 読み切る前の上限 (readMultipartFile) も 0 を上限なしと読まず、413 にする。
+func TestFilesCreate_ZeroPolicyRejects(t *testing.T) {
+	for _, v := range []any{0, -1.0} {
+		h, fileRepo, _ := newHandlerWithRoleChecker(t, roleStub{maxFileSizeMb: v})
+		c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
+		setUser(c, "u1")
+		require.NoError(t, h.FilesCreate(c))
+		assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, "maxFileSizeMb=%v で保存できている", v)
+		assert.Empty(t, fileRepo.Files)
+	}
+}
+
+// 0 の上限でも、読み切る前の上限は「上限なし」(0 以下) にしない。0 を渡すと
+// readMultipartFile は本体を全部読んでから Upload の gate で落とすので、保存は
+// されないがヒープは server の上限まで確保される。
+func TestFilesCreate_ZeroPolicyBoundsTheRead(t *testing.T) {
+	orig := readMultipartFile
+	t.Cleanup(func() { readMultipartFile = orig })
+	var got int64 = -1
+	readMultipartFile = func(c echo.Context, maxBytes int64) ([]byte, string, error) {
+		got = maxBytes
+		return orig(c, maxBytes)
+	}
+	h, _, _ := newHandlerWithRoleChecker(t, roleStub{maxFileSizeMb: 0})
+	c, _ := newMultipartReq(t, "hello.txt", "hello world", nil)
+	setUser(c, "u1")
+	require.NoError(t, h.FilesCreate(c))
+	assert.Positive(t, got, "0 の上限を readMultipartFile に上限なしとして渡している")
+	assert.LessOrEqual(t, got, int64(1))
+}
+
 func TestFilesCreate_SaturatedPolicyStillUploads(t *testing.T) {
-	h, fileRepo, _ := newHandler(t)
-	h.svc.SetRoleChecker(roleStub{maxFileSizeMb: math.MaxFloat64})
+	h, fileRepo, _ := newHandlerWithRoleChecker(t, roleStub{maxFileSizeMb: math.MaxFloat64})
 
 	c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
 	setUser(c, "u1")

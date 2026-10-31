@@ -245,7 +245,7 @@ func TestUnfollowForBlock_NotFollowingIsNoop(t *testing.T) {
 func TestService_HasMeUpdatedPublisher(t *testing.T) {
 	svc, _, _, _ := newSvc(t)
 	assert.False(t, svc.HasMeUpdatedPublisher())
-	svc.SetUserPacker(&countingPacker{})
+	svc.SetUserPackerForTest(&countingPacker{})
 	assert.False(t, svc.HasMeUpdatedPublisher(), "別の依存だけを配線しても false")
 	svc.SetMeUpdatedPublisher(&recordingMeUpdated{})
 	assert.True(t, svc.HasMeUpdatedPublisher())
@@ -273,6 +273,9 @@ func TestFollow_SilentSuppressesFollowEventOnly(t *testing.T) {
 
 // 本家 unfollow の silent は main stream の unfollow と Webhook を止めるが、配送はする。
 func TestUnfollowWithoutNotify_DeliversButEmitsNothing(t *testing.T) {
+	// ローカルからリモートへのフォローは Accept まで申請になる (#3491)。このテストは
+	// 成立した後を見るので、本家の backend e2e と同じ切り替えで即座に成立させる。
+	t.Setenv("FORCE_FOLLOW_REMOTE_USER_FOR_TESTING", "true")
 	r := newRequestEventsSvc(t, localUser("alice", false), remoteUser("carol", false))
 	_, err := r.svc.Follow("alice", "carol", following.FollowOptions{})
 	require.NoError(t, err)

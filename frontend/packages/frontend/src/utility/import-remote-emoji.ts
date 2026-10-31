@@ -1,33 +1,18 @@
 /*
- * SPDX-FileCopyrightText: mk-go project
+ * SPDX-FileCopyrightText: Elythia-Network
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 import { defineAsyncComponent } from 'vue';
+import type * as Elythia from 'elythia-js';
 import * as os from '@/os.js';
 import { misskeyApi } from '@/utility/misskey-api.js';
 import { i18n } from '@/i18n.js';
 import { customEmojisMap } from '@/custom-emojis.js';
 import { $i } from '@/i.js';
 
-export type RemoteEmojiMeta = {
-	fetched: boolean;
-	reason?: 'unsupported' | 'notFound' | 'error';
-	emojiId: string;
-	name: string;
-	host: string;
-	originalUrl: string;
-	category?: string;
-	aliases?: string[];
-	license?: string;
-	isSensitive?: boolean;
-};
-
-// mk-go 独自のエンドポイントなので misskey-js の型集合には無い。
-// signup-applications.vue と同じ理由の cast。
-function api<T>(endpoint: string, params: Record<string, unknown> = {}): Promise<T> {
-	return misskeyApi(endpoint as never, params as never) as unknown as Promise<T>;
-}
+// 取得に成功したかで持つ項目が違うので、fetched で絞ってから読む。
+export type RemoteEmojiMeta = Elythia.RemoteEmojiMeta;
 
 /**
  * mk-go: リモート絵文字をその場からインポートする (#2698)。
@@ -85,7 +70,8 @@ export async function importRemoteEmoji(name: string, host: string | null | unde
 	// 手で埋めてもらう。ここで弾くと「取り込めない絵文字」ができてしまう。
 	let res: RemoteEmojiMeta;
 	try {
-		res = await api<RemoteEmojiMeta>('admin/emoji/fetch-remote-meta', { name: bare, host });
+		const meta = await misskeyApi('admin/emoji/fetch-remote-meta', { name: bare, host });
+		res = meta;
 	} catch {
 		os.alert({ type: 'error', text: i18n.ts.somethingHappened });
 		return null;

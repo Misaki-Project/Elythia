@@ -569,3 +569,106 @@ func TestVersion2_1_RegistrationClosed(t *testing.T) {
 	assert.Equal(t, false, resp["openRegistrations"])
 	assert.Equal(t, true, resp["metadata"].(map[string]any)["disableRegistration"])
 }
+
+// InvalidateCache は metaUpdated で呼ばれる (#3663)。次のリクエストは今の meta
+// から組み直す。
+func TestNodeinfo_InvalidateCacheRebuildsFromCurrentMeta(t *testing.T) {
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	h, userRepo, _ := newCountingHandler(t, now)
+	metaRepo := testutil.NewMockMetaRepository()
+	before := "before"
+	metaRepo.Meta = &model.Meta{ID: "x", Name: &before}
+	h.SetMetaRepo(metaRepo)
+
+	name := func() any { return getNodeinfo(t, h.Version2_1)["metadata"].(map[string]any)["nodeName"] }
+	require.Equal(t, "before", name())
+	after := "after"
+	metaRepo.Meta.Name = &after
+	require.Equal(t, "before", name(), "without invalidation the cached document stays")
+	calls := userRepo.calls.Load()
+
+	h.InvalidateCache()
+	assert.Equal(t, "after", name())
+	assert.Equal(t, calls+1, userRepo.calls.Load())
+}
+
+// 捨てる前に始まった組み立ての結果は、捨てた後に積まない。積むと、捨てる前の
+// meta で組んだ document を TTL の間配り続ける。捨てた後に来たリクエストを、
+// その組み立てに相乗りさせもしない。
+func TestNodeinfo_InvalidateDuringBuildDoesNotCacheStaleDocument(t *testing.T) {
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	h, userRepo, _ := newCountingHandler(t, now)
+	metaRepo := testutil.NewMockMetaRepository()
+	stale := "stale"
+	metaRepo.Meta = &model.Meta{ID: "x", Name: &stale}
+	h.SetMetaRepo(metaRepo)
+
+	inBuild := make(chan struct{})
+	release := make(chan struct{})
+	var first atomic.Bool
+	userRepo.before = func() {
+		if first.CompareAndSwap(false, true) {
+			close(inBuild)
+			<-release
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rec := httptest.NewRecorder()
+		c := echo.New().NewContext(httptest.NewRequest(http.MethodGet, "/nodeinfo/2.1", nil), rec)
+		assert.NoError(t, h.Version2_1(c))
+	}()
+	<-inBuild
+	// 組み立ては meta を読み終えている (nodeName は COUNT より前に読む)。ここで
+	// meta が変わり、metaUpdated でキャッシュを捨てる。
+	fresh := "fresh"
+	metaRepo.Meta.Name = &fresh
+	h.InvalidateCache()
+
+	// 捨てた後のリクエストは、止まっている組み立てを待たずに組み直す。
+	got := make(chan any, 1)
+	go func() {
+		got <- getNodeinfo(t, h.Version2_1)["metadata"].(map[string]any)["nodeName"]
+	}()
+	select {
+	case v := <-got:
+		assert.Equal(t, "fresh", v)
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("a request after InvalidateCache joined the build that started before it")
+	}
+	close(release)
+	<-done
+
+	assert.Equal(t, "fresh", getNodeinfo(t, h.Version2_1)["metadata"].(map[string]any)["nodeName"],
+		"the stale build must not overwrite the cache")
+}
+
+// DropLocal は version ごとの document を両方捨てる (#3721)。
+func TestNodeinfo_DropLocalDropsEveryVersion(t *testing.T) {
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	h, _, _ := newCountingHandler(t, now)
+	metaRepo := testutil.NewMockMetaRepository()
+	before := "before"
+	metaRepo.Meta = &model.Meta{ID: "x", Name: &before}
+	h.SetMetaRepo(metaRepo)
+
+	versions := map[string]func(echo.Context) error{"2.0": h.Version2_0, "2.1": h.Version2_1}
+	name := func(fn func(echo.Context) error) any {
+		return getNodeinfo(t, fn)["metadata"].(map[string]any)["nodeName"]
+	}
+	for v, fn := range versions {
+		require.Equal(t, "before", name(fn), v)
+	}
+	after := "after"
+	metaRepo.Meta.Name = &after
+	for v, fn := range versions {
+		require.Equal(t, "before", name(fn), "前提: 捨てるまでは cache が返る (%s)", v)
+	}
+
+	h.DropLocal()
+	for v, fn := range versions {
+		assert.Equal(t, "after", name(fn), "DropLocal did not drop the %s document", v)
+	}
+}

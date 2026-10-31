@@ -2,6 +2,7 @@
 package inbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,12 +10,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/core/federation"
+	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
 	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
+	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
 )
 
@@ -69,54 +73,86 @@ type InboxEnqueuer interface {
 // Handler accepts incoming activities and dispatches them to the federation
 // processor after verifying their HTTP signature.
 type Handler struct {
-	resolver        *federation.Resolver
-	processor       *federation.Processor
+	resolver  *federation.Resolver
+	processor *federation.Processor
+	// hostBlocker はシグネチャ検証成功後の actor が属するホストが blocked
+	// リストに含まれる (または federation 設定が許さない) 場合に 403 を返して
+	// 以降の処理をスキップする判定。**nil だと `federation: none` 設定でも inbox が
+	// 受け付ける。** 構築子の必須の引数 (#3833。以前は setter と起動時の検査、
+	// #2683)。テストは nil を渡せる。
 	hostBlocker     HostBlockChecker
 	instanceTracker InstanceTracker
 	chartHook       ChartHook
 	capabilities    SignatureCapabilityRecorder
-	enqueuer        InboxEnqueuer
-	// keyCache は同期 fallback 経路 (SetEnqueuer 未配線時) の HTTP Signature
+	// enqueuer は署名を検証した activity を worker へ渡す queue (#534)。nil だと
+	// processor.Process をリクエストの goroutine で同期に呼ぶ legacy な経路へ落ちる。
+	// **その経路は worker 側の actor-authorization gate (署名者 != activity.actor の
+	// なりすまし検出)・LD-Signature 検証・inbox replay guard を通らない。** 本番は
+	// async 一択である前提で、同期の経路はテストのためだけに残してある。構築子の
+	// 必須の引数 (#3833。以前は setter と起動時の検査、#2682)。
+	enqueuer InboxEnqueuer
+	// keyCache は同期 fallback 経路 (enqueuer が nil のとき) の HTTP Signature
 	// verify で公開鍵パースをメモ化する (#1426)。worker 側 InboxProcessor と
 	// 同じ最適化を、enqueue せず inline verify する構成にも適用する。
 	keyCache *activitypub.PublicKeyCache
 	// expectedHost は config 由来の自ホスト (host:port)。inbox admission の
-	// host 署名必須 + 一致チェックに使う。未設定時は host チェックを skip する
-	// (#1949)。
-	expectedHost string
+	// host 署名必須 + 一致チェックに使う (upstream の
+	// `request.headers.host !== this.config.host`、#1949)。**空文字だと
+	// VerifyInboxAdmission の host 検査が丸ごと skip され、host ヘッダが署名対象に
+	// 含まれているかの確認と、自ホストとの一致確認の 2 つが飛ぶ。** 構築子の必須の
+	// 引数 (#3833。以前は setter と起動時の検査、#2682)。
+	expectedHost            string
+	localFederationObserver activitypub.LocalFederationObserver
+	userRepo                repository.UserRepository
+	noteRepo                repository.NoteRepository
+}
+
+func (h *Handler) SetLocalFederationObserver(observer activitypub.LocalFederationObserver) {
+	h.localFederationObserver = observer
+	if h.resolver != nil {
+		h.resolver.SetLocalFederationObserver(observer)
+	}
+}
+
+func (h *Handler) SetUserRepo(repo repository.UserRepository) {
+	h.userRepo = repo
+	if h.resolver != nil {
+		h.resolver.SetUserRepo(repo)
+	}
+}
+
+func (h *Handler) SetNoteRepo(repo repository.NoteRepository) {
+	h.noteRepo = repo
+	if h.resolver != nil {
+		h.resolver.SetNoteRepo(repo)
+	}
 }
 
 // NewHandler constructs a Handler.
-func NewHandler(resolver *federation.Resolver, processor *federation.Processor) *Handler {
-	return &Handler{resolver: resolver, processor: processor, keyCache: activitypub.NewPublicKeyCache(0)}
-}
-
-// SetEnqueuer wires the queue.Enqueuer used to dispatch verified activities
-// to the worker pool. When unset, the handler falls back to running
-// processor.Process synchronously inside the request goroutine — which is
-// the pre-#534 behaviour and what unit tests without a queue rely on.
-func (h *Handler) SetEnqueuer(e InboxEnqueuer) {
-	h.enqueuer = e
-}
-
-// SetHostBlockChecker attaches a HostBlockChecker. 設定されると、シグネチャ
-// 検証成功後の actor が属するホストが blocked リストに含まれる場合は 403 を
-// 返して以降の処理をスキップする。
-func (h *Handler) SetHostBlockChecker(c HostBlockChecker) {
-	h.hostBlocker = c
+//
+// expectedHost / enqueuer / hostBlocker はテストでは空文字か nil を渡せる
+// (それぞれのフィールドの説明のとおりに検査が外れるか、同期の経路になる)。
+func NewHandler(
+	resolver *federation.Resolver,
+	processor *federation.Processor,
+	expectedHost string,
+	enqueuer InboxEnqueuer,
+	hostBlocker HostBlockChecker,
+) *Handler {
+	return &Handler{
+		resolver:     resolver,
+		processor:    processor,
+		keyCache:     activitypub.NewPublicKeyCache(0),
+		expectedHost: expectedHost,
+		enqueuer:     enqueuer,
+		hostBlocker:  hostBlocker,
+	}
 }
 
 // SetInstanceTracker attaches an InstanceTracker. 設定されると、署名検証に
 // 成功するたびに対応 instance row の latestRequestReceivedAt が更新される。
 func (h *Handler) SetInstanceTracker(t InstanceTracker) {
 	h.instanceTracker = t
-}
-
-// SetExpectedHost wires the configured host (host:port) used by inbox admission
-// to require the request Host header to be signed and to match this server.
-// Mirrors upstream `request.headers.host !== this.config.host` (#1949).
-func (h *Handler) SetExpectedHost(host string) {
-	h.expectedHost = host
 }
 
 // SetChartHook attaches a ChartHook invoked after each successfully
@@ -151,14 +187,36 @@ var signatureRelevantHeaders = []string{
 	"Accept",
 }
 
+// Limits on the signed headers captured beyond signatureRelevantHeaders.
+const (
+	// maxSignedExtraHeaders is how many extra headers named in the
+	// Signature's headers= list are carried to the worker.
+	maxSignedExtraHeaders = 16
+	// maxSignedExtraHeaderBytes caps the total size of their values.
+	maxSignedExtraHeaderBytes = 8 << 10
+)
+
 // captureSignatureHeaders extracts the headers needed to re-verify the
-// HTTP signature in the inbox worker. Only the small allowlist above is
-// included so the queue payload stays compact.
+// HTTP signature in the inbox worker: the allowlist above, plus every header
+// the Signature's headers= list names (within the limits above), so that the
+// worker rebuilds the same signing string the sender signed.
 //
 // Host は net/http で req.Host に格納される (Header map には入らない) た
 // め、明示的に補完してから capture する。これが無いと worker 側 verify が
 // `host: ""` で署名再構築して RSA verify が失敗する。
-func captureSignatureHeaders(req *http.Request) map[string]string {
+//
+// **署名の headers= に挙がったヘッダーも運ぶ (#3498)。** 決め打ちの一覧だけを
+// 運ぶと、一覧に無いヘッダーを署名に含める相手の配送が、署名が正しいのに worker で
+// `missing required header` になって捨てられる。Mastodon はフォロワー限定の投稿の
+// 配送に `Collection-Synchronization` を付けて署名するので、フォロワー限定だけが
+// 届かなかった (#3037 の `X-Date` も同じ形だった)。
+//
+// 上限はキューの payload を相手の申告で膨らませないためのもの。正規の送り手が
+// そこまで多くのヘッダーを署名することは無い。署名に挙がったヘッダーを上限で
+// 積みきれなかったときは complete が false になる。呼び出し側はそれを受付で
+// 401 にする (積まずに 202 を返すと、worker で黙って捨てることになり、相手には
+// 成功に見える)。
+func captureSignatureHeaders(req *http.Request) (headers map[string]string, complete bool) {
 	out := make(map[string]string, len(signatureRelevantHeaders))
 	for _, h := range signatureRelevantHeaders {
 		if v := req.Header.Get(h); v != "" {
@@ -168,7 +226,33 @@ func captureSignatureHeaders(req *http.Request) map[string]string {
 	if out["Host"] == "" && req.Host != "" {
 		out["Host"] = req.Host
 	}
-	return out
+	parsed, err := activitypub.ParseSignatureHeader(out["Signature"])
+	if err != nil {
+		// 受付の admitInbox が先に 401 で弾くので、ここには来ない。
+		return out, true
+	}
+	extra, size := 0, 0
+	for _, name := range parsed.Headers {
+		if strings.HasPrefix(name, "(") {
+			// (request-target) などの疑似ヘッダーは、method と path から作る。
+			continue
+		}
+		key := http.CanonicalHeaderKey(name)
+		if _, ok := out[key]; ok {
+			continue
+		}
+		v := req.Header.Get(key)
+		if v == "" {
+			continue
+		}
+		if extra >= maxSignedExtraHeaders || size+len(v) > maxSignedExtraHeaderBytes {
+			return out, false
+		}
+		out[key] = v
+		extra++
+		size += len(v)
+	}
+	return out, true
 }
 
 // Inbox handles POST /inbox and POST /users/:id/inbox.
@@ -183,11 +267,12 @@ func captureSignatureHeaders(req *http.Request) map[string]string {
 // が消え、faker.send rps が ~2x 改善する (#564 bench)。Misskey TS と同じ
 // アーキテクチャ (read-and-enqueue + verify-in-worker)。
 //
-// SetEnqueuer 未配線時は legacy synchronous mode に fallback し、handler
+// enqueuer が nil のときは legacy synchronous mode に fallback し、handler
 // 内で従来通り verify + block + track + chart + process を実行する。これは
 // 単体テスト / 旧来配線を維持するためのもので、production 配線では
-// SetEnqueuer 経由の async path を踏む。
+// 構築子で渡す enqueuer 経由の async path を踏む。
 func (h *Handler) Inbox(c echo.Context) error {
+	c.Response().Header().Set("Cache-Control", "no-store")
 	// upstream ActivityPubServerService.inbox と同じく、federation mode が "none" なら
 	// body を読む前に 403 を即返す (#1959)。per-actor の IsAllowed gate は actor が
 	// local 扱い (host nil) や async enqueue 後にしか効かない経路があるため、最前段で弾く。
@@ -206,6 +291,14 @@ func (h *Handler) Inbox(c echo.Context) error {
 			return he
 		}
 		return c.NoContent(http.StatusBadRequest)
+	}
+	parsedForObservation, _ := activitypub.ParseSignatureHeader(c.Request().Header.Get("Signature"))
+	if err := h.observeLocalInboxPathTarget(c, signerHostOf(parsedForObservation)); err != nil {
+		if errors.Is(err, corelocalfederation.ErrFederationDisabled) || errors.Is(err, errLocalInboxTargetUnavailable) {
+			return c.NoContent(http.StatusNotFound)
+		}
+		slog.Error("inbox local path target observation failed", "err", err)
+		return c.NoContent(http.StatusInternalServerError)
 	}
 
 	// Echo の Request からはホストヘッダが空のことがあるため、明示的に補完する。
@@ -244,6 +337,17 @@ func (h *Handler) Inbox(c echo.Context) error {
 		return c.NoContent(http.StatusBadRequest)
 	}
 
+	if err := h.observeLocalInboxBodyTargets(body, signerHostOf(parsed)); err != nil {
+		if errors.Is(err, errLocalInboxTooManyReferences) {
+			return c.NoContent(http.StatusBadRequest)
+		}
+		if errors.Is(err, corelocalfederation.ErrFederationDisabled) || errors.Is(err, errLocalInboxTargetUnavailable) {
+			return c.NoContent(http.StatusNotFound)
+		}
+		slog.Error("inbox local body target observation failed", "err", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+
 	if h.enqueuer != nil {
 		// Fast write path. signature の crypto 検証は worker 側で再現する。
 		// admitInbox を上で通しているので handler 側の presence check は不要。
@@ -251,11 +355,20 @@ func (h *Handler) Inbox(c echo.Context) error {
 		// path + query で署名するので (本家 7c9c38c04a / 同期経路の
 		// VerifyRequestCached も同じ)、URL.Path だと `/inbox?x=1` 宛ての署名が
 		// worker 側でだけ合わなくなる。
+		headers, complete := captureSignatureHeaders(c.Request())
+		if !complete {
+			// 署名に挙がったヘッダーを積みきれないと worker が必ず検証に失敗する。
+			// 202 で受けて黙って捨てるより、ここで 401 にして相手に失敗を見せる (#3498)。
+			// 捨てる経路なので相手を出す (#2725)。
+			slog.Warn("inbox: rejecting a signature over too many or too large headers",
+				"host", signerHostOf(parsed), "keyId", signerKeyIDOf(parsed))
+			return c.NoContent(http.StatusUnauthorized)
+		}
 		payload := queue.InboxPayload{
 			Body:    body,
 			Method:  c.Request().Method,
 			Path:    c.Request().URL.RequestURI(),
-			Headers: captureSignatureHeaders(c.Request()),
+			Headers: headers,
 		}
 		if err := h.enqueuer.EnqueueInbox(c.Request().Context(), payload); err != nil {
 			// queue 障害時は 500 を返して上流に retry させる (best-effort
@@ -267,8 +380,8 @@ func (h *Handler) Inbox(c echo.Context) error {
 	}
 
 	// Legacy synchronous fallback (enqueuer 未配線時)。テストや旧来配線を
-	// 維持するために残してある。production では router.go が必ず SetEnqueuer を
-	// 呼ぶため到達しない。なお本経路は worker 側 InboxProcessor が持つ
+	// 維持するために残してある。production では setupRoutes が構築子で必ず
+	// enqueuer を渡すため到達しない。なお本経路は worker 側 InboxProcessor が持つ
 	// actor-authorization gate (署名者 != activity.actor のなりすまし検出,
 	// #parity review AUTH-1/AUTH-4) を通らない。production が async 一択である
 	// 前提のため許容しているが、将来この fallback を残すなら同 gate の適用
@@ -290,9 +403,46 @@ func (h *Handler) Inbox(c echo.Context) error {
 	return h.processSynchronously(c, body)
 }
 
+var errLocalInboxTargetUnavailable = errors.New("local inbox target is not externally available")
+var errLocalInboxTooManyReferences = errors.New("too many local inbox references")
+
+const maxInboxBodyReferences = 64
+
+// observeLocalInboxPathTarget preserves the path-only target policy before
+// admission. It does not parse or inspect the request body.
+func (h *Handler) observeLocalInboxPathTarget(c echo.Context, host string) error {
+	id := c.Param("id")
+	if id == "" || h.userRepo == nil || h.localFederationObserver == nil {
+		return nil
+	}
+	if err := h.resolver.ObserveLocalInboxPathTarget(id, host); errors.Is(err, federation.ErrInboundLocalReferenceUnavailable) {
+		return errLocalInboxTargetUnavailable
+	} else {
+		return err
+	}
+}
+
+// observeLocalInboxBodyTargets validates all semantic body references first,
+// then records availability. Body-derived identities are not inspected until
+// inbox admission and the required actor check have both succeeded.
+func (h *Handler) observeLocalInboxBodyTargets(body []byte, host string) error {
+	if h.userRepo == nil || h.localFederationObserver == nil || h.resolver == nil {
+		return nil
+	}
+	userIDs, noteIDs := h.resolver.ExtractLocalAPReferences(string(body))
+	if len(userIDs)+len(noteIDs) > maxInboxBodyReferences {
+		return errLocalInboxTooManyReferences
+	}
+	if err := h.resolver.ObserveLocalInboxBodyReferences(userIDs, noteIDs, host); errors.Is(err, federation.ErrInboundLocalReferenceUnavailable) {
+		return errLocalInboxTargetUnavailable
+	} else {
+		return err
+	}
+}
+
 // processSynchronously runs federation.Processor.Process inline and maps
 // the outcome to an HTTP status code. Kept as a fallback for tests and
-// configurations that don't wire SetEnqueuer.
+// configurations that pass no enqueuer.
 func (h *Handler) processSynchronously(c echo.Context, body []byte) error {
 	if err := h.processor.Process(body); err != nil {
 		if errors.Is(err, federation.ErrUnsupportedActivity) {
@@ -434,37 +584,25 @@ func (h *Handler) commitChart(actor *model.User) {
 	h.chartHook.OnInboxReceived(*actor.Host)
 }
 
-// bodyHasActor reports whether the inbox activity body is a JSON object with a
-// non-null `actor` field. upstream #17558: actor 無し activity は authenticate
-// 不能なので enqueue 前に弾く。actor は string ID / embedded object どちらも許容
-// (presence + 非 null のみ判定)。
+// bodyHasActor reports whether the inbox activity body is a JSON object whose
+// `actor` can name an actor: a non-empty string, an object or an array.
+// upstream #17558: actor 無し activity は authenticate 不能なので enqueue 前に
+// 弾く。数値・真偽値・空文字列は actor を名指せないので、null と同じく弾く
+// (worker の authorizeActor も落とすが、無駄な enqueue を避ける。2026-10-31 の監査)。
 func bodyHasActor(body []byte) bool {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(body, &probe); err != nil {
 		return false // object でない (= 不正) → reject
 	}
-	actor, ok := probe["actor"]
-	return ok && len(actor) > 0 && string(actor) != "null"
+	actor := bytes.TrimSpace(probe["actor"])
+	if len(actor) == 0 {
+		return false
+	}
+	switch actor[0] {
+	case '"':
+		return len(actor) > 2 // `""` は名指していない
+	case '{', '[':
+		return true
+	}
+	return false
 }
-
-// HasExpectedHost reports whether the expected Host value is wired.
-//
-// 空文字だと VerifyInboxAdmission の host 検査が丸ごと skip され、**host ヘッダが
-// 署名対象に含まれているかの確認と、自ホストとの一致確認の 2 つが飛ぶ**。
-// 本番では router が config.Host を必ず配線する (#2682)。
-func (h *Handler) HasExpectedHost() bool { return h.expectedHost != "" }
-
-// HasEnqueuer reports whether the async inbox enqueuer is wired.
-//
-// 未配線だと Handle が legacy な同期経路へ落ちる。その経路は worker 側の
-// **actor-authorization gate (署名者 != activity.actor のなりすまし検出)・
-// LD-Signature 検証・inbox replay guard を通らない**。同ファイルのコメントが
-// 「production が async 一択である前提のため許容している」と書いているとおり、
-// production では必ず配線される (#2682)。
-func (h *Handler) HasEnqueuer() bool { return h.enqueuer != nil }
-
-// HasHostBlockChecker reports whether the host block checker was wired.
-//
-// 未配線だと `federation: none` 設定でも inbox が受け付ける。起動時検査に
-// 使う (#2683)。
-func (h *Handler) HasHostBlockChecker() bool { return h.hostBlocker != nil }

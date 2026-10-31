@@ -345,18 +345,21 @@ func TestReadInlinableAsset_RejectsTerminators(t *testing.T) {
 	}
 }
 
-// 読み込みは 1 回だけ。**再ビルド後は再起動が要る** (client entry と同じ前提)。
-func TestBootLoaderAssets_ReadsOnce(t *testing.T) {
+// **呼ぶたびにディスクから読み直す (#3803)。** キャッシュは組み立ての側
+// (internal/server) が持ち、組み立て直した世代は作り直した frontend の loader を
+// 読む。ここでプロセスに 1 つのキャッシュを持つと、組み立て直しても古い loader が
+// 残る。
+func TestReadBootLoaderAssets_ReadsEveryCall(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "loader"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "style.css"),
 		[]byte("first"), 0o644))
 	t.Setenv("MISSKEY_FRONTEND_DIR", dir)
 
-	first := BootLoaderAssets()
+	require.Equal(t, "first", ReadBootLoaderAssets().CSS)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "style.css"),
 		[]byte("second"), 0o644))
-	assert.Equal(t, first, BootLoaderAssets(), "2 回目もキャッシュを返す")
+	assert.Equal(t, "second", ReadBootLoaderAssets().CSS, "前に読んだ内容を返している")
 }
 
 func TestFrontendEmbedDir_Default(t *testing.T) {
@@ -393,36 +396,70 @@ func TestDetectEmbedEntry(t *testing.T) {
 	})
 }
 
-// embed 側の loader も同じく 1 回だけ読む (#2551)。
-func TestEmbedLoaderAssets(t *testing.T) {
+// embed 側の loader も、呼ぶたびに読み直す (#2551、#3803)。
+func TestReadEmbedLoaderAssets(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "loader"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "boot.js"),
 		[]byte("embed-boot"), 0o644))
 	t.Setenv("MISSKEY_FRONTEND_EMBED_DIR", dir)
-	ResetLoaderCacheForTest()
 
-	assert.Equal(t, "embed-boot", EmbedLoaderAssets().JS)
-	assert.Empty(t, EmbedLoaderAssets().CSS, "無いものは空のまま")
+	assert.Equal(t, "embed-boot", ReadEmbedLoaderAssets().JS)
+	assert.Empty(t, ReadEmbedLoaderAssets().CSS, "無いものは空のまま")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "loader", "boot.js"),
+		[]byte("embed-boot-2"), 0o644))
+	assert.Equal(t, "embed-boot-2", ReadEmbedLoaderAssets().JS, "前に読んだ内容を返している")
 }
 
-// **キャッシュを捨てられないと、ディレクトリを差し替える test 同士が干渉する。**
-func TestResetLoaderCacheForTest(t *testing.T) {
-	first := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(first, "loader"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(first, "loader", "style.css"),
-		[]byte("first"), 0o644))
-	t.Setenv("MISSKEY_FRONTEND_DIR", first)
-	ResetLoaderCacheForTest()
-	require.Equal(t, "first", BootLoaderAssets().CSS)
+// preloads.json (ビルドの locale inliner が書く) から、entry の modulepreload の一覧を
+// 読む (#3613)。HTML の inline script に入るので、形の合わない名前は落とす。
+func TestDetectClientEntry_Preloads(t *testing.T) {
+	manifest := `{"src/_boot_.ts":{"file":"scripts/entry-AAAAAAAA.js","isEntry":true,"imports":["_a.js"]},"_a.js":{"file":"scripts/a-BBBBBBBB.js"}}`
+	setup := func(t *testing.T, preloads string) ClientEntryInfo {
+		t.Helper()
+		dir := t.TempDir()
+		t.Setenv("MISSKEY_FRONTEND_DIR", dir)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0644))
+		if preloads != "" {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "preloads.json"), []byte(preloads), 0644))
+		}
+		return DetectClientEntry()
+	}
 
-	second := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(second, "loader"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(second, "loader", "style.css"),
-		[]byte("second"), 0o644))
-	t.Setenv("MISSKEY_FRONTEND_DIR", second)
-	assert.Equal(t, "first", BootLoaderAssets().CSS, "捨てるまではキャッシュのまま")
+	t.Run("reads the list of the entry", func(t *testing.T) {
+		info := setup(t, `{"src/_boot_.ts":["scripts/a-BBBBBBBB.js","scripts/c_D-EEEEEEEE.js"],"src/i18n.ts":["scripts/x-FFFFFFFF.js"]}`)
+		assert.Equal(t, []string{"scripts/a-BBBBBBBB.js", "scripts/c_D-EEEEEEEE.js"}, info.Preloads)
+	})
 
-	ResetLoaderCacheForTest()
-	assert.Equal(t, "second", BootLoaderAssets().CSS)
+	t.Run("drops the entry, duplicates and unexpected names", func(t *testing.T) {
+		info := setup(t, `{"src/_boot_.ts":[
+			"scripts/entry-AAAAAAAA.js",
+			"scripts/a-BBBBBBBB.js",
+			"scripts/a-BBBBBBBB.js",
+			"scripts/../manifest.js",
+			"scripts/x.js\"</script>",
+			"assets/style.css",
+			"/scripts/y.js",
+			"scripts/sub/z.js",
+			"scripts/w.mjs"
+		]}`)
+		assert.Equal(t, []string{"scripts/a-BBBBBBBB.js"}, info.Preloads)
+	})
+
+	t.Run("nil without the file", func(t *testing.T) {
+		info := setup(t, "")
+		assert.Equal(t, "scripts/entry-AAAAAAAA.js", info.Script)
+		assert.Nil(t, info.Preloads)
+	})
+
+	t.Run("nil on a broken file", func(t *testing.T) {
+		info := setup(t, `{broken`)
+		assert.Nil(t, info.Preloads)
+	})
+
+	t.Run("nil when the entry is not listed", func(t *testing.T) {
+		info := setup(t, `{"src/other.ts":["scripts/a-BBBBBBBB.js"]}`)
+		assert.Nil(t, info.Preloads)
+	})
 }

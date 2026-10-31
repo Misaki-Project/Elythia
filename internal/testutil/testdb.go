@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -165,6 +166,18 @@ func openTestDBForPackage(pkg string) (*gorm.DB, error) {
 		}
 		return nil, err
 	}
+	if err := claimSchema(pkg); err != nil {
+		if sqlDB, derr := db.DB(); derr == nil {
+			_ = sqlDB.Close()
+		}
+		// **error で返さず panic する。** 呼び出し側の多くは開けないと「PostgreSQL
+		// が無い」として t.Skip するので、error で返すと 2 本目のプロセスが黙って
+		// 全部 skip して緑になる (#3369 で実測)。接続できないときは従来どおり error。
+		if errors.Is(err, errSchemaInUse) {
+			panic(err)
+		}
+		return nil, err
+	}
 	return db, nil
 }
 
@@ -254,8 +267,8 @@ func projectRoot() string {
 // した列も 1 テーブル 1600 列の上限に数えるため、繰り返すと最後は
 // `tables can have at most 1600 columns` で落ちる。
 //
-// **再適用で実際に枠を食うのは `note` だけ** (実測。migration が作る 121 テーブル
-// 中 1 つ。`internal_repository` を数えると 121 だが、増えた 1 つはこの台帳自身)。
+// **再適用で実際に枠を食うのは `note` だけ** (実測。migration が作る 123 テーブル
+// 中 1 つ。`internal_repository` を数えると 124 だが、増えた 1 つはこの台帳自身)。
 // `000033` が `ADD COLUMN IF NOT EXISTS` で足し `000036` が落とすため。`DROP
 // COLUMN` を含む migration は他に 3 本あるが、落とす列は `CREATE TABLE` 由来で
 // 再適用時は `IF NOT EXISTS` の no-op になるので枠を食わない。
@@ -271,13 +284,14 @@ const migrationLedgerTable = "testutil_applied_migrations"
 // 一過性の失敗 (並行 DDL / lock timeout / 新しい migration の実バグ) が恒久的に
 // 隠れる。
 //
-// 既存 schema への再適用でエラーになるのは実測で **117 本中 2 本だけ**
+// 既存 schema への再適用でエラーになるのは実測で **138 本中 2 本だけ**
 // (`000001_initial` の制約重複と `000075_signup_application`)。どちらも
 // 1 ファイル = 1 つの暗黙トランザクションなので丸ごとロールバックし、列枠を
 // 食わない。**列枠を食う `000033` (ADD) / `000036` (DROP) は成功する側**なので、
 // 成功時のみの記録でも #2756 は解消する。
 func ApplyMigrations(db *gorm.DB) {
-	files, err := findMigrationFiles()
+	dir := filepath.Join(projectRoot(), "migration")
+	files, err := findMigrationFiles(dir)
 	if err != nil {
 		panic("failed to find migration files: " + err.Error())
 	}
@@ -287,7 +301,7 @@ func ApplyMigrations(db *gorm.DB) {
 		if err != nil {
 			panic("failed to read migration file: " + err.Error())
 		}
-		key := filepath.Base(path)
+		key := migrationLedgerKey(dir, path)
 		sum := fmt.Sprintf("%x", sha256.Sum256(sql))
 		if applied[key] == sum {
 			continue
@@ -332,15 +346,33 @@ func recordAppliedMigration(db *gorm.DB, name, sum string) {
 		ON CONFLICT (name) DO UPDATE SET sha = EXCLUDED.sha`, name, sum).Error
 }
 
-func findMigrationFiles() ([]string, error) {
-	_, thisFile, _, _ := runtime.Caller(0)
-	projectRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
-	dir := filepath.Join(projectRoot, "migration")
-	matches, err := filepath.Glob(filepath.Join(dir, "*.up.sql"))
+// findMigrationFiles returns the up migrations under dir (the core track),
+// followed by those under dir/local (a fork's track, #3428).
+//
+// **local も流す。** fork が本体の表に列を足してモデルにも足すと、テストの DB に
+// その列が無ければ fork のテストが全部落ちる。`elythia migrate` と同じく core の
+// 後に流す。Elythia 本体には local が無いので、ここでは何も増えない。
+func findMigrationFiles(dir string) ([]string, error) {
+	core, err := filepath.Glob(filepath.Join(dir, "*.up.sql"))
 	if err != nil {
 		return nil, err
 	}
-	return matches, nil
+	local, err := filepath.Glob(filepath.Join(dir, "local", "*.up.sql"))
+	if err != nil {
+		return nil, err
+	}
+	return append(core, local...), nil
+}
+
+// migrationLedgerKey names a migration file in the ledger: the base name for
+// the core track (the keys existing ledgers already hold) and `local/<name>`
+// for the fork's track, so the two tracks may reuse the same number and name.
+func migrationLedgerKey(dir, path string) string {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return filepath.Base(path)
+	}
+	return filepath.ToSlash(rel)
 }
 
 // MustOpenTestDB は OpenTestDB のパニック版。init() で使う。

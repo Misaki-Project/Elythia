@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: mk-go project
+ * SPDX-FileCopyrightText: Elythia-Network
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -7,7 +7,7 @@ import * as Misskey from 'misskey-js';
 import { version } from '@@/js/config.js';
 import { languages } from 'i18n/const';
 import type { Locale } from 'i18n';
-import { acct } from '@/filters/user.js';
+import { acct } from '@@/js/user.js';
 import { i18n } from '@/i18n.js';
 import { instance } from '@/instance.js';
 

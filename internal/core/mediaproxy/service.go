@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	// 注意 (#672 Phase 1): TGA decoder は `blezek/tga` (auto-register 無し)
 	// を採用し、`decodeImage` 内で MIME 判定で manual dispatch している。
@@ -325,6 +326,16 @@ func NewService(instanceURL, userAgent string, driveStorage coredrive.Storage, a
 	return s
 }
 
+// SetTransport replaces the transport used to fetch remote media, keeping
+// the client timeout. The transport must apply the same SSRF guard
+// (safehttp.NewSSRFSafeTransport).
+//
+// サーバーは外向き全体で 1 つの Transport を共有して、同じ相手 (リモートの
+// 添付は actor と同じホストにあることが多い) への接続を使い回す (#3591)。
+func (s *Service) SetTransport(rt http.RoundTripper) {
+	s.httpClient = &http.Client{Timeout: s.httpClient.Timeout, Transport: rt}
+}
+
 // SetDriveLookup attaches a DriveFileLookup so the proxy can substitute the
 // cached thumbnail / webpublic variant for `?preview` and `?static` requests
 // against local files (#637 M1)。
@@ -389,6 +400,14 @@ func storableURL(rawURL string) bool {
 	return colfit.Storable(rawURL)
 }
 
+// MaxAllowlistURLChars is the longest unsigned URL (in characters) Authorize
+// looks up in the allowlist. allowlistSQL の列は `drive_file.url` / `uri` /
+// `src` と `user.avatarUrl` が varchar(1024) で最大、他 (`user.bannerUrl` /
+// `emoji.originalUrl` / `instance.iconUrl` など) はそれ以下なので、1024 文字より
+// 長い値はどの行にも一致しえない。varchar(n) は文字数で数えるので、バイト数では
+// なく rune で数える (`colfit.Fits` と同じ)。
+const MaxAllowlistURLChars = 1024
+
 // SignURL generates an HMAC-SHA256 signature for the given URL.
 func (s *Service) SignURL(rawURL string) string {
 	return SignURL(s.hmacSecret, rawURL)
@@ -425,6 +444,13 @@ func (s *Service) Authorize(ctx context.Context, rawURL, sig string) error {
 	// 一致しえないので「許可されていない」が事実で、**クエリを投げていない
 	// 以上そこに隠れる障害も無い** (#2792 に反しない)。
 	if !storableURL(rawURL) {
+		return ErrUnauthorized
+	}
+	// **列に入らない長さも引く前に弾く (2026-10-31 の監査)。** allowlist の列は
+	// varchar(1024) 以下なので、それより長い値はどの行にも一致しえない。長さを
+	// 見ないと、未認証の 1 リクエストで header に収まる約 1MiB の値を 11 箇所に
+	// bind して PostgreSQL へ渡せた (実測: 1 台・20 並列の 22rps で CPU 40〜78%)。
+	if utf8.RuneCountInString(rawURL) > MaxAllowlistURLChars {
 		return ErrUnauthorized
 	}
 
@@ -547,6 +573,14 @@ func (s *Service) resolveLocal(ctx context.Context, rawURL, filesPrefix string, 
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("mediaproxy: local file access: %w", err)
+	}
+
+	// 大きさが分かるなら、上限を超えるものは読む前に断る (リモートの
+	// Content-Length が上限を超えたときと同じ)。上限の手前まで読んでから
+	// 捨てる分のメモリと転送を省く。
+	if size, ok := coredrive.ObjectSize(body); ok && size > maxDownload {
+		body.Close()
+		return nil, ErrTooLarge
 	}
 
 	// ローカルファイルの場合はMIME判定して画像処理

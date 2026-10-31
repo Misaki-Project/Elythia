@@ -37,18 +37,18 @@ func TestPackJobData_RedactsSigningKeys(t *testing.T) {
 
 func TestRedactPayloadSecrets(t *testing.T) {
 	raw := []byte(`{"inbox":"https://remote.example/inbox","keyPem":"SECRET-RSA","ed25519PrivPem":"SECRET-ED"}`)
-	got := redactPayloadSecrets(raw)
+	got := redactPayloadSecrets(queue.TaskTypeDeliver, raw)
 	require.NotContains(t, got, "SECRET-RSA")
 	require.NotContains(t, got, "SECRET-ED")
 	require.Contains(t, got, "https://remote.example/inbox")
 
 	// 鍵を持たない payload は素通し (無駄な再シリアライズをしない)。
 	plain := []byte(`{"inbox":"https://remote.example/inbox"}`)
-	require.Equal(t, string(plain), redactPayloadSecrets(plain))
+	require.Equal(t, string(plain), redactPayloadSecrets(queue.TaskTypeDeliver, plain))
 
 	// JSON でないものはそのまま (非 JSON payload の job がありうる)。
-	require.Equal(t, "not-json", redactPayloadSecrets([]byte("not-json")))
-	require.Equal(t, "", redactPayloadSecrets(nil))
+	require.Equal(t, "not-json", redactPayloadSecrets(queue.TaskTypeWebPush, []byte("not-json")))
+	require.Equal(t, "", redactPayloadSecrets(queue.TaskTypeWebPush, nil))
 }
 
 // **redact の一覧が payload の json tag と一致していること。**
@@ -63,7 +63,7 @@ func TestJobSecretKeysMatchPayloadTags(t *testing.T) {
 	}
 	specs := []spec{
 		{reflect.TypeOf(queue.DeliverPayload{}), []string{"KeyPEM", "Ed25519PrivPEM"}},
-		{reflect.TypeOf(queue.WebhookPayload{}), []string{"OverrideSecret"}},
+		{reflect.TypeOf(queue.WebhookPayload{}), []string{"OverrideSecret", "OverrideURL"}},
 	}
 
 	// **別 package の非公開 struct に由来するものは、ここでは名前で持つ。**
@@ -152,7 +152,10 @@ func TestPackTaskSummary_RedactsWebhookSecret(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContainsf(t, string(encoded), "HOOK-SECRET",
 		"レスポンスから webhook の secret が読める: %s", encoded)
-	require.Contains(t, string(encoded), "https://example/hook")
+	// テスト送信の送信先も伏せる (Discord などは URL が資格情報)。
+	require.NotContainsf(t, string(encoded), "example/hook",
+		"レスポンスから webhook の送信先が読める: %s", encoded)
+	require.Contains(t, string(encoded), "w1")
 }
 
 // **プラグイン peer の送信本文が API から読めないこと (#3037)。**
@@ -165,7 +168,7 @@ func TestPeerEnvelopeIsRedacted(t *testing.T) {
 	raw := []byte(`{"host":"peer.example","sendId":"s1","envelope":{"secret":"plugin data"}}`)
 
 	// mk-go 独自の `payload` フィールド側。
-	out := redactPayloadSecrets(raw)
+	out := redactPayloadSecrets("plugin:demo:_peer", raw)
 	assert.NotContains(t, out, "plugin data", "peer の送信本文がそのまま出ている")
 	assert.Contains(t, out, redactedPlaceholder)
 	// **伏せるのは envelope だけ。** host / sendId は追跡に要る。
@@ -173,11 +176,88 @@ func TestPeerEnvelopeIsRedacted(t *testing.T) {
 	assert.Contains(t, out, "s1")
 
 	// `data.body` 側。
-	body := redactJobSecrets(map[string]any{
+	body := redactJobSecrets("plugin:demo:_peer", map[string]any{
 		"host": "peer.example", "envelope": map[string]any{"secret": "plugin data"},
 	})
 	m, ok := body.(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, redactedPlaceholder, m["envelope"])
 	assert.Equal(t, "peer.example", m["host"])
+}
+
+// **webhook の失敗の文面に載った送信先 URL が出ないこと。**
+//
+// processor は *url.Error の URL を落とすようにしたが、それより前に失敗した job は
+// URL 入りの文面を持っている。failedReason / lastErr / stacktrace のどれからも
+// 読めず、検索 (packTaskSummary の結果に対して行う) でも当たらないこと。
+func TestPackTaskSummary_RedactsWebhookErrorURL(t *testing.T) {
+	const reason = `Post "https://hook.example/api/webhooks/1/SECRET-TOKEN": dial tcp 192.0.2.1:443: connect: connection refused`
+	for _, typ := range []string{queue.TaskTypeUserWebhook, queue.TaskTypeSystemWebhook} {
+		t.Run(typ, func(t *testing.T) {
+			got := packTaskSummary(&QueueTaskSummary{
+				ID: "j1", Queue: "webhook", Type: typ, State: "failed",
+				Payload:    []byte(`{"webhookId":"w1"}`),
+				LastErr:    reason,
+				Stacktrace: []string{reason},
+			})
+			encoded, err := json.Marshal(got)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "SECRET-TOKEN")
+			assert.NotContains(t, string(encoded), "hook.example")
+			// 原因は残す。
+			assert.Equal(t, `Post [redacted]: dial tcp 192.0.2.1:443: connect: connection refused`, got["failedReason"])
+			assert.Equal(t, got["failedReason"], got["lastErr"])
+			assert.Equal(t, []string{`Post [redacted]: dial tcp 192.0.2.1:443: connect: connection refused`}, got["stacktrace"])
+			assert.False(t, jobMatchesSearch(got, searchTerms("secret-token")), "URL で検索に当たってはいけない")
+		})
+	}
+
+	// webhook 以外の job の文面は変えない (配送先の inbox は資格情報ではなく、追跡に要る)。
+	other := `Post "https://remote.example/inbox": context deadline exceeded`
+	got := packTaskSummary(&QueueTaskSummary{ID: "j2", Queue: "deliver", Type: queue.TaskTypeDeliver, LastErr: other})
+	assert.Equal(t, other, got["failedReason"])
+}
+
+// **Web Push の通知の中身が admin/queue から読めないこと。**
+//
+// チャットやダイレクトのノートの本文が入り、宛先の本人にしか見せないもの。
+// data / payload のどちらからも読めず、検索 (packTaskSummary の結果に対して
+// 行う) でも当たらないこと。宛先と種類は残す。
+func TestPackTaskSummary_RedactsWebPushBody(t *testing.T) {
+	raw, err := json.Marshal(queue.WebPushPayload{
+		UserID: "u1", Type: "newChatMessage",
+		Body: json.RawMessage(`{"type":"newChatMessage","body":{"text":"PRIVATE-CHAT-TEXT"}}`),
+	})
+	require.NoError(t, err)
+
+	got := packTaskSummary(&QueueTaskSummary{ID: "j1", Queue: "webpush", Type: queue.TaskTypeWebPush, Payload: raw})
+	encoded, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "PRIVATE-CHAT-TEXT")
+	assert.NotContains(t, got["payload"].(string), "PRIVATE-CHAT-TEXT", "payload フィールドから本文が読める")
+	dataJSON, err := json.Marshal(got["data"])
+	require.NoError(t, err)
+	assert.NotContains(t, string(dataJSON), "PRIVATE-CHAT-TEXT", "data フィールドから本文が読める")
+	assert.Contains(t, string(encoded), `"userId":"u1"`)
+	assert.Contains(t, string(encoded), "newChatMessage")
+	assert.False(t, jobMatchesSearch(got, searchTerms("private-chat-text")), "本文で検索に当たってはいけない")
+	assert.True(t, jobMatchesSearch(got, searchTerms("u1")), "宛先では検索できる")
+
+	// 同じ key でも webhook の送信本文は伏せない (upstream も job data に持つ)。
+	hook := packTaskSummary(&QueueTaskSummary{
+		ID: "j2", Queue: "webhook", Type: queue.TaskTypeUserWebhook,
+		Payload: []byte(`{"webhookId":"w1","body":{"text":"hook body"}}`),
+	})
+	hookJSON, err := json.Marshal(hook)
+	require.NoError(t, err)
+	assert.Contains(t, string(hookJSON), "hook body")
+}
+
+// jobSecretKeysByType の key が payload の json tag と一致していること
+// (tag を変えると黙って伏せなくなるため)。
+func TestJobSecretKeysByTypeMatchPayloadTags(t *testing.T) {
+	f, ok := reflect.TypeOf(queue.WebPushPayload{}).FieldByName("Body")
+	require.True(t, ok, "WebPushPayload.Body が無い (rename した? jobSecretKeysByType も直すこと)")
+	tag := strings.SplitN(f.Tag.Get("json"), ",", 2)[0]
+	assert.Equal(t, map[string]map[string]struct{}{queue.TaskTypeWebPush: {tag: {}}}, jobSecretKeysByType)
 }

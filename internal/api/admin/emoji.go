@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/entity"
@@ -27,9 +28,9 @@ const (
 	emojiAliasMaxRunes    = 128
 	emojiLicenseMaxRunes  = 1024
 	emojiRoleIDMaxRunes   = 128
-	// `emoji.originalUrl` / `publicUrl` は varchar(512)。利用者の文字列が直接入る
-	// のは `admin/emoji/add` の `url` 直接指定 (mk-go 独自の legacy 経路) だけだが、
-	// drive が作った URL も同じ列に入るので #3023 でそちらにも掛けている。
+	// `emoji.originalUrl` / `publicUrl` は varchar(512)。drive が作った URL が入る
+	// (#3023)。利用者の文字列が直接入る `admin/emoji/add` の `url` 直接指定は
+	// #3865 で消した。
 	emojiURLMaxRunes = 512
 )
 
@@ -44,7 +45,7 @@ const (
 // 別テーブル。**NUL も #3022 で同じ述語に揃えた**)。
 //
 // **切るのはリモート由来の値だけ** — `admin/emoji/copy` と AP 経路は相手サーバーが
-// 決めた値を入れるので、弾くと取り込みそのものができなくなる (docs/divergence.md の
+// 決めた値を入れるので、弾くと取り込みそのものができなくなる (docs/divergence/security.md の
 // 「リモート由来の文字列を列に入れるときの規則」、#2726)。
 //
 // NUL も `colfit.Fits` が落とす。PostgreSQL の text 系列は長さに関わらず NUL を
@@ -351,7 +352,7 @@ func (h *Handler) EmojiCopy(c echo.Context) error {
 	// varchar(128) / `license` varchar(1024) / `aliases` varchar(128)[] を
 	// 超えて SQLSTATE 22001 になり、インポートが 500 で落ちる。AP 経路は
 	// `internal/core/federation` が同じ 3 列に対して既に同じ規則を持っており
-	// (#2726、docs/divergence.md の「リモート由来の文字列を列に入れるときの
+	// (#2726、docs/divergence/security.md の「リモート由来の文字列を列に入れるときの
 	// 規則」)、REST 経路だけ素通しにすると非対称になる。
 	//
 	// **本文は切り、要素は落とす。** category / license は本文なので切る
@@ -548,24 +549,23 @@ func (h *Handler) EmojiListRemote(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	var req struct {
-		Query     string `json:"query"`
-		Host      string `json:"host"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
-		Limit     *int   `json:"limit"`
-		Offset    int    `json:"offset"`
+		Query     string     `json:"query"`
+		Host      string     `json:"host"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
+		Limit     *jsnum.Int `json:"limit"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -579,7 +579,8 @@ func (h *Handler) EmojiListRemote(c echo.Context) error {
 	if host != "" {
 		host = toPunyHost(host)
 	}
-	emojis, err := h.emojiRepo.ListRemoteWithFilter(req.Query, host, sinceID, untilID, limit, req.Offset)
+	// 本家のparamDefにoffsetは無いので読まない(#3857)。admin/emoji/listと同じ。
+	emojis, err := h.emojiRepo.ListRemoteWithFilter(req.Query, host, sinceID, untilID, limit, 0)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}

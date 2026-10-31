@@ -92,7 +92,7 @@ func newTestService(t *testing.T) (*Service, *fakeRepo) {
 func TestService_OnNoteCreated_LocalUser(t *testing.T) {
 	s, repo := newTestService(t)
 	user := &model.User{ID: "u1"} // Host == nil → local
-	note := &model.Note{ID: "n1", UserID: "u1", Tags: model.StringArray{"#go", "#test"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, ID: "n1", UserID: "u1", Tags: model.StringArray{"#go", "#test"}}
 
 	s.OnNoteCreated(note, user)
 	s.WaitForPendingWrites()
@@ -117,6 +117,31 @@ func TestService_OnNoteCreated_LocalUser(t *testing.T) {
 	}
 }
 
+// followers / specified のノートのタグは記録しない。本家 NoteCreateService の
+// updateHashtags は public / home のときだけ呼ばれる。
+func TestService_OnNoteCreated_OnlyPublicAndHome(t *testing.T) {
+	cases := map[string]struct {
+		visibility model.NoteVisibility
+		want       int
+	}{
+		"public":    {model.NoteVisibilityPublic, 1},
+		"home":      {model.NoteVisibilityHome, 1},
+		"followers": {model.NoteVisibilityFollowers, 0},
+		"specified": {model.NoteVisibilitySpecified, 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, repo := newTestService(t)
+			note := &model.Note{ID: "n1", UserID: "u1", Visibility: tc.visibility, Tags: model.StringArray{"#secret"}}
+			s.OnNoteCreated(note, &model.User{ID: "u1"})
+			s.WaitForPendingWrites()
+			if got := len(repo.snapshotCalls()); got != tc.want {
+				t.Fatalf("RecordMention calls = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // meta.sensitiveWords にマッチする tag は RecordMention されない (= featured
 // / trends に出ない、upstream HashtagService.updateHashtagsRanking と同
 // semantics)。テストユーザー報告経路と合わせて drop-in 互換を回復する。
@@ -127,7 +152,7 @@ func TestService_OnNoteCreated_SkipsSensitiveTags(t *testing.T) {
 	s.SetMetaRepo(metaRepo)
 
 	user := &model.User{ID: "u1"}
-	note := &model.Note{ID: "n1", UserID: "u1", Tags: model.StringArray{"#nsfw", "#safe"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, ID: "n1", UserID: "u1", Tags: model.StringArray{"#nsfw", "#safe"}}
 
 	s.OnNoteCreated(note, user)
 	s.WaitForPendingWrites()
@@ -151,7 +176,7 @@ func TestService_OnNoteCreated_SkipsHiddenTags(t *testing.T) {
 	s.SetMetaRepo(metaRepo)
 
 	user := &model.User{ID: "u1"}
-	note := &model.Note{ID: "n1", UserID: "u1", Tags: model.StringArray{"#hidden", "#visible"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, ID: "n1", UserID: "u1", Tags: model.StringArray{"#hidden", "#visible"}}
 
 	s.OnNoteCreated(note, user)
 	s.WaitForPendingWrites()
@@ -168,7 +193,7 @@ func TestService_OnNoteCreated_NoMetaRepoMeansNoFilter(t *testing.T) {
 	// SetMetaRepo を呼ばない
 
 	user := &model.User{ID: "u1"}
-	note := &model.Note{ID: "n1", UserID: "u1", Tags: model.StringArray{"#nsfw", "#anything"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, ID: "n1", UserID: "u1", Tags: model.StringArray{"#nsfw", "#anything"}}
 
 	s.OnNoteCreated(note, user)
 	s.WaitForPendingWrites()
@@ -182,7 +207,7 @@ func TestService_OnNoteCreated_RemoteUser(t *testing.T) {
 	s, repo := newTestService(t)
 	host := "remote.example"
 	user := &model.User{ID: "u2", Host: &host}
-	note := &model.Note{ID: "n2", UserID: "u2", Tags: model.StringArray{"#federation"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, ID: "n2", UserID: "u2", Tags: model.StringArray{"#federation"}}
 
 	s.OnNoteCreated(note, user)
 	s.WaitForPendingWrites()
@@ -202,7 +227,7 @@ func TestService_OnNoteCreated_SkipEmpty(t *testing.T) {
 		author *model.User
 	}{
 		"nil note":    {note: nil, author: &model.User{ID: "u"}},
-		"nil author":  {note: &model.Note{Tags: model.StringArray{"#x"}}, author: nil},
+		"nil author":  {note: &model.Note{Visibility: model.NoteVisibilityPublic, Tags: model.StringArray{"#x"}}, author: nil},
 		"empty tags":  {note: &model.Note{Tags: model.StringArray{}}, author: &model.User{ID: "u"}},
 		"nil tags":    {note: &model.Note{}, author: &model.User{ID: "u"}},
 		"empty entry": {note: &model.Note{Tags: model.StringArray{""}}, author: &model.User{ID: "u"}},
@@ -222,14 +247,14 @@ func TestService_OnNoteCreated_SkipEmpty(t *testing.T) {
 func TestService_OnNoteCreated_NilService(t *testing.T) {
 	// nil receiver でも panic しないこと (defensive guard)。
 	var s *Service
-	s.OnNoteCreated(&model.Note{Tags: model.StringArray{"#x"}}, &model.User{ID: "u"})
+	s.OnNoteCreated(&model.Note{Visibility: model.NoteVisibilityPublic, Tags: model.StringArray{"#x"}}, &model.User{ID: "u"})
 }
 
 func TestService_OnNoteCreated_NilRepo(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	s := &Service{repo: nil, idGen: idGen}
 	// repo nil でも panic せず early return すること。
-	s.OnNoteCreated(&model.Note{Tags: model.StringArray{"#x"}}, &model.User{ID: "u"})
+	s.OnNoteCreated(&model.Note{Visibility: model.NoteVisibilityPublic, Tags: model.StringArray{"#x"}}, &model.User{ID: "u"})
 }
 
 func TestService_OnNoteCreated_RepoError_BestEffort(t *testing.T) {
@@ -239,7 +264,7 @@ func TestService_OnNoteCreated_RepoError_BestEffort(t *testing.T) {
 	repo.errOn = "#fail"
 	repo.mu.Unlock()
 	user := &model.User{ID: "u3"}
-	note := &model.Note{Tags: model.StringArray{"#ok1", "#fail", "#ok2"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, Tags: model.StringArray{"#ok1", "#fail", "#ok2"}}
 
 	s.OnNoteCreated(note, user)
 	s.WaitForPendingWrites()
@@ -259,7 +284,7 @@ func TestService_OnNoteCreated_ReturnsImmediately(t *testing.T) {
 	s := NewService(slow, idGen)
 
 	user := &model.User{ID: "u1"}
-	note := &model.Note{Tags: model.StringArray{"#a"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, Tags: model.StringArray{"#a"}}
 
 	start := time.Now()
 	s.OnNoteCreated(note, user)
@@ -309,7 +334,7 @@ func TestService_Shutdown_DrainsPending(t *testing.T) {
 	repo := &slowRepo{block: make(chan struct{})}
 	s := &Service{repo: repo, idGen: idGen}
 	user := &model.User{ID: "u1"}
-	note := &model.Note{Tags: model.StringArray{"#a"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, Tags: model.StringArray{"#a"}}
 	s.OnNoteCreated(note, user)
 
 	go func() {
@@ -332,7 +357,7 @@ func TestService_Shutdown_RespectsContextDeadline(t *testing.T) {
 	repo := &slowRepo{block: make(chan struct{})}
 	s := &Service{repo: repo, idGen: idGen}
 	user := &model.User{ID: "u1"}
-	note := &model.Note{Tags: model.StringArray{"#a"}}
+	note := &model.Note{Visibility: model.NoteVisibilityPublic, Tags: model.StringArray{"#a"}}
 	s.OnNoteCreated(note, user)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -445,5 +470,64 @@ func TestService_UpdateUsertags_Guards(t *testing.T) {
 	s2.WaitForPendingWrites()
 	if got := len(repo.snapshotAttaches()); got != 0 {
 		t.Errorf("expected no attach for empty userID, got %d", got)
+	}
+}
+
+// TestRankingFilter_Excludes pins the ranking guard of upstream
+// HashtagService.updateHashtagsRanking (#3628): hiddenTags compare after
+// normalizeForSearch, sensitiveWords follow isKeyWordIncluded.
+func TestRankingFilter_Excludes(t *testing.T) {
+	f := NewRankingFilter(
+		[]string{"Hidden", "ＦＵＬＬ", ""},
+		[]string{"nsfw", "bad word", "/^r[0-9]+$/", "/CaseRe/i", "Upper", "/(broken/"},
+	)
+	cases := []struct {
+		name string
+		tag  string
+		want bool
+	}{
+		{name: "hidden tag matches after lowercasing the setting", tag: "hidden", want: true},
+		{name: "hidden tag matches after NFKC of the setting", tag: "full", want: true},
+		{name: "hidden tag is an exact match, not a substring", tag: "hiddenx", want: false},
+		{name: "not normalized tag is still matched", tag: "HIDDEN", want: true},
+		{name: "fullwidth tag is matched after NFKC", tag: "ＨＩＤＤＥＮ", want: true},
+		{name: "sensitive word matches as a substring", tag: "nsfwart", want: true},
+		{name: "space separated words must all appear", tag: "badword", want: true},
+		{name: "only one of the space separated words", tag: "bad", want: false},
+		{name: "regex filter", tag: "r18", want: true},
+		{name: "regex filter is anchored by the pattern", tag: "xr18", want: false},
+		{name: "regex i flag ignores case", tag: "casere", want: true},
+		{name: "plain sensitive word is case-sensitive like upstream", tag: "upper", want: false},
+		{name: "broken regex never matches", tag: "(broken", want: false},
+		{name: "sensitive words are matched against the normalized tag", tag: "ＮＳＦＷart", want: true},
+		{name: "ordinary tag", tag: "misskey", want: false},
+		{name: "empty tag", tag: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := f.Excludes(tc.tag); got != tc.want {
+				t.Fatalf("Excludes(%q) = %v, want %v", tc.tag, got, tc.want)
+			}
+		})
+	}
+}
+
+// Empty settings build no filter, and a nil filter excludes nothing.
+func TestRankingFilter_EmptySettings(t *testing.T) {
+	if f := NewRankingFilter(nil, nil); f != nil {
+		t.Fatalf("empty settings must build a nil filter, got %+v", f)
+	}
+	if f := NewRankingFilter([]string{""}, []string{"", "/(broken/"}); f != nil {
+		t.Fatalf("settings that can never match must build a nil filter, got %+v", f)
+	}
+	if f := NewRankingFilter([]string{"only"}, nil); !f.Excludes("only") {
+		t.Fatal("hiddenTags alone must build a filter")
+	}
+	if f := NewRankingFilter(nil, []string{"only"}); !f.Excludes("only") {
+		t.Fatal("sensitiveWords alone must build a filter")
+	}
+	var f *RankingFilter
+	if f.Excludes("anything") {
+		t.Fatal("nil filter must exclude nothing")
 	}
 }

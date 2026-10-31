@@ -1,0 +1,285 @@
+package adminbackup
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+
+	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/core/moderationlog"
+	"github.com/elythia-network/elythia/internal/server/middleware"
+)
+
+// RestorePathPrefix is where the restore endpoints live. They are forwarded
+// to the backup service as they are, also while the server is in
+// maintenance (#3463 (6c)).
+const RestorePathPrefix = "/api/admin/backup/restore/"
+
+// RestoreOps are the forwarded operations. prepare also starts a rollback
+// (kind "rollback", #3463 (6d)); candidates lists the databases a rollback
+// can swap back in.
+var RestoreOps = []string{"prepare", "confirm", "abort", "status", "candidates"}
+
+// opCandidates lists the kept databases. The server re-authenticates it
+// like admin/backup/list, so only the session token is sent.
+const opCandidates = "candidates"
+
+// ServiceAuthChallenge is the WWW-Authenticate the backup service sends when
+// it refuses the service token. The forwarder tells it from a 401 about the
+// administrator's own credentials by it.
+const ServiceAuthChallenge = `Bearer realm="elythia-backup"`
+
+// idServiceUnreachable is returned when the backup service cannot be reached.
+const idServiceUnreachable = "1d3f5b9a-27c4-4e60-9f0e-6a8b2c4d7e19"
+
+// IDRestoreUnavailable is the error ID of RESTORE_UNAVAILABLE, shared by the
+// backup service and the status forward.
+const IDRestoreUnavailable = "515b8e48-8f90-439a-bd56-2bdd4d8870a5"
+
+// opStatus is the progress of a restore, which the server does not
+// authenticate.
+const opStatus = "status"
+
+// statusUnavailable answers a status request the service cannot serve.
+//
+// **status は誰でも送れるので、読めない理由を分けて返さない。** 未設定 (400)、
+// daemon に届かない (502)、daemon が Redis を読めない (503) を分けて返すと、匿名で
+// 「バックアップのサービスが止まっている時間帯」を外から観測できた。画面はどれも
+// 「今は読めない」として読み直すだけなので、同じ 503 にする。理由は本体と daemon の
+// ログに残る。
+func statusUnavailable(w http.ResponseWriter) {
+	writeJSONBody(w, http.StatusServiceUnavailable, apierr.ErrorWithKind("RESTORE_UNAVAILABLE",
+		"The restore status cannot be read now. Please try again later.", IDRestoreUnavailable, apierr.KindServer))
+}
+
+// forwardTimeout bounds one forwarded request. 準備の検査 (保存先の meta.json、
+// DB の権限) を含むので、取る・確かめるの受け付けより長くする。
+const forwardTimeout = time.Minute
+
+// forwardResponseLimit caps the response read from the backup service.
+const forwardResponseLimit = 1 << 20
+
+// Forwarder relays the restore requests to the backup service.
+//
+// **本体では照合しない。** 再認証は daemon が行う (本体で照合すると、同じ TOTP の
+// コードを本体と daemon で二重に消費して落ちる)。本体が見るのは、本文の上限と形、
+// daemon の設定の有無だけ。利用者の Authorization ヘッダーの token は本文の i へ
+// 移す (daemon への Authorization は serviceToken が使う)。
+type Forwarder struct {
+	base, token string
+	client      *http.Client
+}
+
+// NewForwarder returns a Forwarder for the control API at baseURL. An empty
+// baseURL or token answers BACKUP_SERVICE_NOT_CONFIGURED.
+func NewForwarder(baseURL, token string, client *http.Client) *Forwarder {
+	if client == nil {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		// 同じ compose の中の宛先。proxy を通すと Bearer の token が proxy に渡る。
+		t.Proxy = nil
+		client = &http.Client{Timeout: forwardTimeout, Transport: t}
+	}
+	return &Forwarder{base: strings.TrimRight(baseURL, "/"), token: token, client: client}
+}
+
+// Configured reports whether a backup service is set.
+func (f *Forwarder) Configured() bool { return f != nil && f.base != "" && f.token != "" }
+
+func writeJSONBody(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// Serve relays one request for op ("prepare", ...). clientIP is the
+// administrator's address as the server resolved it.
+func (f *Forwarder) Serve(w http.ResponseWriter, r *http.Request, op, clientIP string) {
+	known := false
+	for _, o := range RestoreOps {
+		known = known || o == op
+	}
+	if !known || r.Method != http.MethodPost {
+		writeJSONBody(w, http.StatusNotFound, apierr.NotFound())
+		return
+	}
+	if !f.Configured() {
+		if op == opStatus {
+			statusUnavailable(w)
+			return
+		}
+		writeJSONBody(w, http.StatusBadRequest, apierr.Error("BACKUP_SERVICE_NOT_CONFIGURED",
+			"The backup service is not configured.", idServiceNotConfigured))
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, reauthBodyLimit+1))
+	if err != nil || len(body) > reauthBodyLimit {
+		writeJSONBody(w, http.StatusBadRequest, apierr.InvalidParam())
+		return
+	}
+	fields := map[string]json.RawMessage{}
+	if len(bytes.TrimSpace(body)) > 0 {
+		if !middleware.IsJSONContentType(r.Header.Get(echo.HeaderContentType)) {
+			writeJSONBody(w, http.StatusBadRequest, apierr.InvalidParam())
+			return
+		}
+		if err := json.Unmarshal(body, &fields); err != nil {
+			writeJSONBody(w, http.StatusBadRequest, apierr.InvalidParam())
+			return
+		}
+	}
+	if op == opCandidates {
+		// 一覧は本体の再認証 (guarded) で照合済み。パスワードとコードを daemon へ渡さない
+		// (daemon は使わない)。
+		fields = map[string]json.RawMessage{"i": fields["i"]}
+		if fields["i"] == nil {
+			delete(fields, "i")
+		}
+	}
+	// 本体の認証 (middleware の extractToken) と同じく、ヘッダーの token を本文の i より
+	// 先に使う。逆だと、本体が管理者と確かめた token と別の token で daemon が照合する。
+	if tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && tok != "" {
+		b, _ := json.Marshal(tok)
+		fields["i"] = b
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		writeJSONBody(w, http.StatusBadRequest, apierr.InvalidParam())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), forwardTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.base+"/restore/"+op, bytes.NewReader(out))
+	if err != nil {
+		f.unreachable(w, op, err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+f.token)
+	if clientIP != "" {
+		req.Header.Set(clientIPHeader, clientIP)
+	}
+	// パスキーの検証は Origin を見る。
+	if o := r.Header.Get("Origin"); o != "" {
+		req.Header.Set("Origin", o)
+	}
+	res, err := f.client.Do(req)
+	if err != nil {
+		f.unreachable(w, op, err)
+		return
+	}
+	defer func() { _ = res.Body.Close() }()
+	data, err := io.ReadAll(io.LimitReader(res.Body, forwardResponseLimit+1))
+	if err != nil || len(data) > forwardResponseLimit {
+		f.unreachable(w, op, err)
+		return
+	}
+	if res.StatusCode == http.StatusUnauthorized && res.Header.Get("WWW-Authenticate") == ServiceAuthChallenge {
+		// daemon が serviceToken を断った。本体と daemon の設定の食い違いで、利用者の
+		// 認証の誤りではない (401 のまま返すと、画面がサインアウトの扱いをする)。
+		// 利用者の token が無いときの daemon の 401 (CREDENTIAL_REQUIRED) は、この
+		// ヘッダーを付けないので、そのまま返す。
+		slog.Error("admin/backup: the backup service refused the service token; check backup.server.serviceToken")
+		f.unreachable(w, op, nil)
+		return
+	}
+	if op == opStatus && res.StatusCode >= http.StatusInternalServerError {
+		statusUnavailable(w)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if v := res.Header.Get("Retry-After"); v != "" {
+		w.Header().Set("Retry-After", v)
+	}
+	if len(data) == 0 {
+		w.WriteHeader(res.StatusCode)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(res.StatusCode)
+	_, _ = w.Write(data)
+}
+
+func (f *Forwarder) unreachable(w http.ResponseWriter, op string, err error) {
+	if err != nil {
+		slog.Warn("admin/backup: cannot reach the backup service", "err", err)
+	}
+	if op == opStatus {
+		statusUnavailable(w)
+		return
+	}
+	writeJSONBody(w, http.StatusBadGateway, apierr.ErrorWithKind("BACKUP_SERVICE_UNREACHABLE",
+		"The backup service cannot be reached.", idServiceUnreachable, apierr.KindServer))
+}
+
+// clientIPHeader carries the administrator's address to the service.
+const clientIPHeader = "X-Elythia-Client-IP"
+
+// RestorePrepare handles POST /api/admin/backup/restore/prepare.
+func (h *Handler) RestorePrepare(c echo.Context) error { return h.restore(c, "prepare") }
+
+// RestoreConfirm handles POST /api/admin/backup/restore/confirm.
+func (h *Handler) RestoreConfirm(c echo.Context) error { return h.restore(c, "confirm") }
+
+// RestoreAbort handles POST /api/admin/backup/restore/abort.
+func (h *Handler) RestoreAbort(c echo.Context) error { return h.restore(c, "abort") }
+
+// RestoreCandidates handles POST /api/admin/backup/restore/candidates, after
+// the re-authentication.
+//
+// 一覧 (admin/backup/list の listBackups) と同じく、閲覧も記録する。退避した DB には
+// 利用者の秘密鍵などがそのまま入っており、その名前と大きさを誰がいつ見たかを追える
+// ようにする。成立した (daemon が 200 を返した) ときだけ書く。
+func (h *Handler) RestoreCandidates(c echo.Context) error {
+	return h.guarded(c, h.restoreCandidates)
+}
+
+func (h *Handler) restoreCandidates(c echo.Context) error {
+	cw := &capturedResponse{header: http.Header{}, status: http.StatusOK}
+	h.forwarder.Serve(cw, c.Request(), opCandidates, c.RealIP())
+	if cw.status == http.StatusOK {
+		var body struct {
+			Databases []json.RawMessage `json:"databases"`
+		}
+		if json.Unmarshal(cw.body.Bytes(), &body) == nil {
+			h.log(c, moderationlog.LogListKeptDatabases, map[string]any{"databaseCount": len(body.Databases)})
+		}
+	}
+	w := c.Response()
+	for k, v := range cw.header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(cw.status)
+	_, _ = w.Write(cw.body.Bytes())
+	return nil
+}
+
+// capturedResponse keeps a response in memory so that the handler can look
+// at it before passing it on.
+type capturedResponse struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (r *capturedResponse) Header() http.Header         { return r.header }
+func (r *capturedResponse) Write(p []byte) (int, error) { return r.body.Write(p) }
+func (r *capturedResponse) WriteHeader(status int)      { r.status = status }
+
+// RestoreStatus handles POST /api/admin/backup/restore/status.
+func (h *Handler) RestoreStatus(c echo.Context) error { return h.restore(c, "status") }
+
+func (h *Handler) restore(c echo.Context, op string) error {
+	h.forwarder.Serve(c.Response(), c.Request(), op, c.RealIP())
+	return nil
+}
+
+// SetForwarder sets the forwarder of the restore endpoints.
+func (h *Handler) SetForwarder(f *Forwarder) { h.forwarder = f }

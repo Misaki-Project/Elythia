@@ -55,7 +55,7 @@ func publicHandlerWithRepository(t *testing.T, roleRepo repository.RoleRepositor
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	return roles.NewHandler(corerole.NewService(roleRepo, assignRepo, metaRepo, idGen), idGen)
+	return roles.NewHandler(corerole.NewService(roleRepo, assignRepo, metaRepo, idGen), idGen, nil, nil, nil, nil)
 }
 
 func publicRoleEndpoints() []struct {
@@ -144,9 +144,12 @@ func TestUsersSecondLookupErrors(t *testing.T) {
 type mockRoleNotesQuery struct {
 	Notes []*model.Note
 	Err   error
+	// LastSinceID / LastUntilID record the cursor of the last call.
+	LastSinceID, LastUntilID string
 }
 
 func (m *mockRoleNotesQuery) ListByRole(roleID string, limit int, sinceID, untilID string) ([]*model.Note, error) {
+	m.LastSinceID, m.LastUntilID = sinceID, untilID
 	if m.Err != nil {
 		return nil, m.Err
 	}
@@ -159,13 +162,20 @@ func (m *mockRoleNotesQuery) ListByRole(roleID string, limit int, sinceID, until
 
 func newTestHandler(t *testing.T) (*roles.Handler, *testutil.MockRoleRepository) {
 	t.Helper()
+	return newTestHandlerWithMeta(t, nil)
+}
+
+// newTestHandlerWithMeta builds the handler newTestHandler builds, with meta as
+// the meta repository of the blocked-host filter.
+func newTestHandlerWithMeta(t *testing.T, meta repository.MetaRepository) (*roles.Handler, *testutil.MockRoleRepository) {
+	t.Helper()
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
 	metaRepo := testutil.NewMockMetaRepository()
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corerole.NewService(roleRepo, assignRepo, metaRepo, idGen)
-	h := roles.NewHandler(svc, idGen)
+	h := roles.NewHandler(svc, idGen, nil, nil, meta, nil)
 	return h, roleRepo
 }
 
@@ -260,7 +270,7 @@ func TestShow_IncludesPoliciesTargetAndUsersCount(t *testing.T) {
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corerole.NewService(roleRepo, assignRepo, metaRepo, idGen)
-	h := roles.NewHandler(svc, idGen)
+	h := roles.NewHandler(svc, idGen, nil, nil, nil, nil)
 
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "Pub", IsPublic: true, Target: model.RoleTargetManual}
 	require.NoError(t, assignRepo.Create(&model.RoleAssignment{ID: "a1", UserID: "u1", RoleID: "r1"}))
@@ -331,6 +341,13 @@ func TestUsers_Success(t *testing.T) {
 // 露出した handler を返す (roles/users の割当ユーザー一覧テスト用)。
 func newUsersTestHandler(t *testing.T) (*roles.Handler, *testutil.MockRoleRepository, *testutil.MockRoleAssignmentRepository, *testutil.MockUserRepository) {
 	t.Helper()
+	return newUsersTestHandlerWithPacker(t, nil)
+}
+
+// newUsersTestHandlerWithPacker builds the handler newUsersTestHandler builds,
+// with packer as the packer of the users embedded in roles/users.
+func newUsersTestHandlerWithPacker(t *testing.T, packer userpack.ListPacker) (*roles.Handler, *testutil.MockRoleRepository, *testutil.MockRoleAssignmentRepository, *testutil.MockUserRepository) {
+	t.Helper()
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
 	userRepo := testutil.NewMockUserRepository()
@@ -339,7 +356,7 @@ func newUsersTestHandler(t *testing.T) (*roles.Handler, *testutil.MockRoleReposi
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corerole.NewService(roleRepo, assignRepo, metaRepo, idGen)
-	h := roles.NewHandler(svc, idGen)
+	h := roles.NewHandler(svc, idGen, nil, nil, nil, packer)
 	h.SetUserRepo(userRepo)
 	return h, roleRepo, assignRepo, userRepo
 }
@@ -365,13 +382,13 @@ func TestUsers_ReturnsAssignedUsers(t *testing.T) {
 // #1973: roles/users の embed user に viewer 視点の relation block が乗る。
 // viewer が assigned user を follow していれば isFollowing=true、匿名なら省略。
 func TestUsers_EmbedsViewerRelation(t *testing.T) {
-	h, roleRepo, assignRepo, userRepo := newUsersTestHandler(t)
+	followingRepo := testutil.NewMockFollowingRepository()
+	followingRepo.Followings["f1"] = &model.Following{ID: "f1", FollowerID: "viewer1", FolloweeID: "alice"}
+	h, roleRepo, assignRepo, userRepo := newUsersTestHandlerWithPacker(t,
+		userpack.New(nil, userpack.Lookups{Relations: userrelation.Repos{Following: followingRepo}}, nil))
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", IsPublic: true, IsExplorable: true}
 	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
 	require.NoError(t, assignRepo.Create(&model.RoleAssignment{ID: "ra1", RoleID: "r1", UserID: "alice"}))
-	followingRepo := testutil.NewMockFollowingRepository()
-	followingRepo.Followings["f1"] = &model.Following{ID: "f1", FollowerID: "viewer1", FolloweeID: "alice"}
-	h.SetListPacker(userpack.New(userpack.Lookups{Relations: userrelation.Repos{Following: followingRepo}}, nil))
 
 	// 認証 viewer: isFollowing=true。
 	vc := newCtxWithViewer(`{"roleId":"r1"}`, "viewer1")
@@ -419,7 +436,7 @@ func TestUsers_NilUserRepoPacksWithoutProfile(t *testing.T) {
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corerole.NewService(roleRepo, assignRepo, metaRepo, idGen)
-	h := roles.NewHandler(svc, idGen) // SetUserRepo は呼ばない (profile lookup 無効)
+	h := roles.NewHandler(svc, idGen, nil, nil, nil, nil) // SetUserRepo は呼ばない (profile lookup 無効)
 
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", IsPublic: true, IsExplorable: true}
 	userRepo.Users["alice"] = &model.User{ID: "alice", Username: "alice"}
@@ -482,7 +499,7 @@ func TestList_Error(t *testing.T) {
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corerole.NewService(roleRepo, assignRepo, metaRepo, idGen)
-	h := roles.NewHandler(svc, idGen)
+	h := roles.NewHandler(svc, idGen, nil, nil, nil, nil)
 	rec := doPost(h.List, `{}`)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -679,4 +696,46 @@ func TestSettersWireOptionalDeps(t *testing.T) {
 	h.SetNotesQuery(mock)
 	rec := doPost(h.Notes, `{"roleId":"r1"}`)
 	require.Equal(t, http.StatusOK, rec.Code)
+}
+
+// roles/users and roles/notes accept an integer-valued fraction for limit /
+// sinceDate / untilDate, as upstream's ajv does for an integer, and read them
+// (#3762).
+func TestUsersAndNotes_AcceptIntegerValuedFractions(t *testing.T) {
+	usersCount := func(t *testing.T, body string) int {
+		t.Helper()
+		h, roleRepo, assignRepo, userRepo := newUsersTestHandler(t)
+		roleRepo.Roles["r1"] = &model.Role{ID: "r1", IsPublic: true, IsExplorable: true}
+		// 割り当ての ID を 1e12 と 2e12 (ミリ秒) の時刻で作り、日付で絞れることを見る。
+		gen, _ := id.NewGenerator("aidx")
+		for i, u := range []string{"alice", "bob"} {
+			userRepo.Users[u] = &model.User{ID: u, Username: u}
+			aid := gen.Generate(time.UnixMilli(int64(i+1) * 1e12))
+			require.NoError(t, assignRepo.Create(&model.RoleAssignment{ID: aid, RoleID: "r1", UserID: u}))
+		}
+		rec := doPost(h.Users, body)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		var resp []map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		return len(resp)
+	}
+	assert.Equal(t, 1, usersCount(t, `{"roleId":"r1","limit":1.0}`))
+	assert.Equal(t, 0, usersCount(t, `{"roleId":"r1","untilDate":1e1}`), "untilDate is read, not just accepted")
+	assert.Equal(t, 2, usersCount(t, `{"roleId":"r1","sinceDate":1e1}`))
+	assert.Equal(t, 1, usersCount(t, `{"roleId":"r1","sinceDate":1.5e12}`), "sinceDate is read, not just accepted")
+
+	h, roleRepo := newTestHandler(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "Public", IsPublic: true, IsExplorable: true}
+	notes := &mockRoleNotesQuery{Notes: []*model.Note{
+		{ID: "n1", UserID: "u1", Text: strPtr("a"), Visibility: "public"},
+		{ID: "n2", UserID: "u1", Text: strPtr("b"), Visibility: "public"},
+	}}
+	h.SetNotesQuery(notes)
+	rec := doPost(h.Notes, `{"roleId":"r1","limit":1.0,"sinceDate":1e1,"untilDate":1e15}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var arr []any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &arr))
+	assert.Len(t, arr, 1)
+	assert.NotEmpty(t, notes.LastSinceID, "sinceDate is read as a cursor")
+	assert.NotEmpty(t, notes.LastUntilID, "untilDate is read as a cursor")
 }

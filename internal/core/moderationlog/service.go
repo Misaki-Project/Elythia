@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
@@ -30,13 +31,21 @@ import (
 type Service struct {
 	repo  repository.ModerationLogRepository
 	idGen id.Generator
+	// background は書き込みの goroutine を起動する箱 (#3661)。世代の停止で
+	// 待つ。nil なら素の goroutine で起動する (テスト)。
+	background *bgwork.Group
 }
 
-// New constructs a Service. Either dependency may be nil during tests
-// or partial wiring; in that case Log degrades to a silent no-op and
-// List returns an empty result without error.
-func New(repo repository.ModerationLogRepository, idGen id.Generator) *Service {
-	return &Service{repo: repo, idGen: idGen}
+// New constructs a Service. Either repository dependency may be nil during
+// tests or partial wiring; in that case Log degrades to a silent no-op and
+// List returns an empty result without error. background is the group the
+// writes run in, so stopping the server generation waits for them (#3661).
+//
+// background が無いと、書き込みは素の goroutine で走り、世代を止めても待たれずに
+// 閉じた DB へ書きに行く。起動もテストも通るので気付けない。構築子の必須の引数で
+// 受ける (#3825)。
+func New(repo repository.ModerationLogRepository, idGen id.Generator, background *bgwork.Group) *Service {
+	return &Service{repo: repo, idGen: idGen, background: background}
 }
 
 // Log records a moderation action performed by moderatorID. The info
@@ -64,7 +73,7 @@ func (s *Service) Log(ctx context.Context, moderatorID string, t LogType, info m
 	if info == nil {
 		info = map[string]any{}
 	}
-	safeGo(ctx, func() {
+	safeGo(ctx, s.background, func() {
 		infoBytes, err := json.Marshal(info)
 		if err != nil {
 			slog.WarnContext(ctx, "moderation log: marshal info failed",
@@ -113,7 +122,7 @@ func (s *Service) LogMany(ctx context.Context, moderatorID string, entries []Ent
 	if len(entries) == 0 {
 		return
 	}
-	safeGo(ctx, func() {
+	safeGo(ctx, s.background, func() {
 		now := time.Now()
 		rows := make([]*model.ModerationLog, 0, len(entries))
 		for _, e := range entries {
@@ -167,13 +176,16 @@ func (s *Service) List(filter model.ModerationLogFilter) ([]*model.ModerationLog
 	return logs, nil
 }
 
-// safeGo runs fn in a goroutine, recovering from panics to keep audit-log
-// writes from taking down the request handler thread. Mirrors the private
-// helper of the same name in internal/core/note/note_create_service.go;
+// safeGo runs fn in a goroutine of g, recovering from panics to keep
+// audit-log writes from taking down the request handler thread. Mirrors the
+// private helper of the same name in internal/core/note/note_create_service.go;
 // duplicated here intentionally to avoid leaking goroutine helpers across
 // package boundaries.
-func safeGo(ctx context.Context, fn func()) {
-	go func() {
+//
+// 世代が止まった後に呼ばれたら書かない (#3661)。止まった世代の DB は閉じるので、
+// 書きに行っても失敗する。
+func safeGo(ctx context.Context, g *bgwork.Group, fn func()) {
+	g.Go(func(context.Context) {
 		defer func() {
 			if r := recover(); r != nil {
 				// 後続 phase で 30+ handler から呼ばれるようになると
@@ -186,5 +198,5 @@ func safeGo(ctx context.Context, fn func()) {
 			}
 		}()
 		fn()
-	}()
+	})
 }

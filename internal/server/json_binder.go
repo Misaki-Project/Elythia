@@ -8,12 +8,15 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/labstack/echo/v4"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/paramschema"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 )
 
@@ -89,15 +92,28 @@ type apiBinder struct {
 // 'object'`. An empty application/json body never gets here: JSONBodyParse
 // answers it with FST_ERR_CTP_EMPTY_JSON_BODY first, as Fastify does.
 //
-// For a GET request to an API endpoint it first rejects, with errQueryCast,
-// a query value that upstream cannot cast to its param's type (see
-// checkQueryCasts).
+// For a GET or HEAD request to an API endpoint it binds only the path and
+// query params, never the body, as upstream does. A GET first rejects, with
+// errQueryCast, a query value that upstream cannot cast to its param's type
+// (see checkQueryCasts).
 func (b *apiBinder) Bind(i any, c echo.Context) error {
 	req := c.Request()
-	if req.Method == http.MethodGet && isAPIEndpointRoute(c) {
-		if err := checkQueryCasts(c, reflect.TypeOf(i)); err != nil {
+	if (req.Method == http.MethodGet || req.Method == http.MethodHead) && isAPIEndpointRoute(c) {
+		if req.Method == http.MethodGet {
+			if err := checkQueryCasts(c, reflect.TypeOf(i)); err != nil {
+				return err
+			}
+		}
+		// **GET の本文は読まない。** 本家 (Fastify) は GET の本文を parse せず、
+		// ApiCallService は request.query だけを引数にする。echo の既定は query の
+		// 後に本文も bind して上書きするので、`GET /api/emoji?name=foo` に本文
+		// `{"name":"bar"}` を付けると bar の応答が返る。cacheSec の endpoint では
+		// それに public が付き、URL だけを鍵にする CDN が別の内容を配ってしまう
+		// (#3593)。
+		if err := b.BindPathParams(c, i); err != nil {
 			return err
 		}
+		return b.bindExactQueryParams(c, i)
 	}
 	err := b.DefaultBinder.Bind(i, c)
 	if req.Method == http.MethodGet || req.Method == http.MethodHead || !isAPIEndpointRoute(c) || !expectsObject(reflect.TypeOf(i)) {
@@ -114,6 +130,51 @@ func (b *apiBinder) Bind(i any, c echo.Context) error {
 	}
 	apierr.MarkBodyNotObject(c)
 	return errBodyNotObject
+}
+
+// bindExactQueryParams binds the `query` tagged fields of a struct i from the
+// query params whose key equals the tag exactly. echo's binder also takes a
+// key that matches ignoring case (`?Limit=` for `limit`), which upstream's
+// fast-querystring + ajv never do: an unknown key is ignored there. Binding it
+// let a caller hand the handler a value the validator never saw (the
+// validator reads the query with exact keys; 2026-10-31 の監査)。A non-struct
+// target (a map) keeps echo's behaviour.
+func (b *apiBinder) bindExactQueryParams(c echo.Context, i any) error {
+	t := derefType(reflect.TypeOf(i))
+	if t == nil || t.Kind() != reflect.Struct {
+		return b.BindQueryParams(c, i)
+	}
+	names := map[string]bool{}
+	collectQueryNames(t, names)
+	filtered := url.Values{}
+	for k, vs := range c.QueryParams() {
+		if names[k] {
+			filtered[k] = vs
+		}
+	}
+	// echo は c.QueryParams() を request の URL から読むので、完全一致の分だけを
+	// 持つ URL の使い捨ての context で bind する。
+	req := c.Request().Clone(c.Request().Context())
+	u := *req.URL
+	u.RawQuery = filtered.Encode()
+	req.URL = &u
+	return b.BindQueryParams(c.Echo().NewContext(req, c.Response()), i)
+}
+
+// collectQueryNames gathers the `query` tag names of t's fields, descending
+// into untagged struct fields like echo's binder and firstCastFailure do.
+func collectQueryNames(t reflect.Type, names map[string]bool) {
+	for i := range t.NumField() {
+		f := t.Field(i)
+		name := f.Tag.Get("query")
+		if name == "" {
+			if ft := derefType(f.Type); ft != nil && ft.Kind() == reflect.Struct && !decodesItself(ft) {
+				collectQueryNames(ft, names)
+			}
+			continue
+		}
+		names[name] = true
+	}
 }
 
 // errQueryCast is returned by c.Bind when a GET query value cannot be cast
@@ -211,6 +272,9 @@ func isTextPlain(ct string) bool {
 // text/plain body. It answers like the binder does (INVALID_PARAM with
 // info {param: "#/type", reason: "must be object"}).
 //
+// The endpoints whose upstream paramDef accepts a non-object body
+// (anyBodyEndpoints) are let through, as upstream does.
+//
 // apiRoutes appends it as the last route middleware, so it runs after the
 // route's credential / permission checks and right before the handler —
 // the same place upstream's ajv validation has in ApiCallService.call. It
@@ -222,6 +286,14 @@ func requireObjectBody(next echo.HandlerFunc) echo.HandlerFunc {
 			return next(c)
 		}
 		ct := req.Header.Get(echo.HeaderContentType)
+		// 本家の paramDef が {} の endpoint も、parser の無い Content-Type は fastify が
+		// 415 にする (ajv より前)。それ以外の本文は何でも通す。
+		if anyBodyEndpoints()[strings.TrimPrefix(c.Path(), "/api/")] {
+			if isUnsupportedAPIContentType(ct) {
+				return unsupportedMediaType(c)
+			}
+			return next(c)
+		}
 		notObject := false
 		switch {
 		case middleware.IsJSONContentType(ct):
@@ -248,6 +320,22 @@ func requireObjectBody(next echo.HandlerFunc) echo.HandlerFunc {
 				break
 			}
 			notObject = req.ContentLength == 0
+		case isMultipartForm(ct):
+			// 本家は @fastify/multipart を全体に登録しているので 415 にはならず、
+			// requireFile でない endpoint では request.body が object にならずに
+			// ajv の #/type で落ちる。requireFile の endpoint (と Elythia の
+			// create-chunked/append) は handler が multipart を読むので通す。
+			if multipartBodyRoutes[c.Path()] {
+				return next(c)
+			}
+			notObject = true
+		default:
+			// 本家は application/json・text/plain・multipart 以外の parser を持たず、
+			// fastify が 415 を返す。以前は他の Content-Type を素通しして echo の
+			// binder が束縛していたので、XML や form-urlencoded で送ると宣言の
+			// 検証 (JSON の body だけを見る) を迂回して handler に届いた
+			// (2026-10-31 の監査)。
+			return unsupportedMediaType(c)
 		}
 		if !notObject {
 			return next(c)
@@ -257,21 +345,87 @@ func requireObjectBody(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+// isUnsupportedAPIContentType reports whether upstream's /api has no body parser
+// for the content type: anything but application/json, text/plain, multipart
+// and no content type at all.
+func isUnsupportedAPIContentType(ct string) bool {
+	return !middleware.IsJSONContentType(ct) && !isTextPlain(ct) && !isMultipartForm(ct) && strings.TrimSpace(ct) != ""
+}
+
+// unsupportedMediaType answers like fastify's FST_ERR_CTP_INVALID_MEDIA_TYPE.
+func unsupportedMediaType(c echo.Context) error {
+	return c.JSON(http.StatusUnsupportedMediaType, map[string]any{
+		"statusCode": http.StatusUnsupportedMediaType,
+		"code":       "FST_ERR_CTP_INVALID_MEDIA_TYPE",
+		"error":      "Unsupported Media Type",
+		"message":    "Unsupported Media Type",
+	})
+}
+
+// multipartBodyRoutes are the /api routes whose handler reads a multipart body:
+// upstream's requireFile endpoints (multipartUploadRoutes) and Elythia's
+// drive/files/create-chunked/append (docs/param-shadow.md の宣言しない例外)。
+var multipartBodyRoutes = func() map[string]bool {
+	m := map[string]bool{"/api/drive/files/create-chunked/append": true}
+	for _, p := range multipartUploadRoutes {
+		m[p] = true
+	}
+	return m
+}()
+
+// isMultipartForm reports whether the content type is multipart/form-data.
+func isMultipartForm(ct string) bool {
+	essence, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		essence, _, _ = strings.Cut(ct, ";")
+		essence = strings.ToLower(strings.TrimSpace(essence))
+	}
+	return essence == echo.MIMEMultipartForm
+}
+
+// anyBodyEndpoints returns the upstream endpoints whose paramDef accepts a
+// body that is not an object (its paramDef is `{}`: reversi/invitations and
+// admin/captcha/current). Upstream hands any body to ajv, which passes it, so
+// requireObjectBody lets these through.
+//
+// 本家の paramDef に type が無いと、ajv は null・配列・文字列も通す。名前を手で
+// 書くと本家の版上げで取り残されるので、golden の schema から求める (#3843)。
+var anyBodyEndpoints = sync.OnceValue(func() map[string]bool {
+	out := map[string]bool{}
+	eps, err := paramschema.Upstream()
+	if err != nil {
+		return out
+	}
+	for name, ep := range eps {
+		if ep.Schema != nil && ep.CompileErr == nil && ep.Schema.Validate(nil) == nil && ep.Schema.Validate("x") == nil {
+			out[name] = true
+		}
+	}
+	return out
+})
+
 // apiRoutes is the /api group whose POST and Match registrations get
-// requireObjectBody as their last route middleware.
+// withParamShadow and requireObjectBody as their last route middleware, and
+// whose GET registrations get withParamShadow.
 type apiRoutes struct {
 	*echo.Group
 }
 
-// POST registers a POST route like echo.Group.POST, then requireObjectBody.
+// POST registers a POST route like echo.Group.POST, then withParamShadow and
+// requireObjectBody.
 func (g apiRoutes) POST(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	return g.Group.POST(path, h, append(m, requireObjectBody)...)
+	return g.Group.POST(path, h, append(m, withParamShadow, requireObjectBody)...)
 }
 
-// Match registers routes like echo.Group.Match, then requireObjectBody (which
-// skips GET / HEAD itself).
+// Match registers routes like echo.Group.Match, then withParamShadow and
+// requireObjectBody (which skips GET / HEAD itself).
 func (g apiRoutes) Match(methods []string, path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) []*echo.Route {
-	return g.Group.Match(methods, path, h, append(m, requireObjectBody)...)
+	return g.Group.Match(methods, path, h, append(m, withParamShadow, requireObjectBody)...)
+}
+
+// GET registers a GET route like echo.Group.GET, then withParamShadow.
+func (g apiRoutes) GET(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
+	return g.Group.GET(path, h, append(m, withParamShadow)...)
 }
 
 // isNonObjectJSON reports whether data (valid JSON) is a top-level value

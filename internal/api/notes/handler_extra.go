@@ -8,14 +8,18 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	coreachievement "github.com/elythia-network/elythia/internal/core/achievement"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/core/notesfilter"
+	"github.com/elythia-network/elythia/internal/core/translate"
 	"github.com/elythia-network/elythia/internal/core/ugcvisibility"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/hashtag"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
@@ -123,22 +127,25 @@ func (h *Handler) FavoritesDelete(c echo.Context) error {
 // ハイライトタブから叩かれる経路)。過去はこの絞り込みが無く、無関係な
 // グローバルノートが混ざっていた (#489)。untilId は cursor pagination 用。
 func (h *Handler) Featured(c echo.Context) error {
+	// GET でも受ける (本家は allowGet: true) ので query の名前も付ける。無いと GET の
+	// channelId / limit が読まれず、別の内容の応答が public でキャッシュされる (#3593)。
+	// 本家の paramDef は limit・untilId・channelId だけを持つ。以前は本家に無い
+	// offset・untilDate も読んでいたが、型の違う値 (offset: "x") を 400 にし、本家が
+	// 無視する値で件数を飛ばしていたので、読まない (#3847)。frontend は untilId で送る。
 	var req struct {
-		Limit     *int   `json:"limit"`
-		Offset    int    `json:"offset"`
-		ChannelID string `json:"channelId"`
-		UntilID   string `json:"untilId"`
-		UntilDate *int64 `json:"untilDate"`
+		Limit     *jsnum.Int `json:"limit" query:"limit"`
+		ChannelID string     `json:"channelId" query:"channelId"`
+		UntilID   string     `json:"untilId" query:"untilId"`
 	}
 	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid parameters.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
+		// GET の query で数値に読めない値は、本家と同じ cast のエラーにする。
+		return apierr.JSONInvalidParam(c)
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	// untilDate を aidx prefix に正規化 (#1166)。
-	_, untilID, cursorOK := id.NormalizeCursor("", req.UntilID, nil, req.UntilDate)
+	_, untilID, cursorOK := id.NormalizeCursor("", req.UntilID, nil, nil)
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -153,7 +160,7 @@ func (h *Handler) Featured(c echo.Context) error {
 		}
 		localOnly = policy == ugcvisibility.Local
 	}
-	notes, err := h.featuredNotes(c.Request().Context(), viewer, req.ChannelID, untilID, limit, req.Offset, localOnly)
+	notes, err := h.featuredNotes(c.Request().Context(), viewer, req.ChannelID, untilID, limit, 0, localOnly)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
@@ -189,10 +196,7 @@ func (h *Handler) featuredNotes(ctx context.Context, viewer *model.User, channel
 		}
 		notes = out
 	}
-	// upstream featured.ts は me の mute / 被block を isUserRelated で除外する
-	// (#1682)。users/featured-notes (#1547) と同じく被block / mute / instance-mute を
-	// 取得後に除外し、blocked-host / suspended も applyMuteBlock が落とす (#1783)。
-	notes, err = h.applyMuteBlock(viewer, notes)
+	notes, err = h.filterFeatured(viewer, notes)
 	if err != nil {
 		return nil, err
 	}
@@ -204,13 +208,55 @@ func (h *Handler) featuredNotes(ctx context.Context, viewer *model.User, channel
 	return notes, nil
 }
 
+// filterFeatured drops the featured candidates upstream notes/featured.ts
+// (2026.10.0) drops: notes whose author, reply-target author, or
+// renote-target author has blocked the viewer or is muted by the viewer
+// (isUserRelated without ignoreAuthor), belongs to an admin-blocked host
+// (generateBlockedHostQueryForNote), or is suspended
+// (generateSuspendedUserQueryForNote). Only depth 1 is inspected. Channel
+// mutes, instance mutes, and renote mutes are not applied.
+//
+// Lookup errors are returned (fail-closed); the caller answers 500.
+func (h *Handler) filterFeatured(viewer *model.User, notes []*model.Note) ([]*model.Note, error) {
+	// 本家 featured.ts は他の一覧と違い generateBaseNoteFilteringQuery を使わず、
+	// 取得後に isUserRelated で被block と mute だけを見る。#3369 より前は
+	// applyMuteBlock を通していて、チャンネル・インスタンスのミュートと、
+	// リノート元の返信先・リノート元 (2 段目) でも落としていた。どれも閲覧者の
+	// 好みによる絞り込みで、外しても見えてはいけないノートが出るわけではない。
+	if viewer != nil {
+		muting, blocking, _ := h.newRequestRelations(viewer).listers()
+		sets, err := notesfilter.LoadMuteBlockSets(viewer, muting, blocking, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		notes = notesfilter.DropUserRelated(notes, sets.BlockerIDs, false)
+		notes = notesfilter.DropUserRelated(notes, sets.MutedUserIDs, false)
+	}
+	blocked, err := h.blockedHosts()
+	if err != nil {
+		return nil, err
+	}
+	notes = notesfilter.ApplyBlockedHosts(notes, blocked)
+	// 本家は著者に加えて返信先・リノート元の著者の凍結も見る
+	// (replyUser / renoteUser の isSuspended)。#3369 より前は著者だけを見ていた。
+	out := make([]*model.Note, 0, len(notes))
+	for _, n := range notes {
+		if n == nil || notesfilter.HasSuspendedAuthor(n, nil) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
 // fetchFeaturedNotes fetches the featured candidates before featuredNotes
 // filters them. The ranking path returns every ranked note below untilID; the
-// SQL fallback returns at most limit rows from offset.
+// SQL fallback returns at most limit rows from offset, drawn only from notes
+// upstream could put into the ranking (see repository ListFeatured).
 func (h *Handler) fetchFeaturedNotes(ctx context.Context, channelID, untilID string, limit, offset int) ([]*model.Note, error) {
 	// SQL fallback (ranking が無い / 空のとき) は upstream に無い経路なので、
 	// これまでどおり limit / offset で引いてから絞る (件数が欠けることがある。
-	// docs/divergence.md)。
+	// docs/divergence/security.md)。
 	if h.featuredRanking == nil {
 		return h.noteRepo.ListFeatured(channelID, untilID, limit, offset)
 	}
@@ -304,24 +350,30 @@ func (h *Handler) Unrenote(c echo.Context) error {
 func (h *Handler) Mentions(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req struct {
-		Limit      *int   `json:"limit"`
-		SinceID    string `json:"sinceId"`
-		UntilID    string `json:"untilId"`
-		SinceDate  *int64 `json:"sinceDate"`
-		UntilDate  *int64 `json:"untilDate"`
-		Visibility string `json:"visibility"`
-		Following  bool   `json:"following"`
+		Limit      *jsnum.Int `json:"limit"`
+		SinceID    string     `json:"sinceId"`
+		UntilID    string     `json:"untilId"`
+		SinceDate  *jsnum.Int `json:"sinceDate"`
+		UntilDate  *jsnum.Int `json:"untilDate"`
+		Visibility string     `json:"visibility"`
+		Following  bool       `json:"following"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid parameters.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
+	// **enum 列へそのまま比較値として渡る。** `note_visibility_enum` に無い値は
+	// PostgreSQL の型変換で落ちて 500 になる (本家も paramDef が string だけで同じ)。
+	// 呼び出し側の誤りなので引く前に 400 で返す (#3518)。
+	if !validMentionsVisibility(req.Visibility) {
 		return apierr.JSONInvalidParam(c)
 	}
 	// visibility kind の絞り込みは ListMentions の SQL push-down に委譲する
@@ -352,22 +404,22 @@ func (h *Handler) Mentions(c echo.Context) error {
 func (h *Handler) UserListTimeline(c echo.Context) error {
 	me := middleware.GetUser(c)
 	var req struct {
-		ListID                string `json:"listId"`
-		Limit                 *int   `json:"limit"`
-		SinceID               string `json:"sinceId"`
-		UntilID               string `json:"untilId"`
-		SinceDate             *int64 `json:"sinceDate"`
-		UntilDate             *int64 `json:"untilDate"`
-		WithFiles             bool   `json:"withFiles"`
-		WithRenotes           *bool  `json:"withRenotes"`
-		IncludeMyRenotes      *bool  `json:"includeMyRenotes"`
-		IncludeRenotedMyNotes *bool  `json:"includeRenotedMyNotes"`
-		IncludeLocalRenotes   *bool  `json:"includeLocalRenotes"`
+		ListID                string     `json:"listId"`
+		Limit                 *jsnum.Int `json:"limit"`
+		SinceID               string     `json:"sinceId"`
+		UntilID               string     `json:"untilId"`
+		SinceDate             *jsnum.Int `json:"sinceDate"`
+		UntilDate             *jsnum.Int `json:"untilDate"`
+		WithFiles             bool       `json:"withFiles"`
+		WithRenotes           *bool      `json:"withRenotes"`
+		IncludeMyRenotes      *bool      `json:"includeMyRenotes"`
+		IncludeRenotedMyNotes *bool      `json:"includeRenotedMyNotes"`
+		IncludeLocalRenotes   *bool      `json:"includeLocalRenotes"`
 	}
 	if err := c.Bind(&req); err != nil || req.ListID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "listId is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -386,7 +438,7 @@ func (h *Handler) UserListTimeline(c echo.Context) error {
 		}
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -434,6 +486,10 @@ func (h *Handler) UserListTimeline(c echo.Context) error {
 	return c.JSON(http.StatusOK, h.packMany(c.Request().Context(), notes, me))
 }
 
+// maxSearchByTagGroups caps the number of OR groups in notes/search-by-tag's
+// query.
+const maxSearchByTagGroups = 32
+
 // SearchByTag handles POST /api/notes/search-by-tag.
 // TS互換: tag (string) または query (string[][] — 外側 OR・内側 AND の複合タグ
 // 検索) を受け付ける (#1683、upstream search-by-tag.ts)。tag が指定されれば
@@ -442,11 +498,11 @@ func (h *Handler) SearchByTag(c echo.Context) error {
 	var req struct {
 		Tag       string     `json:"tag"`
 		Query     [][]string `json:"query"`
-		Limit     *int       `json:"limit"`
+		Limit     *jsnum.Int `json:"limit"`
 		SinceID   string     `json:"sinceId"`
 		UntilID   string     `json:"untilId"`
-		SinceDate *int64     `json:"sinceDate"`
-		UntilDate *int64     `json:"untilDate"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 		Reply     *bool      `json:"reply"`
 		Renote    *bool      `json:"renote"`
 		Poll      *bool      `json:"poll"`
@@ -459,8 +515,33 @@ func (h *Handler) SearchByTag(c echo.Context) error {
 	// upstream: 'tag' があれば単一タグ、無ければ query をそのまま使う。
 	var tagGroups [][]string
 	if req.Tag != "" {
+		// 本家の paramDef は tag に maxLength: 128 を持つ (ajv は code point で数える)。
+		// 保存されるタグは 128 文字以下なので、それより長いタグはどのノートにも
+		// 一致しない。正規化 (NFKC) の前に拒否する。
+		if utf8.RuneCountInString(req.Tag) > hashtag.MaxTagLength {
+			return apierr.JSONInvalidParam(c)
+		}
 		tagGroups = [][]string{{req.Tag}}
 	} else {
+		// **query の大きさに上限を置く。** 1 要求の検索の重さを一定に収めるため。
+		// グループの数は hashtag ストリームの購読数の上限 (maxHashtagTopics) と
+		// 同じ 32 に、グループ内のタグの数はノートが持てるタグの上限
+		// (hashtag.MaxNoteTags) にする。後者を超える AND は、どのノートにも一致
+		// しない。数えるのは空のタグを除く前の個数。
+		if len(req.Query) > maxSearchByTagGroups {
+			return apierr.JSONInvalidParam(c)
+		}
+		for _, inner := range req.Query {
+			if len(inner) > hashtag.MaxNoteTags {
+				return apierr.JSONInvalidParam(c)
+			}
+			// query の各タグにも本家と同じ maxLength: 128 を掛ける (tag と同じ理由)。
+			for _, t := range inner {
+				if utf8.RuneCountInString(t) > hashtag.MaxTagLength {
+					return apierr.JSONInvalidParam(c)
+				}
+			}
+		}
 		for _, inner := range req.Query {
 			g := make([]string, 0, len(inner))
 			for _, t := range inner {
@@ -476,12 +557,12 @@ func (h *Handler) SearchByTag(c echo.Context) error {
 	if len(tagGroups) == 0 {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "tag is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -506,23 +587,39 @@ func (h *Handler) SearchByTag(c echo.Context) error {
 		}
 		filter.LocalUsersOnly = policy == ugcvisibility.Local
 	}
-	notes, err := h.noteRepo.SearchByTag(tagGroups, viewerID, limit, sinceID, untilID, filter)
-	if err != nil {
-		// tag 検索失敗は従来どおり空配列で返す (TS 互換) が、visibility
-		// push-down 追加で SQL エラーも黙殺されうるため診断用に 1 行残す。
-		// ユーザー挙動 (200 + 空配列) は不変で operator-actionable でもないため
-		// Warn ではなく Debug に留める (#1446 review)。
-		slog.Debug("notes/search-by-tag: SearchByTag failed", "tag", req.Tag, "err", err)
-		return c.JSON(http.StatusOK, []entity.NoteEntity{})
-	}
 	// upstream search-by-tag は generateBaseNoteFilteringQuery で被block / mute /
-	// instance-mute を除外する (#1554)。block/mute は post-fetch で適用する。
-	notes, err = h.applyMuteBlock(viewer, notes)
+	// instance-mute を除外する (#1554)。block/mute は post-fetch で適用する
+	// (searchVisiblePage の中)。notes/search と同じく、閲覧者に本文が隠れる
+	// ノートは結果に載せない。
+	packed, err := h.searchVisiblePage(c.Request().Context(), viewer, limit,
+		searchPage{sinceID: sinceID, untilID: untilID},
+		func(p searchPage) ([]*model.Note, error) {
+			notes, err := h.noteRepo.SearchByTag(tagGroups, viewerID, limit, p.sinceID, p.untilID, filter)
+			if err != nil {
+				return nil, errSearchByTagFetch{err}
+			}
+			return notes, nil
+		})
 	if err != nil {
+		var fetchErr errSearchByTagFetch
+		if errors.As(err, &fetchErr) {
+			// tag 検索失敗は従来どおり空配列で返す (TS 互換) が、visibility
+			// push-down 追加で SQL エラーも黙殺されうるため診断用に 1 行残す。
+			// ユーザー挙動 (200 + 空配列) は不変で operator-actionable でもないため
+			// Warn ではなく Debug に留める (#1446 review)。
+			slog.Debug("notes/search-by-tag: SearchByTag failed", "tag", req.Tag, "err", fetchErr.err)
+			return c.JSON(http.StatusOK, []entity.NoteEntity{})
+		}
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
-	return c.JSON(http.StatusOK, h.packMany(c.Request().Context(), notes, viewer))
+	return c.JSON(http.StatusOK, packed)
 }
+
+// errSearchByTagFetch marks an error returned by the repository search in
+// notes/search-by-tag, as opposed to one from the mute / block filter.
+type errSearchByTagFetch struct{ err error }
+
+func (e errSearchByTagFetch) Error() string { return e.err.Error() }
 
 // SetClipRepos wires the clip repos used by notes/clips (#1554)。未配線時は
 // 旧 stub 同様に空配列を返す。
@@ -594,7 +691,7 @@ func (h *Handler) Clips(c echo.Context) error {
 				}
 			}
 		}
-		out = append(out, entity.PackClip(cl, h.idGen, owner, extras))
+		out = append(out, h.entityPacker.PackClip(cl, h.idGen, owner, extras))
 	}
 	return c.JSON(http.StatusOK, out)
 }
@@ -602,10 +699,10 @@ func (h *Handler) Clips(c echo.Context) error {
 // Translate handles POST /api/notes/translate.
 func (h *Handler) Translate(c echo.Context) error {
 	var req struct {
-		NoteID     string `json:"noteId"`
-		TargetLang string `json:"targetLang"`
+		NoteID     string  `json:"noteId"`
+		TargetLang *string `json:"targetLang"`
 	}
-	if err := c.Bind(&req); err != nil || req.NoteID == "" || req.TargetLang == "" {
+	if err := c.Bind(&req); err != nil || req.NoteID == "" || req.TargetLang == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "noteId and targetLang are required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 
@@ -683,8 +780,33 @@ func (h *Handler) Translate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("UNAVAILABLE", "Translate of notes unavailable.", "50a70314-2d8a-431b-b433-efa5cc56444c"))
 	}
 
-	result, err := h.translator.Translate(c.Request().Context(), text, req.TargetLang)
+	// 本家の paramDef は targetLang を string とするだけで、空文字も通す。ノートの
+	// 照合・可視性・空の本文・翻訳の設定の判定は本家と同じ順で先に済ませ、翻訳に
+	// 回す直前で拒否する (#3847)。本家は空の言語を DeepL へ送り、500 になる。
+	if *req.TargetLang == "" {
+		if cc, ok := h.translator.(translatorConfigured); ok {
+			configured, err := cc.Configured()
+			if err != nil {
+				slog.Error("notes/translate: reading translator settings failed", "err", err)
+				return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Translation failed.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
+			}
+			if !configured {
+				return c.JSON(http.StatusBadRequest, apierr.Error("UNAVAILABLE", "Translate of notes unavailable.", "50a70314-2d8a-431b-b433-efa5cc56444c"))
+			}
+		}
+		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "targetLang is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
+	}
+
+	result, err := h.translator.Translate(c.Request().Context(), text, *req.TargetLang)
+	if errors.Is(err, translate.ErrNotConfigured) {
+		// キーは翻訳のたびに meta から読む (#3663)。未設定は本家の
+		// `deeplAuthKey == null` と同じ unavailable にする (上の nil と同じ応答)。
+		return c.JSON(http.StatusBadRequest, apierr.Error("UNAVAILABLE", "Translate of notes unavailable.", "50a70314-2d8a-431b-b433-efa5cc56444c"))
+	}
 	if err != nil {
+		// 利用者には汎用の文言だけを返す。キーは err に入らない (DeepL の応答本文の
+		// 抜粋か、meta を読めなかった理由だけ)。
+		slog.Error("notes/translate: translation failed", "err", err)
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Translation failed.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
 
@@ -692,6 +814,13 @@ func (h *Handler) Translate(c echo.Context) error {
 		"sourceLang": result.SourceLang,
 		"text":       result.Text,
 	})
+}
+
+// translatorConfigured is implemented by translators that read their settings
+// per call (translate.MetaDeepL), so the handler can answer UNAVAILABLE before
+// rejecting an empty targetLang, in upstream's order.
+type translatorConfigured interface {
+	Configured() (bool, error)
 }
 
 // translateHiddenByAuthorPrefs reports whether the packed note would carry
@@ -795,7 +924,9 @@ func (h *Handler) ShowPartialBulk(c echo.Context) error {
 	// 軽量 diff のみ返す (reaction polling 用途、本文/可視性詳細は返さない)。
 	// packMany が reactions (buffered merge 込み) と reactionEmojis を解決済みなので
 	// それを投影して shape を揃える (#1538)。
-	packed := h.packMany(c.Request().Context(), notes, viewer)
+	// 詳細画面に表示中のノートのリアクションを更新する経路なので、ハードミュートを掛けない
+	// (本家の fetchDiffs も掛けない)。
+	packed := h.packManyWithoutHardMute(c.Request().Context(), notes, viewer)
 	diffs := make([]map[string]any, 0, len(packed))
 	for i := range packed {
 		diffs = append(diffs, map[string]any{
@@ -833,4 +964,17 @@ func (h *Handler) materializeIfMissing(noteID string, lookupErr error) bool {
 	}
 	_, err := h.materializer.EnsureNote(context.Background(), noteID)
 	return err == nil
+}
+
+// validMentionsVisibility reports whether v is a value notes/mentions can
+// compare against the `note_visibility_enum` column.
+//
+// **空文字は許す。** 未指定は全種別を返す意味で、Go の string では省略と空文字を
+// 区別できない。
+func validMentionsVisibility(v string) bool {
+	switch model.NoteVisibility(v) {
+	case "", model.NoteVisibilityPublic, model.NoteVisibilityHome, model.NoteVisibilityFollowers, model.NoteVisibilitySpecified:
+		return true
+	}
+	return false
 }

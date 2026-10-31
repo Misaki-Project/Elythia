@@ -27,8 +27,8 @@ func newUserListTimelineHandler(t *testing.T, rows []*model.Note) *Handler {
 	noteRepo := &userListNotesRepo{MockNoteRepository: testutil.NewMockNoteRepository(), rows: rows}
 	idGen, _ := id.NewGenerator("aidx")
 	querySvc := corenote.NewQueryService(noteRepo, testutil.NewMockFollowingRepository())
-	h := NewHandler(noteRepo,
-		corenote.NewCreateService(noteRepo, testutil.NewMockPollRepository(), idGen, nil),
+	h := newHandlerNilDeps(noteRepo,
+		corenote.NewCreateService(noteRepo, testutil.NewMockPollRepository(), idGen, nil, nil, nil, nil, nil, nil, nil),
 		corenote.NewDeleteService(noteRepo), querySvc, nil, nil, nil, nil, idGen)
 	listRepo := testutil.NewMockUserListRepository()
 	listRepo.Lists["l1"] = &model.UserList{ID: "l1", UserID: "u1", Name: "my list"}
@@ -48,7 +48,7 @@ func TestUserListTimeline_DropsBlockedHostNotes(t *testing.T) {
 	h := newUserListTimelineHandler(t, userListBlockedHostRows())
 	meta := testutil.NewMockMetaRepository()
 	meta.Meta = &model.Meta{ID: "x", BlockedHosts: []string{"bad.example"}}
-	h.SetMetaRepo(meta)
+	h.metaRepo = meta
 
 	rec := postExtra(h.UserListTimeline, `{"listId":"l1"}`, &model.User{ID: "u1"})
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -67,7 +67,7 @@ func TestUserListTimeline_BlockedHostFetchErrorIsFatal(t *testing.T) {
 	h := newUserListTimelineHandler(t, userListBlockedHostRows())
 	meta := testutil.NewMockMetaRepository()
 	meta.FetchErr = assert.AnError
-	h.SetMetaRepo(meta)
+	h.metaRepo = meta
 
 	rec := postExtra(h.UserListTimeline, `{"listId":"l1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)

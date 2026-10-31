@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/id"
@@ -26,10 +27,9 @@ import (
 // ModeratorChecker reports whether a user holds a moderator (or administrator)
 // role. Delete uses it to reproduce upstream's moderator bypass (#2812).
 //
-// 未配線なら「モデレーターではない」に倒れる。**緩む側ではなく厳しい側**なので、
-// `recordCriticalWiring` (= 起動を止める配線検査) の対象にはしない。代わりに
-// `TestInviteModeratorCheckerIsWired` が router のソースを読んで固定する — 配線を
-// 消してもこのパッケージのテストは checker を自分で注入するので緑のまま通る。
+// 未配線なら「モデレーターではない」に倒れる。**緩む側ではなく厳しい側**。
+// NewHandler の必須の引数なので、組み立てで渡し忘れるとコンパイルが通らない
+// (#3817。以前は router のソースを読むテストで固定していた)。
 type ModeratorChecker interface {
 	IsModerator(userID string) bool
 }
@@ -41,17 +41,18 @@ type Handler struct {
 	rolePolicyProvider role.PolicyProvider
 	userRepo           repository.UserRepository
 	moderatorChecker   ModeratorChecker
+	// entityPacker は利用者を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3794)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // NewHandler returns a Handler wired with the given repository + id generator.
-func NewHandler(repo repository.RegistrationTicketRepository, idGen id.Generator) *Handler {
-	return &Handler{repo: repo, idGen: idGen}
-}
-
-// SetRolePolicyProvider wires the policy provider used by Create / Limit.
-// Nil keeps the gate disabled (= test fixture / wire 未配線).
-func (h *Handler) SetRolePolicyProvider(p role.PolicyProvider) {
-	h.rolePolicyProvider = p
+// entityPacker is the Packer this Handler packs entities with (#3794).
+// rolePolicyProvider is the policy provider used by Create / Limit; nil keeps
+// the gate disabled. moderatorChecker is the moderator lookup used by Delete
+// (#2812); nil only disables the moderator bypass.
+func NewHandler(repo repository.RegistrationTicketRepository, idGen id.Generator, entityPacker *entity.Packer, rolePolicyProvider role.PolicyProvider, moderatorChecker ModeratorChecker) *Handler {
+	return &Handler{repo: repo, idGen: idGen, entityPacker: entityPacker, rolePolicyProvider: rolePolicyProvider, moderatorChecker: moderatorChecker}
 }
 
 // SetUserRepo wires the user repository used by List to pack the createdBy /
@@ -59,14 +60,6 @@ func (h *Handler) SetRolePolicyProvider(p role.PolicyProvider) {
 // (createdBy は middleware user から常に解決できる)。
 func (h *Handler) SetUserRepo(r repository.UserRepository) {
 	h.userRepo = r
-}
-
-// SetModeratorChecker wires the moderator lookup used by Delete (#2812).
-//
-// 未配線なら bypass が効かないだけ (= 作成者の未使用の招待しか消せない)。
-// **#2812 以前と同じではない** — あちらは作成者なら使用済みでも消せた。
-func (h *Handler) SetModeratorChecker(c ModeratorChecker) {
-	h.moderatorChecker = c
 }
 
 // Create implements POST /api/invite/create. Upstream Misskey TS
@@ -78,7 +71,9 @@ func (h *Handler) Create(c echo.Context) error {
 	now := time.Now()
 
 	policies := h.policies(user.ID)
-	if invLimit, ok := role.PolicyNumber(policies["inviteLimit"]); ok && invLimit > 0 {
+	// upstream は `if (policies.inviteLimit)` (0 は falsy で上限なし) の中で
+	// `count >= inviteLimit` を見るので、負の値は「作れない」になる。
+	if invLimit, ok := role.PolicyNumber(policies["inviteLimit"]); ok && invLimit != 0 {
 		// **`time.Duration(f) * time.Minute` と書かない。** Duration への変換で
 		// 小数が切り捨てられてから掛かるので 0.5 分が 0 になる (#2613)。
 		cycle := time.Duration(0)
@@ -119,7 +114,7 @@ func (h *Handler) Create(c echo.Context) error {
 		"code": ticket.Code,
 		// upstream InviteCodeEntityService.ts:50 は expiresAt ? toISOString() : null (#1948-10)。
 		"expiresAt": entity.ISOMillisPtr(ticket.ExpiresAt),
-		"createdBy": entity.PackUserLite(user),
+		"createdBy": h.entityPacker.PackUserLite(user),
 		"usedBy":    nil,
 		"usedAt":    nil,
 		"used":      false,
@@ -134,22 +129,24 @@ func (h *Handler) Create(c echo.Context) error {
 func (h *Handler) List(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req struct {
-		Limit     *int   `json:"limit"`
-		SinceID   string `json:"sinceId"`
-		UntilID   string `json:"untilId"`
-		SinceDate *int64 `json:"sinceDate"`
-		UntilDate *int64 `json:"untilDate"`
+		// limit / sinceDate / untilDate は、本家(ajv の integer)と同じく値が
+		// 整数の小数(10.0)を受ける (#3762)。
+		Limit     *jsnum.Int `json:"limit"`
+		SinceID   string     `json:"sinceId"`
+		UntilID   string     `json:"untilId"`
+		SinceDate *jsnum.Int `json:"sinceDate"`
+		UntilDate *jsnum.Int `json:"untilDate"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
 
-	limit, limitOK := pagination.ResolveLimit(req.Limit, 30, 100)
+	limit, limitOK := pagination.ResolveLimit(req.Limit.IntPtr(), 30, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -166,7 +163,7 @@ func (h *Handler) List(c echo.Context) error {
 	// createdBy は常に呼び出し元自身。usedBy は `usedById` を持つ ticket の利用者を batch 解決する
 	// (#1776)。frontend MkInviteCode.vue が createdBy/usedBy の avatar/username を
 	// 描画するため、ここを null 固定にすると招待管理画面の詳細表示が空になる。
-	createdByLite := entity.PackUserLite(user)
+	createdByLite := h.entityPacker.PackUserLite(user)
 	usedByMap := map[string]entity.UserLite{}
 	if h.userRepo != nil {
 		seen := make(map[string]struct{}, len(tickets))
@@ -184,7 +181,7 @@ func (h *Handler) List(c echo.Context) error {
 		if len(ids) > 0 {
 			if users, err := h.userRepo.FindManyByIDs(ids); err == nil {
 				for _, u := range users {
-					usedByMap[u.ID] = entity.PackUserLite(u)
+					usedByMap[u.ID] = h.entityPacker.PackUserLite(u)
 				}
 			}
 		}
@@ -284,7 +281,9 @@ func (h *Handler) Limit(c echo.Context) error {
 	user := middleware.GetUser(c)
 	policies := h.policies(user.ID)
 	invLimit, hasLimit := role.PolicyNumber(policies["inviteLimit"])
-	if !hasLimit || invLimit <= 0 {
+	// 負の値は falsy ではないので数えて 0 を返す (upstream と同じ。invite/create も
+	// 負の値では作れない)。null を返すと、画面には無制限と出るのに作れない。
+	if !hasLimit || invLimit == 0 {
 		return c.JSON(http.StatusOK, map[string]any{"remaining": nil})
 	}
 	cycle := time.Duration(0)
@@ -334,9 +333,3 @@ func generateInviteCode() string {
 	}
 	return string(b)
 }
-
-// HasRolePolicyProvider reports whether the role policy provider was wired.
-//
-// 未配線だと policy が空 map になり、招待の上限が無制限になる。起動時検査に
-// 使う (#2683)。
-func (h *Handler) HasRolePolicyProvider() bool { return h.rolePolicyProvider != nil }

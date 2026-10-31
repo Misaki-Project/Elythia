@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 func newTestSvc(t *testing.T) *Service {
 	t.Helper()
 	testRedis.FlushAll(context.Background())
-	svc := NewService(testRedis.Client, idGen, "")
+	svc := NewService(testRedis.Client, idGen, "", nil)
 	// テストでは 2 秒の AfterFunc を待ちたくないので同期 publish にする。
 	svc.SetUnreadPublishDelay(0)
 	return svc
@@ -66,7 +66,7 @@ func TestService_Create_RequiresNotifiee(t *testing.T) {
 func TestService_KeyPrefix(t *testing.T) {
 	testRedis.FlushAll(context.Background())
 	const host = "example.test"
-	svc := NewService(testRedis.Client, idGen, host+":")
+	svc := NewService(testRedis.Client, idGen, host+":", nil)
 	ctx := context.Background()
 
 	_, err := svc.Create(ctx, CreateInput{
@@ -589,7 +589,7 @@ func TestService_Flush(t *testing.T) {
 }
 
 func TestService_RedisErrors(t *testing.T) {
-	svc := NewService(closedClient(t), idGen, "")
+	svc := NewService(closedClient(t), idGen, "", nil)
 	ctx := context.Background()
 
 	_, err := svc.Create(ctx, CreateInput{NotifieeID: "u", NotifierID: "v", Type: TypeFollow})
@@ -940,7 +940,7 @@ func TestService_MarkAllAsRead_ReadsMarkerBeforeStream(t *testing.T) {
 	hooked := redis.NewClient(&redis.Options{Addr: testRedis.Addr})
 	t.Cleanup(func() { require.NoError(t, hooked.Close()) })
 
-	seed := NewService(testRedis.Client, idGen, "")
+	seed := NewService(testRedis.Client, idGen, "", nil)
 	seed.SetUnreadPublishDelay(0)
 	first, err := seed.Create(ctx, CreateInput{
 		NotifieeID: "alice", NotifierID: "bob", Type: TypeFollow,
@@ -959,7 +959,7 @@ func TestService_MarkAllAsRead_ReadsMarkerBeforeStream(t *testing.T) {
 		readTo:  newest[0].ID,
 	})
 
-	svc := NewService(hooked, idGen, "")
+	svc := NewService(hooked, idGen, "", nil)
 	svc.SetUnreadPublishDelay(0)
 	pub := &stubMainPublisher{}
 	svc.SetMainStreamPublisher(pub)
@@ -968,4 +968,40 @@ func TestService_MarkAllAsRead_ReadsMarkerBeforeStream(t *testing.T) {
 	assert.Len(t, pub.snapshot(), 1,
 		"既読位置はストリームより先に読むこと。逆順だと並走した既読要求の書き込みを"+
 			"読んでしまい publish しない側へ倒れる")
+}
+
+// UnreadStreamSummary is UnreadSummary without the note_unread read: with a
+// note_unread repository it leaves HasSpecifiedNote to the caller (/api/i
+// reads it in its one-statement query, #3608); without one it still takes it
+// from the stream.
+func TestService_UnreadStreamSummary_LeavesNoteUnreadToCaller(t *testing.T) {
+	ctx := context.Background()
+
+	svc := newTestSvc(t)
+	unread := testutil.NewMockNoteUnreadRepository()
+	svc.SetNoteUnreadRepo(unread)
+	_ = unread.Upsert(&model.NoteUnread{
+		ID: "nu1", UserID: "alice", NoteID: "n1", NoteUserID: "bob", IsSpecified: true,
+	})
+	// stream 側の通知も specified にしておく。note_unread を持つ Service では
+	// note_unread が正なので、stream から HasSpecifiedNote を立ててはいけない
+	// (立てると、note_unread では読み終えているのに true になりうる)。
+	_, err := svc.Create(ctx, CreateInput{NotifieeID: "alice", NotifierID: "bob", Type: TypeMention, NoteID: "n2", NoteVisibility: "specified"})
+	require.NoError(t, err)
+
+	assert.True(t, svc.SpecifiedNoteFromDB())
+	stream, err := svc.UnreadStreamSummary(ctx, "alice", []Type{TypeMention})
+	require.NoError(t, err)
+	assert.Equal(t, UnreadSummary{TotalCount: 1, HasMentions: true}, stream)
+	full, err := svc.UnreadSummary(ctx, "alice", []Type{TypeMention})
+	require.NoError(t, err)
+	assert.Equal(t, UnreadSummary{TotalCount: 1, HasMentions: true, HasSpecifiedNote: true}, full)
+
+	plain := newTestSvc(t)
+	assert.False(t, plain.SpecifiedNoteFromDB())
+	_, err = plain.Create(ctx, CreateInput{NotifieeID: "carol", NotifierID: "bob", Type: TypeMention, NoteID: "n3", NoteVisibility: "specified"})
+	require.NoError(t, err)
+	stream, err = plain.UnreadStreamSummary(ctx, "carol", nil)
+	require.NoError(t, err)
+	assert.True(t, stream.HasSpecifiedNote, "note_unread が無ければ stream から求める")
 }

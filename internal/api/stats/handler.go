@@ -5,9 +5,12 @@ package stats
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 
 	"github.com/elythia-network/elythia/internal/core/chart"
@@ -23,11 +26,39 @@ type ChartReader interface {
 	GetChart(ctx context.Context, span chart.Span, amount int, cursor *time.Time, group string) (chart.Result, error)
 }
 
+// CountsCacheTTL is how long the instances / reactionsCount totals are reused.
+//
+// upstream stats.ts は `noteReactionsRepository.count({ cache: 3600000 })` と
+// `instancesRepository.count({ cache: 3600000 })` で 1 時間キャッシュする。
+// 毎回数えると note_reaction の全件 COUNT (122 万行で 43ms) が、認証なしで
+// 呼べる経路から何度でも走る (#3612)。
+// キャッシュはプロセスごとに持つ。本家の TypeORM のキャッシュは Redis
+// (`type: 'ioredis'`) で全プロセスが共有するので、複数プロセスで動かすと
+// プロセスごとに数えた時刻がずれる。
+const CountsCacheTTL = time.Hour
+
 // Handler serves the stats endpoint.
 type Handler struct {
 	db         *gorm.DB
 	notesChart ChartReader
 	usersChart ChartReader
+
+	// 数え上げの結果は閲覧者に依らない (誰が呼んでも同じ値) ので、ハンドラに
+	// 1 つだけ持つ。chart の値は upstream もキャッシュしないので毎回引く。
+	now      func() time.Time
+	countsMu sync.Mutex
+	counts   *dbCounts
+	// countsGen は DropLocal で進める世代の番号 (#3738)。数え上げは countsMu の
+	// 外で走るので、捨てる前に始めた数え上げを、捨てた後に積まないために使う。
+	countsGen uint64
+	sf        singleflight.Group
+}
+
+// dbCounts is the cached pair of DB-wide totals and when it goes stale.
+type dbCounts struct {
+	instances int64
+	reactions int64
+	expires   time.Time
 }
 
 // NewHandler creates a stats Handler.
@@ -35,7 +66,57 @@ type Handler struct {
 // db / chart はいずれも nil を許す。未配線の項目は 0 で返す — upstream の
 // レスポンス shape は全フィールド必須なので、欠けさせるより 0 のほうが安全。
 func NewHandler(db *gorm.DB, notesChart, usersChart ChartReader) *Handler {
-	return &Handler{db: db, notesChart: notesChart, usersChart: usersChart}
+	return &Handler{db: db, notesChart: notesChart, usersChart: usersChart, now: time.Now}
+}
+
+// countDB returns the instance and reaction totals, reusing them for
+// CountsCacheTTL.
+//
+// **数え損ねた値はキャッシュしない。** 失敗を 0 で 1 時間固定すると、DB が
+// 一瞬詰まっただけで about ページの数字が 1 時間 0 になる。失敗したときは
+// 今までどおり 0 を返し、次の呼び出しで数え直す。
+// 期限切れの直後に同時に来た呼び出しは singleflight で 1 回の COUNT にまとめる。
+func (h *Handler) countDB() (instances, reactions int64) {
+	if h.db == nil {
+		return 0, 0
+	}
+	h.countsMu.Lock()
+	if c := h.counts; c != nil && h.now().Before(c.expires) {
+		h.countsMu.Unlock()
+		return c.instances, c.reactions
+	}
+	gen := h.countsGen
+	h.countsMu.Unlock()
+
+	// singleflight のキーに世代の番号を含める。捨てた後の呼び出しが、捨てる前に
+	// 始まった数え上げに相乗りして古い値を受け取らないようにする。
+	v, _, _ := h.sf.Do("counts:"+strconv.FormatUint(gen, 10), func() (any, error) {
+		var c dbCounts
+		errInstances := h.db.Model(&model.Instance{}).Count(&c.instances).Error
+		// upstream stats.ts は reactionsCount を noteReactionsRepository.count()
+		// で返す。mk-go は 0 固定だったので note_reaction の総数を集計する (#1777)。
+		errReactions := h.db.Model(&model.NoteReaction{}).Count(&c.reactions).Error
+		if errInstances == nil && errReactions == nil {
+			c.expires = h.now().Add(CountsCacheTTL)
+			h.countsMu.Lock()
+			if h.countsGen == gen {
+				h.counts = &c
+			}
+			h.countsMu.Unlock()
+		}
+		return c, nil
+	})
+	c := v.(dbCounts)
+	return c.instances, c.reactions
+}
+
+// DropLocal drops the totals held by this process (#3738). 他のプロセスへは
+// 伝えない。
+func (h *Handler) DropLocal() {
+	h.countsMu.Lock()
+	defer h.countsMu.Unlock()
+	h.countsGen++
+	h.counts = nil
 }
 
 // totals reads the newest local/remote cumulative totals from one chart.
@@ -70,13 +151,7 @@ func (h *Handler) Stats(c echo.Context) error {
 	notesCount, originalNotesCount := totals(ctx, h.notesChart)
 	usersCount, originalUsersCount := totals(ctx, h.usersChart)
 
-	var instancesCount, reactionsCount int64
-	if h.db != nil {
-		h.db.Model(&model.Instance{}).Count(&instancesCount)
-		// upstream stats.ts は reactionsCount を noteReactionsRepository.count()
-		// で返す。mk-go は 0 固定だったので note_reaction の総数を集計する (#1777)。
-		h.db.Model(&model.NoteReaction{}).Count(&reactionsCount)
-	}
+	instancesCount, reactionsCount := h.countDB()
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"notesCount":         notesCount,

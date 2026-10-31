@@ -9,6 +9,7 @@ import (
 
 	apiusers "github.com/elythia-network/elythia/internal/api/users"
 	"github.com/elythia-network/elythia/internal/entity"
+	"github.com/elythia-network/elythia/internal/misc/remoteurl"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 )
@@ -44,7 +45,7 @@ type avatarUserLookup interface {
 //
 // Sets Cache-Control: public, max-age=86400 so browsers do not run
 // the DB lookup for every mention chip (matches upstream).
-func avatarHandler(userRepo avatarUserLookup, localHost string) echo.HandlerFunc {
+func avatarHandler(pk *entity.Packer, userRepo avatarUserLookup, localHost string) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		// 304 / cache-hit でも返したい header なので Redirect 前に書く。
 		c.Response().Header().Set(echo.HeaderCacheControl, "public, max-age=86400")
@@ -68,6 +69,14 @@ func avatarHandler(userRepo avatarUserLookup, localHost string) echo.HandlerFunc
 		}
 
 		target := user.AvatarURL
+		// リモートの人の、プロキシで包めない形の avatarUrl は使わない ((*entity.Packer).IdenticonURL と同じ)。
+		if target != nil && user.Host != nil && *user.Host != "" {
+			if clean, ok := remoteurl.Media(*target); ok {
+				target = &clean
+			} else {
+				target = nil
+			}
+		}
 		if target == nil || *target == "" {
 			// identicon fallback。`user.id` をシード化文字列として使う。
 			target = strPtr("/identicon/" + user.ID)
@@ -95,13 +104,13 @@ func avatarHandler(userRepo avatarUserLookup, localHost string) echo.HandlerFunc
 		// **先に** HMAC を見る (`/emoji/:path` が無条件にプロキシへ回しているのと
 		// 同じ形、#2905)。
 		if _, wantsStatic := c.QueryParams()["static"]; wantsStatic && proxyableAvatarTarget(*target) {
-			if proxied := entity.StaticAvatarProxyURL(*target); proxied != "" {
+			if proxied := pk.StaticAvatarProxyURL(*target); proxied != "" {
 				return c.Redirect(http.StatusFound, proxied)
 			}
 			// context 未配線 (テスト等) なら従来どおり raw へ 302 する。
 		}
 		// 同一オリジン・相対 URL (identicon fallback を含む) は wrap されない。
-		return c.Redirect(http.StatusFound, entity.ProxyAvatarURLString(*target))
+		return c.Redirect(http.StatusFound, pk.ProxyAvatarURLString(*target))
 	}
 }
 

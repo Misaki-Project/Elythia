@@ -8,13 +8,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/elythia-network/elythia/internal/activitypub/mfm"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/hashtag"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/misc/idnhost"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/mfm"
 
 	"github.com/elythia-network/elythia/internal/core/role"
 )
@@ -27,6 +27,9 @@ const MaxPinnedNotes = 5
 var (
 	// ErrUserNotFound is returned when the target user does not exist.
 	ErrUserNotFound = errors.New("user not found")
+	// ErrManagedAccountMustBeBot is returned when an update would clear isBot
+	// on an account that a plugin manages (#3468).
+	ErrManagedAccountMustBeBot = errors.New("a plugin-managed account must stay a bot")
 	// ErrFailedToResolveRemoteUser is returned when ShowByUsername is called
 	// with a non-local host and remote resolution fails. Handlers map this
 	// to the dedicated FAILED_TO_RESOLVE_REMOTE_USER API error.
@@ -51,6 +54,11 @@ var (
 	// ErrBannerNotFound / ErrBannerNotImage are the banner counterparts.
 	ErrBannerNotFound = errors.New("banner drive file not found")
 	ErrBannerNotImage = errors.New("banner drive file is not an image")
+	// ErrAvatarIsSensitive / ErrBannerIsSensitive are returned when the
+	// drive_file is marked as sensitive. Mirrors upstream 2026.10.1's
+	// AVATAR_IS_SENSITIVE / BANNER_IS_SENSITIVE.
+	ErrAvatarIsSensitive = errors.New("avatar drive file is sensitive")
+	ErrBannerIsSensitive = errors.New("banner drive file is sensitive")
 )
 
 // MainStreamPublisher emits real-time events to a single target user's `main`
@@ -103,6 +111,9 @@ type Service struct {
 	// hashtag 集計 (attachedUsersCount) を更新する hook。未配線なら集計を
 	// skip (= populate のみ、旧挙動)。実装は core/hashtag.Service。
 	usertagHook UsertagHook
+	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
+	// 持つ (#3792)。組み立てで渡す。
+	entityPacker *entity.Packer
 }
 
 // UsertagHook reconciles the hashtag attach aggregate when a user's tags
@@ -121,17 +132,23 @@ func (s *Service) SetRolePolicyProvider(p role.PolicyProvider) {
 // NewService creates a new user Service.
 // noteRepo, piningRepo, idGen are optional for callers that only need the
 // read-only show methods (pass nil); the pin-related methods require them.
+//
+// entityPacker packs users and notes (#3792). 無いと avatarUrl などを media proxy を
+// 通さずに返し、閲覧者の IP がリモートへ漏れる。しかも黙って劣化するので、構築子の
+// 必須の引数で受ける (#3825)。
 func NewService(
 	userRepo repository.UserRepository,
 	noteRepo repository.NoteRepository,
 	piningRepo repository.UserNotePiningRepository,
 	idGen id.Generator,
+	entityPacker *entity.Packer,
 ) *Service {
 	return &Service{
-		userRepo:   userRepo,
-		noteRepo:   noteRepo,
-		piningRepo: piningRepo,
-		idGen:      idGen,
+		userRepo:     userRepo,
+		noteRepo:     noteRepo,
+		piningRepo:   piningRepo,
+		idGen:        idGen,
+		entityPacker: entityPacker,
 	}
 }
 
@@ -482,6 +499,14 @@ type UpdateInput struct {
 	CarefulBot               *bool
 	InjectFeaturedNote       *bool
 	ReceiveAnnouncementEmail *bool
+	// FollowApprovalLocalSeconds / FollowApprovalRemoteSeconds は作られてから
+	// 日の浅いアカウントからのフォローを止める期間 (秒、#3466)。**int で
+	// 3 状態 (nil=不変 / *nil=NULL / **v=値) を表す。範囲の検証は呼び出し側。
+	FollowApprovalLocalSeconds  **int
+	FollowApprovalRemoteSeconds **int
+	// FollowApprovalAction は止め方 (#3466、Elythia 独自)。nil なら不変。
+	// 値の検証は呼び出し側。
+	FollowApprovalAction *string
 	// ChatScope は誰からのチャットを許可するか (1-on-1 DM 用)。
 	// 受け付けるのは "everyone" / "followers" / "following" / "mutual" / "none"
 	// (CherryPick / Misskey TS と同じ enum)。検証は呼び出し側 (#692)。
@@ -491,9 +516,6 @@ type UpdateInput struct {
 	// (Misskey TS と同じ enum)。enum 検証は呼び出し側 (api/i ハンドラ) で行う。
 	FollowingVisibility *string
 	FollowersVisibility *string
-	// Room は jsonb 列に書き込む生バイト列。nil の場合は更新しない。
-	// 呼び出し側で JSON として妥当であることを保証する必要がある。
-	Room *json.RawMessage
 	// AvatarID / BannerID は drive_file の ID。
 	//   nil       → 不変 (no change)
 	//   &"<id>"   → SET (drive_file 行を引いて所有権 + image MIME 検証)
@@ -552,6 +574,15 @@ type UpdateInput struct {
 	MakeNotesHiddenBefore        **int
 }
 
+// nullableInt returns v's value, or an untyped nil for SQL NULL (the same
+// shape as makeNotesFollowersOnlyBefore above).
+func nullableInt(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
 // FieldItem represents one row of user_profile.fields. upstream Misskey の
 // PropertyValue 連合経路にも乗る shape (= name / value ペア)。
 type FieldItem struct {
@@ -568,6 +599,13 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 			return nil, err
 		}
 		return nil, ErrUserNotFound
+	}
+	// **プラグインが管理するアカウントの bot の印は外させない (#3468)。**
+	// 黙って無視すると、プラグインは「外した」つもりのまま動く。拒否して
+	// 気付かせる。isBot だけを見て、他の項目を巻き込んで落とすのは外す
+	// 指定があったときだけ (true を送る更新は通す)。
+	if existing.IsPluginManaged() && in.IsBot != nil && !*in.IsBot {
+		return nil, ErrManagedAccountMustBeBot
 	}
 
 	userFields := map[string]any{}
@@ -657,6 +695,15 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 	if in.ReceiveAnnouncementEmail != nil {
 		profileFields["receiveAnnouncementEmail"] = *in.ReceiveAnnouncementEmail
 	}
+	if in.FollowApprovalLocalSeconds != nil {
+		profileFields["followApprovalLocalSeconds"] = nullableInt(*in.FollowApprovalLocalSeconds)
+	}
+	if in.FollowApprovalRemoteSeconds != nil {
+		profileFields["followApprovalRemoteSeconds"] = nullableInt(*in.FollowApprovalRemoteSeconds)
+	}
+	if in.FollowApprovalAction != nil {
+		profileFields["followApprovalAction"] = *in.FollowApprovalAction
+	}
 	if in.ChatScope != nil {
 		userFields["chatScope"] = *in.ChatScope
 	}
@@ -668,12 +715,9 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 	if in.FollowersVisibility != nil {
 		profileFields["followersVisibility"] = *in.FollowersVisibility
 	}
-	if in.Room != nil {
+	if in.MutedWords != nil {
 		// GORM は map で渡された値を jsonb 列に直接書き込む。
 		// []byte を渡すと bytea 扱いされてしまうので string にキャストする。
-		profileFields["room"] = string(*in.Room)
-	}
-	if in.MutedWords != nil {
 		profileFields["mutedWords"] = string(*in.MutedWords)
 	}
 	if in.HardMutedWords != nil {
@@ -681,7 +725,7 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 	}
 	if in.AvatarDecorations != nil {
 		// avatarDecorations は user (not user_profile) 側の jsonb 列。
-		// Room と同じく []byte ではなく string で渡して bytea 化を防ぐ。
+		// mutedWords と同じく []byte ではなく string で渡して bytea 化を防ぐ。
 		userFields["avatarDecorations"] = string(*in.AvatarDecorations)
 	}
 	var newFields []FieldItem
@@ -717,7 +761,7 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 			userFields["alsoKnownAs"] = strings.Join(*in.AlsoKnownAs, ",")
 		}
 	}
-	// #1546 i/update 残り field。jsonb 列は Room と同じく string キャストで
+	// #1546 i/update 残り field。jsonb 列は mutedWords と同じく string キャストで
 	// bytea 化を防ぐ。
 	if in.NotificationRecieveConfig != nil {
 		profileFields["notificationRecieveConfig"] = string(*in.NotificationRecieveConfig)
@@ -756,10 +800,10 @@ func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile
 	// avatarId / bannerId 更新 (#467)。driveFileRepo 未配線時は media
 	// 更新経路を skip して旧 behaviour に戻す (テスト互換維持)。
 	if s.driveFileRepo != nil {
-		if err := s.applyMediaUpdate(userID, in.AvatarID, "avatar", userFields, ErrAvatarNotFound, ErrAvatarNotImage); err != nil {
+		if err := s.applyMediaUpdate(userID, in.AvatarID, "avatar", userFields, ErrAvatarNotFound, ErrAvatarNotImage, ErrAvatarIsSensitive); err != nil {
 			return nil, err
 		}
-		if err := s.applyMediaUpdate(userID, in.BannerID, "banner", userFields, ErrBannerNotFound, ErrBannerNotImage); err != nil {
+		if err := s.applyMediaUpdate(userID, in.BannerID, "banner", userFields, ErrBannerNotFound, ErrBannerNotImage, ErrBannerIsSensitive); err != nil {
 			return nil, err
 		}
 	}
@@ -860,7 +904,7 @@ func (s *Service) profileEmojis(userID string, existing *model.User, in UpdateIn
 // `prefix` is "avatar" or "banner". notFoundErr / notImageErr are the
 // specific sentinel errors callers want surfaced (handler maps them to
 // distinct API error codes).
-func (s *Service) applyMediaUpdate(userID string, idPtr *string, prefix string, userFields map[string]any, notFoundErr, notImageErr error) error {
+func (s *Service) applyMediaUpdate(userID string, idPtr *string, prefix string, userFields map[string]any, notFoundErr, notImageErr, sensitiveErr error) error {
 	if idPtr == nil {
 		return nil
 	}
@@ -891,6 +935,12 @@ func (s *Service) applyMediaUpdate(userID string, idPtr *string, prefix string, 
 	if !strings.HasPrefix(file.Type, "image/") {
 		return notImageErr
 	}
+	// センシティブと印を付けた画像は、アイコンとバナーにできない (本家 2026.10.1)。
+	// どちらもタイムライン・プロフィール・連合の actor にそのまま出るため。
+	// 判定の順は本家と同じく、存在・所有 → 画像か → センシティブか。
+	if file.IsSensitive {
+		return sensitiveErr
+	}
 	userFields[prefix+"Id"] = file.ID
 	// **原本 (`file.URL`) を入れない。** あれは所有者にしか渡さない値で
 	// (`entity.GetSelfURL` の doc)、EXIF / XMP が載ったままになる。アイコンと
@@ -902,7 +952,7 @@ func (s *Service) applyMediaUpdate(userID string, idPtr *string, prefix string, 
 	// **プロキシには通さない。** ここは DB に保存する値で、mk-go の
 	// `ProxiedURL` は `sig=` に HMAC を付けるため、保存するとプロキシの secret を
 	// 変えた瞬間に全員のアイコン URL が無効になる。リモート origin の包み直しは
-	// packer 側 (`entity.PackUserLite` → `ProxyAvatarURL`) が既に行う。
+	// packer 側 (`(*entity.Packer).PackUserLite` → `ProxyAvatarURL`) が既に行う。
 	userFields[prefix+"Url"] = entity.WebpublicOrOriginalURL(file)
 	if file.Blurhash != nil {
 		userFields[prefix+"Blurhash"] = *file.Blurhash
@@ -922,7 +972,7 @@ func (s *Service) publishMeUpdated(bundle *UserWithProfile) {
 	}
 	// profile update / pin / unpin は頻度が低く hot path ではないため
 	// full pack する (UserLite ではなく UserDetailed)。
-	body := entity.PackUserDetailed(bundle.User, bundle.Profile, s.idGen)
+	body := s.entityPacker.PackUserDetailed(bundle.User, bundle.Profile, s.idGen)
 	// **本人にはカウントを見せる。** packer は `followersVisibility` /
 	// `followingVisibility` が public でないカウントを既定で伏せるので、
 	// self event でゲートを通さないと 0 が流れる。fork frontend は

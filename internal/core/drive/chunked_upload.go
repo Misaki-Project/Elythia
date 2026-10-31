@@ -244,12 +244,13 @@ func (s *Service) StartChunkedUpload(_ context.Context, in StartChunkedUploadInp
 	// こちらは remote / local を問わず適用する: 分割アップロードは申告値を
 	// 信用して受け入れ枠を確保する経路なので、gate が外れる分岐を作らない。
 	//
-	// **値の読み取りはpolicyMegabytesに通す。** このhelperはpolicyNumberを介して
-	// int/float64を正規化してからbyte数へ飽和変換する。素の `.(int)` だと
-	// float64で型アサーションに失敗し、上限違反で弾くのではなく**上限そのものが
-	// 消える**。Upload側も同じhelperを通すため、同じpolicyが経路によって効いたり
-	// 効かなかったりしない (#2611)。
-	if maxBytes, ok := policyMegabytes(policies["maxFileSizeMb"]); ok {
+	// **値の読み取りはhelperに通す。** maxFileSizeMb / driveCapacityMb は
+	// policyLimitBytes、Elythia独自の保留容量はpolicyMegabytes。どちらも
+	// policyNumberを介してint/float64を正規化してからbyte数へ飽和変換する。素の
+	// `.(int)` だとfloat64で型アサーションに失敗し、上限違反で弾くのではなく
+	// **上限そのものが消える**。Upload側も同じhelperを通すため、同じpolicyが
+	// 経路によって効いたり効かなかったりしない (#2611)。
+	if maxBytes, ok := policyLimitBytes(policies["maxFileSizeMb"]); ok {
 		if in.Size > maxBytes {
 			return nil, ErrMaxFileSizeExceeded
 		}
@@ -259,7 +260,7 @@ func (s *Service) StartChunkedUpload(_ context.Context, in StartChunkedUploadInp
 	if err != nil {
 		return nil, fmt.Errorf("count pending chunked uploads: %w", err)
 	}
-	if capacityBytes, ok := policyMegabytes(policies["driveCapacityMb"]); ok {
+	if capacityBytes, ok := policyLimitBytes(policies["driveCapacityMb"]); ok {
 		usage, err := s.fileRepo.UsageByUser(in.User.ID)
 		if err != nil {
 			// Upload と同じ理由で握り潰さない。usage=0 として素通しにすると
@@ -382,11 +383,11 @@ type ChunkAppendResult struct {
 // (`drive/files/create` 側は 250MB のような大きい本体がパーサで**ディスクへ
 // spill** されるので、そちらの guard は最大 250MB のヒープ確保を実際に消す。)
 //
-// ok=false は「上限を決められない」(セッションが無い / 他人のもの / 期限切れ)。
-// **その場合は上限を掛けない** — 本物の判定は `AppendChunk` が行い、そちらが
-// 正しいエラーを返す。ここで独自に落とすと、応答の種類が経路で食い違う。
-// 存在しない `uploadId` を送ればこの枝に入れるが、body limit が 33MiB なので
-// 最悪値は変わらない (`AppendChunk` がその後 404 を返す)。
+// ok=false は「上限を決められない」(機能が無効 / セッションが無い / 他人のもの /
+// 期限切れ)。**その場合、handler はチャンクを読まずに SessionError の答えで断る**
+// (2026-10-31 の監査)。以前は上限を掛けずに読んで `AppendChunk` の判定に任せて
+// いたが、それだと存在しない `uploadId` を送るだけで 1 リクエストあたり 33MiB
+// (body limit いっぱい) をメモリに載せられた。
 func (s *Service) SessionChunkSize(user *model.User, sessionID string) (int64, bool) {
 	if s.chunkedRepo == nil {
 		return 0, false
@@ -396,6 +397,21 @@ func (s *Service) SessionChunkSize(user *model.User, sessionID string) (int64, b
 		return 0, false
 	}
 	return sess.ChunkSize, true
+}
+
+// SessionError reports why SessionChunkSize could not find a session, as the
+// error AppendChunk would answer for it: ErrChunkedUploadUnavailable when the
+// feature is off, ErrUploadSessionNotFound for a missing, foreign or expired
+// session. The handler answers with it before reading the chunk.
+func (s *Service) SessionError(user *model.User, sessionID string) error {
+	if _, _, err := s.chunkedMultipart(); err != nil {
+		return err
+	}
+	if _, err := s.loadOwnedSession(user, sessionID, time.Now()); err != nil {
+		return err
+	}
+	// 行はあるが chunkSize が壊れている。読んでも AppendChunk は受け付けない。
+	return ErrUploadSessionNotFound
 }
 
 // AppendChunk stores one chunk as a part of the session's multipart upload.
