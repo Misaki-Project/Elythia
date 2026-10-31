@@ -248,7 +248,10 @@ func parseFxResponse(body []byte, wantedID string) (PublicPost, error) {
 			return PublicPost{}, &fetchError{"schema", errors.New("invalid Fx quoted status")}
 		}
 		if discriminator.Type == "tombstone" {
-			post.QuoteUnavailableReason, _ = tombstoneReason(status.Quote, "")
+			post.QuoteUnavailableReason = "unknown"
+			if reason, ok := tombstoneReason(status.Quote, ""); ok {
+				post.QuoteUnavailableReason = reason
+			}
 		} else {
 			var quote fxStatus
 			if err := json.Unmarshal(status.Quote, &quote); err != nil || !statusIDPattern.MatchString(quote.ID) || quote.Author.Name == "" || quote.Author.ScreenName == "" {

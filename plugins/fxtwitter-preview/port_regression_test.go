@@ -218,6 +218,42 @@ func TestPortQuoteTombstonePreservesOnlyKnownReason(t *testing.T) {
 	}
 }
 
+func TestPortMalformedQuoteTombstonesRemainExplicitUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name, quote string
+	}{
+		{"object_reason", `{"type":"tombstone","provider":"twitter","reason":{},"message":"private upstream message","text":"private quote body"}`},
+		{"numeric_provider", `{"type":"tombstone","provider":17,"reason":"deleted","message":"private upstream message","text":"private quote body"}`},
+		{"object_id", `{"type":"tombstone","provider":"twitter","reason":"deleted","id":{},"message":"private upstream message","text":"private quote body"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"code":200,"status":{"id":"1234567890","text":"main","author":{"name":"A","screen_name":"a"},"quote":` + tc.quote + `}}`)
+			post, err := parseFxResponse(body, "1234567890")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if post.ID != "1234567890" || post.Text != "main" || post.Quote != nil {
+				t.Fatalf("outer post or unavailable quote changed: %#v", post)
+			}
+			publicJSON := mustJSON(t, publicEntry(&CacheEntry{State: "ready", Post: &post}, "note1"))
+			var dto struct {
+				Post map[string]any `json:"post"`
+			}
+			if err := json.Unmarshal([]byte(publicJSON), &dto); err != nil {
+				t.Fatal(err)
+			}
+			if dto.Post["quoteUnavailableReason"] != "unknown" || dto.Post["quote"] != nil {
+				t.Fatalf("malformed tombstone lost explicit unknown: %s", publicJSON)
+			}
+			for _, forbidden := range []string{"private upstream message", "private quote body", `"message"`} {
+				if strings.Contains(publicJSON, forbidden) {
+					t.Fatalf("unavailable quote leaked %q: %s", forbidden, publicJSON)
+				}
+			}
+		})
+	}
+}
+
 func TestPortAuditRouteLabelsHistoricalNormalizedText(t *testing.T) {
 	db := migratedDB(t)
 	post, err := parseFxResponse([]byte(`{"code":200,"status":{"id":"1234567890","author":{"name":"A","screen_name":"a"},"raw_text":{"text":"&amp; https://t.co/x media","facets":[{"type":"url","indices":[6,20],"original":"https://t.co/x","replacement":"https://example.com/page"},{"type":"media","indices":[21,26],"original":"media"}]}}}`), "1234567890")
