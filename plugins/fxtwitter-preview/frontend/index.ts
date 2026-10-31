@@ -140,7 +140,6 @@ function normalizedVideo(value: unknown): PublicPost['video'] | null | undefined
 	const video = record(value);
 	if (video == null) return null;
 	const provider = video.provider ?? 'external';
-	if (provider !== 'x' && provider !== 'external') return null;
 	const providerVideoId = optionalString(video.providerVideoId);
 	const posterUrl = optionalString(video.posterUrl);
 	const posterExpiresAt = optionalString(video.posterExpiresAt);
@@ -148,6 +147,17 @@ function normalizedVideo(value: unknown): PublicPost['video'] | null | undefined
 	const embedExpiresAt = optionalString(video.embedExpiresAt);
 	const durationMs = video.durationMs == null ? undefined : typeof video.durationMs === 'number' && Number.isFinite(video.durationMs) ? video.durationMs : null;
 	if (providerVideoId === null || posterUrl === null || posterExpiresAt === null || embedToken === null || embedExpiresAt === null || durationMs === null) return null;
+	// v0.3 ready caches can contain YouTube descriptors. Keep their safe public
+	// content, but never carry the retired provider/player capability forward.
+	if (provider === 'youtube' && providerVideoId != null && providerVideoId.trim() !== '') {
+		return {
+			provider: 'external',
+			...(posterUrl == null ? {} : { posterUrl }),
+			...(posterExpiresAt == null ? {} : { posterExpiresAt }),
+			...(durationMs == null ? {} : { durationMs }),
+		};
+	}
+	if (provider !== 'x' && provider !== 'external') return null;
 	if (providerVideoId != null) return null;
 	if (provider === 'external' && embedToken != null) return null;
 	return {

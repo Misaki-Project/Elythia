@@ -186,7 +186,7 @@ test.each([
 	'https://platform.twitter.com.evil.test/embed/index.html',
 	'https://www.youtube.com/embed/abcdefghijk',
 ])('forged complete-post embed rejected: %s', async base => {
-	api.mockImplementation(async (_path, params) => ({ url: base + '?' + new URLSearchParams({ id: '1234567890', embedId: params.nonce, theme: 'light', lang: 'ja', hideCard: 'false', hideThread: 'false', dnt: 'true', frame: 'false', maxWidth: '560px' }) }));
+	api.mockImplementation(async (_path, params) => ({ url: fullEmbed(params).replace('https://platform.twitter.com/embed/index.html', base) }));
 	const view = card(); await nextTick();
 	await waitFor(() => expect(view.container.querySelector('[data-fx-video-play]')).toBeTruthy());
 	await fireEvent.click(must(view.container.querySelector('[data-fx-video-play]')));
@@ -343,7 +343,119 @@ test('unsupported external video stays a source link without an embed request', 
 	const response = data(); response.post.video = { provider: 'external' };
 	const view = card(response); await nextTick(); await nextTick();
 	expect(view.container.querySelector('[data-fx-video-play],iframe')).toBeNull(); expect(api).not.toHaveBeenCalled();
+	expect(view.queryByText('メディアを読み込めませんでした。')).toBeNull();
 	expect(view.getByText('Xで投稿を開く').getAttribute('href')).toBe('https://x.com/i/status/1234567890');
+});
+
+test.each([
+	{ state: 'ready', target: 'main' }, { state: 'ready', target: 'quote' },
+	{ state: 'stale', target: 'main' }, { state: 'stale', target: 'quote' },
+] as const)('legacy $state $target video preserves the public post as a non-playable copy', async ({ state, target }) => {
+	const response = data();
+	response.state = state;
+	response.post.video = { provider: 'external' };
+	response.post.quote = { id: '9876543210', url: 'https://x.com/bob/status/9876543210', text: 'quoted public body', author: { name: 'Bob', screenName: 'bob' }, images: [], hasVideo: true };
+	const legacy = { provider: 'youtube', providerVideoId: 'abcdefghijk', posterUrl: `/api/plugin/fxtwitter-preview/media/1234567890/${target === 'main' ? 'poster' : 'quote-poster'}/0?noteId=note-1`, posterExpiresAt: '2026-11-01T00:00:00Z', durationMs: 1000, embedToken: 'deprecated-token', embedExpiresAt: '2026-11-01T00:00:00Z' };
+	const videoPost = target === 'main' ? response.post : response.post.quote;
+	Object.assign(videoPost, { video: legacy });
+	const imagePost = target === 'main' ? response.post.quote : response.post;
+	imagePost.images = [{ url: `/api/plugin/fxtwitter-preview/media/1234567890/${target === 'main' ? 'quote-image' : 'image'}/0?noteId=note-1`, alt: 'retained image' }];
+	const original = JSON.stringify(response);
+	Object.freeze(legacy); Object.freeze(response.post.quote); Object.freeze(response.post); Object.freeze(response);
+	api.mockResolvedValue(response);
+	const pending = loadPreview(input, context, new AbortController().signal);
+	await expect(pending).resolves.toMatchObject({ state });
+	const normalized = await pending;
+	expect(normalized.state).toBe(state);
+	expect(normalized.post?.text).toBe('public body');
+	expect(normalized.post?.url).toBe('https://x.com/alice/status/1234567890');
+	expect(normalized.post?.quote?.text).toBe('quoted public body');
+	expect(normalized.post?.quote?.url).toBe('https://x.com/bob/status/9876543210');
+	const video = target === 'main' ? normalized.post?.video : normalized.post?.quote?.video;
+	expect(video).toEqual({ provider: 'external', posterUrl: legacy.posterUrl, posterExpiresAt: '2026-11-01T00:00:00Z', durationMs: 1000 });
+	expect(video).not.toBe(legacy);
+	expect(normalized.post).not.toBe(response.post);
+	expect(normalized.post?.quote).not.toBe(response.post.quote);
+	expect(JSON.stringify(response)).toBe(original);
+	const view = card(normalized);
+	await waitFor(() => expect(view.container.querySelector('img[alt="retained image"]')).toBeTruthy());
+	expect(view.getByText('public body')).toBeTruthy();
+	expect(view.getByText('quoted public body')).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/alice/status/1234567890"]')).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/bob/status/9876543210"]')).toBeTruthy();
+	expect(view.container.querySelector('[data-fx-video-play],iframe')).toBeNull();
+	expect(api.mock.calls.filter(call => call[0].endsWith('/embed/shell'))).toHaveLength(0);
+});
+
+test.each(['unavailable', 'disabled', 'pending'] as const)('legacy %s response never revives its body', async state => {
+	const response = data();
+	Object.assign(must(response.post.video), { provider: 'youtube', providerVideoId: 'abcdefghijk' });
+	const original = JSON.stringify(response);
+	api.mockResolvedValue({ ...response, state, body: 'private audit body' });
+	if (state === 'pending') vi.useFakeTimers();
+	const pending = loadPreview(input, context, new AbortController().signal);
+	if (state === 'pending') await vi.runAllTimersAsync();
+	const normalized = await pending;
+	expect(normalized).toEqual({ state });
+	expect(JSON.stringify(response)).toBe(original);
+	const view = card(normalized);
+	expect(view.container.textContent).not.toContain('public body');
+	expect(view.container.textContent).not.toContain('private audit body');
+	expect(view.container.querySelector('iframe,img')).toBeNull();
+	expect(media).not.toHaveBeenCalled();
+	expect(api.mock.calls.filter(call => call[0].endsWith('/embed/shell'))).toHaveLength(0);
+});
+
+test.each([
+	{ provider: 'unknown', providerVideoId: 'abcdefghijk' },
+	{ provider: 'youtube' },
+	{ provider: 'youtube', providerVideoId: '' },
+	{ provider: 'youtube', providerVideoId: 123 },
+	{ provider: 'youtube', providerVideoId: 'abcdefghijk', durationMs: 'invalid' },
+	{ provider: 'external', providerVideoId: 'abcdefghijk' },
+])('legacy compatibility keeps unrelated malformed video strict: %j', async video => {
+	const response = data(); Object.assign(response.post, { video }); api.mockResolvedValue(response);
+	await expect(loadPreview(input, context, new AbortController().signal)).resolves.toMatchObject({ state: 'unavailable', error: 'invalid-response' });
+});
+
+test.each([
+	{ failure: 'rejected', kind: 'image' }, { failure: 'http', kind: 'image' }, { failure: 'mime', kind: 'image' }, { failure: 'blob', kind: 'image' },
+	{ failure: 'rejected', kind: 'avatar' }, { failure: 'http', kind: 'avatar' }, { failure: 'mime', kind: 'avatar' }, { failure: 'blob', kind: 'avatar' },
+] as const)('expected media $kind $failure failure is visible with body and source fallback', async ({ failure, kind }) => {
+	if (failure === 'rejected') media.mockRejectedValue(new Error('fetch failed'));
+	if (failure === 'http') media.mockResolvedValue(new Response('', { status: 503 }));
+	if (failure === 'mime') media.mockResolvedValue(new Response(new Blob(['unsafe'], { type: 'text/html' }), { headers: { 'Content-Type': 'text/html' } }));
+	if (failure === 'blob') media.mockResolvedValue({ ok: true, headers: new Headers({ 'Content-Type': 'image/png' }), blob: async () => { throw new Error('blob failed'); } });
+	const response = data();
+	response.post.video = { provider: 'external' };
+	if (kind === 'image') response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
+	if (kind === 'avatar') response.post.author.avatarUrl = '/api/plugin/fxtwitter-preview/media/1234567890/avatar/0?noteId=note-1';
+	const view = card(response);
+	await waitFor(() => expect(view.queryByText('メディアを読み込めませんでした。')).toBeTruthy());
+	expect(view.getByText('public body')).toBeTruthy();
+	expect(view.container.querySelector(`a[href="${input.href}"]`)).toBeTruthy();
+	expect(view.container.querySelector('img,iframe')).toBeNull();
+	expect(URL.createObjectURL).not.toHaveBeenCalled();
+});
+
+test.each(['inactive', 'source', 'session'] as const)('late media failure after %s cannot publish an old error', async change => {
+	let reject!: (reason: Error) => void;
+	media.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+	const response = data(); response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
+	const view = card(response);
+	await waitFor(() => expect(media).toHaveBeenCalledTimes(1));
+	const signal = media.mock.calls[0][1].signal;
+	if (change === 'inactive') await view.rerender({ context: { ...context, active: false } });
+	if (change === 'source') await view.rerender({ data: { state: 'ready', post: { ...response.post, images: [], video: undefined } }, context: { ...context, source: { kind: 'note', noteId: 'note-2' } } });
+	if (change === 'session') initApi(api as PluginHost['api'], media as PluginHost['fetch'], viewer);
+	await nextTick();
+	expect(signal.aborted).toBe(true);
+	reject(new Error('late fetch failure'));
+	// Drain the rejected fetch and resource-bundle promises before asserting absence.
+	await new Promise(resolve => { window.setTimeout(resolve); }); await nextTick();
+	expect(view.queryByText('メディアを読み込めませんでした。')).toBeNull();
+	expect(view.container.querySelector('img')).toBeNull();
+	expect(URL.createObjectURL).not.toHaveBeenCalled();
 });
 test('cached Blob load settling after abort cannot publish a URL', async () => {
 	let finish!: (value: Blob) => void;
@@ -383,7 +495,37 @@ test.each(['moderator', 'settings-error'])('audit UI remains usable with %s inde
 	await fireEvent.update(must(view.container.querySelector('input[pattern]')), '1234567890');
 	await fireEvent.click(must(view.getAllByRole('button').find(value => value.textContent.includes('スナップショットを表示'))));
 	await waitFor(() => expect(view.getByText('moderator audit')).toBeTruthy());
+	expect(view.container.querySelector('form')).toBeNull();
+	if (mode === 'settings-error') expect(view.queryByText('settings status unavailable')).toBeTruthy();
 	expect(api.mock.calls.some(call => call[0] === 'admin/roles/list' || call[0].endsWith('/admin/rate-limit-settings'))).toBe(false);
+	expect(api.mock.calls.some(call => call[0].endsWith('/admin/rate-limit-settings/update'))).toBe(false);
+});
+
+test.each(['pending', 'rejected', 'invalid'] as const)('administrator form stays closed while settings are %s', async state => {
+	let finish!: (value: unknown) => void;
+	api.mockImplementation(async path => {
+		if (path.endsWith('/admin/status')) return { canManageRateLimits: true };
+		if (path === 'admin/roles/list') return [];
+		if (path.endsWith('/admin/rate-limit-settings')) {
+			if (state === 'pending') return new Promise(resolve => { finish = resolve; });
+			if (state === 'rejected') throw new Error('settings unavailable');
+			return { revision: 0, authenticatedPerHour: 100, authenticatedPerDay: 600, globalPerHour: 300, roleLimits: [] };
+		}
+		throw new Error(`unexpected administrator call ${path}`);
+	});
+	const view = render(AdminPage, { global: globals });
+	await waitFor(() => expect(api.mock.calls.some(call => call[0].endsWith('/admin/rate-limit-settings'))).toBe(true));
+	expect(view.container.querySelector('form')).toBeNull();
+	if (state === 'pending') {
+		finish({ revision: 1, authenticatedPerHour: 100, authenticatedPerDay: 600, globalPerHour: 300, roleLimits: [] });
+		await waitFor(() => expect(view.container.querySelector('form')).toBeTruthy());
+		await fireEvent.submit(must(view.container.querySelector('form')));
+		expect(api.mock.calls.filter(call => call[0].endsWith('/admin/rate-limit-settings/update'))).toHaveLength(1);
+	} else {
+		await waitFor(() => expect(view.queryByText(state === 'rejected' ? 'settings unavailable' : '設定を取得できませんでした。')).toBeTruthy());
+		expect(view.container.querySelector('form')).toBeNull();
+		expect(api.mock.calls.some(call => call[0].endsWith('/admin/rate-limit-settings/update'))).toBe(false);
+	}
 });
 
 test.each([{ detail: false }, { revealed: false }, { active: false }, { inViewport: false }, { source: null }])('populated media cannot start work in gated context %j', async patch => {

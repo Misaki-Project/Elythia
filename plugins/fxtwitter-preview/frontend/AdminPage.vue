@@ -31,10 +31,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 				<MkInput v-model="limit.perDay" type="number" :min="1" :max="100000"><template #label>1日</template></MkInput>
 				<MkButton type="button" danger @click="roleLimits.splice(index, 1)">削除</MkButton>
 			</div>
-			<p v-if="settingsError" :class="$style.error">{{ settingsError }}</p>
 			<p v-if="settingsSaved" :class="$style.saved">保存しました。</p>
 			<MkButton primary type="submit" :disabled="settingsSaving || !validSettings">レート制限を保存</MkButton>
 		</form>
+		<p v-if="settingsError" :class="$style.error">{{ settingsError }}</p>
 	</section>
 
 	<section :class="$style.section">
@@ -82,7 +82,7 @@ const canDelete = computed(() => validPostId.value && reason.value.trim() !== ''
 
 const settingsLoading = ref(true);
 const settingsSaving = ref(false);
-const canManageSettings = ref(true);
+const canManageSettings = ref(false);
 const settingsError = ref('');
 const settingsSaved = ref(false);
 const revision = ref(0);
@@ -126,17 +126,17 @@ function errorMessage(failure: unknown, fallback: string): string {
 
 async function loadSettings(): Promise<void> {
 	settingsLoading.value = true;
+	canManageSettings.value = false;
 	settingsError.value = '';
 	try {
 		const status = await api<{ canManageRateLimits: boolean }>('admin/status');
-		if (!status.canManageRateLimits) {
-			canManageSettings.value = false;
-			return;
-		}
+		if (status.canManageRateLimits !== true) return;
 		const [settings, adminRoles] = await Promise.all([api<RateLimitSettings>('admin/rate-limit-settings'), nativeApi<AdminRole[]>('admin/roles/list')]);
 		applySettings(settings);
+		if (!Number.isSafeInteger(revision.value) || revision.value < 1 || !validSettings.value) throw new Error('設定を取得できませんでした。');
 		roles.value = adminRoles.map(role => ({ id: role.id, name: role.name }));
 		for (const limit of settings.roleLimits) if (!roles.value.some(role => role.id === limit.roleId)) roles.value.push({ id: limit.roleId, name: `${limit.roleId}（削除済みロール）` });
+		canManageSettings.value = true;
 	} catch (err) { settingsError.value = errorMessage(err, '設定を取得できませんでした。'); } finally { settingsLoading.value = false; }
 }
 
@@ -146,7 +146,7 @@ function addRoleLimit(): void {
 }
 
 async function saveSettings(): Promise<void> {
-	if (!validSettings.value) return;
+	if (!canManageSettings.value || settingsLoading.value || settingsSaving.value || !validSettings.value) return;
 	settingsSaving.value = true; settingsError.value = ''; settingsSaved.value = false;
 	try {
 		const payload: Omit<RateLimitSettings, 'updatedAt' | 'updatedBy'> = {

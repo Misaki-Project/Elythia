@@ -101,6 +101,7 @@ type IdentityBundle = {
 	avatar: LoadedMedia | null;
 	quoteAvatar: LoadedMedia | null;
 	objectUrls: string[];
+	failed: boolean;
 };
 type AttachmentBundle = {
 	images: Array<LoadedMedia | null>;
@@ -108,6 +109,7 @@ type AttachmentBundle = {
 	quoteImages: Array<LoadedMedia | null>;
 	quotePoster: LoadedMedia | null;
 	objectUrls: string[];
+	failed: boolean;
 };
 let identityGeneration = 0;
 let attachmentGeneration = 0;
@@ -125,7 +127,9 @@ const quoteImageSources = ref<Array<string | null>>([]);
 const quoteImageBlobs = ref<Array<Blob | null>>([]);
 const quoteImagesRevealed = ref(false);
 const quotePosterSrc = ref<string | null>(null);
-const mediaLoadFailed = ref(false);
+const identityLoadFailed = ref(false);
+const attachmentLoadFailed = ref(false);
+const mediaLoadFailed = computed(() => [identityLoadFailed.value, attachmentLoadFailed.value].includes(true));
 const renderedImages = computed(() => (props.data.post?.images ?? []).flatMap((image, index) => {
 	const src = imageSources.value[index];
 	return src == null ? [] : [{ index, src, alt: image.alt ?? '', width: image.width, height: image.height }];
@@ -191,6 +195,7 @@ function clearIdentity(): void {
 	identityKey = '';
 	avatarSrc.value = null;
 	quoteAvatarSrc.value = null;
+	identityLoadFailed.value = false;
 }
 
 function clearAttachments(): void {
@@ -204,12 +209,12 @@ function clearAttachments(): void {
 	quoteImageSources.value = [];
 	quoteImageBlobs.value = [];
 	quotePosterSrc.value = null;
+	attachmentLoadFailed.value = false;
 }
 
 function clearMedia(): void {
 	clearIdentity();
 	clearAttachments();
-	mediaLoadFailed.value = false;
 }
 
 async function fetchMedia(path: string, signal: AbortSignal): Promise<LoadedMedia | null> {
@@ -243,22 +248,33 @@ async function loadIdentity(): Promise<void> {
 	const current = identityGeneration;
 	const quote = post.quote;
 	const lease = retainResource<IdentityBundle>(nextKey, async signal => {
-		const loadOne = async (path?: string): Promise<LoadedMedia | null> => path == null ? null : await fetchMedia(path, signal).catch(() => null);
+		let failed = false;
+		const loadOne = async (path?: string): Promise<LoadedMedia | null> => {
+			if (path == null) return null;
+			const value = await fetchMedia(path, signal).catch(() => null);
+			if (value == null && !signal.aborted) failed = true;
+			return value;
+		};
 		const [avatar, quoteAvatar] = await Promise.all([
 			loadOne(post.author.avatarUrl),
 			loadOne(quote?.author.avatarUrl),
 		]);
 		const objectUrls = [avatar, quoteAvatar].flatMap(value => value == null ? [] : [value.src]);
-		return { avatar, quoteAvatar, objectUrls };
+		return { avatar, quoteAvatar, objectUrls, failed };
 	}, bundle => {
 		for (const objectUrl of bundle.objectUrls) URL.revokeObjectURL(objectUrl);
 	});
 	identityLease = lease;
 	identityKey = nextKey;
-	const bundle = await lease.promise;
-	if (current !== identityGeneration || identityLease !== lease) return;
-	avatarSrc.value = bundle.avatar?.src ?? null;
-	quoteAvatarSrc.value = bundle.quoteAvatar?.src ?? null;
+	try {
+		const bundle = await lease.promise;
+		if (current !== identityGeneration || identityLease !== lease) return;
+		avatarSrc.value = bundle.avatar?.src ?? null;
+		quoteAvatarSrc.value = bundle.quoteAvatar?.src ?? null;
+		identityLoadFailed.value = bundle.failed;
+	} catch {
+		if (current === identityGeneration && identityLease === lease) identityLoadFailed.value = true;
+	}
 }
 
 async function loadAttachments(): Promise<void> {
@@ -274,7 +290,13 @@ async function loadAttachments(): Promise<void> {
 	const current = attachmentGeneration;
 	const quote = post.quote;
 	const lease = retainResource<AttachmentBundle>(nextKey, async signal => {
-		const loadOne = async (path?: string): Promise<LoadedMedia | null> => path == null ? null : await fetchMedia(path, signal).catch(() => null);
+		let failed = false;
+		const loadOne = async (path?: string): Promise<LoadedMedia | null> => {
+			if (path == null) return null;
+			const value = await fetchMedia(path, signal).catch(() => null);
+			if (value == null && !signal.aborted) failed = true;
+			return value;
+		};
 		const [images, poster, quoteImages, quotePoster] = await Promise.all([
 			Promise.all(post.images.map(image => loadOne(image.url))),
 			loadOne(post.video?.posterUrl),
@@ -282,20 +304,25 @@ async function loadAttachments(): Promise<void> {
 			loadOne(quote?.video?.posterUrl),
 		]);
 		const objectUrls = [...images, poster, ...quoteImages, quotePoster].flatMap(value => value == null ? [] : [value.src]);
-		return { images, poster, quoteImages, quotePoster, objectUrls };
+		return { images, poster, quoteImages, quotePoster, objectUrls, failed };
 	}, bundle => {
 		for (const objectUrl of bundle.objectUrls) URL.revokeObjectURL(objectUrl);
 	});
 	attachmentLease = lease;
 	attachmentKey = nextKey;
-	const bundle = await lease.promise;
-	if (current !== attachmentGeneration || attachmentLease !== lease) return;
-	imageSources.value = bundle.images.map(value => value?.src ?? null);
-	imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
-	posterSrc.value = bundle.poster?.src ?? null;
-	quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
-	quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
-	quotePosterSrc.value = bundle.quotePoster?.src ?? null;
+	try {
+		const bundle = await lease.promise;
+		if (current !== attachmentGeneration || attachmentLease !== lease) return;
+		imageSources.value = bundle.images.map(value => value?.src ?? null);
+		imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
+		posterSrc.value = bundle.poster?.src ?? null;
+		quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
+		quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
+		quotePosterSrc.value = bundle.quotePoster?.src ?? null;
+		attachmentLoadFailed.value = bundle.failed;
+	} catch {
+		if (current === attachmentGeneration && attachmentLease === lease) attachmentLoadFailed.value = true;
+	}
 }
 
 async function loadMedia(): Promise<void> {
@@ -305,9 +332,7 @@ async function loadMedia(): Promise<void> {
 		clearMedia();
 		return;
 	}
-	mediaLoadFailed.value = false;
-	const results = await Promise.allSettled([loadIdentity(), loadAttachments()]);
-	if (results.some(result => result.status === 'rejected')) mediaLoadFailed.value = true;
+	await Promise.all([loadIdentity(), loadAttachments()]);
 }
 
 async function openImage(index: number): Promise<void> {
