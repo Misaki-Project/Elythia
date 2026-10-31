@@ -75,7 +75,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 							v-if="content.type === 'image'"
 							:class="[$style.content, { [$style.pixelatedZoom]: pixelatedZoom }]"
 							:src="content.url"
-							:alt="content.file?.comment ?? undefined"
+							:alt="content.file?.comment ?? content.alt ?? undefined"
 							draggable="false"
 							@load="originalContentLoaded = true"
 						>
@@ -85,7 +85,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 							data-gallery-click-action="media"
 							:class="[$style.video, { [$style.videoSized]: videoAspectRatio != null }]"
 							:src="content.url"
-							:alt="content.file?.comment ?? undefined"
+							:alt="content.file?.comment ?? content.alt ?? undefined"
 							draggable="false"
 							:controls="prefer.s.useNativeUiForVideoAudioPlayer"
 							playsinline
@@ -101,7 +101,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 							<audio
 								ref="audioEl"
 								:src="content.url"
-								:alt="content.file?.comment ?? undefined"
+								:alt="content.file?.comment ?? content.alt ?? undefined"
 								:class="$style.audio"
 								controls
 								@loadedmetadata="originalContentLoaded = true"
@@ -166,6 +166,7 @@ export type Content = {
 	width?: number | null;
 	height?: number | null;
 	filename?: string | null;
+	alt?: string;
 	file?: Misskey.entities.DriveFile;
 	isSensitive?: boolean;
 	sourceElement?: HTMLElement | null;
