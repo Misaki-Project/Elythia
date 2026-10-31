@@ -4,9 +4,9 @@
 
 ## 1. 適用条件と復旧準備
 
-レビューと CI を確認し、[PR29（上流同期・履歴安全性）](https://github.com/Misaki-Project/Elythia/pull/29) → [PR30（host API）](https://github.com/Misaki-Project/Elythia/pull/30) → [PR31（Fx 移植）](https://github.com/Misaki-Project/Elythia/pull/31) の順に適用します。作成時点ではいずれも未 merge で、PR30/31 は Draft です。PR があることと本番に導入済みであることは別です。隔離検証では、依存変更を含むレビュー済み最終 plugin commit を直接 checkout できます。
+依存の順序は、[PR29（上流同期・履歴安全性）](https://github.com/Misaki-Project/Elythia/pull/29) → [PR30（host API）](https://github.com/Misaki-Project/Elythia/pull/30) → [PR31（Fx 移植）](https://github.com/Misaki-Project/Elythia/pull/31) です。2026-10-31 の GitHub 確認時点で、PR29 は同日04:11:57 UTCに merge 済み（merge commit `a0e8796c2f3911c752a25c5ac70fb001c5cb4459`）、PR30/31 は Draft・未 merge です。今後はレビューと CI を確認して PR30、PR31 の順に適用します。merge 状態と本番に導入済みであることは別です。隔離検証では、依存変更を含むレビュー済み最終 plugin commit を直接 checkout できます。
 
-現在の PR30 の base は `sync/upstream-20261030`、PR31 の base は `feature/fxtwitter-host-api-20261030` です。このまま各 base へ merge するだけでは `Misaki-develop` に全機能は入りません。運営者は repository の merge 方針を確認し、依存 PR の merge 後に後続 PR の base を `Misaki-develop` へ変更して差分と CI を再確認します。squash/rebase によって祖先が変わり差分が膨らむ場合は、その方針に合わせた branch の再整備と再レビューが必要です。未確認の merge 方式や force-push を手順として固定しません。この文書の作成では base 変更・merge は実行していません。
+同じ確認時点で、PR30 の base はすでに `Misaki-develop` へ変更済みで、PR31 の base は `feature/fxtwitter-host-api-20261030` のままです。今後 host の PR30 を merge した後、運営者は repository の merge 方針を確認し、PR31 の base を `Misaki-develop` へ変更して差分と CI を再確認します。将来の squash/rebase によって祖先が変わり差分が膨らむ場合は、その方針に合わせた branch の再整備と再レビューが必要です。未確認の merge 方式や force-push を手順として固定しません。
 
 確認済みの依存点は、同期 commit `076c0d2f3823f316c1ccdac692fc8a3f7c7e6bb3`（Misaki 基点 `29715b8954ea844ff2799d50a8c3903406ca7c6a`、上流 `2a026d427f9e35558b6a03eac06348d7882834dc`）、host commit `1bd68821116a6926445c9de5e154f1c052f93336` です。以下の `<REVIEWED_PLUGIN_SHA>` は、最終レビュー・CI を通過し、これらを含む **40桁の commit SHA** に置き換えます。ブランチ名や未確認のタグで代用しません。
 
