@@ -173,6 +173,7 @@ go test -race -count=1 -shuffle=3 -timeout 10m \
 | [シェイプドリフト検出](docs/shape-drift.md) | レスポンス形状・エラーID・権限のドリフトを検出する静的ゲート |
 | [本家 backend e2e](docs/upstream-backend-e2e.md) | Misskey 本家の `test/e2e/**` を本家ソースを正本として Elythia に向けて実行する (UserLite の期待DTOにローカル連合状態のみ追加) |
 | [プラグイン](docs/plugins/) | ビルド時組み込みプラグインの書き方・運用 |
+| [FxTwitter preview 導入手順（日本語）](docs/plugins/fxtwitter-install-ja.md) | 固定版ビルド・外部取得 OFF での検証・復旧 |
 | [プラグイン peer プロトコル](docs/plugin-peer-protocol.md) | Elythia 同士でだけ通じる署名付き HTTP チャネルの wire 仕様 |
 | [UDSデプロイ](docs/docker-uds.md) | UNIXドメインソケット構成 |
 | [queue-bench](docs/queue-bench.md) | BullMQ / mkq の 2-way 比較 (#563) |

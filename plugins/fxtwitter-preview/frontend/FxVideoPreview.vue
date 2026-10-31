@@ -59,6 +59,10 @@ function failEmbed(current: number): void {
 	frameTimer = null; controller?.abort(); controller = null; embedUrl.value = null; embedState.value = 'failed';
 }
 
+function playbackIsActive(): boolean {
+	return canPlay.value;
+}
+
 async function play(): Promise<void> {
 	const source = props.context.source;
 	if (!canPlay.value || source?.kind !== 'note' || embedState.value === 'loading') return;
@@ -70,8 +74,7 @@ async function play(): Promise<void> {
 	try {
 		const result = await api<{ url: string }>('embed/shell', { noteId: source.noteId, postId: props.cachePostId, token: props.video.embedToken, target: props.target, theme: 'light', lang: 'ja', nonce }, { signal: request.signal });
 		// Both the signal and reactive context may change while the host API is pending.
-		// eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-		if (request.signal.aborted || current !== generation || !canPlay.value) return;
+		if (request.signal.aborted || current !== generation || !playbackIsActive()) return;
 		const url = validatedEmbedURL(result.url);
 		if (url == null) throw new Error('invalid official embed URL');
 		embedUrl.value = url;

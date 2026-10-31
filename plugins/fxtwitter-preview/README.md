@@ -3,7 +3,7 @@
 
 # FxTwitter preview plugin v0.4.0
 
-既存 FxTwitter plugin の現在 SDK 向け独立 Go module です。この段階は backend のみで、frontend は後続の detail-only 統合で追加します。Go 1.27.3 と、root の `github.com/elythia-network/elythia/plugin` を使います。
+既存 FxTwitter plugin の現在 SDK 向け独立 Go module と、詳細画面専用の frontend です。Go 1.27.3 と、root の `github.com/elythia-network/elythia/plugin` を使います。固定版ビルド・外部取得 OFF での確認・復旧は[日本語導入手順](../../docs/plugins/fxtwitter-install-ja.md)を参照してください。
 
 `elythia-plugin.yml` は `disabled: true`、runtime の `externalFetchEnabled` は既定で `false` です。ビルドへの明示的な選択と、運用者による別途承認された外部取得の有効化が必要です。この移植では公開 repository、タグ、リリース、本番移行を作成しません。
 
@@ -15,7 +15,7 @@ Fx への送信は固定 `https://api.fxtwitter.com/2/status/{numeric-id}` の�
 
 `externalFetchEnabled: false` は preview の外部 job 起動、queued fetch job、既存 cache descriptor の画像 proxy、embed capability の利用を止めます。capabilities と権限のある管理 read は利用できます。
 
-画像・avatar・poster は認証済み same-origin route で毎回 note ACL を検証します。外部画像は正確な HTTPS `pbs.twimg.com` のみを許可します。response は `Cache-Control: private, no-store` とし、viewer の権限変更後に browser/shared cache から認証を迂回して再利用できない契約です。frontend 側の Blob 解放・再認可 gate は後続統合で扱います。
+画像・avatar・poster は認証済み same-origin route で毎回 note ACL を検証します。外部画像は正確な HTTPS `pbs.twimg.com` のみを許可します。response は `Cache-Control: private, no-store` とし、viewer の権限変更後に browser/shared cache から認証を迂回して再利用できない契約です。frontend は認証付き Blob 取得と活動状態の gate、abort・URL 解放を行います。
 
 ## cache と理由 DTO
 
@@ -39,7 +39,7 @@ migration 1–5 は既存 schema/data を保持します。追加 migration 6 �
 
 native X video は `officialEmbed` の場合だけ、クリックに対応する認証済み `POST /embed/shell` で完全投稿の `https://platform.twitter.com/embed/index.html` URL を発行します。post ID、cache-bound token、有効期限、引用 target、theme/lang、per-click nonce を検証し、note ACL を再確認します。元の `Tweet.html` 動画専用 presentation、直接 video CDN bytes、YouTube player は使いません。既存 cache の YouTube descriptor も capability として拒否します。
 
-外部 video provider は poster と元の X 投稿リンクへの fallback に留めます。`linkOnly` は embed 発行を止めます。detail/CW reveal/active/viewport gate、mount/abort の cleanup、source-link UI は後続 frontend 統合の契約です。
+外部 video provider は poster と元の X 投稿リンクへの fallback に留めます。`linkOnly` は embed 発行を止めます。frontend は detail/CW reveal/active/viewport gate、mount/abort の cleanup、source-link UI を持ちます。動画モード省略時は `officialEmbed` ですが、外部取得の既定は OFF です。初回手順では `linkOnly` を明示し、公式 iframe は運営者が後で許可してもクリック後だけ読み込みます。
 
 ## 検証
 
