@@ -36,9 +36,10 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+ARG PLUGIN_INCLUDE_DISABLED_DIR=
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    GOWORK=off go run ./tools/pluginbuild && \
+    GOWORK=off go run ./tools/pluginbuild -include-disabled-dir "$PLUGIN_INCLUDE_DISABLED_DIR" && \
     mkdir -p /gen/src && \
     cp frontend/packages/frontend/src/server-plugins.generated.ts /gen/src/ && \
     if [ -f frontend/packages/frontend/mk-plugins.generated.json ]; then \

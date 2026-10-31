@@ -27,6 +27,8 @@
 import { defineAsyncComponent } from 'vue';
 import type { Component } from 'vue';
 import type { entities } from 'misskey-js';
+import { FILE_TYPE_BROWSERSAFE } from '@@/js/const.js';
+import type { Content } from '@/components/MkLightbox.item.vue';
 import { misskeyApi } from '@/utility/misskey-api.js';
 import { $i } from '@/i.js';
 
@@ -49,6 +51,10 @@ export { default as MkSwitch } from '@/components/MkSwitch.vue';
 export { default as MkAvatar } from '@/components/global/MkAvatar.vue';
 export { default as MkUserName } from '@/components/global/MkUserName.vue';
 export { default as MkTime } from '@/components/global/MkTime.vue';
+// ルーターやダイアログをAPIモジュールの読み込みだけで初期化しない。
+export const MkA = defineAsyncComponent(() => import('@/components/global/MkA.vue'));
+export const MkUrl = defineAsyncComponent(() => import('@/components/global/MkUrl.vue'));
+export const MkSensitiveMediaGuard = defineAsyncComponent(() => import('@/components/MkSensitiveMediaGuard.vue'));
 export { default as PageWithHeader } from '@/components/global/PageWithHeader.vue';
 /**
  * サーバープラグインの秘密の値 (API キーなど) の入力欄 (Elythia #3470)。
@@ -113,6 +119,18 @@ export type PreviewRegistration = {
 	id: string;
 	plugin: string;
 	provider: PreviewProvider;
+};
+
+/** A fetched media Blob owned by a plugin, rather than a drive file. */
+export type PluginMediaItem = {
+	id: string;
+	type: 'image' | 'video' | 'audio';
+	blob: Blob;
+	width?: number | null;
+	height?: number | null;
+	filename?: string | null;
+	isSensitive?: boolean;
+	initiallyRevealed?: boolean;
 };
 
 /**
@@ -266,6 +284,12 @@ export type PluginHost = {
 	 * 認証は利用者のセッションがそのまま使われる。
 	 */
 	api<T = unknown>(endpoint: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<T>;
+
+	/** Fetches a Response from this plugin's root-relative API path using the host session. */
+	fetch(path: string, options?: RequestInit): Promise<Response>;
+
+	/** Opens browser-safe fetched Blobs in the host media viewer. */
+	openMedia(items: PluginMediaItem[], initialId?: string): Promise<void>;
 };
 
 export type PluginDefinition = {
@@ -378,6 +402,7 @@ function pagePath(name: string, path: string): string {
 }
 
 function buildHost(name: string): PluginHost {
+	const pluginAPIPrefix = `/api/plugin/${name}/`;
 	return {
 		name,
 		me: toSlotUser($i),
@@ -398,6 +423,63 @@ function buildHost(name: string): PluginHost {
 			// misskeyApi の型は既知のエンドポイント集合に閉じているが、
 			// プラグインのエンドポイントはそこに無い。ここで境界を吸収する。
 			return misskeyApi(endpoint as never, (params ?? {}) as never, undefined, options?.signal) as never;
+		},
+		async fetch(path, options) {
+			if ($i?.token == null || $i.token === '') throw new Error('Plugin fetch requires authentication');
+			const url = new URL(path, window.location.origin);
+			const rawPath = path.split('?')[0];
+			if (!path.startsWith(pluginAPIPrefix) || url.origin !== window.location.origin ||
+				!url.pathname.startsWith(pluginAPIPrefix) || /[%\\\s#]/.test(rawPath) || path.includes('#') ||
+				rawPath.split('/').some(segment => segment === '.' || segment === '..') || url.searchParams.has('i')) {
+				throw new Error(`Plugin fetch must stay inside ${pluginAPIPrefix}`);
+			}
+			const headers = new Headers(options?.headers);
+			headers.set('Authorization', `Bearer ${$i.token}`);
+			return window.fetch(`${url.pathname}${url.search}`, {
+				...options,
+				credentials: 'omit',
+				redirect: 'error',
+				headers,
+			});
+		},
+		async openMedia(items, initialId) {
+			if (items.length === 0) return;
+			// URL生成より前に全件を検証し、型不一致やSVGを表示対象にしない。
+			for (const item of items) {
+				const mime = item.blob instanceof Blob ? item.blob.type.split(';')[0].trim().toLowerCase() : '';
+				if (!['image', 'video', 'audio'].includes(item.type) || !mime.startsWith(`${item.type}/`) || !FILE_TYPE_BROWSERSAFE.includes(mime)) {
+					throw new Error(`Plugin media ${item.id} has an invalid MIME type`);
+				}
+			}
+			const objectUrls: string[] = [];
+			let revoked = false;
+			const revoke = (): void => {
+				if (revoked) return;
+				revoked = true;
+				for (const url of objectUrls) URL.revokeObjectURL(url);
+			};
+			try {
+				const contents = items.map<Content>(item => {
+					const url = URL.createObjectURL(item.blob);
+					objectUrls.push(url);
+					return {
+						id: item.id, type: item.type, url, thumbnailUrl: url,
+						width: item.width, height: item.height, filename: item.filename,
+						isSensitive: item.isSensitive === true,
+					};
+				});
+				const os = await import('@/os.js');
+				const { dispose } = await os.popupAsyncWithDialog(import('@/components/MkLightbox.vue').then(module => module.default), {
+					defaultIndex: Math.max(0, contents.findIndex(content => content.id === initialId)),
+					contents,
+					initiallyRevealedContentIds: items.filter(item => item.initiallyRevealed === true).map(item => item.id),
+				}, {
+					closed: () => { dispose(); revoke(); },
+				});
+			} catch (err) {
+				revoke();
+				throw err;
+			}
 		},
 	};
 }

@@ -33,7 +33,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 					v-if="hide"
 					data-gallery-click-action="hidden"
 					:class="[$style.hidden, {
-						[$style.sensitive]: content.file?.isSensitive && prefer.s.highlightSensitiveMedia,
+						[$style.sensitive]: contentIsSensitive && prefer.s.highlightSensitiveMedia,
 					}]"
 					:style="hiddenStyle"
 					@click.stop="onHiddenClick"
@@ -54,7 +54,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 						<div v-else :class="$style.hiddenPlaceholder"></div>
 						<div :class="[$style.hiddenText, { [$style.withBlur]: content.type === 'video' && content.thumbnailUrl != null }]">
 							<div :class="$style.hiddenTextWrapper">
-								<b v-if="content.file?.isSensitive" style="display: block;"><i class="ti ti-eye-exclamation"></i> {{ i18n.ts.sensitive }}</b>
+								<b v-if="contentIsSensitive" style="display: block;"><i class="ti ti-eye-exclamation"></i> {{ i18n.ts.sensitive }}</b>
 								<b v-else style="display: block;"><i class="ti" :class="contentHideFileIcon"></i> {{ contentHideFileText }}</b>
 								<span style="display: block;">{{ i18n.ts.clickToShow }}</span>
 							</div>
@@ -167,6 +167,7 @@ export type Content = {
 	height?: number | null;
 	filename?: string | null;
 	file?: Misskey.entities.DriveFile;
+	isSensitive?: boolean;
 	sourceElement?: HTMLElement | null;
 };
 
@@ -207,7 +208,7 @@ import { DI } from '@/di.js';
 import * as os from '@/os.js';
 import { prefer } from '@/preferences.js';
 import { i18n } from '@/i18n.js';
-import { shouldHideFileByDefault, canRevealFile } from '@/utility/sensitive-file.js';
+import { shouldHideSensitiveMediaByDefault, canRevealSensitiveMedia } from '@/utility/sensitive-file.js';
 import { makeDoubleTapDetector } from '@/utility/double-tap.js';
 import { deviceKind } from '@/utility/device-kind.js';
 import { isTouchUsing } from '@/utility/touch.js';
@@ -264,6 +265,7 @@ const thumbnailContentLoaded = ref(false);
 const enableTransition = ref(false);
 const infoShowing = ref(false);
 const hide = ref(true);
+const contentIsSensitive = computed(() => props.content.file?.isSensitive ?? props.content.isSensitive ?? false);
 const isMediaControlledByMisskey = computed(() => ['video', 'audio'].includes(props.content.type) && !prefer.s.useNativeUiForVideoAudioPlayer);
 // ビジュアライザー使用時は音量の適用をGainNode側が担当する (メディア要素は100%固定にして、波形が音量レベルに依存しないようにするため)
 const isVolumeHandledByVisualizer = computed(() => props.content.type === 'audio' && !prefer.s.useNativeUiForVideoAudioPlayer);
@@ -368,8 +370,9 @@ const hiddenStyle = computed(() => {
 });
 
 function shouldHideInGallery(content: Content): boolean {
-	if (content.file == null) return false;
-	const hiddenByDefault = shouldHideFileByDefault(content.file, true);
+	// 既存のファイルなしメディアは従来どおり表示し、明示された機密性だけを追加で扱う。
+	if (content.file == null && content.isSensitive == null) return false;
+	const hiddenByDefault = shouldHideSensitiveMediaByDefault(content.file?.isSensitive ?? content.isSensitive ?? false, true);
 	if (!hiddenByDefault) return false;
 
 	// 呼び出し元で既にぼかしが解除されているものは初期表示で隠さない
@@ -942,7 +945,7 @@ function playWhenAvailable() {
 
 async function onHiddenClick() {
 	if (hide.value) {
-		if (props.content.file == null || await canRevealFile(props.content.file)) {
+		if (await canRevealSensitiveMedia(contentIsSensitive.value)) {
 			hide.value = false;
 			if (['audio', 'video'].includes(props.content.type)) {
 				playWhenAvailable();
