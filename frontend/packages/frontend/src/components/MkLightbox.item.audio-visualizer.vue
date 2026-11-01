@@ -20,6 +20,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 		width="1600"
 		height="900"
 		data-gallery-click-action="media"
+		:role="(content.file?.comment ?? content.alt) ? 'img' : undefined"
+		:aria-label="content.file?.comment ?? content.alt"
 		:class="$style.visualizer"
 		v-bind="$attrs"
 	></canvas>

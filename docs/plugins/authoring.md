@@ -230,7 +230,7 @@ if res.Role.Target == "conditional" {
 return res.Assigned, nil
 ```
 
-条件つきロールまで含めた実効的な判定は用意していない。条件式の評価は利用者ごとに全ロールを読み込む必要があり、この API の利点である「1 回引くだけで終わる」性質が失われるため。
+`roles/assignment-show`では条件つきロールの有効判定はできない。認証済みの呼び出し元の有効な手動・条件つきロールIDを列挙する場合は、`req`を任意拡張の`plugin.ActiveRoleRequest`へ型アサーションして`ActiveRoleIDs()`を呼ぶ。未認証なら空の一覧を返し、取得に失敗した場合はIDを返さずエラーになる。未実装またはエラーの場合、ロールに応じたアクセスや制限を緩めず失敗として扱うこと。既存の`plugin.Request`に必須メソッドは増えない。詳細は[ホストのメディア契約](host-media.md)を参照。
 
 非公開ロールで `roles/assignment-show` を使うと、**付与されていない利用者には `NO_SUCH_ROLE`** が返る（存在の有無を漏らさないため）。条件つきかつ非公開のロールは、条件を満たす利用者にもこうなる。`admin/roles/assignment-show` にこの秘匿は無く、モデレーター以上なら非公開ロールも読める。
 
@@ -1256,6 +1256,10 @@ type Request interface
   UserID() string
   IsModerator() bool
   IsAdministrator() bool
+
+type ActiveRoleRequest interface
+  Request
+  ActiveRoleIDs() ([]string, error)
 
 type Storage interface
   DB() *sql.DB

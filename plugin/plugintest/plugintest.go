@@ -466,6 +466,10 @@ func (j *JobSet) lookup(name string) (plugin.JobHandler, error) {
 
 // Request describes one fake HTTP request.
 type Request struct {
+	// ActiveRoleIDs supplies the authenticated caller's server-derived role IDs.
+	ActiveRoleIDs []string
+	// ActiveRoleError simulates a failed role lookup; no IDs are returned on error.
+	ActiveRoleError error
 	// UserID is what plugin.Request.UserID returns. 空文字は未認証。
 	UserID string
 	// Body is the raw JSON request body.
@@ -491,6 +495,7 @@ func (r Request) build() plugin.Request {
 	return &fakeRequest{
 		ctx: ctx, userID: r.UserID, body: body, params: r.Params, query: r.Query,
 		moderator: r.Moderator || r.Administrator, administrator: r.Administrator,
+		activeRoleIDs: append([]string(nil), r.ActiveRoleIDs...), activeRoleError: r.ActiveRoleError,
 	}
 }
 
@@ -615,13 +620,15 @@ func (j *fakeJobs) Schedule(cron string, name string, payload any) {
 }
 
 type fakeRequest struct {
-	ctx           context.Context
-	userID        string
-	body          string
-	params        map[string]string
-	query         map[string]string
-	moderator     bool
-	administrator bool
+	activeRoleIDs   []string
+	activeRoleError error
+	ctx             context.Context
+	userID          string
+	body            string
+	params          map[string]string
+	query           map[string]string
+	moderator       bool
+	administrator   bool
 }
 
 func (r *fakeRequest) Context() context.Context { return r.ctx }
@@ -630,6 +637,25 @@ func (r *fakeRequest) Param(k string) string    { return r.params[k] }
 func (r *fakeRequest) IsModerator() bool        { return r.moderator }
 func (r *fakeRequest) IsAdministrator() bool    { return r.administrator }
 func (r *fakeRequest) Query(k string) string    { return r.query[k] }
+
+func (r *fakeRequest) ActiveRoleIDs() ([]string, error) {
+	if r.userID == "" {
+		return []string{}, nil
+	}
+	if r.activeRoleError != nil {
+		return nil, r.activeRoleError
+	}
+	seen := make(map[string]bool, len(r.activeRoleIDs))
+	ids := make([]string, 0, len(r.activeRoleIDs))
+	for _, id := range r.activeRoleIDs {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
 
 func (r *fakeRequest) Bind(v any) error {
 	dec := json.NewDecoder(strings.NewReader(r.body))
