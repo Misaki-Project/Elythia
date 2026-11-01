@@ -8,7 +8,7 @@
 
 同じ確認時点で、PR30 の base はすでに `Misaki-develop` へ変更済みで、PR31 の base は `feature/fxtwitter-host-api-20261030` のままです。今後 host の PR30 を merge した後、運営者は repository の merge 方針を確認し、PR31 の base を `Misaki-develop` へ変更して差分と CI を再確認します。将来の squash/rebase によって祖先が変わり差分が膨らむ場合は、その方針に合わせた branch の再整備と再レビューが必要です。未確認の merge 方式や force-push を手順として固定しません。
 
-確認済みの依存点は、同期 commit `076c0d2f3823f316c1ccdac692fc8a3f7c7e6bb3`（Misaki 基点 `29715b8954ea844ff2799d50a8c3903406ca7c6a`、上流 `2a026d427f9e35558b6a03eac06348d7882834dc`）、レビュー修正済み host commit `cf66aec692e8909461b3d6aaa3379d61385fef48` です。以下の `<REVIEWED_PLUGIN_SHA>` は、最終レビュー・CI を通過し、これらを含む **40桁の commit SHA** に置き換えます。ブランチ名や未確認のタグで代用しません。
+確認済みの依存点は、同期 commit `076c0d2f3823f316c1ccdac692fc8a3f7c7e6bb3`（Misaki 基点 `29715b8954ea844ff2799d50a8c3903406ca7c6a`、上流 `2a026d427f9e35558b6a03eac06348d7882834dc`）、レビュー修正済み host commit `0f46558ad70755ad17ea38c2076e7c6ec762d021` です。以下の `<REVIEWED_PLUGIN_SHA>` は、最終レビュー・CI を通過し、これらを含む **40桁の commit SHA** に置き換えます。ブランチ名や未確認のタグで代用しません。
 
 旧117まで適用済みの既存 DB は、先に [Misaki migration 履歴照合手順](../misaki-migration-reconciliation.md) を読んでください。PR29 の guard は旧履歴を自動変換しません。バックアップをアプリから切り離した検証 DB へ復元し、全履歴と core/local 台帳の前提を照合する手順が必要です。guard の無効化や、番号だけを見た台帳の書換えで先へ進めません。
 
@@ -36,7 +36,7 @@ set -eu
 git checkout --detach '<REVIEWED_PLUGIN_SHA>'
 test "$(git rev-parse HEAD)" = '<REVIEWED_PLUGIN_SHA>'
 git merge-base --is-ancestor 076c0d2f3823f316c1ccdac692fc8a3f7c7e6bb3 HEAD
-git merge-base --is-ancestor cf66aec692e8909461b3d6aaa3379d61385fef48 HEAD
+git merge-base --is-ancestor 0f46558ad70755ad17ea38c2076e7c6ec762d021 HEAD
 
 # 3つとも未配置の専用 checkout でだけ実施。存在する場合は止めて由来を確認する
 test ! -e plugins/genshin
