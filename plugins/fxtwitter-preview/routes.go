@@ -129,7 +129,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		}
 		fetchCtx, cancel := context.WithTimeout(req.Context(), cfg.RequestTimeout)
 		defer cancel()
-		blob, err := fetchMedia(fetchCtx, ctx.HTTP(), rawURL, cfg.StaticImageMaxBytes)
+		blob, err := fetchMedia(fetchCtx, req.Context(), ctx.HTTP(), rawURL, cfg.StaticImageMaxBytes)
 		if err != nil {
 			ctx.Logger().Warn("Fx preview media unavailable", "postId", req.Param("postId"), "kind", req.Param("kind"), "err", err)
 			return nil, plugin.ErrNotFound("media unavailable")

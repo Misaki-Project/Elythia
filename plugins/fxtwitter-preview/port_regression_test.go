@@ -315,7 +315,7 @@ func TestPortAuthenticatedImageCannotRemainInBrowserCache(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return response(200, "image/png", string(tinyImage(t, "png"))), nil
 	})}
-	blob, err := fetchMedia(context.Background(), client, "https://pbs.twimg.com/a.png", 1<<20)
+	blob, err := fetchTestMedia(context.Background(), client, "https://pbs.twimg.com/a.png", 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}

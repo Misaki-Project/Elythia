@@ -89,7 +89,7 @@ func TestMediaFetchAcceptsBoundedRasterFormats(t *testing.T) {
 				}
 				return response(200, "image/"+kind, string(body)), nil
 			})}
-			blob, err := fetchMedia(context.Background(), client, "https://pbs.twimg.com/media/test."+kind, 1<<20)
+			blob, err := fetchTestMedia(context.Background(), client, "https://pbs.twimg.com/media/test."+kind, 1<<20)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -111,7 +111,7 @@ func TestMediaFetchRejectsLegacyYouTubePosterHostBeforeOutbound(t *testing.T) {
 		}
 		return response(200, "image/jpeg", string(body)), nil
 	})}
-	_, err := fetchMedia(context.Background(), client, rawURL, 1<<20)
+	_, err := fetchTestMedia(context.Background(), client, rawURL, 1<<20)
 	if err == nil || called {
 		t.Fatalf("legacy host allowed: called = %v, err = %v", called, err)
 	}
@@ -132,7 +132,7 @@ func TestMediaFetchRejectsUnsafeOrInvalidResponses(t *testing.T) {
 		"https://img.youtube.com:443/a.png",
 	} {
 		called = false
-		if _, err := fetchMedia(context.Background(), client, raw, 1<<20); err == nil || called {
+		if _, err := fetchTestMedia(context.Background(), client, raw, 1<<20); err == nil || called {
 			t.Fatalf("accepted %q", raw)
 		}
 	}
@@ -144,7 +144,7 @@ func TestMediaFetchRejectsUnsafeOrInvalidResponses(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return res, nil })}
-			if _, err := fetchMedia(context.Background(), c, "https://pbs.twimg.com/a.png", 1024); err == nil {
+			if _, err := fetchTestMedia(context.Background(), c, "https://pbs.twimg.com/a.png", 1024); err == nil {
 				t.Fatal("invalid media accepted")
 			}
 		})

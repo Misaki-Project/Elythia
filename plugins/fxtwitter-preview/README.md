@@ -3,6 +3,8 @@
 
 # FxTwitter preview plugin v0.4.0
 
+画像proxyはプロセス全体で受付を33件、画像本体の読み込み・デコードを同時1件に制限します。ヘッダー取得は並行でき、処理枠を待つ間は画像本体を読み込みません。応答用の画像バッファには合計128MiBの予約枠を設け、各要求の設定上限の2倍＋1KiBを読み込み前に予約します。受付枠とバッファ予約は、短い取得用タイムアウトでは解放せず、ホストがHTTP応答を完了するかクライアントが切断するまで保持します。これはプロセス全体のRSS上限ではありません。受付飽和やタイムアウトは従来と同じ「media unavailable」となり、キャンセルしても実行中の同期デコーダーが戻るまでは処理枠を保持します。外部取得の既定OFFと、各リクエストのノート閲覧権限・URL・MIME・サイズ検査は維持します。
+
 既存 FxTwitter plugin の現在 SDK 向け独立 Go module と、詳細画面専用の frontend です。Go 1.27.3 と、root の `github.com/elythia-network/elythia/plugin` を使います。固定版ビルド・外部取得 OFF での確認・復旧は[日本語導入手順](../../docs/plugins/fxtwitter-install-ja.md)を参照してください。
 
 `elythia-plugin.yml` は `disabled: true`、runtime の `externalFetchEnabled` は既定で `false` です。ビルドへの明示的な選択と、運用者による別途承認された外部取得の有効化が必要です。この移植では公開 repository、タグ、リリース、本番移行を作成しません。
