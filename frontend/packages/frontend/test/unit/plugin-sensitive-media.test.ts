@@ -6,6 +6,8 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/vue';
 import { defineComponent, h } from 'vue';
 import LightboxItem from '@/components/MkLightbox.item.vue';
+// 遅延読み込み自体ではなく、実際のビジュアライザーの記述を検査する。
+import '@/components/MkLightbox.item.audio-visualizer.vue';
 import type { Content } from '@/components/MkLightbox.item.vue';
 import { prefer } from '@/preferences.js';
 import { directives } from '@/directives/index.js';
@@ -39,20 +41,99 @@ function renderItem(isSensitive = true, initiallyRevealed = false, content: Part
 	});
 }
 
-async function openPluginMedia(type: 'video' | 'audio', isSensitive = false) {
+async function openPluginMedia(type: 'video' | 'audio', isSensitive = false, metadata: Pick<pluginAPI.PluginMediaItem, 'filename' | 'alt'> = { filename: 'download', alt: 'Media description' }) {
 	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:plugin-media');
 	const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
 	let host!: pluginAPI.PluginHost;
 	await pluginAPI.launchServerPlugins([{ name: 'example', setup: value => { host = value; } }]);
 	await host.openMedia([{
 		id: 'plugin-media', type, blob: new Blob(['media'], { type: type === 'video' ? 'video/mp4' : 'audio/mpeg' }),
-		filename: 'download', alt: 'Media description', isSensitive,
+		...metadata, isSensitive,
 	}]);
 	const [component, props, events] = mocks.popup.mock.calls[0];
 	await component;
 	const { contents } = props as { contents: Content[] };
 	return { content: contents[0], revoke, close: (events as { closed(): void }).closed };
 }
+
+function scaffoldCustomAudioBrowserAPIs() {
+	// DOMの記述とイベントを検査し、音声の復号やキャンバスの描画は行わない。
+	vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null);
+	const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+	vi.spyOn(globalThis, 'AudioContext').mockImplementation(class {
+		state = 'running';
+		sampleRate = 48000;
+		destination = {};
+		createAnalyser() { return { connect() {}, disconnect() {}, getByteFrequencyData() {} }; }
+		createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
+		createMediaElementSource() { return { connect: (node: unknown) => node, disconnect() {} }; }
+		async close() { this.state = 'closed'; }
+	} as unknown as typeof AudioContext);
+	return { play };
+}
+
+test.each([
+	[undefined, 'Spoken description', 'Spoken description'],
+	['Drive description', 'Blob description', 'Drive description'],
+	['', 'Blob description', ''],
+	[null, 'Blob description', 'Blob description'],
+	[undefined, undefined, null],
+] as const)('default custom audio exposes effective description with comment=%s and alt=%s', async (comment, alt, expected) => {
+	preferState.nsfw = 'respect';
+	preferState.useNativeUiForVideoAudioPlayer = false;
+	const { play } = scaffoldCustomAudioBrowserAPIs();
+	const { content, revoke, close } = await openPluginMedia('audio', false, { filename: 'download.mp3', alt });
+	const file: Content['file'] = comment === undefined ? undefined : {
+		id: 'drive-audio', createdAt: '2026-10-31T00:00:00.000Z', name: 'drive.mp3', type: 'audio/mpeg',
+		md5: '0123456789abcdef0123456789abcdef', size: 1, isSensitive: false, blurhash: null, properties: {},
+		url: 'blob:drive-audio', thumbnailUrl: null, comment, folderId: null, userId: null,
+	};
+	const result = renderItem(false, false, { ...content, file });
+	await waitFor(() => expect(result.container.querySelector('canvas')).not.toBeNull());
+	const canvas = result.container.querySelector('canvas[data-gallery-click-action="media"]')!;
+	const audio = result.container.querySelector('audio')!;
+	expect(canvas).not.toBeNull();
+	expect(audio.controls).toBe(false);
+	expect(audio.getAttribute('src')).toBe('blob:plugin-media');
+	expect(canvas.getAttribute('aria-label')).toBe(expected);
+	expect(canvas.getAttribute('role')).toBe(expected ? 'img' : null);
+	if (expected) expect(result.getByRole('img', { name: expected })).toBe(canvas);
+	expect(result.container.textContent).toContain('download.mp3');
+	await fireEvent.loadedMetadata(audio);
+	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
+	expect(canvas.getAttribute('aria-label')).toBe(expected);
+	await fireEvent.click(canvas);
+	expect(play).toHaveBeenCalled();
+	expect(revoke).not.toHaveBeenCalled();
+	result.unmount();
+	close();
+	close();
+	expect(revoke.mock.calls).toEqual([['blob:plugin-media']]);
+});
+
+test('default custom audio reveals its description only after sensitive confirmation', async () => {
+	preferState.nsfw = 'respect';
+	preferState.useNativeUiForVideoAudioPlayer = false;
+	preferState.confirmWhenRevealingSensitiveMedia = true;
+	scaffoldCustomAudioBrowserAPIs();
+	const { content, revoke, close } = await openPluginMedia('audio', true);
+	const result = renderItem(true, false, content);
+	const hidden = result.container.querySelector('[data-gallery-click-action="hidden"]')!;
+	expect(result.container.querySelector('canvas, audio')).toBeNull();
+	mocks.confirm.mockResolvedValueOnce({ canceled: true });
+	await fireEvent.click(hidden);
+	expect(result.container.querySelector('canvas, audio')).toBeNull();
+	await fireEvent.click(hidden);
+	await waitFor(() => expect(result.container.querySelector('canvas')).not.toBeNull());
+	const canvas = await result.findByRole('img', { name: 'Media description' });
+	expect(canvas.tagName).toBe('CANVAS');
+	await fireEvent.loadedMetadata(result.container.querySelector('audio')!);
+	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
+	expect(result.container.querySelector('img')).toBeNull();
+	result.unmount();
+	close();
+	expect(revoke.mock.calls).toEqual([['blob:plugin-media']]);
+});
 
 test.each(['video', 'audio'] as const)('real viewer renders plugin %s metadata without a residual image thumbnail', async type => {
 	preferState.nsfw = 'respect';
