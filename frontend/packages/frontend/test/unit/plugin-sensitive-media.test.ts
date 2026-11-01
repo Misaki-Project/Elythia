@@ -13,15 +13,21 @@ import { components } from '@/components/index.js';
 import { preferState } from '../setup.unit.js';
 import * as pluginAPI from '@/plugin-api.js';
 
-const mocks = vi.hoisted(() => ({ confirm: vi.fn(async () => ({ canceled: false })) }));
-vi.mock('@/os.js', () => ({ confirm: mocks.confirm }));
+const mocks = vi.hoisted(() => ({
+	confirm: vi.fn(async () => ({ canceled: false })),
+	popup: vi.fn(async (_component: unknown, _props: unknown, _events: unknown) => ({ dispose: vi.fn() })),
+}));
+vi.mock('@/os.js', () => ({ confirm: mocks.confirm, popupAsyncWithDialog: mocks.popup }));
 
-const original = { nsfw: prefer.s.nsfw, confirm: prefer.s.confirmWhenRevealingSensitiveMedia };
+const original = { nsfw: prefer.s.nsfw, confirm: prefer.s.confirmWhenRevealingSensitiveMedia, native: prefer.s.useNativeUiForVideoAudioPlayer };
 afterEach(() => {
 	cleanup();
+	vi.restoreAllMocks();
 	preferState.nsfw = original.nsfw;
 	preferState.confirmWhenRevealingSensitiveMedia = original.confirm;
+	preferState.useNativeUiForVideoAudioPlayer = original.native;
 	mocks.confirm.mockClear();
+	mocks.popup.mockClear();
 });
 
 function renderItem(isSensitive = true, initiallyRevealed = false, content: Partial<Content> = {}) {
@@ -30,6 +36,66 @@ function renderItem(isSensitive = true, initiallyRevealed = false, content: Part
 		global: { directives, components },
 	});
 }
+
+async function openPluginMedia(type: 'video' | 'audio', isSensitive = false) {
+	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:plugin-media');
+	const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+	let host!: pluginAPI.PluginHost;
+	await pluginAPI.launchServerPlugins([{ name: 'example', setup: value => { host = value; } }]);
+	await host.openMedia([{
+		id: 'plugin-media', type, blob: new Blob(['media'], { type: type === 'video' ? 'video/mp4' : 'audio/mpeg' }),
+		filename: 'download', alt: 'Media description', isSensitive,
+	}]);
+	const [component, props, events] = mocks.popup.mock.calls[0];
+	await component;
+	const { contents } = props as { contents: Content[] };
+	return { content: contents[0], revoke, close: (events as { closed(): void }).closed };
+}
+
+test.each(['video', 'audio'] as const)('real viewer renders plugin %s metadata without a residual image thumbnail', async type => {
+	preferState.nsfw = 'respect';
+	preferState.useNativeUiForVideoAudioPlayer = true;
+	const { content, revoke, close } = await openPluginMedia(type);
+	const result = renderItem(false, false, content);
+	const media = result.container.querySelector<HTMLMediaElement>(type)!;
+	expect(media).not.toBeNull();
+	expect(media.getAttribute('src')).toBe('blob:plugin-media');
+	expect(media.getAttribute('alt')).toBe('Media description');
+	expect(media.controls).toBe(true);
+	expect(result.container.querySelector('[class*="loading"]')).not.toBeNull();
+	await fireEvent.loadedMetadata(media);
+	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
+	expect(result.container.querySelector('img')).toBeNull();
+	expect(result.container.querySelector(type)).toBe(media);
+	expect(revoke).not.toHaveBeenCalled();
+	result.unmount();
+	close();
+	close();
+	expect(revoke.mock.calls).toEqual([['blob:plugin-media']]);
+});
+
+test.each(['video', 'audio'] as const)('real viewer keeps sensitive plugin %s behind a placeholder until confirmation', async type => {
+	preferState.nsfw = 'respect';
+	preferState.confirmWhenRevealingSensitiveMedia = true;
+	preferState.useNativeUiForVideoAudioPlayer = true;
+	const { content, close } = await openPluginMedia(type, true);
+	const result = renderItem(true, false, content);
+	const hidden = result.container.querySelector<HTMLElement>('[data-gallery-click-action="hidden"]')!;
+	expect(hidden).not.toBeNull();
+	expect(hidden.querySelector('[class*="hiddenPlaceholder"]')).not.toBeNull();
+	expect(result.container.querySelector('img, video, audio')).toBeNull();
+	mocks.confirm.mockResolvedValueOnce({ canceled: true });
+	await fireEvent.click(hidden);
+	expect(result.container.querySelector(type)).toBeNull();
+	await fireEvent.click(hidden);
+	await waitFor(() => expect(result.container.querySelector(type)).not.toBeNull());
+	expect(result.container.querySelector('[data-gallery-click-action="hidden"]')).toBeNull();
+	await fireEvent.loadedMetadata(result.container.querySelector(type)!);
+	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
+	expect(result.container.querySelector('img')).toBeNull();
+	result.unmount();
+	close();
+});
 
 test.each([
 	[undefined, 'A red kite above a lake', 'A red kite above a lake'],

@@ -438,6 +438,7 @@ function buildHost(name: string): PluginHost {
 			headers.set('Authorization', `Bearer ${$i.token}`);
 			return window.fetch(`${url.pathname}${url.search}`, {
 				...options,
+				mode: 'same-origin',
 				credentials: 'omit',
 				redirect: 'error',
 				headers,
@@ -464,7 +465,7 @@ function buildHost(name: string): PluginHost {
 					const url = URL.createObjectURL(item.blob);
 					objectUrls.push(url);
 					return {
-						id: item.id, type: item.type, url, thumbnailUrl: url,
+						id: item.id, type: item.type, url, thumbnailUrl: item.type === 'image' ? url : undefined,
 						width: item.width, height: item.height, filename: item.filename, alt: item.alt,
 						isSensitive: item.isSensitive === true,
 					};
