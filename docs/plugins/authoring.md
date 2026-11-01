@@ -801,6 +801,7 @@ Misskey のコンポーネント（`MkInput` など）を使うなら前者。�
 import { MkInput, MkButton, MkFolder, MkLoading } from '@/plugin-api.js';
 // 2026.10.0-mk.5 から
 import { MkSelect, MkSwitch, MkAvatar, MkUserName, MkTime, PageWithHeader, useMkSelect, definePage, getUsers } from '@/plugin-api.js';
+import { MkA, MkUrl, MkSensitiveMediaGuard } from '@/plugin-api.js';
 ```
 
 `getUsers(ids)` は ID の重複を除き、`users/show` を 100 件ずつ呼んで公開ユーザー情報 (`PluginUser`) を返す。見えないユーザー (存在しない・凍結中など) は結果から黙って消えるので、件数は入力以下になり順序も保証しない。形式が不正な ID が混ざると、その 100 件のまとまりごと失敗する。`PluginUser` は misskey-js の `UserLite` そのままで (MkAvatar / MkUserName にそのまま渡すため)、upstream が型を変えると一緒に変わる。
@@ -820,6 +821,8 @@ const abortable = host.api<T>('plugin/myplugin/preview', { url }, {
 
 **POST 固定。** 利用者のセッションがそのまま使われる。第3引数の`signal`へ
 `AbortSignal`を渡すと、画面の破棄などに合わせてリクエストを中止できる。
+
+JSON以外の応答には`host.fetch(path, options?)`を使う。自身の`/api/plugin/<name>/`以下だけを、ホストが管理する認証・同一オリジン設定で取得する。取得済みのBlobは`host.openMedia(items, initialId?)`で共有のメディアビューアへ渡せる。`alt`と`filename`は別の用途で、機密性と開示状態も明示できる。パス・MIME・URL解放・センシティブ表示の契約は[ホストのメディア契約](host-media.md)を参照。
 
 ### プレビュー provider
 
@@ -1365,15 +1368,18 @@ definePlugin({ name, pages?, setup })
 host.slot(name, renderer)
 host.preview.register(provider)
 host.api<T>(endpoint, params, { signal? })
+host.fetch(path, options?)
+host.openMedia(items, initialId?)
 
 PluginPage: { path, component, navTitle?, navIcon?, admin? }
 
 型: SlotName / SlotUser / SlotContext / SlotMount / SlotComponent / SlotRenderer
     PluginPage / PageRegistration / PluginUser / PreviewInput / PreviewContext
-    PreviewProvider / PreviewRegistration
+    PreviewProvider / PreviewRegistration / PluginMediaItem
 関数: getUsers(ids)
 再公開: MkInput / MkButton / MkFolder / MkLoading
         MkSelect / MkSwitch / MkAvatar / MkUserName / MkTime / PageWithHeader
+        MkA / MkUrl / MkSensitiveMediaGuard
         useMkSelect / definePage
         MkPluginSecrets (秘密の値の入力欄。props: plugin)
 ```
