@@ -28,15 +28,16 @@ afterEach(() => {
 });
 
 describe('plugin Blob fetch', () => {
-	test('uses the host session, preserves cancellation and refuses redirects', async () => {
+	test('owns same-origin session options despite caller overrides and preserves cancellation', async () => {
 		const response = new Response(new Blob(['image'], { type: 'image/png' }));
 		const fetch = vi.spyOn(window, 'fetch').mockResolvedValue(response);
 		const signal = new AbortController().signal;
 		const api = await host();
-		expect(await api.fetch('/api/plugin/example/media/1?size=large', { signal, headers: { Authorization: 'Bearer forged', Accept: 'image/png' }, credentials: 'include', redirect: 'follow' })).toBe(response);
+		expect(await api.fetch('/api/plugin/example/media/1?size=large', { signal, headers: { Authorization: 'Bearer forged', Accept: 'image/png' }, mode: 'no-cors', credentials: 'include', redirect: 'follow' })).toBe(response);
 		const [url, options] = fetch.mock.calls[0];
 		expect(url).toBe('/api/plugin/example/media/1?size=large');
 		expect(options?.signal).toBe(signal);
+		expect(options?.mode).toBe('same-origin');
 		expect(options?.credentials).toBe('omit');
 		expect(options?.redirect).toBe('error');
 		expect(new Headers(options?.headers).get('Authorization')).toBe('Bearer test-session');
@@ -73,8 +74,25 @@ describe('plugin media viewer', () => {
 		await api.openMedia([{ id: 'alt-image', type: 'image', blob: new Blob(['image'], { type: 'image/png' }), filename: 'download.png', alt: 'A red kite above a lake' }]);
 		const [component, props, events] = mocks.popup.mock.calls[0];
 		await component;
-		expect(props).toMatchObject({ contents: [{ id: 'alt-image', filename: 'download.png', alt: 'A red kite above a lake' }] });
+		expect(props).toMatchObject({ contents: [{ id: 'alt-image', url: 'blob:alt-image', thumbnailUrl: 'blob:alt-image', filename: 'download.png', alt: 'A red kite above a lake' }] });
 		(events as { closed(): void }).closed();
+	});
+
+	test.each([
+		['video', 'video/mp4'], ['audio', 'audio/mpeg'],
+	] as const)('opens browser-safe %s without treating the Blob as an image thumbnail', async (type, mime) => {
+		vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:plugin-media');
+		const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+		const api = await host();
+		await api.openMedia([{ id: 'media', type, blob: new Blob(['media'], { type: mime }), filename: 'download', alt: 'Media description' }]);
+		const [component, props, events] = mocks.popup.mock.calls[0];
+		await component;
+		expect(props).toMatchObject({ contents: [{ id: 'media', type, url: 'blob:plugin-media', filename: 'download', alt: 'Media description' }] });
+		expect((props as { contents: { thumbnailUrl?: string }[] }).contents[0].thumbnailUrl).toBeUndefined();
+		expect(revoke).not.toHaveBeenCalled();
+		(events as { closed(): void }).closed();
+		(events as { closed(): void }).closed();
+		expect(revoke.mock.calls).toEqual([['blob:plugin-media']]);
 	});
 
 	test('passes explicit sensitivity and selection to the lightbox and revokes URLs on close', async () => {
