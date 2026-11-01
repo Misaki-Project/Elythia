@@ -230,7 +230,21 @@ if res.Role.Target == "conditional" {
 return res.Assigned, nil
 ```
 
-条件つきロールまで含めた実効的な判定は用意していない。条件式の評価は利用者ごとに全ロールを読み込む必要があり、この API の利点である「1 回引くだけで終わる」性質が失われるため。
+**HTTPリクエストの認証済み利用者自身**については、optionalな`plugin.ActiveRoleRequest`の`ActiveRoleIDs()`で、有効な手動ロールと条件つきロールのIDを取得できる。空のIDと重複を除いたソート済みsliceを返し、未認証ならnilではない空sliceになる。対象の利用者はhostが認証結果から決め、bodyやqueryから指定する口は無い。
+
+```go
+roles, ok := req.(plugin.ActiveRoleRequest)
+if !ok {
+	return nil, plugin.Errorf(http.StatusServiceUnavailable, "ロールを確認できません")
+}
+roleIDs, err := roles.ActiveRoleIDs()
+if err != nil {
+	return nil, err
+}
+return roleIDs, nil
+```
+
+必要な依存が未配線、またはロール一覧・手動付与・条件評価に必要な利用者の読取が失敗した場合は、IDを返さずerrorになる。部分的なロールや空sliceで成功した扱いにはしない。**capabilityが無い場合も、lookupが失敗した場合も、ロール別の許可や上限を緩めずに処理を止めること。** 条件式の意味と本体の管理者・モデレーター判定、効果ポリシーの解決は変更しない。`roles/assignment-show`の手動付与だけを調べる契約もそのまま。
 
 非公開ロールで `roles/assignment-show` を使うと、**付与されていない利用者には `NO_SUCH_ROLE`** が返る（存在の有無を漏らさないため）。条件つきかつ非公開のロールは、条件を満たす利用者にもこうなる。`admin/roles/assignment-show` にこの秘匿は無く、モデレーター以上なら非公開ロールも読める。
 
@@ -1257,6 +1271,10 @@ type Request interface
   UserID() string
   IsModerator() bool
   IsAdministrator() bool
+
+type ActiveRoleRequest interface
+  Request
+  ActiveRoleIDs() ([]string, error)
 
 type Storage interface
   DB() *sql.DB

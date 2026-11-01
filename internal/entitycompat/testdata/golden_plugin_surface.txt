@@ -32,6 +32,8 @@ plugin/plugintest:   field ManagedAccount.Suspended bool
 plugin/plugintest:   field PeerSend.Host string
 plugin/plugintest:   field PeerSend.ID string
 plugin/plugintest:   field PeerSend.Payload json.RawMessage
+plugin/plugintest:   field Request.ActiveRoleError error
+plugin/plugintest:   field Request.ActiveRoleIDs []string
 plugin/plugintest:   field Request.Administrator bool
 plugin/plugintest:   field Request.Body string
 plugin/plugintest:   field Request.Ctx context.Context
@@ -142,6 +144,7 @@ plugin:   method Accounts.Create(context.Context, string) (Account, error)
 plugin:   method Accounts.Delete(context.Context, string) error
 plugin:   method Accounts.List(context.Context) ([]Account, error)
 plugin:   method Accounts.UpdateProfile(context.Context, string, ProfileUpdate) error
+plugin:   method ActiveRoleRequest.ActiveRoleIDs() ([]string, error)
 plugin:   method Caller.Call(context.Context, string, any) (json.RawMessage, error)
 plugin:   method Config.Unmarshal(any) error
 plugin:   method Context.API() API
@@ -207,6 +210,7 @@ plugin: type APIError struct
 plugin: type Account struct
 plugin: type Accounts interface
 plugin: type ActiveRoleAssignment struct
+plugin: type ActiveRoleRequest interface
 plugin: type Blob struct
 plugin: type Caller interface
 plugin: type Config interface

@@ -30,6 +30,10 @@ Elythia 本体を変更する人向け。**公開面を広げてよい条件**�
 
 `EffectivePolicyRequest.ActiveAssignments` と `plugin.ActiveRoleAssignment` の追加も同じ扱い。`EffectivePolicyRequest` はhostが組み立ててproviderへ渡す入力であり、**`RoleIDs` は変更されない**。そのため`RoleIDs`だけを読む既存providerの挙動は変わらず、新しいsliceを無視する実装にも影響はない。`APIVersion`は1のまま。
 
+`plugin.ActiveRoleRequest`もoptionalな追加interfaceであり、既存の`plugin.Request`にはmethodを追加しない。既存のRequest実装はそのままコンパイルできる。認証済みの呼出元自身の有効な手動・条件つきロールIDだけを返し、匿名は非nilの空slice、必要な依存の未配線・lookup失敗はIDなしのerrorになる。利用するpluginはtype assertionとerrorを確認し、判定できない場合は許可や上限を緩めない。`APIVersion`は1のまま。
+
+テスト用の`plugintest.Request`には`ActiveRoleIDs []string`と`ActiveRoleError error`を追加する。このexported structも**keyed struct literalだけ**を互換対象とする（`UserID: ...`のようにフィールド名を書く）。既存のkeyed literalでは省略したfixtureが従来の動作を変えず、認証済みの場合は空のロール一覧になる。positional / unkeyed literalはフィールド追加でソースがコンパイルできなくなるためサポートしない。
+
 `EffectivePolicyContribution.ReplaceRoleID`の追加も同じ扱い。**keyed struct literalで組み立てる限り**、**未設定なら追加contributionのまま**なので既存providerの挙動は変わらず、pluginは「対象ロールのネイティブcontributionを置き換える」という新しい契約にだけオプトインする。置換の`Priority`/`Order`制約はprovider作者の誤りを弾くもので、既存providerの出力形式は変えない。`APIVersion`は1のまま。
 
 `EffectivePolicyRequest`をpluginのtestやヘルパーで組み立てる場合は`plugin.Definition`と同じく**keyed struct literalだけ**を互換対象とする（`RoleIDs: ...`のようにフィールド名を書く）。外部プラグインのpositional / unkeyed literalはサポートしない。

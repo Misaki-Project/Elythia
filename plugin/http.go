@@ -107,6 +107,15 @@ type Request interface {
 	IsAdministrator() bool
 }
 
+// ActiveRoleRequest is an optional extension implemented by host requests.
+// ActiveRoleIDs returns the authenticated caller's active manual and conditional
+// role IDs. Lookup failures return an error, never a successful empty fallback.
+// Plugins must fail closed when role-aware access or limits cannot be resolved.
+type ActiveRoleRequest interface {
+	Request
+	ActiveRoleIDs() ([]string, error)
+}
+
 // StatusError lets a handler choose the HTTP status of an error response.
 // Plain errors become 500 with a generic message.
 type StatusError struct {

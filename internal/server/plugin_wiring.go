@@ -22,6 +22,7 @@ import (
 	"github.com/elythia-network/elythia/internal/bgwork"
 	coredrive "github.com/elythia-network/elythia/internal/core/drive"
 	corerole "github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/pluginstore"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/queue/driver"
@@ -207,6 +208,9 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			group := api.Group(pluginRoutePrefix+def.Name, middleware.RejectAppToken())
 			if needsRoutes {
 				r := &pluginRouter{group: group, roles: s.pluginRoles}
+				if s.roleService != nil {
+					r.roleLister = s.roleService
+				}
 				if err := def.Routes(pctx, r); err != nil {
 					return fmt.Errorf("plugin %q: ルート登録に失敗しました: %w", def.Name, err)
 				}
@@ -760,9 +764,14 @@ func (c *pluginContext) startGo(fn func(context.Context)) {
 
 // --- Router ---
 
+type pluginActiveRolesProvider interface {
+	GetUserRolesStrict(string) ([]*model.Role, error)
+}
+
 type pluginRouter struct {
-	group *echo.Group
-	roles middleware.RoleChecker
+	group      *echo.Group
+	roles      middleware.RoleChecker
+	roleLister pluginActiveRolesProvider
 	// err holds the first registration failure (pluginJobs と同じ方針)。
 	err error
 }
@@ -772,7 +781,7 @@ func (r *pluginRouter) GET(path string, h plugin.Handler) {
 		r.err = fmt.Errorf("パス %q は mk-go の予約です (_ で始まるパスは使えません)", path)
 		return
 	}
-	r.group.GET(path, wrapPluginHandler(h, r.roles))
+	r.group.GET(path, wrapPluginHandler(h, r.roles, r.roleLister))
 }
 
 func (r *pluginRouter) POST(path string, h plugin.Handler) {
@@ -780,7 +789,7 @@ func (r *pluginRouter) POST(path string, h plugin.Handler) {
 		r.err = fmt.Errorf("パス %q は mk-go の予約です (_ で始まるパスは使えません)", path)
 		return
 	}
-	r.group.POST(path, wrapPluginHandler(h, r.roles))
+	r.group.POST(path, wrapPluginHandler(h, r.roles, r.roleLister))
 }
 
 // reservedPluginPath reports whether mk-go owns this path.
@@ -797,9 +806,13 @@ func reservedPluginPath(path string) bool {
 // エラーはhost-ownedのStatusErrorまたはcoded status errorのときだけメッセージを
 // 返す。素のerrorを返すとプラグインの内部事情 (DBのエラー文字列など) がそのまま
 // 外に出るため、ログにだけ残して汎用メッセージを返す。
-func wrapPluginHandler(h plugin.Handler, roles middleware.RoleChecker) echo.HandlerFunc {
+func wrapPluginHandler(h plugin.Handler, roles middleware.RoleChecker, roleListers ...pluginActiveRolesProvider) echo.HandlerFunc {
+	var roleLister pluginActiveRolesProvider
+	if len(roleListers) > 0 {
+		roleLister = roleListers[0]
+	}
 	return func(c echo.Context) error {
-		res, err := h(&pluginRequest{c: c, roles: roles})
+		res, err := h(&pluginRequest{c: c, roles: roles, roleLister: roleLister})
 		if err != nil {
 			se, code := plugin.ExtractStatusError(err)
 			if se != nil {
@@ -867,7 +880,8 @@ func writePluginBlob(c echo.Context, b plugin.Blob) error {
 // --- Request ---
 
 type pluginRequest struct {
-	c echo.Context
+	roleLister pluginActiveRolesProvider
+	c          echo.Context
 	// roles は権限判定に使う。未配線なら常に false を返す (画面は出ても
 	// API は通らない、という安全側に倒す)。
 	roles middleware.RoleChecker
@@ -908,6 +922,34 @@ func (r *pluginRequest) IsAdministrator() bool {
 	}
 	return r.roles.IsAdministrator(id)
 }
+
+// ActiveRoleIDs returns the authenticated caller's active manual and conditional
+// role IDs. Errors propagate so a caller cannot relax role-specific restrictions.
+func (r *pluginRequest) ActiveRoleIDs() ([]string, error) {
+	id := r.UserID()
+	if id == "" {
+		return []string{}, nil
+	}
+	if r.roleLister == nil {
+		return nil, errors.New("active role lookup is unavailable")
+	}
+	roles, err := r.roleLister.GetUserRolesStrict(id)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(roles))
+	ids := make([]string, 0, len(roles))
+	for _, role := range roles {
+		if role != nil && role.ID != "" && !seen[role.ID] {
+			seen[role.ID] = true
+			ids = append(ids, role.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+var _ plugin.ActiveRoleRequest = (*pluginRequest)(nil)
 
 // --- API ---
 

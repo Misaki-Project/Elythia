@@ -623,6 +623,33 @@ func (s *Service) GetUserRoles(userID string) ([]*model.Role, error) {
 	return snapshot.roles, nil
 }
 
+// GetUserRolesStrict resolves complete active manual and conditional roles,
+// returning no roles when any required lookup fails. It never reads or writes
+// the lenient per-user cache, which may contain incomplete conditional results.
+func (s *Service) GetUserRolesStrict(userID string) ([]*model.Role, error) {
+	if userID == "" {
+		return nil, nil
+	}
+	if s.assignmentRepo == nil || s.roleRepo == nil {
+		return nil, errors.New("active role repositories are unavailable")
+	}
+	assignments, err := s.assignmentRepo.ListByUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	assigned := make([]*model.Role, 0, len(assignments))
+	for _, assignment := range assignments {
+		if assignment.Role != nil {
+			assigned = append(assigned, assignment.Role)
+		}
+	}
+	conditional, err := s.evaluateConditionalRolesStrict(userID, assigned)
+	if err != nil {
+		return nil, err
+	}
+	return cloneRoles(append(assigned, conditional...)), nil
+}
+
 func (s *Service) finishUserRoleFlight(userID string) {
 	s.userRoleCacheMu.Lock()
 	defer s.userRoleCacheMu.Unlock()
@@ -720,12 +747,19 @@ func (s *Service) GetUserAssign(userID, roleID string, at time.Time) (*model.Rol
 // callers fall back to assigned roles only. Matches upstream TS where
 // evalCond swallows all errors as false.
 func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role) []*model.Role {
+	matched, _ := s.evaluateConditionalRolesStrict(userID, assigned)
+	return matched
+}
+
+// evaluateConditionalRolesStrict preserves formula evaluation semantics while
+// making missing prerequisites and repository failures visible to strict callers.
+func (s *Service) evaluateConditionalRolesStrict(userID string, assigned []*model.Role) ([]*model.Role, error) {
 	if s.userRepo == nil {
-		return nil
+		return nil, errors.New("conditional role user repository is unavailable")
 	}
 	allRoles, err := s.listRolesCached()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	// 早期 short-circuit: conditional role が 1 つも無いなら user fetch を
 	// 省略する (= upstream TS と同 optimization)。これで大多数のインスタンス
@@ -738,11 +772,14 @@ func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role
 		}
 	}
 	if !hasCond {
-		return nil
+		return nil, nil
 	}
 	user, err := s.userRepo.FindByID(userID)
-	if err != nil || user == nil {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, errors.New("conditional role user is unavailable")
 	}
 	matched := make([]*model.Role, 0)
 	for _, r := range allRoles {
@@ -759,7 +796,7 @@ func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role
 			matched = append(matched, r)
 		}
 	}
-	return matched
+	return matched, nil
 }
 
 // isRootUser checks if the user is the root user.
