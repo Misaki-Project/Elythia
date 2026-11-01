@@ -52,6 +52,31 @@ function card(response: PreviewResponse = data(), ctx = context) {
 	return render(FxPreview, { props: { input, data: response, context: ctx }, global: globals });
 }
 
+function retryCard(response: PreviewResponse = { state: 'pending' }) {
+	return render(provider.component as typeof FxPreview, { props: { input, data: response, context }, global: globals });
+}
+
+async function flushPreview(): Promise<void> {
+	for (let step = 0; step < 12; step++) await nextTick();
+}
+
+function previewCalls() {
+	return api.mock.calls.filter(call => call[0].endsWith('/preview'));
+}
+
+function retryButton(view: ReturnType<typeof retryCard>): HTMLButtonElement {
+	const button = view.container.querySelector<HTMLButtonElement>('[data-fx-preview-retry]');
+	expect(button).not.toBeNull();
+	return must(button);
+}
+
+function mixedData() {
+	const response = data();
+	response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1', alt: 'main photo' }];
+	response.post.quote = { id: '9876543210', url: 'https://x.com/bob/status/9876543210', text: 'quoted body', author: { name: 'Bob', screenName: 'bob' }, images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/quote-image/0?noteId=note-1', alt: 'quote photo' }], hasVideo: true, video: { provider: 'x', embedToken: '0123456789abcdef0123456789abcdef' } };
+	return response;
+}
+
 function must<T>(value: T | null | undefined): T {
 	if (value == null) throw new Error('Required fixture element is missing');
 	return value;
@@ -120,6 +145,136 @@ test('already aborted and abort-ignoring late responses cannot escape the loader
 	const pending = loadPreview(input, context, controller.signal);
 	controller.abort(); finish(data());
 	await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+});
+
+test('eight pending polls settle with an explicit bounded retry that can become ready', async () => {
+	vi.useFakeTimers();
+	api.mockImplementation(async path => path.endsWith('/capabilities') ? { externalFetchEnabled: true } : { state: 'pending', post: data().post, body: 'audit body' });
+	await register(); const view = coordinate(); await flushPreview();
+	await vi.advanceTimersByTimeAsync(7 * 750); await flushPreview();
+	expect(previewCalls()).toHaveLength(8);
+	expect(retryButton(view).disabled).toBe(false);
+	expect(view.container.textContent).not.toContain('public body');
+	expect(view.container.textContent).not.toContain('audit body');
+	await vi.advanceTimersByTimeAsync(60_000); await flushPreview();
+	expect(previewCalls()).toHaveLength(8);
+	api.mockResolvedValue(data());
+	await fireEvent.click(retryButton(view)); await flushPreview();
+	expect(previewCalls()).toHaveLength(9);
+	expect(view.getByText('public body')).toBeTruthy();
+	expect(view.container.querySelector('[data-fx-preview-retry]')).toBeNull();
+});
+
+test('poll batches honor valid server nextPollAt and retain the minimum delay', async () => {
+	vi.useFakeTimers();
+	api.mockResolvedValueOnce({ state: 'pending', nextPollAt: new Date(Date.now() + 2_000).toISOString() }).mockResolvedValueOnce({ state: 'pending', nextPollAt: 'invalid' }).mockResolvedValue(data());
+	const pending = loadPreview(input, context, new AbortController().signal); await flushPreview();
+	await vi.advanceTimersByTimeAsync(1_999); expect(previewCalls()).toHaveLength(1);
+	await vi.advanceTimersByTimeAsync(1); expect(previewCalls()).toHaveLength(2);
+	await vi.advanceTimersByTimeAsync(749); expect(previewCalls()).toHaveLength(2);
+	await vi.advanceTimersByTimeAsync(1); await expect(pending).resolves.toMatchObject({ state: 'ready' });
+});
+
+test('retry is single flight and a rejected batch stays retryable after cooldown', async () => {
+	vi.useFakeTimers();
+	let reject!: (reason: Error) => void;
+	api.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+	const view = retryCard();
+	const button = retryButton(view);
+	button.click(); button.click(); button.click(); await flushPreview();
+	expect(previewCalls()).toHaveLength(1); expect(retryButton(view).disabled).toBe(true);
+	reject(new Error('temporary failure')); await flushPreview();
+	expect(view.container.querySelector('[data-fx-preview-error]')).toBeTruthy();
+	expect(retryButton(view).disabled).toBe(true);
+	for (let click = 0; click < 10; click++) button.click();
+	await vi.advanceTimersByTimeAsync(999); expect(previewCalls()).toHaveLength(1); expect(retryButton(view).disabled).toBe(true);
+	await vi.advanceTimersByTimeAsync(1); expect(retryButton(view).disabled).toBe(false);
+	api.mockResolvedValue(data()); await fireEvent.click(retryButton(view)); await flushPreview();
+	expect(view.getByText('public body')).toBeTruthy(); expect(previewCalls()).toHaveLength(2);
+});
+
+test('a manually retried pending batch also stops at eight without background polling', async () => {
+	vi.useFakeTimers(); api.mockResolvedValue({ state: 'pending' });
+	const view = retryCard(); await fireEvent.click(retryButton(view)); await flushPreview();
+	await vi.advanceTimersByTimeAsync(7 * 750); await flushPreview();
+	expect(previewCalls()).toHaveLength(8); expect(retryButton(view).disabled).toBe(true);
+	await vi.advanceTimersByTimeAsync(60_000); expect(previewCalls()).toHaveLength(8); expect(retryButton(view).disabled).toBe(false);
+});
+
+test.each(['unmount', 'cw', 'inactive', 'viewport', 'detail', 'source', 'input', 'session', 'parent'] as const)('retry aborts and rejects late publication on %s change', async change => {
+	let finish!: (value: PreviewResponse) => void;
+	api.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+	const view = retryCard(); await fireEvent.click(retryButton(view)); await flushPreview();
+	const signal = previewCalls()[0][2].signal;
+	if (change === 'unmount') view.unmount();
+	else if (change === 'session') { initApi(api as PluginHost['api'], media as PluginHost['fetch'], viewer); await nextTick(); } else if (change === 'input') await view.rerender({ input: { kind: 'url', href: 'https://x.com/bob/status/9876543210' } });
+	else if (change === 'parent') await view.rerender({ data: { state: 'disabled' } });
+	else await view.rerender({ context: { ...context, ...(change === 'cw' ? { revealed: false } : change === 'inactive' ? { active: false } : change === 'viewport' ? { inViewport: false } : change === 'detail' ? { detail: false } : { source: { kind: 'note', noteId: 'note-2' } }) } });
+	expect(signal.aborted).toBe(true);
+	finish(data()); await flushPreview();
+	expect(view.queryByText('public body')).toBeNull(); expect(media).not.toHaveBeenCalled();
+	if (change === 'cw' || change === 'inactive' || change === 'viewport' || change === 'detail') {
+		expect(retryButton(view).disabled).toBe(true);
+		await view.rerender({ context }); expect(retryButton(view).disabled).toBe(false);
+		expect(previewCalls()).toHaveLength(1);
+		api.mockResolvedValue(data()); await fireEvent.click(retryButton(view)); await flushPreview();
+		expect(view.getByText('public body')).toBeTruthy(); expect(previewCalls()).toHaveLength(2);
+	}
+});
+
+test('retry overrides are discarded on note ownership change and use only the new source', async () => {
+	api.mockResolvedValue(data()); const view = retryCard();
+	await fireEvent.click(retryButton(view)); await flushPreview(); expect(view.getByText('public body')).toBeTruthy();
+	await view.rerender({ context: { ...context, source: { kind: 'note', noteId: 'note-2' } } });
+	expect(view.queryByText('public body')).toBeNull();
+	api.mockResolvedValue({ state: 'pending', post: data().post });
+	await fireEvent.click(retryButton(view)); await flushPreview();
+	expect(previewCalls()[1][1]).toEqual({ noteId: 'note-2', postId: '1234567890' });
+	expect(view.queryByText('public body')).toBeNull(); view.unmount();
+});
+
+test.each(['success', 'failure'] as const)('main and quote photos coexist with their videos after image %s', async result => {
+	if (result === 'failure') media.mockRejectedValue(new Error('image failed'));
+	const view = card(mixedData()); await flushPreview();
+	if (result === 'success') {
+		expect(view.container.querySelector('img[alt="main photo"]')).toBeTruthy();
+		expect(view.container.querySelector('img[alt="quote photo"]')).toBeTruthy();
+	}
+	expect(view.container.querySelector('[data-fx-video-target="main"] [data-fx-video-play]')).toBeTruthy();
+	expect(view.container.querySelector('[data-fx-video-target="quote"] [data-fx-video-play]')).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeTruthy();
+	expect(view.container.querySelector('iframe')).toBeNull(); expect(api).not.toHaveBeenCalled();
+});
+
+test('a newly mounted pending card respects the server retry time without issuing work', async () => {
+	vi.useFakeTimers(); const view = retryCard({ state: 'pending', nextPollAt: new Date(Date.now() + 2_000).toISOString() });
+	expect(retryButton(view).disabled).toBe(true);
+	await fireEvent.click(retryButton(view)); expect(previewCalls()).toHaveLength(0);
+	await vi.advanceTimersByTimeAsync(1_999); expect(retryButton(view).disabled).toBe(true);
+	await vi.advanceTimersByTimeAsync(1); expect(retryButton(view).disabled).toBe(false); expect(previewCalls()).toHaveLength(0);
+});
+
+test('a session change during an initial loader request rejects its late public body', async () => {
+	let finish!: (value: PreviewResponse) => void;
+	api.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+	const pending = loadPreview(input, context, new AbortController().signal);
+	initApi(api as PluginHost['api'], media as PluginHost['fetch'], viewer); finish(data());
+	await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+});
+
+test('image completion cannot replace a mounted main or quote full-post iframe', async () => {
+	const finish: Array<(response: Response) => void> = [];
+	media.mockImplementation(() => new Promise(resolve => { finish.push(resolve); }));
+	api.mockImplementation(async (_path, params) => ({ url: fullEmbed(params).replace('id=1234567890', params.target === 'quote' ? 'id=9876543210' : 'id=1234567890') }));
+	const view = card(mixedData()); await flushPreview();
+	await waitFor(() => expect(view.container.querySelectorAll('[data-fx-video-play]')).toHaveLength(2));
+	for (const button of view.container.querySelectorAll('[data-fx-video-play]')) await fireEvent.click(button);
+	await waitFor(() => expect(view.container.querySelectorAll('iframe')).toHaveLength(2));
+	const frames = Array.from(view.container.querySelectorAll('iframe'));
+	for (const resolve of finish) resolve(new Response(new Blob(['png'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+	await flushPreview(); expect(Array.from(view.container.querySelectorAll('iframe'))).toEqual(frames);
+	expect(view.container.querySelector('img[alt="main photo"]')).toBeTruthy(); expect(view.container.querySelector('img[alt="quote photo"]')).toBeTruthy();
 });
 test('unrevealed detail CW opens, collapses, aborts, and rejects its late result', async () => {
 	let finish!: (value: PreviewResponse) => void;

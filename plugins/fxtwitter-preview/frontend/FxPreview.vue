@@ -27,7 +27,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
 	<FxMediaGrid v-if="showAttachmentMedia && renderedImages.length" :key="`images:${data.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="data.post.isSensitive" @open="openImage"/>
 	<FxVideoPreview
-		v-else-if="showAttachmentMedia && data.post.video"
+		v-if="showAttachmentMedia && data.post.video"
 		:key="`video:${data.post.id}`"
 		:video="data.post.video"
 		:posterSrc="posterSrc"
@@ -56,7 +56,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<p v-if="!showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
 		<FxMediaGrid v-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${data.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="data.post.quote.isSensitive" @open="openQuoteImage"/>
 		<FxVideoPreview
-			v-else-if="showAttachmentMedia && data.post.quote.video"
+			v-if="showAttachmentMedia && data.post.quote.video"
 			:key="`quote-video:${data.post.quote.id}`"
 			:video="data.post.quote.video"
 			:posterSrc="quotePosterSrc"

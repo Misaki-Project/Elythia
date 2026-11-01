@@ -4,11 +4,11 @@
 
 ## 1. 適用条件と復旧準備
 
-依存の順序は、[PR29（上流同期・履歴安全性）](https://github.com/Misaki-Project/Elythia/pull/29) → [PR30（host API）](https://github.com/Misaki-Project/Elythia/pull/30) → [PR31（Fx 移植）](https://github.com/Misaki-Project/Elythia/pull/31) です。2026-10-31 の GitHub 確認時点で、PR29 は同日04:11:57 UTCに merge 済み（merge commit `a0e8796c2f3911c752a25c5ac70fb001c5cb4459`）、PR30/31 は Draft・未 merge です。今後はレビューと CI を確認して PR30、PR31 の順に適用します。merge 状態と本番に導入済みであることは別です。隔離検証では、依存変更を含むレビュー済み最終 plugin commit を直接 checkout できます。
+依存の順序は、[PR29（上流同期・履歴安全性）](https://github.com/Misaki-Project/Elythia/pull/29) → [PR30（host API）](https://github.com/Misaki-Project/Elythia/pull/30) → [PR31（Fx 移植）](https://github.com/Misaki-Project/Elythia/pull/31) です。2026-11-01 の GitHub 確認時点で、PR29 は2026-10-31 04:11:57 UTCに merge 済み（merge commit `a0e8796c2f3911c752a25c5ac70fb001c5cb4459`）、PR30/31 はレビュー可能・未 merge です。今後はレビューと CI を確認して PR30、PR31 の順に適用します。merge 状態と本番に導入済みであることは別です。隔離検証では、依存変更を含むレビュー済み最終 plugin commit を直接 checkout できます。
 
 同じ確認時点で、PR30 の base はすでに `Misaki-develop` へ変更済みで、PR31 の base は `feature/fxtwitter-host-api-20261030` のままです。今後 host の PR30 を merge した後、運営者は repository の merge 方針を確認し、PR31 の base を `Misaki-develop` へ変更して差分と CI を再確認します。将来の squash/rebase によって祖先が変わり差分が膨らむ場合は、その方針に合わせた branch の再整備と再レビューが必要です。未確認の merge 方式や force-push を手順として固定しません。
 
-確認済みの依存点は、同期 commit `076c0d2f3823f316c1ccdac692fc8a3f7c7e6bb3`（Misaki 基点 `29715b8954ea844ff2799d50a8c3903406ca7c6a`、上流 `2a026d427f9e35558b6a03eac06348d7882834dc`）、host commit `1bd68821116a6926445c9de5e154f1c052f93336` です。以下の `<REVIEWED_PLUGIN_SHA>` は、最終レビュー・CI を通過し、これらを含む **40桁の commit SHA** に置き換えます。ブランチ名や未確認のタグで代用しません。
+確認済みの依存点は、同期 commit `076c0d2f3823f316c1ccdac692fc8a3f7c7e6bb3`（Misaki 基点 `29715b8954ea844ff2799d50a8c3903406ca7c6a`、上流 `2a026d427f9e35558b6a03eac06348d7882834dc`）、レビュー修正済み host commit `cf66aec692e8909461b3d6aaa3379d61385fef48` です。以下の `<REVIEWED_PLUGIN_SHA>` は、最終レビュー・CI を通過し、これらを含む **40桁の commit SHA** に置き換えます。ブランチ名や未確認のタグで代用しません。
 
 旧117まで適用済みの既存 DB は、先に [Misaki migration 履歴照合手順](../misaki-migration-reconciliation.md) を読んでください。PR29 の guard は旧履歴を自動変換しません。バックアップをアプリから切り離した検証 DB へ復元し、全履歴と core/local 台帳の前提を照合する手順が必要です。guard の無効化や、番号だけを見た台帳の書換えで先へ進めません。
 
@@ -36,7 +36,7 @@ set -eu
 git checkout --detach '<REVIEWED_PLUGIN_SHA>'
 test "$(git rev-parse HEAD)" = '<REVIEWED_PLUGIN_SHA>'
 git merge-base --is-ancestor 076c0d2f3823f316c1ccdac692fc8a3f7c7e6bb3 HEAD
-git merge-base --is-ancestor 1bd68821116a6926445c9de5e154f1c052f93336 HEAD
+git merge-base --is-ancestor cf66aec692e8909461b3d6aaa3379d61385fef48 HEAD
 
 # 3つとも未配置の専用 checkout でだけ実施。存在する場合は止めて由来を確認する
 test ! -e plugins/genshin
@@ -51,6 +51,7 @@ printf '%s\n' \
 GOWORK=off go run ./tools/pluginbuild -include-disabled-dir plugins/fxtwitter-preview
 docker build -f Dockerfile.bundled \
   --build-arg PLUGIN_INCLUDE_DISABLED_DIR=plugins/fxtwitter-preview \
+  --label org.opencontainers.image.revision='<REVIEWED_PLUGIN_SHA>' \
   -t '<LOCAL_IMAGE_TAG>' .
 ```
 
@@ -58,7 +59,9 @@ docker build -f Dockerfile.bundled \
 
 `elythia-plugin.yml` の `disabled: true` はそのままです。これはビルドの既定選択で、runtime 設定とは別です。通常の generator では Fx を除外し、上の `-include-disabled-dir`／Docker build argument は Fx だけを追加選択します。`rolelevel` と配置した3つは含まれ、他の disabled sample は選びません。生成された `cmd/elythia/plugins_generated.go`、`frontend/packages/frontend/src/server-plugins.generated.ts` と `mk-plugins.generated.json` でこの集合を確認してください。
 
-`<LOCAL_IMAGE_TAG>` は運営者が選ぶローカルタグです。registry、公開先、image digest は未確定で、この手順は push しません。既存の `misaki-genshin-image` workflow が変更なしで Fx を含むとは限りません。ここでは選択 argument を渡すローカルビルドを明示しています。ビルド成功後の `docker image inspect '<LOCAL_IMAGE_TAG>' --format '{{.Id}}'` とソース SHA を記録します。本番への配布・実際の image digest 固定・サービス切替は、運用環境を確認した別の手順で実施します。
+`<LOCAL_IMAGE_TAG>` は運営者が選ぶローカルタグです。registry、公開先、image digest は未確定で、この手順は push しません。既存の `misaki-genshin-image` workflow が変更なしで Fx を含むとは限りません。ここでは選択 argument を渡すローカルビルドを明示しています。ビルド成功後の `docker image inspect '<LOCAL_IMAGE_TAG>' --format '{{.Id}}'` とソース SHA を記録し、`org.opencontainers.image.revision` が checkout した `<REVIEWED_PLUGIN_SHA>` と一致することも確認します。この手順の作成時点では、この image のビルド・公開は実施していません。本番への配布・実際の image digest 固定・サービス切替は、運用環境を確認した別の手順で実施します。
+
+旧 plugin commit `68ff75dc0fe6c2f2854315ca5fa31c3efc92a17a` を固定した updater-v2 のプロファイルは、新しい SHA の適用前に別途レビューして更新する必要があります。この手順では updater 自体を書き換えず、revision の偽装や強制適用で確認を迂回しません。
 
 ## 3. 初回は外部取得 OFF
 
