@@ -225,6 +225,28 @@ func (m *MockFollowingRepository) ListFollowersToNotify(userID string) ([]*model
 	return rows, nil
 }
 
+// FollowsAnyOnHost mirrors repository.followingRepository.FollowsAnyOnHost.
+func (m *MockFollowingRepository) FollowsAnyOnHost(followerID, host string) (bool, error) {
+	for _, f := range m.Followings {
+		if f.FollowerID == followerID && f.FolloweeHost != nil && *f.FolloweeHost == host {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ListLocalFollowerIDsLimit mirrors repository.followingRepository.ListLocalFollowerIDsLimit.
+func (m *MockFollowingRepository) ListLocalFollowerIDsLimit(followeeID string, limit int) ([]string, error) {
+	ids, err := m.ListLocalFollowerIDs(followeeID)
+	if err != nil || len(ids) <= limit {
+		return ids, err
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	return ids[:limit], nil
+}
+
 // ListLocalFollowerIDs mirrors repository.followingRepository.ListLocalFollowerIDs
 // (followeeId 一致かつ followerHost IS NULL の followerId を全件)。
 // 実装同様 followerId 昇順で返し、caller が順序に依存できるようにする。

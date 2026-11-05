@@ -30,10 +30,19 @@ type FederationDeliverer interface {
 	DeliverToUser(signerUserID string, recipient *model.User, body []byte) error
 }
 
-// ReversiStreamPublisher publishes `invited` events to a local user's
-// reversi stream topic (#417 P2)。実装は internal/stream.ReversiGamePublisher。
+// ReversiStreamPublisher publishes `invited` and `matched` events to a local
+// user's reversi stream topic (#417 P2、#3946)。実装は
+// internal/stream.ReversiGamePublisher。
 type ReversiStreamPublisher interface {
 	PublishInvited(targetUserID string, inviter *model.User)
+	PublishMatched(targetUserID string, game map[string]any)
+}
+
+// InviteObserver is told about invitations to local users, with the game
+// (#3942). プラグインが管理するアカウントへの通知 (core/pluginnotify) が実装する。
+// stream の `invited` と違い、対局の ID を渡す。
+type InviteObserver interface {
+	ReversiInvited(ctx context.Context, inviteeID, inviterID, gameID string)
 }
 
 // Handler handles reversi/* endpoints.
@@ -46,6 +55,7 @@ type Handler struct {
 	fedCache     *corereversi.FederationIDCache
 	userRepo     repository.UserRepository
 	streamPub    ReversiStreamPublisher
+	inviteObs    InviteObserver
 	fedChecker   FederationAvailabilityChecker
 	remoteLookup RemoteUserLookup
 	// lites は reversi/invitations の招待者 (UserLite) の instance と絵文字を
@@ -114,6 +124,12 @@ func (h *Handler) SetRemoteUserLookup(r RemoteUserLookup) {
 // される (Match 側で h.userRepo != nil guard がある)。
 func (h *Handler) SetStreamPublisher(p ReversiStreamPublisher) {
 	h.streamPub = p
+}
+
+// SetInviteObserver attaches the observer told about local invitations
+// (#3942).
+func (h *Handler) SetInviteObserver(o InviteObserver) {
+	h.inviteObs = o
 }
 
 // SetFederation attaches federation support.
@@ -279,7 +295,7 @@ func (h *Handler) Games(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -320,6 +336,12 @@ func (h *Handler) Invitations(c echo.Context) error {
 		// 招待を受けている側 (User2) のみ対象。自分が招待側 (User1) のゲームは
 		// invitations UI の文脈的に表示しない。
 		if g.User2ID != user.ID {
+			continue
+		}
+		// Elythia: 受けた対局は招待として出さない (#3949)。本家は受けた時点で招待を
+		// 消す。受けた後に招待した人が去っても対局は残すので、ここで除かないと
+		// 招待一覧に出続ける
+		if h.svc != nil && h.svc.WasInvitationAccepted(c.Request().Context(), g) {
 			continue
 		}
 		if g.User1 == nil {
@@ -370,6 +392,7 @@ func (h *Handler) ShowGame(c echo.Context) error {
 		if err := h.sendJoinForAcceptedInvite(c, viewer, game); errors.Is(err, corelocalfederation.ErrFederationDisabled) {
 			return federationDisabledResponse(c)
 		}
+		h.acceptInvitation(c, game)
 	}
 	return c.JSON(http.StatusOK, packGame(h.entityPacker, game, h.idGen))
 }
@@ -446,10 +469,11 @@ func (h *Handler) Match(c echo.Context) error {
 	// を流用し、相手に Join を返すだけにする。これをやらないと /match が毎回
 	// 新しいゲーム + 新しい session_id を作って二重招待になり、state 伝播が
 	// 噛み合わなくなる。
-	if existing := h.findPendingInvitationFrom(user.ID, req.UserID); existing != nil {
+	if existing := h.findInvitationFrom(c, user.ID, req.UserID); existing != nil {
 		if err := h.sendJoinForAcceptedInvite(c, user, existing); errors.Is(err, corelocalfederation.ErrFederationDisabled) {
 			return federationDisabledResponse(c)
 		}
+		h.acceptInvitation(c, existing)
 		return c.JSON(http.StatusOK, packGame(h.entityPacker, existing, h.idGen))
 	}
 
@@ -460,11 +484,21 @@ func (h *Handler) Match(c echo.Context) error {
 	// 上の inbound-accept (mk-go 独自の Join 送信) が既に担うのでここでは扱わない。
 	// multiple=true は upstream 同様このスキップで毎回新規作成する (#1774)。
 	if !req.Multiple {
-		if existing := h.findPendingInvitationFrom(req.UserID, user.ID); existing != nil && h.withinMatchDedupWindow(existing) {
+		existing := h.findPendingInvitationFrom(req.UserID, user.ID)
+		// Elythia: 相手が受けた自分発の招待は、本家と同じく対局を返す (#3946)。本家は
+		// 受けた時点で行を作り、作られてから 3 分以内の対局を返す (ReversiService.ts:
+		// 103-112)。こちらは受けてから 3 分で数える。作られてからの 3 分で切ると、
+		// 招待から 3 分を過ぎて受けられたときに新しい招待を作ってしまう。stream の
+		// matched を取りこぼしても、画面は次の heartbeat で対局へ移れる
+		if existing != nil && h.svc != nil && h.svc.InvitationAcceptedRecently(c.Request().Context(), existing.ID) {
+			return c.JSON(http.StatusOK, packGame(h.entityPacker, existing, h.idGen))
+		}
+		if existing != nil && h.withinMatchDedupWindow(existing) {
 			// まだ相手が accept していない自分発の招待。upstream は招待を
 			// Redis にしか置かず、対局成立まで null (= 204) を返す
 			// (match.ts:68 `if (game == null) return;`)。200 で game を返すと
 			// フロントが即ゲーム画面に遷移してしまう (#1553 と同じ罠)。
+			h.markInviterWaiting(c, existing)
 			return c.NoContent(http.StatusNoContent)
 		}
 	}
@@ -498,6 +532,7 @@ func (h *Handler) Match(c echo.Context) error {
 	if err := h.repo.Create(game); err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
+	h.markInviterWaiting(c, game)
 
 	// ターゲット種別によって挙動分岐:
 	//   - remote: federation session を Redis に保存 + Invite 送信
@@ -521,9 +556,15 @@ func (h *Handler) Match(c echo.Context) error {
 					_ = h.deliverer.DeliverToUser(user.ID, targetUser, body)
 				}
 			}
-		} else if h.streamPub != nil {
+		} else {
 			// local: stream に invited イベントを push (#417 P2)
-			h.streamPub.PublishInvited(targetUser.ID, user)
+			if h.streamPub != nil {
+				h.streamPub.PublishInvited(targetUser.ID, user)
+			}
+			// Elythia: プラグインが管理するアカウントへも知らせる (#3942)
+			if h.inviteObs != nil {
+				h.inviteObs.ReversiInvited(c.Request().Context(), targetUser.ID, user.ID, game.ID)
+			}
 		}
 	}
 
@@ -592,6 +633,69 @@ func (h *Handler) sendJoinForAcceptedInvite(c echo.Context, accepter *model.User
 	return nil
 }
 
+// findInvitationFrom returns the newest pending invitation from inviterID to
+// viewerID that still counts as an invitation (not staleAccepted, #3949).
+//
+// 最も新しい 1 件だけを見ると、それが受けてから 3 分を過ぎた対局のとき、より古い
+// 受けられていない招待 (招待一覧には出る) があっても逆向きの招待になる。一覧と
+// 同じく、招待として扱える対局を探す
+func (h *Handler) findInvitationFrom(c echo.Context, viewerID, inviterID string) *model.ReversiGame {
+	newest := h.findPendingInvitationFrom(viewerID, inviterID)
+	if newest == nil || !h.staleAccepted(c, newest) {
+		return newest
+	}
+	games, err := h.repo.ListByUser(viewerID, 20)
+	if err != nil {
+		return nil
+	}
+	var found *model.ReversiGame
+	for _, g := range games {
+		if g.IsStarted || g.IsEnded || g.User1ID != inviterID || g.User2ID != viewerID {
+			continue
+		}
+		if h.staleAccepted(c, g) {
+			continue
+		}
+		if found == nil || g.ID > found.ID {
+			found = g
+		}
+	}
+	return found
+}
+
+// staleAccepted reports whether the game no longer counts as an invitation
+// (Service.AcceptedLongAgo, #3949).
+func (h *Handler) staleAccepted(c echo.Context, g *model.ReversiGame) bool {
+	return h.svc != nil && h.svc.AcceptedLongAgo(c.Request().Context(), g)
+}
+
+// acceptInvitation records that the caller (User2) accepted the pending game,
+// so the inviter's screen moves to the game (#3946).
+func (h *Handler) acceptInvitation(c echo.Context, game *model.ReversiGame) {
+	if h.svc != nil {
+		h.svc.AcceptInvitation(c.Request().Context(), game)
+	}
+}
+
+// markInviterWaiting records that the caller is waiting for their invitation
+// to be accepted, so the `matched` reaches them (#3946). 画面は待っている間
+// 5 秒ごとに reversi/match を呼ぶので、そのたびに付け直す。
+func (h *Handler) markInviterWaiting(c echo.Context, game *model.ReversiGame) {
+	if h.svc != nil {
+		h.svc.MarkInviterWaiting(c.Request().Context(), game.ID)
+	}
+}
+
+// ReversiMatched implements core/reversi.MatchedNotifier: it publishes
+// `matched` with the game to the inviter's reversi stream (#3946). 対局は
+// reversi/match が返すのと同じ形 (本家の packDetail) で包む。
+func (h *Handler) ReversiMatched(inviterID string, game *model.ReversiGame) {
+	if h.streamPub == nil {
+		return
+	}
+	h.streamPub.PublishMatched(inviterID, packGame(h.entityPacker, game, h.idGen))
+}
+
 func federationDisabledResponse(c echo.Context) error {
 	return c.JSON(http.StatusBadRequest, apierr.Error("FEDERATION_DISABLED", "This account is not available for federation.", "ff6844bb-b2d5-4e8c-a3d1-14e0ac15d5a1"))
 }
@@ -612,23 +716,49 @@ func (h *Handler) CancelMatch(c echo.Context) error {
 	// userId 未指定 = ランダムマッチの取り消し。待機列から自分を外す (#2407)。
 	// upstream matchAnyUserCancel に対応する。ここで外さないと、取り消した
 	// つもりの利用者が他人にマッチされ続ける。
-	if req.UserID == "" && h.svc != nil {
-		if err := h.svc.CancelMatchAny(ctx, user.ID); err != nil {
-			slog.Warn("reversi cancel-match: dequeue from match-any failed",
-				"userId", user.ID, "err", err)
+	//
+	// 本家の matchAnyUserCancel は待機列から外すだけなので、未開始の対局には触らない
+	// (#3369)。以前は自分の未開始の対局 (受けた招待を含む) を最大10件まで取り消して
+	// いたので、ランダムマッチを取り消すと他人からの招待まで黙って消えていた。
+	if req.UserID == "" {
+		if h.svc != nil {
+			if err := h.svc.CancelMatchAny(ctx, user.ID); err != nil {
+				slog.Warn("reversi cancel-match: dequeue from match-any failed",
+					"userId", user.ID, "err", err)
+			}
 		}
+		return c.NoContent(http.StatusNoContent)
 	}
 	games, _ := h.repo.ListByUser(user.ID, 10)
 	for _, g := range games {
 		if g.IsStarted || g.IsEnded {
 			continue
 		}
-		// userId 指定時は upstream matchSpecificUserCancel 互換 (cancel-match.ts:
-		// 33-38): 自分がその相手に送った招待 (User1=自分, User2=相手) だけを
-		// 取り消す。未指定時は自分の pending を全部片付ける (待機列からの離脱は
-		// 上で済ませてある)。
-		if req.UserID != "" && (g.User1ID != user.ID || g.User2ID != req.UserID) {
+		// upstream matchSpecificUserCancel 互換 (cancel-match.ts:33-38): 自分が
+		// その相手に送った招待 (User1=自分, User2=相手) だけを取り消す。
+		if g.User1ID != user.ID || g.User2ID != req.UserID {
 			continue
+		}
+		// Elythia: 受けられた対局は取り消さない (#3949)。待機画面は離れるとき (リロード・
+		// 移動・タブを閉じる) に必ずここを呼ぶ。本家は招待を Redis にだけ置き、取り消しは
+		// それを消すだけで、受けた時点で作られた対局には触らない。Elythia は招待の時点で
+		// 対局の行を作るので、受けられた後の対局まで消し、連合では相手の対局も Undo(Invite)
+		// で消していた。招待した人は「自分の対局」から開ける
+		// 一覧を取った後に受けられていないかも見るため、取り消す直前に読み直した対局で
+		// 判定する (窓を狭めるだけで、完全には閉じない)
+		if h.svc != nil {
+			fresh, err := h.svc.Get(ctx, g.ID)
+			if err != nil {
+				// 読み直せないときは取り消さない (受けられた対局を壊さない側に倒す)。
+				// 行が消えていれば、取り消すものも無い
+				if !errors.Is(err, corereversi.ErrGameNotFound) {
+					slog.Warn("reversi cancel-match: reload failed", "gameId", g.ID, "userId", user.ID, "err", err)
+				}
+				continue
+			}
+			if h.svc.WasInvitationAccepted(ctx, fresh) {
+				continue
+			}
 		}
 		if h.svc != nil {
 			// ListByUser snapshot 後に相手が ready / start させた場合、
@@ -806,10 +936,11 @@ func (h *Handler) matchAny(c echo.Context, user *model.User, noIrregularRules, m
 	// 2. 自分宛ての招待を消費する。mk-go では招待が reversi_game 行なので、
 	//    「自分が User2 の未開始 game」がそれにあたる。specific-match の
 	//    accept 経路と同じ扱いにして、相手に Join を返す。
-	if g := h.findPendingInvitationTo(user.ID); g != nil {
+	if g := h.findPendingInvitationTo(c, user.ID); g != nil {
 		if err := h.sendJoinForAcceptedInvite(c, user, g); errors.Is(err, corelocalfederation.ErrFederationDisabled) {
 			return federationDisabledResponse(c)
 		}
+		h.acceptInvitation(c, g)
 		return c.JSON(http.StatusOK, packGame(h.entityPacker, g, h.idGen))
 	}
 
@@ -853,6 +984,11 @@ func (h *Handler) matchAny(c echo.Context, user *model.User, noIrregularRules, m
 	if h.streamPub != nil {
 		h.streamPub.PublishInvited(res.OpponentID, user)
 	}
+	// Elythia: 待っていたのがプラグインの管理するアカウントなら、組まれた対局を
+	// 知らせる (#3942)。bot は stream の invited を受けられないので、これで対局を知る
+	if h.inviteObs != nil {
+		h.inviteObs.ReversiInvited(ctx, res.OpponentID, user.ID, game.ID)
+	}
 	return c.JSON(http.StatusOK, packGame(h.entityPacker, game, h.idGen))
 }
 
@@ -881,7 +1017,7 @@ func (h *Handler) findPendingGameFor(userID string) *model.ReversiGame {
 //
 // specific-match は相手が分かっているので FindPendingInvitation を使うが、
 // any-match は「誰でもいいから自分宛ての招待」を探す。
-func (h *Handler) findPendingInvitationTo(userID string) *model.ReversiGame {
+func (h *Handler) findPendingInvitationTo(c echo.Context, userID string) *model.ReversiGame {
 	games, err := h.repo.ListByUser(userID, 20)
 	if err != nil {
 		return nil
@@ -890,7 +1026,7 @@ func (h *Handler) findPendingInvitationTo(userID string) *model.ReversiGame {
 		if g.IsStarted || g.IsEnded {
 			continue
 		}
-		if g.User2ID == userID && g.User1ID != userID {
+		if g.User2ID == userID && g.User1ID != userID && !h.staleAccepted(c, g) {
 			return g
 		}
 	}

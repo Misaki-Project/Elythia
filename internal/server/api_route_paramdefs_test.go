@@ -89,6 +89,25 @@ func upstreamDirectRoutes(t *testing.T) map[string]bool {
 // namespaces of the plugins it was built with ("plugin/<name>/").
 func builtAPIRoutes(t *testing.T) (routes map[string]map[string]bool, pluginNamespaces []string) {
 	t.Helper()
+	echoRoutes, pluginNamespaces := builtEchoRoutes(t)
+	routes = map[string]map[string]bool{}
+	for _, r := range echoRoutes {
+		name, ok := strings.CutPrefix(r.Path, apiGroupPrefix+"/")
+		if !ok || r.Method == echo.RouteNotFound {
+			continue
+		}
+		if routes[name] == nil {
+			routes[name] = map[string]bool{}
+		}
+		routes[name][r.Method] = true
+	}
+	return routes, pluginNamespaces
+}
+
+// builtEchoRoutes builds the server like builtAPIRoutes does and returns every
+// echo route of it, with the namespaces of the plugins it was built with.
+func builtEchoRoutes(t *testing.T) (routes []*echo.Route, pluginNamespaces []string) {
+	t.Helper()
 	t.Setenv(config.EnvOnlyServer, "1")
 	t.Setenv(config.EnvOnlyQueue, "")
 	mr := miniredis.RunT(t)
@@ -116,18 +135,7 @@ func builtAPIRoutes(t *testing.T) (routes map[string]map[string]bool, pluginName
 	srv, err := newServer(cfg, serverIntegrationDB, clients, defs, noopStorage)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.Background())) })
-	routes = map[string]map[string]bool{}
-	for _, r := range srv.echo.Routes() {
-		name, ok := strings.CutPrefix(r.Path, apiGroupPrefix+"/")
-		if !ok || r.Method == echo.RouteNotFound {
-			continue
-		}
-		if routes[name] == nil {
-			routes[name] = map[string]bool{}
-		}
-		routes[name][r.Method] = true
-	}
-	return routes, pluginNamespaces
+	return srv.echo.Routes(), pluginNamespaces
 }
 
 // TestAPIRoutesHaveParamDefs is the gate of #3890: every /api route of the
@@ -167,6 +175,8 @@ func TestAPIRoutesHaveParamDefs(t *testing.T) {
 		"admin/backup/list": {http.MethodPost},
 		"signup":            {http.MethodPost},
 		"v1/instance/peers": {http.MethodGet},
+		// 本家は fastify.all で登録し、handler が GET と POST 以外を 405 にする (#3926)。
+		"clear-browser-cache": {http.MethodGet, http.MethodPost, http.MethodPut},
 	} {
 		for _, m := range methods {
 			require.True(t, routes[name][m], "the built server has no %s /api/%s", m, name)

@@ -3,7 +3,7 @@ import tsParser from '@typescript-eslint/parser';
 import parser from 'vue-eslint-parser';
 import pluginVue from 'eslint-plugin-vue';
 import pluginMisskey from '@misskey-dev/eslint-plugin';
-import sharedConfig from '../shared/eslint.config.js';
+import sharedConfig, { loaderScriptConfig } from '../shared/eslint.config.js';
 
 const mfmParserImports = [
 	{ name: 'mfm-js', message: 'mfm-js is no longer used. Use `@/utility/mfm.js`.' },
@@ -23,7 +23,6 @@ export default [
 	...pluginVue.configs['flat/recommended'],
 	{
 		files: ['src/**/*.{ts,vue}'],
-		ignores: ['**/*.stories.ts'],
 		languageOptions: {
 			globals: {
 				...Object.fromEntries(Object.entries(globals.node).map(([key]) => [key, 'off'])),
@@ -56,9 +55,14 @@ export default [
 			}],
 			// MFM は src/utility/mfm.ts を通して扱う (解析器を差し替える口をそこに置いている)。
 			// shared の punycode の制限もここで指定し直す。
+			// useCssModule は本番のビルドで空を返すことがある。rollup-plugin-unwind-css-module-class-name
+			// は、描画関数に `_ctx.$style` の参照が 1 つも残らない部品から CSS Modules の表を外す。
+			// script の最上位で $style を宣言すると必ずこの条件に当たる。開発時と vitest では動くので
+			// 気付けない (#3950。アバターの画像が枠より大きく描かれた)
 			'no-restricted-imports': ['error', {
 				paths: [
 					{ name: 'punycode' },
+					{ name: 'vue', importNames: ['useCssModule'], message: '本番のビルドでは、描画関数に _ctx.$style の参照が残らない部品で空を返す。クラスはテンプレートの $style で参照する' },
 					...mfmParserImports,
 				],
 				patterns: mfmParserImportPatterns,
@@ -184,4 +188,11 @@ export default [
 			}],
 		},
 	},
+	// サーバーが boot.js の前に置く定数 (internal/server/frontend.go)
+	loaderScriptConfig({
+		VERSION: 'readonly',
+		CLIENT_ENTRY: 'readonly',
+		CLIENT_PRELOADS: 'readonly',
+		LANGS: 'readonly',
+	}),
 ];

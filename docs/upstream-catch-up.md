@@ -123,9 +123,9 @@ mirror (`.cache/misskey/mirror.git`、無ければ作る) に今の版 (`UPSTREA
 | 取り込む | `packages/` (`packages/backend` を除く)、`packages-private/`、`locales/`、`scripts/`、`patches/`、直下の `package.json` など | `frontend/` の下の同じパスへ当てる |
 | 付け替える | `packages/backend/assets/` / 直下の `assets/` | `frontend/assets/` / `frontend/repo-assets/` へ当てる (D3) |
 | 作り直す | `pnpm-lock.yaml` | 当てない。手順 4 で作り直す |
-| 取り込まない | `packages/backend` (アセットを除く)、`.github/`、`.config/`、`Dockerfile`、文書類など | 当てない |
+| 取り込まない | `packages/backend` (アセットを除く)、`.github/`、`.config/`、`Dockerfile`、文書類など。Elythia が `frontend/` から外したもの (Storybook の `packages/frontend/.storybook/`・`*.stories.impl.ts`・`*.stories.meta.ts`・`src/index.mdx` (#4027)、本家の frontend の e2e の `packages/frontend/test/e2e/` (`shared.ts` を除く)・`playwright.config.ts` (#4025)) | 当てない。外したものへの本家の変更を当てようとすると、当てる先が無くて止まるため。Storybook の依存の版上げなど `package.json` への変更は「取り込む」の側で衝突するので、足し戻さずに消す側で解く |
 
-**どの区分にも当たらないパスがあると、何も当てずに止まる。** 本家が直下に新しく足したファイルや、submodule の gitlink の変更が該当する。「取り込む」で絞るだけだと新しいパスが黙って落ちるため。止まったら、そのパスの区分を決めて `tools/upstreamsync/main.go` の表 (`importFiles` / `importDirs` / `skipFiles` / `skipDirs`) と設計 D1 の表の両方に足し、`go test ./tools/upstreamsync/` を通してからやり直す。
+**どの区分にも当たらないパスがあると、何も当てずに止まる。** 本家が直下に新しく足したファイルや、submodule の gitlink の変更が該当する。「取り込む」で絞るだけだと新しいパスが黙って落ちるため。止まったら、そのパスの区分を決めて `tools/upstreamsync/main.go` の表 (`importFiles` / `importDirs` / `skipFiles` / `skipDirs`。Elythia が `frontend/` から外したパスなら `removedDirs` / `removedFiles` / `removedSuffixes`、外したディレクトリの中で残すものは `keptInRemovedDirs`) と設計 D1 の表の両方に足し、`go test ./tools/upstreamsync/` を通してからやり直す。
 
 **2. 当てる。**
 
@@ -230,10 +230,12 @@ git add internal/entitycompat/testdata/
 make upstream-fetch                    # UPSTREAM_MISSKEY_VERSION の本家を取得
 make paramdef-gen                      # 抜き出し (extract.mjs) → corpus (corpus.mjs) → Elythia の宣言の corpus
 go test ./internal/api/paramschema/... # 検証器が新しい paramDef と corpus に合うか
+make perm-check                        # 本家の meta (段階・secure・kind・requiredRolePolicy・cacheSec) と router の middleware が合うか
 git add internal/api/paramschema/upstream_paramdefs.json internal/api/paramschema/testdata/ajv_corpus.jsonl internal/api/paramschema/testdata/ajv_corpus_elythia.jsonl
 ```
 
 - **`frontend/node_modules`が要る。** 抜き出しは本家の`.ts`を`frontend/node_modules/typescript`のパーサーで読み(実行はしない)、corpusは`frontend/node_modules/.pnpm/ajv@<版>`のajvで判定する。ajvの版は本家の`packages/backend/package.json`から読む。frontendはajvに直接依存しておらず、推移的に入っている版を名指しして読むので、本家がajvを上げてその版が`frontend/`の依存に無いと`paramdef-gen`が落ちる。そのときは`frontend/package.json`のdevDependenciesにその版のajvを足し、`make upstream-sync-lock`でlockを作り直す
+- **本家のmetaに、`extract.mjs`の知らないkeyがあっても落ちる**(`unknown key`、#3369)。残すkey(`META_KEYS`)・`doc`に置くkey(`DOC_KEYS`)・読まないと決めたkey(`IGNORED_META_KEYS`)のどこに置くかを決め、残すなら`internal/entitycompat`の`upstreamMeta`にも足して、読むゲートが要るかを決める
 - **抜き出しは、評価できない式が1つでもあれば落ちる**(`unresolved values`)。本家のparamDefが新しい書き方を使い始めたら、`tools/paramdefspec/extract.mjs`の`ev`にその式の評価を足す。推測の値で埋めない
 - **解くのはトップレベルの`const`だけ。** 宣言の後に書き換えられる名前も解かずに落とす。実行時の値が宣言の初期値と違うかもしれないため。`unresolved values`の行の読み方は次のとおり
   - `<名前> is not a const in <ファイル>`: paramDefが`let` / `var`の名前を参照している。宣言の初期値をそのまま使わず、実行時の値を確かめてから`extract.mjs`での扱いを決める

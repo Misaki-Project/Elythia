@@ -1,8 +1,6 @@
 package entitycompat
 
 import (
-	_ "embed"
-	"encoding/json"
 	"os"
 	"regexp"
 	"sort"
@@ -11,13 +9,6 @@ import (
 
 	"github.com/elythia-network/elythia/internal/server/middleware"
 )
-
-// embeddedCacheSecJSON is the committed golden map of every upstream
-// `allowGet: true` endpoint -> its `cacheSec` (0 when it has none), generated
-// by `go run ./tools/permspec`.
-//
-//go:embed testdata/golden_cache_sec.json
-var embeddedCacheSecJSON []byte
 
 var (
 	// apiGetRouteRe matches `api.GET("/path"`.
@@ -36,7 +27,7 @@ var (
 //
 // **method の一覧の変数は、同じファイルの中だけで引く (#3672)。**
 // `chartMethods := []string{...}` はローカル変数なので、別のファイルの同名の
-// 変数は別物。引けなければ GET を含まない扱いになり、golden 側の
+// 変数は別物。引けなければ GET を含まない扱いになり、本家の allowGet の側の
 // 「GET の route が無い」として落ちる (緩む方向には倒れない)。
 func parseGetRoutes(t *testing.T, paths ...string) map[string]bool {
 	t.Helper()
@@ -84,14 +75,16 @@ func parseGetRoutes(t *testing.T, paths ...string) map[string]bool {
 // retention) と、cacheSec の Cache-Control が付かないもの 8 本があった。
 // handler ごとに書く形では付け忘れを検出できない。
 func TestCacheSecDrift(t *testing.T) {
-	var golden map[string]int
-	if err := json.Unmarshal(embeddedCacheSecJSON, &golden); err != nil {
-		t.Fatalf("parse golden_cache_sec.json: %v", err)
+	// 本家の allowGet / cacheSec は upstream_paramdefs.json の meta から作る
+	// (upstreamMetas)。allowGet の無い cacheSec があれば止める。
+	golden, err := upstreamCacheSecs(upstreamMetas(t))
+	if err != nil {
+		t.Fatal(err)
 	}
 	// 拾えなくなったら落とす。名指しで要求して、抽出が空振りしたまま緑に
 	// なるのを防ぐ。
 	if len(golden) < 20 || golden["emojis"] != 3600 {
-		t.Fatalf("cacheSec golden looks broken (%d entries, emojis=%d); regenerate with `make shapecheck-gen`", len(golden), golden["emojis"])
+		t.Fatalf("upstream cacheSec looks broken (%d entries, emojis=%d); regenerate with `make paramdef-gen`", len(golden), golden["emojis"])
 	}
 
 	// 表があっても、/api の group に middleware を付けていなければ何も起きない。

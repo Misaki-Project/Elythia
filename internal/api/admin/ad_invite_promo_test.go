@@ -235,10 +235,45 @@ func TestAdUpdate_PartialFields(t *testing.T) {
 	assert.Equal(t, "high", repo.Ads["a1"].Priority)
 }
 
+// 本家 ad/update.ts と同じく、無い広告は 400 NO_SUCH_AD。
 func TestAdUpdate_NotFound(t *testing.T) {
 	h, _ := setupAdHandler(t)
-	assert.Equal(t, http.StatusNotFound,
-		doPost(h.AdUpdate, `{"id":"missing","url":"x"}`, adminUser).Code)
+	rec := doPost(h.AdUpdate, `{"id":"missing","url":"x"}`, adminUser)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "b7aa1727-1354-47bc-a182-3a9c3973d300")
+}
+
+// 本家 ad/delete.ts と同じく、無い広告は 400 NO_SUCH_AD。
+func TestAdDelete_NotFound(t *testing.T) {
+	h, _ := setupAdHandler(t)
+	rec := doPost(h.AdDelete, `{"id":"missing"}`, adminUser)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "ccac9863-3a03-416e-b899-8a64041118b1")
+}
+
+type failingFindAdRepo struct{ *testutil.MockAdRepository }
+
+func (f *failingFindAdRepo) FindByID(string) (*model.Ad, error) { return nil, assert.AnError }
+
+type failingDeleteAdRepo struct{ *testutil.MockAdRepository }
+
+func (f *failingDeleteAdRepo) Delete(string) error { return assert.AnError }
+
+// DB の障害は「無い」に丸めず 500 にする (#2792)。
+func TestAdDelete_RepoErrorsAre500(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	h.SetAdRepo(&failingFindAdRepo{testutil.NewMockAdRepository()})
+	assert.Equal(t, http.StatusInternalServerError, doPost(h.AdDelete, `{"id":"a1"}`, adminUser).Code)
+
+	del := &failingDeleteAdRepo{testutil.NewMockAdRepository()}
+	require.NoError(t, del.Create(&model.Ad{ID: "a1"}))
+	h.SetAdRepo(del)
+	assert.Equal(t, http.StatusInternalServerError, doPost(h.AdDelete, `{"id":"a1"}`, adminUser).Code)
+}
+
+func TestAdDelete_EmptyIDIs400(t *testing.T) {
+	h, _ := setupAdHandler(t)
+	assert.Equal(t, http.StatusBadRequest, doPost(h.AdDelete, `{"id":""}`, adminUser).Code)
 }
 
 func TestAdUpdate_MissingID(t *testing.T) {
@@ -247,24 +282,28 @@ func TestAdUpdate_MissingID(t *testing.T) {
 		doPost(h.AdUpdate, `{}`, adminUser).Code)
 }
 
-// Explicit expiresAt:0 in Update はクライアントが明示的に 1970-01-01 を指定した
-// ケースとして扱う (nil なら変更なし)。handler 側の millisOrNow 適用で now に
-// 読み替えてしまう regression を防ぐ。
-func TestAdUpdate_ExplicitZeroExpiresAtStays1970(t *testing.T) {
+// 本家 ad/update.ts と同じく、0 の startsAt / expiresAt は「変えない」として無視する。
+func TestAdUpdate_ZeroDatesAreIgnored(t *testing.T) {
+	starts := time.UnixMilli(time.Now().UnixMilli())
+	expires := starts.Add(time.Hour)
 	h, repo := setupAdHandler(t,
 		&model.Ad{
 			ID: "a1", URL: "u", Place: "square", Priority: "middle", Ratio: 1, ImageURL: "i",
-			StartsAt:  time.Now(),
-			ExpiresAt: time.Now().Add(time.Hour),
+			StartsAt:  starts,
+			ExpiresAt: expires,
 		},
 	)
 
-	rec := doPost(h.AdUpdate, `{"id":"a1","expiresAt":0}`, adminUser)
+	rec := doPost(h.AdUpdate, `{"id":"a1","expiresAt":0,"startsAt":0}`, adminUser)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
-	// time.UnixMilli(0) は UTC 1970-01-01。time.Now() と大きく異なること。
-	got := repo.Ads["a1"].ExpiresAt
-	assert.Equal(t, int64(0), got.UnixMilli(),
-		"explicit expiresAt:0 should map to UNIX epoch, not time.Now()")
+	assert.Equal(t, expires.UnixMilli(), repo.Ads["a1"].ExpiresAt.UnixMilli())
+	assert.Equal(t, starts.UnixMilli(), repo.Ads["a1"].StartsAt.UnixMilli())
+
+	// 0 でない値は書き換える。
+	rec = doPost(h.AdUpdate, `{"id":"a1","expiresAt":1000,"startsAt":500}`, adminUser)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, int64(1000), repo.Ads["a1"].ExpiresAt.UnixMilli())
+	assert.Equal(t, int64(500), repo.Ads["a1"].StartsAt.UnixMilli())
 }
 
 func TestAdDelete_WithRepo(t *testing.T) {
@@ -626,6 +665,54 @@ func TestPromoCreate_Success(t *testing.T) {
 	require.NotNil(t, promo.created)
 	assert.Equal(t, "n1", promo.created.NoteID)
 	assert.Equal(t, "authorU", promo.created.UserID)
+}
+
+// JavaScript の Date で表せない日時 (絶対値が 8.64e15 を超える) は 400 にし、
+// 保存しない。境界の値は通す (#3369)。
+func TestAdAndPromo_RejectDatesOutsideJSDateRange(t *testing.T) {
+	const maxMs = int64(8_640_000_000_000_000)
+	for _, tc := range []struct {
+		field string
+		ms    int64
+		ok    bool
+	}{
+		{"expiresAt", maxMs, true},
+		{"expiresAt", maxMs + 1, false},
+		{"startsAt", -maxMs, true},
+		{"startsAt", -maxMs - 1, false},
+	} {
+		name := fmt.Sprintf("%s=%d", tc.field, tc.ms)
+		h, repo := setupAdHandler(t, &model.Ad{ID: "a1", URL: "u", ImageURL: "i"})
+		rec := doPost(h.AdCreate, fmt.Sprintf(`{"url":"u","imageUrl":"i",%q:%d}`, tc.field, tc.ms), adminUser)
+		if tc.ok {
+			assert.Equal(t, http.StatusOK, rec.Code, "create "+name)
+		} else {
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "create "+name)
+			assert.Len(t, repo.Ads, 1, "create "+name)
+		}
+		rec = doPost(h.AdUpdate, fmt.Sprintf(`{"id":"a1",%q:%d}`, tc.field, tc.ms), adminUser)
+		if tc.ok {
+			assert.Equal(t, http.StatusNoContent, rec.Code, "update "+name)
+		} else {
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "update "+name)
+		}
+	}
+	for _, tc := range []struct {
+		ms int64
+		ok bool
+	}{{maxMs, true}, {maxMs + 1, false}, {-maxMs - 1, false}} {
+		h, _, _, _ := newTestHandler(t)
+		promo := &stubPromoRepo{}
+		h.SetPromoNoteRepo(promo)
+		h.SetNoteFinder(&stubNoteFinder{note: &model.Note{ID: "n1", UserID: "u", Visibility: model.NoteVisibilityPublic}})
+		rec := doPost(h.PromoCreate, fmt.Sprintf(`{"noteId":"n1","expiresAt":%d}`, tc.ms), adminUser)
+		if tc.ok {
+			assert.Equal(t, http.StatusNoContent, rec.Code, "promo %d", tc.ms)
+		} else {
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "promo %d", tc.ms)
+			assert.Nil(t, promo.created, "promo %d", tc.ms)
+		}
+	}
 }
 
 // #1466: followers / home / specified visibility note の promote 試行は

@@ -19,7 +19,7 @@
 
 - **upstream catch-up**: **2026.10.1 まで追従完了**。2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 → 2026.10.0 → 2026.10.1 と段階的に追従した (**2026.8.0 に stable は無い**)。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
 - **本家 backend e2e**: Misskey 本家の `test/e2e/**` を本家ソースを正本として Elythia に向けて実行する基盤を整備し、**25 ファイル 1256 テストが全通過**。ローカル連合状態は UserLite の期待DTOだけに追加し、ほかの比較を維持する。PR ごとに CI で回る。『通らないことが正しい』23 件は根拠付きで expected-failure として登録している ([`upstream-backend-e2e.md`](upstream-backend-e2e.md))
-- **Playwright e2e**: 299 spec ファイルを PR ごとに実行。Misskey TS backend に対しては upstream 追従時に実行し、spec が Elythia の挙動に引きずられていないかを検証する
+- **Playwright e2e**: 301 spec ファイルを PR ごとに実行。Misskey TS backend に対しては upstream 追従時に実行し、spec が Elythia の挙動に引きずられていないかを検証する
 - **drift backlog**: Phase 1-4 の spec 整備中に発見した 40+ 件の drop-in 互換 drift は fix 済
 
 ## エンドポイントカバー率 (Playwright Phase 1-4 時点)
@@ -62,7 +62,7 @@ Misskey 公式フロントの一部ページが未登録エンドポイントの
 method に関わらず 404 を返す (#2822。200 だと送信側が「受け口が無い」と
 「プラグインが空の応答を返した」を区別できない。詳細は
 [peer プロトコル](plugin-peer-protocol.md))。いずれも warn ログ
-(`unimplemented API endpoint`) が出る。なお **upstream endpoint の未実装は現在ゼロ (coverage 100.0%、444/444)**。
+(`unimplemented API endpoint`) が出る。なお **upstream endpoint の未実装は現在ゼロ (coverage 100.0%、446/446)**。
 
 ## 対応済みの互換性修正
 
@@ -282,7 +282,7 @@ TS版の`.config/default.yml`をそのまま使用可能。以下の設定もGo�
 
 ### テーブル
 
-Go側のマイグレーション (000001〜) はTS版テーブルに対して原則追加のみだが、例外が 22 件ある ([migration-from-ts.md](migration-from-ts.md#破壊的なマイグレーション))。TS版のマイグレーションで作成される全テーブルは維持される。
+Go側のマイグレーション (000001〜) はTS版テーブルに対して原則追加のみだが、例外が 23 件ある ([migration-from-ts.md](migration-from-ts.md#破壊的なマイグレーション))。TS版のマイグレーションで作成される全テーブルは維持される。
 
 この22件は本体の系列だけを数える。Misakiのリモートアバターデコレーション削除は`migration/local/`の独立した1本で、CherryPick由来のリモート行を削除し、downで復元できない。旧Misaki版から更新する場合は[移行履歴の照合](misaki-migration-reconciliation.md)も先に確認する。
 
@@ -361,7 +361,7 @@ drop-in テスト (#367) で発見した補完カラム:
   #14554 (2024-09) でコメントアウトごと削除済み。到達するのは API を
   直接叩く場合とサードパーティクライアントだけで、そこでは 204 が返るので
   **成功したように見えて誰にも表示されない**。
-  Elythia はこの状態を忠実に再現している (endpoint を消すと 444/444 の
+  Elythia はこの状態を忠実に再現している (endpoint を消すと 446/446 の
   カバレッジが崩れ、drop-in 切替でも挙動が変わるため)。表示経路を足すなら
   upstream に無い additive 拡張になる。
   ただし入力側だけは Elythia に意図的乖離がある — `admin/promo/create` は public

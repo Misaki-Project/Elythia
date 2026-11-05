@@ -13,6 +13,7 @@ import (
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/testutil"
+	"github.com/elythia-network/elythia/plugin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -1055,6 +1056,10 @@ func (f *failingAssignRepo) CountActiveByRole(_ string) (int, error) {
 	return 0, assert.AnError
 }
 
+func (f *failingAssignRepo) CountVisibleByRole(_ string) (int, error) {
+	return 0, assert.AnError
+}
+
 // CountAssignedUsers は active assignment 数を返す。
 func TestCountAssignedUsers_Counts(t *testing.T) {
 	svc, roleRepo, assignRepo, _ := newTestService(t)
@@ -1072,6 +1077,26 @@ func TestCountAssignedUsers_FailOpen(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	assert.Equal(t, 0, svc.CountAssignedUsers("r1"))
+	assert.Equal(t, 0, svc.CountVisibleAssignedUsers("r1"))
+}
+
+// #3999: CountVisibleAssignedUsers は凍結中とローカルの削除済みを数えない。
+func TestCountVisibleAssignedUsers_SkipsHiddenMembers(t *testing.T) {
+	svc, roleRepo, assignRepo, _ := newTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "R"}
+	userRepo := testutil.NewMockUserRepository()
+	require.NoError(t, userRepo.Create(&model.User{ID: "u1", Username: "u1"}))
+	require.NoError(t, userRepo.Create(&model.User{ID: "u2", Username: "u2", IsSuspended: true}))
+	require.NoError(t, userRepo.Create(&model.User{ID: "u3", Username: "u3", IsDeleted: true}))
+	// host が空文字の行もローカルとして扱う (model.User.IsLocal)。
+	empty := ""
+	require.NoError(t, userRepo.Create(&model.User{ID: "u4", Username: "u4", Host: &empty, IsDeleted: true}))
+	assignRepo.UserRepo = userRepo
+	for _, uid := range []string{"u1", "u2", "u3", "u4"} {
+		assignRepo.Assignments[uid+":r1"] = &model.RoleAssignment{ID: "a" + uid, UserID: uid, RoleID: "r1"}
+	}
+	assert.Equal(t, 4, svc.CountAssignedUsers("r1"))
+	assert.Equal(t, 1, svc.CountVisibleAssignedUsers("r1"))
 }
 
 type failingRoleRepo struct {
@@ -1232,6 +1257,59 @@ func TestIsSilenced_CanPublicNoteFalseMeansSilenced(t *testing.T) {
 		ID: "a1", UserID: "user1", RoleID: "r1",
 	}
 	assert.True(t, svc.IsSilenced("user1"))
+}
+
+// BoolPolicyMayBeFalse is false only while no base policy, role or provider
+// can make canPublicNote anything but true (#3369).
+func TestBoolPolicyMayBeFalse(t *testing.T) {
+	t.Run("defaults and roles that keep it true", func(t *testing.T) {
+		svc, roleRepo, _, _ := newTestService(t)
+		roleRepo.Roles["r1"] = &model.Role{ID: "r1", Policies: datatypes.JSON([]byte(
+			`{"canPublicNote":{"useDefault":true,"priority":2,"value":false},"canInvite":{"useDefault":false,"priority":0,"value":false}}`,
+		))}
+		roleRepo.Roles["r2"] = &model.Role{ID: "r2", Policies: datatypes.JSON([]byte(
+			`{"canPublicNote":{"useDefault":false,"priority":0,"value":true}}`,
+		))}
+		assert.False(t, svc.BoolPolicyMayBeFalse(role.PolicyCanPublicNote))
+	})
+	t.Run("a role sets it false", func(t *testing.T) {
+		svc, roleRepo, _, _ := newTestService(t)
+		roleRepo.Roles["r1"] = &model.Role{ID: "r1", Policies: datatypes.JSON([]byte(
+			`{"canPublicNote":{"useDefault":false,"priority":0,"value":false}}`,
+		))}
+		assert.True(t, svc.BoolPolicyMayBeFalse(role.PolicyCanPublicNote))
+	})
+	t.Run("a role sets a non-boolean value", func(t *testing.T) {
+		svc, roleRepo, _, _ := newTestService(t)
+		roleRepo.Roles["r1"] = &model.Role{ID: "r1", Policies: datatypes.JSON([]byte(
+			`{"canPublicNote":{"useDefault":false,"priority":0,"value":"no"}}`,
+		))}
+		assert.True(t, svc.BoolPolicyMayBeFalse(role.PolicyCanPublicNote))
+	})
+	t.Run("base policy is false", func(t *testing.T) {
+		svc, _, _, metaRepo := newTestService(t)
+		metaRepo.Meta.Policies = datatypes.JSON([]byte(`{"canPublicNote":false}`))
+		assert.True(t, svc.BoolPolicyMayBeFalse(role.PolicyCanPublicNote))
+	})
+	t.Run("base policy cannot be read", func(t *testing.T) {
+		svc, _, _, metaRepo := newTestService(t)
+		metaRepo.FetchErr = errors.New("db down")
+		assert.True(t, svc.BoolPolicyMayBeFalse(role.PolicyCanPublicNote))
+	})
+	t.Run("a provider declares the key", func(t *testing.T) {
+		svc, _, _, _ := newTestService(t)
+		registerProvider(t, svc, "p", []string{role.PolicyCanPublicNote}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			return nil, nil
+		})
+		assert.True(t, svc.BoolPolicyMayBeFalse(role.PolicyCanPublicNote))
+	})
+	t.Run("a provider of another key", func(t *testing.T) {
+		svc, _, _, _ := newTestService(t)
+		registerProvider(t, svc, "p", []string{"canInvite"}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			return nil, nil
+		})
+		assert.False(t, svc.BoolPolicyMayBeFalse(role.PolicyCanPublicNote))
+	})
 }
 
 // --- per-user role cache (#300 3-5) -----------------------------------------
@@ -1735,6 +1813,8 @@ func TestAssign_FailedDoesNotInvalidate(t *testing.T) {
 func TestListByRole_RoleNotFound(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
 	_, err := svc.ListByRole("ghost", "", "", 10)
+	assert.ErrorIs(t, err, role.ErrRoleNotFound)
+	_, err = svc.ListVisibleByRole("ghost", "", "", 10)
 	assert.ErrorIs(t, err, role.ErrRoleNotFound)
 }
 

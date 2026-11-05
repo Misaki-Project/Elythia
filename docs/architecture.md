@@ -72,14 +72,15 @@ Elythia は Misskey (TypeScript/NestJS) から生まれ、バックエンドを 
 
 ### 3.1 `internal/api/` — HTTP ハンドラ（60 パッケージ / 553 ルート）
 
-upstream `server/api/endpoints/` の endpoint 群を、ディレクトリ単位で実装。**upstream の 444 endpoint をすべて実装済み** (coverage 100.0%)。一次情報は `make apicompat` が生成する [api-compat.md](api-compat.md)。
+upstream `server/api/endpoints/` の endpoint 群を、ディレクトリ単位で実装。**upstream の 446 endpoint をすべて実装済み** (coverage 100.0%)。一次情報は `make apicompat` が生成する [api-compat.md](api-compat.md)。
 
-ルート数は `internal/server` が `/api/*` に静的登録する数 (`api.POST` 514 + `api.GET` 14 +
-`api.Match(chartMethods, …)` 12 × 2 methods + catchall の `api.Any` 1 = 553。test mode でだけ
-登録する `/api/reset-db` を含む)。登録は、catchall と `/api/reset-db` が `router.go` の
-`setupRoutes()`、ほかは領域ごとの `routes_<領域>.go` にある (#3697、4.2)。実行時は
-これに同梱プラグインのルートが乗る。`docs/api-compat.md` の 444 + 108 = 552 に catchall を
-足した数と一致する。パッケージ数は、`git ls-files internal/api` のうちテストでない `.go` を持つ
+ルート数は `internal/server` が `/api/*` に静的登録する数 (`api.POST` 516 + `api.GET` 14 +
+`api.Match(chartMethods, …)` 12 × 2 methods = 554 と、`api.Any` 2。test mode でだけ登録する
+`/api/reset-db` を含む)。`api.Any` は catchall と、全メソッドで受ける `/api/clear-browser-cache`
+(#3926)。登録は、この 2 つと `/api/reset-db` が `router.go` の `setupRoutes()`、ほかは領域ごとの
+`routes_<領域>.go` にある (#3697、4.2)。実行時はこれに同梱プラグインのルートが乗る。
+`docs/api-compat.md` の 446 + 110 = 556 は、554 に `/api/clear-browser-cache` の GET と POST を
+足した数と一致する (api-compat.md は GET と POST だけを数え、catchall を数えない)。パッケージ数は、`git ls-files internal/api` のうちテストでない `.go` を持つ
 ディレクトリの数 (`apierr` のような handler でないものも含む)。
 
 前に書いていた「52 パッケージ / 503 ルート」(`api.POST` 466 + `api.GET` 12 + 12 × 2 + 1、
@@ -87,6 +88,7 @@ api-compat.md の 444 + 58) は、ルート数の段落を最後に直した 202
 正しかった (その版の `router.go` と api-compat.md で数え直して一致)。数え方は同じで、その後に
 足したルートとパッケージが反映されていなかった。#3697 で数え直した (ルートは `internal/server` の
 非テストの `.go` の構文木で、`api` への `POST` / `GET` / `Match` / `Any` の呼び出しを数えた)。
+#3926 でも同じ数え方で数え直した (`api.POST` は #3926 より前から 516 で、514 のままだった)。
 
 `/api` の外は `s.echo` へ直接登録していて、`setupRoutes()` とその節 (4.2 の「setupRoutes の節」、
 #3901) の本文の登録の式文は 65 (`GET` 51 / `POST` 5 / `OPTIONS` 2 / `Any` 1 / `File` 4 / `Static` 2。
@@ -1898,7 +1900,11 @@ resolverの`SetBackground`・`SetHostBlockChecker`・`SetSoftwareSuspensionCheck
   roles・canChat・isSilencedが黙って既定値になる。以前の表の行も変数`entityPacker`しか見ていな
   かったので、これは捕まらなかった。照合するのは`*entity.Packer`型の欄だけで、Packerを包む部品
   (`userpack.Packer`・`NoteFieldResolver`など)を作り直して1つのhandlerにだけ渡す誤りは、包む部品の
-  型の欄やinterfaceの欄に現れるので捕まらない(既知の限界。#3834の前から捕まっていなかった)
+  型の欄やinterfaceの欄に現れるので捕まらなかった(#3834の前から捕まっていなかった)。#3369で、
+  同じテストの`assertSharedComponents`が、各部品の直下の欄(interfaceの欄は中の値)のうち
+  `routeParts`・`coreParts`の部品と同じ型のものが、その部品そのものを指すことを見るようにした。
+  型が同じ部品が2つ以上あるときは照合しない。構築子の中で同じPackerから作り直す
+  `webPushNotePacker.files`だけを、理由付きで許す(`sharedComponentAllowed`)
 - **`entitycompat`の`TestEntityPackerDepsAreWired`から`MediaURL: mediaURLCtx`の行を外し、構築子の
   呼び出しの照合に置き換えた。** `PackerDeps`の欄の数と表の行の数(7)を突き合わせる。nilの検査では、
   作り直した`*MediaURLContext`を渡す誤りが捕まらない。`mediaURLCtx`には後から、管理画面の
@@ -2296,10 +2302,10 @@ func (s *Server) wireCacheInvalidation(d cacheInvalidationDeps) {
 値から作る13個の部品の型は12(`deliveryHealth`と`inboxHealth`は同じ型)で、どれも形を満たす。
 値の無いworkerは満たさない。部品の型にメソッドを足して形が変わると、ここが落ちる。
 判定が知る形の一覧 (`valueShapes`) は、`TestValueShapes_CoverEveryRegistrationFromValue` が
-`lifecycle_parts.go` を構文木で読み、`addFromValue` を呼ぶ登録の関数と、その値の引数の interface の型を
-列挙して突き合わせる (1 つも拾えなければ落とす)。登録の形を足して判定に足し忘れると、ここが落ちる。
-ただし読むのは `lifecycle_parts.go` の `Server` のメソッドだけで、別のファイルに置いた登録と、
-型パラメータを持つ自由関数 (メソッドは型パラメータを持てない) で書いた登録は拾えない。
+`internal/server` の非テストの全ファイル (`git ls-files` で列挙) を構文木で読み、`addFromValue` を呼ぶ
+登録の関数と、その値の引数の interface の型を列挙して突き合わせる (1 つも拾えなければ落とす)。
+登録の形を足して判定に足し忘れると、ここが落ちる。メソッドでない関数も読み、値の引数が型パラメータ
+なら、その制約の型を見る (#3369)。
 
 **実行時には拒まない**(`lifecycle.add`は印を見ない)。本番で`lifecycle.add`・`addWithStart`を呼ぶのは、
 値から作る登録(`addFromValue`)と`addWorker`だけで、値を持つ部品が直接通っていないことは上のテストが見る。
@@ -2401,8 +2407,8 @@ func (s *Server) wireCacheInvalidation(d cacheInvalidationDeps) {
   起動せずに`errGenerationStopped`を返す(1度きりの起動の結果なので、後の呼び出しも同じエラーを返す)。
   起動の途中で停止が始まったときは、停止は起動が済むのを待ってから印を立て、その起動が起動したもの
   をすべて止める。起動の間はmutexを握ったままにした。起動は部品のgoroutineを立てるほか、cronの登録
-  (`registerSchedulerJobs`の12個の登録の関数)と撤去(`PruneUnregistered`)でRedisを
-  `context.Background()`のまま呼ぶので、その分だけ長くかかりうる
+  (`registerSchedulerJobs`の12個の登録の関数)と撤去(`PruneUnregistered`)、起動時のジョブの投入
+  (`enqueueDueJobsAtStartup`、#3994)でRedisを`context.Background()`のまま呼ぶので、その分だけ長くかかりうる
   - **本番の経路に足す待ちは無い。** Supervisorは`StartBackground`と`StopBackground`をどちらも`genMu`の
     下で呼ぶので、固まった起動は#3709の前から停止を止めていた(`Supervisor.Shutdown`は
     `lockBefore(&s.genMu, b.drainUntil)`で見切って進む)。走っている起動を`runMu`で待つのは、
@@ -3331,7 +3337,7 @@ wire 互換を機械的に守る多層防御。upstream は **official `misskey/
 | drift detector | CanSeeNote ↔ SQL push-down 等のロジック整合検出 | shape-drift.md |
 | 値レベル diff harness | TS インスタンス ↔ Elythia の応答を値単位で diff（`make diff-test`） | diff-e2e.md |
 | drop-in e2e | 実 Misskey TS ↔ Elythia 切替の連合/フロント互換（PR ごと。frontend e2e のみ nightly） | dropin-e2e.md / dropin-frontend-e2e.md |
-| playwright | 299 spec を Elythia backend で（PR ごと、4 シャード）。TS backend は手動 | — |
+| playwright | 301 spec を Elythia backend で（PR ごと、4 シャード）。TS backend は手動 | — |
 | inbound/outbound 連合 | Fedibird-like mock との Ed25519 双方向 verify | federation.md |
 
 CI（`ci.yml`）は build / 4-shard test（パッケージ毎 90% カバレッジ強制）/ lint を必須化。
@@ -3361,11 +3367,11 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 `MK_` プレフィックスの環境変数でオーバーライド可（例 `MK_DB_HOST`）。詳細は [configuration.md](configuration.md)。
 
-マイグレーション（`migration/`、golang-migrate、現在 138 本）:
+マイグレーション（`migration/`、golang-migrate、現在 140 本）:
 
-Misakiの独自処理は別系列の`migration/local/000001_misaki_drop_remote_avatar_decorations`へ置く。本体138本とforkの1本は別の台帳で管理する。旧Misaki版では上流と異なる番号を割り当てていたため、既存DBの更新は[移行履歴の照合](misaki-migration-reconciliation.md)に従う。
+Misakiの独自処理は別系列の`migration/local/000001_misaki_drop_remote_avatar_decorations`へ置く。本体140本とforkの1本は別の台帳で管理する。旧Misaki版では上流と異なる番号を割り当てていたため、既存DBの更新は[移行履歴の照合](misaki-migration-reconciliation.md)に従う。
 
-- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 22 件あり、うち 16 件は Elythia が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
+- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 23 件あり、うち 17 件は Elythia が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
 - drop-in テストで発見した補完列は専用マイグレーションで追加。
 - down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただしこれは今後の規約で、既存の down は守れていない** — 宣言があるのは 31 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down が 51 本ある（[migration-from-ts.md](migration-from-ts.md#elythia-内での切り戻し)）。
 

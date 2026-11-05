@@ -281,6 +281,28 @@ func TestNewHandler_OffsetParses(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
+// 本家の chart は自分の paramDef に無い host・userId を知らない項目として無視
+// するので、型の違う値でも400にしない (#3369)。
+func TestCharts_IgnoreFieldsTheChartDoesNotHave(t *testing.T) {
+	h, _ := newHandlerWithAllCharts(t)
+	cases := []struct {
+		name string
+		fn   echo.HandlerFunc
+		body string
+	}{
+		{"notes", h.Notes, `{"span":"hour","host":1,"userId":{}}`},
+		{"instance", h.Instance, `{"span":"hour","host":"example.com","userId":1}`},
+		{"user/notes", h.UserNotes, `{"span":"hour","userId":"u1","host":1}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, rec := newReq(t, tc.body)
+			require.NoError(t, tc.fn(c))
+			assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		})
+	}
+}
+
 func TestInstanceEndpoints_HappyPath(t *testing.T) {
 	h, _ := newHandlerWithAllCharts(t)
 	cases := []struct {
@@ -467,6 +489,23 @@ func TestParseRequest_OffsetIsEpochMs(t *testing.T) {
 	assert.EqualValues(t, 0, total(t, fmt.Sprintf(`{"span":"hour","limit":1,"offset":%d}`, pastMs)))
 }
 
+// offset が JavaScript の Date で表せない時刻 (絶対値が 8.64e15 を超える) なら、
+// int64 の範囲外と同じ 400 にする (以前は 500。#3369)。境界の 8.64e15 は通す。
+func TestParseRequest_OffsetOutsideJSDateRange(t *testing.T) {
+	h, _ := newHandlerWithAllCharts(t)
+	for _, offset := range []string{"1e17", "9223372036854775807", "-9223372036854775808", "8640000000000001", "-8640000000000001"} {
+		c, rec := newReq(t, `{"span":"hour","offset":`+offset+`}`)
+		require.NoError(t, h.Notes(c))
+		assert.Equal(t, http.StatusBadRequest, rec.Code, offset)
+		assert.Contains(t, rec.Body.String(), `"param":"#"`, offset)
+	}
+	for _, offset := range []string{"8640000000000000", "-8640000000000000"} {
+		c, rec := newReq(t, `{"span":"hour","offset":`+offset+`}`)
+		require.NoError(t, h.Notes(c))
+		assert.Equal(t, http.StatusOK, rec.Code, "%s: %s", offset, rec.Body.String())
+	}
+}
+
 // TestParseRequest_OffsetZeroIsNoCursor は offset=0 が upstream の falsy 分岐
 // (`0 ? ... : null`) に従い cursor 無し (engine の now()) になることを確認する。
 func TestParseRequest_OffsetZeroIsNoCursor(t *testing.T) {
@@ -540,6 +579,8 @@ func TestInvalidParam_EnvelopeShape(t *testing.T) {
 		{"missing host", h.Instance, `{"span":"hour"}`, "#/required", "must have required property 'host'"},
 		{"missing userId", h.UserNotes, `{"span":"hour"}`, "#/required", "must have required property 'userId'"},
 		{"bad json", h.Notes, `{not json`, "#", "Invalid request body."},
+		{"bad json (instance)", h.Instance, `{not json`, "#", "Invalid request body."},
+		{"wrong host type", h.Instance, `{"span":"hour","host":1}`, "#", "Invalid request body."},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

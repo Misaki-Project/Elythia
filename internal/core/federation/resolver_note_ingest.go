@@ -176,9 +176,11 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	// 保存するのは切った本文、禁止語・連合のルール・本文からの hashtag の判定は
 	// 切る前の全文で行う (本家 ApNoteService は checkProhibitedWordsContain を
 	// 全文で見てから NoteCreateService.create で切る)。
+	// 切った後に前後の空白を削り、空なら本文無しにする (本家と同じ、#3369)。
 	if fullText != nil {
-		clipped := clipRemoteNoteText(*fullText)
-		note.Text = &clipped
+		if stored := storedRemoteNoteText(*fullText); stored != "" {
+			note.Text = &stored
+		}
 	}
 	if apNote.Summary != "" {
 		// **列の上限で切り、NUL を落とす。** CW は**相手が自由に決められる値**で、
@@ -220,7 +222,9 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	// 本家はリモートの投稿も NoteCreateService.create を通すので、ローカル投稿と
 	// 同じ降格が掛かる。判定は禁止語と同じく切る前の全文で行う (本家も切る前に
 	// 判定する)。編集 (Update) の取り込みでも同じ判定で降格する (UpdateRemoteNote)。
-	if note.Visibility == model.NoteVisibilityPublic && r.containsSensitiveWords(fullText, note.CW) {
+	// 当たらなければ、本家と同じく投稿者のロールの canPublicNote でも降格する (#3369)。
+	if note.Visibility == model.NoteVisibilityPublic &&
+		(r.containsSensitiveWords(fullText, note.CW) || r.authorCannotPublicNote(actor.ID)) {
 		note.Visibility = model.NoteVisibilityHome
 	}
 	// 連合のルール (#3090)。禁止語と同じく**行を作る前**に評価する。ここより後ろは
@@ -504,6 +508,10 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 		}
 		return nil, false, err
 	}
+	// 本家はリモートの投稿も NoteCreateService を通すので、投稿者の notesCount を
+	// 1 増やす (#3928)。ephemeral に入れた時点では数えず (投稿者の行が DB に無い
+	// ことがある)、DB に入れたここで数える。失敗はベストエフォートで無視。
+	r.incrementAuthorNotesCount(actor.ID)
 	// ローカルノートへの返信の場合、repliesCount を増やす。
 	// これにより timeline や API 上の「返信数」表示が federated reply も
 	// 含むようになる。失敗はベストエフォートで無視。

@@ -1,8 +1,11 @@
 package federation
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/elythia-network/elythia/internal/activitypub"
 )
 
 // resolveChain is the set of note identities held by the current resolve
@@ -52,6 +55,11 @@ type resolveChain struct {
 	inboundLocalReferences bool
 	inboundSourceHost      string
 	ids                    map[string]string
+	// fetchKey は、instance actor では見えなかった投稿を取り直すときに使う
+	// ローカルの利用者の鍵 (#3915)。引用先の解決と actor の解決 (とそこから入る
+	// featured) には渡さない (resolveQuoteURI / resolveActorOnceWithID が
+	// withoutFetchKey で外す)。nil なら取り直さない。
+	fetchKey *fetchKeySource
 }
 
 // treeBudget is the wait allowance shared by every chain in one resolve tree.
@@ -95,6 +103,7 @@ func (c *resolveChain) with(key, docID string) *resolveChain {
 	if c != nil {
 		next.id, next.budget, next.bestEffort = c.id, c.budget, c.bestEffort
 		next.inboundLocalReferences, next.inboundSourceHost = c.inboundLocalReferences, c.inboundSourceHost
+		next.fetchKey = c.fetchKey
 	}
 	next.rootStamp()
 	return next
@@ -109,6 +118,7 @@ func (c *resolveChain) asBestEffort() *resolveChain {
 	if c != nil {
 		next.id, next.budget, next.ids = c.id, c.budget, c.ids
 		next.inboundLocalReferences, next.inboundSourceHost = c.inboundLocalReferences, c.inboundSourceHost
+		next.fetchKey = c.fetchKey
 	}
 	next.rootStamp()
 	return next
@@ -200,7 +210,103 @@ func (c *resolveChain) ensureTree() *resolveChain {
 		// ids は不変に扱っているので共有してよい。
 		next.ids, next.bestEffort = c.ids, c.bestEffort
 		next.inboundLocalReferences, next.inboundSourceHost = c.inboundLocalReferences, c.inboundSourceHost
+		next.fetchKey = c.fetchKey
 	}
 	next.rootStamp()
 	return next
+}
+
+// fetchKeyFor returns the local user's key this chain retries the hidden note
+// at uri with, or nil. The key is only used for notes on the host it was given
+// for.
+func (c *resolveChain) fetchKeyFor(uri string) *activitypub.PrivateKey {
+	if !c.fetchKeyAppliesTo(uri) {
+		return nil
+	}
+	return c.fetchKey.get()
+}
+
+// fetchKeyIDFor identifies the key this chain would retry the note at uri with,
+// without loading it, or "" when it would not retry it.
+func (c *resolveChain) fetchKeyIDFor(uri string) string {
+	if !c.fetchKeyAppliesTo(uri) {
+		return ""
+	}
+	return c.fetchKey.id
+}
+
+// fetchKeyAppliesTo reports whether this chain has a key for the host of uri.
+func (c *resolveChain) fetchKeyAppliesTo(uri string) bool {
+	if c == nil || c.fetchKey == nil {
+		return false
+	}
+	host, err := hostFromURI(uri)
+	return err == nil && host == c.fetchKey.host
+}
+
+// withoutFetchKey returns this chain with no key to retry with.
+//
+// **actor の解決には鍵を持ち込まない。** actor を作るか読み直すと featured
+// (ピン留め) を取り込み、その引用先までたどる。そこで鍵を使うと、照会した人が
+// 選んでいない投稿 (他のホストのものを含む) へ、その人の署名付き GET が出る。
+func (c *resolveChain) withoutFetchKey() *resolveChain {
+	if c == nil || c.fetchKey == nil {
+		return c
+	}
+	next := *c
+	next.fetchKey = nil
+	return &next
+}
+
+// fetchKeySource is the local user's key a hidden note is retried with, and
+// the only host it is used for.
+//
+// **鍵を使うのは 1 つのホストだけ。** 引用先と actor の解決では鍵を外すが、
+// ホストでも縛っておく。どこかの経路で鍵が枝に漏れても、相手が選んだ他の
+// ホストへ鍵の持ち主の署名付き GET を出させないため。
+//
+// **受信では鍵を要るときに 1 回だけ引く (#3916)。** 取り直しが要るのは見えない
+// 投稿に当たったときだけで、鍵を引くにはフォロワーを探して DB を何度か引く。
+// 解決のたびに先に引くと、ほとんどの受信で無駄になる。
+type fetchKeySource struct {
+	// id は singleflight の鍵に入れる。同じ id なら同じ鍵になる。
+	id   string
+	host string
+	once sync.Once
+	load func() *activitypub.PrivateKey
+	key  *activitypub.PrivateKey
+}
+
+// newFetchKeySource returns a source for key used only for notes on the host of
+// uri. It returns nil (no retry) when key is nil or uri has no host.
+func newFetchKeySource(key *activitypub.PrivateKey, uri string) *fetchKeySource {
+	if key == nil {
+		return nil
+	}
+	host, err := hostFromURI(uri)
+	if err != nil {
+		return nil
+	}
+	s := &fetchKeySource{id: key.KeyID, host: host, key: key}
+	s.once.Do(func() {})
+	return s
+}
+
+// lazyFetchKeySource returns a source that calls load on first use, for notes
+// on host only. id must name whose key load returns. It returns nil when host
+// is empty.
+func lazyFetchKeySource(id, host string, load func() *activitypub.PrivateKey) *fetchKeySource {
+	if host == "" {
+		return nil
+	}
+	return &fetchKeySource{id: id, host: host, load: load}
+}
+
+func (s *fetchKeySource) get() *activitypub.PrivateKey {
+	s.once.Do(func() {
+		if s.load != nil {
+			s.key = s.load()
+		}
+	})
+	return s.key
 }

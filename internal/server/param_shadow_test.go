@@ -26,6 +26,7 @@ import (
 	"github.com/elythia-network/elythia/internal/core/cache"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
+	"github.com/elythia-network/elythia/internal/testutil"
 	"github.com/elythia-network/elythia/plugin"
 )
 
@@ -191,18 +192,41 @@ func newParamShadowServers(t *testing.T, opts ...func(*config.Config)) (off, on 
 // functions applied to both servers.
 func newParamShadowServersSetup(t *testing.T, beforeSetup []func(*Server), opts ...func(*config.Config)) (off, on *Server, logs *syncBuffer) {
 	t.Helper()
-	t.Setenv(config.EnvOnlyServer, "1")
-	t.Setenv(config.EnvOnlyQueue, "")
 	mr := miniredis.RunT(t)
 	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })
+	redisPort, err := strconv.Atoi(mr.Port())
+	require.NoError(t, err)
+	return newParamShadowServersOn(t, redisClient, config.RedisOptions{Host: mr.Host(), Port: redisPort}, beforeSetup, opts...)
+}
+
+// newRealRedis starts a Redis container for t and returns a client on it and
+// its options.
+//
+// **ジョブを積む endpoint を通すテストは、miniredis でなく実 Redis を使う (#3369)。**
+// miniredis には mkq の Lua が使う cmsgpack が無く、ジョブの投入が必ず失敗して
+// 500 になる (本番の挙動と違う)。testcontainers で立てるので Docker が要る。
+// **手元で Docker が無いと、使うテスト (TestEnforcedEndpointsMatchTheCorpus) は
+// skip する** (testutil.SkipIfNoDocker)。CI (環境変数 CI がある) では skip せず落ちる。
+func newRealRedis(t *testing.T) (*redis.Client, config.RedisOptions) {
+	t.Helper()
+	testutil.SkipIfNoDocker(t)
+	tr, err := testutil.SetupRedis(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { tr.Teardown(context.Background()) })
+	return tr.Client, config.RedisOptions{Host: tr.Host(), Port: tr.Port()}
+}
+
+// newParamShadowServersOn is newParamShadowServersSetup on the Redis
+// redisClient talks to (described by redisOptions for the queue driver).
+func newParamShadowServersOn(t *testing.T, redisClient *redis.Client, redisOptions config.RedisOptions, beforeSetup []func(*Server), opts ...func(*config.Config)) (off, on *Server, logs *syncBuffer) {
+	t.Helper()
+	t.Setenv(config.EnvOnlyServer, "1")
+	t.Setenv(config.EnvOnlyQueue, "")
 	redisClients := &cache.RedisClients{
 		Default: redisClient, Pubsub: redisClient, JobQueue: redisClient,
 		Timelines: redisClient, Reactions: redisClient,
 	}
-	redisPort, err := strconv.Atoi(mr.Port())
-	require.NoError(t, err)
-	redisOptions := config.RedisOptions{Host: mr.Host(), Port: redisPort}
 	build := func(disable bool) *Server {
 		cfg := &config.Config{
 			URL: "http://example.test", Host: "example.test", Hostname: "example.test",
@@ -240,6 +264,10 @@ func TestParamShadowChangesNoResponse(t *testing.T) {
 	const adminRoleID, adminAssignID = "pshadow-admin-role", "pshadow-admin-assign"
 	// 数えるだけの例は admin/update-meta に置く (下の requests)。受理する入力は
 	// meta を書き換えるので、流す前の行へ戻す。
+	// meta の行は起動時か最初の読み込みで作られる。-shuffle でこのテストがパッケージの
+	// 最初の方に回ると、まだ行が無いので、読む前に作っておく (#3994 で順序が変わって表に出た)。
+	_, err := repository.NewMetaRepository(db).Fetch()
+	require.NoError(t, err)
 	var metaBefore []string
 	require.NoError(t, db.Raw(`SELECT row_to_json(m)::text FROM meta m ORDER BY id`).Scan(&metaBefore).Error)
 	require.Len(t, metaBefore, 1)
@@ -391,7 +419,12 @@ func TestParamShadowChangesNoResponse(t *testing.T) {
 var apiRegistrationAllowed = map[string]string{
 	// 登録の無い/api/*に200と空のobjectを返すcatchall。goldenのendpointではない。
 	`api.Any("/*", apiCatchall)`: "router.go",
+	// 本家がendpointの外でfastify.allに直接登録するroute(#3926)。frontendが
+	// 設定画面のキャッシュの削除からGETで呼ぶ。本文を読まないので本文の検査は要らない。
+	`api.Any("/clear-browser-cache", meta.ClearBrowserCache)`: "router.go",
 	// プラグインのroute(/api/plugin/<名前>/...)。Elythia独自で、goldenに無い。
+	// 上の登録をするsetupPluginsへ、/apiのgroupを渡す。
+	`s.setupPlugins(api.Group, registeredPlugins, openPluginStorage)`: "router.go",
 	// pluginAppTokenPolicyはapp tokenを既定で拒否する。例外は
 	// POST /api/plugin/role-level/admin/change-expだけで、専用scope
 	// write:admin:role-level-experienceとhandlerの管理者/モデレーター認可を併用する。
@@ -399,10 +432,16 @@ var apiRegistrationAllowed = map[string]string{
 }
 
 // apiBypassingRegistration matches a registration on the /api group that
-// does not go through apiRoutes' POST / Match / GET, and one on the echo
-// instance under /api/.
+// does not go through apiRoutes' POST / Match / GET, a use of the /api group
+// as a value (passed to a function or aliased), and one on the echo instance
+// under /api/.
+//
+// **値として使う`api.Group`も落とす (#3369 I10)。** `addXRoutes(api.Group, h)`や
+// `g := api.Group`を通すと、受け取った側の登録はどの名前の走査にも掛からない。
 var apiBypassingRegistration = regexp.MustCompile(
-	`\bapi\.(?:Group\.|Group\(|Add\(|Any\(|PUT\(|PATCH\(|DELETE\(|HEAD\(|OPTIONS\(|CONNECT\(|TRACE\(|RouteNotFound\()[^\n]*` +
+	`[\w.]+\(api\.Group\b[^\n]*?\)` +
+		`|\bapi\.Group(?:[^.(\w]|$)[^\n]*` +
+		`|\bapi\.(?:Group\.|Group\(|Add\(|Any\(|PUT\(|PATCH\(|DELETE\(|HEAD\(|OPTIONS\(|CONNECT\(|TRACE\(|RouteNotFound\()[^\n]*` +
 		`|\becho\.(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|Add|Any|Match)\([^\n]*"/api/[^\n]*`)
 
 // TestAPIRegistrationsGoThroughAPIRoutes is the gate of the #3677 review
@@ -411,9 +450,7 @@ var apiBypassingRegistration = regexp.MustCompile(
 //
 // 名前で見る走査なので、普通に書いたときに踏む形(api.Group.POST、api.Add、
 // api.PUTなど)だけを落とす。次の形は見つけられない(docs/gates.mdの既知の限界)。
-//   - *echo.Group型の引数で受け取ったgroupへの登録(registerX(api.Group))
 //   - s.echo.Group("/api")で作った別のgroupへの登録
-//   - g := api.Groupのような別名を通した登録
 //   - "/api/"を定数で書いたs.echo.POST
 //   - e := s.echoのようにechoを別名にしたe.POST("/api/x", h)
 //   - pathをraw stringで書いたs.echo.POST(`/api/x`, h)
@@ -458,6 +495,10 @@ func TestAPIBypassingRegistrationPattern(t *testing.T) {
 		`api.PUT("/x", h)`,
 		`s.echo.POST("/api/notes/create", h)`,
 		`e.echo.Match(methods, "/api/x", h)`,
+		`addXRoutes(api.Group, h)`,
+		`registerX(h, api.Group)`,
+		`g := api.Group`,
+		`return api.Group`,
 	} {
 		assert.True(t, apiBypassingRegistration.MatchString(line), line)
 	}
@@ -468,6 +509,7 @@ func TestAPIBypassingRegistrationPattern(t *testing.T) {
 		`api.Use(mw)`,
 		`s.echo.GET("/api.json", h)`,
 		`apiGroup.PUT("/x", h)`,
+		`api.Groups("/x")`,
 	} {
 		assert.False(t, apiBypassingRegistration.MatchString(line), line)
 	}

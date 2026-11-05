@@ -15,7 +15,7 @@
 | 連合テスト (Mastodon) | Elythia ↔ 本物の Mastodon の引用の承認 (FEP-044f) | Docker Compose多段 | `make federation-mastodon-e2e` (起動から撤去まで通し) |
 | Drop-in e2e (pytest) | TS-A backend を mk-A に差し替えて state preservation 検証 | TS 2 instance + mk overlay | `make dropin-swap-test` (#365 / #367 / #372 / #374、詳細は[dropin-e2e.md](dropin-e2e.md)) |
 | Drop-in frontend e2e (cypress) | 3 TS instance + mk overlay swap で frontend 視点の互換 | cypress + 3 TS + mk-A | `make dropin-frontend-swap-test` (#380 / #381 / #387 / #394、詳細は[dropin-frontend-e2e.md](dropin-frontend-e2e.md)) |
-| Playwright e2e | Elythia と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、299 spec ファイル。PR ごとに Elythia、upstream 追従時に TS backend) |
+| Playwright e2e | Elythia と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、301 spec ファイル。PR ごとに Elythia、upstream 追従時に TS backend) |
 | fuzz (画像デコーダ) | `internal/misc/imagedecode` のデコーダと判定関数 | 不要 | `make fuzz-imagedecode` (詳細は[画像デコーダの fuzz](#画像デコーダの-fuzz-3480)) |
 | 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体正本のまま Elythia に向けて実行 (UserLite の期待DTOにローカル連合状態を追加) | PostgreSQL / Redis + Elythia バイナリ | `make upstream-e2e` (#2347、25 ファイル 1256 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
 
@@ -101,6 +101,7 @@ CI は **`-shuffle=3` を全 shard 共通の固定値として**回す。`on` (�
 - **複数行が返りうるクエリを `Scan(&string)` で受けない (#2777)。** GORM は `*string` に対し**全行を走査して dest を上書きし続ける**ので、複数行が返ると**最後の 1 行**が残る。実測では `pg_indexes` の絞りを外すと 17 件中 17 番目 (`internal_repository_ts`) の定義が返り、**それでもテストが緑のまま通っていた** — 上の (a) の実例。slice で受けて件数と schema 名を確かめる (`internal/repository/index_lookup_test.go` の `indexDef` が例)
 - 行の投入は**戻り値を検査する** (`require.NoError(t, db.Create(x).Error)`)。捨てると FK 違反が黙って流れ、「200 のはずが 400」のような原因から遠い症状に化ける
 - **同じパッケージのテストを、同じ DB に向けて 2 本同時に流さない (#3369)。** schema はパッケージ単位なので、2 本が互いの行を見て一覧の比較などが無関係な形で落ちる (worktree を並べた検証や、複数のエージェントが既定の `misskey_test` を共有したときに起きた)。並べるときは `TEST_DB_NAME` を分ける (`testutil` は database を作らないので、先に `CREATE DATABASE` しておく。手元の `mk` は CREATEDB を持たないことがあるので、作れないときは別の PostgreSQL を立てて `TEST_DB_PORT` で指す)。`testutil` は schema を開くときにその schema の advisory lock (`pg_try_advisory_lock`) を取り、プロセスが終わるまで持つ (鍵はプロセスで 1 本の接続に載せる。その接続が切れると鍵は外れ、次に schema を開くときに張り直して取り直す)。取れなければ `test schema "..." on database "..." is in use by another test process` で **panic する** (error で返すと、呼び出し側の多くが「DB が無い」として skip し、2 本目が黙って緑になるため)。**`-run` で DB を使わないテストだけを選んでも落ちる。** `TestMain` / `init` で DB を開くパッケージは、どのテストを選んでも schema を開くため (例: `make frontend-check` が回す `internal/server` のゲートは、同じ DB で `make test` が `internal/server` を流している間は panic する)。CI は shard ごとに DB を持ち、1 つの shard に各パッケージは 1 回しか入らないので、ここでは落ちない
+- **テストの DB の pool は、1 つにつき接続 20 本までで、2 秒使わなかった接続を閉じる (#3369)。** 閉じない pool (テストごとに `OpenTestDB` を呼ぶパッケージがある) が idle の接続を持ち続け、手元の `make test` で同時接続が `max_connections` (既定 100) に近づいて `too many clients` で落ちていた。値と実測は `internal/testutil/testdb.go` の `testDBMaxOpenConns`。1 つの pool で 20 本より多くの接続を同時に持ったまま待ち合わせるテストを書くと詰まる (トランザクションを開いたまま別の goroutine の書き込みを待つ形など)
 
 migration で enum を作るときは `EXCEPTION WHEN duplicate_object THEN NULL` を使う。`pg_type WHERE typname = ...` は **schema を見ない**ため、別 schema に同名の型があるだけで作成を飛ばし、直後の `CREATE TABLE` が落ちる。
 
@@ -138,6 +139,8 @@ PGPASSWORD=mk psql -h localhost -U mk -d misskey_test \
 |---|---|---|
 | Redis | `SetupRedis` を **27 パッケージ**が使う。**`SkipIfNoDocker` を置いているのは 7 つだけで、残り 20 は `TestMain` で `log.Fatalf` する** (= Docker が無いとそのパッケージは落ちる) | — |
 | PostgreSQL | `SetupPostgres` は `internal/api/test` / `tests/e2e` / `tests/e2e-federation` の **3 パッケージだけ** | `OpenTestDB` / `MustOpenTestDB` を **15 パッケージ**が使い、`TEST_DB_*` の指す PostgreSQL に直接つなぐ |
+
+`internal/server` の照合のテスト (`TestEnforcedEndpointsMatchTheCorpus`) は、ジョブを積む endpoint を本番どおりに通すため、miniredis でなく `SetupRedis` の実 Redis を使う (#3369。miniredis には mkq の Lua が使う `cmsgpack` が無い)。**手元で Docker が無いと、このテストは `SkipIfNoDocker` で skip する** (環境変数 `CI` がある CI では skip せず落ちる)。
 
 つまり **Redis は Docker があれば足りるが、PostgreSQL は自分で用意する必要がある**。`MustOpenTestDB` は失敗時に panic し、しかも `init()` から呼ばれるので、PostgreSQL が無いと該当パッケージはまとめて落ちる (skip されない)。
 
@@ -273,11 +276,11 @@ make federation-misskey-down
 
 `tests/playwright/` 配下の spec を Elythia と Misskey TS の **両 backend** で並列実行し、drop-in 互換 regression を PR ごとに検出する基盤。
 
-- 範囲: 299 spec ファイル (upstream 290 = ui 194 / api 96、elythia 9) / 40 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
+- 範囲: 301 spec ファイル (upstream 290 = ui 194 / api 96、elythia 11) / 40 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
 - トリガー: `pull_request` (paths フィルタ) + `workflow_dispatch`。**nightly ではない** (#2291 で移行)。`.github/workflows/playwright.yml`
-- **4 シャード並列** (`--shard=i/4`、`fail-fast: false`)。1 スタックに対しては直列でしか回せない (共有の root と instance meta を spec が取り合う) ので、並列度はシャードごとに独立した stack を立てて稼ぐ (#2609)
+- **4 シャード並列** (`PLAYWRIGHT_SHARD=i/4`、所要時間で割り振る。`fail-fast: false`)。1 スタックに対しては直列でしか回せない (共有の root と instance meta を spec が取り合う) ので、並列度はシャードごとに独立した stack を立てて稼ぐ (#2609)
 - **TS backend は `workflow_dispatch` 専用**で PR では回らない。upstream が変わらない限り答えも変わらないため、追従する本家の版を上げたタイミングだけ回す
-- spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/elythia/` の 9 件 (Elythia 独自機能を見るので公式 image では通らない)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している
+- spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/elythia/` の 11 件 (9 件は Elythia 独自機能を見るので公式 image では通らない。残る 2 件は spec の helper のガードで、1 つの backend で見れば足りる)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している
 
 ### spec を書くときの注意: root の per-user quota
 

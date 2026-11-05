@@ -166,7 +166,8 @@ type Server struct {
 	// stopped, before they stop anything.
 	//
 	// 起動の間は握ったままにする。起動は部品のgoroutineを立てるほか、cronの登録
-	// (registerSchedulerJobsの12個の登録の関数)と撤去(PruneUnregistered)でRedisを
+	// (registerSchedulerJobsの12個の登録の関数)と撤去(PruneUnregistered)、起動時の
+	// ジョブの投入(enqueueDueJobsAtStartup、#3994)でRedisを
 	// context.Background()のまま呼ぶので、その分だけ長くかかりうる。本番の経路では
 	// StartBackgroundとStopBackgroundをどちらもSupervisorのgenMuの下で呼ぶので、
 	// 固まった起動は#3709の前から停止を止めていた(Supervisor.ShutdownはlockBeforeで
@@ -204,6 +205,11 @@ type Server struct {
 	// 通らない)ので、照合のテストがbeforeSetupで数えるだけの偽物を入れる(#3877)。
 	selfCheckRunner apiadmin.SelfCheckRunner
 	remoteChecker   apiadmin.RemoteChecker
+	// outboundLookupは、外向きの通信(outboundOpts)の名前解決。nilなら既定の
+	// resolver。safehttpはproxyへ渡す前に宛先を手元で名前解決するので、proxyで
+	// 数える照合のテストは名前解決を数えられない。テストがbeforeSetupで、数えて
+	// 拒否するresolverを入れる(#3369)。本番の組み立ては入れない。
+	outboundLookup func(ctx context.Context, host string) ([]net.IPAddr, error)
 	// paramEnforcedは、本家と同じ400で拒否するendpointの一覧。nilなら
 	// paramEnforcedEndpoints(宣言の全部)。本家の残りのendpoint(reset-db)では数えるだけの
 	// 検証を試せないので、影の検証のテストがbeforeSetupで差し替える(#3888)。
@@ -750,6 +756,9 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	}
 
 	e := echo.New()
+	// GET のルートを HEAD にも応えさせる (#3925)。ルートの記録と最も外側の
+	// middleware を兼ねるので、ルートと他の middleware より先に置く。
+	headRouting := installHeadRoutes(e)
 	e.HideBanner = true
 	e.HidePort = true
 	applyServerTimeouts(e.Server)
@@ -804,11 +813,15 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 			return nil
 		}
 	})
+	// ここから内側では、GET のルートへ振り分けた HEAD を GET として見せる
+	// (#3925)。アクセスログより内側に置くので、ログには HEAD と出る。
+	e.Use(headRouting.presentAsGET)
 	e.Use(corsMiddleware())
 	// gzip response compression (#413 Phase 3 #12)。Misskey TS は nginx
 	// 前段で gzip するのが定石だが、mk-go は単体運用も想定するので app 側
-	// で提供する。設定は gzipConfig() に集約してテストと共有。
-	e.Use(echomw.GzipWithConfig(gzipConfig()))
+	// で提供する。設定は gzipConfig() と gzipMiddleware() に集約してテストと
+	// 共有。画像・動画・音声と 206 は圧縮しない (#3966)。
+	e.Use(gzipMiddleware())
 
 	// CachedUserRepository を一度だけ構築して auth middleware と
 	// setupRoutes (services) が同じ cache を共有するようにする (#300 3-3)。
@@ -1146,6 +1159,22 @@ func (s *Server) registerSchedulerJobs() {
 	}
 }
 
+// enqueueDueJobsAtStartup puts the startup run of the jobs that otherwise
+// run only at a due time (#3994): the announcement auto-archive and the
+// QuoteRequest resend. Each handles what came due while no job ran and
+// schedules again the jobs not yet due.
+//
+// cron と同じく queue を回すプロセスだけが積む。積めなくても起動は止めない
+// (お知らせは日次の保険が落とす。送り直しは配送の queue も使えないので送れない)。
+func (s *Server) enqueueDueJobsAtStartup() {
+	if s.queueClient == nil {
+		return
+	}
+	if err := s.queueClient.EnqueueDueJobsAtStartup(); err != nil {
+		slog.Warn("enqueue due jobs at startup failed", "err", err)
+	}
+}
+
 // SetSyncDeliverHookForTest replaces the queued deliver enqueue with the
 // supplied synchronous hook. e2e_federation 系テストで queue worker 経由の
 // deliver が動かない/動かしたくないシナリオで、sign + HTTP POST を inline
@@ -1245,6 +1274,7 @@ func (s *Server) startBackground(what backgroundStart) error {
 		}
 		s.autoscale = runner
 		s.registerSchedulerJobs()
+		s.enqueueDueJobsAtStartup()
 	}
 	// chart は **両方の role で回す**。メモリ上の集計バッファはプロセスごとに
 	// 溜まり (API 経由の投稿は server、連合 inbox 由来は queue)、自分の分は

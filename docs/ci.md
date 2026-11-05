@@ -19,7 +19,7 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 |---|---|---|---|
 | `build` | CI | 全パッケージがコンパイルできるか + 同梱プラグインの `go vet` + 同梱サンプルが既定無効か（`rolelevel`だけはallowlistで既定有効） + 同梱サンプル入りの統合バイナリ | `go build ./...` / `make plugin-vet` / `make plugins-all && go build -o /dev/null ./cmd/elythia` |
 | `lint` | CI | `go vet` + **actionlint** + `gofmt -s -d` の差分 + 重複 fixture ID + **golangci-lint** | `make lint` / `make actionlint` / `make fmt` / `make golangci-lint` |
-| `test` | CI | 4-way shard、Python delivery artifact test、A/B harness helper test の集約。どれか 1 つでも落ちれば赤 | `make test` / `python3 -m unittest discover -s tests/bench/queue/common -p 'test_*.py' -v` / `bash tests/bench/ab/test_run_helpers.sh` |
+| `test` | CI | 4-way shard、Python delivery artifact test、A/B harness helper test、ベンチのデータの生成器のテストの集約。どれか 1 つでも落ちれば赤 | `make test` / `python3 -m unittest discover -s tests/bench/queue/common -p 'test_*.py' -v` / `bash tests/bench/ab/test_run_helpers.sh` / `python3 -m unittest discover -s tests/bench/data -p 'test_*.py' -v` |
 | `frontend` | frontend | `frontend-lint` (10 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) の集約。frontend に関係しない差分では両方を skip して成功する | 下の「`frontend` が落ちたとき」 |
 
 ### `test` が落ちたとき
@@ -111,7 +111,7 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 | `ed25519-verify` | Drop-in e2e | Fedibird-like mock との Ed25519 双方向 verify | 5 min | `make dropin-fedibird-test` |
 | `federation` | Drop-in e2e | 本物の Misskey TS との実連合 (follow/note/reaction/renote/reply/mention/delete) | 4 min | `make federation-misskey-e2e` |
 | `federation-mastodon` | Drop-in e2e | 本物の Mastodon との引用の承認 (FEP-044f): 双方向の引用が承認済みになるか、取り消しが双方向で効くか | 未計測 | `make federation-mastodon-e2e` |
-| `spec (Elythia 1/4)` 〜 `4/4` | Playwright | ブラウザからの統合互換 (299 spec ファイル) | 4-9 min | `make playwright-check` |
+| `spec (Elythia 1/4)` 〜 `4/4` | Playwright | ブラウザからの統合互換 (301 spec ファイル) | 4-6 min (#4026 の実測。spec の実行は shard ごとに 148-182 秒) | `make playwright-check` |
 | `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない)。`-bundled` は image の中で frontend もビルドする (#3379) | 4 min (`-bundled` はキャッシュが冷えていると frontend の分だけ延びる。手元の冷えたビルドで frontend stage だけ約 3 分) | `docker build -f Dockerfile .` / `docker build -f Dockerfile.bundled .` |
 | `compare` | Bench compare | **ベンチの仕組みを変えた PR でだけ**、PR の head 同士 (A/A) を同じスタックで流し、最後まで完了するか。「差なし」かどうかは check では見ず、Summary を人が見る。base と head を選んで比べるときは手動で起動する (`gh workflow run bench-compare.yml -f base=develop -f head=<ref>`、[bench-compare.md](bench-compare.md))。結果は対象の PR にコメントでも出る (下の「`bench-compare` / `bench-compare-comment` workflow」) | 35 min | `make bench-compare BASE=HEAD HEAD=HEAD SMOKE=1` (本番のホストでは smoke だけ) |
 | `compare` | Bench upstream | **本家の版 (`UPSTREAM_MISSKEY_VERSION`) かベンチの仕組み (bench-compare と同じ paths) を変えた PR でだけ**、本家の公式 image と PR の head を同じスタックで流し、最後まで完了するか。どちらが速いかは check では見ず、Summary を人が見る。毎週月曜日 (日本時間) の schedule と手動でも流れる (`gh workflow run bench-upstream.yml -f ref=develop`、[bench-compare.md](bench-compare.md#本家-misskey-との比較-bench-upstream)) | 未計測 (見込み 40 min) | `make bench-upstream SMOKE=1` (本番のホストでは smoke だけ) |
@@ -288,7 +288,7 @@ required の `test` で走る。
 `make plugins-all` を workspace のビルドより先に回す。frontend が import する
 `frontend/packages/frontend/src/server-plugins.generated.ts` は追跡しておらず (#3379)、
 無いとビルドが import で落ちる。`make frontend-check` は frontend の型・ゲート・
-`emoji-regex-check`・frontend の eslint までを手元でまとめて回す target (CI の job ではない)。
+`emoji-regex-check`・frontend と frontend-embed の eslint までを手元でまとめて回す target (CI の job ではない)。
 **vitest はそこに入っていない** (`make frontend-test`)。ほかの workspace の eslint や check-dts などは
 `.github/workflows/frontend.yml` の各 step をそのまま叩く。
 
@@ -302,7 +302,7 @@ make frontend-test
 
 **本番を動かしているチェックアウトでは `pnpm -r build` / `pnpm build` を流さないこと。** frontend 自身のビルドが `frontend/built` を消してから作り直すので、そこを bind mount している本番が 404 になる (#3379 の切り替え後)。手元の検証は別の worktree で行う。
 
-eslint (frontend だけ) を回すなら `make frontend-lint` (実測 55 秒)。
+eslint (frontend と frontend-embed だけ) を回すなら `make frontend-lint` (実測 70 秒。frontend-embed を足す前の #2906 の時点では 55 秒)。
 
 **`emoji-regex-check` が落ちたとき (#3324):** サーバーの MFM の解析器 (Go のモジュール `github.com/elythia-network/mfm`、#3514) が持つ Unicode 絵文字の正規表現 (モジュールの `emoji_regex_gen.go`) と、`frontend/` に pnpm install した frontend の MFM の解析器 (`@elythia-network/mfm`、#3515) が持つ正規表現が食い違っている。frontend の解析器は、emoji-data の正規表現と、その元の emoji-data の版・使い方を写した mfm-js の版を `built/emoji-regex.gen.js` に書き出しており、検査ツールはそれを Go の正規表現へ変換してモジュールのファイルと突き合わせる。どちらも Elythia-Network/mfm から出ているので、`… is stale` で Go のモジュールの側が名指しされたら、片方だけを上げているので、`go.mod` (`go get`) と `frontend/` の `@elythia-network/mfm` を同じリリースへ揃える。snapshot (`tools/emojiregex/testdata/source.txt`) が名指しされたら、`make emoji-regex` で書き写して差分ごとコミットする。検査ツールが `declarations` や `flags`、構文のエラーで落ちたら、解析器の書き出す形か正規表現の構文が変わっているので、検査ツール (`tools/emojiregex/`) を直す。
 
@@ -589,12 +589,12 @@ checkout / setup-go を除くと step は実行順に 3 つ。**required job な
 - `.github/workflows/playwright.yml` で Playwright spec を実行する。
   `pull_request` (paths フィルタ) と `workflow_dispatch` で発火。nightly から
   PR トリガーへ移行済み (#2291)。
-- **4 シャード並列** (`--shard=i/4`)。`fail-fast: false` で 1 つが落ちても
+- **4 シャード並列** (`PLAYWRIGHT_SHARD=i/4`。所要時間で割り振る、#4026)。`fail-fast: false` で 1 つが落ちても
   他は完走する。
-- **1 スタックあたりは直列でしか回せない。** 299 spec ファイル中 179 が共有の
-  root (alice) で**ブラウザからサインイン**し (数え方は
-  `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`)、さらに 32 が
-  サインインせず root の token で API を叩く (`root.json` を読むのが 211 で、その差分)。
+- **1 スタックあたりは直列でしか回せない。** 301 spec ファイル中 180 が共有の
+  root (alice) で**ブラウザでサインインした状態**を使い (数え方は
+  `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`)、さらに 33 が
+  サインインせず root の token で API を叩く (`root.json` を読むのが 213 で、その差分)。
   instance meta も全 spec が共有する。Playwright は
   ファイル単位で並列化するので、`workers` を上げると `profile_iscat_toggle` と
   `profile_isbot_toggle` が同じアカウントを、`admin_branding_save` と

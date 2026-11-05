@@ -24,6 +24,9 @@ var (
 	ErrAlreadyFollowing = errors.New("already following this channel")
 	// ErrNotFollowing is returned when there is no follow record to delete.
 	ErrNotFollowing = errors.New("not following this channel")
+	// ErrNoSuchBanner is returned by Update when UpdateInput.BannerOK rejects
+	// the banner file.
+	ErrNoSuchBanner = errors.New("no such banner file")
 )
 
 // ModeratorChecker reports whether a user holds a moderator/admin role.
@@ -156,6 +159,10 @@ type UpdateInput struct {
 	IsSensitive *bool
 	// BannerID: nil = 変更なし、*が nil = banner 解除(null)、値 = 設定 (#3758)。
 	BannerID **string
+	// BannerOK reports whether the banner file may be set (the caller owns
+	// it). Update calls it after the existence and permission checks, only
+	// when a banner is set. nil accepts any file.
+	BannerOK func(fileID string) bool
 	// PinnedNoteIDs: nil = 変更なし、非 nil = その配列で置換。
 	PinnedNoteIDs *[]string
 	// AllowRenoteToExternal: nil = 変更なし、非 nil でその値に更新。
@@ -180,6 +187,13 @@ func (s *Service) Update(userID, channelID string, in UpdateInput) (*model.Chann
 	isModerator := s.moderatorChecker != nil && s.moderatorChecker.IsModerator(userID)
 	if !isOwner && !isModerator {
 		return nil, ErrAccessDenied
+	}
+	// バナーのファイルの検査は、本家と同じくチャンネルの存在と権限の後に行う
+	// (#3369)。先に行うと、存在しないチャンネルや他人のチャンネルに自分のものでない
+	// bannerId を送ったときに、NO_SUCH_CHANNEL / ACCESS_DENIED でなく NO_SUCH_FILE
+	// になる。
+	if in.BannerID != nil && *in.BannerID != nil && in.BannerOK != nil && !in.BannerOK(**in.BannerID) {
+		return nil, ErrNoSuchBanner
 	}
 	fields := map[string]any{}
 	if in.Name != nil {
@@ -244,11 +258,9 @@ func (s *Service) Follow(userID, channelID string) error {
 		FollowerID: userID,
 		FolloweeID: channelID,
 	}
-	if err := s.followingRepo.Create(f); err != nil {
-		return err
-	}
-	_ = s.repo.IncrementCount(channelID, "usersCount", 1)
-	return nil
+	// usersCount はフォローでは動かさない。本家と同じく、チャンネルに投稿した
+	// 人の数を OnNotePosted で数える (#3369)。
+	return s.followingRepo.Create(f)
 }
 
 // Unfollow removes the follow relationship.
@@ -261,11 +273,7 @@ func (s *Service) Unfollow(userID, channelID string) error {
 		}
 		return ErrNotFollowing
 	}
-	if err := s.followingRepo.Delete(f); err != nil {
-		return err
-	}
-	_ = s.repo.IncrementCount(channelID, "usersCount", -1)
-	return nil
+	return s.followingRepo.Delete(f)
 }
 
 // ListFollowed returns the channels followed by the user. 結果には channel の
@@ -371,7 +379,8 @@ func (s *Service) Timeline(channelID, viewerID, untilID, sinceID string, limit i
 	return s.noteRepo.ListByChannelID(channelID, viewerID, untilID, sinceID, limit)
 }
 
-// OnNotePosted updates lastNotedAt / notesCount and, when unreadRepo is
+// OnNotePosted updates lastNotedAt / notesCount, counts the author into
+// usersCount on their first post in the channel, and, when unreadRepo is
 // wired, fans out per-follower unread rows so /api/i can populate
 // hasUnreadChannel. Best-effort: errors are ignored.
 //
@@ -383,6 +392,11 @@ func (s *Service) OnNotePosted(channelID, noteID, authorID string) {
 	now := s.clock()
 	_ = s.repo.UpdateFields(channelID, map[string]any{"lastNotedAt": &now})
 	_ = s.repo.IncrementCount(channelID, "notesCount", 1)
+	// usersCount は本家と同じく「このチャンネルに投稿した人の数」。初めての投稿の
+	// ときだけ 1 増やす (判定は repository の 1 文で行う、#3369)。
+	if noteID != "" && authorID != "" {
+		_ = s.repo.IncrementUsersCountOnFirstPost(channelID, authorID, noteID)
+	}
 	if s.unreadRepo == nil || noteID == "" {
 		return
 	}

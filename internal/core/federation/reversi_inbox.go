@@ -22,6 +22,13 @@ type ReversiStreamPublisher interface {
 	PublishInvited(targetUserID string, inviter *model.User)
 }
 
+// ReversiInviteObserver is told about invitations that arrive over
+// federation, with the game created for them (#3942). プラグインが管理する
+// アカウントへの通知 (core/pluginnotify) が実装する。未設定なら呼ばない。
+type ReversiInviteObserver interface {
+	ReversiInvited(ctx context.Context, inviteeID, inviterID, gameID string)
+}
+
 // --- Incoming reversi AP activities (CherryPick compatible) ---
 //
 // All four activity types carry a custom Game object as `object`, structured
@@ -100,7 +107,12 @@ func (p *Processor) handleReversiInvite(act genericActivity) error {
 	// CherryPick は fresh session_id で Invite を 5 秒ごと再送するため、
 	// 同じ (inviter, invitee) の pending game があれば session mapping を
 	// 最新に差し替えて再利用する。これが無いと招待ごとに row が増殖する。
-	if existing := corereversi.FindPendingInvitation(p.reversiRepo, invitee.ID, actor.ID); existing != nil {
+	//
+	// Elythia: 受けてから 3 分を過ぎた対局は使い回さず、新しい対局にする (#3949)。
+	// 受けた後に招待した人が去っても対局は残すので、改めて届いた招待を古い対局に
+	// 付け替えると、受けた印が残ったまま招待一覧から外れ、受けようとすると逆向きの
+	// 招待になる
+	if existing := corereversi.FindPendingInvitation(p.reversiRepo, invitee.ID, actor.ID); existing != nil && !p.reversiSvc.AcceptedLongAgo(ctx, existing) {
 		if oldSession, ok := p.reversiFedCache.GetSessionByGame(ctx, existing.ID); ok && oldSession != state.GameSessionID {
 			p.reversiFedCache.Delete(ctx, oldSession, "")
 		}
@@ -132,28 +144,47 @@ func (p *Processor) handleReversiInvite(act genericActivity) error {
 	if p.reversiStreamPub != nil {
 		p.reversiStreamPub.PublishInvited(invitee.ID, actor)
 	}
+	// Elythia: プラグインが管理するアカウントへも知らせる (#3942)
+	if p.reversiInviteObs != nil {
+		p.reversiInviteObs.ReversiInvited(ctx, invitee.ID, actor.ID, game.ID)
+	}
 	return nil
 }
 
 // handleReversiJoin processes an incoming Join for a game we (the local
 // inviter) previously sent Invite for. CherryPick semantics: the remote
-// player has accepted; no local state change beyond acknowledging existence.
+// player has accepted. The local inviter is told so (stream `matched`, #3946).
 func (p *Processor) handleReversiJoin(act genericActivity) error {
 	if !p.reversiReady() {
 		return ErrUnsupportedActivity
 	}
-	_, gameObj, state, err := p.parseReversiActivity(act)
+	actor, gameObj, state, err := p.parseReversiActivity(act)
 	if err != nil {
 		return err
 	}
 	if gameObj == nil || state.GameSessionID == "" {
 		return errors.New("reversi join: missing game state")
 	}
-	gameID, err := p.reversiFedCache.Get(context.Background(), state.GameSessionID)
+	ctx := context.Background()
+	gameID, err := p.reversiFedCache.Get(ctx, state.GameSessionID)
 	if err != nil || gameID == "" {
 		return fmt.Errorf("reversi join: unknown session %s", state.GameSessionID)
 	}
 	slog.Info("reversi federation: peer joined", "session", state.GameSessionID, "gameId", gameID)
+	// Elythia: 招待した人の画面を対局へ進める (#3946)。受けたと言えるのは招待された
+	// 本人だけなので、Join の送り手が対局の User2 のときに限る
+	game, err := p.reversiRepo.FindByID(gameID)
+	if repository.IsNotFound(err) {
+		// 取り消された後に届いた Join。知らせる対局が無い
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reversi join: find game %s: %w", gameID, err)
+	}
+	if game.User2ID != actor.ID {
+		return nil
+	}
+	p.reversiSvc.AcceptInvitation(ctx, game)
 	return nil
 }
 

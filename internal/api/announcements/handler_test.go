@@ -244,6 +244,21 @@ func TestAdminCreate_ResponseImageURLRaw(t *testing.T) {
 	}
 }
 
+// 本家と同じく、空の imageUrl は null として保存して返す。
+func TestAdminCreate_EmptyImageURLIsNull(t *testing.T) {
+	h, repo := newTestHandler(t)
+	rec := doPost(h.AdminCreate, `{"title":"News","text":"x","imageUrl":""}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Contains(t, resp, "imageUrl")
+	assert.Nil(t, resp["imageUrl"])
+	require.Len(t, repo.Items, 1)
+	for _, a := range repo.Items {
+		assert.Nil(t, a.ImageURL)
+	}
+}
+
 func TestAdminCreate_InvalidParam(t *testing.T) {
 	h, _ := newTestHandler(t)
 	rec := doPost(h.AdminCreate, `{}`, nil)
@@ -658,7 +673,7 @@ func (f *failingListAnnouncementRepo) ListForUser(_ string, _ bool, _ int, _, _ 
 	return nil, assert.AnError
 }
 
-func (f *failingListAnnouncementRepo) ListForAdmin(_, _ string, _, _ int, _, _ string, _ time.Time) ([]*model.Announcement, error) {
+func (f *failingListAnnouncementRepo) ListForAdmin(_, _ string, _ int, _, _ string, _ time.Time) ([]*model.Announcement, error) {
 	return nil, assert.AnError
 }
 
@@ -718,9 +733,35 @@ func (f *failingDeleteAnnouncementRepo) Delete(_ string) error { return assert.A
 
 func TestAdminDelete_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
-	h := announcements.NewHandler(&failingDeleteAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen, nil)
+	repo := &failingDeleteAnnouncementRepo{testutil.NewMockAnnouncementRepository()}
+	repo.Items["x"] = &model.Announcement{ID: "x"}
+	h := announcements.NewHandler(repo, idGen, nil)
 	rec := doPost(h.AdminDelete, `{"id":"x"}`, nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// 本家 admin/announcements/delete.ts と同じく、無いお知らせは NO_SUCH_ANNOUNCEMENT。
+func TestAdminDelete_MissingIsNoSuchAnnouncement(t *testing.T) {
+	h, _ := newTestHandler(t)
+	rec := doPost(h.AdminDelete, `{"id":"missing"}`, nil)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "ecad8040-a276-4e85-bda9-015a708d291e")
+}
+
+type failingFindAnnouncementRepo struct {
+	*testutil.MockAnnouncementRepository
+}
+
+func (f *failingFindAnnouncementRepo) FindByID(_ string) (*model.Announcement, error) {
+	return nil, assert.AnError
+}
+
+// DB の障害は「無い」に丸めず 500 にする (#2792)。
+func TestAdminDelete_FindErrorIs500(t *testing.T) {
+	idGen, _ := id.NewGenerator("aidx")
+	h := announcements.NewHandler(&failingFindAnnouncementRepo{testutil.NewMockAnnouncementRepository()}, idGen, nil)
+	rec := doPost(h.AdminDelete, `{"id":"x"}`, nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
 func TestReadAnnouncement_MarkReadError(t *testing.T) {

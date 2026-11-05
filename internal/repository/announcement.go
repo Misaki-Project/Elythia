@@ -29,7 +29,7 @@ type AnnouncementRepository interface {
 	// user announcements only). When empty, restricts to "userId" IS NULL
 	// (global only), matching upstream Misskey's semantics. status is one
 	// of "all" / "active" / "archived"; empty defaults to "active".
-	ListForAdmin(userID, status string, limit, offset int, sinceID, untilID string, now time.Time) ([]*model.Announcement, error)
+	ListForAdmin(userID, status string, limit int, sinceID, untilID string, now time.Time) ([]*model.Announcement, error)
 	// CountReadsByAnnouncementIDs returns reads count keyed by
 	// announcementId. IDs not present have count 0 (caller should default
 	// to 0 when absent).
@@ -44,6 +44,10 @@ type AnnouncementRepository interface {
 	// whose autoArchiveAt is at or before now, and returns how many rows it
 	// changed (#3809).
 	ArchiveExpired(now time.Time) (int64, error)
+	// ListScheduledArchives returns the active announcements whose
+	// autoArchiveAt is after now, i.e. those still waiting for their archive
+	// job (#3994).
+	ListScheduledArchives(now time.Time) ([]*model.Announcement, error)
 }
 
 // whereAnnouncementActive narrows q to the announcements that are active at
@@ -181,7 +185,7 @@ func (r *announcementRepository) ListForUser(userID string, activeOnly bool, lim
 	return announcements, nil
 }
 
-func (r *announcementRepository) ListForAdmin(userID, status string, limit, offset int, sinceID, untilID string, now time.Time) ([]*model.Announcement, error) {
+func (r *announcementRepository) ListForAdmin(userID, status string, limit int, sinceID, untilID string, now time.Time) ([]*model.Announcement, error) {
 	q := r.db.Order(paginationOrder(sinceID, untilID, "id"))
 	// upstreamはuserId指定時にannouncement.userId = ?を、未指定時に
 	// announcement.userId IS NULLを当てる。前者がユーザーモデレーション画面
@@ -212,9 +216,6 @@ func (r *announcementRepository) ListForAdmin(userID, status string, limit, offs
 	}
 	if untilID != "" {
 		q = q.Where("id < ?", untilID)
-	}
-	if sinceID == "" && untilID == "" && offset > 0 {
-		q = q.Offset(offset)
 	}
 	var announcements []*model.Announcement
 	if err := q.Find(&announcements).Error; err != nil {
@@ -273,8 +274,11 @@ func (r *announcementRepository) UnreadForUser(userID string) ([]*model.Announce
 	// global announcement(userId IS NULL)は全ユーザーに見せる。
 	// 自動アーカイブの期限を過ぎたものは未読に数えない (本家 2026.10.1 の
 	// getUnreadAnnouncements、#3809)。
+	// silence のお知らせと、登録より前に作られた forExistingUsers のお知らせも
+	// 本家と同じく未読に数えない。後者は本家と同じく id の大小で作成の前後を見る。
 	err := whereAnnouncementActive(r.db, true, time.Now()).Where(
-		`("userId" IS NULL OR "userId" = ?) AND id NOT IN (?)`,
+		`("userId" IS NULL OR "userId" = ?) AND silence = false AND ("forExistingUsers" = false OR id > ?) AND id NOT IN (?)`,
+		userID,
 		userID,
 		r.db.Model(&model.AnnouncementRead{}).Select("\"announcementId\"").Where("\"userId\" = ?", userID),
 	).Order("id DESC").Find(&announcements).Error
@@ -293,4 +297,15 @@ func (r *announcementRepository) ArchiveExpired(now time.Time) (int64, error) {
 		Where(`"isActive" = true AND "autoArchiveAt" IS NOT NULL AND "autoArchiveAt" <= ?`, now).
 		Updates(map[string]any{"isActive": false, "updatedAt": now})
 	return res.RowsAffected, res.Error
+}
+
+func (r *announcementRepository) ListScheduledArchives(now time.Time) ([]*model.Announcement, error) {
+	// 起動時に、期限がまだ来ていないお知らせの遅延ジョブを積み直すのに使う (#3994。
+	// 本家 AnnouncementService.onModuleInit と同じ対象)。期限付きのお知らせは
+	// 管理者が手で作るものだけなので、件数で区切らない。
+	var rows []*model.Announcement
+	err := r.db.Select(`"id"`, `"autoArchiveAt"`).
+		Where(`"isActive" = true AND "autoArchiveAt" IS NOT NULL AND "autoArchiveAt" > ?`, now).
+		Order("id").Find(&rows).Error
+	return rows, err
 }

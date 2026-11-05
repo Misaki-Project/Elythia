@@ -83,9 +83,9 @@ frontend-check: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ を型チェック�
 	$(MAKE) frontend-lint
 
 .PHONY: frontend-lint
-frontend-lint: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ の frontend を eslint で検査 (CI と同じ範囲)
+frontend-lint: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ の frontend と frontend-embed を eslint で検査 (CI と同じ範囲)
 	# CI の `Lint (eslint)` step と同じ。範囲は package.json の script が持つ
-	# (`--quiet "src/**/*.{ts,vue}"`)。**`eslint .` にしないこと** — upstream が
+	# (`--quiet "src/**/*.{ts,vue}" "public/loader/*.js"`)。**`eslint .` にしないこと** — upstream が
 	# lint していない test/ まで拾い、追従のたびに他人の負債で落ちる。
 	#
 	# **`npm run` で script を呼ぶ (引数を書き写さない)。** 書き写すと
@@ -93,7 +93,11 @@ frontend-lint: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ の frontend を esl
 	# ずれた)。CI は `pnpm eslint` だが手元に pnpm があるとは限らないので、
 	# 同じ script を呼べる npx/npm 側に寄せる (frontend-check / frontend-test も
 	# npx を使っている)。
+	#
+	# frontend-embed も回す。起動画面のスクリプト (public/loader/boot.js) は 2 つの
+	# package にあり、構文の誤りが 1 つあるだけで起動全体が止まる (#3954)
 	cd frontend/packages/frontend && npm run --silent eslint
+	cd frontend/packages/frontend-embed && npm run --silent eslint
 
 .PHONY: frontend-test
 frontend-test: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ の frontend の vitest を実行
@@ -1058,9 +1062,13 @@ BASE ?= develop
 HEAD ?= HEAD
 ROUNDS ?= 2
 SCENARIO ?= prod-like
+# core (今までの 7 つ) か extra (通知・リアクション・ドライブなど、#4014)
+ENDPOINTS ?= core
+# small (50 人 × 50 ノート) か medium (中規模のサーバーを想定したデータ、#4016)
+DATA ?= small
 
-bench-compare: ## base と head の commit の性能を比べる (BASE= HEAD= ROUNDS= SCENARIO= BENCH_OUT= SMOKE=1)
-	tests/bench/ab/run.sh --base '$(BASE)' --head '$(HEAD)' --rounds '$(ROUNDS)' --scenario '$(SCENARIO)' $(if $(BENCH_OUT),--out '$(BENCH_OUT)') $(if $(filter 1,$(SMOKE)),--smoke)
+bench-compare: ## base と head の commit の性能を比べる (BASE= HEAD= ROUNDS= SCENARIO= ENDPOINTS= DATA= BENCH_OUT= SMOKE=1)
+	tests/bench/ab/run.sh --base '$(BASE)' --head '$(HEAD)' --rounds '$(ROUNDS)' --scenario '$(SCENARIO)' --endpoints '$(ENDPOINTS)' --data '$(DATA)' $(if $(BENCH_OUT),--out '$(BENCH_OUT)') $(if $(filter 1,$(SMOKE)),--smoke)
 
 bench-compare-down: ## bench-compare / bench-upstream のスタックを撤去
 	docker compose -f $(BENCH_AB_COMPOSE) --profile tools down -v --remove-orphans
@@ -1070,8 +1078,8 @@ bench-compare-down: ## bench-compare / bench-upstream のスタックを撤去
 # bench-compare-down。負荷をかけるので、本番が動いているホストでは SMOKE=1 だけにする。
 UPSTREAM_VERSION ?= default
 
-bench-upstream: ## 本家 Misskey と Elythia の性能を比べる (UPSTREAM_VERSION= HEAD= ROUNDS= SCENARIO= BENCH_OUT= SMOKE=1)
-	tests/bench/ab/run.sh --upstream '$(UPSTREAM_VERSION)' --head '$(HEAD)' --rounds '$(ROUNDS)' --scenario '$(SCENARIO)' $(if $(BENCH_OUT),--out '$(BENCH_OUT)') $(if $(filter 1,$(SMOKE)),--smoke)
+bench-upstream: ## 本家 Misskey と Elythia の性能を比べる (UPSTREAM_VERSION= HEAD= ROUNDS= SCENARIO= ENDPOINTS= DATA= BENCH_OUT= SMOKE=1)
+	tests/bench/ab/run.sh --upstream '$(UPSTREAM_VERSION)' --head '$(HEAD)' --rounds '$(ROUNDS)' --scenario '$(SCENARIO)' --endpoints '$(ENDPOINTS)' --data '$(DATA)' $(if $(BENCH_OUT),--out '$(BENCH_OUT)') $(if $(filter 1,$(SMOKE)),--smoke)
 
 # Queue bench (#563): deliver/inbox throughput comparison between
 # Misskey TS (BullMQ) and mk-go (mkq). asynq driver は #2985 で削除。
@@ -1210,19 +1218,30 @@ PLAYWRIGHT_COMPOSE=tests/playwright/compose.yml
 playwright-up: ## Playwright スタック (Elythia backend) を起動
 	docker compose -f $(PLAYWRIGHT_COMPOSE) up -d --build
 
-# PLAYWRIGHT_ARGS は runner の `playwright` に素通しする追加引数。CI が
-# `--shard=i/N` を渡してシャード分割するために使う (#2609)。ローカルで
-# 動画が欲しいときは `PLAYWRIGHT_ARGS=--video=on` を渡す。
+# PLAYWRIGHT_ARGS は runner の `playwright` に素通しする追加引数。spec を絞る
+# ときや、動画が欲しいとき (`PLAYWRIGHT_ARGS=--video=on`) に渡す。shard の
+# 分割は下の PLAYWRIGHT_SHARD で行う (#2609、#4026)。
 #
 # runner の ENTRYPOINT は `playwright` で CMD が `test`。引数を足すと CMD が
 # 丸ごと置き換わるので、`test` を明示してから追加する。
 PLAYWRIGHT_ARGS ?=
 
+# PLAYWRIGHT_SHARD は `i/N`。所要時間で割り振った N 個のうち i 番目だけを流す
+# (playwright.config.ts、tests/playwright/shard-plan.mjs、#4026)。CI は
+# `--shard` ではなくこちらを使う。`--shard` はファイルの並び順で切るので偏る。
+PLAYWRIGHT_SHARD ?=
+PLAYWRIGHT_SHARD_ENV = $(if $(PLAYWRIGHT_SHARD),-e PLAYWRIGHT_SHARD=$(PLAYWRIGHT_SHARD))
+
 playwright-test: ## Playwright spec を実行 (Elythia backend、PLAYWRIGHT_ARGS で引数追加)
 	# `--build` を付けて runner image を rebuild check させる。package.json
 	# 更新時に node_modules が古いままにならないよう、毎回 build context を
 	# 確認する (cache hit なら ms 単位で済むので overhead 無視可)。
-	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test run --rm --build playwright-runner test $(PLAYWRIGHT_ARGS)
+	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test run --rm --build $(PLAYWRIGHT_SHARD_ENV) playwright-runner test $(PLAYWRIGHT_ARGS)
+
+playwright-update-snapshots: ## Playwright の見た目の差分の基準画像を作り直す (PLAYWRIGHT_ARGS で spec を絞る)
+	# toHaveScreenshot の基準画像は runner の container (Linux の chromium) で
+	# 作る。手元の OS で作ると、文字の描画が違って CI で必ず差分になる (#4026)。
+	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test run --rm --build playwright-runner test --update-snapshots $(PLAYWRIGHT_ARGS)
 
 playwright-down: ## Playwright スタックを撤去
 	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test down -v
@@ -1246,7 +1265,7 @@ playwright-ts-test: ## Playwright spec を実行 (TS backend、upstream 追従�
 	# **`specs/upstream` に絞る。** `specs/elythia` は Elythia 独自機能の spec で、
 	# 公式 image に対しては通らない (README の「境界」を参照)。絞らないと
 	# TS backend 実行が elythia 側の spec で落ちる。
-	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test run --rm --build playwright-runner test specs/upstream $(PLAYWRIGHT_ARGS)
+	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test run --rm --build $(PLAYWRIGHT_SHARD_ENV) playwright-runner test specs/upstream $(PLAYWRIGHT_ARGS)
 
 playwright-ts-down: ## Playwright TS スタックを撤去
 	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test down -v
@@ -1556,9 +1575,8 @@ apicompat: apicompat-routes apicompat-render ## API 互換性マトリクス doc
 shapecheck-gen: ## shape drift の golden snapshot を再生成
 	go run ./tools/shapediff
 	go run ./tools/erroriddiff
-	go run ./tools/permspec
-	go run ./tools/securespec
 	go run ./tools/schemadrift
+	go run ./tools/paginationspec
 
 # 全 family の drift を severity 付きで一覧表示する (gate にかける前の調査用)。
 shapecheck-report: ## shape drift のレポートを出力
@@ -1579,10 +1597,11 @@ errorid-check: ## error id / HTTP status / kind の drift を検査
 # permission drift gate をローカルで実行する。mk-go の router middleware が
 # Misskey の requireAdmin/requireModerator/requireCredential より緩くないか検証。
 # TestOAuthKindDrift は別軸で、meta.kind (OAuth scope) の一致を見る。
+# TestRolePolicyDrift は meta.requiredRolePolicy と route の RequireRolePolicy の policy 名を見る (#3369)。
 # TestCacheSecDrift は allowGet の GET route と cacheSec の Cache-Control の表を見る (#3593)。
 # **アクセス階層の gate では scope の取り違えを検出できない** (#2877)。
 perm-check: ## router middleware の権限が upstream より緩くないか検査
-	go test ./internal/entitycompat/... -run 'TestPermissionDrift|TestSecureDrift|TestOAuthKindDrift|TestCacheSecDrift' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestPermissionDrift|TestSecureDrift|TestOAuthKindDrift|TestRolePolicyDrift|TestCacheSecDrift' -count=1 -v
 
 .PHONY: wiring-check
 wiring-check: ## router で配線が必要なものが外れていないか検査

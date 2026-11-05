@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -930,6 +931,46 @@ func (s *Service) IsSilenced(userID string) bool {
 	policies := s.GetUserPolicies(userID)
 	if canPublic, ok := policies["canPublicNote"].(bool); ok {
 		return !canPublic
+	}
+	return false
+}
+
+// BoolPolicyMayBeFalse reports whether the boolean policy key could resolve
+// to something other than true for some user: the base policy (default and
+// meta.policies) is not true, a role sets the key to a value other than true,
+// or an effective-policy provider declares the key. It is conservative and
+// returns true when the base policy or the roles cannot be read.
+//
+// Only meaningful for keys aggregated with OR (canPublicNote and the like):
+// with every candidate true, the cascade cannot produce false.
+//
+// **利用者ごとの policy を引かずに「誰にも当たりえない」を判定するためのもの
+// (#3369)。** リモートの投稿の取り込みは著者ごとに policy を引くと、利用者ごとの
+// キャッシュに受信したノートの著者が際限なく積もる。ロールの一覧とベースの値は
+// 利用者に依らないキャッシュから読む。
+func (s *Service) BoolPolicyMayBeFalse(key string) bool {
+	base := DefaultPoliciesClone()
+	if err := s.applyMetaBasePolicies(base); err != nil {
+		return true
+	}
+	if v, ok := base[key].(bool); !ok || !v {
+		return true
+	}
+	for _, p := range s.snapshotPolicyProviders() {
+		if slices.Contains(p.reg.Keys, key) {
+			return true
+		}
+	}
+	roles, err := s.listRolesCached()
+	if err != nil {
+		return true
+	}
+	for _, in := range newRolePolicyInputs(roles) {
+		if o, ok := in.overrides[key]; ok && !o.UseDefault {
+			if v, ok := o.Value.(bool); !ok || !v {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -2095,6 +2136,16 @@ func (s *Service) ListByRole(roleID, untilID, sinceID string, limit int) ([]*mod
 	return s.assignmentRepo.ListByRole(roleID, untilID, sinceID, limit)
 }
 
+// ListVisibleByRole is ListByRole restricted to the assignees non-moderators
+// may see (not suspended, not a deleted local user). roles/users uses it for
+// non-moderator viewers (#3999).
+func (s *Service) ListVisibleByRole(roleID, untilID, sinceID string, limit int) ([]*model.RoleAssignment, error) {
+	if _, err := s.findRoleByID(roleID); err != nil {
+		return nil, err
+	}
+	return s.assignmentRepo.ListVisibleByRole(roleID, untilID, sinceID, limit)
+}
+
 // CountAssignedUsers returns the number of users currently assigned to a role
 // (non-expired assignments). Used by the Role packer's usersCount field. On
 // repository error it returns 0 so packing never fails the whole response.
@@ -2105,6 +2156,19 @@ func (s *Service) CountAssignedUsers(roleID string) int {
 		// best-effort で 0 を返す)。ただし silent に 0 を返すと corrupt/transient
 		// DB error が usersCount:0 として隠れるため warn で観測可能にする。
 		slog.Warn("role: CountActiveByRole failed; usersCount falls back to 0", "roleId", roleID, "err", err)
+		return 0
+	}
+	return n
+}
+
+// CountVisibleAssignedUsers is CountAssignedUsers restricted to the assignees
+// ListVisibleByRole returns, so the usersCount a non-moderator sees matches
+// the members roles/users shows them (#3999). Errors fall back to 0 like
+// CountAssignedUsers.
+func (s *Service) CountVisibleAssignedUsers(roleID string) int {
+	n, err := s.assignmentRepo.CountVisibleByRole(roleID)
+	if err != nil {
+		slog.Warn("role: CountVisibleByRole failed; usersCount falls back to 0", "roleId", roleID, "err", err)
 		return 0
 	}
 	return n

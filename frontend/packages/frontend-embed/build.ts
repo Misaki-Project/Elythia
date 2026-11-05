@@ -5,6 +5,7 @@ import { execa } from 'execa';
 import locales from 'i18n';
 import { LocaleInliner } from '../frontend-builder/locale-inliner.js';
 import { createLogger } from '../frontend-builder/logger';
+import { minifyLoaderAssets } from '../frontend-builder/minify-loader.js';
 
 // requires node 21 or later
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
@@ -36,6 +37,13 @@ async function buildAllLocale() {
 	inliner.collectsModifications();
 
 	await inliner.saveAllLocales(locales);
+	// Elythia: 埋め込みの HTML から先読みする一覧 (#3992)。boot.ts は動き出してすぐ、
+	// アイコンの CSS を `await import` し、ui.vue を `defineAsyncComponent` で読む。
+	await inliner.savePreloads({
+		dynamicImports: {
+			'src/boot.ts': ['icons-subsetter/built/tabler-icons-frontendEmbed.css', 'src/ui.vue'],
+		},
+	});
 
 	if (logger.errorCount > 0) {
 		throw new Error(`Build failed with ${logger.errorCount} errors and ${logger.warningCount} warnings.`);
@@ -45,6 +53,7 @@ async function buildAllLocale() {
 async function build() {
 	await fs.rm(outputDir, { recursive: true, force: true });
 	await viteBuild();
+	await minifyLoaderAssets(outputDir);
 	await buildAllLocale();
 }
 

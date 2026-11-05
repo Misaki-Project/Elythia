@@ -16,6 +16,7 @@ import (
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/core/chart"
+	"github.com/elythia-network/elythia/internal/misc/jsdate"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 )
@@ -71,12 +72,30 @@ type Request struct {
 	//
 	// Limit と Offset は、本家(ajv の integer)と同じく値が整数の小数(10.0)を
 	// 受ける。GET の query も同じ (#3744)。
+	//
+	// host と userId は、それを持つ chart だけが hostRequest / userRequest で読む。
+	// 本家は持たない chart ではその項目を知らない項目として無視するので、型の
+	// 違う値でも400にしない (#3369)。
+	Span   string     `json:"span" query:"span"`
+	Limit  *jsnum.Int `json:"limit" query:"limit"`
+	Offset *jsnum.Int `json:"offset" query:"offset"`
+}
+
+// hostRequest is the body of the host-grouped instance chart.
+type hostRequest struct {
+	Span   string     `json:"span" query:"span"`
+	Limit  *jsnum.Int `json:"limit" query:"limit"`
+	Offset *jsnum.Int `json:"offset" query:"offset"`
+	// Host は欠落(nil)と空文字列を区別する。本家は空文字列を通す (#3744)。
+	Host *string `json:"host" query:"host"`
+}
+
+// userRequest is the body of the per-user charts.
+type userRequest struct {
 	Span   string     `json:"span" query:"span"`
 	Limit  *jsnum.Int `json:"limit" query:"limit"`
 	Offset *jsnum.Int `json:"offset" query:"offset"`
 	UserID string     `json:"userId" query:"userId"`
-	// Host は欠落(nil)と空文字列を区別する。本家は空文字列を通す (#3744)。
-	Host *string `json:"host" query:"host"`
 }
 
 // paramError carries an upstream-compatible (param, reason) pair for a
@@ -160,8 +179,18 @@ func (h *Handler) serveInstance(c echo.Context, ch *chart.Chart, requireHost boo
 	if ch == nil {
 		return chartUnavailable(c)
 	}
-	var req Request
-	if err := c.Bind(&req); err != nil {
+	var (
+		req  Request
+		host *string
+	)
+	if requireHost {
+		var hr hostRequest
+		if err := c.Bind(&hr); err != nil {
+			return apierr.JSONInvalidParamClient(c, "#", "Invalid request body.")
+		}
+		req = Request{Span: hr.Span, Limit: hr.Limit, Offset: hr.Offset}
+		host = hr.Host
+	} else if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParamClient(c, "#", "Invalid request body.")
 	}
 	span, amount, cursor, perr := h.parseRequest(&req)
@@ -174,10 +203,10 @@ func (h *Handler) serveInstance(c echo.Context, ch *chart.Chart, requireHost boo
 		// ただし本家の getChartRaw は '' を falsy として group で絞らず、範囲内の
 		// どれかのホストの行を返す。Elythia は group が '' の行を探すので空の
 		// chart になる (docs/divergence/approximations.md)。
-		if req.Host == nil {
+		if host == nil {
 			return invalidParam(c, &paramError{param: "#/required", reason: "must have required property 'host'"})
 		}
-		group = *req.Host
+		group = *host
 	}
 	return h.respond(c, ch, span, amount, cursor, group)
 }
@@ -188,18 +217,19 @@ func (h *Handler) servePerUser(c echo.Context, ch *chart.Chart) error {
 	if ch == nil {
 		return chartUnavailable(c)
 	}
-	var req Request
-	if err := c.Bind(&req); err != nil {
+	var ur userRequest
+	if err := c.Bind(&ur); err != nil {
 		return apierr.JSONInvalidParamClient(c, "#", "Invalid request body.")
 	}
+	req := Request{Span: ur.Span, Limit: ur.Limit, Offset: ur.Offset}
 	span, amount, cursor, perr := h.parseRequest(&req)
 	if perr != nil {
 		return invalidParam(c, perr)
 	}
-	if req.UserID == "" {
+	if ur.UserID == "" {
 		return invalidParam(c, &paramError{param: "#/required", reason: "must have required property 'userId'"})
 	}
-	return h.respond(c, ch, span, amount, cursor, req.UserID)
+	return h.respond(c, ch, span, amount, cursor, ur.UserID)
 }
 
 // respond runs the actual GetChart call and writes the JSON response.
@@ -246,6 +276,12 @@ func (h *Handler) parseRequest(req *Request) (chart.Span, int, *time.Time, *para
 	}
 	var cursor *time.Time
 	if offset := req.Offset.Int64Ptr(); offset != nil && *offset != 0 {
+		// JavaScript の Date で表せない時刻 (絶対値が 8.64e15 ms を超える) は、
+		// int64 の範囲外と同じ 400 にする (#3369)。以前は 500 になっていた。本家も
+		// Invalid Date のまま問い合わせて失敗する (ソースを読む限り 500)。
+		if !jsdate.ValidMillis(*offset) {
+			return "", 0, nil, &paramError{param: "#", reason: "Invalid request body."}
+		}
 		t := time.UnixMilli(*offset)
 		cursor = &t
 	}

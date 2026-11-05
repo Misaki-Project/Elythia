@@ -345,6 +345,8 @@ func retryUnlessClientError(err error) error {
 | `NotificationFollowRequest` | フォローリクエストが来た (承認制のとき) | (空) |
 | `NotificationReaction` | 投稿にリアクションされた (`Reaction` に絵文字) | リアクションされた投稿 |
 | `NotificationChatMessage` | 1:1 のチャットでメッセージが来た (`ChatMessageID`) | (空) |
+| `NotificationReversiInvited` | リバーシに招待された、またはランダムマッチで対局が組まれた (`GameID`) | (空) |
+| `NotificationReversiGame` | 対局者になっている対局が進んだ (`GameID`、`GameEvent`) | (空) |
 
 `UserID` は相手 (メンションした人・フォローした人・送った人。リモートの利用者のこともある)。`NoteVisibility` は mention / reply / quote のときだけ、通知を作った時点の投稿の公開範囲 (`public` / `home` / `followers` / `specified`) が入る (リアクションでは空)。**`specified` (ダイレクト) の投稿に公開の返事をしないこと** — 宛先の外へ本文が漏れる。本文などの中身は渡さないので、要るなら `AsUser(ev.AccountID)` で `notes/show` などを呼んで取る。その時点の可視性で判定されるので、消された投稿は取れない。
 
@@ -369,6 +371,75 @@ func retryUnlessClientError(err error) error {
 
 テストは `plugintest` の `Notifications` と `Notify` で、handler へ直接届けられる ([テスト](#テスト))。
 
+### リバーシ
+
+管理するアカウントでリバーシを遊べる (#3942)。招待と対局の進みは通知で届き、手は REST で打つ。管理するアカウントは streaming に繋げないので、本家のクライアントが websocket (`reversiGame` チャンネル) で送る操作を、同じ条件で受ける REST の入口を Elythia が足している。
+
+```go
+// onReversi は通知の handler から、リバーシの通知のときに呼ぶ。どの通知でも対局を
+// 読み直し、そのとき要ることをする (準備していなければ準備し、自分の番なら打つ)。
+// 招待の通知が届かなかったとき (ミュートした相手とランダムマッチで組まれたなど) や、
+// bot から招待した対局でも、対局の進みの通知で同じように動ける
+func onReversi(c context.Context, ctx plugin.Context, ev plugin.Notification) error {
+	bot := ctx.API().AsUser(ev.AccountID)
+	game, err := bot.Call(c, "reversi/show-game", map[string]any{"gameId": ev.GameID})
+	if err != nil {
+		return retryUnlessClientError(err) // 取り消された対局は 4xx
+	}
+	// 招待された側 (user2Id が自分) なら受ける。ランダムマッチで組まれた対局は、待って
+	// いた自分が user1Id なので受けなくてよい (受けると相手への新しい招待を作ることがある)
+	if ev.Type == plugin.NotificationReversiInvited && isInvitee(game, ev.AccountID) {
+		if _, err := bot.Call(c, "reversi/match", map[string]any{"userId": ev.UserID}); err != nil {
+			return retryUnlessClientError(err)
+		}
+	}
+	if needsReady(game, ev.AccountID) { // 始まっていなくて、自分がまだ準備していない
+		_, err := bot.Call(c, "reversi/ready", map[string]any{"gameId": ev.GameID, "ready": true})
+		return retryUnlessClientError(err)
+	}
+	pos, ok := chooseMove(game, ev.AccountID) // 始まっていて自分の番なら、置く場所を決める
+	if !ok {
+		return nil
+	}
+	_, err = bot.Call(c, "reversi/put-stone", map[string]any{"gameId": ev.GameID, "pos": pos})
+	return retryUnlessClientError(err) // 盤面が古くて打てない手は NOT_YOUR_TURN / INVALID_MOVE (4xx)
+}
+```
+
+使う endpoint:
+
+| endpoint | すること |
+|---|---|
+| `reversi/match` | 招待を受ける (`userId` に招待した相手)。本家と同じ |
+| `reversi/ready` | 準備完了を切り替える (`gameId`、`ready`)。両者がそろうと始まる。Elythia の追加 |
+| `reversi/put-stone` | 石を置く (`gameId`、`pos`。`id` は任意で、stream の `log` にそのまま載る)。手番でない・置けない場所は `NOT_YOUR_TURN` / `INVALID_MOVE` で断る。Elythia の追加 |
+| `reversi/claim-time-is-up` | 相手の手番の時間切れを申告する (`gameId`)。時間が残っていれば何もしない。Elythia の追加 |
+| `reversi/show-game` | 対局を読む。盤面は `logs` と `map` から組み立てる。本家と同じ |
+| `reversi/surrender` / `reversi/cancel-match` | 投了 / 始まる前の取り消し。本家と同じ |
+
+`ev.GameEvent` の値 (`plugin.ReversiGame*`) は、対局の stream に出るイベントと同じ:
+
+| 値 | いつ |
+|---|---|
+| `ReversiGameReadyStates` | どちらかが準備完了を切り替えた |
+| `ReversiGameSettings` | 始まる前に設定 (盤面など) が変わった。両者の準備完了は外れる |
+| `ReversiGameStarted` | 両者がそろって始まった |
+| `ReversiGameLog` | どちらかが石を置いた (自分の手でも届く) |
+| `ReversiGameEnded` | 終局した (置ける所が無くなった・投了・時間切れ) |
+| `ReversiGameCanceled` | 始まる前に取り消された。対局は消えているので `reversi/show-game` は失敗する |
+
+決まっていること:
+
+- **中身は載せない。** 盤面や手番は `reversi/show-game` で読み直す。通知は順序どおりとは限らず、同じものが二度届くこともあるので、届いた順に手を数えない
+- `UserID` は、招待では招待した相手、対局では対局の相手 (自分の手で起きたイベントでも相手)
+- **招待は、ミュート・ブロックしている相手からは届かない** (チャットと同じ判定)。対局の進みは、始めた対局なので相手をミュートしていても届く
+- 招待はこのサーバーの利用者からのものも、連合で届くものも同じに届く。連合の相手が招待を送り直しても、届くのは対局ごとに 1 回
+- 1 手ごとに `log` が届くので、両方の対局者を bot にすると、キューの handler が交互に呼ばれ続ける。手を打つ処理は短く保ち、時間のかかる探索はジョブに分ける ([ジョブ](#ジョブ))
+- **同じ対局の手は本体が直列にする。** handler は並行に動く (キューは同時に 2 本) ので、2 つの通知が同じ手番を見て両方が `reversi/put-stone` を呼ぶことがある。本体は対局ごとに手を 1 つずつ処理し、後から来た手は最新の盤面で確かめ直す。手番でなければ `NOT_YOUR_TURN`、置けなければ `INVALID_MOVE` で断る。相手がパスして自分の番が続いていれば、古い盤面で選んだ手でも置ける場所なら通る。投了も同じ順番に並ぶ
+- **bot から招待したときは、相手が受けたことを知らせる通知は無い。** 相手が準備すると `ReversiGameReadyStates` が届くので、そこで読み直して準備する (上の例の形)
+- **ランダムマッチ (`reversi/match` を `userId` 無しで呼ぶ) は、組まれるまで 10 秒ごとに呼び直す。** 待機列は呼び直し (heartbeat) が 15 秒途切れると消え、個々の待機は 30 秒で古いとみなされる。組まれると、待っていた側に `NotificationReversiInvited` が届く
+- **ランダムマッチの相手はミュート・ブロックを見ない** (本家と同じ)。ミュート・ブロックした相手と組まれると、招待の通知は届かないが、対局の進みの通知は届く
+
 ## ジョブ
 
 ```go
@@ -380,6 +451,8 @@ func jobs(ctx plugin.Context, j plugin.Jobs) error {
 	return nil
 }
 ```
+
+**ジョブ名は `^[A-Za-z0-9][A-Za-z0-9_-]*$` に合うこと** (英数字で始まり、英数字・ハイフン・アンダースコアだけ)。`_` で始まる名前 (`_peer`・`_notification` など) は本体が peer と通知の受け渡しに使う予約名で、プラグインは使えない。**規則に合わない名前を `Handle` や `Schedule` に渡すと、プラグインの設定の失敗として起動が失敗する** (#3369。以前は `daily.sync` のような名前でも `Handle` と `Schedule` は通り、`ctx.Queue()` で積むときだけ失敗していた)。同じ名前を `Handle` に 2 回渡しても、同じく起動が失敗する。
 
 task type は `plugin:<name>:<job>` として名前空間が付き、**プラグインごとの専用キュー
 `plugin:<name>`** で動く。遅い処理が連合の配送を止めることはないし、他のプラグインの
@@ -765,6 +838,8 @@ r.POST("/admin/stats", func(req plugin.Request) (any, error) {
 ### レート制限は一律の既定値
 
 本体の per-endpoint テーブルはプラグインのパスを持たないので、**登録したルートには一律の既定の上限が掛かる**（`internal/server/middleware/ratelimit_defs.go` の `PluginRouteDefaultLimit`、10 分に 600 回）。数えるのはルート（パスの型）ごとに、本体の endpoint と同じ単位（ログインしていれば利用者とIP、していなければIP）。超えると本体と同じ 429 `RATE_LIMIT_EXCEEDED` になる。`plugin.Router` には上限を宣言する口が無いので、ルートごとに値を変えることはできない。peer の受け口（`_peer`）には掛からない（専用の上限がある）。管理者が `disableEndpointRateLimits` で本体の上限を切ると、これも切れる。
+
+**`r.GET` で登録したルートは HEAD にも応える**（本家の Fastify と同じ。#3925）。`plugin.Request` はメソッドを持たないので、handler は HEAD を見分けられず、GET と同じく最後まで動く（返した本文は本体が捨てる）。状態を変える処理は GET に置かず、POST にする。
 
 この値は叩き続けるものを止めるためのもので、重い処理（画像の生成、外部への問い合わせ、集計クエリ）を守るには緩い。そういう処理は自分でも持つこと。素直なのは結果をキャッシュすることで、`Storage()` に置くか、プロセス内に持つ。
 
@@ -1311,6 +1386,15 @@ const NotificationFollow
 const NotificationFollowRequest
 const NotificationReaction
 const NotificationChatMessage
+const NotificationReversiInvited
+const NotificationReversiGame
+
+const ReversiGameReadyStates
+const ReversiGameSettings
+const ReversiGameStarted
+const ReversiGameLog
+const ReversiGameEnded
+const ReversiGameCanceled
 
 type Notification struct
   ID            string
@@ -1321,6 +1405,8 @@ type Notification struct
   Reaction      string
   NoteVisibility string
   ChatMessageID string
+  GameID        string
+  GameEvent     string
   CreatedAt     time.Time
 
 type Handler func(Request) (any, error)

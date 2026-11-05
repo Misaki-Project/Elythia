@@ -4,17 +4,17 @@
 
 - Misskey (TS) version: `2026.10.1`
 - mk-go version: `2.1.0-misaki.1`
-- TS endpoints (POST `/api/*`): **444**
-- mk-go implemented (TS の subset): **444**
+- TS endpoints (POST `/api/*`): **446**
+- mk-go implemented (TS の subset): **446**
 - mk-go coverage of TS: **100.0%**
 - TS only (mk-go 未実装): **0**
-- mk-go only (TS spec 外): **123**
+- mk-go only (TS spec 外): **126**
 
 ## TS 側に存在するが mk-go で未実装 (0)
 
 (なし)
 
-## mk-go 側にしかない endpoint (123)
+## mk-go 側にしかない endpoint (126)
 
 ### GET variant 追加 (25)
 
@@ -70,7 +70,7 @@ yojo-art/cherrypick 由来の federated chat 拡張 endpoint。Misskey TS 本家
 | POST | `/api/chat/rooms/unmute` |
 | POST | `/api/chat/unread-count` |
 
-### その他 mk-go 独自 / alias (83)
+### その他 mk-go 独自 / alias (86)
 
 上記カテゴリに当てはまらない mk-go 独自 endpoint。backward-compat shim や alias を含む。
 
@@ -153,6 +153,9 @@ yojo-art/cherrypick 由来の federated chat 拡張 endpoint。Misskey TS 本家
 | POST | `/api/plugin/role-level/users/profile-hide` |
 | POST | `/api/plugin/role-level/users/profile-settings` |
 | POST | `/api/plugin/role-level/users/show` |
+| POST | `/api/reversi/claim-time-is-up` |
+| POST | `/api/reversi/put-stone` |
+| POST | `/api/reversi/ready` |
 | POST | `/api/roles/assignment-show` |
 | POST | `/api/signin` |
 | POST | `/api/signup-application/apply` |
@@ -160,7 +163,7 @@ yojo-art/cherrypick 由来の federated chat 拡張 endpoint。Misskey TS 本家
 | POST | `/api/signup-application/register` |
 | POST | `/api/signup-application/status` |
 
-## 両方に存在する endpoint (444)
+## 両方に存在する endpoint (446)
 
 <details>
 <summary>展開する</summary>
@@ -344,6 +347,8 @@ yojo-art/cherrypick 由来の federated chat 拡張 endpoint。Misskey TS 本家
 | POST | `/api/chat/rooms/owned` |
 | POST | `/api/chat/rooms/show` |
 | POST | `/api/chat/rooms/update` |
+| GET | `/api/clear-browser-cache` |
+| POST | `/api/clear-browser-cache` |
 | POST | `/api/clips/add-note` |
 | POST | `/api/clips/create` |
 | POST | `/api/clips/delete` |

@@ -29,13 +29,23 @@ SPDX-License-Identifier: AGPL-3.0-only
 	</div>
 
 	<div v-else ref="rootEl">
+		<!--
+			Elythia: 古いものを読み足したら、遷移を切る (#3939)。読み足した項目はたいてい画面の下に
+			足されて見えないのに、出現の遷移の終わりを知るために Vue が項目ごとに getComputedStyle を
+			読み、そのたびにページ全体のスタイル再計算が走っていた (見える位置に足したときは、
+			出現の動きが付かないだけ)。移動のクラスも外すと、描いた後に
+			全件の位置を測り直す処理 (移動のアニメーションのため) も省かれる。描く前の全件の位置の
+			計測は TransitionGroup の作りで止められない。切る期間は deferOlderMounts の
+			quietTransitions を参照。
+		-->
 		<component
 			:is="prefer.s.animation ? TransitionGroup : 'div'" :class="[$style.notifications]"
 			:enterActiveClass="$style.transition_x_enterActive"
 			:leaveActiveClass="$style.transition_x_leaveActive"
 			:enterFromClass="$style.transition_x_enterFrom"
 			:leaveToClass="$style.transition_x_leaveTo"
-			:moveClass="$style.transition_x_move"
+			:moveClass="quietTransitions() ? undefined : $style.transition_x_move"
+			:css="!quietTransitions()"
 			tag="div"
 		>
 			<div v-for="(notification, i) in paginator.items.value" :key="notification.id" :data-scroll-anchor="notification.id" :class="$style.item">
@@ -44,13 +54,16 @@ SPDX-License-Identifier: AGPL-3.0-only
 					<span style="height: 1em; width: 1px; background: var(--MI_THEME-divider);"></span>
 					<span>{{ getSeparatorInfo(paginator.items.value[i -1].createdAt, notification.createdAt)?.nextText }} <i class="ti ti-chevron-down"></i></span>
 				</div>
-				<MkNote v-if="['reply', 'quote', 'mention'].includes(notification.type) && 'note' in notification" :class="$style.content" :note="notification.note" :withHardMute="true"/>
-				<XNotification v-else :class="$style.content" :notification="notification" :withTime="true" :full="true"/>
+				<!-- Elythia: 古いものを読み足したときは、中身を数フレームに分けて組み立てる (#3937) -->
+				<MkDeferredMount :defer="olderMounts.shouldDefer(notification.id)" :unmountWhenFar="true" :class="$style.content">
+					<MkNote v-if="['reply', 'quote', 'mention'].includes(notification.type) && 'note' in notification" :note="notification.note" :withHardMute="true"/>
+					<XNotification v-else :notification="notification" :withTime="true" :full="true"/>
+				</MkDeferredMount>
 			</div>
 		</component>
 		<!-- mk-go: レート制限の理由と再試行 (#2955)。落とすだけだと「これで全部」に見える。 -->
 		<MkRateLimitedNotice :paginator="paginator"/>
-		<button v-show="paginator.canFetchOlder.value" key="_more_" v-appear="prefer.s.enableInfiniteScroll ? paginator.fetchOlder : null" :disabled="paginator.fetchingOlder.value" class="_button" :class="$style.more" @click="paginator.fetchOlder">
+		<button v-show="paginator.canFetchOlder.value" key="_more_" v-appear="prefer.s.enableInfiniteScroll ? olderMounts.fetchOlder : null" :disabled="paginator.fetchingOlder.value" class="_button" :class="$style.more" @click="olderMounts.fetchOlder">
 			<div v-if="!paginator.fetchingOlder.value">{{ i18n.ts.loadMore }}</div>
 			<MkLoading v-else/>
 		</button>
@@ -59,7 +72,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { onUnmounted, onMounted, computed, useTemplateRef, TransitionGroup, markRaw, watch } from 'vue';
+import { onUnmounted, onMounted, onActivated, onDeactivated, computed, provide, useTemplateRef, TransitionGroup, markRaw, watch } from 'vue';
 import * as Misskey from 'misskey-js';
 import { notificationTypes } from 'misskey-js';
 import { useInterval } from '@@/js/use-interval.js';
@@ -67,6 +80,7 @@ import { getScrollContainer, scrollToTop } from '@@/js/scroll.js';
 import XNotification from '@/components/MkNotification.vue';
 import MkRateLimitedNotice from '@/components/MkRateLimitedNotice.vue';
 import MkNote from '@/components/MkNote.vue';
+import MkDeferredMount from '@/components/MkDeferredMount.vue';
 import { useStream } from '@/stream.js';
 import { i18n } from '@/i18n.js';
 import MkPullToRefresh from '@/components/MkPullToRefresh.vue';
@@ -76,6 +90,8 @@ import { isSeparatorNeeded, getSeparatorInfo } from '@/utility/timeline-date-sep
 import { Paginator } from '@/utility/paginator.js';
 import { createReconnectResync, paginatorResyncOptions, NOTIFICATION_RESYNC_PARAMS } from '@/utility/reconnect-resync.js';
 import { useTimelineUpdatePause } from '@/composables/use-timeline-update-pause.js';
+import { deferOlderMounts } from '@/utility/mount-scheduler.js';
+import { createFarItems, FAR_ITEMS } from '@/utility/far-items.js';
 
 const props = defineProps<{
 	excludeTypes?: typeof notificationTypes[number][] | null;
@@ -124,6 +140,13 @@ const { isPausing: isPausingUpdate } = useTimelineUpdatePause({
 	onActivatedAtTop: () => paginator.releaseQueue(),
 });
 
+const olderMounts = deferOlderMounts(() => paginator.fetchOlder(), () => paginator.items.value.map(x => x.id));
+const quietTransitions = () => olderMounts.quietTransitions({
+	newestId: paginator.items.value[0]?.id,
+	lastId: paginator.items.value.at(-1)?.id,
+	generation: paginator.generation,
+});
+
 function isTop() {
 	if (scrollContainer == null) return true;
 	if (rootEl.value == null) return true;
@@ -152,6 +175,22 @@ watch(rootEl, (el) => {
 		scrollContainer.addEventListener('scroll', onScrollContainerScroll, { passive: true }); // ほんとはscrollendにしたいけどiosが非対応
 	}
 }, { immediate: true });
+
+// Elythia: 画面から遠い項目を DOM から外す (#3941)。読んだ分を全部 mount したままだと、
+// 下へ読むほど DOM とメモリが増え続けていた。スクロールの容器が決まってから見始め、
+// KeepAlive で裏に回っている間は止める
+const farItems = createFarItems();
+provide(FAR_ITEMS, farItems);
+watch(rootEl, (el) => {
+	if (el) {
+		farItems.connect(scrollContainer, el);
+	} else {
+		farItems.disconnect();
+	}
+}, { immediate: true });
+onActivated(() => farItems.resume());
+onDeactivated(() => farItems.pause());
+onUnmounted(() => farItems.disconnect());
 
 function onNotification(notification: Misskey.entities.Notification) {
 	const isMuted = props.excludeTypes ? props.excludeTypes.includes(notification.type as typeof notificationTypes[number]) : false;
@@ -241,8 +280,11 @@ defineExpose({
 .transition_x_enterActive {
 	transition: transform 0.7s cubic-bezier(0.23, 1, 0.32, 1), opacity 0.7s cubic-bezier(0.23, 1, 0.32, 1);
 
+	// Elythia: 中身を後回しにした項目は、外側の div にクラスが付くので中身にも掛ける (#3937)
 	&.content,
-	.content {
+	.content,
+	&.content > *,
+	.content > * {
 		/* Skip Note Rendering有効時、TransitionGroupで通知を追加するときに一瞬がくっとなる問題を抑制する */
 		content-visibility: visible !important;
 	}

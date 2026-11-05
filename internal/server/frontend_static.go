@@ -16,6 +16,7 @@ import (
 	"github.com/labstack/echo/v4"
 	echomw "github.com/labstack/echo/v4/middleware"
 
+	"github.com/elythia-network/elythia/internal/misc/headreq"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 )
 
@@ -117,6 +118,14 @@ func frontendAssetName(param string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	// `.`・`..`・空のセグメントを含むパスは、path.Clean で正規化して配信しない。
+	// echo の静的配信はこの形を 404 にするので、自前の経路だけが事前圧縮の変種と
+	// immutable を付けて返すと、方針がずれる (#3369)。
+	for seg := range strings.SplitSeq(strings.TrimPrefix(p, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", false
+		}
+	}
 	name := path.Clean(strings.TrimPrefix(p, "/"))
 	if !fs.ValidPath(name) || name == "." {
 		return "", false
@@ -165,7 +174,7 @@ func servePrecompressed(c echo.Context, fsys fs.FS, name string, orig fs.FileInf
 		return false
 	}
 	defer bestF.Close()
-	req := c.Request()
+	req := headreq.Request(c)
 	h := c.Response().Header()
 	h.Set(echo.HeaderContentType, ctype)
 	h.Set(echo.HeaderContentEncoding, bestEnc)

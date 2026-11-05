@@ -12,6 +12,7 @@ import (
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/jsdate"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
@@ -33,6 +34,12 @@ type BroadcastPublisher interface {
 	PublishBroadcast(eventType string, body any)
 }
 
+// ArchiveScheduler schedules the auto-archive job of an announcement at its
+// autoArchiveAt (#3994). queue.Client satisfies it.
+type ArchiveScheduler interface {
+	ScheduleAnnouncementArchive(id string, at time.Time) error
+}
+
 // Handler handles announcement-related API endpoints.
 type Handler struct {
 	repo                repository.AnnouncementRepository
@@ -46,6 +53,31 @@ type Handler struct {
 	entityPacker *entity.Packer
 	// clock は自動アーカイブの期限と比べる現在時刻 (#3809)。テストで差し替える。
 	clock func() time.Time
+	// archiveScheduler は自動アーカイブの期限の時刻にジョブを積む (#3994)。nil なら
+	// 積まない (起動時の処理と日次の保険が落とす)。
+	archiveScheduler ArchiveScheduler
+}
+
+// SetArchiveScheduler sets where the auto-archive jobs are scheduled (#3994).
+// nil disables scheduling.
+func (h *Handler) SetArchiveScheduler(s ArchiveScheduler) {
+	h.archiveScheduler = s
+}
+
+// scheduleArchive schedules the auto-archive job of a when it is active and has
+// an autoArchiveAt, like upstream AnnouncementService.create / update.
+//
+// 積めなくても API は失敗させない (本家は失敗を返す)。お知らせは既に保存済みで、
+// 読むときに期限を見るので見え方は変わらず、DB の isActive は起動時の処理か日次の
+// 保険が落とす。
+func (h *Handler) scheduleArchive(c echo.Context, a *model.Announcement) {
+	if h.archiveScheduler == nil || a == nil || !a.IsActive || a.AutoArchiveAt == nil {
+		return
+	}
+	if err := h.archiveScheduler.ScheduleAnnouncementArchive(a.ID, *a.AutoArchiveAt); err != nil {
+		slog.WarnContext(c.Request().Context(), "announcement: schedule auto-archive failed",
+			"announcementId", a.ID, "err", err)
+	}
 }
 
 // SetClock overrides the time source the auto-archive checks compare
@@ -146,7 +178,7 @@ func (h *Handler) List(c echo.Context) error {
 		activeOnly = *req.IsActive
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -276,6 +308,11 @@ func (h *Handler) AdminCreate(c echo.Context) error {
 	if err := json.Unmarshal(req.ImageURL, &imageURL); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "imageUrl must be a string or null.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
+	// 本家 AnnouncementService.create の`values.imageUrl || null`と同じく、空文字は
+	// null として保存する (#3369)。
+	if imageURL != nil && *imageURL == "" {
+		imageURL = nil
+	}
 	if req.Icon == "" {
 		req.Icon = "info"
 	}
@@ -292,7 +329,7 @@ func (h *Handler) AdminCreate(c echo.Context) error {
 	var autoArchiveAt *time.Time
 	if req.AutoArchiveAt != nil {
 		ms := int64(*req.AutoArchiveAt)
-		if ms <= h.clock().UnixMilli() || !validDateMillis(ms) {
+		if ms <= h.clock().UnixMilli() || !jsdate.ValidMillis(ms) {
 			return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_AUTO_ARCHIVE_AT", "Invalid auto archive date.", "2a892bd5-487d-46a2-a5fe-3d85ad51defe"))
 		}
 		t := time.UnixMilli(ms).UTC()
@@ -324,6 +361,7 @@ func (h *Handler) AdminCreate(c echo.Context) error {
 	if err := h.repo.Create(a); err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
+	h.scheduleArchive(c, a)
 	// upstream AnnouncementService.create: per-user (userId 指定) は main へ、
 	// global (userId 無し) は broadcast stream へ announcementCreated を流す (#2056)。
 	// #2106 L24/L52: create event は upstream 同様 me-less で pack する (viewerID="" → forYou=false)。
@@ -354,13 +392,12 @@ func (h *Handler) AdminCreate(c echo.Context) error {
 	return c.JSON(http.StatusOK, resp)
 }
 
-// maxDateMillis is the largest absolute millisecond value a JavaScript Date
-// holds (8.64e15). 本家は new Date(ms) が NaN になる値を INVALID_AUTO_ARCHIVE_AT で断る。
-const maxDateMillis = 8_640_000_000_000_000
-
-// validDateMillis reports whether ms is a time a JavaScript Date can hold.
-func validDateMillis(ms int64) bool {
-	return ms >= -maxDateMillis && ms <= maxDateMillis
+// sameTimePtr reports whether a and b are both nil or the same instant.
+func sameTimePtr(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }
 
 // isValidAnnouncementIcon reports whether v matches upstream's
@@ -428,7 +465,7 @@ func (h *Handler) AdminUpdate(c echo.Context) error {
 		if err := json.Unmarshal(req.AutoArchiveAt, &ms); err != nil {
 			return apierr.JSONInvalidParam(c)
 		}
-		if ms < 0 || !validDateMillis(int64(ms)) {
+		if ms < 0 || !jsdate.ValidMillis(int64(ms)) {
 			return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_AUTO_ARCHIVE_AT", "Invalid auto archive date.", "01b83d7b-2fd5-4d7c-86c4-d03144d16355"))
 		}
 		autoArchiveAt = time.UnixMilli(int64(ms)).UTC()
@@ -482,12 +519,25 @@ func (h *Handler) AdminUpdate(c echo.Context) error {
 	if len(fields) == 0 {
 		return c.NoContent(http.StatusNoContent)
 	}
+	// 更新の前の期限と isActive を値で控える (repository によっては before が更新後の
+	// 行と同じものを指す)。
+	var beforeAutoArchiveAt *time.Time
+	if before.AutoArchiveAt != nil {
+		t := *before.AutoArchiveAt
+		beforeAutoArchiveAt = &t
+	}
+	beforeActive := before.IsActive
 	if err := h.repo.UpdateFields(req.ID, fields); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ANNOUNCEMENT", "No such announcement.", "d3aae5a7-6372-4cb4-b61c-f511ffc2d7cc"))
 	}
 	after, err := h.repo.FindByID(req.ID)
 	if err != nil {
 		return c.NoContent(http.StatusNoContent)
+	}
+	// 本家 AnnouncementService.update と同じく、期限か isActive が変わったときに積む。
+	// 古い期限のジョブは取り消さない (走っても、保存されている期限と比べて何もしない)。
+	if !sameTimePtr(beforeAutoArchiveAt, after.AutoArchiveAt) || beforeActive != after.IsActive {
+		h.scheduleArchive(c, after)
 	}
 	h.logAnnouncementAction(c, moderationlog.LogUpdateGlobalAnnouncement, moderationlog.LogUpdateUserAnnouncement, before, map[string]any{
 		"announcementId": req.ID,
@@ -505,17 +555,23 @@ func (h *Handler) AdminDelete(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.ID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "id is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
-	// snapshot before delete (log info に含める + global/user 分岐判定)
-	snapshot, _ := h.repo.FindByID(req.ID)
+	// snapshot before delete (log info に含める + global/user 分岐判定)。
+	// 本家 delete.ts と同じく、無いお知らせは NO_SUCH_ANNOUNCEMENT にする (#3369)。
+	// 以前は無くても 204 を返し、逆に DB の障害を NO_SUCH_ANNOUNCEMENT にしていた (#2792)。
+	snapshot, err := h.repo.FindByID(req.ID)
+	if err != nil {
+		if repository.IsNotFound(err) {
+			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ANNOUNCEMENT", "No such announcement.", "ecad8040-a276-4e85-bda9-015a708d291e"))
+		}
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err := h.repo.Delete(req.ID); err != nil {
-		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ANNOUNCEMENT", "No such announcement.", "ecad8040-a276-4e85-bda9-015a708d291e"))
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
-	if snapshot != nil {
-		h.logAnnouncementAction(c, moderationlog.LogDeleteGlobalAnnouncement, moderationlog.LogDeleteUserAnnouncement, snapshot, map[string]any{
-			"announcementId": req.ID,
-			"announcement":   snapshot,
-		})
-	}
+	h.logAnnouncementAction(c, moderationlog.LogDeleteGlobalAnnouncement, moderationlog.LogDeleteUserAnnouncement, snapshot, map[string]any{
+		"announcementId": req.ID,
+		"announcement":   snapshot,
+	})
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -544,7 +600,7 @@ func (h *Handler) AdminList(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "Invalid parameters.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -554,7 +610,7 @@ func (h *Handler) AdminList(c echo.Context) error {
 	}
 	// 絞り込みと isActive の計算は同じ「今」で行う (本家も 1 つの now を使う)。
 	now := h.clock()
-	items, err := h.repo.ListForAdmin(req.UserID, req.Status, limit, 0, sinceID, untilID, now)
+	items, err := h.repo.ListForAdmin(req.UserID, req.Status, limit, sinceID, untilID, now)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}

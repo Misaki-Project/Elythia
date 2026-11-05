@@ -227,7 +227,7 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string, inboundSourceH
 		newText = mfm.FromHTML(apNote.Content)
 	}
 	// 保存するのは切った本文、判定と hashtag は全文 (create 経路と同じ)。
-	storedText := clipRemoteNoteText(newText)
+	storedText := storedRemoteNoteText(newText)
 	// CW は**下の fields 反映より前に**決める。禁止語の判定を「更新後の値」で
 	// 行うために先に要るが、判定は `existing` を書き換える前に済ませたい
 	// (弾く場合は in-memory の note も無傷で返す)。
@@ -329,14 +329,23 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string, inboundSourceH
 	// (取り込みと同じ判定)。編集の取り込みは Elythia の拡張なので本家に対応物は
 	// 無いが、掛けないと当たらない投稿を作ってから差し替えるだけで降格を
 	// 素通りできる。**狭める方向だけ** — 当たらなくなっても public には戻さない
-	// (降格の理由がセンシティブワードかどうかを記録していないため)。
-	if existing.Visibility == model.NoteVisibilityPublic && r.containsSensitiveWords(effectiveText, effectiveCW) {
+	// (降格の理由がセンシティブワードかどうかを記録していないため)。投稿者のロールの
+	// canPublicNote も同じく見る (#3369。作った後にロールで止められた投稿者が、編集で
+	// public のまま本文を差し替え続けられないように)。
+	if existing.Visibility == model.NoteVisibilityPublic &&
+		(r.containsSensitiveWords(effectiveText, effectiveCW) || r.authorCannotPublicNote(existing.UserID)) {
 		fields["visibility"] = model.NoteVisibilityHome
 		existing.Visibility = model.NoteVisibilityHome
 	}
 	if newText != "" {
-		fields["text"] = &storedText
-		existing.Text = &storedText
+		// 削った結果が空なら、取り込み (IngestNote) と同じく本文無しにする (#3369)。
+		if storedText == "" {
+			fields["text"] = nil
+			existing.Text = nil
+		} else {
+			fields["text"] = &storedText
+			existing.Text = &storedText
+		}
 	}
 	if !slices.Equal([]string(existing.Mentions), []string(mentions)) {
 		fields["mentions"] = mentions

@@ -645,9 +645,9 @@ func TestLocalSandbox(t *testing.T) {
 
 func TestVerifyReportsFsckDriftAsWarning(t *testing.T) {
 	e := getVerifyEnv(t)
-	// notesCount を実際の件数 (0) とずらしたユーザーを置く。元の DB にあるずれで、
+	// followersCount を実際の件数 (0) とずらしたユーザーを置く。元の DB にあるずれで、
 	// バックアップの欠陥ではないので、段は通して警告に残す。
-	require.NoError(t, e.db.Exec(`INSERT INTO "user" (id, username, "usernameLower", "avatarDecorations", "notesCount") VALUES ('verifydrift1', 'drift', 'drift', '[]', 5)`).Error)
+	require.NoError(t, e.db.Exec(`INSERT INTO "user" (id, username, "usernameLower", "avatarDecorations", "followersCount") VALUES ('verifydrift1', 'drift', 'drift', '[]', 5)`).Error)
 	t.Cleanup(func() { require.NoError(t, e.db.Exec(`DELETE FROM "user" WHERE id = 'verifydrift1'`).Error) })
 	dump := e.dump(t)
 	s := newMemStorage()
@@ -734,9 +734,11 @@ func TestVerifyGenerationsTakenByTake(t *testing.T) {
 	require.NoError(t, err)
 	closeGorm(gdb)
 	// CountRows が扱う形 (拡張、別の schema と引用の要る名前、分割表) を、
-	// Elythia の schema に足す。
+	// Elythia の schema に足す。pg_stat_statements は、Elythia が起動のときに
+	// 作ることがある (#3909)。作るのに読み込みは要らない (view を読むときに要る)。
 	p.exec(t,
 		`CREATE EXTENSION pg_trgm`,
+		`CREATE EXTENSION pg_stat_statements`,
 		`CREATE SCHEMA other`,
 		`CREATE TABLE other."Weird Name" (x int)`,
 		`INSERT INTO other."Weird Name" VALUES (1), (2), (3)`,
@@ -775,6 +777,9 @@ func TestVerifyGenerationsTakenByTake(t *testing.T) {
 			require.NoError(t, err)
 			// 前提: 拡張と locale が記録され、verify がそれを使う経路を通る。
 			require.True(t, slices.ContainsFunc(meta.Extensions, func(x ExtensionInfo) bool { return x.Name == "pg_trgm" }), "%+v", meta.Extensions)
+			// pg_stat_statements は dump に入れない (TestTake_LeavesPgStatStatementsOut)。
+			// 入っている DB からでも、確かめる処理は通る。
+			require.False(t, slices.ContainsFunc(meta.Extensions, func(x ExtensionInfo) bool { return x.Name == "pg_stat_statements" }), "%+v", meta.Extensions)
 			require.NotEmpty(t, meta.DatabaseLocale.Collate)
 			require.Equal(t, int64(3), meta.RowCounts[`other.Weird Name`])
 			require.Equal(t, tc.encrypt, meta.Encrypted)

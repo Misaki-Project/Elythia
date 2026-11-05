@@ -1060,12 +1060,15 @@ func (h *Handler) Following(c echo.Context) error {
 
 // jsonNoSuchUserForRelations returns the NO_SUCH_USER error with the id
 // upstream assigns to users/followers / users/following (別 id が振られている)。
+//
+// 本家のこのエラーは httpStatusCode を持たないので 400 (#3369)。404 を明示して
+// いるのは users/show だけ。
 func jsonNoSuchUserForRelations(c echo.Context, followers bool) error {
 	nsuID := "63e4aba4-4156-4e53-be25-c9559e42d71b" // users/following
 	if followers {
 		nsuID = "27fa5435-88ab-43de-9360-387de88727cd" // users/followers
 	}
-	return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_USER", "No such user.", nsuID))
+	return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", nsuID))
 }
 
 func (h *Handler) listRelations(c echo.Context, followers bool) error {
@@ -1122,7 +1125,7 @@ func (h *Handler) listRelations(c echo.Context, followers bool) error {
 		return jsonNoSuchUserForRelations(c, followers)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}

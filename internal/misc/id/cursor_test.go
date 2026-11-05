@@ -115,3 +115,64 @@ func TestNormalizeCursor_DateCursorStaysStorable(t *testing.T) {
 	assert.NotEmpty(t, s)
 	assert.NotEmpty(t, u)
 }
+
+// 本家は sinceDate / untilDate を真偽値として見るので、0 (JSON の -0 も int64 では
+// 0) は指定なしと同じ。時刻 0 のカーソルにすると untilDate: 0 が空の一覧になる。
+func TestNormalizeCursor_ZeroDateIsAbsent(t *testing.T) {
+	zero := int64(0)
+	s, u, ok := NormalizeCursor("", "", &zero, nil)
+	assert.True(t, ok)
+	assert.Empty(t, s, "sinceDate: 0 must not become a cursor")
+	assert.Empty(t, u)
+
+	s, u, ok = NormalizeCursor("", "", nil, &zero)
+	assert.True(t, ok)
+	assert.Empty(t, s)
+	assert.Empty(t, u, "untilDate: 0 must not become a cursor")
+
+	// 負の日付は真なので、本家と同じくカーソルにする
+	neg := int64(-1)
+	s, u, ok = NormalizeCursor("", "", &neg, &neg)
+	assert.True(t, ok)
+	assert.NotEmpty(t, s)
+	assert.NotEmpty(t, u)
+}
+
+func TestNormalizeCursorIDFirst(t *testing.T) {
+	dateMs := int64(1779744000000)
+	zero := int64(0)
+	datePrefix := AidxCutoffPrefix(time.UnixMilli(dateMs))
+	tests := []struct {
+		name                 string
+		sinceID, untilID     string
+		sinceDate, untilDate *int64
+		wantSince, wantUntil string
+		wantOK               bool
+	}{
+		{name: "sinceId drops untilDate", sinceID: "abc", untilDate: &dateMs, wantSince: "abc", wantOK: true},
+		{name: "untilId drops sinceDate", untilID: "xyz", sinceDate: &dateMs, wantUntil: "xyz", wantOK: true},
+		{name: "sinceId drops sinceDate", sinceID: "abc", sinceDate: &dateMs, wantSince: "abc", wantOK: true},
+		{name: "both ids drop both dates", sinceID: "abc", untilID: "xyz", sinceDate: &dateMs, untilDate: &dateMs, wantSince: "abc", wantUntil: "xyz", wantOK: true},
+		{name: "dates only become cursors", sinceDate: &dateMs, untilDate: &dateMs, wantSince: datePrefix, wantUntil: datePrefix, wantOK: true},
+		{name: "untilDate only", untilDate: &dateMs, wantUntil: datePrefix, wantOK: true},
+		{name: "zero date is absent", sinceDate: &zero, untilDate: &zero, wantOK: true},
+		{name: "nothing", wantOK: true},
+		{name: "unstorable id is rejected", sinceID: "a\x00b", untilDate: &dateMs, wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, u, ok := NormalizeCursorIDFirst(tt.sinceID, tt.untilID, tt.sinceDate, tt.untilDate)
+			assert.Equal(t, tt.wantOK, ok)
+			if !tt.wantOK {
+				return
+			}
+			assert.Equal(t, tt.wantSince, s)
+			assert.Equal(t, tt.wantUntil, u)
+			// ID が無いときは NormalizeCursor と同じ結果になる。
+			if tt.sinceID == "" && tt.untilID == "" {
+				ns, nu, nok := NormalizeCursor(tt.sinceID, tt.untilID, tt.sinceDate, tt.untilDate)
+				assert.Equal(t, []any{ns, nu, nok}, []any{s, u, ok})
+			}
+		})
+	}
+}

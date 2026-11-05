@@ -395,6 +395,35 @@ func TestAnnouncementRepository_ReadManagement(t *testing.T) {
 	assert.Empty(t, unread)
 }
 
+// 本家の getUnreadAnnouncements と同じく、silence のお知らせと、
+// 利用者より前に作られた forExistingUsers のお知らせは未読に数えない。
+func TestAnnouncementRepository_UnreadForUser_SkipsSilenceAndOlderForExistingUsers(t *testing.T) {
+	repo := NewAnnouncementRepository(testDB)
+	createTestUser(t, "annunrd5")
+
+	mk := func(id string, silence, forExisting bool) {
+		t.Helper()
+		a := &model.Announcement{ID: id, Title: "T", Text: "t", Icon: "info", Display: "normal", IsActive: true, Silence: silence, ForExistingUsers: forExisting}
+		require.NoError(t, repo.Create(a))
+		t.Cleanup(func() { cleanupAnnouncement(t, id) })
+	}
+	mk("annunrd9s", true, false)  // silence
+	mk("annunrd0e", false, true)  // forExistingUsers、利用者より前
+	mk("annunrd9e", false, true)  // forExistingUsers、利用者より後
+	mk("annunrd0p", false, false) // 通常
+
+	unread, err := repo.UnreadForUser("annunrd5")
+	require.NoError(t, err)
+	got := map[string]bool{}
+	for _, a := range unread {
+		got[a.ID] = true
+	}
+	assert.False(t, got["annunrd9s"], "silence announcement must not count as unread")
+	assert.False(t, got["annunrd0e"], "forExistingUsers announcement older than the user must not count")
+	assert.True(t, got["annunrd9e"], "forExistingUsers announcement newer than the user counts")
+	assert.True(t, got["annunrd0p"], "plain announcement counts")
+}
+
 func TestAnnouncementRepository_UnreadForUser_Error(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -433,7 +462,7 @@ func TestAnnouncementRepository_ListForAdmin_FiltersByUserID(t *testing.T) {
 	defer cleanupAnnouncement(t, oUser.ID)
 
 	// userId 指定 → そのユーザー宛のみ
-	rows, err := repo.ListForAdmin(tu.ID, "active", 10, 0, "", "", time.Now())
+	rows, err := repo.ListForAdmin(tu.ID, "active", 10, "", "", time.Now())
 	require.NoError(t, err)
 	ids := make(map[string]bool)
 	for _, r := range rows {
@@ -444,7 +473,7 @@ func TestAnnouncementRepository_ListForAdmin_FiltersByUserID(t *testing.T) {
 	assert.False(t, ids[oUser.ID])
 
 	// userId 未指定 → global only
-	rows, err = repo.ListForAdmin("", "active", 10, 0, "", "", time.Now())
+	rows, err = repo.ListForAdmin("", "active", 10, "", "", time.Now())
 	require.NoError(t, err)
 	ids = make(map[string]bool)
 	for _, r := range rows {
@@ -470,7 +499,7 @@ func TestAnnouncementRepository_ListForAdmin_StatusBranches(t *testing.T) {
 	defer cleanupAnnouncement(t, archived.ID)
 
 	// archived: archived row が含まれ active row が含まれないこと。
-	rows, err := repo.ListForAdmin("", "archived", 10, 0, "", "", time.Now())
+	rows, err := repo.ListForAdmin("", "archived", 10, "", "", time.Now())
 	require.NoError(t, err)
 	archivedIDs := make(map[string]bool)
 	for _, r := range rows {
@@ -480,7 +509,7 @@ func TestAnnouncementRepository_ListForAdmin_StatusBranches(t *testing.T) {
 	assert.True(t, archivedIDs[archived.ID])
 	assert.False(t, archivedIDs[active.ID])
 	// all (両方含む)
-	rows, err = repo.ListForAdmin("", "all", 10, 0, "", "", time.Now())
+	rows, err = repo.ListForAdmin("", "all", 10, "", "", time.Now())
 	require.NoError(t, err)
 	ids := make(map[string]bool)
 	for _, r := range rows {
@@ -490,11 +519,11 @@ func TestAnnouncementRepository_ListForAdmin_StatusBranches(t *testing.T) {
 	assert.True(t, ids[archived.ID])
 
 	// limit / offset / since / until / clamp paths
-	_, err = repo.ListForAdmin("", "active", 0, 0, "", "", time.Now())
+	_, err = repo.ListForAdmin("", "active", 0, "", "", time.Now())
 	require.NoError(t, err)
-	_, err = repo.ListForAdmin("", "active", 1000, 5, "", "", time.Now())
+	_, err = repo.ListForAdmin("", "active", 1000, "", "", time.Now())
 	require.NoError(t, err)
-	_, err = repo.ListForAdmin("", "active", 10, 0, "since_x", "until_x", time.Now())
+	_, err = repo.ListForAdmin("", "active", 10, "since_x", "until_x", time.Now())
 	require.NoError(t, err)
 }
 

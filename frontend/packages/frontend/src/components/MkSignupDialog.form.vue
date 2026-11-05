@@ -93,7 +93,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { ref, computed } from 'vue';
+import { ref, computed, onBeforeUnmount } from 'vue';
 import { toUnicode } from 'punycode.js';
 import * as Misskey from 'misskey-js';
 import * as config from '@@/js/config.js';
@@ -233,7 +233,12 @@ function onChangeUsername(): void {
 // `username/available` を叩く回数だけが打鍵の止まった後の 1 回に減る。
 // cancelUsernameCheck drops a scheduled lookup and the in-flight request.
 function cancelUsernameCheck(): void {
-	checkUsernameAvailable.cancel();
+	// **`upcomingOnly: true` を外さない (#3912)。** throttle-debounce 5.x の
+	// 引数なしの `cancel()` は、予約済みの呼び出しを消すだけでなく、この
+	// debounce 関数を以後ずっと無効にする。関数はコンポーネントに 1 つしか
+	// 無いので、短すぎる名前や空欄を一度通ると、直した名前でも問い合わせが
+	// 二度と飛ばず「確認しています」のまま登録できなくなる。
+	checkUsernameAvailable.cancel({ upcomingOnly: true });
 	usernameAbortController.value?.abort();
 	usernameAbortController.value = null;
 }
@@ -245,6 +250,10 @@ const checkUsernameAvailable = debounce(1000, (name: string, signal: AbortSignal
 		if (signal.aborted) return;
 		usernameState.value = result.available ? 'ok' : 'unavailable';
 	}).catch((err) => {
+		// **`.then` と同じく、取り消した後の失敗は捨てる (#3912)。** 応答が
+		// 届いた後に取り消すと、4xx の `body.error` が `AbortError` でないまま
+		// ここへ来る。見ないと、直した名前の状態を `'error'` で上書きする。
+		if (signal.aborted) return;
 		if (err.name !== 'AbortError') {
 			usernameState.value = 'error';
 		}
@@ -269,7 +278,8 @@ function onChangeEmail(): void {
 }
 
 function cancelEmailCheck(): void {
-	checkEmailAvailable.cancel();
+	// 利用者名欄と同じ理由で、保留中の呼び出しだけを取り消す (#3912)。
+	checkEmailAvailable.cancel({ upcomingOnly: true });
 	emailAbortController.value?.abort();
 	emailAbortController.value = null;
 }
@@ -288,10 +298,21 @@ const checkEmailAvailable = debounce(1000, (address: string, signal: AbortSignal
 			result.reason === 'smtp' ? 'unavailable:smtp' :
 			'unavailable';
 	}).catch((err) => {
+		// 利用者名欄と同じ理由で、取り消した後の失敗は捨てる。
+		if (signal.aborted) return;
 		if (err.name !== 'AbortError') {
 			emailState.value = 'error';
 		}
 	});
+});
+
+// ダイアログを閉じた後に予約済みの問い合わせが飛ばないようにする。
+// もう使わない関数なので、ここでは以後の呼び出しごと無効にしてよい。
+onBeforeUnmount(() => {
+	checkUsernameAvailable.cancel();
+	checkEmailAvailable.cancel();
+	usernameAbortController.value?.abort();
+	emailAbortController.value?.abort();
 });
 
 function onChangePassword(): void {

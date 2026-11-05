@@ -177,6 +177,12 @@ func (m *mockReversiRepo) Delete(id string) error {
 	return nil
 }
 
+func (m *mockReversiRepo) ListOutdatedFederatedGames(string, int) ([]*model.ReversiGame, error) {
+	return nil, nil
+}
+
+func (m *mockReversiRepo) DeleteNotStarted(string) (bool, error) { return false, nil }
+
 func (m *mockReversiRepo) DeleteOutdatedGames(thresholdID string) (int64, error) {
 	var n int64
 	for id, g := range m.games {
@@ -505,9 +511,26 @@ func TestCancelMatch_Success(t *testing.T) {
 	g := sampleGame()
 	g.IsStarted = false
 	repo.games["g1"] = g
-	rec := post(h.CancelMatch, `{}`, u1)
+	rec := post(h.CancelMatch, `{"userId":"u2"}`, u1)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 	assert.Empty(t, repo.games)
+}
+
+// 本家の matchAnyUserCancel と同じく、userId 無しは待機列から外すだけで、
+// 送った招待も受けた招待も取り消さない (#3369)。
+func TestCancelMatch_WithoutUserIDKeepsPendingGames(t *testing.T) {
+	h, repo := newTestHandler()
+	sent := sampleGame() // User1=u1, User2=u2
+	repo.games["g1"] = sent
+	received := sampleGame()
+	received.ID = "g2"
+	received.User1ID = "u3"
+	received.User2ID = "u1"
+	repo.games["g2"] = received
+
+	rec := post(h.CancelMatch, `{}`, u1)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Len(t, repo.games, 2)
 }
 
 // userId 指定時は upstream matchSpecificUserCancel 互換で、その相手に送った
@@ -786,11 +809,21 @@ type stubStreamPubCall struct {
 }
 
 type stubStreamPub struct {
-	calls []stubStreamPubCall
+	calls   []stubStreamPubCall
+	matched []stubMatchedCall
+}
+
+type stubMatchedCall struct {
+	targetUserID string
+	game         map[string]any
 }
 
 func (s *stubStreamPub) PublishInvited(targetUserID string, inviter *model.User) {
 	s.calls = append(s.calls, stubStreamPubCall{targetUserID: targetUserID, inviter: inviter})
+}
+
+func (s *stubStreamPub) PublishMatched(targetUserID string, game map[string]any) {
+	s.matched = append(s.matched, stubMatchedCall{targetUserID: targetUserID, game: game})
 }
 
 type mockDeliverer struct {
