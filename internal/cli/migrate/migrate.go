@@ -291,6 +291,10 @@ func validateForceFlags(set map[string]bool, track string) string {
 // 理由で受けない。
 func (e env) forceTrack(logger *slog.Logger, cfg *config.Config, track string, version uint) int {
 	log := logger.With("track", track)
+	if track == trackCore && version == 117 {
+		log.Error("refusing to force core version 117; reconcile legacy migration history first")
+		return 1
+	}
 	dir := e.coreDir
 	if track == trackLocal {
 		dir = e.localDir
@@ -336,6 +340,9 @@ func (e env) forceTrack(logger *slog.Logger, cfg *config.Config, track string, v
 		return 1
 	case err != nil:
 		logDBError(log, cfg, "failed to read the current version", err)
+		return 1
+	case track == trackCore && before == 117:
+		log.Error("legacy core migration version 117 requires history reconciliation; refusing to force", "dirty", dirty)
 		return 1
 	case !dirty:
 		log.Error("the tracking table is not dirty; refusing to force (-force only recovers a dirty table)",
@@ -414,7 +421,7 @@ func (e env) runTrack(logger *slog.Logger, cfg *config.Config, track, direction 
 	}
 	defer m.Close()
 
-	if track == trackCore && direction == "up" {
+	if track == trackCore {
 		if err := refuseLegacy117(dir, dbURL, m); err != nil {
 			logDBError(log, cfg, "migration history check failed", err)
 			return 1

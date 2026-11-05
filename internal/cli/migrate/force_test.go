@@ -158,6 +158,24 @@ func TestRun_ForceRefusesTableThatIsNotDirty(t *testing.T) {
 	})
 }
 
+func TestRun_ForceRefusesDirtyLegacy117(t *testing.T) {
+	m := &fakeMigrator{version: 117, dirty: true}
+	e, out, _ := forceEnv(t, m)
+	assert.Equal(t, 1, run(e, &bytes.Buffer{}, []string{"-config", writeConfig(t), "-force", "1", "-track", "core"}))
+	assert.Contains(t, out.String(), "legacy core migration version 117 requires history reconciliation")
+	assert.Empty(t, m.calls)
+}
+
+func TestRun_ForceRefusesCoreTarget117(t *testing.T) {
+	m := &fakeMigrator{version: 118, dirty: true}
+	e, out, opened := forceEnv(t, m)
+	writeMigration(t, e.coreDir, "000117_legacy", "SELECT 1;", "SELECT 1;")
+	assert.Equal(t, 1, run(e, &bytes.Buffer{}, []string{"-config", writeConfig(t), "-force", "117", "-track", "core"}))
+	assert.Contains(t, out.String(), "refusing to force core version 117")
+	assert.Empty(t, *opened)
+	assert.Empty(t, m.calls)
+}
+
 func TestRun_ForceErrors(t *testing.T) {
 	t.Run("open", func(t *testing.T) {
 		e, out, _ := forceEnv(t, nil)
