@@ -95,7 +95,7 @@ make test-fast               # -race抜き。反復用で、コミット前の�
 make gates                   # 静的なparityゲートを一括(サーバー・Docker不要)
 make plugin-test             # 同梱プラグインのテスト(別moduleなので./...に入らない)
 make migrate-up / migrate-down   # downは本体の系列を1段だけ戻す(forkの系列はmake migrate-down-local、docs/fork-migrations.md)
-make frontend-check          # frontend/の型チェック + frontendを読むゲート + 絵文字の正規表現 + eslint
+make frontend-check          # frontend/の型チェック + frontendを読むゲート + 絵文字の正規表現 + importの検査 + en-USの語の抜け + ルートとspecの対応付け + eslint
 make frontend-lint / frontend-test   # frontend/のeslint / vitest
 ```
 
@@ -243,14 +243,14 @@ docを直すと、直した先で新しい誤りを作りやすくなります�
 | `ci.yml` test | push / PR | ○ | 4 shardで`-race -count=1 -shuffle=3`、パッケージごとのカバレッジ閾値 |
 | `ci.yml` lint | push / PR | ○ | vet / gofmt / actionlint / golangci-lint / テストfixtureのID重複 |
 | `ci.yml` plugin-tests | push / PR | | 同梱プラグインのテスト、`authoring.md`のスニペットのコンパイル |
-| `frontend` | push / PR | ○ | `frontend/`の検査(10 workspaceのeslint、typecheck、SPDX、locale、本番ビルド、vitest)、絵文字の正規表現。frontendに関係しない変更ではlintとtestをskipし、集約jobの`frontend`だけが成功する |
+| `frontend` | push / PR | ○ | `frontend/`の検査(10 workspaceのeslint、typecheck、SPDX、Elythiaのファイルのimport、en-USの語の抜け、ルートとPlaywrightのspecの対応付け、locale、本番ビルド、vitest)、絵文字の正規表現。frontendに関係しない変更ではlintとtestをskipし、集約jobの`frontend`だけが成功する |
 | `ci.yml` vulncheck | push / PR | | govulncheck、`go.mod`とDockerfileのGoの版の一致 |
 | `dependency-review` | PR | | PRが持ち込む依存の既知脆弱性 |
 | `codeql` | PR / push / 週1回 | | Goとworkflowの静的解析 |
 | `dropin-e2e` | PR(paths限定) | | TS→mkの切替(往路)、TSへ戻す復路の測定、実Misskey / Mastodonとの連合など5シナリオ |
-| `playwright` | PR(paths限定) | | ブラウザのe2e(4 shard) |
-| `upstream-backend-e2e` | PR(paths限定) | | 本家backend e2eを実行。UserLiteの期待DTOにローカル連合状態のみ追加 (4 shard) |
-| `diff-e2e` | PR(paths限定) | | TSとの値レベルの差分 |
+| `playwright` | PR(paths限定) | | ブラウザのe2e(7 shard)、叩いたAPIの集計 |
+| `upstream-backend-e2e` | PR(paths限定) | | 本家backend e2eを実行。UserLiteの期待DTOにローカル連合状態のみ追加 (4 shard)、叩いたAPIの集計 |
+| `diff-e2e` | PR(paths限定) | | TSとの値レベルの差分、叩いたAPIの集計 |
 | `apicompat` | PR(paths限定) | | `docs/api-compat.md`が実態と一致しているか、goldenが本家の版に追いついているか(`make upstream-check`) |
 | `build-with-plugins-selftest` | PR(paths限定) | | 運営者向けreusable workflowのビルド |
 | `docker` | `main` / `develop` / tagへのpush、PR | | imageがビルドできるか。PR以外ではimageをpublishする |
@@ -260,6 +260,7 @@ docを直すと、直した先で新しい誤りを作りやすくなります�
 | `queue-bench-smoke` | 毎日(schedule) | | queue driverがジョブを落としていないか |
 | `bench-compare` | PR(paths限定) | | baseとheadの2つのcommitを同じスタックで交互に流し、性能を比べる。主に手動で使う。PRでは、ベンチの仕組みを変えたときだけhead同士を流す |
 | `bench-compare-comment` | `bench-compare`の完了(`workflow_run`) | | `bench-compare`の結果を、対象のPRにコメントで出す。headのコードは動かさない。default branchにある版で動く |
+| `api-coverage` | 毎週火曜日(schedule)、PR(paths限定) | | どの層でも通っていないAPIが一覧(`internal/routecoverage/uncovered.tsv`)と一致しているか。層ごとの集計はdevelopにマージ済みのPRのrunから取る |
 | `bench-upstream` | 毎週月曜日(schedule)、PR(paths限定) | | 本家Misskeyの公式imageとElythiaを`bench-compare`と同じスタックで交互に流し、性能を比べる。PRでは、本家の版(`UPSTREAM_MISSKEY_VERSION`)かベンチの仕組みを変えたときだけ流す |
 
 `ci.yml` / `dependency-review` / `build-with-plugins` / `bench-compare-comment`以外は、手動(`workflow_dispatch`)でも起動できます。scheduleのものはPRでは回らないので、失敗はActions上で確認して別のPRで直します。各workflowの設計理由と、落ちたときの対処は[docs/ci.md](docs/ci.md)にあります。
@@ -305,6 +306,13 @@ docを直すと、直した先で新しい誤りを作りやすくなります�
 
 このファイル自体を変えたときだけ、1行で追記します(新しいものを上に)。経緯の本文はリンク先にあります。個別のfixの履歴は`CHANGELOG.md`にあります。
 
+- 2026-11-06: `make frontend-check`とCIの`frontend`に、ja-JPの語がen-USにもあるかの検査を足したので、Section 3とSection 8の行に足した (#4047) → [docs/contributing.md](docs/contributing.md#コーディング規約fork-frontend)
+- 2026-11-06: `playwright`のshardを6から7にしたので、Section 8の行を直した (#4049) → [docs/playwright.md](docs/playwright.md#shard-の数)
+- 2026-11-05: `playwright`のshardを4から6にしたので、Section 8の行を直した (#4043) → [docs/playwright.md](docs/playwright.md#shard-の数)
+- 2026-11-05: どの層でも通っていないAPIを一覧と突き合わせる`api-coverage` workflowを足したので、Section 8の表に1行を足した (#4039) → [docs/ci.md](docs/ci.md#通っていない-api-の一覧と週次のゲート-4039)
+- 2026-11-05: `playwright` / `upstream-backend-e2e` / `diff-e2e`が、叩いたAPIをアクセスログから集計してSummaryに出すようにしたので、Section 8の3行に足した (#4037) → [docs/ci.md](docs/ci.md#api-の通過の集計-4037)
+- 2026-11-05: `make frontend-check`とCIの`frontend`に、frontendの全ルートがPlaywrightのspecに対応付いているかの検査を足したので、Section 3とSection 8の行に足した (#4035) → [docs/playwright.md](docs/playwright.md#ルートと-spec-の対応付け-4035)
+- 2026-11-05: `make frontend-check`とCIの`frontend`に、Elythiaのファイルが`misskey-js`を直接importしていないかの検査を足したので、Section 3とSection 8の行に足した (#4028) → [docs/contributing.md](docs/contributing.md#elythia-独自の-api-の型-frontendpackageselythia-js)
 - 2026-10-24: 組み立てが書き換えるグローバルが無くなり`restoreProcessGlobals`を消したので、Section 4の`TestProcessGlobalsAreRestored`の案内を`TestConstructionSetsNoProcessGlobals`に直した (#3803) → [docs/testing.md](docs/testing.md)
 - 2026-10-17: 本家Misskeyとの性能比較の`bench-upstream` workflowを足したので、Section 8の表に1行を足した (#3654) → [docs/bench-compare.md](docs/bench-compare.md#本家-misskey-との比較-bench-upstream)
 - 2026-10-16: システムカタログの`indexdef`をWHEREに書かないことを、`catalog-check`が検査するようにしたので、Section 4の行に注意を足した (#3369) → [docs/testing.md](docs/testing.md)

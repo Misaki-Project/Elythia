@@ -3337,7 +3337,7 @@ wire 互換を機械的に守る多層防御。upstream は **official `misskey/
 | drift detector | CanSeeNote ↔ SQL push-down 等のロジック整合検出 | shape-drift.md |
 | 値レベル diff harness | TS インスタンス ↔ Elythia の応答を値単位で diff（`make diff-test`） | diff-e2e.md |
 | drop-in e2e | 実 Misskey TS ↔ Elythia 切替の連合/フロント互換（PR ごと。frontend e2e のみ nightly） | dropin-e2e.md / dropin-frontend-e2e.md |
-| playwright | 301 spec を Elythia backend で（PR ごと、4 シャード）。TS backend は手動 | — |
+| playwright | 370 spec を Elythia backend で（PR ごと、7 シャード）。TS backend は手動 | — |
 | inbound/outbound 連合 | Fedibird-like mock との Ed25519 双方向 verify | federation.md |
 
 CI（`ci.yml`）は build / 4-shard test（パッケージ毎 90% カバレッジ強制）/ lint を必須化。
@@ -3367,7 +3367,7 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 `MK_` プレフィックスの環境変数でオーバーライド可（例 `MK_DB_HOST`）。詳細は [configuration.md](configuration.md)。
 
-マイグレーション（`migration/`、golang-migrate、現在 140 本）:
+マイグレーション（`migration/`、golang-migrate、現在 141 本）:
 
 Misakiの独自処理は別系列の`migration/local/000001_misaki_drop_remote_avatar_decorations`へ置く。本体140本とforkの1本は別の台帳で管理する。旧Misaki版では上流と異なる番号を割り当てていたため、既存DBの更新は[移行履歴の照合](misaki-migration-reconciliation.md)に従う。
 

@@ -1,7 +1,7 @@
 # Playwright e2e
 
 Elythia のフロントエンド / API を実ブラウザから検証する e2e。spec は
-`tests/playwright/specs/` にあり、現在 301 ファイル
+`tests/playwright/specs/` にあり、現在 370 ファイル
 (`find tests/playwright/specs -name '*.spec.ts' | wc -l`)。
 
 Cypress からの移行完了に伴い、frontend e2e はこちらに一本化した (#2437)。本家も
@@ -38,18 +38,53 @@ upstream と食い違っていても気付けない**。
 **upstream が変わらない限り答えも変わらない**ので、常時回す意味が薄いため。追従する本家の版を
 上げたときに回す (`docs/upstream-catch-up.md`)。
 
+### Elythia で足した `data-testid` を使う spec は、公式 image では落ちる
+
+公式 image は本家の frontend を配るので、Elythia の frontend で足した `data-testid` が無い。
+`specs/upstream/ui/` の spec のうち、本家にもある要素を、Elythia で足した `data-testid` で
+取っているものは、**TS backend の実行では要素が見つからずに落ちる。既知の例外として扱い、
+spec を `elythia/` へ移したり、文言で取り直したりはしない。**
+
+2026-11-06 の時点で 35 ファイルあり、すべて #4024 の拡充で足した spec (#4043 が 20、#4046 が 7、
+#4049 が 8)。ノートの操作 (メニュー・リアクション・画像・投票)、投稿フォーム、タイムラインと
+通知のタブ、通知の行、絵文字ピッカー、ドライブ、設定の検索、ダイアログのボタンなどが該当する。
+
+数え方: 本家 (`.cache/misskey/<版>/packages/frontend/src`) と Elythia
+(`frontend/packages/frontend/src`) の `data-testid="…"` の差を取り (67 種)、その名前を
+引用符付きで含む `specs/upstream` の spec と、`fixtures/ui_drive.ts` を使う spec を数える。
+テンプレートで作る名前 (通知の行の `notification-<種類>`、公開範囲の `visibility-<範囲>`) と、
+ページの見出しのタブの `testId` (`timeline-tab-*` / `notifications-tab-*`。#4046 で足した
+仕組みで、本家には無い) を使う spec も足す。増やしたら、この数を直す。
+
+- 置き場所は、検証する機能が本家にもあるかで決める (README の「境界」)。取り方の都合で
+  `elythia/` へ移すと、本家にもある機能の spec が Elythia 独自に見えてしまう
+- 文言で取る形へ切り替えないのは、文言は locale と本家の版で変わり、同じ文言の別の要素も
+  拾いやすいため
+- **例外にできるのは、本家にもある要素に `data-testid` だけを足したものに限る。** Elythia
+  独自の要素 (独自機能のボタンなど) を取る spec は、例外ではなく `elythia/` に置く
+- **この 35 ファイルは、`data-testid` より後ろの期待値も本家と照合されない。** TS backend では
+  要素を取る段で落ちるため。たとえば `note_poll_vote` の1つ目のテストは、投票した後に
+  `notes/show` の票数を確かめるが、その前の `poll-choice` で落ちるので、票数は本家と照合されない。
+  画面の振る舞いだけでなく、UI の spec の中で叩いている API の期待値も、`data-testid` を取る
+  行より後ろにあれば照合されない
+- TS backend の実行で落ちたら、落ちた locator の `data-testid` が本家の frontend にあるかを
+  見る。fixture の中で取っているもの (`ui_drive.ts` の `drive-file` など) や、テンプレートで
+  作る名前は、落ちた行を見ただけでは名前が分からないので、呼び出し元まで辿る。本家に無ければ
+  この例外で、あれば期待値と本家の挙動の食い違いとして調べる
+
 ## CI での扱い
 
 `.github/workflows/playwright.yml` が `pull_request` (paths フィルタ) と
 `workflow_dispatch` で発火する。nightly から PR トリガーへ移行済み (#2291)。
 
-**4 シャード並列** (`PLAYWRIGHT_SHARD=i/4`、`fail-fast: false`)。check 名は
-`spec (Elythia 1/4)` 〜 `4/4`。
+**7 シャード並列** (`PLAYWRIGHT_SHARD=i/7`、`fail-fast: false`)。check 名は
+`spec (Elythia 1/7)` 〜 `7/7`。
 
-**1 スタックあたりは直列でしか回せない。** 301 spec のうち 180 が共有の root (alice) で
-**ブラウザでサインインした状態**を使い (数え方は `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`。
-`uiSigninAsRoot` helper が 179 で、`signin.spec.ts` だけ signin フォームを直接駆動する)、
-さらに 33 がサインインせず root の token で API を叩く (`root.json` を読むのが 213 で、その差分)。
+**1 スタックあたりは直列でしか回せない。** 370 spec のうち 185 が共有の root (alice) で
+**ブラウザでサインインした状態**を使い (`uiSigninAsRoot` helper が 184 で、`signin.spec.ts` だけ signin フォームを直接
+駆動する。数え方は `grep -rl 'uiSigninAsRoot' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す。フォームから入る spec はほかにもあるが、
+自分で作った利用者で入るので数えない)、さらに 40 がサインインせず root の token で API を叩く (`root.json` を
+読み、root でサインインしないもの。数え方は `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。
 instance meta は全 spec が共有する。Playwright はファイル単位で並列化する
 ので `workers` を上げると `profile_iscat_toggle` と `profile_isbot_toggle` が同じ
 アカウントを、`admin_branding_save` と `about_page_render` が同じ meta を取り合う。
@@ -96,29 +131,43 @@ commit を見て、spec が漏れたり 2 回流れたりする。pull_request �
 
 ### shard の数
 
-**今は 4。** 所要時間で割り振った後の CI の実測 (#4026、PR #4031 の run):
+**今は 7** (#4043 で 4 から 6 に、#4049 で 7 に上げた)。目安は「いちばん遅い shard の spec の実行が 300 秒を超えたら、数を見直す」。
 
-| | 1/4 | 2/4 | 3/4 | 4/4 |
-|---|---|---|---|---|
-| spec の実行 (`Run Playwright` の step) | 182 秒 | 162 秒 | 181 秒 | 148 秒 |
-| job 全体 | 335 秒 | 291 秒 | 323 秒 | 258 秒 |
+経緯:
 
-割り振る前の直近 3 回は、spec の実行が shard ごとに約 100〜440 秒、いちばん遅い job が
-584〜651 秒だった。
+- #4026 (PR #4031) で所要時間で割り振るようにした時点は 4 で、spec の実行は shard ごとに 148〜182 秒、
+  job 全体は 258〜335 秒だった。6 にしても、いちばん遅い job は約 75 秒しか縮まない見込みだった (job 1 つに
+  環境の起動と後片付けの固定の時間が約 130〜150 秒かかるため)。PR 1 件で動く job (約 30) はすでに GitHub の
+  同時実行の上限 (Free で組織全体 20) を超えているので、増やすと待ち行列が伸びる
+- #4041 (PR #4042) で全ルートの表 (7 ファイル、手元で計 658 秒) を足すと、4 shard の spec の実行は
+  327・331・266・284 秒になり、目安を超えた。#4043 でさらに 24 ファイル (手元で計 116 秒) を足すので、
+  6 にした
+- #4049 (PR #4050) で 18 ファイルを足すと、6 shard の spec の実行は 270〜353 秒になった。所要時間の記録を
+  CI の値で取り直すと見込みは各 shard 約 298 秒で、次の run でも 238〜333 秒と目安を超えた。1 回ごとに
+  振れる spec がある (`notification_types_render` は 1 回目の run で 52 秒、2 回目で 25 秒) ので、見込みが
+  目安に張り付くと毎回超える。7 にした (見込みは最大約 262 秒、ほかの shard は約 255 秒)
+- **7 より増やしても、いちばん遅い shard は約 262 秒より縮まない。** `route_table_permission_signed_out`
+  (全ルートの表の未ログインの権限) が 1 ファイルで約 262 秒かかり、7 では 1 つの shard をこれだけが占める。
+  ほかの shard が目安を超えたときは、shard を増やせば効く。この spec だけの shard が目安に近づいたら、
+  shard を増やしても縮まないので、この spec を分ける
 
-6 にしても、いちばん遅い job は約 260 秒の見込みで、縮むのは約 75 秒だけ。spec の実行の
-合計 (673 秒) を 6 で割った約 112 秒に、job 1 つの固定の時間 (約 130〜150 秒。環境の
-起動と後片付け) が足されるため。一方で job が 2 つ増え、PR 1 件で動く job (約 30) は
-すでに GitHub の同時実行の上限 (Free で組織全体 20) を超えているので、待ち行列が伸びる。
+7 にした後の実測 (#4049 の PR #4050 の run):
 
-**いちばん遅い shard の spec の実行が 300 秒を超えたら、数を見直す。** spec を増やす
-段階 (#4024) で届く見込み。見直すときは、`playwright.yml` の `SHARD_TOTAL` を変えた
-PR の run で、上の表と同じ値を測って書き換える。
+| | 1/7 | 2/7 | 3/7 | 4/7 | 5/7 | 6/7 | 7/7 |
+|---|---|---|---|---|---|---|---|
+| spec の実行 (`results.json` の `stats.duration`) | 273 秒 | 251 秒 | 269 秒 | 234 秒 | 266 秒 | 261 秒 | 218 秒 |
+| job 全体 | 460 秒 | 452 秒 | 462 秒 | 423 秒 | 461 秒 | 456 秒 | 396 秒 |
+
+この実測から、所要時間の記録 (`shard-durations.json`) を CI の値で取り直した。手元で測った値は CI より短い
+(#4043 のとき、全ルートの表の 7 ファイルで手元 658 秒に対して CI 749 秒、約 1.14 倍) ので、spec を足した
+PR では、その PR の run の値で取り直す。
+
+数を見直すときは、`playwright.yml` の `SHARD_TOTAL` を変えた PR の run で、上の表と同じ値を測って書き換える。
 
 ### project (`main` と `meta`)
 
 instance meta を書き換える spec (`admin/update-meta` か `admin/roles/update-default-policies`
-を呼ぶもの。今は 16) は、
+を呼ぶもの。今は 18) は、
 `meta` の project に分けてある。判定は `shard-plan.mjs` の `writesMeta` が自動で
 行うので、spec を書く側で振り分ける必要は無い。数え方 (リポジトリの root で):
 
@@ -261,6 +310,175 @@ mount 後に遅延ロードされる chunk (route 単位の code splitting、shi
 `https://esm.sh` 動的 import) やサインイン後の画面で起きる違反は数えない。
 issue #2788 の主目的 (shell に hash 無しの inline script が入る) はこれで足りる。
 
+## ルートと spec の対応付け (#4035)
+
+frontend のルートを足したのに spec を書かないと、`make playwright-route-check` が落ちる。CI では
+required の `frontend` (`frontend-lint` job) で回り、手元では `make frontend-check` からも呼ばれる。
+spec の一覧を playwright に解かせるので、`tests/playwright` で `npm ci` しておく (サーバーと
+ブラウザは要らない)。
+
+**spec の側で宣言する。** `test()` の第 2 引数に `coversRoutes(...)` (`fixtures/ui_route.ts`) を渡す。
+
+```ts
+test('the note page shows the reply', coversRoutes('/notes/:noteId/:initialTab?'), async ({ page, baseURL }) => {
+```
+
+- パスは `router.definition.ts` の `path` と同じ文字列で書く。子のルートは親と連結する
+  (`/settings/profile`、`/admin/roles/:id`)。子の `/` は親と同じなので、親のパスで書く
+- **宣言してよいのは、そのルートを開いて、そのページに固有のものを確かめるテストだけ。**
+  見出しや `data-testid`、seed した中身、そのページが呼ぶ API、そのページでの操作の結果を
+  見ていること。ナビが見える、本文が何文字ある、not-found でない (`gotoRoute` だけ)、では
+  宣言しない。ゲートは宣言の有無しか見ないので、ここはレビューで受ける
+- **どのページにも出るもので判定しない。** サインイン中は navbar に自分の名前が、画面が広いと右の
+  ウィジェット列に通知 (フォローした人の名前、フォローリクエストの承認・拒否のボタンまで) が出る。
+  未サインインで幅が広いと、左のダッシュボードにインスタンス名 (未設定なら host) とローカル
+  タイムラインが出る。これらと同じ名前・本文・ボタンで判定すると、not-found のページでも通る。
+  #4035 で既存の spec に宣言を付けたとき、この形のテストが 11 本あり、宣言を外した (ほかに、管理画面の
+  メニューと同じ見出しの文言だけで判定していた 4 本も外した)
+- `test.only` が残っていると、ゲートは exit 2 で落ちる (`--forbid-only`)
+- 1 つのテストで複数のルートを確かめるなら並べる (`coversRoutes('/a', '/b')`)
+- 既に別のオプションを渡しているなら混ぜる (`{ ...coversRoutes('/a'), tag: '@x' }`)。既に `annotation` を渡しているテストでは、
+  そのまま混ぜると後に書いた方が上書きする。配列をつなぐ (`annotation: [...coversRoutes('/a').annotation, ...]`)
+- `test.skip` / `test.fixme` / `test.describe.skip` のテストの宣言は数えない (一覧で skipped になるもの)。
+  実行時の `test.skip(条件)` は一覧からは見えないので、宣言するテストでは使わない
+
+**宣言できないルートは、2 つのリストのどちらかに載せる。** どちらも `<ルート>\t<2 列目>` の TSV。
+
+| リスト | 載せるもの | 2 列目 |
+|---|---|---|
+| `tests/playwright/route-coverage-allowlist.tsv` | ずっと spec を付けないルート | どの経路でそうなるか (例: `/oauth/authorize` はサーバーが受け、外のクライアントの情報を取れたときだけ描く) |
+| `tests/playwright/route-coverage-pending.tsv` | これから spec を付けるルート | 付ける予定の issue の番号 (`#4024(15)` のように親と段階でもよい) |
+
+ゲート (`tests/playwright/route-coverage.mjs`) が落とすのは次のとき。
+
+- 宣言も無く、どちらのリストにも無いルートがある
+- 宣言やリストの行が、`router.definition.ts` に無いルートを指している (ルートの改名で古くなった)
+- 宣言のあるルートがリストにも載っている。spec を付けたら、リストの行を消す
+- 同じルートが 2 つのリストの両方にある
+- git が追跡していない spec の宣言 (数えない。手元でだけ緑になるのを防ぐ)
+- 2 つのリストに無いルートを、全ルートの表 (下の節) の spec が宣言していない。ほかの spec が宣言
+  していても落ちる (表に行を足し忘れたルートを拾う)
+- skip / fixme のテストの宣言 (数えない)
+- `tests/playwright` に、git が無視する `.js` が残っている (exit 2)。`.ts` の spec や fixture より先に読まれ、
+  手元と CI で一覧が食い違うため (下の「spec を書くときの注意」)
+- 何も拾えなかった (exit 2)。ルートが 150 未満のとき、目印の 4 つ (`/notes/:noteId/:initialTab?`
+  `/settings/profile` `/admin/roles/:id` `/:(*)`) を拾えなかったとき、宣言が 1 件も無いとき
+
+ルートの一覧は `ROUTE_DEF` を TypeScript の構文木で辿って作る。`path` を式で組み立てたときと、
+ルートの中に `{ children }` や `...rest` を書いたときは、読めないので落とす。プラグインのルート (`router.ts` の `routeDefsWithPlugins`) は対象にしない。
+どのプラグインを入れるかが運営者ごとに違い、`ROUTE_DEF` に現れないため。
+
+## 全ルートの表 (#4041)
+
+frontend の全ルートを、表 (`fixtures/route_table.ts`) 1 つで次の 2 点について確かめる。ルートを足したら
+表にも 1 行足す (足さないと、上の対応付けのゲートが落とす。表の spec の宣言を、ほかの spec の宣言とは
+別に数えている)。
+
+- **開ける** (`specs/elythia/ui/route_table_open_<領域>.spec.ts`): root で開き、not-found でないこと、
+  開いたパスに留まること、そのページの目印 (marker) が出ること、page error が無いことを見る。
+  1 つのファイルで 5 件落ちたら、残りは開かずに落とす (stack が壊れているときに、時間切れの積み重ねで
+  CI の job の時間を超えないように)。数は `.auth/route-table-failures/` に置く (Playwright はテストが落ちる
+  たびに worker を作り直すので、変数では数えられない)。globalSetup が実行ごとに消す
+  リダイレクトだけのルートは、行き先へ移ることを見る
+- **権限の無い人の扱い**: 未ログイン (`route_table_permission_signed_out.spec.ts`) で、公開のルートは
+  開け、ログイン必須のルートは not-found とサインインのダイアログになり、モデレーターのルートは
+  not-found になること。ロールの無い利用者で `/admin*` が、チャットを使えないロールの利用者で
+  `/chat*` が not-found になること (`route_table_permission_users.spec.ts`)。本当の防御はサーバーの
+  認可で、ここで見るのは「画面が出てしまわない」ことだけ
+
+表の書き方:
+
+- **kind は `router.definition.ts` から作らず、手で書く。** 作ると `loginRequired` や `iAmModerator` の
+  書き忘れを表も同じく忘れて、拾えない。実際、表を書いたときに 6 ルート (`/registry` など) を
+  ログイン必須と思い込んでいて、未ログインの spec で食い違いが見つかった (どれもルートの側が公開で、
+  ページが自分でサインインを促す)
+- **marker は、そのページが mount したときにだけ出るもので書く。** `title` (ページが `definePage` で
+  付ける title)、`text` (ページの本体 = RouterView の `._pageContainer` の最も内側の innerText)、
+  `api` (開くときに呼び、2xx が返る API)、`testId` の組み合わせで、書いたものは全部を満たす必要がある。
+  設定と管理画面の子ページは title が親 (`Settings` / `Control Panel`) と共通なので、本文で見分ける。上の
+  「どのページにも出るもので判定しない」の罠に加えて、次に注意する
+  - 親が呼ぶ API は子の目印にならない (管理画面は、どの子を開いても `admin/abuse-user-reports` を呼ぶ)
+  - 設定の子ページの本体には、設定のメニューと案内も入る (`settings/index.vue` が自分の `._pageContainer`
+    を持たない)。メニューと同じ文言 (Profile、Privacy など) を子の `text` にすると、どの子でも通る
+  - パラメータの先が無いときに「見つかりません」を出すページは、title と API の呼び出しだけでは中身を
+    見ていない。先があるときにだけ出るもの (相手の名前など) を `text` に足す。テストの stack に作れない
+    もの (`/instance-info/:host` の連合先) は、表のコメントに「mount と照会まで」と書いてある
+- パラメータは `fixtures/route_seed.ts` が作ったもので埋める。seed は実行ごとに 1 回だけ作って
+  `.auth/route-seed.json` に残し、spec のファイルの間で使い回す (ファイルごとに作ると webhook などの
+  上限に当たる)。globalSetup は実行の始めに root のアンテナ・webhook・クリップ・リストを消すので、
+  同じ所で seed も消す
+- `/settings` と `/admin` は、広い画面だと最初の子へ移るので、狭い画面で開く (`narrow`)
+- 未ログインで開くと中身が変わる公開のルートは、違いを `signedOut` に理由と一緒に書く (`noTitle`: title を
+  付けない、`pageError`: 出る page error の文面の正規表現)。書いた違いは実際に起きることも見るので、直ったら
+  行から消す。`pageError` を書いた行でも、正規表現に合わない page error が出たら落ちる。
+  今は `/registry` (3 つ)・`/invite`・`/reversi` が、未ログインでもログインの要る API を呼んで失敗を
+  受けない (本家から来たページ)
+- page error のうち、どのページでも起きるもの (stack の自己署名の証明書で Service Worker の登録が
+  失敗する) は `fixtures/route_check.ts` の `KNOWN_PAGE_ERRORS` で除く
+
+## 見た目の差分 (#4054)
+
+主な画面を、ライトとダークで撮って基準画像と比べる (`toHaveScreenshot`)。CSS の崩れは操作の spec では
+落ちないため。撮る画面は #4054 に挙げた 22 項目で、1 項目を何枚かに分けて撮るものがあるので、基準画像は
+62 枚 (`find tests/playwright/specs/elythia/ui/visual -name '*.png' | wc -l`)。spec は
+`specs/elythia/ui/visual/` の 5 ファイル、helper は `fixtures/visual.ts`。基準画像は各 spec の隣の
+`<spec のファイル名>-snapshots/` に置き、git で追跡する。TS backend の run では流さない
+(frontend が同じなので)。
+
+### 基準画像を作り直す
+
+- **意図して見た目を変えた PR では、基準画像も作り直して同じ PR に入れる。** `make playwright-up` の後に
+  `make playwright-update-snapshots PLAYWRIGHT_ARGS=specs/elythia/ui/visual/` を流し、書き直された画像を
+  見てからコミットする。モードは `changed` で、基準としきい値の中で一致するものは書き直さない
+- 手元の OS で作らない (下の「spec を書くときの注意」)。runner の container で作った印として、名前の
+  末尾に `-linux` が付く
+- 同梱しないプラグインを入れたチェックアウトで作らない。`server-plugins.generated.ts` がプラグインを
+  import していると、CI (プラグイン無し) と画面が変わりうる。プラグインの無い worktree で作る
+- Playwright の版を上げると Chromium の描画が変わるので、全部作り直す
+- CI で落ちたときの画像 (`*-expected.png` / `*-actual.png` / `*-diff.png`) は、`playwright-results-*` の
+  artifact に入る
+- 名前に project を入れない (`playwright.config.ts` の `snapshotPathTemplate`)。spec が meta を書くように
+  なると、project が `main` から `meta` に変わり、基準画像を見失うため
+
+### 毎回同じ絵にするための決まり
+
+- **撮るのは固定の利用者 (`vr_alice` / `vr_bob` / `vr_carol` / `vr_dave`) と、その人たちだけが作った
+  データ。** 種まきは 1 つの DB で 1 回だけ (alice の自己紹介が印)。ホームのタイムラインに他の spec の
+  ノートが混ざらないよう、3 人は互いにだけフォローする。名前は固定なので、同じスタックで 2 回目を流すと
+  利用者を作り直さずに使う
+- **Redis にしか無いものを絵に入れない。** globalSetup は流すたびに Redis を空にするので、同じスタックの
+  2 回目で消える。該当するのは次の 2 つ
+  - 通知: ふだんは空にしておき、通知の画面のテストが作ってから撮り、撮った後に消す
+  - ホームのタイムラインの「自分への返信」: Redis の記録からは出るが、記録が無いときの DB からの
+    組み立てでは出ない (本家も同じ)。種まきに作らない
+- 撮るたびに変わる文字は場所ごと消す (`display: none`)。`<time>` と、`<time>` の外に出る en-US の
+  書式の日時 (ノートの見出し、登録日)、ドライブの作った月の見出し (`2026/11`)、about の版 (`2.1.0`)。場所を保って見えなくすると、文字の長さ (`3m ago` と `10m ago`) で幅が
+  変わって隣がずれる。mask (四角で塗る) は、要素がダイアログやツールチップの背後にあっても一番上に
+  描かれ、手前のものを隠すので使わない
+- 他の spec のデータで変わる部分も隠す。入口の流れるタイムライン・人数・連合先は、登録のダイアログの
+  背後に回るので、場所を保ったまま見えなくする (`visibility: hidden`。`data-testid` で取る。クラス名は本番のビルドでハッシュになるので使えない)。
+  about の統計と管理画面のダッシュボードは、上に何も重ならないので mask で塗る。絵文字ピッカーは
+  「Custom Emoji」の見出しより上だけを撮る
+- 撮る前に起動の準備をする (`prepareVisualPage`): ウィジェットの既定 (カレンダー・トレンド) の差し替え、
+  ソースコードの案内を出さない、`Math.random` の固定。サインインの後に「Tips & Tricks」を全部閉じる。
+  ログインと実績の通知は受け取らない (サインインと画面を開いた順で増える)
+- アニメーションは、OS の「動きを減らす」(prefer の `animation` の既定がこれに従う) と
+  `animations: 'disabled'` で止める
+- ページを開いた直後は、通信が静まるのを待つ。同じページで操作した後は、出てくる要素を spec で待ち、
+  `toHaveScreenshot` が 2 枚続けて同じになるまで撮り直すのに任せる (`networkidle` は、一度静まった
+  文書ではすぐに返る)。画面の中の画像の読み込みも待つ (画面の外の遅延読み込みの画像は待たない)
+- 管理画面のトップは、未解決の通報の警告を出さない (`admin/abuse-user-reports` を空で返す)。通報を作って
+  解決しない spec が、同じ shard の前に流れるかで変わるため
+- しきい値は、1 画素の色の許容 `threshold: 0.02` と、許容を超えた画素の数 `maxDiffPixels: 8`。
+  8 は、同じスタックでもときどき出る描画の揺れ (プロフィールの大きなアイコンの縁で 5 画素) より大きく、
+  文字 1 つの変化 (所在地の `Tokyo` を `Tokyp` にして 12〜19 画素) より小さい値。割合で認めると
+  (`maxDiffPixelRatio: 0.01` で約 1 万画素)、件数の数字や時刻の文字が変わっても通る。
+  色の許容を既定 (0.2) のままにすると、テーマの色を少し変えたぐらい (ダークのパネルを `#0e1433` から
+  `#162048` へ) は同じ色とみなされ、ノートの写らないダークの画面 (設定・チャットなど) は 1 つも
+  落ちなかった。0.02 では落ちる (#4054 で変異させて確かめた)
+
+**揺れたら、しきい値を上げて黙らせない。** 何が変わったかを差分の画像で見て、上の決まりに足す。
+
 ## spec を書くときの注意
 
 `_spec.ts` は silent skip される。ファイル名は必ず `.spec.ts`。
@@ -292,7 +510,8 @@ vite の hash class を selector に使わない (`[class*="_button_"]` 等)。p
 
 **見た目の差分の基準画像は runner の container で作る。** `toHaveScreenshot` の基準画像は
 `make playwright-update-snapshots PLAYWRIGHT_ARGS=<spec>` で作り直す。手元の OS で作ると
-文字の描画が違い、CI で必ず差分になる。
+文字の描画が違い、CI で必ず差分になる。撮る画面を同じ絵にする決まりは、上の
+「[見た目の差分](#見た目の差分-4054)」にある。
 
 **要素は文字で、完全一致かつちょうど 1 つで取る。** スイッチは `clickSwitchByLabel`
 (`fixtures/ui_click.ts`)、MkFolder の中の要素は `openFolderByLabel` / `fillFolderTextarea` /

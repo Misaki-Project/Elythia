@@ -20,7 +20,7 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 | `build` | CI | 全パッケージがコンパイルできるか + 同梱プラグインの `go vet` + 同梱サンプルが既定無効か（`rolelevel`だけはallowlistで既定有効） + 同梱サンプル入りの統合バイナリ | `go build ./...` / `make plugin-vet` / `make plugins-all && go build -o /dev/null ./cmd/elythia` |
 | `lint` | CI | `go vet` + **actionlint** + `gofmt -s -d` の差分 + 重複 fixture ID + **golangci-lint** | `make lint` / `make actionlint` / `make fmt` / `make golangci-lint` |
 | `test` | CI | 4-way shard、Python delivery artifact test、A/B harness helper test、ベンチのデータの生成器のテストの集約。どれか 1 つでも落ちれば赤 | `make test` / `python3 -m unittest discover -s tests/bench/queue/common -p 'test_*.py' -v` / `bash tests/bench/ab/test_run_helpers.sh` / `python3 -m unittest discover -s tests/bench/data -p 'test_*.py' -v` |
-| `frontend` | frontend | `frontend-lint` (10 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) の集約。frontend に関係しない差分では両方を skip して成功する | 下の「`frontend` が落ちたとき」 |
+| `frontend` | frontend | `frontend-lint` (10 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、Elythia のファイルの import、ルートと Playwright の spec の対応付け、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) の集約。frontend に関係しない差分では両方を skip して成功する | 下の「`frontend` が落ちたとき」 |
 
 ### `test` が落ちたとき
 
@@ -111,10 +111,11 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 | `ed25519-verify` | Drop-in e2e | Fedibird-like mock との Ed25519 双方向 verify | 5 min | `make dropin-fedibird-test` |
 | `federation` | Drop-in e2e | 本物の Misskey TS との実連合 (follow/note/reaction/renote/reply/mention/delete) | 4 min | `make federation-misskey-e2e` |
 | `federation-mastodon` | Drop-in e2e | 本物の Mastodon との引用の承認 (FEP-044f): 双方向の引用が承認済みになるか、取り消しが双方向で効くか | 未計測 | `make federation-mastodon-e2e` |
-| `spec (Elythia 1/4)` 〜 `4/4` | Playwright | ブラウザからの統合互換 (301 spec ファイル) | 4-6 min (#4026 の実測。spec の実行は shard ごとに 148-182 秒) | `make playwright-check` |
+| `spec (Elythia 1/7)` 〜 `7/7` | Playwright | ブラウザからの統合互換 (370 spec ファイル) | 実測は [playwright.md の「shard の数」](playwright.md#shard-の数) | `make playwright-check` |
 | `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない)。`-bundled` は image の中で frontend もビルドする (#3379) | 4 min (`-bundled` はキャッシュが冷えていると frontend の分だけ延びる。手元の冷えたビルドで frontend stage だけ約 3 分) | `docker build -f Dockerfile .` / `docker build -f Dockerfile.bundled .` |
 | `compare` | Bench compare | **ベンチの仕組みを変えた PR でだけ**、PR の head 同士 (A/A) を同じスタックで流し、最後まで完了するか。「差なし」かどうかは check では見ず、Summary を人が見る。base と head を選んで比べるときは手動で起動する (`gh workflow run bench-compare.yml -f base=develop -f head=<ref>`、[bench-compare.md](bench-compare.md))。結果は対象の PR にコメントでも出る (下の「`bench-compare` / `bench-compare-comment` workflow」) | 35 min | `make bench-compare BASE=HEAD HEAD=HEAD SMOKE=1` (本番のホストでは smoke だけ) |
 | `compare` | Bench upstream | **本家の版 (`UPSTREAM_MISSKEY_VERSION`) かベンチの仕組み (bench-compare と同じ paths) を変えた PR でだけ**、本家の公式 image と PR の head を同じスタックで流し、最後まで完了するか。どちらが速いかは check では見ず、Summary を人が見る。毎週月曜日 (日本時間) の schedule と手動でも流れる (`gh workflow run bench-upstream.yml -f ref=develop`、[bench-compare.md](bench-compare.md#本家-misskey-との比較-bench-upstream)) | 未計測 (見込み 40 min) | `make bench-upstream SMOKE=1` (本番のホストでは smoke だけ) |
+| `gate` | API coverage | **集計の道具か workflow を変えた PR でだけ**、どの層でも通っていない API が一覧 (`uncovered.tsv`) と一致しているかを、develop にマージ済みの PR の集計で確かめる。一覧だけを直した PR では回らない (下の「通っていない API の一覧と週次のゲート」)。毎週火曜日の schedule と手動でも流れる | 1 min | 下の「一覧を作り直す」の手順で集計を落とし、`make route-coverage ROUTE_INPUTS='route-hits-*.json' ROUTE_FLAGS='-gate -layers upstream-backend-e2e,playwright,diff-e2e'` |
 | `build / build` | Build with plugins (selftest) | 運営者向けの reusable workflow が通るか。外部プラグインを実際に clone し、frontend を持つので `Dockerfile.bundled` の中でプラグインの .vue を含めた SPA のビルドまで走る。**`docker build --check` では見えない範囲** (pluginbuild / go build / frontend のビルドが通るか、生成物とプラグインの frontend が frontend stage に届くか) を確認できるのはこの check だけ | 6 min | paths に該当する PR で自動発火する。手動なら `gh workflow run build-with-plugins-selftest.yml --ref <branch>` (default branch にある場合のみ) |
 
 ### e2e 系が「何を守っているか」の違い
@@ -162,6 +163,79 @@ enum・index 名・default のどれかが TypeORM の期待とずれていれ�
 保証しない (#3191) が、どこまで移れるかを測るために残している
 ([dropin-e2e.md の「復路は測る対象」](dropin-e2e.md#復路は測る対象-3191))。実際この経路の初回実行で、RSA 秘密鍵が
 PKCS#1 のため TS 側の送信連合が全滅する不具合が見つかっている (#2380)。
+
+### API の通過の集計 (#4037)
+
+`upstream-backend-e2e`・`playwright`・`diff-e2e` は、Elythia のアクセスログから、その層が実際に
+叩いた `/api` のエンドポイントを集計し、`API coverage` job の Summary に出す。成功したときも出す。
+数はコードから静的に拾ったものではなく実測なので、UI の spec が frontend 経由で叩いた API も入る。
+
+- **数え方**: アクセスログの 1 行 (`<RFC3339> <METHOD> <URI> <STATUS> <latency>`、
+  `internal/server` の `accessLogConfig`) を、エンドポイントごとに「2xx・3xx で通った」「4xx だけ」
+  「5xx が出た」に分けて数える。400 や 401 だけのものは handler の中身を通っていないので、
+  通ったことにしない。`miauth/:session/check` のようなパラメータ付きのパスはルートの形に直す
+- **分母**: 本家の paramDef の golden (`upstream_paramdefs.json`。直接のルートを含む) と Elythia の
+  宣言 (`elythia_paramdefs.json`) に、宣言を持たない 2 つ (`signin`、`drive/files/create-chunked/append`)
+  を足したもの (`internal/routecoverage` の `Endpoints`)。組み立てたサーバーのルートと一致することを
+  `internal/server` の `TestRouteCoverageEndpointsMatchRoutes` が確かめる。`reset-db` は testMode でだけ
+  登録されるが、分母には入る。プラグインのパスと catch-all (`*`) は「エンドポイントでないパス」に出る
+- **集め方**: `upstream-backend-e2e` は shard ごとに集計した `route-hits-upstream-backend-e2e-<shard>`
+  を、`playwright` (Elythia の backend だけ) と `diff-e2e` は Elythia の生のログ
+  (`mkgo-access-<層>[-<shard>]`、保持 3 日) を残し、`API coverage` job が足し合わせる。合計は
+  `route-hits-<層>` (保持 30 日) に残る。artifact は `merge-multiple` で 1 か所に落とすので、
+  ファイル名は artifact ごとに変えてある (同じ名前だと上書きされる)
+- **表の読み方**: 列のうち「5xx が出た」は、ほかの列と重なる (2xx でも通り、5xx も出たものは両方に
+  数える)。「4xx だけ」は 2xx・3xx も 5xx も無いもの。テスト以外の要求も数える。たとえば
+  `upstream-backend-e2e` の harness は、起動を待つあいだと再起動のたびに `meta` を叩くので、`meta` は
+  常に通った扱いになる。healthcheck (`/healthz`) は `/api` の外なので数えない
+- **落ちるとき**: `API coverage` job は、`/api` の行を 1 行も拾えなかったとき、読んだログのうち 1 本でも
+  `/api` の行が 0 だったとき (shard の 1 つで stack が起動しなかったなど。ほかの shard で下限は満たされ、
+  数だけが減って緑になるのを防ぐ)、`notes/create` を 2xx・3xx で通っていないときに落ちる。読んだログと
+  その行数は Summary に出る。どちらも、ログの書式が変わったか、ログを取り損ねた
+  (stack が先に片付けられたなど) 合図。テストの失敗とは別に見る。入力のファイルが 1 つも無いとき
+  (どの job もログを残せなかった) も落ちる。`upstream-backend-e2e` は shard ごとの `Collect API hits` も、
+  `/api` の行を 1 行も拾えなければ落ちる (テストが通っていても、その shard の job が赤になる)
+- **全層を合わせる**: 各 run の `route-hits-<層>` を手元に落として
+  `make route-coverage ROUTE_INPUTS='route-hits-*.json'` とすると、全層を足した表と、どの層でも
+  叩かれていないエンドポイントの一覧が出る (`gh run download <run-id> -n route-hits-playwright` など)
+- **対象にしない層**: Go の e2e (`tests/e2e`) はプロセスの中でサーバーを動かしていて、アクセスログが
+  `go test` の出力に混ざる。`dropin-e2e` は 5 つのシナリオがそれぞれの script の中で stack を片付け、
+  残すログを `--tail=2000` で切り詰めている。どちらも、取るための手間に見合わないので入れていない
+
+#### 通っていない API の一覧と週次のゲート (#4039)
+
+どの層でも 2xx・3xx で通っていないエンドポイントは、`internal/routecoverage/uncovered.tsv` に
+`<エンドポイント>\t<付ける予定の issue>` の形で載せる (4xx だけのものも載せる)。Elythia 独自のものは
+`#4024(18)`、本家互換のものは `#4024` (段階 C か (19) で見直す) にしてある。
+
+- **週次のゲート** (`api-coverage` workflow。毎週火曜日と手動実行、必須ではない): 3 つの層について、
+  **develop にマージ済みの PR** の最新の run の `route-hits-<層>` を取ってきて合わせ、一覧と突き合わせる。
+  3 つの workflow は schedule を持たず、手動実行の run は起動したブランチの先頭を指すので試したコードと
+  対応しない。そこでマージ済みの PR の run を使う。成功したかは問わない (必須でないので、落ちたまま
+  マージできる。成功に絞ると古い run の集計を使ってしまう)。使った run と PR の番号・マージの日時は
+  Summary に出る。落ちるのは次のとき
+  - 通っていないのに一覧に無いエンドポイントがある。新しいエンドポイントがテスト無しで入ったか、
+    既存のテストがそれを叩かなくなった。テストを足すか、付ける予定の issue と一緒に一覧へ足す
+  - 一覧にあるのに通っている行がある。テストが付いたので、行を消す
+  - 一覧の行が、実在しないエンドポイントを指している (改名か削除)
+  - 3 層のどれかの集計が見つからない、または `notes/create` が通っていない (下限)
+  - マージ済みの PR の最新の run から集計を取れなかった (古い run には戻らない)。その run が集計を出す前に
+    落ちた (`notes/create` の下限など) か、集計の artifact が期限 (30 日) で消えたときに起きる。取り消された
+    run は飛ばす。対処は、次に 3 つの workflow が走る PR のマージを待つ。develop で手動実行しても直らない
+    (手動実行の run は使わない)。その PR の run の再実行は、30 日以内なら試せるが、マージ後は
+    `refs/pull/<番号>/merge` が消えているので、merge ref を checkout する `diff-e2e` は落ちる見込みが高い
+- **PR で回るとき**: 集計の道具か workflow を変えた PR でだけ、同じ判定を回す。使う集計は develop に
+  マージ済みの過去の run のものなので、テストを付けて一覧の行を消す PR では回さない (回すと、その PR の
+  テストを含まない集計で判定し、正しい PR が必ず赤になる)。その PR の判定は、マージ後の週次のゲートで行う
+- **PR の中で見るもの**: required の `test` で、一覧の書式と、各行が実在するエンドポイントを 1 回だけ
+  指していることを確かめる (`TestUncoveredListIsWellFormed`)。3 層の集計が揃うのはそれぞれの
+  workflow が終わった後なので、通っているかどうかは PR の中では判定しない
+- **一覧を作り直す**: 3 層の `route-hits-<層>` を落として
+  `make route-coverage ROUTE_INPUTS='route-hits-*.json' ROUTE_FLAGS='-layers upstream-backend-e2e,playwright,diff-e2e -write-uncovered internal/routecoverage/uncovered.tsv'`
+  とする。既にある行の issue は保ち、新しい行には上の既定の issue を付ける。3 層のどれかが欠けていると
+  書かずに落ちる。**シェルのリダイレクト (`> uncovered.tsv`) で書かない。** ビルドの前にファイルが空に
+  され、空の一覧が埋め込まれて、既存の行の issue が全部既定に戻る。週次のゲートの run の Summary に、
+  使った run の番号が出ているので、`gh run download <run-id> -n route-hits-<層>` で同じものを落とせる
 
 ### `e2e` (本家 backend e2e) が落ちたとき
 
@@ -276,8 +350,10 @@ package load エラーで解析が空振りしうる。**ローカルの `go` �
 `changes` が落ちたときも赤になる (判定できないまま緑にしないため)。
 
 - `frontend-lint`: 10 workspace の eslint、typecheck (frontend は `vue-tsc --noEmit`、ほかに sw / misskey-js / elythia-js)、
-  check-dts とその self test、SPDX ヘッダーとその検査ツールの self test、locale の検証、misskey-js の API レポート、
-  `emoji-regex-check` (#3324) のいずれか
+  check-dts とその self test、SPDX ヘッダーとその検査ツールの self test、Elythia のファイルが misskey-js を直接 import していないかの検査とその self test (#4028)、
+  ja-JP の語が en-US にもあるかの検査とその self test (#4047)、
+  全ルートが Playwright の spec に対応付いているかの検査とその self test (`make playwright-route-check`、#4035。`tests/playwright` で `npm ci` してから回す)、
+  locale の検証、misskey-js の API レポート、`emoji-regex-check` (#3324) のいずれか
 - `frontend-test`: 本番設定のビルド、frontend の vitest、misskey-js のテストのいずれか
 
 `frontend/` のソースを読むゲート (`internal/server/*_gate_test.go`、#2892) はこの workflow ではなく
@@ -288,7 +364,7 @@ required の `test` で走る。
 `make plugins-all` を workspace のビルドより先に回す。frontend が import する
 `frontend/packages/frontend/src/server-plugins.generated.ts` は追跡しておらず (#3379)、
 無いとビルドが import で落ちる。`make frontend-check` は frontend の型・ゲート・
-`emoji-regex-check`・frontend と frontend-embed の eslint までを手元でまとめて回す target (CI の job ではない)。
+`emoji-regex-check`・Elythia のファイルの import の検査・frontend と frontend-embed の eslint までを手元でまとめて回す target (CI の job ではない)。
 **vitest はそこに入っていない** (`make frontend-test`)。ほかの workspace の eslint や check-dts などは
 `.github/workflows/frontend.yml` の各 step をそのまま叩く。
 
@@ -330,7 +406,7 @@ PR では回らない。失敗は Actions 上で確認して別 PR で対処す�
 
 | workflow | 内容 | 実行方法 |
 |---|---|---|
-| Playwright (`spec (ts 1/4)` 〜 `4/4`) | 同じ spec を **Misskey TS backend** に対して実行し、spec が Elythia の挙動に引きずられていないかを検証 | upstream 追従で本家の版を上げたとき |
+| Playwright (`spec (ts 1/7)` 〜 `7/7`) | 同じ spec を **Misskey TS backend** に対して実行し、spec が Elythia の挙動に引きずられていないかを検証 | upstream 追従で本家の版を上げたとき |
 | Docker (`workflow_dispatch`) | 過去のリリースタグから image を publish し直す | `gh workflow run docker.yml -f tag=1.1.1` |
 
 `spec (ts …)` を常時回さないのは、upstream が変わらない限り答えが変わらないため。詳細は
@@ -589,12 +665,13 @@ checkout / setup-go を除くと step は実行順に 3 つ。**required job な
 - `.github/workflows/playwright.yml` で Playwright spec を実行する。
   `pull_request` (paths フィルタ) と `workflow_dispatch` で発火。nightly から
   PR トリガーへ移行済み (#2291)。
-- **4 シャード並列** (`PLAYWRIGHT_SHARD=i/4`。所要時間で割り振る、#4026)。`fail-fast: false` で 1 つが落ちても
+- **7 シャード並列** (`PLAYWRIGHT_SHARD=i/7`。所要時間で割り振る、#4026。#4043 で 4 から 6 に、#4049 で 7 にした)。`fail-fast: false` で 1 つが落ちても
   他は完走する。
-- **1 スタックあたりは直列でしか回せない。** 301 spec ファイル中 180 が共有の
-  root (alice) で**ブラウザでサインインした状態**を使い (数え方は
-  `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`)、さらに 33 が
-  サインインせず root の token で API を叩く (`root.json` を読むのが 213 で、その差分)。
+- **1 スタックあたりは直列でしか回せない。** 370 spec ファイル中 185 が共有の
+  root (alice) で**ブラウザでサインインした状態**を使い (`uiSigninAsRoot` を呼ぶ 184 と、フォームから入る
+  `signin.spec.ts`。数え方は `grep -rl 'uiSigninAsRoot' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す)、さらに 40 が
+  サインインせず root の token で API を叩く (`root.json` を読み、root でサインインしないもの。数え方は
+  `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。
   instance meta も全 spec が共有する。Playwright は
   ファイル単位で並列化するので、`workers` を上げると `profile_iscat_toggle` と
   `profile_isbot_toggle` が同じアカウントを、`admin_branding_save` と
@@ -689,7 +766,7 @@ checkout / setup-go を除くと step は実行順に 3 つ。**required job な
 - job は 4 つ。
   - `changes`: 毎回動き、`git diff --name-only <base> HEAD` で frontend に関係する変更が
     あるかを判定する。対象は `frontend/`・`plugins/`・`plugin/`・`tools/pluginbuild/`・
-    `tools/emojiregex/`・workflow 自身・
+    `tools/emojiregex/`・`tests/playwright/` (#4035)・workflow 自身・
     `Makefile`・`go.mod` / `go.sum`。リネームは移動元と移動先の両方を見る
     (`--no-renames`)。手動実行と、比べる先が無い push (ブランチの作成など) は
     関係ありとして扱う。**迷ったら関係ありに倒す** — 誤って
@@ -697,8 +774,10 @@ checkout / setup-go を除くと step は実行順に 3 つ。**required job な
     `internal/entitycompat` の `frontend_changes_test` が実際の git の差分で確かめている
   - `frontend-lint`: `make plugins-all` → `pnpm i --frozen-lockfile` → `pnpm build` →
     10 workspace の eslint、typecheck (frontend / sw / misskey-js / elythia-js。frontend は `vue-tsc --noEmit`)、
-    check-dts とその self test、SPDX ヘッダーとその検査ツールの self test、locale の検証、misskey-js の API レポート、
-    `make emoji-regex-check` (#3324)。同梱サンプル入りの統合バイナリの build (#2495) は、
+    check-dts とその self test、SPDX ヘッダーとその検査ツールの self test、Elythia のファイルが misskey-js を直接 import していないかの検査とその self test (#4028)、
+    ja-JP の語が en-US にもあるかの検査とその self test (#4047)、
+    `tests/playwright` の `npm ci` → 全ルートが Playwright の spec に対応付いているかの検査とその self test (`make playwright-route-check`、#4035)、
+    locale の検証、misskey-js の API レポート、`make emoji-regex-check` (#3324)。同梱サンプル入りの統合バイナリの build (#2495) は、
     Node が要らないので毎回走る required の `build` job に置いた (Go だけの変更で
     `cmd/elythia` 側の配線が崩れても拾えるように)
   - `frontend-test`: `make plugins-all` → `pnpm i --frozen-lockfile` → 本番設定のビルド →
@@ -788,6 +867,7 @@ PR では回らないので、失敗は Actions 上で確認して別 PR で対�
 | `dropin-frontend-e2e.yml` | 3 TS インスタンス + cypress で frontend 視点の drop-in 互換 | 19:00 UTC |
 | `queue-bench-smoke.yml` | queue driver がジョブを落としていないか (`ok == sent`) | 17:30 UTC |
 | `bench-upstream.yml` | 本家 Misskey との性能比較 (develop と`UPSTREAM_MISSKEY_VERSION`の版) | 日曜日 20:40 UTC (月曜日 05:40 日本時間) |
+| `api-coverage.yml` | どの層でも通っていない API が一覧 (`internal/routecoverage/uncovered.tsv`) と一致しているか (#4039)。PR でも、集計の道具 (`internal/routecoverage/*.go`、`tools/routecoverage/`) か workflow を変えたときは回る | 火曜日 03:30 UTC (火曜日 12:30 日本時間) |
 
 #### CI失敗時の対応
 

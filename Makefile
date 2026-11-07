@@ -73,6 +73,14 @@ frontend-check: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ を型チェック�
 	# MFM の Unicode 絵文字の正規表現と記録した版が、frontend の MFM の解析器
 	# (@elythia-network/mfm) が持つものと一致するか (#3324)。node_modules が無いと落ちる (skip しない)。
 	$(MAKE) emoji-regex-check
+	# Elythia が書いたファイルは misskey-js を直接 import しない (#4028)。frontend の
+	# eslint は src/ と public/loader/ しか見ないので、test/ も含めて別の script で検査する
+	cd frontend && node --test scripts/check-elythia-imports.test.mjs && node scripts/check-elythia-imports.mjs
+	# ja-JP の語は en-US にもある (#4047)。無い語は英語の UI でも日本語のまま出る。
+	# 例外は scripts/locale-coverage-allowlist.tsv (本家の翻訳待ちの語だけ)
+	cd frontend && node --test scripts/check-locale-coverage.test.mjs && node scripts/check-locale-coverage.mjs
+	# 足したルートに spec の宣言があるか (#4035)。tests/playwright の node_modules が要る
+	$(MAKE) playwright-route-check
 	# **eslint も回す (#2906)。** CI は別 step で `pnpm eslint` を回しており、
 	# ここに無いと**手元で緑でも CI が落ちる**。#2903 で実際に踏んだ (デッドコードを
 	# 消したときの空行が @stylistic/no-multiple-empty-lines で落ちた)。個別ファイルに
@@ -377,6 +385,22 @@ test-fast: ## 全テストを -race 抜きで実行 (反復用。コミット前
 	# -count=1 は落とさない — -shuffle を外したときに (cached) で無検証の緑を
 	# 返すようになるため。
 	go test ./... -count=1 -shuffle=3
+
+# 出力は $GITHUB_STEP_SUMMARY にそのまま足すので、recipe にコメントを書かず、
+# コマンドも echo しない (@)。入力のうち .json は route-hits.json (ROUTE_OUT で
+# 書いたもの) として足し合わせる。何も拾えないか、ROUTE_REQUIRE のエンドポイントが
+# 2xx・3xx で通っていなければ exit 1 (書式が変わって全部が「叩かれていない」に
+# なるのを防ぐ)。ROUTE_FLAGS には -gate -layers <層,...> (uncovered.tsv との突き合わせ、
+# #4039) か -layers <層,...> -write-uncovered <パス> (uncovered.tsv を作り直す。リダイレクトで
+# 書くと、ビルドの前に空にされて既存の行の issue が消える) を渡す。使い方は docs/ci.md の
+# 「API の通過の集計」。
+.PHONY: route-coverage
+ROUTE_LAYER ?=
+ROUTE_OUT ?=
+ROUTE_REQUIRE ?= notes/create
+ROUTE_FLAGS ?=
+route-coverage: ## テストの層のアクセスログか route-hits.json を集計し、API の通過を Markdown で出す (#4037。ROUTE_INPUTS 必須、ROUTE_LAYER / ROUTE_OUT / ROUTE_REQUIRE / ROUTE_FLAGS)
+	@GOWORK=off go run ./tools/routecoverage -layer "$(ROUTE_LAYER)" -o "$(ROUTE_OUT)" -require "$(ROUTE_REQUIRE)" $(ROUTE_FLAGS) $(ROUTE_INPUTS)
 
 .PHONY: emoji-regex emoji-regex-check
 emoji-regex: ## frontend の MFM の解析器が持つ絵文字の正規表現を snapshot に書き写す (#3324)
@@ -1241,7 +1265,19 @@ playwright-test: ## Playwright spec を実行 (Elythia backend、PLAYWRIGHT_ARGS
 playwright-update-snapshots: ## Playwright の見た目の差分の基準画像を作り直す (PLAYWRIGHT_ARGS で spec を絞る)
 	# toHaveScreenshot の基準画像は runner の container (Linux の chromium) で
 	# 作る。手元の OS で作ると、文字の描画が違って CI で必ず差分になる (#4026)。
-	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test run --rm --build playwright-runner test --update-snapshots $(PLAYWRIGHT_ARGS)
+	# モードは `=` で付ける。空けると、続く spec のパスがモードとして読まれて落ちる。
+	# changed は、基準と違うものと無いものだけを書き直す (#4054)
+	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test run --rm --build playwright-runner test --update-snapshots=changed $(PLAYWRIGHT_ARGS)
+
+.PHONY: playwright-route-check
+playwright-route-check: ## frontend の全ルートが、どこかの Playwright spec に対応付いているか検査 (#4035)
+	# spec の一覧は playwright 自身 (`test --list`) に解かせるので、tests/playwright の
+	# node_modules が要る。無ければ skip せずに落とす (`cd tests/playwright && npm ci`)。
+	# サーバーとブラウザは要らない。make gates は Go だけで回る前提なので入れず、
+	# frontend-check と CI の frontend job から呼ぶ。
+	@test -f tests/playwright/node_modules/@playwright/test/cli.js || { echo "tests/playwright の node_modules が無い: cd tests/playwright && npm ci" >&2; exit 1; }
+	node --test tests/playwright/route-coverage.test.mjs
+	node tests/playwright/route-coverage.mjs
 
 playwright-down: ## Playwright スタックを撤去
 	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test down -v
@@ -1253,7 +1289,8 @@ playwright-logs: ## Playwright スタックのログを表示
 #
 # 同 spec を upstream Misskey TS image (= 真の互換挙動の baseline) に対しても
 # 走らせる。両方で pass = drop-in 互換が確認される、片方のみ pass = drift /
-# spec 誤りとして調査対象。
+# spec 誤りとして調査対象。例外は、Elythia で足した data-testid で要素を
+# 取る spec で、公式 image では要素が無いので落ちる (docs/playwright.md)。
 PLAYWRIGHT_TS_OVERLAY=tests/playwright/compose.ts.yml
 
 playwright-ts-up: ## Playwright スタック (Misskey TS backend) を起動

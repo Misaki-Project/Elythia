@@ -1,0 +1,3 @@
+# ずっと spec を付けないルート (#4035)。`<ルート>\t<どの経路でそうなるか>`。
+# 書き方は docs/playwright.md の「ルートと spec の対応付け」。
+/oauth/authorize	GET /oauth/authorize はサーバー (internal/api/oauth/provider.go の Authorize) が受け、client_id の URL から取ったクライアントの情報が正しいときだけ frontend の shell を返して、このルートを描く。test の stack からは外のクライアントの情報を取れないので開けない

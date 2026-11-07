@@ -4,7 +4,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 -->
 <template>
 <component :is="embedded ? 'div' : PageWithHeader">
-	<div class="_spacer" :class="$style.tabs">
+	<div data-testid="game-rankings" class="_spacer" :class="$style.tabs">
 		<div role="tablist" aria-label="ゲーム" :class="$style.tabList">
 			<button v-for="(page, index) in pages" :id="`game-ranking-tab-${page.plugin}`" :key="page.plugin" type="button" class="_button" role="tab" :aria-selected="selected?.plugin === page.plugin" :aria-controls="`game-ranking-panel-${page.plugin}`" :tabindex="selected?.plugin === page.plugin ? 0 : -1" :class="[$style.tab, { [$style.active]: selected?.plugin === page.plugin }]" @click="game = page.plugin" @keydown="moveTab($event, index)">{{ gameRankingLabels[page.plugin] }}</button>
 		</div>

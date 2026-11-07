@@ -39,6 +39,8 @@ on:
       - "internal/**"
       - "cmd/**"
       - "migration/**"
+      # API の通過の集計 (#4037)。internal/routecoverage は internal/** に入る
+      - "tools/routecoverage/**"
       - "tests/playwright/**"
       - "frontend/**"
       - "Makefile"
@@ -91,10 +93,11 @@ jobs:
           # 「スタックごと分ける」= シャード数でしか稼げない。shard への
           # 割り振りは所要時間で均す (PLAYWRIGHT_SHARD、#4026)。
           #
-          # 4 のままにしている理由と、増やす目安は docs/playwright.md の
-          # 「shard の数」。job 1 つに固定で 130-150 秒かかり、PR 1 件で動く job は
-          # すでに GitHub の同時実行の上限 (Free で組織全体 20) を超えている。
-          SHARD_TOTAL: "4"
+          # 7 にした理由と、見直す目安は docs/playwright.md の「shard の数」。
+          # job 1 つに固定で 130-150 秒かかり、PR 1 件で動く job はすでに GitHub の
+          # 同時実行の上限 (Free で組織全体 20) を超えているので、増やすのは
+          # spec の実行の時間が目安を超えたときだけにする。
+          SHARD_TOTAL: "7"
         # backend 固有の make target / compose 引数 / prepull / timeout を
         # ここで一元定義する (= matrix.include の単一の情報源)。
         run: |
@@ -291,10 +294,12 @@ jobs:
 
       - name: Run Playwright
         # spec は 1 スタックあたり直列でしか回せない。共有の root アカウント
-        # を 301 ファイル中 180 がブラウザでサインインした状態で使い (数え方は
-        # `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`)、
-        # さらに 33 がサインインせず root の token で API を叩く
-        # (`root.json` を読むのが 213 で、その差分)。このアカウントと instance meta を全 spec が
+        # を 370 ファイル中 185 がブラウザでサインインした状態で使い (`uiSigninAsRoot` を
+        # 呼ぶ 184 と、フォームから入る signin.spec.ts。数え方は
+        # `grep -rl 'uiSigninAsRoot' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す)、
+        # さらに 40 がサインインせず root の token で API を叩く (`root.json` を読み、
+        # root でサインインしないもの。数え方は
+        # `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。このアカウントと instance meta を全 spec が
         # 共有しており、Playwright のファイル並列だと `profile_iscat_toggle`
         # と `profile_isbot_toggle` が同じ alice を、`admin_branding_save` と
         # `about_page_render` が同じ meta を取り合う。並列度はスタックごと
@@ -362,6 +367,23 @@ jobs:
           # 失敗した job だけを再実行すると、同じ名前の artifact が既にある
           overwrite: true
 
+      # Elythia のアクセスログを、成功したときも残す (#4037)。集計は api-coverage
+      # job が行う (この job の Go は cache が外れたときしか入らない)。TS の backend は
+      # 対象にしない。
+      - name: Save Elythia access log
+        if: ${{ !cancelled() && matrix.backend == 'mk-go' }}
+        run: docker compose ${{ matrix.compose_args }} logs --no-log-prefix --no-color mkgo > /tmp/mkgo-access-${{ matrix.shard }}.log || true
+
+      - name: Upload Elythia access log
+        if: ${{ !cancelled() && matrix.backend == 'mk-go' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mkgo-access-playwright-${{ matrix.shard }}
+          path: /tmp/mkgo-access-${{ matrix.shard }}.log
+          if-no-files-found: ignore
+          retention-days: 3
+          overwrite: true
+
       # 失敗時のみ docker compose logs を artifact 化して原因調査できる
       # ようにする。
       - name: Capture docker compose logs on failure
@@ -383,6 +405,49 @@ jobs:
       - name: Final teardown
         if: always()
         run: make ${{ matrix.down_target }} >/dev/null 2>&1 || true
+
+  # 各 job が残した集計を足し合わせ、この層で叩かれた API を Summary に出す (#4037)。
+  # shard ごとの Elythia のアクセスログ (mkgo-access-playwright-<shard>) を読む。
+  # 落ちた job があっても集計は出す (cancelled のときだけ止める)。notes/create を
+  # 2xx で通っていなければ落とす (ログの書式が変わって何も拾えなくなるのを防ぐ下限)。
+  api-coverage:
+    name: API coverage
+    needs: spec
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mkgo-access-playwright-*
+          path: route-inputs
+          # artifact が 1 つだけのときは、名前のディレクトリを作らずに直下へ展開する
+          # (download-artifact の仕様)。数によって置き場所が変わらないよう、常に
+          # 直下へまとめる。そのため、ファイル名は artifact ごとに変えておく
+          merge-multiple: true
+
+      - name: Summarize API hits
+        run: make route-coverage ROUTE_LAYER=playwright ROUTE_OUT=route-hits-playwright.json ROUTE_INPUTS='route-inputs/*.log' >> "$GITHUB_STEP_SUMMARY"
+
+      # 全層を合わせるときの材料 (make route-coverage ROUTE_INPUTS='*.json'、docs/ci.md)
+      - name: Upload API hits
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: route-hits-playwright
+          path: route-hits-playwright.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
 
   # nightly が壊れたまま放置されるのを防ぐ。schedule 実行が失敗したときだけ
   # issue を起票し、既に open な同名 issue があれば何もしない (重複抑止)。

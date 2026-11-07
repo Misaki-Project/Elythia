@@ -9,7 +9,7 @@ import { defineConfig } from '@playwright/test';
 import { listSpecFiles, loadDurations, parseShard, planShards, writesMeta } from './shard-plan.mjs';
 
 // mk-go backend に対する Playwright e2e の設定 (#744)。spec は
-// `specs/upstream/` に 290 ファイル、`specs/elythia/` に 11 ファイル。CI では
+// `specs/upstream/` に 339 ファイル、`specs/elythia/` に 31 ファイル。CI では
 // `PLAYWRIGHT_SHARD=i/N` で N 個の job に分けて回す (docs/playwright.md)。
 //
 // **shard は `PLAYWRIGHT_SHARD=i/N` で切る (#4026)。** `--shard` はファイルの
@@ -44,6 +44,10 @@ export default defineConfig({
   expect: {
     timeout: 10_000,
   },
+  // 見た目の差分の基準画像 (#4054) の名前に project を入れない。spec が meta を
+  // 書くようになると project が main から meta に変わり、基準画像を見失う。
+  // 末尾の -linux (snapshotSuffix) は残す。runner の container で作った印になる
+  snapshotPathTemplate: '{snapshotDir}/{testFileDir}/{testFileName}-snapshots/{arg}{-snapshotSuffix}{ext}',
   // list は人間向け、json は CI の "spec が 1 件も実行されなかった" guard
   // (.github/workflows/playwright.yml) 向け。outputFile は runner の
   // working_dir (/work = host の tests/playwright) 相対なので、host 側の
@@ -87,17 +91,18 @@ export default defineConfig({
     // i18n key 解決に使うので、これで全 spec の text 前提が安定する。
     locale: 'en-US',
   },
-  // **1 スタックに対しては直列で回すしかない。** 301 spec のうち 180 が共有の
-  // root (alice) でブラウザでサインインした状態を使い (数え方は
-  // `grep -rlE 'uiSigninAsRoot|signin-username' tests/playwright/specs --include='*.spec.ts' | wc -l`)、
-  // さらに 33 がサインインせず root の token で API を叩く
-  // (`root.json` を読むのが 213 で、その差分)。
+  // **1 スタックに対しては直列で回すしかない。** 370 spec のうち 185 が共有の
+  // root (alice) でブラウザでサインインした状態を使い (`uiSigninAsRoot` を呼ぶ 184 と
+  // signin.spec.ts。数え方は `grep -rl 'uiSigninAsRoot' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す)、
+  // さらに 40 がサインインせず root の token で API を叩く (`root.json` を読み、
+  // root でサインインしないもの。数え方は
+  // `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。
   // instance meta は全 spec が共有する。Playwright は
   // ファイル単位で並列化するので、workers を上げると `profile_iscat_toggle` と
   // `profile_isbot_toggle` が同じアカウントを、`admin_branding_save` と
   // `about_page_render` が同じ meta を取り合う。root の quota
   // (antenna 5 / webhook 3 / clip 10) を消費する spec も 18 ある。
-  // 並列度は CI 側で `PLAYWRIGHT_SHARD=i/4` の 4 job に分けて稼ぐ (#2609)。
+  // 並列度は CI 側で `PLAYWRIGHT_SHARD=i/7` の 7 job に分けて稼ぐ (#2609、#4043 で 6 に、#4049 で 7 に)。
   workers: 1,
   // 1 度だけ retry を許可する。Chromium headless が稀に SIGSEGV (= signal 11
   // / GPF) で即死する infrastructure flake (= profile_iscat_toggle 1ms 即死
