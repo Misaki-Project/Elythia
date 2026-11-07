@@ -3,8 +3,8 @@ import { defineConfig, mergeConfig } from 'vitest/config';
 import type { Plugin } from 'vite';
 import { getConfig } from './vite.config.js';
 
-const frontendSrc = path.resolve(__dirname, 'src') + path.sep;
-const embedSrc = path.resolve(__dirname, '../frontend-embed/src') + path.sep;
+const frontendSrc = path.resolve(__dirname, 'src').replaceAll('\\', '/') + '/';
+const embedSrc = path.resolve(__dirname, '../frontend-embed/src').replaceAll('\\', '/') + '/';
 
 /**
  * Resolves `@/` inside frontend-embed sources to frontend-embed/src.
@@ -17,6 +17,8 @@ function embedSelfAlias(): Plugin {
 		name: 'elythia:embed-self-alias',
 		enforce: 'pre',
 		async resolveId(source, importer, options) {
+			source = source.replaceAll('\\', '/');
+			importer = importer?.replaceAll('\\', '/');
 			if (importer == null || !importer.startsWith(embedSrc) || !source.startsWith(frontendSrc)) return null;
 			const target = embedSrc + source.slice(frontendSrc.length);
 			const resolved = await this.resolve(target, importer, { ...options, skipSelf: true });
