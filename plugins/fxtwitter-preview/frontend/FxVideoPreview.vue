@@ -49,13 +49,22 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import MkModal from '@/components/MkModal.vue';
 import { MkSensitiveMediaGuard } from '@/plugin-api.js';
 import type { PreviewContext } from '@/plugin-api.js';
-import { api, apiSessionEpoch, fetchPluginResource, openPluginMedia } from './api.js';
+import { apiSessionEpoch, fetchPluginResource, openPluginMedia } from './api.js';
 import type { PluginMediaItem } from '@/plugin-api.js';
 import type { PublicVideo } from './api.js';
+
+type RefreshedPlayback = { video: PublicVideo; videoIndex: number };
+type RefreshPlayback = (request: {
+	target: 'main' | 'quote';
+	video: PublicVideo;
+	videoIndex?: number;
+	contentPostId: string;
+	signal: AbortSignal;
+}) => Promise<RefreshedPlayback | null>;
 
 const props = defineProps<{
 	video: PublicVideo;
@@ -70,6 +79,7 @@ const props = defineProps<{
 	videoIndex?: number;
 	postHref?: string;
 	tileAspect?: boolean;
+	refreshPlayback?: RefreshPlayback;
 }>();
 
 const iframe = ref<HTMLIFrameElement | null>(null);
@@ -86,6 +96,7 @@ let nonce = '';
 let generation = 0;
 let frameLoadTimer: ReturnType<typeof setTimeout> | null = null;
 let mediaAbort: AbortController | null = null;
+let refreshingCapability = false;
 
 const playerDialogLayout: import('vue').CSSProperties = {
 	boxSizing: 'border-box',
@@ -197,47 +208,95 @@ async function play(): Promise<void> {
 	const source = props.context.source;
 	if (!canPlay.value || playerModalOpen.value || props.video.embedToken == null || source?.kind !== 'note') return;
 	const current = ++generation;
-	if (effectivePlaybackMode.value === 'nativeProxy' && props.video.provider === 'x') {
-		await playNativeVideo(current, source.noteId);
-		return;
-	}
-	nonce = newNonce();
 	embedState.value = 'loading';
 	errorMessage.value = '動画を再生できませんでした。';
+	let selectedVideo = props.video;
+	let selectedIndex = props.videoIndex;
+	let refreshed = false;
+	const controller = new AbortController();
+	mediaAbort = controller;
 	try {
-		const result = await api<{ url: string }>('embed/shell', {
-			noteId: source.noteId,
-			postId: props.cachePostId,
-			token: props.video.embedToken,
-			target: props.target,
-			theme: 'light',
-			lang: 'ja',
-			nonce,
-		});
-		if (current !== generation || !canPlay.value) return;
-		const url = validatedEmbedURL(result.url);
-		if (url == null) throw new Error('invalid official embed URL');
-		embedUrl.value = url;
-		playerModalOpen.value = true;
-		frameLoadTimer = setTimeout(() => failEmbed(current), 15_000);
+		if (capabilityExpired(selectedVideo) || selectedVideo.embedToken == null) {
+			const renewed = await refreshCapability(selectedVideo, selectedIndex, current, controller.signal);
+			if (renewed == null) throw new Error('video capability could not be renewed');
+			selectedVideo = renewed.video;
+			selectedIndex = renewed.videoIndex;
+			refreshed = true;
+		}
+		if (effectivePlaybackMode.value === 'nativeProxy' && selectedVideo.provider === 'x') {
+			await playNativeVideo(current, source.noteId, selectedVideo, selectedIndex, controller.signal, !refreshed);
+			return;
+		}
+		await playOfficialVideo(current, source.noteId, selectedVideo, controller.signal, !refreshed);
 	} catch {
 		failEmbed(current);
+	} finally {
+		if (mediaAbort === controller) mediaAbort = null;
 	}
 }
 
-async function playNativeVideo(current: number, noteId: string): Promise<void> {
-	if (!Number.isSafeInteger(props.videoIndex) || (props.videoIndex ?? -1) < 0) return;
-	const controller = new AbortController();
-	mediaAbort = controller;
-	embedState.value = 'loading';
+function capabilityExpired(video: PublicVideo): boolean {
+	if (video.embedExpiresAt == null) return false;
+	const expiresAt = Date.parse(video.embedExpiresAt);
+	return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+async function refreshCapability(video: PublicVideo, videoIndex: number | undefined, current: number, signal: AbortSignal): Promise<RefreshedPlayback | null> {
+	if (props.refreshPlayback == null || signal.aborted || current !== generation) return null;
+	refreshingCapability = true;
+	try {
+		const renewed = await props.refreshPlayback({
+			target: props.target,
+			video,
+			videoIndex,
+			contentPostId: props.contentPostId,
+			signal,
+		});
+		await nextTick();
+		if (signal.aborted || current !== generation || !canPlay.value || renewed?.video.embedToken == null) return null;
+		return renewed;
+	} finally {
+		refreshingCapability = false;
+	}
+}
+
+async function playOfficialVideo(current: number, noteId: string, video: PublicVideo, signal: AbortSignal, refreshOnRejection: boolean): Promise<void> {
+	nonce = newNonce();
+	const response = await fetchPluginResource('/api/plugin/fxtwitter-preview/embed/shell', {
+		method: 'POST',
+		cache: 'no-store',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ noteId, postId: props.cachePostId, token: video.embedToken, target: props.target, theme: 'light', lang: 'ja', nonce }),
+		signal,
+	});
+	if (response.status === 404 && refreshOnRejection && !signal.aborted && current === generation) {
+		const renewed = await refreshCapability(video, props.videoIndex, current, signal);
+		if (renewed != null) return await playOfficialVideo(current, noteId, renewed.video, signal, false);
+	}
+	if (!response.ok) throw new Error('Embed capability is unavailable');
+	const result = await response.json() as { url?: unknown };
+	if (signal.aborted || current !== generation || !canPlay.value) return;
+	const url = validatedEmbedURL(result.url);
+	if (url == null) throw new Error('invalid official embed URL');
+	embedUrl.value = url;
+	playerModalOpen.value = true;
+	frameLoadTimer = setTimeout(() => failEmbed(current), 15_000);
+}
+
+async function playNativeVideo(current: number, noteId: string, video: PublicVideo, videoIndex: number | undefined, signal: AbortSignal, refreshOnRejection: boolean): Promise<void> {
+	if (!Number.isSafeInteger(videoIndex) || (videoIndex ?? -1) < 0) throw new Error('video index is unavailable');
 	try {
 		const response = await fetchPluginResource('/api/plugin/fxtwitter-preview/media/video', {
 			method: 'POST',
 			cache: 'no-store',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ noteId, postId: props.cachePostId, target: props.target, index: props.videoIndex, token: props.video.embedToken }),
-			signal: controller.signal,
+			body: JSON.stringify({ noteId, postId: props.cachePostId, target: props.target, index: videoIndex, token: video.embedToken }),
+			signal,
 		});
+		if (response.status === 404 && refreshOnRejection && !signal.aborted && current === generation) {
+			const renewed = await refreshCapability(video, videoIndex, current, signal);
+			if (renewed != null) return await playNativeVideo(current, noteId, renewed.video, renewed.videoIndex, signal, false);
+		}
 		const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
 		const contentLength = response.headers.get('Content-Length');
 		if (response.status === 429) {
@@ -247,23 +306,21 @@ async function playNativeVideo(current: number, noteId: string): Promise<void> {
 		if (!response.ok || contentType !== 'video/mp4' || (contentLength != null && (!/^\d+$/.test(contentLength) || Number(contentLength) > 32 * 1024 * 1024))) {
 			throw new Error('Video response is unavailable or invalid');
 		}
-		const blob = await readBoundedVideo(response, controller.signal);
+		const blob = await readBoundedVideo(response, signal);
 		if (blob.size === 0 || blob.size > 32 * 1024 * 1024 || blob.type.split(';', 1)[0]?.trim().toLowerCase() !== 'video/mp4') throw new Error('Video response is too large or invalid');
-		if (current !== generation || controller.signal.aborted || !canPlay.value) return;
+		if (current !== generation || signal.aborted || !canPlay.value) return;
 		const item: PluginMediaItem = {
-			id: `${props.contentPostId}:${props.videoIndex}`,
+			id: `${props.contentPostId}:${videoIndex}`,
 			type: 'video',
 			blob,
-			filename: `x-${props.contentPostId}-${(props.videoIndex ?? 0) + 1}.mp4`,
+			filename: `x-${props.contentPostId}-${(videoIndex ?? 0) + 1}.mp4`,
 			isSensitive: props.isSensitive === true,
 			initiallyRevealed: true,
 		};
 		await openPluginMedia([item], item.id);
 		if (current === generation) embedState.value = 'idle';
-	} catch {
-		if (current === generation && !controller.signal.aborted) embedState.value = 'failed';
-	} finally {
-		if (mediaAbort === controller) mediaAbort = null;
+	} catch (error) {
+		if (!signal.aborted) throw error;
 	}
 }
 
@@ -303,7 +360,12 @@ function onMessage(event: MessageEvent): void {
 }
 
 watch(canPlay, enabled => { if (!enabled) closePlayer(); });
-watch(() => [props.video, props.contentPostId, props.cachePostId, props.target, apiSessionEpoch.value, props.context.source?.noteId], () => {
+watch(() => [props.contentPostId, props.cachePostId, props.target, apiSessionEpoch.value, props.context.source?.noteId], () => {
+	failedPosterIndices.value = new Set();
+	closePlayer();
+});
+watch(() => [props.video.provider, props.video.providerVideoId, props.video.mediaIdentity, props.video.durationMs, props.video.playbackAvailable], () => {
+	if (refreshingCapability) return;
 	failedPosterIndices.value = new Set();
 	closePlayer();
 });

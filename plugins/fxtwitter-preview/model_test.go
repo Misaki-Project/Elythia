@@ -41,3 +41,38 @@ func TestNoteContainsExactStatus(t *testing.T) {
 		t.Fatal("partial status id matched")
 	}
 }
+
+func TestNoteContainsStatusUnderstandsMFMURLs(t *testing.T) {
+	const wanted = "1234567890"
+	for _, text := range []string{
+		"**https://x.com/a/status/" + wanted + "**",
+		"~~ https://x.com/a/status/" + wanted + " ~~",
+		"<s>https://x.com/a/status/" + wanted + "</s>",
+		"[post](https://x.com/a/status/" + wanted + ")",
+		"plain https://x.com/a/status/" + wanted,
+	} {
+		if !noteContainsStatus(text, wanted) {
+			t.Errorf("noteContainsStatus(%q, %q) = false; want true", text, wanted)
+		}
+	}
+}
+
+func TestNoteContainsStatusRejectsNonLinkAndInvalidMFMURLs(t *testing.T) {
+	const wanted = "1234567890"
+	for _, text := range []string{
+		"`https://x.com/a/status/" + wanted + "`",
+		"```\nhttps://x.com/a/status/" + wanted + "\n```",
+		// The frontend MFM parser treats unspaced ~~...~~ as plain text, so it
+		// does not produce a URL node for the host-side status extractor.
+		"~~https://x.com/a/status/" + wanted + "~~",
+		"**https://evil.example/a/status/" + wanted + "**",
+		"**https://user@x.com/a/status/" + wanted + "**",
+		"**https://x.com:444/a/status/" + wanted + "**",
+		"**https://x.com/a/status/%" + wanted + "**",
+		"**https://x.com/a/status/" + wanted + "0**",
+	} {
+		if noteContainsStatus(text, wanted) {
+			t.Errorf("noteContainsStatus(%q, %q) = true; want false", text, wanted)
+		}
+	}
+}

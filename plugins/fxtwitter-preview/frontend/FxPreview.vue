@@ -37,6 +37,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		v-if="showAttachmentMedia && mainVideo && videoPlaybackMode !== 'nativeProxy'"
 		:key="`video:${viewData.post.id}`"
 		:video="mainVideo"
+		:posterSrc="videoPosterSources[0]"
 		:posterSources="videoPosterSources"
 		:cachePostId="viewData.post.id"
 		:contentPostId="viewData.post.id"
@@ -44,9 +45,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 		:context="context"
 		:isSensitive="viewData.post.isSensitive"
 		:playbackMode="videoPlaybackMode"
+		:refreshPlayback="refreshPlaybackCapability"
 	/>
 	<div v-else-if="showAttachmentMedia && videoPlaybackMode === 'nativeProxy' && mainVideos.length > 0" :class="$style.videoGrid" data-fx-video-grid="main" :data-video-count="mainVideos.length">
-		<FxVideoPreview v-for="(video, index) in mainVideos" :key="`video:${viewData.post.id}:${index}`" :video="video" :posterSrc="videoPosterSources[index]" :cachePostId="viewData.post.id" :contentPostId="viewData.post.id" target="main" :videoIndex="index" :playbackMode="videoPlaybackMode" :postHref="viewData.post.url" :context="context" :isSensitive="viewData.post.isSensitive" :tileAspect="mainVideos.length === 2"/>
+			<FxVideoPreview v-for="(video, index) in mainVideos" :key="`video:${viewData.post.id}:${index}`" :video="video" :posterSrc="videoPosterSources[index]" :cachePostId="viewData.post.id" :contentPostId="viewData.post.id" target="main" :videoIndex="index" :playbackMode="videoPlaybackMode" :postHref="viewData.post.url" :context="context" :isSensitive="viewData.post.isSensitive" :tileAspect="mainVideos.length === 2" :refreshPlayback="refreshPlaybackCapability"/>
 	</div>
 	<MkTime v-if="postCreatedAt" :class="$style.postTime" :time="postCreatedAt" mode="detail"/>
 	<section
@@ -68,6 +70,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			v-if="showAttachmentMedia && quoteVideo && videoPlaybackMode !== 'nativeProxy'"
 			:key="`quote-video:${viewData.post.quote.id}`"
 			:video="quoteVideo"
+			:posterSrc="quoteVideoPosterSources[0]"
 			:posterSources="quoteVideoPosterSources"
 			:cachePostId="viewData.post.id"
 			:contentPostId="viewData.post.quote.id"
@@ -75,9 +78,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 			:context="context"
 			:isSensitive="viewData.post.quote.isSensitive"
 			:playbackMode="videoPlaybackMode"
+		:refreshPlayback="refreshPlaybackCapability"
 		/>
 		<div v-else-if="showAttachmentMedia && videoPlaybackMode === 'nativeProxy' && quoteVideos.length > 0" :class="$style.videoGrid" data-fx-video-grid="quote" :data-video-count="quoteVideos.length">
-			<FxVideoPreview v-for="(video, index) in quoteVideos" :key="`quote-video:${viewData.post.quote.id}:${index}`" :video="video" :posterSrc="quoteVideoPosterSources[index]" :cachePostId="viewData.post.id" :contentPostId="viewData.post.quote.id" target="quote" :videoIndex="index" :playbackMode="videoPlaybackMode" :postHref="viewData.post.quote.url" :context="context" :isSensitive="viewData.post.quote.isSensitive" :tileAspect="quoteVideos.length === 2"/>
+			<FxVideoPreview v-for="(video, index) in quoteVideos" :key="`quote-video:${viewData.post.quote.id}:${index}`" :video="video" :posterSrc="quoteVideoPosterSources[index]" :cachePostId="viewData.post.id" :contentPostId="viewData.post.quote.id" target="quote" :videoIndex="index" :playbackMode="videoPlaybackMode" :postHref="viewData.post.quote.url" :context="context" :isSensitive="viewData.post.quote.isSensitive" :tileAspect="quoteVideos.length === 2" :refreshPlayback="refreshPlaybackCapability"/>
 		</div>
 		<MkTime v-if="quoteCreatedAt" :class="$style.postTime" :time="quoteCreatedAt" mode="detail"/>
 	</section>
@@ -133,6 +137,7 @@ const retryLoading = ref(false);
 const retryTransportFailed = ref(false);
 const retryRateLimited = ref(false);
 const retryBlocked = ref(false);
+const mediaRevision = ref(0);
 const retryClock = ref(Date.now());
 const retryBackoffUntil = ref(0);
 let retryController: AbortController | null = null;
@@ -212,7 +217,7 @@ const repostCount = computed(() => Math.min(Number.MAX_SAFE_INTEGER, Math.max(0,
 
 const countFormatter = new Intl.NumberFormat();
 function ownerKey(): string {
-	return `${apiSessionEpoch.value}:${props.context.source?.noteId ?? ''}:${viewData.value.post?.id ?? ''}`;
+	return `${apiSessionEpoch.value}:${props.context.source?.noteId ?? ''}:${viewData.value.post?.id ?? ''}:${mediaRevision.value}`;
 }
 const currentOwnerKey = computed(ownerKey);
 function validDate(value?: string): string | null {
@@ -276,7 +281,7 @@ async function retryPreview(): Promise<void> {
 	try {
 		const response = await loadPreview(props.input, props.context, controller.signal);
 		if (controller.signal.aborted || generation !== retryGeneration || owner !== retryOwnerKey.value) return;
-		retryResponse.value = response;
+		acceptRefreshedPreview(response);
 		retryBlocked.value = response.retryable === false;
 		if (retryBlocked.value) clearMedia();
 		retryBackoffUntil.value = 0;
@@ -344,7 +349,97 @@ function videoCount(arrayCount: number, hasVideo: boolean): number {
 
 function withPrimaryToken(videos?: PublicVideo[], primary?: PublicVideo): PublicVideo[] {
 	const values = videos?.length ? videos : primary == null ? [] : [primary];
-	return values.map(video => primary?.embedToken != null ? { ...video, embedToken: primary.embedToken } : video);
+	return values.map(video => primary?.embedToken != null ? { ...video, embedToken: primary.embedToken, embedExpiresAt: primary.embedExpiresAt } : video);
+}
+
+function acceptRefreshedPreview(response: PreviewResponse): void {
+	retryResponse.value = response;
+	mediaRevision.value++;
+}
+
+type VideoRefreshRequest = {
+	target: 'main' | 'quote';
+	video: PublicVideo;
+	videoIndex?: number;
+	contentPostId: string;
+	signal: AbortSignal;
+};
+
+function sameVideoMetadata(oldVideo: PublicVideo, nextVideo: PublicVideo): boolean {
+	if (oldVideo.provider === 'youtube') return nextVideo.provider === 'youtube' && oldVideo.providerVideoId != null && oldVideo.providerVideoId === nextVideo.providerVideoId;
+	return oldVideo.provider === nextVideo.provider && oldVideo.providerVideoId === nextVideo.providerVideoId &&
+		oldVideo.provider === 'x' && oldVideo.mediaIdentity != null && oldVideo.mediaIdentity === nextVideo.mediaIdentity &&
+		(oldVideo.durationMs == null || nextVideo.durationMs === oldVideo.durationMs) &&
+		(oldVideo.playbackAvailable == null || nextVideo.playbackAvailable === oldVideo.playbackAvailable);
+}
+
+async function refreshPlaybackCapability(request: VideoRefreshRequest): Promise<{ video: PublicVideo; videoIndex: number } | null> {
+	if (request.signal.aborted || props.context.source?.kind !== 'note' || !props.context.revealed || !props.context.active || !props.context.inViewport) return null;
+	const owner = retryOwnerKey.value;
+	const generation = ++retryGeneration;
+	retryController?.abort();
+	const controller = new AbortController();
+	const abortFromPlayback = (): void => controller.abort();
+	request.signal.addEventListener('abort', abortFromPlayback, { once: true });
+	if (request.signal.aborted) controller.abort();
+	retryController = controller;
+	try {
+		const response = await loadPreview(props.input, props.context, controller.signal);
+		if (controller.signal.aborted || generation !== retryGeneration || owner !== retryOwnerKey.value) return null;
+		retryBlocked.value = response.retryable === false;
+		retryTransportFailed.value = response.state === 'unavailable' && response.retryable === true;
+		retryRateLimited.value = response.error === 'temporary' && Date.parse(response.retryAt ?? '') - Date.now() >= 55_000;
+		retryBackoffUntil.value = 0;
+		if (response.state !== 'ready' && response.state !== 'stale' || response.post == null) {
+			acceptRefreshedPreview(response);
+			if (retryBlocked.value) clearMedia();
+			return null;
+		}
+		const targetPost = request.target === 'main' ? response.post : response.post.quote;
+		if (targetPost?.id !== request.contentPostId) {
+			acceptRefreshedPreview(response);
+			return null;
+		}
+		if (videoPlaybackMode.value === 'officialEmbed' && request.video.provider === 'x') {
+			const refreshedPrimaryVideo = targetPost.video;
+			const match = refreshedPrimaryVideo?.provider === 'x' && refreshedPrimaryVideo.embedToken != null
+				? { video: refreshedPrimaryVideo, videoIndex: 0 }
+				: null;
+			acceptRefreshedPreview(response);
+			return match;
+		}
+		const refreshedVideos = request.target === 'main'
+			? withPrimaryToken(response.post.videos, response.post.video)
+			: withPrimaryToken(targetPost.videos, targetPost.video);
+		const candidates = refreshedVideos.flatMap((video, index) => sameVideoMetadata(request.video, video) ? [{ video, index }] : []);
+		if (request.video.provider === 'youtube' && request.video.providerVideoId != null) {
+			const match = candidates.length === 1 && candidates[0].video.embedToken != null
+				? { video: candidates[0].video, videoIndex: candidates[0].index }
+				: null;
+			acceptRefreshedPreview(response);
+			return match;
+		}
+		const match = request.video.provider === 'x' && request.video.mediaIdentity != null && candidates.length === 1 && candidates[0].video.embedToken != null
+			? { video: candidates[0].video, videoIndex: candidates[0].index }
+			: null;
+		acceptRefreshedPreview(response);
+		return match;
+	} catch (error) {
+		if (controller.signal.aborted || generation !== retryGeneration || owner !== retryOwnerKey.value) return null;
+		const failure = failureCode(error);
+		const failureResponse: PreviewResponse = isAccessFailure(error)
+			? { state: 'unavailable', postId: viewData.value.postId, error: 'unavailable', retryable: false }
+			: { state: 'unavailable', postId: viewData.value.postId, error: 'temporary', retryable: true, retryAt: new Date(Date.now() + (failure.status === 429 ? 60_000 : 5000)).toISOString() };
+		acceptRefreshedPreview(failureResponse);
+		retryBlocked.value = failureResponse.retryable === false;
+		retryTransportFailed.value = !retryBlocked.value;
+		retryRateLimited.value = failure.status === 429;
+		if (retryBlocked.value) clearMedia();
+		return null;
+	} finally {
+		request.signal.removeEventListener('abort', abortFromPlayback);
+		if (generation === retryGeneration) retryController = null;
+	}
 }
 
 type TextSegment = { key: string; kind?: PublicTextEntity['kind']; text: string; href?: string };

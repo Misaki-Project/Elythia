@@ -130,13 +130,15 @@ function normalizedVideoMetadata(value: unknown, allowEmbedToken: boolean): Publ
 	const provider = video.provider == null ? 'external' : video.provider;
 	if (provider !== 'x' && provider !== 'youtube' && provider !== 'external') return null;
 	const providerVideoId = optionalString(video.providerVideoId);
+	const mediaIdentity = optionalString(video.mediaIdentity);
 	const posterUrl = optionalString(video.posterUrl);
 	const posterExpiresAt = optionalString(video.posterExpiresAt);
 	const embedToken = optionalString(video.embedToken);
 	const embedExpiresAt = optionalString(video.embedExpiresAt);
 	const durationMs = video.durationMs == null ? undefined : typeof video.durationMs === 'number' && Number.isFinite(video.durationMs) ? video.durationMs : null;
 	const playbackAvailable = optionalBoolean(video.playbackAvailable);
-	if (providerVideoId === null || posterUrl === null || posterExpiresAt === null || embedToken === null || embedExpiresAt === null || durationMs === null || playbackAvailable === null) return null;
+	if (providerVideoId === null || mediaIdentity === null || posterUrl === null || posterExpiresAt === null || embedToken === null || embedExpiresAt === null || durationMs === null || playbackAvailable === null) return null;
+	if (mediaIdentity != null && (!/^[a-f0-9]{64}$/.test(mediaIdentity) || provider !== 'x')) return null;
 	if (!allowEmbedToken && (Object.hasOwn(video, 'embedToken') || Object.hasOwn(video, 'embedExpiresAt'))) return null;
 	if (provider === 'youtube' && (providerVideoId == null || !/^[A-Za-z0-9_-]{11}$/.test(providerVideoId))) return null;
 	if (provider !== 'youtube' && providerVideoId != null) return null;
@@ -144,6 +146,7 @@ function normalizedVideoMetadata(value: unknown, allowEmbedToken: boolean): Publ
 	return {
 		provider,
 		...(providerVideoId == null ? {} : { providerVideoId }),
+		...(mediaIdentity == null ? {} : { mediaIdentity }),
 		...(posterUrl == null ? {} : { posterUrl }),
 		...(posterExpiresAt == null ? {} : { posterExpiresAt }),
 		...(durationMs == null ? {} : { durationMs }),
@@ -163,6 +166,7 @@ function normalizedVideos(value: unknown, legacyVideo: PublicPost['video']): Pub
 		const first = normalizedVideoMetadata({
 			provider: legacyVideo.provider,
 			providerVideoId: legacyVideo.providerVideoId,
+			mediaIdentity: legacyVideo.mediaIdentity,
 			posterUrl: legacyVideo.posterUrl,
 			posterExpiresAt: legacyVideo.posterExpiresAt,
 			durationMs: legacyVideo.durationMs,
@@ -183,7 +187,7 @@ function normalizedVideos(value: unknown, legacyVideo: PublicPost['video']): Pub
 function legacyVideoMatchesFirst(video: PublicPost['video'], videos: PublicPost['videos']): boolean {
 	if (video == null || videos == null || videos.length === 0) return true;
 	const first = videos[0];
-	return video.provider === first.provider && video.providerVideoId === first.providerVideoId && video.posterUrl === first.posterUrl && video.playbackAvailable === first.playbackAvailable;
+	return video.provider === first.provider && video.providerVideoId === first.providerVideoId && video.mediaIdentity === first.mediaIdentity && video.posterUrl === first.posterUrl && video.playbackAvailable === first.playbackAvailable;
 }
 
 function normalizedQuote(value: unknown): PublicQuotedPost | null | undefined {

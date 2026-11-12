@@ -49,20 +49,20 @@ func (s *store) ReadPublic(ctx context.Context, postID string) (*CacheEntry, err
 		return nil, err
 	}
 	if entry.State == "ready" && len(payload) > 0 {
-		var post PublicPost
-		if err := json.Unmarshal(payload, &post); err != nil {
+		post, err := decodePublicPostWithVideoIdentity(payload)
+		if err != nil {
 			return nil, fmt.Errorf("decode public cache: %w", err)
 		}
-		entry.Post = &post
+		entry.Post = post
 	} else if entry.State == "unavailable" && isTransientFailureClass(entry.ErrorClass) && trustedSuccess(lastSuccessPayload) && lastSuccessAt != nil {
 		lastSuccessPayload, _ = stripTrustedSuccess(lastSuccessPayload)
-		var post PublicPost
-		if err := json.Unmarshal(lastSuccessPayload, &post); err != nil {
+		post, err := decodePublicPostWithVideoIdentity(lastSuccessPayload)
+		if err != nil {
 			return nil, fmt.Errorf("decode last successful public cache: %w", err)
 		}
 		entry.State = "stale"
 		entry.Stale = true
-		entry.Post = &post
+		entry.Post = post
 		entry.FetchedAt = lastSuccessAt
 	}
 	return &entry, nil

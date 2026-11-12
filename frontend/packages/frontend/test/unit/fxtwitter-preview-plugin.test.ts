@@ -279,6 +279,15 @@ describe('FxTwitter preview plugin', () => {
 			state: 'ready', post: { video: { provider: 'external' } },
 		});
 
+		const withIdentity = videoData() as unknown as { state: string; post: Record<string, unknown> };
+		withIdentity.post.video = { provider: 'x', mediaIdentity: 'a'.repeat(64), embedToken: 'token' };
+		initApi(vi.fn(async () => withIdentity) as PluginHost['api']);
+		await expect(loadPreview(input, context, new AbortController().signal)).resolves.toMatchObject({
+			state: 'ready', post: { video: { mediaIdentity: 'a'.repeat(64) }, videos: [{ mediaIdentity: 'a'.repeat(64) }] },
+		});
+		withIdentity.post.video = { provider: 'x', mediaIdentity: 'not-a-hash', embedToken: 'token' };
+		await expect(loadPreview(input, context, new AbortController().signal)).resolves.toMatchObject({ state: 'unavailable', error: 'invalid-response' });
+
 		const invalidAvailability = videoData() as unknown as { state: string; post: Record<string, unknown> };
 		invalidAvailability.post.videos = [{ provider: 'x', playbackAvailable: 'true' }];
 		initApi(vi.fn(async () => invalidAvailability) as PluginHost['api']);
@@ -326,6 +335,128 @@ describe('FxTwitter preview plugin', () => {
 		expect(JSON.parse(String(fetcher.mock.calls.find(([path]) => path.endsWith('/media/video'))?.[1]?.body))).toMatchObject({
 			noteId: 'note-1', postId: '1234567890', target: 'main', index: 1, token: '0123456789abcdef0123456789abcdef',
 		});
+	});
+
+	test('refreshes an expired native capability and keeps the selected video when refreshed indexes reorder', async () => {
+		const identityA = 'a'.repeat(64);
+		const identityB = 'b'.repeat(64);
+		const oldResponse = videoData();
+		oldResponse.post!.video = {
+			provider: 'x', mediaIdentity: identityA, embedToken: 'expired-token', embedExpiresAt: '2000-01-01T00:00:00.000Z',
+			posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1', durationMs: 3000, playbackAvailable: true,
+		};
+		oldResponse.post!.videos = [
+			{ provider: 'x', mediaIdentity: identityA, posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1', durationMs: 3000, playbackAvailable: true },
+			{ provider: 'x', mediaIdentity: identityB, posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/1?noteId=note-1', durationMs: 5000, playbackAvailable: true },
+		];
+		const refreshedResponse: PreviewResponse = {
+			...oldResponse,
+			post: {
+				...oldResponse.post!,
+				video: {
+					provider: 'x', mediaIdentity: identityB, embedToken: 'renewed-token', embedExpiresAt: '2099-01-01T00:00:00.000Z',
+					posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1', durationMs: 5000, playbackAvailable: true,
+				},
+				videos: [
+					{ provider: 'x', mediaIdentity: identityB, posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1', durationMs: 5000, playbackAvailable: true },
+					{ provider: 'x', mediaIdentity: identityA, posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/1?noteId=note-1', durationMs: 3000, playbackAvailable: true },
+				],
+			},
+		};
+		const api = vi.fn(async (path: string) => {
+			if (path.endsWith('/preview')) return refreshedResponse;
+			throw new Error(`unexpected API call: ${path}`);
+		});
+		const fetcher = vi.fn(async (path: string, options?: RequestInit) => path.endsWith('/media/video')
+			? new Response(new Blob(['selected video'], { type: 'video/mp4' }), { headers: new Headers({ 'Content-Type': 'video/mp4' }) })
+			: new Response(new Blob(['poster'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) }));
+		const openMedia = vi.fn(async () => undefined);
+		initApi(api as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia as PluginHost['openMedia']);
+		setVideoPlaybackMode('nativeProxy');
+		const result = render(FxPreview, { props: { data: oldResponse, input, context: { ...context, preferenceValue: 'media' } } });
+		const buttons = await waitFor(() => {
+			const found = result.container.querySelectorAll('[data-fx-video-play]');
+			if (found.length !== 2) throw new Error(`expected two native video buttons, found ${found.length}`);
+			return Array.from(found);
+		});
+		await fireEvent.click(buttons[0]);
+		await waitFor(() => expect(openMedia).toHaveBeenCalledTimes(1));
+		expect(api).toHaveBeenCalledTimes(1);
+		expect(fetcher.mock.calls.some(([path]) => path.endsWith('/media/video'))).toBe(true);
+		expect(api).toHaveBeenCalledWith('plugin/fxtwitter-preview/preview', { noteId: 'note-1', postId: '1234567890' }, expect.anything());
+		const request = fetcher.mock.calls.find(([path]) => path.endsWith('/media/video'));
+		expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({ index: 1, token: 'renewed-token' });
+	});
+
+	test('updates an old preview without identity and requires a fresh explicit play click', async () => {
+		const oldResponse = videoData();
+		oldResponse.post!.video = {
+			provider: 'x', embedToken: 'expired-token', embedExpiresAt: '2000-01-01T00:00:00.000Z',
+			posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1', durationMs: 3000, playbackAvailable: true,
+		};
+		const refreshedResponse: PreviewResponse = {
+			...oldResponse,
+			post: {
+				...oldResponse.post!,
+				video: {
+					provider: 'x', mediaIdentity: 'c'.repeat(64), embedToken: 'renewed-token', embedExpiresAt: '2099-01-01T00:00:00.000Z',
+					posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1', durationMs: 3000, playbackAvailable: true,
+				},
+			},
+		};
+		const api = vi.fn(async (path: string) => {
+			if (path.endsWith('/preview')) return refreshedResponse;
+			throw new Error(`unexpected API call: ${path}`);
+		});
+		const fetcher = vi.fn(async (path: string, options?: RequestInit) => path.endsWith('/media/video')
+			? new Response(new Blob(['selected video'], { type: 'video/mp4' }), { headers: new Headers({ 'Content-Type': 'video/mp4' }) })
+			: new Response(new Blob(['poster'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) }));
+		const openMedia = vi.fn(async () => undefined);
+		initApi(api as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia as PluginHost['openMedia']);
+		setVideoPlaybackMode('nativeProxy');
+		const result = render(FxPreview, { props: { data: oldResponse, input, context: { ...context, preferenceValue: 'media' } } });
+		const play = await waitFor(() => result.getByRole('button', { name: '動画を再生' }));
+		await fireEvent.click(play);
+		await waitFor(() => expect(result.getByRole('button', { name: 'もう一度試す' })).toBeTruthy());
+		expect(api).toHaveBeenCalledTimes(1);
+		expect(fetcher.mock.calls.some(([path]) => path.endsWith('/media/video'))).toBe(false);
+		await fireEvent.click(result.getByRole('button', { name: 'もう一度試す' }));
+		await waitFor(() => expect(openMedia).toHaveBeenCalledTimes(1));
+		expect(api).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(String(fetcher.mock.calls.find(([path]) => path.endsWith('/media/video'))?.[1]?.body))).toMatchObject({ index: 0, token: 'renewed-token' });
+	});
+
+	test('refreshes an expired official X embed without native media identity in one click', async () => {
+		const oldResponse = videoData();
+		oldResponse.post!.video!.embedExpiresAt = '2000-01-01T00:00:00.000Z';
+		const refreshedResponse: PreviewResponse = {
+			...oldResponse,
+			post: {
+				...oldResponse.post!,
+				video: {
+					provider: 'x', embedToken: 'renewed-official-token', embedExpiresAt: '2099-01-01T00:00:00.000Z',
+					posterUrl: '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1',
+				},
+			},
+		};
+		const api = vi.fn(async (path: string) => {
+			if (path.endsWith('/preview')) return refreshedResponse;
+			throw new Error(`unexpected API call: ${path}`);
+		});
+		const fetcher = vi.fn(async (_path: string, options?: RequestInit) => {
+			if (options?.method !== 'POST') return new Response(new Blob(['poster'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) });
+			const body = JSON.parse(String(options.body)) as { nonce: string };
+			return new Response(JSON.stringify({ url: officialXEmbedURL('1234567890', body.nonce) }), { status: 200, headers: new Headers({ 'Content-Type': 'application/json' }) });
+		});
+		initApi(api as PluginHost['api'], fetcher as PluginHost['fetch']);
+		const result = render(FxPreview, { props: { data: oldResponse, input, context } });
+		await fireEvent.click(await waitFor(() => result.getByRole('button', { name: '動画を再生' })));
+		const frame = await waitFor(() => result.getByTitle('Xの投稿動画'));
+		expect(api).toHaveBeenCalledTimes(1);
+		expect(fetcher.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1);
+		const shellRequest = fetcher.mock.calls.find(([, options]) => options?.method === 'POST');
+		expect(JSON.parse(String(shellRequest?.[1]?.body))).toMatchObject({ token: 'renewed-official-token', target: 'main' });
+		expect(frame.getAttribute('src')).toMatch(/^https:\/\/platform\.twitter\.com\/embed\/Tweet\.html\?/);
 	});
 
 	test('preserves independent main and quote sensitivity while leaving missing values unknown', async () => {
@@ -561,7 +692,7 @@ describe('FxTwitter preview plugin', () => {
 	});
 
 	test.each(['NOTE_UNAVAILABLE', 'POLICY_UNAVAILABLE'])('permission failure %s removes stale content instead of leaving the last response visible', async code => {
-		const apiMock = vi.fn(async () => { throw { code, status: code === 'NOTE_UNAVAILABLE' ? 404 : 500 }; });
+		const apiMock = vi.fn(async () => { throw Object.assign(new Error('preview denied'), { code, status: code === 'NOTE_UNAVAILABLE' ? 404 : 500 }); });
 		initApi(apiMock as PluginHost['api']);
 		const data: PreviewResponse = { ...videoData(), state: 'stale', error: 'temporary' };
 		const result = render(FxPreview, { props: { data, input, context } });
@@ -1108,21 +1239,23 @@ describe('FxTwitter preview plugin', () => {
 	});
 
 	test('requires separate reveal and play actions for a sensitive video', async () => {
-		const call = vi.fn(async (_path: string, body: Record<string, string>) => ({
-			url: officialXEmbedURL('1234567890', body.nonce),
-		}));
-		initApi(call as PluginHost['api']);
+		const fetcher = vi.fn(async (_path: string, options?: RequestInit) => {
+			if (options?.method !== 'POST') return new Response(new Blob(['poster'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) });
+			const body = JSON.parse(String(options?.body)) as { nonce: string };
+			return new Response(JSON.stringify({ url: officialXEmbedURL('1234567890', body.nonce) }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+		});
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
 		const data = videoData();
 		data.post!.isSensitive = true;
 		const result = render(FxPreview, { props: { data, input, context } });
 		await waitFor(() => expect(result.container.querySelector('[data-sensitive-media-hidden="true"]')).toBeTruthy());
 		expect(result.container.querySelector('iframe')).toBeNull();
-		expect(call).not.toHaveBeenCalled();
+		expect(fetcher.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false);
 		await fireEvent.click(result.container.querySelector('[data-sensitive-media-reveal]')!);
-		expect(call).not.toHaveBeenCalled();
+		expect(fetcher.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false);
 		await fireEvent.click(result.container.querySelector('[data-fx-video-play]')!);
 		await waitFor(() => expect(result.baseElement.querySelector('[data-fx-video-modal] iframe')).toBeTruthy());
-		expect(call).toHaveBeenCalledTimes(1);
+		expect(fetcher.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1);
 	});
 
 	test('uses the native reply icon and combines disjoint repost and quote counts once', () => {
@@ -1137,16 +1270,19 @@ describe('FxTwitter preview plugin', () => {
 	});
 
 	test('mounts one official X iframe only after an active detail click', async () => {
-		const call = vi.fn(async (_path: string, body: Record<string, string>) => ({
-			url: officialXEmbedURL('1234567890', body.nonce),
-		}));
-		initApi(call as PluginHost['api']);
+		const call = vi.fn() as PluginHost['api'];
+		const fetcher = vi.fn(async (_path: string, options?: RequestInit) => {
+			if (options?.method !== 'POST') return new Response(new Blob(['poster'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) });
+			const body = JSON.parse(String(options?.body)) as { nonce: string };
+			return new Response(JSON.stringify({ url: officialXEmbedURL('1234567890', body.nonce) }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+		});
+		initApi(call, fetcher as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data: videoData(), input, context } });
 
 		expect(result.queryByTitle('Xの投稿動画')).toBeNull();
 		await waitFor(() => expect(result.getByRole('img').getAttribute('src')).toMatch(/^blob:fx-/));
 		expect(result.queryByTitle('Xの投稿動画')).toBeNull();
-		expect(call).not.toHaveBeenCalled();
+		expect(fetcher.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false);
 
 		await fireEvent.click(await waitFor(() => result.getByRole('button', { name: '動画を再生' })));
 		await waitFor(() => expect(result.getByTitle('Xの投稿動画')).toBeTruthy());
@@ -1160,21 +1296,26 @@ describe('FxTwitter preview plugin', () => {
 		expect(frame.getAttribute('src')).toMatch(/^https:\/\/platform\.twitter\.com\/embed\/Tweet\.html\?/);
 		expect(result.getByRole('button', { name: '動画を再生中' }).hasAttribute('disabled')).toBe(true);
 		expect(result.container.querySelector('[data-fx-video-target="main"] [data-video-poster-count]')).toBeTruthy();
-		expect(call).toHaveBeenCalledWith('plugin/fxtwitter-preview/embed/shell', expect.objectContaining({
-			noteId: 'note-1', postId: '1234567890', token: '0123456789abcdef0123456789abcdef', target: 'main',
-		}), undefined);
+		expect(fetcher).toHaveBeenCalledWith('/api/plugin/fxtwitter-preview/embed/shell', expect.objectContaining({
+			body: expect.stringContaining('"token":"0123456789abcdef0123456789abcdef"'),
+		}));
+		const embedRequest = fetcher.mock.calls.find(([, options]) => options?.method === 'POST');
+		expect(JSON.parse(String(embedRequest?.[1]?.body))).toMatchObject({ noteId: 'note-1', postId: '1234567890', target: 'main' });
 	});
 
 	test('mounts a fixed click-only YouTube embed for a main external video', async () => {
 		const data = videoData();
 		Object.assign(data.post!.video!, { provider: 'youtube', providerVideoId: 'M7lc1UVf-VE' });
-		const call = vi.fn(async () => ({ url: 'https://www.youtube.com/embed/M7lc1UVf-VE?autoplay=0&playsinline=1' }));
-		initApi(call as PluginHost['api']);
+		const call = vi.fn() as PluginHost['api'];
+		const fetcher = vi.fn(async (_path: string, options?: RequestInit) => options?.method !== 'POST'
+			? new Response(new Blob(['poster'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) })
+			: new Response(JSON.stringify({ url: 'https://www.youtube.com/embed/M7lc1UVf-VE?autoplay=0&playsinline=1' }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+		initApi(call, fetcher as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data, input, context } });
 
 		await waitFor(() => expect(result.container.querySelector('[data-fx-video-target="main"]')).toBeTruthy());
 		expect(result.queryByTitle('YouTube video player')).toBeNull();
-		expect(call).not.toHaveBeenCalled();
+		expect(fetcher.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false);
 		await fireEvent.click(result.container.querySelector('[data-fx-video-target="main"] [data-fx-video-play]')!);
 		const frame = await waitFor(() => result.getByTitle('YouTube video player'));
 		expect(frame.closest('[data-fx-video-modal]')).toBeTruthy();
@@ -1182,7 +1323,8 @@ describe('FxTwitter preview plugin', () => {
 		expect(frame.getAttribute('referrerpolicy')).toBe('strict-origin-when-cross-origin');
 		expect(frame.getAttribute('allow')).not.toContain('autoplay');
 		expect(result.getByRole('link', { name: 'YouTubeで開く' }).getAttribute('href')).toBe('https://www.youtube.com/watch?v=M7lc1UVf-VE');
-		expect(call).toHaveBeenCalledWith('plugin/fxtwitter-preview/embed/shell', expect.objectContaining({ target: 'main' }), undefined);
+		const embedRequest = fetcher.mock.calls.find(([, options]) => options?.method === 'POST');
+		expect(JSON.parse(String(embedRequest?.[1]?.body))).toMatchObject({ target: 'main', postId: '1234567890' });
 	});
 
 	test('plays a quoted YouTube video with the quote target and outer cache post id', async () => {
@@ -1198,16 +1340,20 @@ describe('FxTwitter preview plugin', () => {
 				embedToken: 'quote-token',
 			},
 		};
-		const call = vi.fn(async () => ({ url: 'https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=0&playsinline=1' }));
-		initApi(call as PluginHost['api']);
+		const call = vi.fn() as PluginHost['api'];
+		const fetcher = vi.fn(async (_path: string, options?: RequestInit) => options?.method !== 'POST'
+			? new Response(new Blob(['poster'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) })
+			: new Response(JSON.stringify({ url: 'https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=0&playsinline=1' }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+		initApi(call, fetcher as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data, input, context } });
 		await waitFor(() => expect(result.container.querySelector('[data-fx-video-target="quote"] [data-fx-video-play]')).toBeTruthy());
-		expect(call).not.toHaveBeenCalled();
+		expect(fetcher.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false);
 		await fireEvent.click(result.container.querySelector('[data-fx-video-target="quote"] [data-fx-video-play]')!);
 		await waitFor(() => expect(result.getByTitle('YouTube video player')).toBeTruthy());
-		expect(call).toHaveBeenCalledWith('plugin/fxtwitter-preview/embed/shell', expect.objectContaining({
+		const embedRequest = fetcher.mock.calls.find(([, options]) => options?.method === 'POST');
+		expect(JSON.parse(String(embedRequest?.[1]?.body))).toMatchObject({
 			noteId: 'note-1', postId: '1234567890', token: 'quote-token', target: 'quote',
-		}), undefined);
+		});
 	});
 
 	test('keeps unknown external videos as poster-only fallback', async () => {
@@ -1248,9 +1394,11 @@ describe('FxTwitter preview plugin', () => {
 	});
 
 	test('removes the embed immediately when the note is no longer active', async () => {
-		initApi(vi.fn(async (_path: string, body: Record<string, string>) => ({
-			url: officialXEmbedURL('1234567890', body.nonce),
-		})) as PluginHost['api']);
+		const fetcher = vi.fn(async (_path: string, options?: RequestInit) => {
+			const body = JSON.parse(String(options?.body)) as { nonce: string };
+			return new Response(JSON.stringify({ url: officialXEmbedURL('1234567890', body.nonce) }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+		});
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data: videoData(), input, context } });
 		await fireEvent.click(await waitFor(() => result.getByRole('button', { name: '動画を再生' })));
 		await waitFor(() => expect(result.getByTitle('Xの投稿動画')).toBeTruthy());
@@ -1262,19 +1410,23 @@ describe('FxTwitter preview plugin', () => {
 	});
 
 	test('does not mount a late embed response after deactivation', async () => {
-		let resolve!: (value: { url: string }) => void;
+		let resolve!: (value: Response) => void;
 		let nonce = '';
-		initApi(vi.fn((_path: string, body: Record<string, string>) => new Promise(value => { nonce = body.nonce; resolve = value; })) as PluginHost['api']);
+		const fetcher = vi.fn((_path: string, options?: RequestInit) => new Promise<Response>(value => {
+			nonce = (JSON.parse(String(options?.body)) as { nonce: string }).nonce;
+			resolve = value;
+		}));
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data: videoData(), input, context } });
 		await fireEvent.click(await waitFor(() => result.getByRole('button', { name: '動画を再生' })));
 		await result.rerender({ data: videoData(), input, context: { ...context, active: false } });
-		resolve({ url: officialXEmbedURL('1234567890', nonce) });
+		resolve(new Response(JSON.stringify({ url: officialXEmbedURL('1234567890', nonce) }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
 		await Promise.resolve();
 		expect(result.queryByTitle('Xの投稿動画')).toBeNull();
 	});
 
 	test('keeps one retry action when official embed loading fails', async () => {
-		initApi(vi.fn(async () => { throw new Error('mock failure'); }) as PluginHost['api']);
+		initApi(vi.fn() as PluginHost['api'], (async () => { throw new Error('mock failure'); }) as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data: videoData(), input, context } });
 		await fireEvent.click(await waitFor(() => result.getByRole('button', { name: '動画を再生' })));
 		await waitFor(() => expect(result.getByText('動画を再生できませんでした。')).toBeTruthy());

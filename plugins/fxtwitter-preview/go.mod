@@ -4,6 +4,7 @@ go 1.27.4
 
 require (
 	github.com/elythia-network/elythia v0.0.0
+	github.com/elythia-network/mfm v0.1.0
 	github.com/jackc/pgx/v5 v5.9.2
 	golang.org/x/sync v0.24.0
 )

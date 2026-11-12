@@ -75,6 +75,7 @@ export type Capabilities = {
 export type PublicVideoMetadata = {
 	provider: 'x' | 'youtube' | 'external';
 	providerVideoId?: string;
+	mediaIdentity?: string;
 	posterUrl?: string;
 	posterExpiresAt?: string;
 	durationMs?: number;

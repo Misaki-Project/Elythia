@@ -8,14 +8,14 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/elythia-network/mfm"
 )
 
 var statusIDPattern = regexp.MustCompile(`^[0-9]{2,20}$`)
 var xUserIDPattern = regexp.MustCompile(`^[0-9]{1,20}$`)
 var statusUserPattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,15}$`)
 var youtubeVideoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
-var candidateURLPattern = regexp.MustCompile(`https://[^\s<>"']+`)
-
 var statusHosts = map[string]bool{
 	"x.com": true, "www.x.com": true, "mobile.x.com": true,
 	"twitter.com": true, "www.twitter.com": true, "mobile.twitter.com": true,
@@ -82,6 +82,7 @@ type PublicImage struct {
 type PublicVideo struct {
 	Provider          string     `json:"provider,omitempty"`
 	ProviderVideoID   string     `json:"providerVideoId,omitempty"`
+	MediaIdentity     string     `json:"mediaIdentity,omitempty"`
 	PosterURL         string     `json:"posterUrl,omitempty"`
 	PosterExpiresAt   *time.Time `json:"posterExpiresAt,omitempty"`
 	DurationMS        int64      `json:"durationMs,omitempty"`
@@ -95,6 +96,7 @@ type PublicVideo struct {
 type PublicVideoMetadata struct {
 	Provider          string     `json:"provider,omitempty"`
 	ProviderVideoID   string     `json:"providerVideoId,omitempty"`
+	MediaIdentity     string     `json:"mediaIdentity,omitempty"`
 	PosterURL         string     `json:"posterUrl,omitempty"`
 	PosterExpiresAt   *time.Time `json:"posterExpiresAt,omitempty"`
 	DurationMS        int64      `json:"durationMs,omitempty"`
@@ -187,13 +189,23 @@ func noteContainsStatus(text, wantedID string) bool {
 	if !statusIDPattern.MatchString(wantedID) {
 		return false
 	}
-	for _, candidate := range candidateURLPattern.FindAllString(text, -1) {
-		candidate = strings.TrimRight(candidate, ".,;:!?)]}")
-		if id, ok := statusIDFromURL(candidate); ok && id == wantedID {
-			return true
+	var walk func(nodes []*mfm.Node) bool
+	walk = func(nodes []*mfm.Node) bool {
+		for _, node := range nodes {
+			if node.Type == mfm.NodeURL || node.Type == mfm.NodeLink {
+				if candidate, ok := node.Props["url"].(string); ok {
+					if id, ok := statusIDFromURL(candidate); ok && id == wantedID {
+						return true
+					}
+				}
+			}
+			if walk(node.Children) {
+				return true
+			}
 		}
+		return false
 	}
-	return false
+	return walk(mfm.Parse(text))
 }
 
 func safeHTTPSURL(raw string) string {
