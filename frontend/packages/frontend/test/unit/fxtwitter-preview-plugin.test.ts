@@ -786,23 +786,121 @@ describe('FxTwitter preview plugin', () => {
 		expect(URL.createObjectURL).not.toHaveBeenCalled();
 	});
 
-	test('keeps successful media across viewport exits and refetches only after a full remount', async () => {
-		const pluginFetch = vi.fn(async (_path: string, options?: RequestInit) => await fetchMock('/api/plugin/fxtwitter-preview/media/proxy', options));
+	test('keeps successful media across temporary inactive and viewport exits', async () => {
+		let serverExpires = false;
+		const pluginFetch = vi.fn(async (_path: string, options?: RequestInit) => {
+			if (serverExpires) return new Response('expired', { status: 404 });
+			return await fetchMock('/api/plugin/fxtwitter-preview/media/proxy', options);
+		});
 		initApi(vi.fn() as PluginHost['api'], pluginFetch as PluginHost['fetch']);
 		const data = videoData();
 		data.post!.author.avatarUrl = '/api/plugin/fxtwitter-preview/media/1234567890/avatar/0?noteId=note-1';
 		const result = render(FxPreview, { props: { data, input, context } });
 		await waitFor(() => expect(pluginFetch).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(result.getAllByRole('img').every(image => image.getAttribute('src')?.startsWith('blob:fx-'))).toBe(true));
+		serverExpires = true;
 
-		await result.rerender({ data, input, context: { ...context, inViewport: false } });
+		await result.rerender({ data, input, context: { ...context, active: false, inViewport: false } });
+		await new Promise(resolve => setTimeout(resolve, 20));
 		await result.rerender({ data, input, context: { ...context, inViewport: true } });
 		await Promise.resolve();
 		expect(pluginFetch).toHaveBeenCalledTimes(2);
-
+		expect(result.container.querySelectorAll('img').length).toBeGreaterThan(0);
+		expect(result.container.querySelector('[role="status"]')).toBeNull();
+		expect(URL.revokeObjectURL).not.toHaveBeenCalled();
 		result.unmount();
 		const remounted = render(FxPreview, { props: { data, input, context } });
 		await waitFor(() => expect(pluginFetch).toHaveBeenCalledTimes(4));
+		await waitFor(() => expect(remounted.getByText('メディアを読み込めませんでした。')).toBeTruthy());
 		remounted.unmount();
+	});
+
+	test('offers an explicit media retry after a retryable endpoint failure', async () => {
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1', alt: 'photo' }];
+		const previewApi = vi.fn(async (path: string) => {
+			if (path.endsWith('/preview')) return data;
+			throw new Error(`unexpected API call: ${path}`);
+		});
+		let mediaRequestCount = 0;
+		const pluginFetch = vi.fn(async () => ++mediaRequestCount === 1
+			? new Response('expired media', { status: 404 })
+			: new Response(new Blob(['image bytes'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) }));
+		initApi(previewApi as PluginHost['api'], pluginFetch as PluginHost['fetch']);
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(result.getByText('メディアを読み込めませんでした。')).toBeTruthy());
+		expect(result.getByRole('button', { name: 'メディアを再取得' })).toBeTruthy();
+		expect(previewApi).not.toHaveBeenCalled();
+		await fireEvent.click(result.getByRole('button', { name: 'メディアを再取得' }));
+		await waitFor(() => expect(result.getByRole('img').getAttribute('src')).toMatch(/^blob:fx-/));
+		expect(previewApi).toHaveBeenCalledTimes(1);
+		expect(previewApi).toHaveBeenCalledWith('plugin/fxtwitter-preview/preview', { noteId: 'note-1', postId: '1234567890' }, expect.anything());
+		expect(pluginFetch).toHaveBeenCalledTimes(2);
+		expect(result.queryByRole('button', { name: 'メディアを再取得' })).toBeNull();
+	});
+
+	test.each([401, 403])('blocks media retry after an unauthorized %i response', async status => {
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1', alt: 'photo' }];
+		const previewApi = vi.fn() as PluginHost['api'];
+		const pluginFetch = vi.fn(async () => new Response('not authorized', { status }));
+		initApi(previewApi, pluginFetch as PluginHost['fetch']);
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(result.getByText('メディアを表示する権限を確認できません。')).toBeTruthy());
+		expect(result.queryByRole('button', { name: 'メディアを再取得' })).toBeNull();
+		expect(previewApi).not.toHaveBeenCalled();
+		expect(pluginFetch).toHaveBeenCalledTimes(1);
+	});
+
+	test('clears attachment leases when the content warning hides media and when its source changes', async () => {
+		const pluginFetch = vi.fn(async (_path: string, options?: RequestInit) => await fetchMock('/api/plugin/fxtwitter-preview/media/proxy', options));
+		initApi(vi.fn() as PluginHost['api'], pluginFetch as PluginHost['fetch']);
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1', alt: 'photo' }];
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(result.getByRole('img').getAttribute('src')).toMatch(/^blob:fx-/));
+		await result.rerender({ data, input, context: { ...context, revealed: false } });
+		await waitFor(() => expect(result.container.querySelector('img')).toBeNull());
+		await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledTimes(1));
+		expect(pluginFetch).toHaveBeenCalledTimes(1);
+		await result.rerender({ data, input, context });
+		await waitFor(() => expect(pluginFetch).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(result.getByRole('img').getAttribute('src')).toMatch(/^blob:fx-/));
+		await result.rerender({ data, input, context: { ...context, source: { kind: 'note', noteId: 'note-2' } } });
+		await waitFor(() => expect(result.container.querySelector('img')).toBeNull());
+		expect(pluginFetch).toHaveBeenCalledTimes(2);
+		expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2);
+	});
+
+	test('ignores delayed media failures after CW and source-owner changes', async () => {
+		const pendingResponses: Array<(response: Response) => void> = [];
+		const pluginFetch = vi.fn(async () => await new Promise<Response>(resolve => pendingResponses.push(resolve)));
+		initApi(vi.fn() as PluginHost['api'], pluginFetch as PluginHost['fetch']);
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1', alt: 'photo' }];
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(pluginFetch).toHaveBeenCalledTimes(1));
+		await result.rerender({ data, input, context: { ...context, revealed: false } });
+		await waitFor(() => expect(URL.revokeObjectURL).not.toHaveBeenCalled());
+		pendingResponses[0](new Response('expired', { status: 404 }));
+		await result.rerender({ data, input, context });
+		await waitFor(() => expect(pluginFetch).toHaveBeenCalledTimes(2));
+		await result.rerender({ data, input, context: { ...context, source: { kind: 'note', noteId: 'note-2' } } });
+		await waitFor(() => expect(result.getByRole('status', { name: 'Xの投稿を取得しています' })).toBeTruthy());
+		pendingResponses[1](new Response('denied', { status: 403 }));
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(result.queryByText('メディアを読み込めませんでした。')).toBeNull();
+		expect(result.queryByText('メディアを表示する権限を確認できません。')).toBeNull();
+		expect(result.getByRole('status', { name: 'Xの投稿を取得しています' })).toBeTruthy();
 	});
 
 	test('shares media between references and revokes it after the final release', async () => {

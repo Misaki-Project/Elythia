@@ -234,7 +234,7 @@ return res.Assigned, nil
 
 role policyで認可する場合は、任意拡張`plugin.CheckedRolePolicyRequest`の`CheckedRolePolicies(keys...)`を使う。要求したキーだけをホストのchecked resolverで解決し、DB・provider・policy入力のエラーはそのまま返る。未実装、エラー、欠落値、期待する型でない値は拒否に倒す。`IsAdministrator`や`HasRolePolicy`の短絡を認可として使わず、administratorを含めて解決済みの明示的denyを尊重すること。
 
-条件付きロール評価の入力取得に失敗したsnapshotは、DB読み出しの連続を抑えるため最大1秒だけnegative cacheされる（best-effort）。negative cacheは既存role cache mapの最大1024件までで、上限中は新しいerror entryを保存しないため、連続するDB読み出しが発生する場合がある。checked resolverはcache hitでも元の入力エラーを返し、providerを実行しない。入力が回復すればcache expiry後に再試行し、`InvalidateUser` / `InvalidateRole`による明示的な無効化はすぐ反映される。部分入力から得たprovider出力はcacheされない。
+条件付きロール評価の入力取得に失敗したsnapshotは、DB読み出しの連続を抑えるため最大1秒だけnegative cacheされる（best-effort）。成功分を含むrole cache全体が1024件以上なら、新しいerror entryは保存しない。既存キーの更新は許可される。飽和時は読み直しが残る場合がある。checked resolverはcache hitでも元の入力エラーを返し、providerを実行しない。入力が回復すればcache expiry後に再試行し、`InvalidateUser` / `InvalidateRole`による明示的な無効化はすぐ反映される。部分入力から得たprovider出力はcacheされない。
 
 バックグラウンド処理で、投入後にも許可を再確認する場合は任意拡張`plugin.CheckedUserRolePolicyContext`を使う。これは`plugin.Context`本体を拡張しないため既存の外部実装を壊さない。解決エラーは拒否として扱い、権限が取り消された仕事は外部I/Oの前に取消すこと。
 

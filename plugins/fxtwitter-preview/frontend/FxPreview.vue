@@ -85,7 +85,12 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</div>
 		<MkTime v-if="quoteCreatedAt" :class="$style.postTime" :time="quoteCreatedAt" mode="detail"/>
 	</section>
-	<p v-if="mediaLoadFailed" :class="$style.mediaError">メディアを読み込めませんでした。</p>
+	<div v-if="mediaLoadFailed" :class="$style.mediaError" role="status">
+		<p>{{ mediaLoadBlocked ? 'メディアを表示する権限を確認できません。' : 'メディアを読み込めませんでした。' }}</p>
+		<button v-if="canRetryMedia" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0" @click.stop="retryPreview">
+			{{ retryLoading ? '再取得中…' : 'メディアを再取得' }}
+		</button>
+	</div>
 	<footer :class="$style.footer">
 		<span aria-label="返信"><i class="ti ti-arrow-back-up"></i> {{ formatCount(viewData.post.replies) }}</span>
 		<span aria-label="リポストと引用"><i class="ti ti-repeat"></i> {{ formatCount(repostCount) }}</span>
@@ -151,9 +156,12 @@ const canRetryPreview = computed(() => (viewData.value.state === 'stale' || view
 	props.context.source?.kind === 'note' && props.context.revealed && props.context.active && props.context.inViewport && !retryBlocked.value);
 const expanded = ref(false);
 type LoadedMedia = { src: string; blob: Blob };
+type MediaLoadFailure = 'retryable' | 'blocked';
+type MediaFetchResult = { media: LoadedMedia | null; failure: MediaLoadFailure | null };
 type IdentityBundle = {
 	avatar: LoadedMedia | null;
 	quoteAvatar: LoadedMedia | null;
+	failure: MediaLoadFailure | null;
 	objectUrls: string[];
 };
 type AttachmentBundle = {
@@ -161,6 +169,7 @@ type AttachmentBundle = {
 	videoPosters: Array<LoadedMedia | null>;
 	quoteImages: Array<LoadedMedia | null>;
 	quoteVideoPosters: Array<LoadedMedia | null>;
+	failure: MediaLoadFailure | null;
 	objectUrls: string[];
 };
 let identityGeneration = 0;
@@ -169,6 +178,9 @@ let identityLease: ResourceLease<IdentityBundle> | null = null;
 let attachmentLease: ResourceLease<AttachmentBundle> | null = null;
 let identityKey = '';
 let attachmentKey = '';
+let identityFailure: MediaLoadFailure | null = null;
+let attachmentFailure: MediaLoadFailure | null = null;
+let mediaLoadGeneration = 0;
 const avatarSrc = ref<string | null>(null);
 const imageSources = ref<Array<string | null>>([]);
 const imageBlobs = ref<Array<Blob | null>>([]);
@@ -180,6 +192,10 @@ const quoteImageBlobs = ref<Array<Blob | null>>([]);
 const quoteImagesRevealed = ref(false);
 const quoteVideoPosterSources = ref<Array<string | null>>([]);
 const mediaLoadFailed = ref(false);
+const mediaLoadBlocked = ref(false);
+const canRetryMedia = computed(() => mediaLoadFailed.value && !mediaLoadBlocked.value && !retryBlocked.value &&
+	(viewData.value.state === 'ready' || viewData.value.state === 'stale') && viewData.value.post != null &&
+	props.context.source?.kind === 'note' && props.context.revealed && props.context.active && props.context.inViewport);
 const renderedImages = computed(() => (viewData.value.post?.images ?? []).flatMap((image, index) => {
 	const src = imageSources.value[index];
 	return src == null ? [] : [{ index, src, alt: image.alt ?? '', width: image.width, height: image.height }];
@@ -270,7 +286,7 @@ function isAccessFailure(error: unknown): boolean {
 }
 
 async function retryPreview(): Promise<void> {
-	if (!canRetryPreview.value || retryWaitMs.value > 0 || retryLoading.value || props.context.source?.kind !== 'note') return;
+	if ((!canRetryPreview.value && !canRetryMedia.value) || retryWaitMs.value > 0 || retryLoading.value || props.context.source?.kind !== 'note') return;
 	const owner = retryOwnerKey.value;
 	const generation = ++retryGeneration;
 	const controller = new AbortController();
@@ -467,6 +483,7 @@ function clearIdentity(): void {
 	identityLease?.release();
 	identityLease = null;
 	identityKey = '';
+	identityFailure = null;
 	avatarSrc.value = null;
 	quoteAvatarSrc.value = null;
 }
@@ -476,6 +493,7 @@ function clearAttachments(): void {
 	attachmentLease?.release();
 	attachmentLease = null;
 	attachmentKey = '';
+	attachmentFailure = null;
 	imageSources.value = [];
 	imageBlobs.value = [];
 	videoPosterSources.value = [];
@@ -485,9 +503,24 @@ function clearAttachments(): void {
 }
 
 function clearMedia(): void {
+	mediaLoadGeneration++;
 	clearIdentity();
 	clearAttachments();
 	mediaLoadFailed.value = false;
+	mediaLoadBlocked.value = false;
+}
+
+function emptyMediaResult(): MediaFetchResult {
+	return { media: null, failure: null };
+}
+
+function failedMediaResult(failure: MediaLoadFailure): MediaFetchResult {
+	return { media: null, failure };
+}
+
+function combineMediaFailures(...failures: Array<MediaLoadFailure | null>): MediaLoadFailure | null {
+	if (failures.includes('blocked')) return 'blocked';
+	return failures.includes('retryable') ? 'retryable' : null;
 }
 
 function expectedMediaUrl(kind: string, index: number): URL | null {
@@ -497,66 +530,101 @@ function expectedMediaUrl(kind: string, index: number): URL | null {
 	return new URL(`/api/plugin/fxtwitter-preview/media/${encodeURIComponent(post.id)}/${kind}/${index}?noteId=${encodeURIComponent(source.noteId)}`, window.location.origin);
 }
 
-async function fetchMedia(path: string, signal: AbortSignal, kind: string, index: number): Promise<LoadedMedia | null> {
+async function fetchMedia(path: string, signal: AbortSignal, kind: string, index: number): Promise<MediaFetchResult> {
 	const expected = expectedMediaUrl(kind, index);
 	let url: URL;
-	try { url = new URL(path, window.location.origin); } catch { return null; }
+	try { url = new URL(path, window.location.origin); } catch { return emptyMediaResult(); }
 	if (expected == null || url.origin !== expected.origin || url.pathname !== expected.pathname || url.hash !== '' ||
 		url.username !== '' || url.password !== '' || url.searchParams.size !== 1 ||
-		url.searchParams.getAll('noteId').length !== 1 || url.searchParams.get('noteId') !== props.context.source?.noteId) return null;
-	const response = await fetchPluginResource(`${url.pathname}${url.search}`, {
-		method: 'GET',
-		cache: 'no-store',
-		signal,
-	});
-	if (signal.aborted || !response.ok) return null;
+		url.searchParams.getAll('noteId').length !== 1 || url.searchParams.get('noteId') !== props.context.source?.noteId) return emptyMediaResult();
+	let response: Response;
+	try {
+		response = await fetchPluginResource(`${url.pathname}${url.search}`, {
+			method: 'GET',
+			cache: 'no-store',
+			signal,
+		});
+	} catch {
+		return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable');
+	}
+	if (signal.aborted) return emptyMediaResult();
+	if (response.status === 401 || response.status === 403) return failedMediaResult('blocked');
+	if (!response.ok) return failedMediaResult('retryable');
 	const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
-	if (contentType == null || !['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'].includes(contentType)) return null;
+	if (contentType == null || !['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'].includes(contentType)) return failedMediaResult('retryable');
 	const contentLength = response.headers.get('Content-Length');
-	if (contentLength != null && (!/^\d+$/.test(contentLength) || Number(contentLength) > 50 * 1024 * 1024)) return null;
-	const blob = await response.blob();
+	if (contentLength != null && (!/^\d+$/.test(contentLength) || Number(contentLength) > 50 * 1024 * 1024)) return failedMediaResult('retryable');
+	let blob: Blob;
+	try { blob = await response.blob(); } catch { return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable'); }
 	const blobType = blob.type.split(';', 1)[0]?.trim().toLowerCase();
-	if (signal.aborted || blob.size > 50 * 1024 * 1024 || blobType !== contentType) return null;
-	return { src: URL.createObjectURL(blob), blob };
+	if (signal.aborted) return emptyMediaResult();
+	if (blob.size > 50 * 1024 * 1024 || blobType !== contentType) return failedMediaResult('retryable');
+	try { return { media: { src: URL.createObjectURL(blob), blob }, failure: null }; } catch { return failedMediaResult('retryable'); }
 }
 
-async function loadIdentity(): Promise<void> {
+async function loadIdentity(): Promise<MediaLoadFailure | null> {
 	const post = viewData.value.post;
 	const source = props.context.source;
-	if (post == null || source?.kind !== 'note') return;
+	if (post == null || source?.kind !== 'note') return null;
 	const nextKey = `${ownerKey()}:identity`;
-	if (identityLease != null && identityKey === nextKey) return;
+	if (identityLease != null && identityKey === nextKey) {
+		const lease = identityLease;
+		const current = identityGeneration;
+		const bundle = await lease.promise;
+		if (current !== identityGeneration || identityLease !== lease) return null;
+		identityFailure = bundle.failure;
+		avatarSrc.value = bundle.avatar?.src ?? null;
+		quoteAvatarSrc.value = bundle.quoteAvatar?.src ?? null;
+		return identityFailure;
+	}
 	clearIdentity();
 	const current = identityGeneration;
 	const quote = post.quote;
 	const lease = retainResource<IdentityBundle>(nextKey, async signal => {
-		const loadOne = async (path: string | undefined, kind: string): Promise<LoadedMedia | null> => path == null ? null : await fetchMedia(path, signal, kind, 0).catch(() => null);
-		const [avatar, quoteAvatar] = await Promise.all([
+		const loadOne = async (path: string | undefined, kind: string): Promise<MediaFetchResult> => path == null ? emptyMediaResult() : await fetchMedia(path, signal, kind, 0);
+		const [avatarResult, quoteAvatarResult] = await Promise.all([
 			loadOne(post.author.avatarUrl, 'avatar'),
 			loadOne(quote?.author.avatarUrl, 'quote-avatar'),
 		]);
+		const avatar = avatarResult.media;
+		const quoteAvatar = quoteAvatarResult.media;
 		const objectUrls = [avatar, quoteAvatar].flatMap(value => value == null ? [] : [value.src]);
-		return { avatar, quoteAvatar, objectUrls };
+		return { avatar, quoteAvatar, failure: combineMediaFailures(avatarResult.failure, quoteAvatarResult.failure), objectUrls };
 	}, bundle => {
 		for (const objectUrl of bundle.objectUrls) URL.revokeObjectURL(objectUrl);
 	});
 	identityLease = lease;
 	identityKey = nextKey;
 	const bundle = await lease.promise;
-	if (current !== identityGeneration || identityLease !== lease) return;
+	if (current !== identityGeneration || identityLease !== lease) return null;
+	identityFailure = bundle.failure;
 	avatarSrc.value = bundle.avatar?.src ?? null;
 	quoteAvatarSrc.value = bundle.quoteAvatar?.src ?? null;
+	return identityFailure;
 }
 
-async function loadAttachments(): Promise<void> {
+async function loadAttachments(): Promise<MediaLoadFailure | null> {
 	const post = viewData.value.post;
 	const source = props.context.source;
 	if (post == null || source?.kind !== 'note' || !showAttachmentMedia.value) {
 		clearAttachments();
-		return;
+		return null;
 	}
 	const nextKey = `${ownerKey()}:attachments`;
-	if (attachmentLease != null && attachmentKey === nextKey) return;
+	if (attachmentLease != null && attachmentKey === nextKey) {
+		const lease = attachmentLease;
+		const current = attachmentGeneration;
+		const bundle = await lease.promise;
+		if (current !== attachmentGeneration || attachmentLease !== lease) return null;
+		attachmentFailure = bundle.failure;
+		imageSources.value = bundle.images.map(value => value?.src ?? null);
+		imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
+		videoPosterSources.value = bundle.videoPosters.map(value => value?.src ?? null);
+		quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
+		quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
+		quoteVideoPosterSources.value = bundle.quoteVideoPosters.map(value => value?.src ?? null);
+		return attachmentFailure;
+	}
 	clearAttachments();
 	const current = attachmentGeneration;
 	const quote = post.quote;
@@ -564,39 +632,55 @@ async function loadAttachments(): Promise<void> {
 	const quoteVideos = quote?.videos?.length ? quote.videos : quote?.video == null ? [] : [quote.video];
 	const lease = retainResource<AttachmentBundle>(nextKey, async signal => {
 		const [images, videoPosters, quoteImages, quoteVideoPosters] = await Promise.all([
-			Promise.all((post.images ?? []).map((image, index) => fetchMedia(image.url, signal, 'image', index).catch(() => null))),
-			Promise.all(postVideos.map((video, index) => video.posterUrl == null ? null : fetchMedia(video.posterUrl, signal, 'poster', index).catch(() => null))),
-			Promise.all(quote?.images.map((image, index) => fetchMedia(image.url, signal, 'quote-image', index).catch(() => null)) ?? []),
-			Promise.all(quoteVideos.map((video, index) => video.posterUrl == null ? null : fetchMedia(video.posterUrl, signal, 'quote-poster', index).catch(() => null))),
+			Promise.all((post.images ?? []).map((image, index) => fetchMedia(image.url, signal, 'image', index))),
+			Promise.all(postVideos.map((video, index) => video.posterUrl == null ? emptyMediaResult() : fetchMedia(video.posterUrl, signal, 'poster', index))),
+			Promise.all(quote?.images.map((image, index) => fetchMedia(image.url, signal, 'quote-image', index)) ?? []),
+			Promise.all(quoteVideos.map((video, index) => video.posterUrl == null ? emptyMediaResult() : fetchMedia(video.posterUrl, signal, 'quote-poster', index))),
 		]);
-		const objectUrls = [...images, ...videoPosters, ...quoteImages, ...quoteVideoPosters].flatMap(value => value == null ? [] : [value.src]);
-		return { images, videoPosters, quoteImages, quoteVideoPosters, objectUrls };
+		const results = [...images, ...videoPosters, ...quoteImages, ...quoteVideoPosters];
+		const objectUrls = results.flatMap(result => result.media == null ? [] : [result.media.src]);
+		return {
+			images: images.map(result => result.media),
+			videoPosters: videoPosters.map(result => result.media),
+			quoteImages: quoteImages.map(result => result.media),
+			quoteVideoPosters: quoteVideoPosters.map(result => result.media),
+			failure: combineMediaFailures(...results.map(result => result.failure)),
+			objectUrls,
+		};
 	}, bundle => {
 		for (const objectUrl of bundle.objectUrls) URL.revokeObjectURL(objectUrl);
 	});
 	attachmentLease = lease;
 	attachmentKey = nextKey;
 	const bundle = await lease.promise;
-	if (current !== attachmentGeneration || attachmentLease !== lease) return;
+	if (current !== attachmentGeneration || attachmentLease !== lease) return null;
+	attachmentFailure = bundle.failure;
 	imageSources.value = bundle.images.map(value => value?.src ?? null);
 	imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
 	videoPosterSources.value = bundle.videoPosters.map(value => value?.src ?? null);
 	quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
 	quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
 	quoteVideoPosterSources.value = bundle.quoteVideoPosters.map(value => value?.src ?? null);
+	return attachmentFailure;
 }
 
 async function loadMedia(): Promise<void> {
 	const post = viewData.value.post;
 	const source = props.context.source;
-	if (!props.context.revealed || !props.context.active || (viewData.value.state !== 'ready' && viewData.value.state !== 'stale') || post == null || source?.kind !== 'note') {
+	if (!props.context.revealed || (viewData.value.state !== 'ready' && viewData.value.state !== 'stale') || post == null || source?.kind !== 'note') {
 		clearMedia();
 		return;
 	}
-	if (!props.context.inViewport) return;
-	mediaLoadFailed.value = false;
+	if (!showAttachmentMedia.value) clearAttachments();
+	if (!props.context.active || !props.context.inViewport) return;
+	const owner = ownerKey();
+	const generation = ++mediaLoadGeneration;
 	const results = await Promise.allSettled([loadIdentity(), loadAttachments()]);
-	if (results.some(result => result.status === 'rejected')) mediaLoadFailed.value = true;
+	if (generation !== mediaLoadGeneration || owner !== ownerKey()) return;
+	const failures = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : ['retryable' as const]);
+	const failure = combineMediaFailures(...failures);
+	mediaLoadBlocked.value = failure === 'blocked';
+	mediaLoadFailed.value = failure != null;
 }
 
 async function openImage(index: number): Promise<void> {
@@ -657,11 +741,13 @@ function consumeMoreExpandRequest(): boolean {
 	return true;
 }
 
-watch(() => [viewData.value, props.context.revealed, props.context.active, props.context.inViewport, showAttachmentMedia.value], () => { void loadMedia(); });
-watch(currentOwnerKey, () => {
-	clearMedia();
-	void loadMedia();
-});
+watch(
+	() => [currentOwnerKey.value, viewData.value, props.context.revealed, props.context.active, props.context.inViewport, showAttachmentMedia.value] as const,
+	(values, oldValues) => {
+		if (oldValues != null && values[0] !== oldValues[0]) clearMedia();
+		void loadMedia();
+	},
+);
 watch([
 	() => viewData.value.post?.id,
 	() => props.context.detail,
