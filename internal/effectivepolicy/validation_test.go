@@ -202,12 +202,22 @@ func TestFxTwitterRolePolicyDefaultsAndBounds(t *testing.T) {
 	require.Equal(t, true, defaults["canUseFxTwitterPreview"])
 	require.Equal(t, 100, defaults["fxTwitterColdFetchesPerHour"])
 	require.Equal(t, 600, defaults["fxTwitterColdFetchesPerDay"])
-	for _, value := range []any{true, false} { assert.True(t, ValidatePolicyValue("canUseFxTwitterPreview", value)) }
+	for _, value := range []any{true, false} {
+		assert.True(t, ValidatePolicyValue("canUseFxTwitterPreview", value))
+	}
 	assert.False(t, ValidatePolicyValue("canUseFxTwitterPreview", "true"))
-	for _, value := range []any{1, int64(10000), float64(600)} { assert.True(t, ValidatePolicyValue("fxTwitterColdFetchesPerHour", value)) }
-	for _, value := range []any{0, 10001, "100", 1.5} { assert.False(t, ValidatePolicyValue("fxTwitterColdFetchesPerHour", value)) }
-	for _, value := range []any{1, int64(100000), float64(600)} { assert.True(t, ValidatePolicyValue("fxTwitterColdFetchesPerDay", value)) }
-	for _, value := range []any{0, 100001, "600", 1.5} { assert.False(t, ValidatePolicyValue("fxTwitterColdFetchesPerDay", value)) }
+	for _, value := range []any{1, int64(10000), float64(600)} {
+		assert.True(t, ValidatePolicyValue("fxTwitterColdFetchesPerHour", value))
+	}
+	for _, value := range []any{0, 10001, "100", 1.5} {
+		assert.False(t, ValidatePolicyValue("fxTwitterColdFetchesPerHour", value))
+	}
+	for _, value := range []any{1, int64(100000), float64(600)} {
+		assert.True(t, ValidatePolicyValue("fxTwitterColdFetchesPerDay", value))
+	}
+	for _, value := range []any{0, 100001, "600", 1.5} {
+		assert.False(t, ValidatePolicyValue("fxTwitterColdFetchesPerDay", value))
+	}
 }
 func TestAccountDeletionPolicyDefaultsAndTypes(t *testing.T) {
 	defaults := Defaults()

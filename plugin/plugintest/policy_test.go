@@ -2,6 +2,7 @@ package plugintest_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"testing"
@@ -11,6 +12,45 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCheckedRolePolicyHarnessRequiresUserPropagatesErrorsAndFiltersKeys(t *testing.T) {
+	configured := map[string]any{"canSearchNotes": true, "mentionLimit": 17}
+	pluginContext, ok := plugintest.New(t).WithCheckedUserRolePolicies(configured, nil).Context().(plugin.CheckedUserRolePolicyContext)
+	require.True(t, ok, "harness context implements the optional checked-policy interface")
+	policies, err := pluginContext.CheckedUserRolePolicies("u1", "mentionLimit", "unknown")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"mentionLimit": 17}, policies, "context harness returns only requested keys")
+	_, err = pluginContext.CheckedUserRolePolicies("", "mentionLimit")
+	require.Error(t, err, "background policy lookup requires an actor")
+
+	lookupErr := errors.New("policy source unavailable")
+	failedContext, ok := plugintest.New(t).WithCheckedUserRolePolicies(configured, lookupErr).Context().(plugin.CheckedUserRolePolicyContext)
+	require.True(t, ok)
+	_, err = failedContext.CheckedUserRolePolicies("u1", "mentionLimit")
+	require.ErrorIs(t, err, lookupErr, "background policy lookup preserves its configured failure")
+
+	routeDefinition := plugin.Definition{
+		Name: "checked-request", APIVersion: plugin.APIVersion,
+		Routes: func(_ plugin.Context, router plugin.Router) error {
+			router.POST("/policies", func(req plugin.Request) (any, error) {
+				checked, ok := req.(plugin.CheckedRolePolicyRequest)
+				if !ok {
+					return nil, errors.New("checked policy interface unavailable")
+				}
+				return checked.CheckedRolePolicies("mentionLimit", "unknown")
+			})
+			return nil
+		},
+	}
+	registered := plugintest.New(t).Routes(routeDefinition)
+	_, err = registered.Call(t, "POST /policies", plugintest.Request{})
+	require.Error(t, err, "request policy lookup requires an authenticated user")
+	got, err := registered.Call(t, "POST /policies", plugintest.Request{UserID: "u1", CheckedRolePolicies: configured})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"mentionLimit": 17}, got, "request harness returns only requested keys")
+	_, err = registered.Call(t, "POST /policies", plugintest.Request{UserID: "u1", CheckedRolePolicyError: lookupErr})
+	require.ErrorIs(t, err, lookupErr, "request harness preserves its configured failure")
+}
 
 type policyInvalidatorRecorder struct{ users []string }
 

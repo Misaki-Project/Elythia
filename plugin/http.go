@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // Router registers a plugin's HTTP endpoints.
@@ -69,6 +70,11 @@ type Blob struct {
 
 	// CacheControl sets the header when non-empty.
 	CacheControl string
+
+	// WriteTimeout bounds how long the host may spend writing this response.
+	// Zero keeps the existing unbounded behavior. Negative values are rejected.
+	// The host enforces a positive value before writing the response body.
+	WriteTimeout time.Duration
 }
 
 // Request is the plugin-facing view of an HTTP request.

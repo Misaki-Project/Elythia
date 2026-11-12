@@ -24,6 +24,7 @@ const (
 	mediaProcessingConcurrency = 2
 	mediaRequestCapacity       = 16
 	mediaBufferCapacity        = 128 << 20
+	mediaResponseWriteTimeout  = 2 * time.Minute
 )
 
 var errMediaBusy = errors.New("media processing capacity is unavailable")
@@ -215,7 +216,7 @@ func fetchMediaWithAdmission(ctx context.Context, base *http.Client, rawURL stri
 	}
 	releaseDecoder()
 	keepReservation = true
-	return plugin.Blob{ContentType: detected, Body: body, CacheControl: "private, no-store"}, release, nil
+	return plugin.Blob{ContentType: detected, Body: body, CacheControl: "private, no-store", WriteTimeout: mediaResponseWriteTimeout}, release, nil
 }
 
 func readBoundedMediaBody(reader io.Reader, maxBytes int) ([]byte, error) {

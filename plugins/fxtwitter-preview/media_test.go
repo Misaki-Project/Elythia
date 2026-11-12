@@ -94,7 +94,7 @@ func TestMediaFetchAcceptsBoundedRasterFormats(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(blob.Body) != len(body) || blob.CacheControl != "private, no-store" {
+			if len(blob.Body) != len(body) || blob.CacheControl != "private, no-store" || blob.WriteTimeout != mediaResponseWriteTimeout {
 				t.Fatalf("blob = %#v", blob)
 			}
 		})
@@ -116,7 +116,7 @@ func TestMediaFetchAcceptsAllowlistedYouTubePosterHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !called || len(blob.Body) != len(body) {
+	if !called || len(blob.Body) != len(body) || blob.WriteTimeout != mediaResponseWriteTimeout {
 		t.Fatalf("called = %v, blob bytes = %d", called, len(blob.Body))
 	}
 }

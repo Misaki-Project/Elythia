@@ -62,18 +62,24 @@ const xStatusPath = /^\/(?:[^/]+\/status\/\d+|i\/status\/\d+|i\/web\/status\/\d+
 const signatureKey = /^(?:sig|signature|token|expires|hmac|auth|authorization|key|access_token|refresh_token|x-amz-.*|x-goog-.*)$/i;
 const trailingPunctuation = new Set(['.', ',', '!', '?', ':', ';', '。', '、', '，', '！', '？', '；', '：']);
 const closingDelimiters = new Map([[')', '('], [']', '['], ['}', '{'], ['）', '（'], ['】', '【'], ['」', '「'], ['』', '『']]);
+const openingDelimiters = new Map([...closingDelimiters].map(([closing, opening]) => [opening, closing]));
 
 type Span = { start: number; end: number };
+type BacktickRun = { start: number; end: number };
 
 /** Clean only a small, documented set of tracking keys on supported social hosts. */
 export function cleanTrackingParameters(text: string): string {
 	if (!/(?:https?):\/\//i.test(text)) return text;
 
 	const fencedRanges = findFencedCodeRanges(text);
+	const backtickRuns = findBacktickRuns(text);
+	const backtickClosers = indexBacktickClosers(backtickRuns);
+	let backtickRunIndex = 0;
 	let rangeIndex = 0;
 	let output = '';
 
 	for (let i = 0; i < text.length;) {
+		while (backtickRuns[backtickRunIndex] != null && backtickRuns[backtickRunIndex].end <= i) backtickRunIndex++;
 		while (fencedRanges[rangeIndex] != null && fencedRanges[rangeIndex].end <= i) rangeIndex++;
 		const fenced = fencedRanges[rangeIndex];
 		if (fenced != null && i >= fenced.start && i < fenced.end) {
@@ -84,9 +90,10 @@ export function cleanTrackingParameters(text: string): string {
 		}
 
 		if (text[i] === '`') {
-			const tickLength = countRun(text, i, '`');
-			const closing = findMatchingBackticks(text, i + tickLength, tickLength);
-			if (closing !== -1) {
+			const run = backtickRuns[backtickRunIndex];
+			const closing = backtickClosers.get(i);
+			if (run != null && closing != null) {
+				const tickLength = run.end - i;
 				const end = closing + tickLength;
 				output += text.slice(i, end);
 				i = end;
@@ -118,12 +125,13 @@ function findFencedCodeRanges(text: string): Span[] {
 	while (lineStart < text.length) {
 		const newline = text.indexOf('\n', lineStart);
 		const lineEnd = newline === -1 ? text.length : newline + 1;
-		const line = text.slice(lineStart, newline === -1 ? text.length : newline).replace(/\r$/, '');
-		const marker = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
+		let contentEnd = newline === -1 ? text.length : newline;
+		if (contentEnd > lineStart && text[contentEnd - 1] === '\r') contentEnd--;
+		const marker = readFenceMarker(text, lineStart, contentEnd);
 
 		if (fence == null && marker != null) {
-			fence = { start: lineStart, marker: marker[2][0] as '`' | '~', length: marker[2].length };
-		} else if (fence != null && marker != null && marker[2][0] === fence.marker && marker[2].length >= fence.length && marker[3].trim() === '') {
+			fence = { start: lineStart, marker: marker.marker, length: marker.length };
+		} else if (fence != null && marker != null && marker.marker === fence.marker && marker.length >= fence.length && text.slice(marker.suffixStart, contentEnd).trim() === '') {
 			ranges.push({ start: fence.start, end: lineEnd });
 			fence = undefined;
 		}
@@ -135,21 +143,47 @@ function findFencedCodeRanges(text: string): Span[] {
 	return ranges;
 }
 
-function countRun(text: string, start: number, character: string): number {
-	let end = start;
-	while (text[end] === character) end++;
-	return end - start;
+function readFenceMarker(text: string, lineStart: number, contentEnd: number): { marker: '`' | '~'; length: number; suffixStart: number } | null {
+	let markerStart = lineStart;
+	while (markerStart < contentEnd && markerStart - lineStart < 3 && text[markerStart] === ' ') markerStart++;
+	if (markerStart < contentEnd && text[markerStart] === ' ') return null;
+	const marker = text[markerStart];
+	if (marker !== '`' && marker !== '~') return null;
+	let markerEnd = markerStart + 1;
+	while (markerEnd < contentEnd && text[markerEnd] === marker) markerEnd++;
+	if (markerEnd - markerStart < 3) return null;
+	for (let i = markerEnd; i < contentEnd; i++) {
+		if (text[i] === '\r' || text[i] === '\u2028' || text[i] === '\u2029') return null;
+	}
+	return { marker, length: markerEnd - markerStart, suffixStart: markerEnd };
 }
 
-function findMatchingBackticks(text: string, from: number, length: number): number {
-	for (let i = from; i < text.length;) {
-		const next = text.indexOf('`', i);
-		if (next === -1) return -1;
-		const runLength = countRun(text, next, '`');
-		if (runLength === length) return next;
-		i = next + runLength;
+function findBacktickRuns(text: string): BacktickRun[] {
+	const runs: BacktickRun[] = [];
+	for (let i = 0; i < text.length;) {
+		if (text[i] !== '`') {
+			i++;
+			continue;
+		}
+		const start = i;
+		while (i < text.length && text[i] === '`') i++;
+		runs.push({ start, end: i });
 	}
-	return -1;
+	return runs;
+}
+
+function indexBacktickClosers(runs: BacktickRun[]): Map<number, number> {
+	const closers = new Map<number, number>();
+	const nextRunByLength = new Map<number, number>();
+	for (let runIndex = runs.length - 1; runIndex >= 0; runIndex--) {
+		const run = runs[runIndex];
+		for (let length = run.end - run.start; length > 0; length--) {
+			const closing = nextRunByLength.get(length);
+			if (closing != null) closers.set(run.end - length, closing);
+		}
+		nextRunByLength.set(run.end - run.start, run.start);
+	}
+	return closers;
 }
 
 function isUrlStart(text: string, index: number): boolean {
@@ -175,6 +209,15 @@ function findUrlEnd(text: string, start: number): number {
 }
 
 function trimUrlEnd(text: string, start: number, end: number): number {
+	const balances = new Map<string, number>();
+	for (const character of text.slice(start, end)) {
+		if (closingDelimiters.has(character)) balances.set(character, (balances.get(character) ?? 0) + 1);
+		else {
+			const closing = openingDelimiters.get(character);
+			if (closing != null) balances.set(closing, (balances.get(closing) ?? 0) - 1);
+		}
+	}
+
 	while (end > start) {
 		const last = text[end - 1];
 		if (trailingPunctuation.has(last)) {
@@ -183,19 +226,14 @@ function trimUrlEnd(text: string, start: number, end: number): number {
 		}
 
 		const opening = closingDelimiters.get(last);
-		if (opening != null && countCharacter(text.slice(start, end), last) > countCharacter(text.slice(start, end), opening)) {
+		if (opening != null && (balances.get(last) ?? 0) > 0) {
+			balances.set(last, (balances.get(last) ?? 0) - 1);
 			end--;
 			continue;
 		}
 		break;
 	}
 	return end;
-}
-
-function countCharacter(text: string, character: string): number {
-	let count = 0;
-	for (const value of text) if (value === character) count++;
-	return count;
 }
 
 function cleanUrl(rawUrl: string): string | undefined {

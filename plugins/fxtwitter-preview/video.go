@@ -157,8 +157,10 @@ func (s *store) NeedsNativeVideoMetadata(ctx context.Context, postID string) (bo
 	err := s.db.QueryRowContext(ctx, `
 		SELECT state = 'ready'
 		   AND (COALESCE(payload->>'hasVideo', 'false') = 'true' OR COALESCE(payload->'quote'->>'hasVideo', 'false') = 'true')
-		   AND (payload->'video'->>'provider' = 'x' OR payload->'videos'->0->>'provider' = 'x'
-		        OR payload->'quote'->'video'->>'provider' = 'x' OR payload->'quote'->'videos'->0->>'provider' = 'x')
+		   AND (COALESCE(payload->'video'->>'provider' = 'x', false)
+		        OR COALESCE(payload->'videos'->0->>'provider' = 'x', false)
+		        OR COALESCE(payload->'quote'->'video'->>'provider' = 'x', false)
+		        OR COALESCE(payload->'quote'->'videos'->0->>'provider' = 'x', false))
 		   AND COALESCE(payload->>'_fxVideoSourcesVersion', '') <> '1'
 	FROM public_post_cache WHERE post_id = $1
 	`, postID).Scan(&needs)
@@ -265,7 +267,7 @@ func fetchVideoWithAdmission(ctx context.Context, base *http.Client, rawURL stri
 		return plugin.Blob{}, nil, errors.New("video content is not a supported MP4")
 	}
 	keepReservation = true
-	return plugin.Blob{ContentType: "video/mp4", Body: body, CacheControl: "private, no-store"}, release, nil
+	return plugin.Blob{ContentType: "video/mp4", Body: body, CacheControl: "private, no-store", WriteTimeout: mediaResponseWriteTimeout}, release, nil
 }
 
 func validMP4FTYP(body []byte) bool {

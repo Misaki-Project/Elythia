@@ -153,7 +153,7 @@ func TestFetchVideoReturnsBoundedNoStoreMP4(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
-	if calls != 1 || blob.ContentType != "video/mp4" || blob.CacheControl != "private, no-store" || string(blob.Body) != string(mp4FTYP()) {
+	if calls != 1 || blob.ContentType != "video/mp4" || blob.CacheControl != "private, no-store" || blob.WriteTimeout != mediaResponseWriteTimeout || string(blob.Body) != string(mp4FTYP()) {
 		t.Fatalf("video blob = %#v, calls=%d", blob, calls)
 	}
 }
@@ -207,6 +207,33 @@ func TestNativeMetadataRefreshUsesColdBudgetAndMarksUnsupportedSlots(t *testing.
 	var budgetCount int
 	if err := s.db.QueryRow(`SELECT count FROM cold_fetch_budget WHERE scope='user-hour:u1' AND bucket_start=$1`, now.Add(time.Minute).Truncate(time.Hour)).Scan(&budgetCount); err != nil || budgetCount != 3 {
 		t.Fatalf("cold budget count=%d err=%v; want initial fetch, authorized refresh, and separate YouTube cache seed", budgetCount, err)
+	}
+}
+
+func TestNeedsNativeVideoMetadataDoesNotUpgradeLegacyYouTubeOnlyCache(t *testing.T) {
+	s, now := testStore(t)
+	lease, err := s.AcquireFetch(context.Background(), "4234567890", "u1", now)
+	if err != nil || lease == nil {
+		t.Fatalf("seed lease=%#v err=%v", lease, err)
+	}
+	post := PublicPost{
+		ID: lease.PostID, Text: "youtube only", Author: PublicAuthor{Name: "Y", ScreenName: "y"},
+		HasVideo: true, Video: &PublicVideo{Provider: "youtube", ProviderVideoID: "dQw4w9WgXcQ"},
+	}
+	if _, err := s.CompleteReady(context.Background(), *lease, post, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model an old ready entry created while officialEmbed was selected, before
+	// the native video source version field was written to the payload.
+	s.cfg.VideoPlaybackMode = "nativeProxy"
+	needed, err := s.NeedsNativeVideoMetadata(context.Background(), lease.PostID)
+	if err != nil || needed {
+		t.Fatalf("legacy YouTube-only cache needs native metadata=%v err=%v; want false, nil", needed, err)
+	}
+	refresh, err := s.AcquireNativeMetadataRefreshWithBudget(context.Background(), lease.PostID, "u1", coldFetchBudget{PerHour: 10, PerDay: 10}, now.Add(time.Minute))
+	if err != nil || refresh != nil {
+		t.Fatalf("legacy YouTube-only cache acquired native refresh lease=%#v err=%v; want no refresh", refresh, err)
 	}
 }
 

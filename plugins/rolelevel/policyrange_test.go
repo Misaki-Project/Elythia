@@ -202,7 +202,11 @@ func TestValidateRangesRejectsMismatchedConst(t *testing.T) {
 }
 
 func TestFxTwitterQuotaMultiplierRequiresIntegralBoundedStages(t *testing.T) {
-	for _, tt := range []struct { name, key string; base, additional float64; wantErr bool }{
+	for _, tt := range []struct {
+		name, key        string
+		base, additional float64
+		wantErr          bool
+	}{
 		{"hour valid endpoints", "fxTwitterColdFetchesPerHour", 100, 25, false},
 		{"day exact upper endpoint", "fxTwitterColdFetchesPerDay", 100000, 0, false},
 		{"below minimum", "fxTwitterColdFetchesPerHour", 0, 1, true},
@@ -212,7 +216,9 @@ func TestFxTwitterQuotaMultiplierRequiresIntegralBoundedStages(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := rangeCfg(PolicyRange{Type: RangeMultiplier, Key: tt.key, Start: 1, End: 4, Base: tt.base, Additional: tt.additional}).Validate(defaultCatalog)
-			if (err != nil) != tt.wantErr { t.Fatalf("Validate err = %v, wantErr %t", err, tt.wantErr) }
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate err = %v, wantErr %t", err, tt.wantErr)
+			}
 		})
 	}
 }

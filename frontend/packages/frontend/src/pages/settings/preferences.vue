@@ -752,15 +752,17 @@ SPDX-License-Identifier: AGPL-3.0-only
 								{{ i18n.ts._dataSaver._disableUrlPreview.title }}
 								<template #caption>{{ i18n.ts._dataSaver._disableUrlPreview.description }}</template>
 							</MkSwitch>
-							<MkPreferenceContainer k="xTimelinePreviewMode">
-								<MkRadios v-model="xTimelinePreviewMode" :options="[
+							<SearchMarker :keywords="['timeline', 'preview', 'mode']">
+								<MkPreferenceContainer k="xTimelinePreviewMode">
+									<MkRadios v-model="xTimelinePreviewMode" :options="[
 					{ value: 'ogp', label: timelinePreviewModeLabels.ogp },
 					{ value: 'text', label: timelinePreviewModeLabels.text },
 					{ value: 'media', label: timelinePreviewModeLabels.media },
-								]">
-									<template #label><SearchLabel>{{ i18n.ts.xTimelinePreviewMode }}</SearchLabel></template>
-								</MkRadios>
-							</MkPreferenceContainer>
+										]">
+										<template #label><SearchLabel>{{ i18n.ts.xTimelinePreviewMode }}</SearchLabel></template>
+									</MkRadios>
+								</MkPreferenceContainer>
+							</SearchMarker>
 							<MkSwitch v-model="dataSaver.urlPreviewThumbnail" :disabled="!instance.enableUrlPreview || dataSaver.disableUrlPreview">
 								{{ i18n.ts._dataSaver._urlPreviewThumbnail.title }}
 								<template #caption>{{ i18n.ts._dataSaver._urlPreviewThumbnail.description }}</template>

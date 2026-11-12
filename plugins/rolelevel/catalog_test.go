@@ -89,10 +89,21 @@ func TestCatalogNormalizeConstMatchesHostNumericValidation(t *testing.T) {
 }
 
 func TestFxTwitterQuotaConstantsRequireBoundedIntegers(t *testing.T) {
-	for _, tt := range []struct { key string; max float64 }{{"fxTwitterColdFetchesPerHour", 10000}, {"fxTwitterColdFetchesPerDay", 100000}} {
+	for _, tt := range []struct {
+		key string
+		max float64
+	}{{"fxTwitterColdFetchesPerHour", 10000}, {"fxTwitterColdFetchesPerDay", 100000}} {
 		t.Run(tt.key, func(t *testing.T) {
-			for _, value := range []float64{1, tt.max} { if _, err := defaultCatalog.NormalizeConst(tt.key, value); err != nil { t.Errorf("boundary %v rejected: %v", value, err) } }
-			for _, value := range []float64{0, tt.max + 1, 1.5} { if _, err := defaultCatalog.NormalizeConst(tt.key, value); err == nil { t.Errorf("invalid quota %v accepted", value) } }
+			for _, value := range []float64{1, tt.max} {
+				if _, err := defaultCatalog.NormalizeConst(tt.key, value); err != nil {
+					t.Errorf("boundary %v rejected: %v", value, err)
+				}
+			}
+			for _, value := range []float64{0, tt.max + 1, 1.5} {
+				if _, err := defaultCatalog.NormalizeConst(tt.key, value); err == nil {
+					t.Errorf("invalid quota %v accepted", value)
+				}
+			}
 		})
 	}
 }

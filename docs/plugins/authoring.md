@@ -35,7 +35,7 @@ Go側のcallbackを持たずフロントだけを配布する場合は `frontend
 ```
 module github.com/you/elythia-plugin-myplugin
 
-go 1.27.3
+go 1.27.4
 
 require github.com/elythia-network/elythia v0.0.0
 
@@ -1350,7 +1350,7 @@ type Notification struct
 type Handler func(Request) (any, error)
 type JobHandler func(context.Context, json.RawMessage) error
 type Migration struct { Version int; SQL string }
-type Blob struct { ContentType string; Body []byte; CacheControl string }
+type Blob struct { ContentType string; Body []byte; CacheControl string; WriteTimeout time.Duration }
 type StatusError struct { Status int; Message string }
 type APIError struct { Endpoint string; Status int; Body json.RawMessage }
 

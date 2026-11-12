@@ -8,6 +8,8 @@
 
 `PluginHost.openMedia(items, initialId?)`は、取得済みの`Blob`を既存のライトボックスで表示する。`PluginMediaItem`には`id`、`type`(`image`/`video`/`audio`)、`blob`、任意の寸法・ファイル名・`isSensitive`・`initiallyRevealed`を渡す。MIMEはホストのブラウザ表示用許可一覧と`type`の両方に一致する必要があり、SVGは含まない。生成したObject URLは閉じたときや起動失敗時に解放する。`initiallyRevealed`は呼び出し元で既に開示済みの項目だけに指定する。
 
+`plugin.Blob.WriteTimeout`は任意のレスポンス書き込み期限です。既定値の0は従来どおり期限を設定しません。正の値を設定すると、ホストはヘッダーや本文を書き始める前に現在のHTTPレスポンスへ期限を設定します。レスポンスライターが期限を適用できない場合や、負の値の場合は本文を送る前にエラーにします。期限はハンドラーからの応答書き込みとflushを保護し、グローバルなHTTPサーバー期限を変更しません。大きなBlobでは、許容サイズとクライアント速度を考慮した有限の値を選んでください。
+
 任意の`PluginMediaItem.alt`はBlobメディアの代替テキストとしてviewerへ引き継ぐ。`filename`は表示名・ダウンロード名として独立して扱い、代替テキストには使わない。既存のDriveFileがある場合は`comment`を優先し、それが未設定なら`alt`を使う。どちらも未指定なら従来どおり代替テキストを追加しない。
 
 `MkA`、`MkUrl`、`MkSensitiveMediaGuard`も`@/plugin-api.js`から公開する。ガードは`isSensitive`と`kind`(`image`/`video`)を受け取り、`v-model:revealed`で開示状態を返す。センシティブ表示設定と確認ダイアログはホストと共通で、ライトボックスでもドライブファイルと同じ設定を使う。メディアの取得・プレビューの開始条件はプラグインが既存の`PreviewContext`とキャンセルを使って守る。

@@ -877,6 +877,15 @@ func wrapPluginHandler(h plugin.Handler, roles middleware.RoleChecker, policyRes
 // octet-stream に落ちるので、ブラウザでは表示ではなくダウンロードになる。
 // denylist にしないのは、危険な型を数え上げる形が必ず漏れるため。
 func writePluginBlob(c echo.Context, b plugin.Blob) error {
+	if b.WriteTimeout < 0 {
+		return errors.New("plugin blob write timeout must not be negative")
+	}
+	if b.WriteTimeout > 0 {
+		deadline := time.Now().Add(b.WriteTimeout)
+		if err := http.NewResponseController(c.Response().Writer).SetWriteDeadline(deadline); err != nil {
+			return fmt.Errorf("set plugin blob write deadline: %w", err)
+		}
+	}
 	ct := b.ContentType
 	if ct == "" {
 		ct = echo.MIMEOctetStream

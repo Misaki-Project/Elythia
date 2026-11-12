@@ -3,10 +3,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { cleanTrackingParameters } from '../../../../../plugins/tracking-parameter-cleaner/frontend/cleaner';
 import trackingParameterCleaner from '../../../../../plugins/tracking-parameter-cleaner/frontend/index';
 import type { PluginHost } from '@/plugin-api.js';
+
+vi.mock('@/plugin-api.js', () => ({
+	definePlugin: (plugin: unknown) => plugin,
+}));
 
 describe('tracking parameter cleaner', () => {
 	test.each([
@@ -100,6 +104,32 @@ describe('tracking parameter cleaner', () => {
 		const input = 'https://youtu.be/abc?x=%2f&si=one&x=%2F&feature=shared#t=12';
 		expect(cleanTrackingParameters(input)).toBe('https://youtu.be/abc?x=%2f&x=%2F&feature=shared#t=12');
 		expect(cleanTrackingParameters('https://x.com/a?utm%5Fsource=test&v=1')).toBe('https://x.com/a?v=1');
+	});
+
+	test('trims a long run of unmatched URL closers while keeping balanced closers', () => {
+		const url = 'https://youtu.be/abc(foo)?si=share';
+		const extraClosers = ')'.repeat(8000);
+		expect(cleanTrackingParameters(url + extraClosers)).toBe('https://youtu.be/abc(foo)' + extraClosers);
+		expect(cleanTrackingParameters('https://youtu.be/abc(foo)?si=share))')).toBe('https://youtu.be/abc(foo)))');
+	});
+
+	test('preserves suffix matching after an unmatched longer inline-code run', () => {
+		const inCode = 'https://x.com/a/status/1?s=1```';
+		const afterCode = 'https://x.com/b/status/2?s=2';
+		expect(cleanTrackingParameters('prefix ````' + inCode + ' ' + afterCode))
+			.toBe('prefix ' + '`' + '```' + inCode + ' https://x.com/b/status/2');
+	});
+
+	test('keeps fence lookalikes with embedded JavaScript line terminators unfenced', () => {
+		const input = '```\u2028intro\nhttps://x.com/a/status/1?s=1';
+		expect(cleanTrackingParameters(input))
+			.toBe('```\u2028intro\nhttps://x.com/a/status/1');
+	});
+
+	test('handles long unmatched backtick runs and still cleans following URLs', () => {
+		const unmatched = '`'.repeat(8000);
+		expect(cleanTrackingParameters('prefix ' + unmatched + ' https://x.com/a/status/1?s=1'))
+			.toBe('prefix ' + unmatched + ' https://x.com/a/status/1');
 	});
 
 	test('registers the transform as a default plugin behavior', () => {

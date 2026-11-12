@@ -92,6 +92,7 @@ plugin:   field ActiveRoleAssignment.RoleID string
 plugin:   field Blob.Body []byte
 plugin:   field Blob.CacheControl string
 plugin:   field Blob.ContentType string
+plugin:   field Blob.WriteTimeout time.Duration
 plugin:   field Definition.APIVersion int
 plugin:   field Definition.EffectivePolicies func(Context, EffectivePolicyInvalidator) (EffectivePolicyRegistration, error)
 plugin:   field Definition.Jobs func(Context, Jobs) error
