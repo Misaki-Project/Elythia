@@ -208,6 +208,69 @@ describe('MkPostForm paste transform integration', () => {
 		expect(testState.addFiles).toHaveBeenCalledOnce();
 	});
 
+	test.each(['mid-composition', 'composition-end'] as const)('keeps image paste when it arrives during %s', async state => {
+		await launchServerPlugins([{
+			name: 'cleaner',
+			setup(host) { host.postForm.registerPasteTransform('tracking', testState.transform, { notification: () => 'transformed' }); },
+		}]);
+		const view = await mountPostForm();
+		const textarea = view.getByTestId('post-form-text');
+		textarea.dispatchEvent(new CompositionEvent(state === 'mid-composition' ? 'compositionupdate' : 'compositionend', { data: state === 'mid-composition' ? '未確定' : '' }));
+		const file = new File(['image'], 'image.png', { type: 'image/png' });
+		const item = { kind: 'file', getAsFile: () => file } as unknown as DataTransferItem;
+		const event = makePasteEvent('ignored text', [item]);
+		textarea.dispatchEvent(event);
+		await flush();
+
+		expect(event.defaultPrevented).toBe(true);
+		expect(testState.transform).not.toHaveBeenCalled();
+		expect(testState.addFiles).toHaveBeenCalledOnce();
+		expect(testState.toast).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		['quote URL', `${window.location.origin}/notes/quoted-note`],
+		['long text', 'x'.repeat(1001)],
+	])('leaves %s paste to the browser during active composition', async (_name, raw) => {
+		const transform = vi.fn((text: string) => `${text}!`);
+		await launchServerPlugins([{
+			name: 'cleaner',
+			setup(host) { host.postForm.registerPasteTransform('tracking', transform, { notification: () => 'transformed' }); },
+		}]);
+		const view = await mountPostForm();
+		const textarea = view.getByTestId('post-form-text');
+		textarea.dispatchEvent(new CompositionEvent('compositionupdate', { data: '未確定' }));
+		const event = makePasteEvent(raw);
+		textarea.dispatchEvent(event);
+		await flush();
+
+		expect(event.defaultPrevented).toBe(false);
+		expect(testState.confirm).not.toHaveBeenCalled();
+		expect(transform).not.toHaveBeenCalled();
+		expect(testState.toast).not.toHaveBeenCalled();
+	});
+
+	test('keeps canceled quote paste raw immediately after composition ends', async () => {
+		await launchServerPlugins([{
+			name: 'cleaner',
+			setup(host) { host.postForm.registerPasteTransform('tracking', text => `${text}!`, { notification: () => 'transformed' }); },
+		}]);
+		testState.confirm.mockResolvedValue({ canceled: true });
+		const view = await mountPostForm();
+		const textarea = view.getByTestId('post-form-text') as HTMLTextAreaElement;
+		const compositionEnd = new CompositionEvent('compositionend', { data: '' });
+		textarea.dispatchEvent(compositionEnd);
+		const raw = `${window.location.origin}/notes/quoted-note`;
+		const event = makePasteEvent(raw);
+		textarea.dispatchEvent(event);
+		await flush();
+
+		expect(event.defaultPrevented).toBe(true);
+		expect(testState.confirm).toHaveBeenCalledOnce();
+		expect(textarea.value).toBe(raw);
+		expect(testState.toast).not.toHaveBeenCalled();
+	});
+
 	test('does not lose text when a same-origin quote prefix cannot resolve a quote ID', async () => {
 		testState.confirm.mockResolvedValue({ canceled: false });
 		const view = await mountPostForm();

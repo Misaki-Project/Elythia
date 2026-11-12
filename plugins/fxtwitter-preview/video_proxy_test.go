@@ -7,9 +7,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -413,6 +415,163 @@ func TestNativeVideoProxyRouteRejectsGlobalDisableAndRateLimitsValidRequests(t *
 	if fetches != 1 {
 		t.Fatalf("rate-limited request reached upstream; fetches=%d", fetches)
 	}
+}
+
+func TestNativeVideoProxyRouteLimitsActiveResponsesPerUser(t *testing.T) {
+	db, _, postID, token := nativeVideoRouteFixture(t)
+	api := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	var fetches atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		fetches.Add(1)
+		return response(http.StatusOK, "video/mp4", string(mp4FTYP())), nil
+	})}
+	oldGate, oldAdmission, oldLimiter := processNativeVideoRequestGate, processNativeVideoAdmission, processNativeVideoLimiter
+	processNativeVideoRequestGate = newMediaRequestGate(8, 0, 0, (64<<20)+2)
+	processNativeVideoAdmission = newMediaAdmission(8, 8, (64<<20)+2)
+	processNativeVideoLimiter = newVideoProxyLimiter(nativeVideoUserPerMinute, nativeVideoGlobalPerMinute)
+	t.Cleanup(func() {
+		processNativeVideoRequestGate = oldGate
+		processNativeVideoAdmission = oldAdmission
+		processNativeVideoLimiter = oldLimiter
+	})
+	routes := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(api).WithHTTPClient(client).
+		WithConfig(map[string]any{"externalFetchEnabled": true, "videoPlaybackMode": "nativeProxy"}).Routes(Plugin)
+	request := func(user string, index int, reqCtx context.Context) (any, error) {
+		body := `{"noteId":"note1","postId":"` + postID + `","target":"main","index":` + strconv.Itoa(index) + `,"token":"` + token + `"}`
+		return routes.Call(t, "POST /media/video", plugintest.Request{UserID: user, Body: body, Ctx: reqCtx, CheckedRolePolicies: allowPreviewPolicies()})
+	}
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	if result, err := request("same-user", 0, firstCtx); err != nil {
+		t.Fatalf("first attachment failed: %v", err)
+	} else if _, ok := result.(plugin.Blob); !ok {
+		t.Fatalf("first attachment result=%T; want Blob", result)
+	}
+	blockedCtx, cancelBlocked := context.WithCancel(context.Background())
+	if _, err := request("same-user", 1, blockedCtx); err == nil {
+		t.Fatal("second active attachment for one user was accepted")
+	} else if status, code := plugin.ExtractStatusError(err); status == nil || status.Status != http.StatusServiceUnavailable || code != "VIDEO_BUSY" {
+		t.Fatalf("same-user busy response status=%#v code=%q err=%v", status, code, err)
+	}
+	cancelBlocked()
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("same-user blocked request reached outbound fetch; fetches=%d", got)
+	}
+
+	otherCtx, cancelOther := context.WithCancel(context.Background())
+	if result, err := request("other-user", 0, otherCtx); err != nil {
+		t.Fatalf("another user could not use free shared capacity: %v", err)
+	} else if _, ok := result.(plugin.Blob); !ok {
+		t.Fatalf("other-user result=%T; want Blob", result)
+	}
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("other user fetches=%d; want 2", got)
+	}
+
+	cancelFirst()
+	waitForNativeVideoUserIdle(t, processNativeVideoRequestGate, "same-user")
+	sequentialCtx, cancelSequential := context.WithCancel(context.Background())
+	if result, err := request("same-user", 1, sequentialCtx); err != nil {
+		t.Fatalf("sequential attachment after response end failed: %v", err)
+	} else if _, ok := result.(plugin.Blob); !ok {
+		t.Fatalf("sequential attachment result=%T; want Blob", result)
+	}
+	if got := fetches.Load(); got != 3 {
+		t.Fatalf("sequential attachment fetches=%d; want 3", got)
+	}
+	cancelSequential()
+	cancelOther()
+	waitForNativeVideoUserIdle(t, processNativeVideoRequestGate, "same-user")
+	waitForNativeVideoUserIdle(t, processNativeVideoRequestGate, "other-user")
+}
+
+func TestNativeVideoProxyRouteReleasesPerUserAndSharedAdmissionOnFetchErrorAndCancel(t *testing.T) {
+	db, _, postID, token := nativeVideoRouteFixture(t)
+	api := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	var fetches atomic.Int32
+	startedCanceledFetch := make(chan struct{})
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch fetches.Add(1) {
+		case 1:
+			return nil, errors.New("mock upstream failure")
+		case 2:
+			close(startedCanceledFetch)
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		default:
+			return response(http.StatusOK, "video/mp4", string(mp4FTYP())), nil
+		}
+	})}
+	oldGate, oldAdmission, oldLimiter := processNativeVideoRequestGate, processNativeVideoAdmission, processNativeVideoLimiter
+	processNativeVideoRequestGate = newMediaRequestGate(8, 0, 0, (64<<20)+2)
+	processNativeVideoAdmission = newMediaAdmission(8, 8, (64<<20)+2)
+	processNativeVideoLimiter = newVideoProxyLimiter(nativeVideoUserPerMinute, nativeVideoGlobalPerMinute)
+	t.Cleanup(func() {
+		processNativeVideoRequestGate = oldGate
+		processNativeVideoAdmission = oldAdmission
+		processNativeVideoLimiter = oldLimiter
+	})
+	routes := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(api).WithHTTPClient(client).
+		WithConfig(map[string]any{"externalFetchEnabled": true, "videoPlaybackMode": "nativeProxy"}).Routes(Plugin)
+	request := func(index int, reqCtx context.Context) (any, error) {
+		body := `{"noteId":"note1","postId":"` + postID + `","target":"main","index":` + strconv.Itoa(index) + `,"token":"` + token + `"}`
+		return routes.Call(t, "POST /media/video", plugintest.Request{UserID: "retry-user", Body: body, Ctx: reqCtx, CheckedRolePolicies: allowPreviewPolicies()})
+	}
+	if _, err := request(0, context.Background()); err == nil {
+		t.Fatal("mock fetch error was swallowed")
+	}
+	waitForNativeVideoUserIdle(t, processNativeVideoRequestGate, "retry-user")
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	resultErr := make(chan error, 1)
+	go func() {
+		_, err := request(0, cancelCtx)
+		resultErr <- err
+	}()
+	select {
+	case <-startedCanceledFetch:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("cancellable mock fetch did not start")
+	}
+	cancel()
+	select {
+	case err := <-resultErr:
+		if err == nil {
+			t.Fatal("canceled mock fetch unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route did not return after request cancellation")
+	}
+	waitForNativeVideoUserIdle(t, processNativeVideoRequestGate, "retry-user")
+
+	responseCtx, cancelResponse := context.WithCancel(context.Background())
+	if result, err := request(1, responseCtx); err != nil {
+		t.Fatalf("retry after error/cancel did not get released capacity: %v", err)
+	} else if _, ok := result.(plugin.Blob); !ok {
+		t.Fatalf("retry result=%T; want Blob", result)
+	}
+	cancelResponse()
+	waitForNativeVideoUserIdle(t, processNativeVideoRequestGate, "retry-user")
+	if got := fetches.Load(); got != 3 {
+		t.Fatalf("outbound fetches=%d; want error, cancel, and successful retry", got)
+	}
+}
+
+func waitForNativeVideoUserIdle(t *testing.T, gate *mediaRequestGate, userID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		gate.mu.Lock()
+		state := gate.users[userID]
+		idle := state == nil || (state.active == 0 && state.waiting == 0)
+		gate.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("media request gate did not release user %q", userID)
 }
 
 func nativeVideoRouteFixture(t *testing.T) (*sql.DB, time.Time, string, string) {

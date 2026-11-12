@@ -289,10 +289,15 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if !processNativeVideoLimiter.Allow(req.UserID(), time.Now().UTC()) {
 			return nil, plugin.NewCodedStatusError(http.StatusTooManyRequests, "video playback request limit exceeded; try again in a minute", "VIDEO_RATE_LIMITED")
 		}
+		releaseUser, err := processNativeVideoRequestGate.acquire(req.Context(), req.UserID(), nativeVideoMaxBytes)
+		if err != nil {
+			return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "video playback capacity is busy; try again later", "VIDEO_BUSY")
+		}
 		fetchCtx, cancel := context.WithTimeout(req.Context(), cfg.RequestTimeout)
 		defer cancel()
 		blob, releaseVideo, err := fetchVideoWithAdmission(fetchCtx, ctx.HTTP(), rawURL, nativeVideoMaxBytes, processNativeVideoAdmission)
 		if err != nil {
+			releaseUser()
 			ctx.Logger().Warn("Fx native video unavailable", "postId", body.PostID, "target", body.Target, "index", body.Index, "err", err)
 			if errors.Is(err, errNativeVideoTooLarge) {
 				return nil, plugin.NewCodedStatusError(http.StatusRequestEntityTooLarge, "video exceeds the 32 MiB in-app playback limit; open the post on X", "VIDEO_TOO_LARGE")
@@ -302,11 +307,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			}
 			return nil, plugin.NewCodedStatusError(http.StatusBadGateway, "video is unavailable for in-app playback; open the post on X", "VIDEO_UNAVAILABLE")
 		}
-		if req.Context().Done() == nil {
-			releaseVideo()
-		} else {
-			context.AfterFunc(req.Context(), releaseVideo)
-		}
+		releaseMediaWhenRequestEnds(req.Context(), releaseVideo, releaseUser)
 		return blob, nil
 	})
 

@@ -324,5 +324,6 @@ func (l *videoProxyLimiter) Allow(userID string, now time.Time) bool {
 }
 
 var processNativeVideoAdmission = newMediaAdmission(2, 8, (64<<20)+2)
+var processNativeVideoRequestGate = newMediaRequestGate(8, 0, 0, (64<<20)+2)
 var processNativeVideoLimiter = newVideoProxyLimiter(nativeVideoUserPerMinute, nativeVideoGlobalPerMinute)
 var errNativeVideoTooLarge = errors.New("video response exceeds the 32 MiB playback limit")

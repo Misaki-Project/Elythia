@@ -834,6 +834,8 @@ host.preview.register({
 - `load`には中止用の`AbortSignal`を渡す。取得中に非active・画面外・unmountになった場合は中止される。取得済みの表示は同じノートが所有する間、非activeや画面外になっても保持される。
 - `load`、読み込み表示、または本表示の描画に失敗した場合は元URLのリンクへ閉じ、別providerや既存URLカードへは戻らない。同じ所有キー（provider・URL・note source・detail）のままノートを表示している間は、viewport・タブ・KeepAliveへの復帰だけでは再試行しない。所有キーが変わる、CWを閉じて再展開する、または再mountされる（ノートを開き直す・ページを再読み込みする）場合は再試行する。
 
+`presentation: 'disabled'` は安全な元URLリンクを表示し、providerと既存URLカードの取得を行わない。標準URLカードを残して利用者の展開操作を待つ場合は `manual` を使う。この場合は標準URLカードと展開ボタンを表示し、押された後にproviderを取得する。
+
 現在providerを接続しているのは`MkNote` / `MkNoteDetailed`のURLだけで、チャット、
 URLプレビューポップアップ、ページ本文などは対象外。`PreviewInput`の`file`は将来の
 接続用に型だけを定義しており、現時点でfile入力を渡す画面は無い。

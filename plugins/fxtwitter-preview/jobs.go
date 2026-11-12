@@ -12,6 +12,8 @@ import (
 	"github.com/elythia-network/elythia/plugin"
 )
 
+const auditRetentionBatchSize = 1000
+
 func jobs(ctx plugin.Context, j plugin.Jobs) error {
 	cfg, err := loadConfig(ctx)
 	if err != nil {
@@ -71,12 +73,25 @@ func jobs(ctx plugin.Context, j plugin.Jobs) error {
 		if cfg.AuditRetention == 0 {
 			return nil
 		}
-		deleted, err := s.RetainAudit(jobCtx, time.Now().UTC().Add(-cfg.AuditRetention), 1000)
-		if err != nil {
-			return err
-		}
-		if deleted > 0 {
-			ctx.Logger().Info("expired Fx audit snapshots removed", "count", deleted)
+		cutoff := time.Now().UTC().Add(-cfg.AuditRetention)
+		var totalDeleted int64
+		defer func() {
+			if totalDeleted > 0 {
+				ctx.Logger().Info("expired Fx audit snapshots removed", "count", totalDeleted)
+			}
+		}()
+		for {
+			if err := jobCtx.Err(); err != nil {
+				return err
+			}
+			deleted, err := s.RetainAudit(jobCtx, cutoff, auditRetentionBatchSize)
+			if err != nil {
+				return err
+			}
+			totalDeleted += deleted
+			if deleted < auditRetentionBatchSize {
+				break
+			}
 		}
 		return nil
 	})

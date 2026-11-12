@@ -103,7 +103,14 @@ export function cleanTrackingParameters(text: string): string {
 
 		if (isUrlStart(text, i) && isBoundaryBefore(text, i)) {
 			const rawEnd = findUrlEnd(text, i);
-			const urlEnd = trimUrlEnd(text, i, rawEnd);
+			const trimmedEnd = trimUrlEnd(text, i, rawEnd);
+			const mfmBoundary = findMfmUrlBoundary(text, i, trimmedEnd);
+			if (mfmBoundary.ambiguousEnd != null) {
+				output += text.slice(i, mfmBoundary.ambiguousEnd);
+				i = mfmBoundary.ambiguousEnd;
+				continue;
+			}
+			const urlEnd = mfmBoundary.urlEnd;
 			const rawUrl = text.slice(i, urlEnd);
 			output += cleanUrl(rawUrl) ?? rawUrl;
 			i = urlEnd;
@@ -234,6 +241,56 @@ function trimUrlEnd(text: string, start: number, end: number): number {
 		break;
 	}
 	return end;
+}
+
+type MfmMarkerBoundary = { urlEnd: number; ambiguousEnd?: never } | { urlEnd: number; ambiguousEnd: number };
+
+function findMfmUrlBoundary(text: string, start: number, end: number): MfmMarkerBoundary {
+	let openingStart = start;
+	while (openingStart > 0 && isMfmMarker(text[openingStart - 1])) openingStart--;
+	let closingStart = end;
+	while (closingStart > start && isMfmMarker(text[closingStart - 1])) closingStart--;
+	if (openingStart === start && closingStart === end) return { urlEnd: end };
+	if (openingStart === start) return { urlEnd: end, ambiguousEnd: end };
+
+	const opening = text.slice(openingStart, start);
+	if (isEscaped(text, openingStart)) return { urlEnd: end, ambiguousEnd: end };
+	if (closingStart === end) return { urlEnd: end, ambiguousEnd: end };
+
+	const closing = text.slice(closingStart, end);
+	const openingMarkers = splitMfmMarkers(opening);
+	const closingMarkers = splitMfmMarkers(closing);
+	if (openingMarkers == null || closingMarkers == null || closingMarkers.length !== openingMarkers.length ||
+		openingMarkers.some((marker, index) => marker !== closingMarkers[closingMarkers.length - index - 1]) || isEscaped(text, closingStart)) {
+		return { urlEnd: end, ambiguousEnd: end };
+	}
+	return { urlEnd: closingStart };
+}
+
+function isMfmMarker(character: string | undefined): boolean {
+	return character === '*' || character === '~' || character === '_';
+}
+
+function isEscaped(text: string, markerStart: number): boolean {
+	let backslashes = 0;
+	for (let index = markerStart - 1; index >= 0 && text[index] === '\\'; index--) backslashes++;
+	return backslashes % 2 !== 0;
+}
+
+function splitMfmMarkers(markers: string): string[] | undefined {
+	const result: string[] = [];
+	for (let index = 0; index < markers.length;) {
+		const marker = markers.startsWith('***', index) ? '***'
+			: markers.startsWith('**', index) ? '**'
+				: markers.startsWith('__', index) ? '__'
+					: markers.startsWith('~~', index) ? '~~'
+						: markers.startsWith('*', index) ? '*'
+							: undefined;
+		if (marker == null) return undefined;
+		result.push(marker);
+		index += marker.length;
+	}
+	return result;
 }
 
 function cleanUrl(rawUrl: string): string | undefined {

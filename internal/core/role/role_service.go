@@ -1231,7 +1231,7 @@ func (s *Service) GetUserPolicies(userID string) map[string]any {
 	// 一時障害で 500 にしては困るので、base を読めなかった窓でも
 	// native 既定の map を返す。認可の判断をする consumer は
 	// `GetUserPoliciesChecked` を使い、そちらの error で fail closed する。
-	out, _ := s.resolvePolicies(userID, nil)
+	out, _ := s.resolvePolicies(userID, nil, false)
 	return out
 }
 

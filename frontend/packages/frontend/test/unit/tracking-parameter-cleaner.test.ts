@@ -88,6 +88,30 @@ describe('tracking parameter cleaner', () => {
 		expect(cleanTrackingParameters('$[tada ここ https://x.com/m/status/4?s=1 どうぞ]')).toBe('$[tada ここ https://x.com/m/status/4 どうぞ]');
 	});
 
+	test.each([
+		['bold', '**https://x.com/a/status/123?s=20**', '**https://x.com/a/status/123**'],
+		['italic', '*https://x.com/a/status/123?s=20*', '*https://x.com/a/status/123*'],
+		['strikethrough', '~~https://youtu.be/abcdefghijk?si=tracking~~', '~~https://youtu.be/abcdefghijk~~'],
+		['nested formatting', '***~~https://youtu.be/abcdefghijk?si=tracking~~***', '***~~https://youtu.be/abcdefghijk~~***'],
+		['percent-encoded marker text', '**https://x.com/a/status/123?s=20&literal=%2A%2A**', '**https://x.com/a/status/123?literal=%2A%2A**'],
+	])('preserves closing MFM delimiters for %s URLs', (_name, input, expected) => {
+		expect(cleanTrackingParameters(input)).toBe(expected);
+	});
+
+	test('leaves unmatched or escaped MFM marker candidates unchanged', () => {
+		const unmatched = '**https://x.com/a/status/123?s=20~~';
+		const escaped = '\\**https://x.com/a/status/123?s=20**';
+		expect(cleanTrackingParameters(unmatched)).toBe(unmatched);
+		expect(cleanTrackingParameters(escaped)).toBe(escaped);
+	});
+
+	test('leaves URLs inside surrounding MFM formatting unchanged when the opener is ambiguous', () => {
+		const bold = '**see https://x.com/a/status/123?s=20**';
+		const strikethrough = '~~watch https://youtu.be/abcdefghijk?si=tracking~~';
+		expect(cleanTrackingParameters(bold)).toBe(bold);
+		expect(cleanTrackingParameters(strikethrough)).toBe(strikethrough);
+	});
+
 	test('leaves inline and fenced code examples untouched', () => {
 		const input = '`https://x.com/a/status/1?s=1`\n```txt\nhttps://youtu.be/abc?si=demo\n```\nhttps://x.com/b/status/2?s=2';
 		const expected = '`https://x.com/a/status/1?s=1`\n```txt\nhttps://youtu.be/abc?si=demo\n```\nhttps://x.com/b/status/2';
