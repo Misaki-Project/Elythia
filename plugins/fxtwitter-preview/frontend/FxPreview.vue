@@ -32,9 +32,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</button>
 	</div>
 	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
-	<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.images?.length ?? 0) > 4" :key="`photo-carousel:${currentOwnerKey}`" v-model:revealed="imagesRevealed" :images="photoCarouselImages" :isSensitive="viewData.post.isSensitive" :viewerLoading="photoViewerLoading.main" :viewerError="photoViewerError.main" @visible="loadPhotoWindow('main', $event)" @retry="retryPhoto('main', $event)" @open="openPhotoGallery('main', $event)"/>
+	<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.images?.length ?? 0) > 4" :key="`photo-carousel:${currentOwnerKey}`" v-model:revealed="imagesRevealed" :images="photoCarouselImages" :isSensitive="viewData.post.isSensitive" :viewerLoading="photoViewerLoading.main" :viewerError="photoViewerError.main" :retryDisabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @visible="loadPhotoWindow('main', $event)" @retry="retryPhoto('main', $event)" @open="openPhotoGallery('main', $event)"/>
 	<FxMediaGrid v-else-if="showAttachmentMedia && renderedImages.length" :key="`images:${viewData.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="viewData.post.isSensitive" @open="openImage"/>
-	<p v-if="mainPhotoGridStatus" :class="$style.mediaError" role="status">{{ mainPhotoGridStatus }} <button v-if="mainPhotoGridRetryable" type="button" class="_button" @click.stop="retrySmallPhotoGrid('main')">再試行</button></p>
+	<p v-if="mainPhotoGridStatus" :class="$style.mediaError" role="status">{{ mainPhotoGridStatus }} <button v-if="mainPhotoGridRetryable" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @click.stop="retrySmallPhotoGrid('main')">再試行</button></p>
 	<p v-if="photoViewerError.main && (viewData.post.images?.length ?? 0) <= 4" :class="$style.mediaError" role="status">{{ photoViewerError.main }}</p>
 	<FxVideoPreview
 		v-if="showAttachmentMedia && mainVideo && videoPlaybackMode !== 'nativeProxy'"
@@ -68,9 +68,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</header>
 		<p :class="$style.quoteText"><template v-for="segment in quoteTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template></p>
 		<p v-if="!showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
-		<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.quote.images?.length ?? 0) > 4" :key="`quote-photo-carousel:${currentOwnerKey}:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="quotePhotoCarouselImages" :isSensitive="viewData.post.quote.isSensitive" :viewerLoading="photoViewerLoading.quote" :viewerError="photoViewerError.quote" @visible="loadPhotoWindow('quote', $event)" @retry="retryPhoto('quote', $event)" @open="openPhotoGallery('quote', $event)"/>
+		<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.quote.images?.length ?? 0) > 4" :key="`quote-photo-carousel:${currentOwnerKey}:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="quotePhotoCarouselImages" :isSensitive="viewData.post.quote.isSensitive" :viewerLoading="photoViewerLoading.quote" :viewerError="photoViewerError.quote" :retryDisabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @visible="loadPhotoWindow('quote', $event)" @retry="retryPhoto('quote', $event)" @open="openPhotoGallery('quote', $event)"/>
 		<FxMediaGrid v-else-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="viewData.post.quote.isSensitive" @open="openQuoteImage"/>
-		<p v-if="quotePhotoGridStatus" :class="$style.mediaError" role="status">{{ quotePhotoGridStatus }} <button v-if="quotePhotoGridRetryable" type="button" class="_button" @click.stop="retrySmallPhotoGrid('quote')">再試行</button></p>
+		<p v-if="quotePhotoGridStatus" :class="$style.mediaError" role="status">{{ quotePhotoGridStatus }} <button v-if="quotePhotoGridRetryable" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @click.stop="retrySmallPhotoGrid('quote')">再試行</button></p>
 		<p v-if="photoViewerError.quote && (viewData.post.quote.images?.length ?? 0) <= 4" :class="$style.mediaError" role="status">{{ photoViewerError.quote }}</p>
 		<FxVideoPreview
 			v-if="showAttachmentMedia && quoteVideo && videoPlaybackMode !== 'nativeProxy'"
@@ -91,7 +91,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</div>
 		<MkTime v-if="quoteCreatedAt" :class="$style.postTime" :time="quoteCreatedAt" mode="detail"/>
 	</section>
-	<div v-if="mediaLoadFailed" :class="$style.mediaError" role="status">
+	<div v-if="mediaLoadFailed || photoHasRetryableFailure" :class="$style.mediaError" role="status">
 		<p>{{ mediaLoadBlocked ? 'メディアを表示する権限を確認できません。' : 'メディアを読み込めませんでした。' }}</p>
 		<button v-if="canRetryMedia" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0" @click.stop="retryPreview">
 			{{ retryLoading ? '再取得中…' : 'メディアを再取得' }}
@@ -164,7 +164,7 @@ const canRetryPreview = computed(() => (viewData.value.state === 'stale' || view
 	props.context.source?.kind === 'note' && props.context.revealed && props.context.active && props.context.inViewport && !retryBlocked.value);
 const expanded = ref(false);
 type LoadedMedia = { src: string; blob: Blob };
-type MediaLoadFailure = 'retryable' | 'blocked' | 'budget';
+type MediaLoadFailure = 'retryable' | 'blocked' | 'budget' | 'refresh';
 type MediaFetchResult = { media: LoadedMedia | null; failure: MediaLoadFailure | null };
 type IdentityBundle = {
 	avatar: LoadedMedia | null;
@@ -215,7 +215,8 @@ const quoteImagesRevealed = ref(false);
 const quoteVideoPosterSources = ref<Array<string | null>>([]);
 const mediaLoadFailed = ref(false);
 const mediaLoadBlocked = ref(false);
-const canRetryMedia = computed(() => mediaLoadFailed.value && !mediaLoadBlocked.value && !retryBlocked.value &&
+const photoHasRetryableFailure = computed(() => [...photoStates.value.main, ...photoStates.value.quote].some(state => state === 'error' || state === 'refresh'));
+const canRetryMedia = computed(() => (mediaLoadFailed.value || photoHasRetryableFailure.value) && !mediaLoadBlocked.value && !retryBlocked.value &&
 	(viewData.value.state === 'ready' || viewData.value.state === 'stale') && viewData.value.post != null &&
 	props.context.source?.kind === 'note' && props.context.revealed && props.context.active && props.context.inViewport);
 function hasSharedPhotoBudget(): boolean {
@@ -226,7 +227,7 @@ function photoGridReady(target: PhotoTarget): boolean {
 	const data = photoTargetData(target);
 	if (data == null || data.images.length === 0 || data.images.length > 4 || !hasSharedPhotoBudget()) return true;
 	const blobs = photoBlobRef(target).value;
-	return data.images.every((_, index) => blobs[index] != null || ['blocked', 'budget', 'error'].includes(photoStates.value[target][index] ?? ''));
+	return data.images.every((_, index) => blobs[index] != null || ['blocked', 'budget', 'error', 'refresh'].includes(photoStates.value[target][index] ?? ''));
 }
 function photoGridStatus(target: PhotoTarget): string | null {
 	const data = photoTargetData(target);
@@ -234,13 +235,14 @@ function photoGridStatus(target: PhotoTarget): string | null {
 	const states = photoStates.value[target].slice(0, data.images.length);
 	if (states.includes('blocked')) return '一部の画像を表示する権限を確認できません。';
 	if (states.includes('budget')) return '写真全体がメモリ上限を超えるため、一部の画像とギャラリーを表示できません。';
+	if (states.includes('refresh')) return '画像情報を再取得してください。';
 	if (states.includes('error')) return '一部の画像を読み込めませんでした。';
 	return null;
 }
 const mainPhotoGridStatus = computed(() => photoGridStatus('main'));
 const quotePhotoGridStatus = computed(() => photoGridStatus('quote'));
-const mainPhotoGridRetryable = computed(() => photoStates.value.main.includes('error'));
-const quotePhotoGridRetryable = computed(() => photoStates.value.quote.includes('error'));
+const mainPhotoGridRetryable = computed(() => photoStates.value.main.some(state => state === 'error' || state === 'refresh'));
+const quotePhotoGridRetryable = computed(() => photoStates.value.quote.some(state => state === 'error' || state === 'refresh'));
 const renderedImages = computed(() => {
 	if (!photoGridReady('main')) return [];
 	return (viewData.value.post?.images ?? []).flatMap((image, index) => {
@@ -597,6 +599,7 @@ function failedMediaResult(failure: MediaLoadFailure): MediaFetchResult {
 
 function combineMediaFailures(...failures: Array<MediaLoadFailure | null>): MediaLoadFailure | null {
 	if (failures.includes('blocked')) return 'blocked';
+	if (failures.includes('refresh')) return 'refresh';
 	return failures.includes('retryable') ? 'retryable' : null;
 }
 
@@ -626,6 +629,7 @@ async function fetchMedia(path: string, signal: AbortSignal, kind: string, index
 	}
 	if (signal.aborted) return emptyMediaResult();
 	if (response.status === 401 || response.status === 403) return failedMediaResult('blocked');
+	if (response.status === 404 && (kind === 'image' || kind === 'quote-image')) return failedMediaResult('refresh');
 	if (!response.ok) return failedMediaResult('retryable');
 	const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
 	if (contentType == null || !['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'].includes(contentType)) return failedMediaResult('retryable');
@@ -790,7 +794,7 @@ function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Pr
 	const data = photoTargetData(target);
 	if (!canLoadPhotos() || !hasSharedPhotoBudget() || data == null || !Number.isSafeInteger(index) || index < 0 || index >= data.images.length) return Promise.resolve();
 	if (photoBlobRef(target).value[index] != null) return Promise.resolve();
-	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget') return Promise.resolve();
+	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget' || photoStates.value[target][index] === 'refresh') return Promise.resolve();
 	const key = `${ownerKey()}:${target}:${index}`;
 	const existing = photoPromises.get(key);
 	if (existing != null && !photoControllers.get(key)?.signal.aborted) {
@@ -822,7 +826,7 @@ function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Pr
 			return;
 		}
 		if (result.media == null) {
-			setPhotoState(target, index, result.failure === 'blocked' ? 'blocked' : result.failure === 'budget' ? 'budget' : 'error');
+			setPhotoState(target, index, result.failure === 'blocked' ? 'blocked' : result.failure === 'budget' ? 'budget' : result.failure === 'refresh' ? 'refresh' : 'error');
 			return;
 		}
 		const sources = photoSourceRef(target);
@@ -869,12 +873,20 @@ function loadPhotoWindow(target: PhotoTarget, center: number): void {
 function retryPhoto(target: PhotoTarget, index: number): void {
 	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget') return;
 	photoViewerError.value = { ...photoViewerError.value, [target]: null };
+	if (photoStates.value[target][index] === 'refresh') {
+		if (canRetryMedia.value && retryWaitMs.value === 0) void retryPreview();
+		return;
+	}
 	void loadPhoto(target, index);
 }
 
 function retrySmallPhotoGrid(target: PhotoTarget): void {
 	const data = photoTargetData(target);
 	if (data == null || data.images.length > 4 || !hasSharedPhotoBudget()) return;
+	if (photoStates.value[target].includes('refresh')) {
+		if (canRetryMedia.value && retryWaitMs.value === 0) void retryPreview();
+		return;
+	}
 	for (let index = 0; index < data.images.length; index++) {
 		if (photoStates.value[target][index] === 'error') void loadPhoto(target, index);
 	}
@@ -897,7 +909,7 @@ async function openPhotoGallery(target: PhotoTarget, initialIndex: number): Prom
 			if (controller.signal.aborted || generation !== photoViewerGeneration || owner !== ownerKey()) return;
 			if (photoBlobRef(target).value[index] == null) {
 				const state = photoStates.value[target][index];
-				photoViewerError.value = { ...photoViewerError.value, [target]: state === 'blocked' ? '画像を表示する権限を確認できません。' : state === 'budget' ? '写真全体がメモリ上限を超えるため、ギャラリーを開けません。' : '写真をすべて読み込めませんでした。再試行してください。' };
+				photoViewerError.value = { ...photoViewerError.value, [target]: state === 'blocked' ? '画像を表示する権限を確認できません。' : state === 'budget' ? '写真全体がメモリ上限を超えるため、ギャラリーを開けません。' : state === 'refresh' ? '画像情報を再取得してからギャラリーを開いてください。' : '写真をすべて読み込めませんでした。再試行してください。' };
 				return;
 			}
 		}

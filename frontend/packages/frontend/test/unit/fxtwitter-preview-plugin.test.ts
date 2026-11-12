@@ -1242,10 +1242,10 @@ describe('FxTwitter preview plugin', () => {
 		expect(result.container.querySelectorAll('[data-fx-photo-carousel] img')).toHaveLength(2);
 	});
 
-	test('retries a failed carousel photo explicitly and retains it across viewport reentry', async () => {
+	test('retries a transient carousel photo failure explicitly and retains it across viewport reentry', async () => {
 		let imageZeroRequests = 0;
 		const fetcher = vi.fn(async (path: string) => {
-			if (path.includes('/image/0') && ++imageZeroRequests === 1) return new Response('expired', { status: 404 });
+			if (path.includes('/image/0') && ++imageZeroRequests === 1) return new Response('temporary media failure', { status: 503 });
 			return new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } });
 		});
 		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
@@ -1264,6 +1264,86 @@ describe('FxTwitter preview plugin', () => {
 		await Promise.resolve();
 		expect(fetcher).toHaveBeenCalledTimes(3);
 		expect(result.getByRole('button', { name: 'photo 1を拡大' })).toBeTruthy();
+	});
+
+	test('refreshes an expired carousel photo through the authorized preview request only after an explicit visible retry', async () => {
+		let previewRefreshes = 0;
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
+		const previewApi = vi.fn(async (path: string) => {
+			if (path === 'plugin/fxtwitter-preview/preview') {
+				previewRefreshes++;
+				return data;
+			}
+			throw new Error(`unexpected API call: ${path}`);
+		});
+		const fetcher = vi.fn(async (path: string) => path.includes('/image/0') && previewRefreshes === 0
+			? new Response('expired descriptor', { status: 404 })
+			: new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
+		initApi(previewApi as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(result.getByRole('button', { name: '再試行' })).toBeTruthy());
+		const retry = result.getByRole('button', { name: '再試行' });
+		await result.rerender({ data, input, context: { ...context, active: false, inViewport: false } });
+		await fireEvent.click(retry);
+		expect(previewApi).not.toHaveBeenCalled();
+		await result.rerender({ data, input, context });
+		await fireEvent.click(result.getByRole('button', { name: '再試行' }));
+		await waitFor(() => expect(previewApi).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(result.getByRole('button', { name: 'photo 1を拡大' })).toBeTruthy());
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
+		expect(fetcher.mock.calls.filter(([path]) => path.includes('/image/0'))).toHaveLength(2);
+		expect(previewApi).toHaveBeenCalledWith('plugin/fxtwitter-preview/preview', { noteId: 'note-1', postId: '1234567890' }, expect.anything());
+		expect(openMedia).not.toHaveBeenCalled();
+	});
+
+	test.each([401, 403])('does not offer carousel refresh for an unauthorized %i media response', async status => {
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
+		const previewApi = vi.fn() as PluginHost['api'];
+		const fetcher = vi.fn(async () => new Response('not authorized', { status }));
+		initApi(previewApi, fetcher as PluginHost['fetch']);
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(result.getAllByText('画像を表示できません')).toHaveLength(2));
+		expect(result.queryByRole('button', { name: '再試行' })).toBeNull();
+		expect(result.queryByRole('button', { name: 'メディアを再取得' })).toBeNull();
+		expect(previewApi).not.toHaveBeenCalled();
+	});
+
+	test('refreshes an expired mixed-gallery grid photo through the authorized preview request', async () => {
+		let previewRefreshes = 0;
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: 4 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `main ${index + 1}` }));
+		data.post!.quote = {
+			id: '2234567890', url: 'https://x.com/bob/status/2234567890', text: 'quoted photos', author: { name: 'Bob', screenName: 'bob' }, hasVideo: false,
+			images: Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/quote-image/${index}?noteId=note-1`, alt: `quote ${index + 1}` })),
+		};
+		const previewApi = vi.fn(async (path: string) => {
+			if (path === 'plugin/fxtwitter-preview/preview') {
+				previewRefreshes++;
+				return data;
+			}
+			throw new Error(`unexpected API call: ${path}`);
+		});
+		const fetcher = vi.fn(async (path: string) => path.includes('/image/0') && previewRefreshes === 0
+			? new Response('expired descriptor', { status: 404 })
+			: new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
+		initApi(previewApi as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(result.getByRole('button', { name: 'メディアを再取得' })).toBeTruthy());
+		await fireEvent.click(result.getByRole('button', { name: '再試行' }));
+		await waitFor(() => expect(previewApi).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(result.container.querySelectorAll('[data-fx-media-grid] img')).toHaveLength(4));
+		expect(fetcher.mock.calls.filter(([path]) => path.includes('/image/0'))).toHaveLength(2);
+		expect(openMedia).not.toHaveBeenCalled();
 	});
 
 	test('native proxy renders an independent button for each main and quoted video slot', async () => {

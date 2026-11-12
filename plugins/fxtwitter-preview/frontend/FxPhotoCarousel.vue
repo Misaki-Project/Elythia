@@ -47,9 +47,10 @@
 							<span v-if="image.state === 'loading'" role="status">画像を読み込み中…</span>
 							<span v-else-if="image.state === 'blocked'" role="status">画像を表示できません</span>
 							<span v-else-if="image.state === 'budget'" role="status">メモリ上限に達しました</span>
+							<span v-else-if="image.state === 'refresh'" role="status">画像情報を再取得してください</span>
 							<span v-else-if="image.state === 'error'" role="status">画像を読み込めません</span>
 							<span v-else aria-hidden="true">画像 {{ image.index + 1 }}</span>
-							<button v-if="image.state === 'error'" type="button" class="_button" :class="$style.retry" @click.stop="$emit('retry', image.index)">再試行</button>
+							<button v-if="image.state === 'error' || image.state === 'refresh'" type="button" class="_button" :class="$style.retry" :disabled="retryDisabled" @click.stop="$emit('retry', image.index)">再試行</button>
 						</div>
 					</div>
 				</div>
@@ -75,7 +76,7 @@ export type FxCarouselImage = {
 	alt: string;
 	width?: number;
 	height?: number;
-	state?: 'loading' | 'blocked' | 'budget' | 'error';
+	state?: 'loading' | 'blocked' | 'budget' | 'error' | 'refresh';
 };
 
 const props = defineProps<{
@@ -83,6 +84,7 @@ const props = defineProps<{
 	isSensitive?: boolean;
 	viewerLoading?: boolean;
 	viewerError?: string | null;
+	retryDisabled?: boolean;
 }>();
 
 const emit = defineEmits<{
