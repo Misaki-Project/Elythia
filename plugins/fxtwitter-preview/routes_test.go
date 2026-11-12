@@ -6,11 +6,13 @@ package fxtwitterpreview
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/elythia-network/elythia/plugin"
 	"github.com/elythia-network/elythia/plugin/plugintest"
 )
 
@@ -430,6 +432,14 @@ func TestMediaRouteRechecksNoteACLBeforeOutboundFetch(t *testing.T) {
 	now := time.Now().UTC()
 	s := newStore(db, testConfig())
 	mediaCache(t, s, now, "https://pbs.twimg.com/media/test.png")
+	oldCache := processMediaResponseCache
+	processMediaResponseCache = newMediaResponseCache(mediaResponseCacheBytes, mediaResponseCacheEntries, mediaResponseCacheTTL)
+	t.Cleanup(func() { processMediaResponseCache = oldCache })
+	rawURL, fetchedAt, err := s.ResolveMediaDescriptor(context.Background(), "1234567890", "image", "0", now.Add(time.Second))
+	if err != nil || fetchedAt == nil {
+		t.Fatalf("resolve media for cache seed: url=%q fetchedAt=%v err=%v", rawURL, fetchedAt, err)
+	}
+	processMediaResponseCache.Set(mediaCacheKey{PostID: "1234567890", FetchedAt: *fetchedAt, SourceURL: rawURL, MaxBytes: 10 << 20}, plugin.Blob{ContentType: "image/png", Body: tinyImage(t, "png")}, now)
 	a := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/9999999999"}`}
 	mediaCalled := false
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -440,7 +450,7 @@ func TestMediaRouteRechecksNoteACLBeforeOutboundFetch(t *testing.T) {
 		"externalFetchEnabled": true,
 	})
 	routes := h.Routes(Plugin)
-	_, err := routes.Call(t, "GET /media/:postId/:kind/:index", plugintest.Request{
+	_, err = routes.Call(t, "GET /media/:postId/:kind/:index", plugintest.Request{
 		UserID:              "u1",
 		Params:              map[string]string{"postId": "1234567890", "kind": "image", "index": "0"},
 		Query:               map[string]string{"noteId": "note1"},
@@ -454,6 +464,105 @@ func TestMediaRouteRechecksNoteACLBeforeOutboundFetch(t *testing.T) {
 	}
 	if mediaCalled {
 		t.Fatal("media route fetched outbound bytes before note ACL passed")
+	}
+}
+
+func TestMediaRouteRechecksDescriptorAfterQueueBeforeCacheOrFetch(t *testing.T) {
+	db := migratedDB(t)
+	now := time.Now().UTC()
+	s := newStore(db, testConfig())
+	mediaCache(t, s, now, "https://pbs.twimg.com/media/test.png")
+	oldGate, oldLimiter, oldAdmission, oldCache := processMediaRequestGate, processMediaRequestLimiter, processMediaAdmission, processMediaResponseCache
+	processMediaRequestGate = newMediaRequestGate(mediaRequestCapacity, mediaGlobalWaitLimit, mediaUserWaitLimit, 5*(1024+1))
+	processMediaRequestLimiter = newMediaRequestLimiter(mediaUserRequestsPerMinute, mediaGlobalRequestsPerMinute)
+	processMediaAdmission = newMediaAdmission(mediaProcessingConcurrency, mediaRequestCapacity, mediaBufferCapacity)
+	processMediaResponseCache = newMediaResponseCache(mediaResponseCacheBytes, mediaResponseCacheEntries, mediaResponseCacheTTL)
+	t.Cleanup(func() {
+		processMediaRequestGate, processMediaRequestLimiter, processMediaAdmission, processMediaResponseCache = oldGate, oldLimiter, oldAdmission, oldCache
+	})
+	var held []func()
+	for range 4 {
+		release, err := processMediaRequestGate.acquire(context.Background(), "u1", 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, release)
+	}
+	a := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	mediaCalled := false
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		mediaCalled = true
+		return response(200, "image/png", string(tinyImage(t, "png"))), nil
+	})}
+	h := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(a).WithHTTPClient(client).WithConfig(map[string]any{
+		"externalFetchEnabled": true, "staticImageMaxBytes": 1024,
+	})
+	routes := h.Routes(Plugin)
+	result := make(chan error, 1)
+	go func() {
+		_, err := routes.Call(t, "GET /media/:postId/:kind/:index", plugintest.Request{
+			UserID: "u1", Params: map[string]string{"postId": "1234567890", "kind": "image", "index": "0"},
+			Query: map[string]string{"noteId": "note1"}, CheckedRolePolicies: allowPreviewPolicies(),
+		})
+		result <- err
+	}()
+	waitForMediaGate(t, processMediaRequestGate, 4, 1)
+	if _, err := db.Exec(`DELETE FROM public_post_cache WHERE post_id = $1`, "1234567890"); err != nil {
+		t.Fatal(err)
+	}
+	for _, release := range held {
+		release()
+	}
+	if err := <-result; err == nil {
+		t.Fatal("queued media request succeeded after its descriptor was removed")
+	}
+	if mediaCalled {
+		t.Fatal("queued request fetched outbound bytes after descriptor removal")
+	}
+}
+
+func TestMediaRouteServesAuthorizedWarmCacheUnderSharedAdmission(t *testing.T) {
+	db := migratedDB(t)
+	now := time.Now().UTC()
+	s := newStore(db, testConfig())
+	mediaCache(t, s, now, "https://pbs.twimg.com/media/test.png")
+	rawURL, fetchedAt, err := s.ResolveMediaDescriptor(context.Background(), "1234567890", "image", "0", now.Add(time.Second))
+	if err != nil || fetchedAt == nil {
+		t.Fatalf("resolve media for cache seed: url=%q fetchedAt=%v err=%v", rawURL, fetchedAt, err)
+	}
+	oldGate, oldLimiter, oldAdmission, oldCache := processMediaRequestGate, processMediaRequestLimiter, processMediaAdmission, processMediaResponseCache
+	processMediaRequestGate = newMediaRequestGate(mediaRequestCapacity, mediaGlobalWaitLimit, mediaUserWaitLimit, mediaBufferCapacity)
+	processMediaRequestLimiter = newMediaRequestLimiter(mediaUserRequestsPerMinute, mediaGlobalRequestsPerMinute)
+	processMediaAdmission = newMediaAdmission(mediaProcessingConcurrency, mediaRequestCapacity, mediaBufferCapacity)
+	processMediaResponseCache = newMediaResponseCache(mediaResponseCacheBytes, mediaResponseCacheEntries, mediaResponseCacheTTL)
+	t.Cleanup(func() {
+		processMediaRequestGate, processMediaRequestLimiter, processMediaAdmission, processMediaResponseCache = oldGate, oldLimiter, oldAdmission, oldCache
+	})
+	wantBody := tinyImage(t, "png")
+	processMediaResponseCache.Set(mediaCacheKey{PostID: "1234567890", FetchedAt: *fetchedAt, SourceURL: rawURL, MaxBytes: 1024}, plugin.Blob{ContentType: "image/png", Body: wantBody}, now)
+	mediaCalled := false
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		mediaCalled = true
+		return nil, errors.New("warm cache should avoid outbound fetch")
+	})}
+	a := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	h := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(a).WithHTTPClient(client).WithConfig(map[string]any{
+		"externalFetchEnabled": true, "staticImageMaxBytes": 1024,
+	})
+	routes := h.Routes(Plugin)
+	result, err := routes.Call(t, "GET /media/:postId/:kind/:index", plugintest.Request{
+		UserID: "u1", Params: map[string]string{"postId": "1234567890", "kind": "image", "index": "0"},
+		Query: map[string]string{"noteId": "note1"}, CheckedRolePolicies: allowPreviewPolicies(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, ok := result.(plugin.Blob)
+	if !ok || string(blob.Body) != string(wantBody) || cap(blob.Body) != len(wantBody) {
+		t.Fatalf("warm-cache blob = %#v, want exact copied image bytes", result)
+	}
+	if blob.CacheControl != "private, no-store" || blob.WriteTimeout != mediaResponseWriteTimeout || mediaCalled {
+		t.Fatalf("cache response policy = cache:%q timeout:%s outbound:%v", blob.CacheControl, blob.WriteTimeout, mediaCalled)
 	}
 }
 

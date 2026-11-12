@@ -786,11 +786,6 @@ async function onPaste(ev: ClipboardEvent) {
 			const value = (prefer.s as Record<string, unknown>)[key];
 			return typeof value === 'boolean' ? value : undefined;
 		},
-		resolveMessage: key => {
-			const messages = i18n.ts._postFormPasteNotifications as unknown as Record<string, unknown>;
-			const value = messages[key];
-			return typeof value === 'string' ? value : undefined;
-		},
 	});
 	const paste = transformedPaste.text;
 	const pasteChanged = paste !== rawPaste;

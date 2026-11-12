@@ -143,15 +143,14 @@ type PasteTextRegistration = {
 	options?: PasteTextTransformOptions;
 };
 
-/** Optional native preference and notification resolved by the post form at paste time. */
+/** Optional native preference and plugin-owned notification resolved at paste time. */
 export type PasteTextTransformOptions = {
 	enabledPreferenceKey?: string;
-	notificationMessageKey?: string;
+	notification?: () => string;
 };
 
 export type PasteTextTransformRuntime = {
 	isPreferenceEnabled: (key: string) => boolean | undefined;
-	resolveMessage: (key: string) => string | undefined;
 };
 
 export type TransformedPasteText = { text: string; notification?: string };
@@ -401,7 +400,7 @@ function registerPasteTextTransform(plugin: string, id: string, transform: Paste
 /** Applies registered transforms in stable namespaced-ID order. */
 export function transformPastedText(text: string, runtime?: PasteTextTransformRuntime): TransformedPasteText {
 	let current = text;
-	let notificationMessageKey: string | undefined;
+	let notification: string | undefined;
 	const registrations = [...pasteTransformRegistry.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 	for (const registration of registrations) {
 		const preferenceKey = registration.options?.enabledPreferenceKey;
@@ -429,20 +428,17 @@ export function transformPastedText(text: string, runtime?: PasteTextTransformRu
 				continue;
 			}
 			current = transformed;
-			if (current !== before && registration.options?.notificationMessageKey) {
-				notificationMessageKey ??= registration.options.notificationMessageKey;
+			if (current !== before && notification == null && registration.options?.notification != null) {
+				try {
+					const resolvedNotification = registration.options.notification();
+					if (typeof resolvedNotification === 'string') notification = resolvedNotification;
+				} catch {
+					// Feedback is optional; never interrupt the user's paste.
+				}
 			}
 		} catch {
 			// Never log the exception: a plugin could include the pasted text in it.
 			if (_DEV_) console.warn(`[plugin:post-form-paste:${registration.id}] transform failed; keeping previous text`);
-		}
-	}
-	let notification: string | undefined;
-	if (current !== text && notificationMessageKey && runtime) {
-		try {
-			notification = runtime.resolveMessage(notificationMessageKey);
-		} catch {
-			// Message lookup must never interrupt normal paste behavior.
 		}
 	}
 	return { text: current, ...(notification ? { notification } : {}) };

@@ -105,14 +105,13 @@ describe('post form paste transforms', () => {
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', transform, {
 					enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+					notification: () => 'Tracking parameters removed',
 				});
 			},
 		}]);
 		const input = 'https://example.com/?utm_source=track';
 		const runtime = {
 			isPreferenceEnabled: (key: string) => key === 'trackingParameterCleanerEnabled' ? false : undefined,
-			resolveMessage: (key: string) => key === 'trackingParameterCleanerApplied' ? 'Tracking parameters removed' : undefined,
 		};
 
 		const disabled = transformPastedText(input, runtime);
@@ -138,19 +137,18 @@ describe('post form paste transforms', () => {
 		expect(missingPreferenceUsesDefault.notification).toBe('Tracking parameters removed');
 	});
 
-	test('preference and message resolver failures never interrupt the paste', async () => {
+	test('preference and notification callback failures never interrupt the paste', async () => {
 		await launchServerPlugins([{
 			name: 'cleaner',
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', text => `${text}!`, {
 					enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+				notification: () => { throw new Error('message unavailable'); },
 				});
 			},
 		}]);
 		expect(transformPastedText('paste', {
 			isPreferenceEnabled: () => { throw new Error('preference unavailable'); },
-			resolveMessage: () => { throw new Error('message unavailable'); },
 		})).toEqual({ text: 'paste!' });
 	});
 });

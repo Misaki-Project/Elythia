@@ -845,7 +845,7 @@ URLプレビューポップアップ、ページ本文などは対象外。`Prev
 ```ts
 host.postForm.registerPasteTransform('tracking-cleaner', text => removeTrackingParameters(text), {
   enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-  notificationMessageKey: 'trackingParameterCleanerApplied',
+  notification: () => currentLanguage === 'ja-JP' ? '追跡パラメータを除去しました' : 'Tracking parameters removed',
 });
 ```
 
@@ -853,7 +853,7 @@ host.postForm.registerPasteTransform('tracking-cleaner', text => removeTrackingP
 
 変換対象はテキストだけで、fileが含まれる貼り付けは既存の添付処理を優先する。処理後の文字列はノート引用の確認と長文のテキスト添付にも使われる。通常の短文で内容が変わった場合だけ、hostが既存のカーソル挿入処理で変換後の文字列を挿入する。同じ文字列ならブラウザー標準の貼り付けを維持する。クリップボード自体は変更しない。
 
-`enabledPreferenceKey` はnative preferencesの値を貼り付けのたびに読み、明示的な `false` の場合だけその変換を省く。値が未定義なら有効として扱う。`notificationMessageKey` は `i18n.ts._postFormPasteNotifications` グループ内のキーを指定する。そのキーの翻訳を追加すると、変換後のテキストが本文へ挿入された場合、またはその文字列を長文添付ファイルとして追加した場合にだけhostがローカライズ済み通知を1回表示する。引用の添付だけで本文にテキストが使われない場合や、変換結果が変わらない場合には通知しない。プラグインが何も登録していない場合は従来どおり動く。
+`enabledPreferenceKey` はnative preferencesの値を貼り付けのたびに読み、明示的な `false` の場合だけその変換を省く。値が未定義なら有効として扱う。`notification`にはプラグイン自身の文字列からローカライズ済みメッセージを返す関数を渡せる。貼り付け時に呼ぶため、現在の言語設定に合わせられる。変換後のテキストが本文へ挿入された場合、またはその文字列を長文添付ファイルとして追加した場合にだけhostが通知を1回表示する。引用の添付だけで本文にテキストが使われない場合や、変換結果が変わらない場合には通知しない。プラグインが何も登録していない場合は従来どおり動く。
 ## 他のインスタンスとやりとりする
 
 同じプラグインを入れている **Elythia 同士**でだけ通信できる (#2537)。wire の形は
@@ -1373,7 +1373,7 @@ host.name / host.me
 definePlugin({ name, pages?, setup })
 host.slot(name, renderer)
 host.preview.register(provider)
-host.postForm.registerPasteTransform(id, transform, { enabledPreferenceKey?, notificationMessageKey? })
+host.postForm.registerPasteTransform(id, transform, { enabledPreferenceKey?, notification? })
 host.api<T>(endpoint, params, { signal? })
 
 PluginPage: { path, component, navTitle?, navIcon?, admin? }

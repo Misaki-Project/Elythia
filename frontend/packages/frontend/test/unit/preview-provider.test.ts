@@ -281,6 +281,24 @@ describe('preview provider coordinator', () => {
 		expect(presentation.mock.calls.some(([, context]) => context.preferenceValue === 'ogp')).toBe(true);
 	});
 
+	test.each([
+		['invalid', () => 'unsupported' as unknown as ReturnType<NonNullable<PreviewProvider['presentation']>>],
+		['throwing', () => { throw new Error('presentation failed'); }],
+	])('fails closed when a provider presentation hook is %s', async (_name, presentation) => {
+		const load = vi.fn(async () => 'loaded');
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+		const gatedProvider = Object.assign(lazyProvider({ load }), { presentation });
+		await launchServerPlugins([plugin('gated', gatedProvider)]);
+
+		const result = renderPreview();
+		await nextTick();
+
+		expect(load).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.getByRole('link').getAttribute('href')).toBe(urlInput.href);
+		if (_name === 'throwing') expect(warn).toHaveBeenCalledWith('[preview:gated:card] presentation failed', expect.any(Error));
+	});
+
   test.each(['text', 'media'] as const)('%s mode automatically loads a permitted timeline provider', async mode => {
     setTimelineMode(mode);
     const load = vi.fn(async (_input, context) => `mode:${context.preferenceValue};manual:${context.manual}`);
@@ -387,6 +405,29 @@ describe('preview provider coordinator', () => {
 		const result = renderPreview({ detail: false, showActions: false });
 		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 		expect(result.container.querySelector('button')).toBeNull();
+		expect(result.getAllByRole('link')).toHaveLength(1);
+	});
+
+	test('replacing an object preference invalidates settled provider state by identity', async () => {
+		const preference = (prefer.r as Record<string, { value: unknown }>).mutingEmojis;
+		const original = preference.value;
+		const load = vi.fn(async (_input, context) => `loaded:${String(context.preferenceValue)}`);
+		const objectPreferenceProvider = Object.assign(lazyProvider({ load }), {
+			preferenceKey: 'mutingEmojis',
+			presentation: () => 'automatic' as const,
+		});
+		await launchServerPlugins([plugin('object-preference', objectPreferenceProvider)]);
+
+		try {
+			const result = renderPreview();
+			await waitFor(() => expect(result.getByText('provider: loaded:')).toBeTruthy());
+			expect(load).toHaveBeenCalledTimes(1);
+
+			preference.value = [];
+			await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+		} finally {
+			preference.value = original;
+		}
 	});
 
 	test('does not load while the document is inactive', async () => {

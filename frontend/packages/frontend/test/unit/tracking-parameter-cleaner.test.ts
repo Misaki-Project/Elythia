@@ -133,7 +133,7 @@ describe('tracking parameter cleaner', () => {
 	});
 
 	test('registers the transform as a default plugin behavior', () => {
-		const registered: Array<{ id: string; transform: (text: string) => string; options?: { enabledPreferenceKey?: string; notificationMessageKey?: string } }> = [];
+		const registered: Array<{ id: string; transform: (text: string) => string; options?: { enabledPreferenceKey?: string; notification?: () => string } }> = [];
 		const registerPasteTransform: PluginHost['postForm']['registerPasteTransform'] = (id, transform, options) => {
 			registered.push({ id, transform, options });
 		};
@@ -145,8 +145,9 @@ describe('tracking parameter cleaner', () => {
 		expect(registered[0].id).toBe('clean-links');
 		expect(registered[0].options).toEqual({
 			enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-			notificationMessageKey: 'trackingParameterCleanerApplied',
+			notification: expect.any(Function),
 		});
+		expect(registered[0].options?.notification?.()).toBe('Tracking parameters removed');
 		expect(registered[0].transform('https://x.com/a/status/1?s=1')).toBe('https://x.com/a/status/1');
 	});
 });

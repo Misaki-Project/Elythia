@@ -4,6 +4,7 @@
  */
 
 import { definePlugin } from '@/plugin-api.js';
+import { lang } from '@@/js/config.js';
 import { cleanTrackingParameters } from './cleaner.js';
 
 export { cleanTrackingParameters } from './cleaner.js';
@@ -13,7 +14,7 @@ export default definePlugin({
 	setup(host) {
 		host.postForm.registerPasteTransform('clean-links', cleanTrackingParameters, {
 			enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-			notificationMessageKey: 'trackingParameterCleanerApplied',
+			notification: () => lang === 'ja-JP' ? '追跡パラメータを除去しました' : 'Tracking parameters removed',
 		});
 	},
 });

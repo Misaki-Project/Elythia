@@ -49,14 +49,26 @@ func newMediaAdmission(concurrency, requestCapacity, bufferCapacity int) *mediaA
 }
 
 func (a *mediaAdmission) admit(ctx context.Context, maxBytes int) (func(), error) {
+	return a.admitWithQueue(ctx, maxBytes, false)
+}
+
+func (a *mediaAdmission) admitWithQueue(ctx context.Context, maxBytes int, wait bool) (func(), error) {
 	reserveBytes := int64(maxBytes) + 1
 	if maxBytes < 1 || reserveBytes > a.capacity {
 		return nil, errMediaBusy
 	}
-	select {
-	case a.requests <- struct{}{}:
-	default:
-		return nil, errMediaBusy
+	if wait {
+		select {
+		case a.requests <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	} else {
+		select {
+		case a.requests <- struct{}{}:
+		default:
+			return nil, errMediaBusy
+		}
 	}
 	if err := a.buffered.Acquire(ctx, reserveBytes); err != nil {
 		<-a.requests
@@ -82,60 +94,67 @@ func (a *mediaAdmission) acquireDecoder(ctx context.Context) (func(), error) {
 }
 
 func (s *store) ResolveMedia(ctx context.Context, postID, kind, rawIndex string, now time.Time) (string, error) {
+	url, _, err := s.ResolveMediaDescriptor(ctx, postID, kind, rawIndex, now)
+	return url, err
+}
+
+func (s *store) ResolveMediaDescriptor(ctx context.Context, postID, kind, rawIndex string, now time.Time) (string, *time.Time, error) {
 	if !statusIDPattern.MatchString(postID) {
-		return "", errors.New("invalid post id")
+		return "", nil, errors.New("invalid post id")
 	}
 	index, err := strconv.Atoi(rawIndex)
 	if err != nil || index < 0 {
-		return "", errors.New("invalid media index")
+		return "", nil, errors.New("invalid media index")
 	}
 	entry, err := s.ReadPublic(ctx, postID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if entry == nil || (entry.State != "ready" && entry.State != "stale") || entry.Post == nil || !entry.NextFetchAt.After(now) {
-		return "", errors.New("media descriptor unavailable")
+		return "", nil, errors.New("media descriptor unavailable")
 	}
+	var source string
 	switch kind {
 	case "avatar":
 		if index != 0 {
-			return "", errors.New("avatar index unavailable")
+			return "", nil, errors.New("avatar index unavailable")
 		}
-		return entry.Post.Author.AvatarURL, nil
+		source = entry.Post.Author.AvatarURL
 	case "image":
 		if index >= len(entry.Post.Images) {
-			return "", errors.New("image index unavailable")
+			return "", nil, errors.New("image index unavailable")
 		}
-		return entry.Post.Images[index].URL, nil
+		source = entry.Post.Images[index].URL
 	case "poster":
 		video := indexedVideo(entry.Post.Videos, entry.Post.Video, index)
 		if video == nil ||
 			(entry.State != "stale" && (video.PosterExpiresAt == nil || !video.PosterExpiresAt.After(now))) {
-			return "", errors.New("poster unavailable")
+			return "", nil, errors.New("poster unavailable")
 		}
-		return video.PosterURL, nil
+		source = video.PosterURL
 	case "quote-avatar":
 		if index != 0 || entry.Post.Quote == nil {
-			return "", errors.New("quoted avatar unavailable")
+			return "", nil, errors.New("quoted avatar unavailable")
 		}
-		return entry.Post.Quote.Author.AvatarURL, nil
+		source = entry.Post.Quote.Author.AvatarURL
 	case "quote-image":
 		if entry.Post.Quote == nil || index >= len(entry.Post.Quote.Images) {
-			return "", errors.New("quoted image unavailable")
+			return "", nil, errors.New("quoted image unavailable")
 		}
-		return entry.Post.Quote.Images[index].URL, nil
+		source = entry.Post.Quote.Images[index].URL
 	case "quote-poster":
 		if entry.Post.Quote == nil {
-			return "", errors.New("quoted poster unavailable")
+			return "", nil, errors.New("quoted poster unavailable")
 		}
 		video := indexedVideo(entry.Post.Quote.Videos, entry.Post.Quote.Video, index)
 		if video == nil || (entry.State != "stale" && (video.PosterExpiresAt == nil || !video.PosterExpiresAt.After(now))) {
-			return "", errors.New("quoted poster unavailable")
+			return "", nil, errors.New("quoted poster unavailable")
 		}
-		return video.PosterURL, nil
+		source = video.PosterURL
 	default:
-		return "", errors.New("unknown media kind")
+		return "", nil, errors.New("unknown media kind")
 	}
+	return source, entry.FetchedAt, nil
 }
 
 func indexedVideo(videos []PublicVideoMetadata, legacy *PublicVideo, index int) *PublicVideoMetadata {
@@ -171,6 +190,10 @@ func fetchMediaWithAdmission(ctx context.Context, base *http.Client, rawURL stri
 	if err != nil {
 		return plugin.Blob{}, nil, err
 	}
+	return fetchMediaWithReservation(ctx, base, u, maxBytes, admission, release)
+}
+
+func fetchMediaWithReservation(ctx context.Context, base *http.Client, u *url.URL, maxBytes int, admission *mediaAdmission, release func()) (plugin.Blob, func(), error) {
 	keepReservation := false
 	defer func() {
 		if !keepReservation {

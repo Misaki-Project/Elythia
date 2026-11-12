@@ -47,7 +47,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		:context="context"
 	/>
 	<a
-		v-else-if="selectedProvider != null && safeHref != null"
+		v-else-if="selectedProvider != null && !showNativeFallback && safeHref != null"
 		v-bind="$attrs"
 		:class="[$attrs.class, $style.sourceLink]"
 		:href="safeHref"
@@ -115,7 +115,17 @@ const context = computed<PreviewContext>(() => ({
 	inViewport: inViewport.value,
 	source: props.source,
 }));
-const presentation = computed(() => selectedProvider.value?.presentation?.(input.value, context.value) ?? 'automatic');
+const presentation = computed(() => {
+	const provider = selectedProvider.value;
+	if (provider?.presentation == null) return 'automatic';
+	try {
+		const value = provider.presentation(input.value, context.value);
+		return value === 'manual' || value === 'disabled' || value === 'automatic' ? value : 'disabled';
+	} catch (err) {
+		console.warn(`[preview:${registration.value?.id}] presentation failed`, err);
+		return 'disabled';
+	}
+});
 const canPresent = computed(() => props.source != null && props.revealed && active.value && inViewport.value && safeHref.value != null &&
 	(selectedProvider.value?.requiresDetail !== true || props.detail));
 const showManualAction = computed(() => selectedProvider.value != null && presentation.value === 'manual' && canPresent.value && !manualActivated.value && props.showActions);
@@ -134,10 +144,15 @@ const renderFailed = ref(false);
 const providerRetryAttempt = ref(0);
 let controller: AbortController | null = null;
 let loadGeneration = 0;
-let settledKey = '';
+type PreviewLoadKey = readonly unknown[];
+let settledKey: PreviewLoadKey | null = null;
 
-function loadKey(): string {
-	return [registration.value?.id ?? '', props.url, props.source?.noteId ?? '', props.detail, String(preferenceValue.value), presentation.value, manualActivated.value, providerRetryAttempt.value].join('\u0000');
+function loadKey(): PreviewLoadKey {
+	return [registration.value?.id ?? '', props.url, props.source?.noteId ?? '', props.detail, preferenceValue.value, presentation.value, manualActivated.value, providerRetryAttempt.value];
+}
+
+function sameLoadKey(left: PreviewLoadKey | null, right: PreviewLoadKey): boolean {
+	return left != null && left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
 }
 
 function activateManualPreview(): void {
@@ -167,12 +182,12 @@ function resetLoad(): void {
 	abortLoad();
 	loadState.value = 'idle';
 	loadedData.value = null;
-	settledKey = '';
+	settledKey = null;
 	renderFailed.value = false;
 }
 
-function ownsSettledState(key: string): boolean {
-	return (loadState.value === 'ready' || loadState.value === 'error') && settledKey === key && props.revealed && props.source != null;
+function ownsSettledState(key: PreviewLoadKey): boolean {
+	return (loadState.value === 'ready' || loadState.value === 'error') && sameLoadKey(settledKey, key) && props.revealed && props.source != null;
 }
 
 watch(

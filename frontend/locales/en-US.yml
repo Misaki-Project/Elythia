@@ -142,8 +142,6 @@ reactionSettingDescription2: "Drag to reorder, click to delete, press \"+\" to a
 rememberNoteVisibility: "Remember note visibility settings"
 trackingParameterCleanerEnabled: "Remove tracking parameters when pasting"
 trackingParameterCleanerDescription: "Remove recognized tracking parameters from pasted text."
-_postFormPasteNotifications:
-  trackingParameterCleanerApplied: "Tracking parameters removed"
 attachCancel: "Remove attachment"
 deleteFile: "Delete file"
 markAsSensitive: "Mark as sensitive"

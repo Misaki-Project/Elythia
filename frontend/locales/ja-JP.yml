@@ -142,8 +142,6 @@ reactionSettingDescription2: "ドラッグして並び替え、クリックし�
 rememberNoteVisibility: "公開範囲を記憶する"
 trackingParameterCleanerEnabled: "貼り付け時に追跡パラメータを除去する"
 trackingParameterCleanerDescription: "テキストの貼り付け時、対応している追跡パラメータだけを除去します。"
-_postFormPasteNotifications:
-  trackingParameterCleanerApplied: "追跡パラメータを除去しました"
 attachCancel: "添付取り消し"
 deleteFile: "ファイルを削除"
 markAsSensitive: "センシティブとして設定"

@@ -146,7 +146,7 @@ describe('MkPostForm paste transform integration', () => {
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', transform, {
 					enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+					notification: () => 'Tracking parameters removed',
 				});
 			},
 		}]);
@@ -176,7 +176,7 @@ describe('MkPostForm paste transform integration', () => {
 			name: 'cleaner',
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', text => `${text}!`, {
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+					notification: () => 'Tracking parameters removed',
 				});
 			},
 		}]);
@@ -254,7 +254,7 @@ describe('MkPostForm paste transform integration', () => {
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', text => text.replace('?utm_source=track', ''), {
 					enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+					notification: () => 'Tracking parameters removed',
 				});
 			},
 		}]);
@@ -276,7 +276,7 @@ describe('MkPostForm paste transform integration', () => {
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', text => text.replace('?utm_source=track', ''), {
 					enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+					notification: () => 'Tracking parameters removed',
 				});
 			},
 		}]);
@@ -295,7 +295,7 @@ describe('MkPostForm paste transform integration', () => {
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', text => `${text} cleaned`, {
 					enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+					notification: () => 'Tracking parameters removed',
 				});
 			},
 		}]);
@@ -320,7 +320,7 @@ describe('MkPostForm paste transform integration', () => {
 			setup(host) {
 				host.postForm.registerPasteTransform('tracking', text => `${text} cleaned`, {
 					enabledPreferenceKey: 'trackingParameterCleanerEnabled',
-					notificationMessageKey: 'trackingParameterCleanerApplied',
+					notification: () => 'Tracking parameters removed',
 				});
 			},
 		}]);

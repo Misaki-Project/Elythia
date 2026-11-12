@@ -179,25 +179,82 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		}
 		noteID := req.Query("noteId")
 		postID := req.Param("postId")
-		if noteID == "" || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+		if noteID == "" || !statusIDPattern.MatchString(postID) {
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		rawURL, err := s.ResolveMedia(req.Context(), postID, req.Param("kind"), req.Param("index"), time.Now().UTC())
+		now := time.Now().UTC()
+		if !processMediaRequestLimiter.Allow(req.UserID(), now) {
+			return nil, plugin.NewCodedStatusError(http.StatusTooManyRequests, "media request rate limit exceeded; try again in a minute", "MEDIA_RATE_LIMITED")
+		}
+		if verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		rawURL, fetchedAt, err := s.ResolveMediaDescriptor(req.Context(), postID, req.Param("kind"), req.Param("index"), now)
 		if err != nil {
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		fetchCtx, cancel := context.WithTimeout(req.Context(), cfg.RequestTimeout)
-		defer cancel()
-		blob, releaseMedia, err := fetchMediaWithAdmission(fetchCtx, ctx.HTTP(), rawURL, cfg.StaticImageMaxBytes, processMediaAdmission)
+		waitBudget := mediaQueueWaitBudget(mediaRequestCapacity, mediaBufferCapacity, mediaUserActiveLimit, cfg.StaticImageMaxBytes, cfg.RequestTimeout, mediaQueueWaitTimeout)
+		waitCtx, cancelWait := context.WithTimeout(req.Context(), waitBudget)
+		defer cancelWait()
+		releaseUser, err := processMediaRequestGate.acquire(waitCtx, req.UserID(), cfg.StaticImageMaxBytes)
 		if err != nil {
-			ctx.Logger().Warn("Fx preview media unavailable", "postId", req.Param("postId"), "kind", req.Param("kind"), "err", err)
+			return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "media request capacity is busy; retry shortly", "MEDIA_BUSY")
+		}
+		releaseAdmission, err := processMediaAdmission.admitWithQueue(waitCtx, cfg.StaticImageMaxBytes, true)
+		if err != nil {
+			releaseUser()
+			return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "media request capacity is busy; retry shortly", "MEDIA_BUSY")
+		}
+		// Admission may wait behind other plugin media. Recheck policy, note ACL,
+		// and the current descriptor before using even a warm cache entry.
+		if waitCtx.Err() != nil {
+			releaseAdmission()
+			releaseUser()
+			return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "media request capacity is busy; retry shortly", "MEDIA_BUSY")
+		}
+		if _, err := requirePreviewPolicy(req); err != nil || waitCtx.Err() != nil ||
+			verifyVisibleNote(waitCtx, ctx.API(), req.UserID(), noteID, postID) != nil {
+			releaseAdmission()
+			releaseUser()
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		if req.Context().Done() == nil {
-			releaseMedia()
-		} else {
-			context.AfterFunc(req.Context(), releaseMedia)
+		rawURL, fetchedAt, err = s.ResolveMediaDescriptor(waitCtx, postID, req.Param("kind"), req.Param("index"), time.Now().UTC())
+		if err != nil {
+			releaseAdmission()
+			releaseUser()
+			return nil, plugin.ErrNotFound("media unavailable")
 		}
+		u, err := url.Parse(rawURL)
+		if err != nil || u.Scheme != "https" || !allowedMediaHost(u.Host) || u.User != nil {
+			releaseAdmission()
+			releaseUser()
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		key := mediaCacheKey{PostID: postID, SourceURL: u.String(), MaxBytes: cfg.StaticImageMaxBytes}
+		cacheable := fetchedAt != nil
+		if fetchedAt != nil {
+			key.FetchedAt = *fetchedAt
+		}
+		if cacheable {
+			if blob, ok := processMediaResponseCache.Get(key, time.Now().UTC()); ok {
+				blob.CacheControl = "private, no-store"
+				blob.WriteTimeout = mediaResponseWriteTimeout
+				releaseMediaWhenRequestEnds(req.Context(), releaseAdmission, releaseUser)
+				return blob, nil
+			}
+		}
+		fetchCtx, cancelFetch := context.WithTimeout(req.Context(), cfg.RequestTimeout)
+		defer cancelFetch()
+		blob, releaseMedia, err := fetchMediaWithReservation(fetchCtx, ctx.HTTP(), u, cfg.StaticImageMaxBytes, processMediaAdmission, releaseAdmission)
+		if err != nil {
+			releaseUser()
+			ctx.Logger().Warn("Fx preview media unavailable", "postId", postID, "kind", req.Param("kind"), "err", err)
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		if cacheable {
+			processMediaResponseCache.Set(key, blob, time.Now().UTC())
+		}
+		releaseMediaWhenRequestEnds(req.Context(), releaseMedia, releaseUser)
 		return blob, nil
 	})
 
