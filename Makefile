@@ -400,7 +400,7 @@ plugin-doc-check: ## authoring.md の Go スニペットがコンパイルでき
 # 2箇所に書くのは、CI step を `make plugin-vet` に置き換えると「列挙が git ではなく
 # ディレクトリを走査する pluginbuild に依存する」壊れ方を持ち込むため (#2701 の
 # コメントと同じ判断)。**片方だけ直すと CI と手元で結果が変わる**ので、必ず両方触る。
-BUNDLED_PLUGINS_ENABLED_BY_DEFAULT = rolelevel
+BUNDLED_PLUGINS_ENABLED_BY_DEFAULT = rolelevel tracking-parameter-cleaner
 
 plugin-vet: ## 同梱プラグインの既定無効を検査 + go vet (CI の build job の 2 step 相当)
 	@set -e; \

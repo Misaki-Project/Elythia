@@ -201,6 +201,21 @@ func TestValidateRangesRejectsMismatchedConst(t *testing.T) {
 	}
 }
 
+func TestFxTwitterQuotaMultiplierRequiresIntegralBoundedStages(t *testing.T) {
+	for _, tt := range []struct { name, key string; base, additional float64; wantErr bool }{
+		{"hour valid endpoints", "fxTwitterColdFetchesPerHour", 100, 25, false},
+		{"day exact upper endpoint", "fxTwitterColdFetchesPerDay", 100000, 0, false},
+		{"below minimum", "fxTwitterColdFetchesPerHour", 0, 1, true},
+		{"above maximum", "fxTwitterColdFetchesPerDay", 100000, 1, true},
+		{"fractional intermediate", "fxTwitterColdFetchesPerHour", 1, 0.5, true},
+		{"fractional base", "fxTwitterColdFetchesPerDay", 1.5, 0, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := rangeCfg(PolicyRange{Type: RangeMultiplier, Key: tt.key, Start: 1, End: 4, Base: tt.base, Additional: tt.additional}).Validate(defaultCatalog)
+			if (err != nil) != tt.wantErr { t.Fatalf("Validate err = %v, wantErr %t", err, tt.wantErr) }
+		})
+	}
+}
 func TestValidateRangesAcceptsFractionalNativeNumber(t *testing.T) {
 	err := rangeCfg(PolicyRange{Type: RangeConst, Start: 1, End: 6,
 		Key: "rateLimitFactor", Value: 1.5}).Validate(defaultCatalog)

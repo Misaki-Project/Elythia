@@ -4,16 +4,20 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { cleanup, render, waitFor } from '@testing-library/vue';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/vue';
 import { defineComponent, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { components } from '@/components/index.js';
 import { directives } from '@/directives/index.js';
+import { prefer } from '@/preferences.js';
+import { i18n } from '@/i18n.js';
+import MkUrlPreview from '@/components/MkUrlPreview.vue';
 import MkPluginUrlPreview from '@/components/MkPluginUrlPreview.vue';
 import {
 	_resetPreviewsForTest,
 	launchServerPlugins,
 	resolvePreviewProvider,
 	type PluginDefinition,
+	type PreviewContext,
 	type PreviewInput,
 	type PreviewProvider,
 } from '@/plugin-api.js';
@@ -175,8 +179,13 @@ describe('preview provider registry', () => {
 describe('preview provider coordinator', () => {
 	const source = { kind: 'note' as const, noteId: 'note-1' };
 
+	function setTimelineMode(mode: 'ogp' | 'text' | 'media'): void {
+		(prefer.s as Record<string, unknown>).xTimelinePreviewMode = mode;
+		(prefer.r as Record<string, { value: unknown }>).xTimelinePreviewMode.value = mode;
+	}
+
 	function renderPreview(props: Record<string, unknown> = {}) {
-		fetchMock.mockOnceIf(request => new URL(request.url).pathname === '/url', () => ({
+		fetchMock.mockIf(request => new URL(request.url).pathname === '/url', () => ({
 			status: 200,
 			body: JSON.stringify({
 				url: urlInput.href,
@@ -240,6 +249,144 @@ describe('preview provider coordinator', () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(result.container.querySelector('iframe')).toBeNull();
 		expect(result.getByRole('link').getAttribute('href')).toBe(urlInput.href);
+	});
+
+	const fxTimelineProvider = (load: PreviewProvider['load']): PreviewProvider => Object.assign(
+    lazyProvider({ requiresDetail: false, load }),
+    {
+      preferenceKey: 'xTimelinePreviewMode',
+			presentation: (_input: PreviewInput, context: PreviewContext) => context.detail || context.preferenceValue !== 'ogp' ? 'automatic' as const : 'manual' as const,
+      manualLabel: 'Expand X post',
+    },
+  );
+
+	test('native data-saver preference keeps the original media mode as its default', () => {
+		expect((prefer.s as Record<string, unknown>).xTimelinePreviewMode).toBe('media');
+		expect((prefer.s as Record<string, unknown>).dataSaver).not.toHaveProperty('enableFxTwitterTimelinePreview');
+	});
+
+	test('presentation receives the preference only through its context', async () => {
+		setTimelineMode('ogp');
+		const presentation = vi.fn((_input: PreviewInput, context: PreviewContext) => context.preferenceValue === 'ogp' ? 'manual' as const : 'automatic' as const);
+		const provider = Object.assign(lazyProvider({ requiresDetail: false, load: async () => 'loaded' }), {
+			preferenceKey: 'xTimelinePreviewMode',
+			presentation,
+		});
+		await launchServerPlugins([plugin('example', provider)]);
+
+		renderPreview({ detail: false });
+		await waitFor(() => expect(presentation).toHaveBeenCalled());
+
+		expect(presentation.mock.calls.every(call => call.length === 2)).toBe(true);
+		expect(presentation.mock.calls.some(([, context]) => context.preferenceValue === 'ogp')).toBe(true);
+	});
+
+  test.each(['text', 'media'] as const)('%s mode automatically loads a permitted timeline provider', async mode => {
+    setTimelineMode(mode);
+    const load = vi.fn(async (_input, context) => `mode:${context.preferenceValue};manual:${context.manual}`);
+    await launchServerPlugins([plugin('example', fxTimelineProvider(load))]);
+
+    const result = renderPreview({ detail: false });
+    await waitFor(() => expect(result.getByText(`provider: mode:${mode};manual:false`)).toBeTruthy());
+
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(result.queryByRole('button', { name: 'Expand X post' })).toBeNull();
+  });
+
+	test('changing Fx timeline mode does not reload an unrelated provider', async () => {
+    setTimelineMode('media');
+		const load = vi.fn(async () => 'loaded');
+		await launchServerPlugins([plugin('example', lazyProvider({ requiresDetail: false, load }))]);
+
+		const result = renderPreview({ detail: false });
+		await waitFor(() => expect(result.getByText('provider: loaded')).toBeTruthy());
+		expect(load).toHaveBeenCalledTimes(1);
+
+		setTimelineMode('ogp');
+		await nextTick();
+		expect(load).toHaveBeenCalledTimes(1);
+	});
+
+	test('manual mode hides its action when the caller disables preview actions', async () => {
+		setTimelineMode('ogp');
+		await launchServerPlugins([plugin('example', fxTimelineProvider(async () => 'loaded'))]);
+		const result = renderPreview({ detail: false, showActions: false });
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		expect(result.container.querySelector('button')).toBeNull();
+	});
+
+	test('disabled presentation leaves a safe source link and never mounts OGP or fetches provider data', async () => {
+		setTimelineMode('media');
+		const load = vi.fn(async () => 'must not load');
+		await launchServerPlugins([plugin('example', Object.assign(fxTimelineProvider(load), {
+			presentation: () => 'disabled' as const,
+		}))]);
+		const result = renderPreview({ detail: false });
+		await nextTick();
+
+		expect(load).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.getByRole('link').getAttribute('href')).toBe(urlInput.href);
+		expect(result.queryByRole('button')).toBeNull();
+	});
+
+  test('ogp mode preserves the standard preview until the user asks to expand', async () => {
+    setTimelineMode('ogp');
+    const load = vi.fn(async (_input, context) => `manual:${context.manual};mode:${context.preferenceValue}`);
+    await launchServerPlugins([plugin('example', fxTimelineProvider(load))]);
+
+		const result = renderPreview({ detail: false });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+		expect(load).not.toHaveBeenCalled();
+    expect(result.getByRole('button', { name: 'Expand X post' })).toBeTruthy();
+    expect(result.container.querySelector('iframe')).toBeNull();
+    await fireEvent.click(result.getByRole('button', { name: 'Expand X post' }));
+    await waitFor(() => expect(result.getByText('provider: manual:true;mode:ogp')).toBeTruthy());
+		expect(load).toHaveBeenCalledTimes(1);
+	});
+
+	test('timeline load failure retains its source link and retries only after another click', async () => {
+    setTimelineMode('ogp');
+		const load = vi.fn()
+			.mockRejectedValueOnce(new Error('fetch failed'))
+			.mockResolvedValueOnce('retried');
+    await launchServerPlugins([plugin('example', fxTimelineProvider(load))]);
+
+		const timelineUrl = 'https://example.com/post/1234567890';
+		const result = renderPreview({ detail: false, url: timelineUrl });
+    await waitFor(() => expect(result.getByRole('button', { name: 'Expand X post' })).toBeTruthy());
+    await fireEvent.click(result.getByRole('button', { name: 'Expand X post' }));
+		await waitFor(() => expect(result.container.querySelector('[data-preview-timeline-retry]')).toBeTruthy());
+		expect(result.getByRole('link').getAttribute('href')).toBe(timelineUrl);
+		expect(load).toHaveBeenCalledTimes(1);
+
+		await fireEvent.click(result.container.querySelector('[data-preview-timeline-retry]')!);
+		await waitFor(() => expect(result.getByText('provider: retried')).toBeTruthy());
+		expect(load).toHaveBeenCalledTimes(2);
+	});
+
+	test('manual timeline fallback keeps the standard summary and offers one expand action', async () => {
+    setTimelineMode('ogp');
+    const load = vi.fn(async () => 'expanded');
+    await launchServerPlugins([plugin('example', fxTimelineProvider(load))]);
+
+		const result = renderPreview({ detail: false });
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		expect(load).not.toHaveBeenCalled();
+		expect(result.container.querySelector('iframe')).toBeNull();
+    expect(result.getByRole('button', { name: 'Expand X post' })).toBeTruthy();
+    await fireEvent.click(result.getByRole('button', { name: 'Expand X post' }));
+		await waitFor(() => expect(result.getByText('provider: expanded')).toBeTruthy());
+		expect(load).toHaveBeenCalledTimes(1);
+	});
+
+	test('manual timeline fallback respects showActions=false', async () => {
+    setTimelineMode('ogp');
+    await launchServerPlugins([plugin('example', fxTimelineProvider(async () => 'loaded'))]);
+		const result = renderPreview({ detail: false, showActions: false });
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		expect(result.container.querySelector('button')).toBeNull();
 	});
 
 	test('does not load while the document is inactive', async () => {

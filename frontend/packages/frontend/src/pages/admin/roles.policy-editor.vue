@@ -209,6 +209,28 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</XFolder>
 
 		<!--
+			FxTwitter preview permission and cold fetch budgets. These are native role
+			policies and are resolved with checked policy lookups by the plugin.
+		-->
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canUseFxTwitterPreview, 'canUseFxTwitterPreview'])" v-model:policyMeta="canUseFxTwitterPreviewMeta" :levelConfig="levelConfig" policyKey="canUseFxTwitterPreview" :isBaseRole="isBaseRole" :readonly="readonly">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.canUseFxTwitterPreview }}</template>
+			<template #valueText>{{ canUseFxTwitterPreview ? i18n.ts.yes : i18n.ts.no }}</template>
+			<template #default="{ disabled }">
+				<MkSwitch v-model="canUseFxTwitterPreview" :disabled="disabled"><template #label>{{ i18n.ts.enable }}</template></MkSwitch>
+			</template>
+		</XFolder>
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerHour, 'fxTwitterColdFetchesPerHour'])" v-model:policyMeta="fxTwitterColdFetchesPerHourMeta" :levelConfig="levelConfig" policyKey="fxTwitterColdFetchesPerHour" :isBaseRole="isBaseRole" :readonly="readonly">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerHour }}</template>
+			<template #valueText>{{ fxTwitterColdFetchesPerHour }}</template>
+			<template #default="{ disabled }"><MkInput v-model="fxTwitterColdFetchesPerHour" type="number" :min="1" :max="10000" :disabled="disabled" /></template>
+		</XFolder>
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerDay, 'fxTwitterColdFetchesPerDay'])" v-model:policyMeta="fxTwitterColdFetchesPerDayMeta" :levelConfig="levelConfig" policyKey="fxTwitterColdFetchesPerDay" :isBaseRole="isBaseRole" :readonly="readonly">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerDay }}</template>
+			<template #valueText>{{ fxTwitterColdFetchesPerDay }}</template>
+			<template #default="{ disabled }"><MkInput v-model="fxTwitterColdFetchesPerDay" type="number" :min="1" :max="100000" :disabled="disabled" /></template>
+		</XFolder>
+
+		<!--
 			分割アップロード (#2313) の policy (#2900)。mk-go 独自。
 			**集約は他の bool / 数値 policy と同じ** (bool は OR、数値は max)。
 			intersection なのは下の optOutNotificationTypes だけ。
@@ -699,6 +721,9 @@ const mkGoPolicyMetaKeys: string[] = [
 	'canRequestCustomEmojis',
 	'canUseEmojiAsAvatarDecoration',
 	'canSearchIpHistory',
+	'canUseFxTwitterPreview',
+	'fxTwitterColdFetchesPerHour',
+	'fxTwitterColdFetchesPerDay',
 	'canDeleteAccount',
 	'canPurgeAccount',
 	'canUseChunkedUpload',
@@ -784,6 +809,12 @@ const canUseEmojiAsAvatarDecorationMeta = mkGoPolicyMeta('canUseEmojiAsAvatarDec
 // internal/effectivepolicy/validation.go の default と揃えること。
 const canSearchIpHistory = mkGoPolicyValue('canSearchIpHistory', false);
 const canSearchIpHistoryMeta = mkGoPolicyMeta('canSearchIpHistory');
+const canUseFxTwitterPreview = mkGoPolicyValue('canUseFxTwitterPreview', true);
+const canUseFxTwitterPreviewMeta = mkGoPolicyMeta('canUseFxTwitterPreview');
+const fxTwitterColdFetchesPerHour = mkGoPolicyValue('fxTwitterColdFetchesPerHour', 100);
+const fxTwitterColdFetchesPerHourMeta = mkGoPolicyMeta('fxTwitterColdFetchesPerHour');
+const fxTwitterColdFetchesPerDay = mkGoPolicyValue('fxTwitterColdFetchesPerDay', 600);
+const fxTwitterColdFetchesPerDayMeta = mkGoPolicyMeta('fxTwitterColdFetchesPerDay');
 // Keep these defaults aligned with Elythia-Network/elythia
 // internal/effectivepolicy/validation.go (backend PR #3316).
 const canDeleteAccount = mkGoPolicyValue('canDeleteAccount', accountDeletionPolicyDefaults.canDeleteAccount);

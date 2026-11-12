@@ -573,6 +573,20 @@ export interface Locale extends ILocale {
      */
     "rememberNoteVisibility": string;
     /**
+     * 貼り付け時に追跡パラメータを除去する
+     */
+    "trackingParameterCleanerEnabled": string;
+    /**
+     * テキストの貼り付け時、対応している追跡パラメータだけを除去します。
+     */
+    "trackingParameterCleanerDescription": string;
+    "_postFormPasteNotifications": {
+        /**
+         * 追跡パラメータを除去しました
+         */
+        "trackingParameterCleanerApplied": string;
+    };
+    /**
      * 添付取り消し
      */
     "attachCancel": string;
@@ -13691,6 +13705,24 @@ export interface Locale extends ILocale {
          */
         "caption": string;
     };
+    /**
+     * タイムラインのX投稿プレビュー
+     */
+    "xTimelinePreviewMode": string;
+    "_xTimelinePreviewMode": {
+        /**
+         * 標準OGP＋X投稿のプレビューボタン
+         */
+        "ogp": string;
+        /**
+         * X埋め込み、メディアなし
+         */
+        "text": string;
+        /**
+         * X埋め込み・メディアあり
+         */
+        "media": string;
+    };
     "_reversi": {
         /**
          * リバーシ
@@ -15289,6 +15321,18 @@ export interface Locale extends ILocale {
          * IPアドレスから関連アカウントを探せる
          */
         "canSearchIpHistory": string;
+        /**
+         * FxTwitter プレビューを使える
+         */
+        "canUseFxTwitterPreview": string;
+        /**
+         * FxTwitter 新規取得数（1時間）
+         */
+        "fxTwitterColdFetchesPerHour": string;
+        /**
+         * FxTwitter 新規取得数（1日）
+         */
+        "fxTwitterColdFetchesPerDay": string;
         /**
          * IPアドレスとアカウントの対応を引けるようにします。IPアドレスを入力してそのアドレスから接続したローカルアカウントを一覧する画面と、任意の利用者について同じIPアドレスを使った他のローカルアカウントを列挙する画面の両方が使えるようになります。既定では管理者だけが使えます。同じIPアドレスを使ったことは同一人物であることを意味しません(家庭・職場・学校・公衆Wi-Fi・携帯回線・VPNではアドレスが共有されます)。調査の手掛かりとして使ってください。
          */

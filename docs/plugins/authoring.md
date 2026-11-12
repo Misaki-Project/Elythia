@@ -11,8 +11,8 @@
 ```
 plugins/myplugin/
 ├── elythia-plugin.yml  これがあるものだけがプラグインとして扱われる
-├── go.mod              **必須**
-├── plugin.go
+├── go.mod              backend plugin では必須
+├── plugin.go           backend plugin では必須
 └── frontend/           UI が要る場合だけ
     └── index.ts
 ```
@@ -26,9 +26,11 @@ apiVersion: 1
 
 `apiVersion` はコンパイル前に検査される。合わないとビルドが止まり、理由が出る。
 
+Go側のcallbackを持たずフロントだけを配布する場合は `frontendOnly: true` を指定し、`frontend/index.ts` を置く。この場合、Go moduleや`plugin.go`は作らず、frontend bundleだけに含める。
+
 `disabled: true` を書くとビルドから除外される（詳細は[運営者向け](operating.md)）。この判定は `apiVersion` の検査より先に行われるので、ビルドが通らない状態のプラグインでも無効化はできる。
 
-### `go.mod`
+### `go.mod`（サーバープラグイン）
 
 ```
 module github.com/you/elythia-plugin-myplugin
@@ -42,11 +44,11 @@ replace github.com/elythia-network/elythia => ../..
 
 **`replace` は要る。** `make build` は生成される `go.work` で解決できるが、**`make plugin-test` は `GOWORK=off` で回す**ので、これが無いと `missing go.sum entry` で落ちる。同梱プラグインは全部この形。
 
-**独立した Go module である必要がある。** これは形式ではなく、Go の internal ルールにより「Elythia の内部パッケージを import できない」ことを保証する仕組み。`go.mod` を持たないディレクトリはビルド時にエラーになる。
+**サーバープラグインは独立した Go module である必要がある。** これは形式ではなく、Go の internal ルールにより「Elythia の内部パッケージを import できない」ことを保証する仕組み。`frontendOnly: true` のプラグインには Go module を置かない。
 
 依存を足すときは自分の module の中で `go get` する。**リポジトリのルートで `go mod tidy` を走らせないこと** — 生成物 `cmd/elythia/plugins_generated.go` が各プラグインのモジュール (上の例では `github.com/you/elythia-plugin-myplugin`) を import しており、private repo だと解決に失敗する。
 
-### `plugin.go`
+### `plugin.go`（サーバープラグイン）
 
 `Plugin` という名前のパッケージ変数を公開する。生成される登録コードがこれを参照する。
 
@@ -230,7 +232,9 @@ if res.Role.Target == "conditional" {
 return res.Assigned, nil
 ```
 
-`roles/assignment-show`では条件つきロールの有効判定はできない。認証済みの呼び出し元の有効な手動・条件つきロールIDを列挙する場合は、`req`を任意拡張の`plugin.ActiveRoleRequest`へ型アサーションして`ActiveRoleIDs()`を呼ぶ。未認証なら空の一覧を返し、取得に失敗した場合はIDを返さずエラーになる。未実装またはエラーの場合、ロールに応じたアクセスや制限を緩めず失敗として扱うこと。既存の`plugin.Request`に必須メソッドは増えない。詳細は[ホストのメディア契約](host-media.md)を参照。
+role policyで認可する場合は、任意拡張`plugin.CheckedRolePolicyRequest`の`CheckedRolePolicies(keys...)`を使う。要求したキーだけをホストのchecked resolverで解決し、DB・provider・policy入力のエラーはそのまま返る。未実装、エラー、欠落値、期待する型でない値は拒否に倒す。`IsAdministrator`や`HasRolePolicy`の短絡を認可として使わず、administratorを含めて解決済みの明示的denyを尊重すること。
+
+バックグラウンド処理で、投入後にも許可を再確認する場合は任意拡張`plugin.CheckedUserRolePolicyContext`を使う。これは`plugin.Context`本体を拡張しないため既存の外部実装を壊さない。解決エラーは拒否として扱い、権限が取り消された仕事は外部I/Oの前に取消すこと。
 
 非公開ロールで `roles/assignment-show` を使うと、**付与されていない利用者には `NO_SUCH_ROLE`** が返る（存在の有無を漏らさないため）。条件つきかつ非公開のロールは、条件を満たす利用者にもこうなる。`admin/roles/assignment-show` にこの秘匿は無く、モデレーター以上なら非公開ロールも読める。
 
@@ -834,6 +838,22 @@ host.preview.register({
 URLプレビューポップアップ、ページ本文などは対象外。`PreviewInput`の`file`は将来の
 接続用に型だけを定義しており、現時点でfile入力を渡す画面は無い。
 
+### 投稿フォームの貼り付け変換
+
+投稿フォームへ貼り付けたplain textを同期変換する場合は、`setup`で登録する。
+
+```ts
+host.postForm.registerPasteTransform('tracking-cleaner', text => removeTrackingParameters(text), {
+  enabledPreferenceKey: 'trackingParameterCleanerEnabled',
+  notificationMessageKey: 'trackingParameterCleanerApplied',
+});
+```
+
+登録IDはプラグイン名で名前空間化され、空ID・`:`を含むID・同一IDの重複は拒否される。複数の変換は名前空間付きIDの昇順に適用されるので、登録順やbundle順に依存しない。関数は文字列を同期で返す。例外・文字列以外の戻り値・Promiseはその変換だけを無視し、直前の文字列を次へ渡す。開発ログに変換IDは出るが、貼り付け内容や例外は出さない。
+
+変換対象はテキストだけで、fileが含まれる貼り付けは既存の添付処理を優先する。処理後の文字列はノート引用の確認と長文のテキスト添付にも使われる。通常の短文で内容が変わった場合だけ、hostが既存のカーソル挿入処理で変換後の文字列を挿入する。同じ文字列ならブラウザー標準の貼り付けを維持する。クリップボード自体は変更しない。
+
+`enabledPreferenceKey` はnative preferencesの値を貼り付けのたびに読み、明示的な `false` の場合だけその変換を省く。値が未定義なら有効として扱う。`notificationMessageKey` は `i18n.ts._postFormPasteNotifications` グループ内のキーを指定する。そのキーの翻訳を追加すると、変換後のテキストが本文へ挿入された場合、またはその文字列を長文添付ファイルとして追加した場合にだけhostがローカライズ済み通知を1回表示する。引用の添付だけで本文にテキストが使われない場合や、変換結果が変わらない場合には通知しない。プラグインが何も登録していない場合は従来どおり動く。
 ## 他のインスタンスとやりとりする
 
 同じプラグインを入れている **Elythia 同士**でだけ通信できる (#2537)。wire の形は
@@ -1257,9 +1277,13 @@ type Request interface
   IsModerator() bool
   IsAdministrator() bool
 
-type ActiveRoleRequest interface
+type CheckedRolePolicyRequest interface
   Request
-  ActiveRoleIDs() ([]string, error)
+  CheckedRolePolicies(...string) (map[string]any, error)
+
+type CheckedUserRolePolicyContext interface
+  Context
+  CheckedUserRolePolicies(string, ...string) (map[string]any, error)
 
 type Storage interface
   DB() *sql.DB
@@ -1349,6 +1373,7 @@ host.name / host.me
 definePlugin({ name, pages?, setup })
 host.slot(name, renderer)
 host.preview.register(provider)
+host.postForm.registerPasteTransform(id, transform, { enabledPreferenceKey?, notificationMessageKey? })
 host.api<T>(endpoint, params, { signal? })
 
 PluginPage: { path, component, navTitle?, navIcon?, admin? }

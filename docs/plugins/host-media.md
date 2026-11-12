@@ -1,8 +1,8 @@
-# プラグインの認証付きメディアとロール参照
+# プラグインの認証付きメディアと checked role policy
 
-`plugin.Request`の必須メソッドは変わらない。ロールに応じたアクセスや制限が必要なプラグインは、任意の拡張`plugin.ActiveRoleRequest`へ型アサーションする。`ActiveRoleIDs()`は、認証済み利用者についてホストのロールサービスが評価した有効な手動・条件付きロールのIDを、重複を除いてソートして返す。匿名利用者には空の一覧を返す。認証済み利用者の取得失敗・サービス未配線はエラーになる。拡張が無い場合やエラーの場合、プラグインはロール制限を緩めず処理を拒否する。この参照によってロールの付与やポリシーは変更されない。
+`plugin.Request`と`plugin.Context`の必須メソッドは変わらない。native role policyを使って認可するプラグインは任意拡張`plugin.CheckedRolePolicyRequest`を使い、`CheckedRolePolicies(keys...)`で必要なキーだけを解決する。DB・provider・policy入力の取得失敗はエラーになり、プラグインは許可へ倒さず拒否する。バックグラウンド処理では`plugin.CheckedUserRolePolicyContext`を使い、投入時のactorのpolicyを処理直前に再確認できる。
 
-テスト用の`plugintest.Request`には`ActiveRoleIDs`と`ActiveRoleError`を指定できる。返された一覧の変更は後続の参照へ影響しない。
+`plugintest.Request`の`CheckedRolePolicies`と`CheckedRolePolicyError`、`Harness.WithCheckedUserRolePolicies`で成功値と失敗をテストできる。
 
 フロントエンドの`PluginHost.fetch(path, options)`は、ログイン中の利用者のBearer認証で同一オリジンのプラグインAPIを呼ぶ。`path`は`/api/plugin/<自分の名前>/`以下のルート相対パスに限る。外部URL、他プラグイン、ドットによる階層移動、エスケープされたパス、フラグメント、認証用の`i`クエリは拒否する。Cookieは送らず、リダイレクトは拒否する。呼び出し元のAuthorizationはホストの認証に置き換え、`signal`を含むその他のリクエスト設定は保持する。戻り値は`Response`なので、HTTPステータスを確認して`blob()`を呼ぶ。
 

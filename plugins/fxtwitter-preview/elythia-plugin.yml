@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: syuilo and misskey-project
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: fxtwitter-preview
+apiVersion: 1
+# Disabled by default; included in the bundle only when explicitly requested.
+disabled: true

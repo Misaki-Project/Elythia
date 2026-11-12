@@ -97,17 +97,29 @@ export type PreviewInput =
 /** Runtime state available to a preview provider after it has matched. */
 export type PreviewContext = {
 	detail: boolean;
+	/** True only after the user explicitly requested a manual preview. */
+	manual?: boolean;
+	/** The current value of the provider's named preference, if any. */
+	preferenceValue?: unknown;
 	revealed: boolean;
 	active: boolean;
 	inViewport: boolean;
 	source: { kind: 'note'; noteId: string } | null;
 };
 
+export type PreviewPresentation = 'automatic' | 'manual' | 'disabled';
+
 /** A lazy preview implementation registered by a bundled server plugin. */
 export type PreviewProvider<T = unknown> = {
 	id: string;
 	priority?: number;
 	requiresDetail?: boolean;
+	/** Reads an existing native preference and exposes its value to presentation/load. */
+	preferenceKey?: string;
+	/** Chooses automatic loading, a manual action, or no preview for this context. */
+	presentation?: (input: PreviewInput, context: PreviewContext) => PreviewPresentation;
+	/** Text for the manual preview action. */
+	manualLabel?: string;
 	loadingComponent?: Component;
 	match(input: PreviewInput): boolean;
 	load(input: PreviewInput, context: PreviewContext, signal: AbortSignal): Promise<T>;
@@ -120,6 +132,29 @@ export type PreviewRegistration = {
 	plugin: string;
 	provider: PreviewProvider;
 };
+
+/** A synchronous plain-text transform for text pasted into the post form. */
+export type PasteTextTransform = (text: string) => string;
+
+type PasteTextRegistration = {
+	id: string;
+	plugin: string;
+	transform: PasteTextTransform;
+	options?: PasteTextTransformOptions;
+};
+
+/** Optional native preference and notification resolved by the post form at paste time. */
+export type PasteTextTransformOptions = {
+	enabledPreferenceKey?: string;
+	notificationMessageKey?: string;
+};
+
+export type PasteTextTransformRuntime = {
+	isPreferenceEnabled: (key: string) => boolean | undefined;
+	resolveMessage: (key: string) => string | undefined;
+};
+
+export type TransformedPasteText = { text: string; notification?: string };
 
 /** A fetched media Blob owned by a plugin, rather than a drive file. */
 export type PluginMediaItem = {
@@ -278,6 +313,11 @@ export type PluginHost = {
 		register<T = unknown>(provider: PreviewProvider<T>): void;
 	};
 
+	/** Synchronous plain-text transforms for text pasted into the post form. */
+	readonly postForm: {
+		registerPasteTransform(id: string, transform: PasteTextTransform, options?: PasteTextTransformOptions): void;
+	};
+
 	/**
 	 * Calls an mk-go API endpoint.
 	 *
@@ -323,6 +363,7 @@ export type PageRegistration = PluginPage & { plugin: string; fullPath: string }
 
 const registry = new Map<SlotName, Registration[]>();
 const previewRegistry = new Map<string, PreviewRegistration>();
+const pasteTransformRegistry = new Map<string, PasteTextRegistration>();
 
 function registerPreviewProvider<T>(plugin: string, provider: PreviewProvider<T>): void {
 	if (provider.id.length === 0 || provider.id.includes(':')) {
@@ -339,6 +380,72 @@ function registerPreviewProvider<T>(plugin: string, provider: PreviewProvider<T>
 		plugin,
 		provider: provider as PreviewProvider,
 	});
+}
+
+function registerPasteTextTransform(plugin: string, id: string, transform: PasteTextTransform, options?: PasteTextTransformOptions): void {
+	if (typeof id !== 'string' || id.length === 0 || id.includes(':')) {
+		throw new Error(`Invalid post form paste transform ID: ${id}`);
+	}
+	if (typeof transform !== 'function') {
+		throw new Error(`Post form paste transform must be a function: ${plugin}:${id}`);
+	}
+
+	const namespacedID = `${plugin}:${id}`;
+	if (pasteTransformRegistry.has(namespacedID)) {
+		throw new Error(`Post form paste transform is already registered: ${namespacedID}`);
+	}
+
+	pasteTransformRegistry.set(namespacedID, { id: namespacedID, plugin, transform, options });
+}
+
+/** Applies registered transforms in stable namespaced-ID order. */
+export function transformPastedText(text: string, runtime?: PasteTextTransformRuntime): TransformedPasteText {
+	let current = text;
+	let notificationMessageKey: string | undefined;
+	const registrations = [...pasteTransformRegistry.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+	for (const registration of registrations) {
+		const preferenceKey = registration.options?.enabledPreferenceKey;
+		if (preferenceKey && runtime) {
+			try {
+				if (runtime.isPreferenceEnabled(preferenceKey) === false) continue;
+			} catch {
+				// An unavailable preference uses the declared default (enabled).
+			}
+		}
+		const before = current;
+		try {
+			const transformed: unknown = registration.transform(current);
+			if (typeof transformed !== 'string') {
+				// A Promise is not supported, but consume a rejected one so a plugin
+				// cannot create an unhandled rejection while the host keeps sync paste.
+				try {
+					if (transformed !== null && (typeof transformed === 'object' || typeof transformed === 'function') && typeof (transformed as { then?: unknown }).then === 'function') {
+						void Promise.resolve(transformed).catch(() => {});
+					}
+				} catch {
+					// Ignore invalid thenables without exposing clipboard data or errors.
+				}
+				if (_DEV_) console.warn(`[plugin:post-form-paste:${registration.id}] transform returned a non-string; keeping previous text`);
+				continue;
+			}
+			current = transformed;
+			if (current !== before && registration.options?.notificationMessageKey) {
+				notificationMessageKey ??= registration.options.notificationMessageKey;
+			}
+		} catch {
+			// Never log the exception: a plugin could include the pasted text in it.
+			if (_DEV_) console.warn(`[plugin:post-form-paste:${registration.id}] transform failed; keeping previous text`);
+		}
+	}
+	let notification: string | undefined;
+	if (current !== text && notificationMessageKey && runtime) {
+		try {
+			notification = runtime.resolveMessage(notificationMessageKey);
+		} catch {
+			// Message lookup must never interrupt normal paste behavior.
+		}
+	}
+	return { text: current, ...(notification ? { notification } : {}) };
 }
 
 /** Resolves one deterministic winner without performing provider I/O. */
@@ -410,6 +517,11 @@ function buildHost(name: string): PluginHost {
 		preview: {
 			register(provider) {
 				registerPreviewProvider(name, provider);
+			},
+		},
+		postForm: {
+			registerPasteTransform(id, transform, options) {
+				registerPasteTextTransform(name, id, transform, options);
 			},
 		},
 		slot(slotName, renderer) {
@@ -510,4 +622,9 @@ export function _resetSlotsForTest(): void {
 /** Test hook: clears registered preview providers. */
 export function _resetPreviewsForTest(): void {
 	previewRegistry.clear();
+}
+
+/** Test hook: clears registered post form paste transforms. */
+export function _resetPasteTransformsForTest(): void {
+	pasteTransformRegistry.clear();
 }

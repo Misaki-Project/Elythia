@@ -3,6 +3,7 @@ package rolelevel
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -114,6 +115,11 @@ func validateRangeRules(ranges []PolicyRange, cat *Catalog) error {
 			if !kind.Numeric() {
 				return invalid(CodeMultiplierNotNumeric, field,
 					"%q は %s なので multiplier は使えません (const で指定してください)", r.Key, kind)
+			}
+			if _, _, quota := fxTwitterQuotaBounds(r.Key); quota &&
+				(math.Trunc(r.Base) != r.Base || math.Trunc(r.Additional) != r.Additional) {
+				return invalid(CodeInvalidRangeValue, field,
+					"%q の multiplier base と additional は整数で指定してください", r.Key)
 			}
 			// 両端だけ見る。range 内の値は n の1次式なので単調で、端点が
 			// 受理されるなら中間も受理される。**全 stage を走査しないのは

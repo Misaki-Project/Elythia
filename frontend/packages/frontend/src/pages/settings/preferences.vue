@@ -361,6 +361,15 @@ SPDX-License-Identifier: AGPL-3.0-only
 								</MkPreferenceContainer>
 							</SearchMarker>
 
+							<SearchMarker :keywords="['tracking', 'parameter', 'paste', 'cleaner']">
+								<MkPreferenceContainer k="trackingParameterCleanerEnabled">
+									<MkSwitch v-model="trackingParameterCleanerEnabled">
+										<template #label><SearchLabel>{{ i18n.ts.trackingParameterCleanerEnabled }}</SearchLabel></template>
+										<template #caption>{{ i18n.ts.trackingParameterCleanerDescription }}</template>
+									</MkSwitch>
+								</MkPreferenceContainer>
+							</SearchMarker>
+
 							<SearchMarker :keywords="['mfm', 'enable', 'show', 'advanced', 'picker', 'form', 'function', 'fn']">
 								<MkPreferenceContainer k="enableQuickAddMfmFunction">
 									<MkSwitch v-model="enableQuickAddMfmFunction">
@@ -743,6 +752,15 @@ SPDX-License-Identifier: AGPL-3.0-only
 								{{ i18n.ts._dataSaver._disableUrlPreview.title }}
 								<template #caption>{{ i18n.ts._dataSaver._disableUrlPreview.description }}</template>
 							</MkSwitch>
+							<MkPreferenceContainer k="xTimelinePreviewMode">
+								<MkRadios v-model="xTimelinePreviewMode" :options="[
+					{ value: 'ogp', label: timelinePreviewModeLabels.ogp },
+					{ value: 'text', label: timelinePreviewModeLabels.text },
+					{ value: 'media', label: timelinePreviewModeLabels.media },
+								]">
+									<template #label><SearchLabel>{{ i18n.ts.xTimelinePreviewMode }}</SearchLabel></template>
+								</MkRadios>
+							</MkPreferenceContainer>
 							<MkSwitch v-model="dataSaver.urlPreviewThumbnail" :disabled="!instance.enableUrlPreview || dataSaver.disableUrlPreview">
 								{{ i18n.ts._dataSaver._urlPreviewThumbnail.title }}
 								<template #caption>{{ i18n.ts._dataSaver._urlPreviewThumbnail.description }}</template>
@@ -914,6 +932,8 @@ const $i = ensureSignin();
 
 const lang = ref(miLocalStorage.getItem('lang'));
 const dataSaver = ref(prefer.s.dataSaver);
+const xTimelinePreviewMode = prefer.model('xTimelinePreviewMode');
+const timelinePreviewModeLabels = i18n.ts._xTimelinePreviewMode as unknown as { ogp: string; text: string; media: string };
 const realtimeMode = store.model('realtimeMode');
 
 const overridedDeviceKind = prefer.model('overridedDeviceKind');
@@ -946,6 +966,7 @@ const reactableRemoteReactionEnabled = prefer.model('reactableRemoteReactionEnab
 const defaultNoteVisibility = prefer.model('defaultNoteVisibility');
 const defaultNoteLocalOnly = prefer.model('defaultNoteLocalOnly');
 const rememberNoteVisibility = prefer.model('rememberNoteVisibility');
+const trackingParameterCleanerEnabled = prefer.model('trackingParameterCleanerEnabled');
 const notificationPosition = prefer.model('notificationPosition');
 const notificationStackAxis = prefer.model('notificationStackAxis');
 const instanceTicker = prefer.model('instanceTicker');
