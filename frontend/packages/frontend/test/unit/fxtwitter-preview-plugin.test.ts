@@ -1112,6 +1112,7 @@ describe('FxTwitter preview plugin', () => {
 		expect(openMedia).toHaveBeenCalledTimes(1);
 		expect(openMedia.mock.calls[0][0]).toHaveLength(4);
 		expect(openMedia.mock.calls[0][0].every(item => item.blob instanceof Blob && item.type === 'image')).toBe(true);
+		expect(openMedia.mock.calls[0][0].map(item => item.alt)).toEqual(['photo 1', 'photo 2', 'photo 3', 'photo 4']);
 		expect(openMedia.mock.calls[0][1]).toBe('1234567890:2');
 	});
 
@@ -1307,7 +1308,7 @@ describe('FxTwitter preview plugin', () => {
 		expect(grid?.getAttribute('style')).toContain('0.25');
 		await fireEvent.click(button);
 		expect(openMedia).toHaveBeenCalledWith([
-			expect.objectContaining({ id: '2234567890:0', type: 'image', isSensitive: false, initiallyRevealed: true }),
+			expect.objectContaining({ id: '2234567890:0', type: 'image', alt: 'quoted single', isSensitive: false, initiallyRevealed: true }),
 		], '2234567890:0');
 	});
 
