@@ -1116,6 +1116,128 @@ describe('FxTwitter preview plugin', () => {
 		expect(openMedia.mock.calls[0][1]).toBe('1234567890:2');
 	});
 
+	test('loads large main and quoted galleries on demand and opens each complete gallery in original order', async () => {
+		const fetcher = vi.fn(async (path: string) => new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: 20 }, (_, index) => ({
+			url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `main ${index + 1}`,
+		}));
+		data.post!.quote = {
+			id: '2234567890', url: 'https://x.com/bob/status/2234567890', text: 'quoted photos',
+			author: { name: 'Bob', screenName: 'bob' }, hasVideo: false, images: Array.from({ length: 20 }, (_, index) => ({
+				url: `/api/plugin/fxtwitter-preview/media/1234567890/quote-image/${index}?noteId=note-1`, alt: `quote ${index + 1}`,
+			})),
+		};
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
+		expect(result.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(2);
+		expect(result.container.querySelectorAll('[data-fx-photo-carousel] img')).toHaveLength(4);
+		const requestedIndexes = (kind: string) => fetcher.mock.calls
+			.map(([path]) => String(path))
+			.filter(path => path.includes(`/${kind}/`))
+			.map(path => Number(path.match(new RegExp(`/${kind}/(\\d+)`))?.[1]));
+		expect(requestedIndexes('image')).toEqual([0, 1]);
+		expect(requestedIndexes('quote-image')).toEqual([0, 1]);
+		expect(result.container.querySelectorAll('[data-fx-photo-carousel] [data-photo-index]')).toHaveLength(40);
+
+		const mainCarousel = result.container.querySelectorAll('[data-fx-photo-carousel]')[0];
+		await fireEvent.click(mainCarousel.querySelector('[data-photo-next]')!);
+		await waitFor(() => expect(requestedIndexes('image')).toEqual([0, 1, 2]));
+		await fireEvent.click(result.getByRole('button', { name: 'main 2を拡大' }));
+		await waitFor(() => expect(openMedia).toHaveBeenCalledTimes(1));
+		expect(openMedia.mock.calls[0][0]).toHaveLength(20);
+		expect(openMedia.mock.calls[0][0].map(item => item.alt)).toEqual(Array.from({ length: 20 }, (_, index) => `main ${index + 1}`));
+		expect(openMedia.mock.calls[0][0].map(item => item.id)).toEqual(Array.from({ length: 20 }, (_, index) => `1234567890:${index}`));
+		expect(openMedia.mock.calls[0][1]).toBe('1234567890:1');
+
+		await fireEvent.click(result.getByRole('button', { name: 'quote 1を拡大' }));
+		await waitFor(() => expect(openMedia).toHaveBeenCalledTimes(2));
+		expect(openMedia.mock.calls[1][0]).toHaveLength(20);
+		expect(openMedia.mock.calls[1][0].map(item => item.alt)).toEqual(Array.from({ length: 20 }, (_, index) => `quote ${index + 1}`));
+		expect(openMedia.mock.calls[1][1]).toBe('2234567890:0');
+	});
+
+	test('caps retained photo blobs across main and quoted galleries and never opens a partial viewer', async () => {
+		const retainedSize = 20 * 1024 * 1024;
+		const fetcher = vi.fn(async () => {
+			const blob = new Blob(['small test body'], { type: 'image/png' });
+			Object.defineProperty(blob, 'size', { configurable: true, value: retainedSize });
+			return { ok: true, status: 200, headers: new Headers({ 'Content-Type': 'image/png' }), blob: async () => blob } as Response;
+		});
+		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `main ${index + 1}` }));
+		data.post!.quote = {
+			id: '2234567890', url: 'https://x.com/bob/status/2234567890', text: 'quoted photos', author: { name: 'Bob', screenName: 'bob' }, hasVideo: false,
+			images: Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/quote-image/${index}?noteId=note-1`, alt: `quote ${index + 1}` })),
+		};
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
+		const mainCarousel = result.container.querySelectorAll('[data-fx-photo-carousel]')[0];
+		await fireEvent.click(mainCarousel.querySelector('[data-photo-next]')!);
+		await fireEvent.click(result.getByRole('button', { name: 'main 2を拡大' }));
+		await waitFor(() => expect(mainCarousel.textContent).toContain('写真全体がメモリ上限を超えるため'));
+		expect(openMedia).not.toHaveBeenCalled();
+	});
+
+	test('aborts an explicit large gallery load offscreen and retains successful carousel photos on return', async () => {
+		const pendingThird: { resolve?: (response: Response) => void } = {};
+		const fetcher = vi.fn(async (path: string, _options?: RequestInit) => path.includes('/image/2')
+			? await new Promise<Response>(resolve => { pendingThird.resolve = resolve; })
+			: new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+		await fireEvent.click(result.getByRole('button', { name: 'photo 1を拡大' }));
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(3));
+		const thirdRequest = fetcher.mock.calls.find(([path]) => String(path).includes('/image/2'))!;
+		await result.rerender({ data, input, context: { ...context, active: false, inViewport: false } });
+		expect(thirdRequest[1]?.signal?.aborted).toBe(true);
+		await result.rerender({ data, input, context });
+		await Promise.resolve();
+		expect(fetcher).toHaveBeenCalledTimes(3);
+		pendingThird.resolve?.(new Response(new Blob(['late image'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+		await Promise.resolve();
+		expect(openMedia).not.toHaveBeenCalled();
+		expect(result.container.querySelectorAll('[data-fx-photo-carousel] img')).toHaveLength(2);
+	});
+
+	test('retries a failed carousel photo explicitly and retains it across viewport reentry', async () => {
+		let imageZeroRequests = 0;
+		const fetcher = vi.fn(async (path: string) => {
+			if (path.includes('/image/0') && ++imageZeroRequests === 1) return new Response('expired', { status: 404 });
+			return new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } });
+		});
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(result.getByRole('button', { name: '再試行' })).toBeTruthy());
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+		await fireEvent.click(result.getByRole('button', { name: '再試行' }));
+		await waitFor(() => expect(result.getByRole('button', { name: 'photo 1を拡大' })).toBeTruthy());
+		expect(fetcher).toHaveBeenCalledTimes(3);
+		await result.rerender({ data, input, context: { ...context, active: false, inViewport: false } });
+		await result.rerender({ data, input, context });
+		await Promise.resolve();
+		expect(fetcher).toHaveBeenCalledTimes(3);
+		expect(result.getByRole('button', { name: 'photo 1を拡大' })).toBeTruthy();
+	});
+
 	test('native proxy renders an independent button for each main and quoted video slot', async () => {
 		mockMediaFetch();
 		initApi(vi.fn() as PluginHost['api'], (async (_path, options) => await fetchMock('/poster', options)) as PluginHost['fetch']);

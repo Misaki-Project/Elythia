@@ -220,7 +220,8 @@ const (
 	maxFxAuthorNameBytes      = 512
 	maxFxScreenNameBytes      = 64
 	maxFxAltTextBytes         = 4 << 10
-	maxFxMediaItems           = 4
+	maxFxPhotoItems           = 20
+	maxFxVideoItems           = 4
 	maxFxTextFacets           = 64
 	maxFxDimension            = 100_000
 	maxFxVideoDurationSeconds = float64(24 * 60 * 60)
@@ -442,7 +443,7 @@ func validateFxStatus(status fxStatus) error {
 			return errors.New("Fx text facet exceeds limit")
 		}
 	}
-	if len(status.Media.Photos) > maxFxMediaItems || len(status.Media.Videos) > maxFxMediaItems {
+	if len(status.Media.Photos) > maxFxPhotoItems || len(status.Media.Videos) > maxFxVideoItems {
 		return errors.New("Fx media collection exceeds limit")
 	}
 	if status.Media.External != nil && (len(status.Media.External.Type) > 32 || len(status.Media.External.URL) > 4096 || len(status.Media.External.ThumbnailURL) > 4096) {

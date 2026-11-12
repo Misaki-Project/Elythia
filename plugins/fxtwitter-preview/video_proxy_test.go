@@ -87,7 +87,7 @@ func TestNativeVideoProxyCacheKeepsSourcesPrivateAndSelectsExactMainQuoteIndex(t
 	for _, tc := range []struct {
 		target string
 		index  int
-	}{{"main", 2}, {"other", 0}, {"quote", 1}} {
+	}{{"main", 2}, {"main", maxFxVideoItems}, {"other", 0}, {"quote", 1}} {
 		if _, err := s.ResolveNativeVideoSource(context.Background(), l.PostID, entry.Post.Video.EmbedToken, tc.target, tc.index, now); err == nil {
 			t.Fatalf("accepted target/index %q/%d", tc.target, tc.index)
 		}

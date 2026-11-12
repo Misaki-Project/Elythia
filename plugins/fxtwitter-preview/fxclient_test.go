@@ -125,6 +125,7 @@ func TestFxClientRejectsInvalidInputAndResponse(t *testing.T) {
 		t.Fatal("invalid id reached upstream")
 	}
 
+	longPhotoAlt := strings.Replace(fxMediaResponse(20, 0, 0, 0), `"media-0.jpg"`, `"media-0.jpg","altText":"`+strings.Repeat("x", maxFxAltTextBytes+1)+`"`, 1)
 	cases := []struct {
 		name string
 		res  *http.Response
@@ -134,7 +135,9 @@ func TestFxClientRejectsInvalidInputAndResponse(t *testing.T) {
 		{"mismatched-id", response(200, "application/json", `{"code":200,"status":{"id":"9999999999","text":"x","author":{"name":"a","screen_name":"b"}}}`)},
 		{"tombstone", response(200, "application/json", `{"code":200,"status":{"tombstone":{"text":"gone"}}}`)},
 		{"long-text", response(200, "application/json", `{"code":200,"status":{"id":"1234567890","text":"`+strings.Repeat("x", maxFxTextBytes+1)+`","author":{"name":"a","screen_name":"b"}}}`)},
-		{"too-many-media", response(200, "application/json", `{"code":200,"status":{"id":"1234567890","text":"x","author":{"name":"a","screen_name":"b"},"media":{"photos":[{},{},{},{},{}]}}}`)},
+		{"too-many-photos", response(200, "application/json", fxMediaResponse(21, 0, 0, 0))},
+		{"too-many-videos", response(200, "application/json", fxMediaResponse(0, 0, 5, 0))},
+		{"photo-alt-limit-still-applies", response(200, "application/json", longPhotoAlt)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -145,6 +148,58 @@ func TestFxClientRejectsInvalidInputAndResponse(t *testing.T) {
 			client := newFxClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return tc.res, nil })}, cfg)
 			if _, err := client.Fetch(context.Background(), "1234567890"); err == nil {
 				t.Fatal("invalid response accepted")
+			}
+		})
+	}
+}
+
+func fxMediaResponse(mainPhotos, quotePhotos, mainVideos, quoteVideos int) string {
+	photosJSON := func(count int) string {
+		photos := make([]string, count)
+		for i := range photos {
+			photos[i] = fmt.Sprintf(`{"url":"https://pbs.twimg.com/media-%d.jpg"}`, i)
+		}
+		return "[" + strings.Join(photos, ",") + "]"
+	}
+	videosJSON := func(count int) string {
+		videos := make([]string, count)
+		for i := range videos {
+			videos[i] = fmt.Sprintf(`{"type":"video","url":"https://video.twimg.com/%d.mp4","thumbnail_url":"https://pbs.twimg.com/%d.jpg","duration":1}`, i, i)
+		}
+		return "[" + strings.Join(videos, ",") + "]"
+	}
+	quote := fmt.Sprintf(`{"id":"2234567890","text":"quote","author":{"name":"q","screen_name":"q"},"media":{"photos":%s,"videos":%s}}`, photosJSON(quotePhotos), videosJSON(quoteVideos))
+	return fmt.Sprintf(`{"code":200,"status":{"id":"1234567890","text":"main","author":{"name":"a","screen_name":"b"},"media":{"photos":%s,"videos":%s},"quote":%s}}`, photosJSON(mainPhotos), videosJSON(mainVideos), quote)
+}
+
+func TestFxClientAllowsTwentyPhotosForMainAndQuoteButKeepsVideoLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name                                             string
+		mainPhotos, quotePhotos, mainVideos, quoteVideos int
+		wantErr                                          bool
+	}{
+		{name: "twenty photos main and quote plus four videos each", mainPhotos: 20, quotePhotos: 20, mainVideos: 4, quoteVideos: 4},
+		{name: "main photos over limit", mainPhotos: 21, quotePhotos: 20, wantErr: true},
+		{name: "quote photos over limit", mainPhotos: 20, quotePhotos: 21, wantErr: true},
+		{name: "main videos over limit", mainPhotos: 20, quotePhotos: 20, mainVideos: 5, quoteVideos: 4, wantErr: true},
+		{name: "quote videos over limit", mainPhotos: 20, quotePhotos: 20, mainVideos: 4, quoteVideos: 5, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			post, err := parseFxResponse([]byte(fxMediaResponse(tc.mainPhotos, tc.quotePhotos, tc.mainVideos, tc.quoteVideos)), "1234567890")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("over-limit media accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(post.Images) != 20 || post.Quote == nil || len(post.Quote.Images) != 20 {
+				t.Fatalf("photo counts = main %d / quote %#v", len(post.Images), post.Quote)
+			}
+			if len(post.Videos) != 4 || len(post.Quote.Videos) != 4 {
+				t.Fatalf("video counts = main %d / quote %d", len(post.Videos), len(post.Quote.Videos))
 			}
 		})
 	}

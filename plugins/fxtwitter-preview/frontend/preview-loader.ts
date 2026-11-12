@@ -54,7 +54,7 @@ function optionalBoolean(value: unknown): boolean | undefined | null {
 
 function normalizedImages(value: unknown): PublicPost['images'] | null {
 	if (value == null) return [];
-	if (!Array.isArray(value)) return null;
+	if (!Array.isArray(value) || value.length > 20) return null;
 	const images: PublicPost['images'] = [];
 	for (const candidate of value) {
 		const image = record(candidate);

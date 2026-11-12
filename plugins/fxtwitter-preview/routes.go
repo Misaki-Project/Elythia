@@ -276,7 +276,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			Index     int    `json:"index"`
 			Token     string `json:"token"`
 		}
-		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) || (body.Target != "main" && body.Target != "quote") || body.Index < 0 || body.Index >= maxFxMediaItems || !embedNoncePattern.MatchString(body.Token) {
+		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) || (body.Target != "main" && body.Target != "quote") || body.Index < 0 || body.Index >= maxFxVideoItems || !embedNoncePattern.MatchString(body.Token) {
 			return nil, plugin.NewCodedStatusError(http.StatusBadRequest, "invalid video request", "INVALID_REQUEST")
 		}
 		if err := verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), body.NoteID, body.PostID); err != nil {

@@ -171,7 +171,7 @@ func (s *store) NeedsNativeVideoMetadata(ctx context.Context, postID string) (bo
 }
 
 func (s *store) ResolveNativeVideoSource(ctx context.Context, postID, token, target string, index int, now time.Time) (string, error) {
-	if !statusIDPattern.MatchString(postID) || !embedNoncePattern.MatchString(token) || index < 0 || index >= maxFxMediaItems {
+	if !statusIDPattern.MatchString(postID) || !embedNoncePattern.MatchString(token) || index < 0 || index >= maxFxVideoItems {
 		return "", errors.New("invalid video capability request")
 	}
 	var payload []byte

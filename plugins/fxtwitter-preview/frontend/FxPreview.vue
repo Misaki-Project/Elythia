@@ -32,7 +32,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</button>
 	</div>
 	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
-	<FxMediaGrid v-if="showAttachmentMedia && renderedImages.length" :key="`images:${viewData.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="viewData.post.isSensitive" @open="openImage"/>
+	<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.images?.length ?? 0) > 4" :key="`photo-carousel:${currentOwnerKey}`" v-model:revealed="imagesRevealed" :images="photoCarouselImages" :isSensitive="viewData.post.isSensitive" :viewerLoading="photoViewerLoading.main" :viewerError="photoViewerError.main" @visible="loadPhotoWindow('main', $event)" @retry="retryPhoto('main', $event)" @open="openPhotoGallery('main', $event)"/>
+	<FxMediaGrid v-else-if="showAttachmentMedia && renderedImages.length" :key="`images:${viewData.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="viewData.post.isSensitive" @open="openImage"/>
 	<FxVideoPreview
 		v-if="showAttachmentMedia && mainVideo && videoPlaybackMode !== 'nativeProxy'"
 		:key="`video:${viewData.post.id}`"
@@ -65,7 +66,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</header>
 		<p :class="$style.quoteText"><template v-for="segment in quoteTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template></p>
 		<p v-if="!showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
-		<FxMediaGrid v-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="viewData.post.quote.isSensitive" @open="openQuoteImage"/>
+		<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.quote.images?.length ?? 0) > 4" :key="`quote-photo-carousel:${currentOwnerKey}:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="quotePhotoCarouselImages" :isSensitive="viewData.post.quote.isSensitive" :viewerLoading="photoViewerLoading.quote" :viewerError="photoViewerError.quote" @visible="loadPhotoWindow('quote', $event)" @retry="retryPhoto('quote', $event)" @open="openPhotoGallery('quote', $event)"/>
+		<FxMediaGrid v-else-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="viewData.post.quote.isSensitive" @open="openQuoteImage"/>
 		<FxVideoPreview
 			v-if="showAttachmentMedia && quoteVideo && videoPlaybackMode !== 'nativeProxy'"
 			:key="`quote-video:${viewData.post.quote.id}`"
@@ -127,6 +129,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { MkA, MkTime, MkUrl } from '@/plugin-api.js';
 import type { PluginMediaItem, PreviewContext, PreviewInput } from '@/plugin-api.js';
 import FxMediaGrid from './FxMediaGrid.vue';
+import FxPhotoCarousel from './FxPhotoCarousel.vue';
+import type { FxCarouselImage } from './FxPhotoCarousel.vue';
 import FxVideoPreview from './FxVideoPreview.vue';
 import { apiSessionEpoch, fetchPluginResource, openPluginMedia, truncatePostText, videoPlaybackMode } from './api.js';
 import { loadPreview } from './preview-loader.js';
@@ -156,7 +160,7 @@ const canRetryPreview = computed(() => (viewData.value.state === 'stale' || view
 	props.context.source?.kind === 'note' && props.context.revealed && props.context.active && props.context.inViewport && !retryBlocked.value);
 const expanded = ref(false);
 type LoadedMedia = { src: string; blob: Blob };
-type MediaLoadFailure = 'retryable' | 'blocked';
+type MediaLoadFailure = 'retryable' | 'blocked' | 'budget';
 type MediaFetchResult = { media: LoadedMedia | null; failure: MediaLoadFailure | null };
 type IdentityBundle = {
 	avatar: LoadedMedia | null;
@@ -184,6 +188,20 @@ let mediaLoadGeneration = 0;
 const avatarSrc = ref<string | null>(null);
 const imageSources = ref<Array<string | null>>([]);
 const imageBlobs = ref<Array<Blob | null>>([]);
+const photoStates = ref<{ main: Array<FxCarouselImage['state']>; quote: Array<FxCarouselImage['state']> }>({ main: [], quote: [] });
+const photoViewerLoading = ref<{ main: boolean; quote: boolean }>({ main: false, quote: false });
+const photoViewerError = ref<{ main: string | null; quote: string | null }>({ main: null, quote: null });
+const photoObjectUrls = new Set<string>();
+const photoControllers = new Map<string, AbortController>();
+const photoPromises = new Map<string, Promise<void>>();
+let photoQueue: Promise<void> = Promise.resolve();
+let photoBytes = 0;
+let photoGeneration = 0;
+const photoCenters: Record<PhotoTarget, number> = { main: 0, quote: 0 };
+let photoViewerController: AbortController | null = null;
+let photoViewerGeneration = 0;
+const MAX_PHOTO_BYTES = 64 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
 const imagesRevealed = ref(false);
 const videoPosterSources = ref<Array<string | null>>([]);
 const quoteAvatarSrc = ref<string | null>(null);
@@ -204,6 +222,12 @@ const renderedQuoteImages = computed(() => (viewData.value.post?.quote?.images ?
 	const src = quoteImageSources.value[index];
 	return src == null ? [] : [{ index, src, alt: image.alt ?? '', width: image.width, height: image.height }];
 }));
+const photoCarouselImages = computed<FxCarouselImage[]>(() => (viewData.value.post?.images ?? []).map((image, index) => ({
+	index, src: imageSources.value[index] ?? null, alt: image.alt ?? '', width: image.width, height: image.height, state: photoStates.value.main[index],
+})));
+const quotePhotoCarouselImages = computed<FxCarouselImage[]>(() => (viewData.value.post?.quote?.images ?? []).map((image, index) => ({
+	index, src: quoteImageSources.value[index] ?? null, alt: image.alt ?? '', width: image.width, height: image.height, state: photoStates.value.quote[index],
+})));
 const mainVideo = computed<PublicVideo | null>(() => viewData.value.post?.video ?? viewData.value.post?.videos?.[0] ?? null);
 const quoteVideo = computed<PublicVideo | null>(() => viewData.value.post?.quote?.video ?? viewData.value.post?.quote?.videos?.[0] ?? null);
 const mainVideos = computed<PublicVideo[]>(() => withPrimaryToken(viewData.value.post?.videos, viewData.value.post?.video));
@@ -500,6 +524,26 @@ function clearAttachments(): void {
 	quoteImageSources.value = [];
 	quoteImageBlobs.value = [];
 	quoteVideoPosterSources.value = [];
+	clearPhotoResources();
+}
+
+function clearPhotoResources(): void {
+	photoGeneration++;
+	photoViewerGeneration++;
+	photoViewerController?.abort();
+	photoViewerController = null;
+	for (const controller of photoControllers.values()) controller.abort();
+	photoControllers.clear();
+	photoPromises.clear();
+	for (const objectUrl of photoObjectUrls) URL.revokeObjectURL(objectUrl);
+	photoObjectUrls.clear();
+	photoBytes = 0;
+	photoQueue = Promise.resolve();
+	photoStates.value = { main: [], quote: [] };
+	photoViewerLoading.value = { main: false, quote: false };
+	photoViewerError.value = { main: null, quote: null };
+	photoCenters.main = 0;
+	photoCenters.quote = 0;
 }
 
 function clearMedia(): void {
@@ -530,7 +574,7 @@ function expectedMediaUrl(kind: string, index: number): URL | null {
 	return new URL(`/api/plugin/fxtwitter-preview/media/${encodeURIComponent(post.id)}/${kind}/${index}?noteId=${encodeURIComponent(source.noteId)}`, window.location.origin);
 }
 
-async function fetchMedia(path: string, signal: AbortSignal, kind: string, index: number): Promise<MediaFetchResult> {
+async function fetchMedia(path: string, signal: AbortSignal, kind: string, index: number, maxBytes = MAX_IMAGE_BYTES): Promise<MediaFetchResult> {
 	const expected = expectedMediaUrl(kind, index);
 	let url: URL;
 	try { url = new URL(path, window.location.origin); } catch { return emptyMediaResult(); }
@@ -553,12 +597,18 @@ async function fetchMedia(path: string, signal: AbortSignal, kind: string, index
 	const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
 	if (contentType == null || !['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'].includes(contentType)) return failedMediaResult('retryable');
 	const contentLength = response.headers.get('Content-Length');
-	if (contentLength != null && (!/^\d+$/.test(contentLength) || Number(contentLength) > 50 * 1024 * 1024)) return failedMediaResult('retryable');
+	if (contentLength != null) {
+		if (!/^\d+$/.test(contentLength)) return failedMediaResult('retryable');
+		const length = Number(contentLength);
+		if (length > MAX_IMAGE_BYTES) return failedMediaResult('retryable');
+		if (length > maxBytes) return failedMediaResult('budget');
+	}
 	let blob: Blob;
 	try { blob = await response.blob(); } catch { return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable'); }
 	const blobType = blob.type.split(';', 1)[0]?.trim().toLowerCase();
 	if (signal.aborted) return emptyMediaResult();
-	if (blob.size > 50 * 1024 * 1024 || blobType !== contentType) return failedMediaResult('retryable');
+	if (blob.size > MAX_IMAGE_BYTES || blobType !== contentType) return failedMediaResult('retryable');
+	if (blob.size > maxBytes) return failedMediaResult('budget');
 	try { return { media: { src: URL.createObjectURL(blob), blob }, failure: null }; } catch { return failedMediaResult('retryable'); }
 }
 
@@ -610,6 +660,7 @@ async function loadAttachments(): Promise<MediaLoadFailure | null> {
 		clearAttachments();
 		return null;
 	}
+	const quote = post.quote;
 	const nextKey = `${ownerKey()}:attachments`;
 	if (attachmentLease != null && attachmentKey === nextKey) {
 		const lease = attachmentLease;
@@ -617,24 +668,27 @@ async function loadAttachments(): Promise<MediaLoadFailure | null> {
 		const bundle = await lease.promise;
 		if (current !== attachmentGeneration || attachmentLease !== lease) return null;
 		attachmentFailure = bundle.failure;
-		imageSources.value = bundle.images.map(value => value?.src ?? null);
-		imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
+		if (post.images.length <= 4) {
+			imageSources.value = bundle.images.map(value => value?.src ?? null);
+			imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
+		}
 		videoPosterSources.value = bundle.videoPosters.map(value => value?.src ?? null);
-		quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
-		quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
+		if ((quote?.images.length ?? 0) <= 4) {
+			quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
+			quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
+		}
 		quoteVideoPosterSources.value = bundle.quoteVideoPosters.map(value => value?.src ?? null);
 		return attachmentFailure;
 	}
 	clearAttachments();
 	const current = attachmentGeneration;
-	const quote = post.quote;
 	const postVideos = post.videos?.length ? post.videos : post.video == null ? [] : [post.video];
 	const quoteVideos = quote?.videos?.length ? quote.videos : quote?.video == null ? [] : [quote.video];
 	const lease = retainResource<AttachmentBundle>(nextKey, async signal => {
 		const [images, videoPosters, quoteImages, quoteVideoPosters] = await Promise.all([
-			Promise.all((post.images ?? []).map((image, index) => fetchMedia(image.url, signal, 'image', index))),
+			post.images.length > 4 ? Promise.resolve(post.images.map(() => emptyMediaResult())) : Promise.all(post.images.map((image, index) => fetchMedia(image.url, signal, 'image', index))),
 			Promise.all(postVideos.map((video, index) => video.posterUrl == null ? emptyMediaResult() : fetchMedia(video.posterUrl, signal, 'poster', index))),
-			Promise.all(quote?.images.map((image, index) => fetchMedia(image.url, signal, 'quote-image', index)) ?? []),
+			quote == null ? Promise.resolve([]) : quote.images.length > 4 ? Promise.resolve(quote.images.map(() => emptyMediaResult())) : Promise.all(quote.images.map((image, index) => fetchMedia(image.url, signal, 'quote-image', index))),
 			Promise.all(quoteVideos.map((video, index) => video.posterUrl == null ? emptyMediaResult() : fetchMedia(video.posterUrl, signal, 'quote-poster', index))),
 		]);
 		const results = [...images, ...videoPosters, ...quoteImages, ...quoteVideoPosters];
@@ -655,13 +709,170 @@ async function loadAttachments(): Promise<MediaLoadFailure | null> {
 	const bundle = await lease.promise;
 	if (current !== attachmentGeneration || attachmentLease !== lease) return null;
 	attachmentFailure = bundle.failure;
-	imageSources.value = bundle.images.map(value => value?.src ?? null);
-	imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
+	if (post.images.length <= 4) {
+		imageSources.value = bundle.images.map(value => value?.src ?? null);
+		imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
+	}
 	videoPosterSources.value = bundle.videoPosters.map(value => value?.src ?? null);
-	quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
-	quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
+	if ((quote?.images.length ?? 0) <= 4) {
+		quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
+		quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
+	}
 	quoteVideoPosterSources.value = bundle.quoteVideoPosters.map(value => value?.src ?? null);
 	return attachmentFailure;
+}
+
+type PhotoTarget = 'main' | 'quote';
+
+function photoTargetData(target: PhotoTarget): { id: string; images: Array<{ url: string; width?: number; height?: number; alt?: string }>; kind: string } | null {
+	const post = viewData.value.post;
+	if (post == null) return null;
+	if (target === 'main') return { id: post.id, images: post.images, kind: 'image' };
+	return post.quote == null ? null : { id: post.quote.id, images: post.quote.images, kind: 'quote-image' };
+}
+
+function photoSourceRef(target: PhotoTarget) { return target === 'main' ? imageSources : quoteImageSources; }
+function photoBlobRef(target: PhotoTarget) { return target === 'main' ? imageBlobs : quoteImageBlobs; }
+
+function setPhotoState(target: PhotoTarget, index: number, state: FxCarouselImage['state']): void {
+	const next = { ...photoStates.value, [target]: [...photoStates.value[target]] };
+	while (next[target].length <= index) next[target].push(undefined);
+	next[target][index] = state;
+	photoStates.value = next;
+}
+
+function canLoadPhotos(): boolean {
+	return canOpenMedia() && showAttachmentMedia.value;
+}
+
+function cancelPhotoViewer(): void {
+	photoViewerGeneration++;
+	photoViewerController?.abort();
+	photoViewerController = null;
+	photoViewerLoading.value = { main: false, quote: false };
+}
+
+function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Promise<void> {
+	const data = photoTargetData(target);
+	if (!canLoadPhotos() || data == null || data.images.length <= 4 || !Number.isSafeInteger(index) || index < 0 || index >= data.images.length) return Promise.resolve();
+	if (photoBlobRef(target).value[index] != null) return Promise.resolve();
+	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget') return Promise.resolve();
+	const key = `${ownerKey()}:${target}:${index}`;
+	const existing = photoPromises.get(key);
+	if (existing != null && !photoControllers.get(key)?.signal.aborted) {
+		const controller = photoControllers.get(key);
+		if (signal != null && controller != null) {
+			const abort = (): void => controller.abort();
+			if (signal.aborted) controller.abort();
+			else signal.addEventListener('abort', abort, { once: true });
+			return existing.finally(() => signal.removeEventListener('abort', abort));
+		}
+		return existing;
+	}
+	const generation = photoGeneration;
+	const owner = ownerKey();
+	const controller = new AbortController();
+	photoControllers.set(key, controller);
+	const abortFromCaller = (): void => controller.abort();
+	if (signal?.aborted) controller.abort();
+	else signal?.addEventListener('abort', abortFromCaller, { once: true });
+	setPhotoState(target, index, 'loading');
+	const work = photoQueue.then(async () => {
+		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || (!photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1)) return;
+		const remaining = Math.max(0, MAX_PHOTO_BYTES - photoBytes);
+		const result = await fetchMedia(data.images[index].url, controller.signal, data.kind, index, remaining);
+		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || (!photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1)) {
+			if (result.media != null) URL.revokeObjectURL(result.media.src);
+			return;
+		}
+		if (result.media == null) {
+			setPhotoState(target, index, result.failure === 'blocked' ? 'blocked' : result.failure === 'budget' ? 'budget' : 'error');
+			return;
+		}
+		const sources = photoSourceRef(target);
+		const blobs = photoBlobRef(target);
+		const nextSources = [...sources.value];
+		const nextBlobs = [...blobs.value];
+		while (nextSources.length < data.images.length) nextSources.push(null);
+		while (nextBlobs.length < data.images.length) nextBlobs.push(null);
+		nextSources[index] = result.media.src;
+		nextBlobs[index] = result.media.blob;
+		sources.value = nextSources;
+		blobs.value = nextBlobs;
+		photoObjectUrls.add(result.media.src);
+		photoBytes += result.media.blob.size;
+		setPhotoState(target, index, undefined);
+	});
+	photoQueue = work.catch(() => undefined);
+	photoPromises.set(key, work);
+	return work.finally(() => {
+		signal?.removeEventListener('abort', abortFromCaller);
+		const ownsEntry = photoPromises.get(key) === work;
+		if (photoControllers.get(key) === controller) photoControllers.delete(key);
+		if (ownsEntry) photoPromises.delete(key);
+		if (ownsEntry && generation === photoGeneration && photoBlobRef(target).value[index] == null && photoStates.value[target][index] === 'loading') setPhotoState(target, index, undefined);
+	});
+}
+
+function loadPhotoWindow(target: PhotoTarget, center: number): void {
+	const data = photoTargetData(target);
+	if (data == null || data.images.length <= 4 || !Number.isSafeInteger(center)) return;
+	photoCenters[target] = Math.max(0, Math.min(data.images.length - 1, center));
+	if (!canLoadPhotos() || photoViewerLoading.value[target]) return;
+	const desired = [photoCenters[target], photoCenters[target] - 1, photoCenters[target] + 1];
+	for (const index of desired) {
+		if (index >= 0 && index < data.images.length && photoStates.value[target][index] !== 'error') void loadPhoto(target, index);
+	}
+}
+
+function retryPhoto(target: PhotoTarget, index: number): void {
+	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget') return;
+	photoViewerError.value = { ...photoViewerError.value, [target]: null };
+	void loadPhoto(target, index);
+}
+
+async function openPhotoGallery(target: PhotoTarget, initialIndex: number): Promise<void> {
+	const data = photoTargetData(target);
+	if (!canLoadPhotos() || data == null || !Number.isSafeInteger(initialIndex) || initialIndex < 0 || initialIndex >= data.images.length) return;
+	cancelPhotoViewer();
+	const controller = new AbortController();
+	photoViewerController = controller;
+	const generation = ++photoViewerGeneration;
+	const owner = ownerKey();
+	photoViewerLoading.value = { ...photoViewerLoading.value, [target]: true };
+	photoViewerError.value = { ...photoViewerError.value, [target]: null };
+	try {
+		for (let index = 0; index < data.images.length; index++) {
+			if (photoBlobRef(target).value[index] != null) continue;
+			await loadPhoto(target, index, controller.signal);
+			if (controller.signal.aborted || generation !== photoViewerGeneration || owner !== ownerKey()) return;
+			if (photoBlobRef(target).value[index] == null) {
+				const state = photoStates.value[target][index];
+				photoViewerError.value = { ...photoViewerError.value, [target]: state === 'blocked' ? '画像を表示する権限を確認できません。' : state === 'budget' ? '写真全体がメモリ上限を超えるため、ギャラリーを開けません。' : '写真をすべて読み込めませんでした。再試行してください。' };
+				return;
+			}
+		}
+		if (controller.signal.aborted || generation !== photoViewerGeneration || owner !== ownerKey() || !canOpenMedia()) return;
+		const blobs = photoBlobRef(target).value;
+		if (blobs.length < data.images.length || blobs.slice(0, data.images.length).some(blob => blob == null)) {
+			photoViewerError.value = { ...photoViewerError.value, [target]: '写真をすべて読み込めませんでした。再試行してください。' };
+			return;
+		}
+		const initiallyRevealed = target === 'main' ? imagesRevealed.value : quoteImagesRevealed.value;
+		const items = data.images.map((image, index): PluginMediaItem => ({
+			id: `${data.id}:${index}`, type: 'image', blob: blobs[index]!, alt: image.alt, width: image.width, height: image.height,
+			filename: `x-${data.id}-${index + 1}`, isSensitive: target === 'main' ? viewData.value.post?.isSensitive === true : viewData.value.post?.quote?.isSensitive === true,
+			initiallyRevealed,
+		}));
+		await openPluginMedia(items, `${data.id}:${initialIndex}`);
+	} catch {
+		if (!controller.signal.aborted && generation === photoViewerGeneration && owner === ownerKey()) photoViewerError.value = { ...photoViewerError.value, [target]: 'ギャラリーを開けませんでした。再試行してください。' };
+	} finally {
+		if (generation === photoViewerGeneration) {
+			photoViewerLoading.value = { ...photoViewerLoading.value, [target]: false };
+			if (photoViewerController === controller) photoViewerController = null;
+		}
+	}
 }
 
 async function loadMedia(): Promise<void> {
@@ -672,11 +883,16 @@ async function loadMedia(): Promise<void> {
 		return;
 	}
 	if (!showAttachmentMedia.value) clearAttachments();
-	if (!props.context.active || !props.context.inViewport) return;
+	if (!props.context.active || !props.context.inViewport) {
+		cancelPhotoViewer();
+		return;
+	}
 	const owner = ownerKey();
 	const generation = ++mediaLoadGeneration;
 	const results = await Promise.allSettled([loadIdentity(), loadAttachments()]);
 	if (generation !== mediaLoadGeneration || owner !== ownerKey()) return;
+	loadPhotoWindow('main', photoCenters.main);
+	loadPhotoWindow('quote', photoCenters.quote);
 	const failures = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : ['retryable' as const]);
 	const failure = combineMediaFailures(...failures);
 	mediaLoadBlocked.value = failure === 'blocked';
