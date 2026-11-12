@@ -1187,6 +1187,34 @@ describe('FxTwitter preview plugin', () => {
 		expect(openMedia).not.toHaveBeenCalled();
 	});
 
+	test.each(['main', 'quote'] as const)('shares the 64 MiB photo budget when the %s gallery is large and the other remains a grid', async largeTarget => {
+		const retainedSize = 20 * 1024 * 1024;
+		const fetcher = vi.fn(async () => {
+			const blob = new Blob(['small test body'], { type: 'image/png' });
+			Object.defineProperty(blob, 'size', { configurable: true, value: retainedSize });
+			return { ok: true, status: 200, headers: new Headers({ 'Content-Type': 'image/png', 'Content-Length': String(retainedSize) }), blob: async () => blob } as Response;
+		});
+		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: largeTarget === 'main' ? 5 : 4 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `main ${index + 1}` }));
+		data.post!.quote = {
+			id: '2234567890', url: 'https://x.com/bob/status/2234567890', text: 'quoted photos', author: { name: 'Bob', screenName: 'bob' }, hasVideo: false,
+			images: Array.from({ length: largeTarget === 'quote' ? 5 : 4 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/quote-image/${index}?noteId=note-1`, alt: `quote ${index + 1}` })),
+		};
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(6));
+		await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledTimes(3));
+		const grid = result.container.querySelector('[data-fx-media-grid]');
+		expect(grid?.getAttribute('data-image-count')).toBe('3');
+		expect(result.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(1);
+		await fireEvent.click(result.getByRole('button', { name: largeTarget === 'main' ? 'quote 1' : 'main 1' }));
+		await waitFor(() => expect(result.container.textContent).toContain('写真全体がメモリ上限を超えるため、ギャラリーを開けません。'));
+		expect(openMedia).not.toHaveBeenCalled();
+	});
+
 	test('aborts an explicit large gallery load offscreen and retains successful carousel photos on return', async () => {
 		const pendingThird: { resolve?: (response: Response) => void } = {};
 		const fetcher = vi.fn(async (path: string, _options?: RequestInit) => path.includes('/image/2')

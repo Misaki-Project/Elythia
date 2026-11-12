@@ -18,7 +18,7 @@
 
 - Fx `raw_text.facets` are normalized with UTF-16 offsets. Valid URL replacements use Misskey's standard URL component, media facets are removed from visible text, and invalid replacements remain plain text.
 - Fx `possibly_sensitive` is kept independently for the main and quoted posts. Media follows the existing Misskey `respect` / `ignore` / `force` preference and confirmation flow; revealing a video does not start playback.
-- Main and quoted images share the same capped 1/2/3/4 grid and lightbox behavior. Official X playback remains click-to-load and is centered at a maximum width of 560 px.
+- Main and quoted images use the existing grid for 1–4 images and an independent horizontal carousel for 5–20 images. The carousel fetches the current image and its adjacent images on demand; selecting an image explicitly loads the remaining gallery before opening the existing viewer. When either side has 5 or more images, main and quoted photos share a 64 MiB retained-blob limit per card. If the selected gallery exceeds that limit or a photo cannot be loaded, the viewer stays closed and the card explains why. Official X playback remains click-to-load and is centered at a maximum width of 560 px.
 
 This Misaki-only plugin replaces ordinary X/Twitter URL previews when a visible,
 active note card enters the viewport. It is intentionally disabled at two independent gates:

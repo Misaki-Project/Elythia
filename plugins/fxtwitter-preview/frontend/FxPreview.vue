@@ -34,6 +34,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
 	<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.images?.length ?? 0) > 4" :key="`photo-carousel:${currentOwnerKey}`" v-model:revealed="imagesRevealed" :images="photoCarouselImages" :isSensitive="viewData.post.isSensitive" :viewerLoading="photoViewerLoading.main" :viewerError="photoViewerError.main" @visible="loadPhotoWindow('main', $event)" @retry="retryPhoto('main', $event)" @open="openPhotoGallery('main', $event)"/>
 	<FxMediaGrid v-else-if="showAttachmentMedia && renderedImages.length" :key="`images:${viewData.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="viewData.post.isSensitive" @open="openImage"/>
+	<p v-if="mainPhotoGridStatus" :class="$style.mediaError" role="status">{{ mainPhotoGridStatus }} <button v-if="mainPhotoGridRetryable" type="button" class="_button" @click.stop="retrySmallPhotoGrid('main')">再試行</button></p>
+	<p v-if="photoViewerError.main && (viewData.post.images?.length ?? 0) <= 4" :class="$style.mediaError" role="status">{{ photoViewerError.main }}</p>
 	<FxVideoPreview
 		v-if="showAttachmentMedia && mainVideo && videoPlaybackMode !== 'nativeProxy'"
 		:key="`video:${viewData.post.id}`"
@@ -68,6 +70,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<p v-if="!showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
 		<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.quote.images?.length ?? 0) > 4" :key="`quote-photo-carousel:${currentOwnerKey}:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="quotePhotoCarouselImages" :isSensitive="viewData.post.quote.isSensitive" :viewerLoading="photoViewerLoading.quote" :viewerError="photoViewerError.quote" @visible="loadPhotoWindow('quote', $event)" @retry="retryPhoto('quote', $event)" @open="openPhotoGallery('quote', $event)"/>
 		<FxMediaGrid v-else-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="viewData.post.quote.isSensitive" @open="openQuoteImage"/>
+		<p v-if="quotePhotoGridStatus" :class="$style.mediaError" role="status">{{ quotePhotoGridStatus }} <button v-if="quotePhotoGridRetryable" type="button" class="_button" @click.stop="retrySmallPhotoGrid('quote')">再試行</button></p>
+		<p v-if="photoViewerError.quote && (viewData.post.quote.images?.length ?? 0) <= 4" :class="$style.mediaError" role="status">{{ photoViewerError.quote }}</p>
 		<FxVideoPreview
 			v-if="showAttachmentMedia && quoteVideo && videoPlaybackMode !== 'nativeProxy'"
 			:key="`quote-video:${viewData.post.quote.id}`"
@@ -214,14 +218,43 @@ const mediaLoadBlocked = ref(false);
 const canRetryMedia = computed(() => mediaLoadFailed.value && !mediaLoadBlocked.value && !retryBlocked.value &&
 	(viewData.value.state === 'ready' || viewData.value.state === 'stale') && viewData.value.post != null &&
 	props.context.source?.kind === 'note' && props.context.revealed && props.context.active && props.context.inViewport);
-const renderedImages = computed(() => (viewData.value.post?.images ?? []).flatMap((image, index) => {
+function hasSharedPhotoBudget(): boolean {
+	const post = viewData.value.post;
+	return post != null && (post.images.length > 4 || (post.quote?.images.length ?? 0) > 4);
+}
+function photoGridReady(target: PhotoTarget): boolean {
+	const data = photoTargetData(target);
+	if (data == null || data.images.length === 0 || data.images.length > 4 || !hasSharedPhotoBudget()) return true;
+	const blobs = photoBlobRef(target).value;
+	return data.images.every((_, index) => blobs[index] != null || ['blocked', 'budget', 'error'].includes(photoStates.value[target][index] ?? ''));
+}
+function photoGridStatus(target: PhotoTarget): string | null {
+	const data = photoTargetData(target);
+	if (!hasSharedPhotoBudget() || data == null || data.images.length === 0 || data.images.length > 4) return null;
+	const states = photoStates.value[target].slice(0, data.images.length);
+	if (states.includes('blocked')) return '一部の画像を表示する権限を確認できません。';
+	if (states.includes('budget')) return '写真全体がメモリ上限を超えるため、一部の画像とギャラリーを表示できません。';
+	if (states.includes('error')) return '一部の画像を読み込めませんでした。';
+	return null;
+}
+const mainPhotoGridStatus = computed(() => photoGridStatus('main'));
+const quotePhotoGridStatus = computed(() => photoGridStatus('quote'));
+const mainPhotoGridRetryable = computed(() => photoStates.value.main.includes('error'));
+const quotePhotoGridRetryable = computed(() => photoStates.value.quote.includes('error'));
+const renderedImages = computed(() => {
+	if (!photoGridReady('main')) return [];
+	return (viewData.value.post?.images ?? []).flatMap((image, index) => {
 	const src = imageSources.value[index];
 	return src == null ? [] : [{ index, src, alt: image.alt ?? '', width: image.width, height: image.height }];
-}));
-const renderedQuoteImages = computed(() => (viewData.value.post?.quote?.images ?? []).flatMap((image, index) => {
+	});
+});
+const renderedQuoteImages = computed(() => {
+	if (!photoGridReady('quote')) return [];
+	return (viewData.value.post?.quote?.images ?? []).flatMap((image, index) => {
 	const src = quoteImageSources.value[index];
 	return src == null ? [] : [{ index, src, alt: image.alt ?? '', width: image.width, height: image.height }];
-}));
+});
+});
 const photoCarouselImages = computed<FxCarouselImage[]>(() => (viewData.value.post?.images ?? []).map((image, index) => ({
 	index, src: imageSources.value[index] ?? null, alt: image.alt ?? '', width: image.width, height: image.height, state: photoStates.value.main[index],
 })));
@@ -661,6 +694,7 @@ async function loadAttachments(): Promise<MediaLoadFailure | null> {
 		return null;
 	}
 	const quote = post.quote;
+	const sharedPhotoBudget = hasSharedPhotoBudget();
 	const nextKey = `${ownerKey()}:attachments`;
 	if (attachmentLease != null && attachmentKey === nextKey) {
 		const lease = attachmentLease;
@@ -668,12 +702,12 @@ async function loadAttachments(): Promise<MediaLoadFailure | null> {
 		const bundle = await lease.promise;
 		if (current !== attachmentGeneration || attachmentLease !== lease) return null;
 		attachmentFailure = bundle.failure;
-		if (post.images.length <= 4) {
+		if (!sharedPhotoBudget && post.images.length <= 4) {
 			imageSources.value = bundle.images.map(value => value?.src ?? null);
 			imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
 		}
 		videoPosterSources.value = bundle.videoPosters.map(value => value?.src ?? null);
-		if ((quote?.images.length ?? 0) <= 4) {
+		if (!sharedPhotoBudget && (quote?.images.length ?? 0) <= 4) {
 			quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
 			quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
 		}
@@ -686,9 +720,9 @@ async function loadAttachments(): Promise<MediaLoadFailure | null> {
 	const quoteVideos = quote?.videos?.length ? quote.videos : quote?.video == null ? [] : [quote.video];
 	const lease = retainResource<AttachmentBundle>(nextKey, async signal => {
 		const [images, videoPosters, quoteImages, quoteVideoPosters] = await Promise.all([
-			post.images.length > 4 ? Promise.resolve(post.images.map(() => emptyMediaResult())) : Promise.all(post.images.map((image, index) => fetchMedia(image.url, signal, 'image', index))),
+			sharedPhotoBudget ? Promise.resolve(post.images.map(() => emptyMediaResult())) : Promise.all(post.images.map((image, index) => fetchMedia(image.url, signal, 'image', index))),
 			Promise.all(postVideos.map((video, index) => video.posterUrl == null ? emptyMediaResult() : fetchMedia(video.posterUrl, signal, 'poster', index))),
-			quote == null ? Promise.resolve([]) : quote.images.length > 4 ? Promise.resolve(quote.images.map(() => emptyMediaResult())) : Promise.all(quote.images.map((image, index) => fetchMedia(image.url, signal, 'quote-image', index))),
+			quote == null ? Promise.resolve([]) : sharedPhotoBudget ? Promise.resolve(quote.images.map(() => emptyMediaResult())) : Promise.all(quote.images.map((image, index) => fetchMedia(image.url, signal, 'quote-image', index))),
 			Promise.all(quoteVideos.map((video, index) => video.posterUrl == null ? emptyMediaResult() : fetchMedia(video.posterUrl, signal, 'quote-poster', index))),
 		]);
 		const results = [...images, ...videoPosters, ...quoteImages, ...quoteVideoPosters];
@@ -709,12 +743,12 @@ async function loadAttachments(): Promise<MediaLoadFailure | null> {
 	const bundle = await lease.promise;
 	if (current !== attachmentGeneration || attachmentLease !== lease) return null;
 	attachmentFailure = bundle.failure;
-	if (post.images.length <= 4) {
+	if (!sharedPhotoBudget && post.images.length <= 4) {
 		imageSources.value = bundle.images.map(value => value?.src ?? null);
 		imageBlobs.value = bundle.images.map(value => value?.blob ?? null);
 	}
 	videoPosterSources.value = bundle.videoPosters.map(value => value?.src ?? null);
-	if ((quote?.images.length ?? 0) <= 4) {
+	if (!sharedPhotoBudget && (quote?.images.length ?? 0) <= 4) {
 		quoteImageSources.value = bundle.quoteImages.map(value => value?.src ?? null);
 		quoteImageBlobs.value = bundle.quoteImages.map(value => value?.blob ?? null);
 	}
@@ -754,7 +788,7 @@ function cancelPhotoViewer(): void {
 
 function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Promise<void> {
 	const data = photoTargetData(target);
-	if (!canLoadPhotos() || data == null || data.images.length <= 4 || !Number.isSafeInteger(index) || index < 0 || index >= data.images.length) return Promise.resolve();
+	if (!canLoadPhotos() || !hasSharedPhotoBudget() || data == null || !Number.isSafeInteger(index) || index < 0 || index >= data.images.length) return Promise.resolve();
 	if (photoBlobRef(target).value[index] != null) return Promise.resolve();
 	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget') return Promise.resolve();
 	const key = `${ownerKey()}:${target}:${index}`;
@@ -778,10 +812,12 @@ function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Pr
 	else signal?.addEventListener('abort', abortFromCaller, { once: true });
 	setPhotoState(target, index, 'loading');
 	const work = photoQueue.then(async () => {
-		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || (!photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1)) return;
+		const outsideCarouselWindow = data.images.length > 4 && !photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1;
+		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || outsideCarouselWindow) return;
 		const remaining = Math.max(0, MAX_PHOTO_BYTES - photoBytes);
 		const result = await fetchMedia(data.images[index].url, controller.signal, data.kind, index, remaining);
-		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || (!photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1)) {
+		const outsideCarouselWindowAfterFetch = data.images.length > 4 && !photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1;
+		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || outsideCarouselWindowAfterFetch) {
 			if (result.media != null) URL.revokeObjectURL(result.media.src);
 			return;
 		}
@@ -816,10 +852,15 @@ function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Pr
 
 function loadPhotoWindow(target: PhotoTarget, center: number): void {
 	const data = photoTargetData(target);
-	if (data == null || data.images.length <= 4 || !Number.isSafeInteger(center)) return;
-	photoCenters[target] = Math.max(0, Math.min(data.images.length - 1, center));
+	if (data == null || data.images.length === 0 || !Number.isSafeInteger(center)) return;
+	if (data.images.length <= 4) {
+		if (!hasSharedPhotoBudget()) return;
+		photoCenters[target] = 0;
+	} else {
+		photoCenters[target] = Math.max(0, Math.min(data.images.length - 1, center));
+	}
 	if (!canLoadPhotos() || photoViewerLoading.value[target]) return;
-	const desired = [photoCenters[target], photoCenters[target] - 1, photoCenters[target] + 1];
+	const desired = data.images.length <= 4 ? data.images.map((_, index) => index) : [photoCenters[target], photoCenters[target] - 1, photoCenters[target] + 1];
 	for (const index of desired) {
 		if (index >= 0 && index < data.images.length && photoStates.value[target][index] !== 'error') void loadPhoto(target, index);
 	}
@@ -829,6 +870,14 @@ function retryPhoto(target: PhotoTarget, index: number): void {
 	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget') return;
 	photoViewerError.value = { ...photoViewerError.value, [target]: null };
 	void loadPhoto(target, index);
+}
+
+function retrySmallPhotoGrid(target: PhotoTarget): void {
+	const data = photoTargetData(target);
+	if (data == null || data.images.length > 4 || !hasSharedPhotoBudget()) return;
+	for (let index = 0; index < data.images.length; index++) {
+		if (photoStates.value[target][index] === 'error') void loadPhoto(target, index);
+	}
 }
 
 async function openPhotoGallery(target: PhotoTarget, initialIndex: number): Promise<void> {
@@ -891,8 +940,18 @@ async function loadMedia(): Promise<void> {
 	const generation = ++mediaLoadGeneration;
 	const results = await Promise.allSettled([loadIdentity(), loadAttachments()]);
 	if (generation !== mediaLoadGeneration || owner !== ownerKey()) return;
-	loadPhotoWindow('main', photoCenters.main);
-	loadPhotoWindow('quote', photoCenters.quote);
+	const targets: PhotoTarget[] = ['main', 'quote'];
+	if (hasSharedPhotoBudget()) {
+		for (const target of targets) {
+			if ((photoTargetData(target)?.images.length ?? 0) <= 4) loadPhotoWindow(target, 0);
+		}
+		for (const target of targets) {
+			if ((photoTargetData(target)?.images.length ?? 0) > 4) loadPhotoWindow(target, photoCenters[target]);
+		}
+	} else {
+		loadPhotoWindow('main', photoCenters.main);
+		loadPhotoWindow('quote', photoCenters.quote);
+	}
 	const failures = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : ['retryable' as const]);
 	const failure = combineMediaFailures(...failures);
 	mediaLoadBlocked.value = failure === 'blocked';
@@ -901,7 +960,12 @@ async function loadMedia(): Promise<void> {
 
 async function openImage(index: number): Promise<void> {
 	const post = viewData.value.post;
-	if (!canOpenMedia() || post == null || !Number.isSafeInteger(index) || imageBlobs.value[index] == null) return;
+	if (!canOpenMedia() || post == null || !Number.isSafeInteger(index)) return;
+	if (hasSharedPhotoBudget()) {
+		await openPhotoGallery('main', index);
+		return;
+	}
+	if (imageBlobs.value[index] == null) return;
 	const items = (post.images ?? []).flatMap<PluginMediaItem>((image, imageIndex) => {
 		const blob = imageBlobs.value[imageIndex];
 		return blob == null ? [] : [{
@@ -921,7 +985,12 @@ async function openImage(index: number): Promise<void> {
 
 async function openQuoteImage(index: number): Promise<void> {
 	const quote = viewData.value.post?.quote;
-	if (!canOpenMedia() || quote == null || !Number.isSafeInteger(index) || quoteImageBlobs.value[index] == null) return;
+	if (!canOpenMedia() || quote == null || !Number.isSafeInteger(index)) return;
+	if (hasSharedPhotoBudget()) {
+		await openPhotoGallery('quote', index);
+		return;
+	}
+	if (quoteImageBlobs.value[index] == null) return;
 	const items = quote.images.flatMap<PluginMediaItem>((image, imageIndex) => {
 		const blob = quoteImageBlobs.value[imageIndex];
 		return blob == null ? [] : [{
