@@ -140,6 +140,8 @@ overwriteFromPinnedEmojisForReaction: "リアクション設定から上書き�
 overwriteFromPinnedEmojis: "全般設定から上書きする"
 reactionSettingDescription2: "ドラッグして並び替え、クリックして削除、＋を押して追加します。"
 rememberNoteVisibility: "公開範囲を記憶する"
+trackingParameterCleanerEnabled: "貼り付け時に追跡パラメータを除去する"
+trackingParameterCleanerDescription: "テキストの貼り付け時、対応している追跡パラメータだけを除去します。"
 attachCancel: "添付取り消し"
 deleteFile: "ファイルを削除"
 markAsSensitive: "センシティブとして設定"
@@ -3628,6 +3630,12 @@ _hemisphere:
   S: "南半球"
   caption: "一部のクライアント設定で、季節を判定するために使用します。"
 
+xTimelinePreviewMode: "タイムラインのX投稿プレビュー"
+_xTimelinePreviewMode:
+  ogp: "標準OGP＋X投稿のプレビューボタン"
+  text: "X埋め込み、メディアなし"
+  media: "X埋め込み・メディアあり"
+
 _reversi:
   reversi: "リバーシ"
   gameSettings: "対局の設定"
@@ -4079,6 +4087,9 @@ _mkgoRolePolicy:
   canRequestCustomEmojis: "カスタム絵文字の登録を申請できる"
   canRequestCustomEmojis_caption: "自作の絵文字の登録をモデレーターに申請できます。実際に登録されるのは承認された後です。"
   canSearchIpHistory: "IPアドレスから関連アカウントを探せる"
+  canUseFxTwitterPreview: "FxTwitter プレビューを使える"
+  fxTwitterColdFetchesPerHour: "FxTwitter 新規取得数（1時間）"
+  fxTwitterColdFetchesPerDay: "FxTwitter 新規取得数（1日）"
   canSearchIpHistory_caption: "IPアドレスとアカウントの対応を引けるようにします。IPアドレスを入力してそのアドレスから接続したローカルアカウントを一覧する画面と、任意の利用者について同じIPアドレスを使った他のローカルアカウントを列挙する画面の両方が使えるようになります。既定では管理者だけが使えます。同じIPアドレスを使ったことは同一人物であることを意味しません(家庭・職場・学校・公衆Wi-Fi・携帯回線・VPNではアドレスが共有されます)。調査の手掛かりとして使ってください。"
   canDeleteAccount: "自分のアカウントを削除できる"
   canDeleteAccount_caption: "本人によるアカウント削除を許可します。管理者が他のアカウントを削除する操作には影響しません。"

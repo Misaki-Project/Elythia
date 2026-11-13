@@ -356,6 +356,76 @@ func TestDiscover_DetectsFrontend(t *testing.T) {
 	assert.False(t, byName["backonly"].hasFrontend)
 }
 
+func TestDiscover_FrontendOnlyRequiresFrontendAndNoGoModule(t *testing.T) {
+	t.Run("requires frontend entry", func(t *testing.T) {
+		root := t.TempDir()
+		writePlugin(t, root, "plugins/cleaner", "", "name: cleaner\napiVersion: 1\nfrontendOnly: true\n")
+		_, err := discover(root, "plugins", include{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), frontendEntry)
+	})
+
+	t.Run("rejects a Go module", func(t *testing.T) {
+		root := t.TempDir()
+		dir := writePlugin(t, root, "plugins/cleaner", "example.com/cleaner", "name: cleaner\napiVersion: 1\nfrontendOnly: true\n")
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "frontend"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, frontendEntry), []byte("export default {}"), 0o644))
+		_, err := discover(root, "plugins", include{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "frontendOnly")
+		assert.Contains(t, err.Error(), "go.mod")
+	})
+}
+
+func TestRun_FrontendOnlyGeneratesFrontendAndRemovesStaleGoArtifacts(t *testing.T) {
+	root := t.TempDir()
+	dir := writePlugin(t, root, "plugins/cleaner", "", "name: cleaner\napiVersion: 1\nfrontendOnly: true\n")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "frontend"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, frontendEntry), []byte("export default {}"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "frontend/packages/frontend/src"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "cmd/elythia"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, generatedFile), []byte("stale go registration"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "go.work"), []byte("stale workspace"), 0o644))
+
+	require.NoError(t, run(root, "plugins", include{}))
+	_, err := os.Stat(filepath.Join(root, generatedFile))
+	assert.True(t, os.IsNotExist(err), "frontend-only plugin must remove stale Go registration")
+	_, err = os.Stat(filepath.Join(root, "go.work"))
+	assert.True(t, os.IsNotExist(err), "frontend-only plugin must remove stale go.work")
+
+	frontendList, err := os.ReadFile(filepath.Join(root, frontendGeneratedTS))
+	require.NoError(t, err)
+	assert.Contains(t, string(frontendList), "@mkplugin/cleaner")
+	manifestJSON, err := os.ReadFile(filepath.Join(root, frontendManifestJSON))
+	require.NoError(t, err)
+	assert.Contains(t, string(manifestJSON), "cleaner")
+}
+func TestRun_MixedPluginsSplitBackendAndFrontendOutputs(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/host\n\ngo 1.27.3\n"), 0o644))
+	serverDir := writePlugin(t, root, "plugins/server", "example.com/server", "name: server\napiVersion: 1\n")
+	frontDir := writePlugin(t, root, "plugins/cleaner", "", "name: cleaner\napiVersion: 1\nfrontendOnly: true\n")
+	for _, dir := range []string{serverDir, frontDir} {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "frontend"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, frontendEntry), []byte("export default {}"), 0o644))
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "frontend/packages/frontend/src"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "cmd/elythia"), 0o755))
+
+	require.NoError(t, run(root, "plugins", include{}))
+	registration, err := os.ReadFile(filepath.Join(root, generatedFile))
+	require.NoError(t, err)
+	assert.Contains(t, string(registration), `p0 "example.com/server"`)
+	assert.NotContains(t, string(registration), "cleaner")
+	workspace, err := os.ReadFile(filepath.Join(root, "go.work"))
+	require.NoError(t, err)
+	assert.Contains(t, string(workspace), "./plugins/server")
+	assert.NotContains(t, string(workspace), "plugins/cleaner")
+	frontendList, err := os.ReadFile(filepath.Join(root, frontendGeneratedTS))
+	require.NoError(t, err)
+	assert.Contains(t, string(frontendList), "@mkplugin/server")
+	assert.Contains(t, string(frontendList), "@mkplugin/cleaner")
+}
 func TestRenderFrontendList_Empty(t *testing.T) {
 	out := renderFrontendList(nil)
 	assert.Contains(t, out, "export const serverPlugins: PluginDefinition[] = [];")

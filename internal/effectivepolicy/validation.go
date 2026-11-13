@@ -25,6 +25,9 @@ var defaults = map[string]any{
 	"inviteLimitCycle":              10080,
 	"inviteExpirationTime":          0,
 	"canManageCustomEmojis":         false,
+	"canUseFxTwitterPreview":        true,
+	"fxTwitterColdFetchesPerHour":   100,
+	"fxTwitterColdFetchesPerDay":    600,
 	// 絵文字の登録申請 (#2934)。**default true** — 登録は必ずモデレーターの
 	// 承認を通るので、申請そのものを既定で塞ぐ必要が無い。canCreateChannel と
 	// 同じく、絞りたい運営者が role で false にする。
@@ -262,6 +265,12 @@ func valueValid(key string, native, value any) bool {
 		_, ok := value.(bool)
 		return ok
 	case int:
+		if key == "fxTwitterColdFetchesPerHour" {
+			return integerPolicyInRange(value, 1, 10000)
+		}
+		if key == "fxTwitterColdFetchesPerDay" {
+			return integerPolicyInRange(value, 1, 100000)
+		}
 		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" {
 			switch v := value.(type) {
 			case int:
@@ -320,6 +329,18 @@ func valueValid(key string, native, value any) bool {
 	}
 }
 
+func integerPolicyInRange(value any, min, max int) bool {
+	switch v := value.(type) {
+	case int:
+		return v >= min && v <= max
+	case int64:
+		return v >= int64(min) && v <= int64(max)
+	case float64:
+		return v >= float64(min) && v <= float64(max) && math.Trunc(v) == v
+	default:
+		return false
+	}
+}
 func numberValid(value any) bool {
 	switch v := value.(type) {
 	case int:

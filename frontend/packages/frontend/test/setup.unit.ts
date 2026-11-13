@@ -48,6 +48,7 @@ const { updateI18n } = await import('@/i18n.js');
 updateI18n(locales['en-US']);
 
 export const preferState: Record<string, unknown> = {
+	xTimelinePreviewMode: 'media',
 
 	// なんかtestがうまいこと動かないのでここに書く
 	dataSaver: {

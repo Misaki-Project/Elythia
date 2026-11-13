@@ -140,6 +140,8 @@ overwriteFromPinnedEmojisForReaction: "Override from reaction settings"
 overwriteFromPinnedEmojis: "Override from general settings"
 reactionSettingDescription2: "Drag to reorder, click to delete, press \"+\" to add."
 rememberNoteVisibility: "Remember note visibility settings"
+trackingParameterCleanerEnabled: "Remove tracking parameters when pasting"
+trackingParameterCleanerDescription: "Remove recognized tracking parameters from pasted text."
 attachCancel: "Remove attachment"
 deleteFile: "Delete file"
 markAsSensitive: "Mark as sensitive"
@@ -3307,6 +3309,12 @@ _hemisphere:
   N: "Northern Hemisphere"
   S: "Southern Hemisphere"
   caption: "Used in some client settings to determine season."
+
+xTimelinePreviewMode: "X post previews in timelines"
+_xTimelinePreviewMode:
+  ogp: "Standard OGP with an X post preview button"
+  text: "X post embed without media"
+  media: "X post embed with media"
 _reversi:
   reversi: "Reversi"
   gameSettings: "Game settings"
@@ -3841,6 +3849,9 @@ _mkgoAvatarDecoration:
   emojiDisabledButWorn: "Your role no longer allows custom emoji as avatar decorations, but you are still wearing {n}. Until you remove them you cannot change any of your other decorations either. Pick them under \"Used\" above to detach."
 
 _mkgoRolePolicy:
+  canUseFxTwitterPreview: "Allow FxTwitter previews"
+  fxTwitterColdFetchesPerHour: "FxTwitter cold fetches per hour"
+  fxTwitterColdFetchesPerDay: "FxTwitter cold fetches per day"
   canRequestCustomEmojis: "Can request custom emoji"
   canRequestCustomEmojis_caption: "Lets the user ask moderators to register their own emoji. Nothing is registered until a moderator approves it."
   canUseEmojiAsAvatarDecoration: "Can wear custom emoji on their avatar"

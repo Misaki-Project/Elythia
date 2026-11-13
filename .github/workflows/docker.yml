@@ -35,6 +35,11 @@ on:
         description: "Tag to build and publish (e.g. 1.1.1). Empty = build the branch."
         required: false
         default: ""
+      include_fxtwitter:
+        description: "Include FxTwitter in the bundled image"
+        type: boolean
+        required: false
+        default: false
 
 # ghcr.io に push するには packages: write が必要。
 # contents: read は checkout 用。
@@ -214,6 +219,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile.bundled
+          build-args: |
+            PLUGIN_INCLUDE_DISABLED_DIR=${{ inputs.include_fxtwitter == true && 'plugins/fxtwitter-preview' || '' }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

@@ -1,0 +1,3 @@
+name: tracking-parameter-cleaner
+apiVersion: 1
+frontendOnly: true

@@ -3,6 +3,7 @@ package role
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"math"
@@ -243,6 +244,14 @@ const (
 // (#300 3-5)。
 const roleCacheTTL = 5 * time.Minute
 
+// conditionalRoleErrorCacheTTL briefly caches conditional-role lookup errors
+// to bound repeated repository reads while allowing recovery checks promptly.
+const conditionalRoleErrorCacheTTL = time.Second
+
+// maxConditionalRoleErrorCacheEntries caps the existing role-cache map size
+// when admitting new conditional-error entries. Successful snapshots keep their policy.
+const maxConditionalRoleErrorCacheEntries = 1024
+
 // roleCacheEntry は per-user の roles snapshot + 失効時刻。
 type roleCacheEntry struct {
 	// snapshot は roles と activeAssignments の組。**1 回の ListByUser から共に
@@ -300,6 +309,7 @@ func cloneRoles(roles []*model.Role) []*model.Role {
 type userRoleSnapshot struct {
 	roles             []*model.Role
 	activeAssignments []activeRoleAssignment
+	conditionalErr    error
 }
 
 // clone は cache entry と呼び出し側のどちらかが他の変更を観測しないよう値を複製
@@ -308,6 +318,7 @@ func (s userRoleSnapshot) clone() userRoleSnapshot {
 	return userRoleSnapshot{
 		roles:             cloneRoles(s.roles),
 		activeAssignments: cloneActiveRoleAssignments(s.activeAssignments),
+		conditionalErr:    s.conditionalErr,
 	}
 }
 
@@ -574,10 +585,10 @@ func (s *Service) resolveUserRoleSnapshot(userID string) (userRoleSnapshot, erro
 	// formula 評価で絞り込む。assigned roles と matched conditional の和集合
 	// を返す。upstream TS の getUserRoles と同じ順 (assigned が先)。
 	//
-	// roleRepo / userRepo どちらかが未配線なら、conditional 評価は skip して
-	// assigned のみを返す (= 旧挙動)。test 経路で userRepo 未注入のケースに
-	// 配慮した soft-fail。
-	condRoles := s.evaluateConditionalRoles(userID, assignedRoles)
+	// 条件付きロールの入力を確認できないときも、既存の GetUserRoles 向けに
+	// 手動割当ロールの結果は返す。不完全な snapshot は短い TTL で保持し、
+	// checked consumer へ conditionalErr をそのまま伝える。
+	condRoles, conditionalErr := s.evaluateConditionalRoles(userID, assignedRoles)
 	roles := append(assignedRoles, condRoles...)
 
 	// #2106 S5: cache 失効を「TTL」と「最も早い assignment expiresAt」の min にする。
@@ -586,17 +597,39 @@ func (s *Service) resolveUserRoleSnapshot(userID string) (userRoleSnapshot, erro
 	// role/policy として効き続けてしまう (upstream は getUserAssigns で read 毎に
 	// expiresAt を再 filter)。entry を soonest expiry で drop すれば、次 read が
 	// 再 fetch して DB filter が期限切れ assignment を除外する。
-	cacheExpiry := time.Now().Add(roleCacheTTL)
+	now := time.Now()
+	cacheExpiry := now.Add(roleCacheTTL)
 	for _, a := range assignments {
 		if a.ExpiresAt != nil && a.ExpiresAt.Before(cacheExpiry) {
 			cacheExpiry = *a.ExpiresAt
 		}
 	}
+	if conditionalErr != nil {
+		errorExpiry := now.Add(conditionalRoleErrorCacheTTL)
+		if errorExpiry.Before(cacheExpiry) {
+			cacheExpiry = errorExpiry
+		}
+	}
 
-	snapshot := userRoleSnapshot{roles: roles, activeAssignments: activeAssignments}
+	snapshot := userRoleSnapshot{roles: roles, activeAssignments: activeAssignments, conditionalErr: conditionalErr}
 	s.userRoleCacheMu.Lock()
 	if s.allUserRoleEpoch == allEpoch && s.userRoleEpoch[userID] == userEpoch {
-		s.userRoleCache[userID] = &roleCacheEntry{snapshot: snapshot.clone(), expiresAt: cacheExpiry}
+		mayPublish := true
+		if conditionalErr != nil {
+			existing := s.userRoleCache[userID]
+			if existing != nil &&
+				time.Now().Before(existing.expiresAt) && existing.snapshot.conditionalErr == nil {
+				// A slower failed lookup must not overwrite a newer successful snapshot.
+				mayPublish = false
+			}
+			if existing == nil && len(s.userRoleCache) >= maxConditionalRoleErrorCacheEntries {
+				// Negative caching is best-effort once the bounded error-key budget is full.
+				mayPublish = false
+			}
+		}
+		if mayPublish {
+			s.userRoleCache[userID] = &roleCacheEntry{snapshot: snapshot.clone(), expiresAt: cacheExpiry}
+		}
 	}
 	s.userRoleCacheMu.Unlock()
 	return snapshot.clone(), nil
@@ -623,33 +656,6 @@ func (s *Service) GetUserRoles(userID string) ([]*model.Role, error) {
 		return nil, err
 	}
 	return snapshot.roles, nil
-}
-
-// GetUserRolesStrict resolves complete active manual and conditional roles,
-// returning no roles when any required lookup fails. It never reads or writes
-// the lenient per-user cache, which may contain incomplete conditional results.
-func (s *Service) GetUserRolesStrict(userID string) ([]*model.Role, error) {
-	if userID == "" {
-		return nil, nil
-	}
-	if s.assignmentRepo == nil || s.roleRepo == nil {
-		return nil, errors.New("active role repositories are unavailable")
-	}
-	assignments, err := s.assignmentRepo.ListByUser(userID)
-	if err != nil {
-		return nil, err
-	}
-	assigned := make([]*model.Role, 0, len(assignments))
-	for _, assignment := range assignments {
-		if assignment.Role != nil {
-			assigned = append(assigned, assignment.Role)
-		}
-	}
-	conditional, err := s.evaluateConditionalRolesStrict(userID, assigned)
-	if err != nil {
-		return nil, err
-	}
-	return cloneRoles(append(assigned, conditional...)), nil
 }
 
 func (s *Service) finishUserRoleFlight(userID string) {
@@ -743,25 +749,13 @@ func (s *Service) GetUserAssign(userID, roleID string, at time.Time) (*model.Rol
 }
 
 // evaluateConditionalRoles returns the subset of `target=conditional`
-// roles whose `condFormula` evaluates to true for the user. Best-effort:
-// when prerequisites are missing (no userRepo wired, role list fetch
-// fails, user lookup fails, formula JSON malformed) we return nil so
-// callers fall back to assigned roles only. Matches upstream TS where
-// evalCond swallows all errors as false.
-func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role) []*model.Role {
-	matched, _ := s.evaluateConditionalRolesStrict(userID, assigned)
-	return matched
-}
-
-// evaluateConditionalRolesStrict preserves formula evaluation semantics while
-// making missing prerequisites and repository failures visible to strict callers.
-func (s *Service) evaluateConditionalRolesStrict(userID string, assigned []*model.Role) ([]*model.Role, error) {
-	if s.userRepo == nil {
-		return nil, errors.New("conditional role user repository is unavailable")
-	}
+// roles whose `condFormula` evaluates to true for the user. Repository lookup
+// failures are returned separately so checked policy consumers can fail closed;
+// legacy callers may keep using the assigned-role fallback.
+func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role) ([]*model.Role, error) {
 	allRoles, err := s.listRolesCached()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list roles for conditional evaluation: %w", err)
 	}
 	// 早期 short-circuit: conditional role が 1 つも無いなら user fetch を
 	// 省略する (= upstream TS と同 optimization)。これで大多数のインスタンス
@@ -776,12 +770,15 @@ func (s *Service) evaluateConditionalRolesStrict(userID string, assigned []*mode
 	if !hasCond {
 		return nil, nil
 	}
+	if s.userRepo == nil {
+		return nil, errors.New("conditional role user lookup is unavailable")
+	}
 	user, err := s.userRepo.FindByID(userID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lookup user for conditional evaluation: %w", err)
 	}
 	if user == nil {
-		return nil, errors.New("conditional role user is unavailable")
+		return nil, errors.New("conditional role user lookup returned no user")
 	}
 	matched := make([]*model.Role, 0)
 	for _, r := range allRoles {
@@ -790,7 +787,8 @@ func (s *Service) evaluateConditionalRolesStrict(userID string, assigned []*mode
 		}
 		var formula CondFormula
 		// CondFormula は datatypes.JSON。未設定だと "{}" が入っていて
-		// type が空文字列のため EvalCond で false に倒れる。
+		// type が空文字列のため EvalCond で false に倒れる。既存挙動と同じく
+		// malformed JSON はこのロールだけ不一致として扱う。
 		if err := json.Unmarshal(r.CondFormula, &formula); err != nil {
 			continue
 		}
@@ -1264,7 +1262,7 @@ func (s *Service) GetUserPolicies(userID string) map[string]any {
 	// 一時障害で 500 にしては困るので、base を読めなかった窓でも
 	// native 既定の map を返す。認可の判断をする consumer は
 	// `GetUserPoliciesChecked` を使い、そちらの error で fail closed する。
-	out, _ := s.resolvePolicies(userID, nil)
+	out, _ := s.resolvePolicies(userID, nil, false)
 	return out
 }
 

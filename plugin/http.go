@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // Router registers a plugin's HTTP endpoints.
@@ -69,6 +70,11 @@ type Blob struct {
 
 	// CacheControl sets the header when non-empty.
 	CacheControl string
+
+	// WriteTimeout bounds how long the host may spend writing this response.
+	// Zero keeps the existing unbounded behavior. Negative values are rejected.
+	// The host enforces a positive value before writing the response body.
+	WriteTimeout time.Duration
 }
 
 // Request is the plugin-facing view of an HTTP request.
@@ -110,13 +116,12 @@ type Request interface {
 	IsAdministrator() bool
 }
 
-// ActiveRoleRequest is an optional extension implemented by host requests.
-// ActiveRoleIDs returns the authenticated caller's active manual and conditional
-// role IDs. Lookup failures return an error, never a successful empty fallback.
-// Plugins must fail closed when role-aware access or limits cannot be resolved.
-type ActiveRoleRequest interface {
+// CheckedRolePolicyRequest is an optional request extension for plugins whose
+// authorization depends on native role policies. CheckedRolePolicies resolves
+// only the requested keys and returns resolver errors instead of a permissive fallback.
+type CheckedRolePolicyRequest interface {
 	Request
-	ActiveRoleIDs() ([]string, error)
+	CheckedRolePolicies(keys ...string) (map[string]any, error)
 }
 
 // StatusError lets a handler choose the HTTP status of an error response.

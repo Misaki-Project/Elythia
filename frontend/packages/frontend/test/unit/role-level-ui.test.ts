@@ -174,6 +174,15 @@ describe('role-level UI integration points', () => {
 		expect(ranges).not.toContain('JSON.parse');
 	});
 
+	test('FxTwitter quota ranges use numeric integer bounds', () => {
+		const ranges = read('packages/frontend/src/pages/admin/roles.policy-level-ranges.vue');
+		expect(ranges).toContain("'fxTwitterColdFetchesPerHour'");
+		expect(ranges).toContain("'fxTwitterColdFetchesPerDay'");
+		expect(ranges).toContain('fxQuotaBounds');
+		expect(ranges).toContain('Number.isInteger');
+		expect(ranges).toContain('range.end - 1');
+	});
+
 	test('experience curve shows its inputs in one row and cumulative previews', () => {
 		const source = read('packages/frontend/src/pages/admin/roles.level-editor.vue');
 		expect(source).toContain('$style.curveValues');

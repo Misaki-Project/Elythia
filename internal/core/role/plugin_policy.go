@@ -98,8 +98,9 @@ func newPolicyProviderRuntime(cacheEntries int) *policyProviderRuntime {
 }
 
 type policyProviderCacheKey struct {
-	userID  string
-	roleIDs string
+	userID        string
+	roleIDs       string
+	partialInputs bool
 	// assignments は ActiveAssignments の encoding。**RoleIDs が同じでも assignment が
 	// 違えば結果は違う** plugin がある（assignment ごとに状態を持つ）ので、付けないと
 	// 付け外し / 再割り当ての直後に前の結果を返す。
@@ -192,7 +193,7 @@ func (s *Service) snapshotPolicyProviders() []policyProvider {
 // bounded per-provider LRU; plugins must explicitly invalidate affected inputs
 // after committed state changes.
 func (s *Service) GetUserPoliciesChecked(userID string) (map[string]any, error) {
-	return s.resolvePolicies(userID, nil)
+	return s.resolvePolicies(userID, nil, true)
 }
 
 // GetUserPoliciesCheckedForKeys resolves policies using only providers that
@@ -204,20 +205,23 @@ func (s *Service) GetUserPoliciesCheckedForKeys(userID string, keys ...string) (
 	for _, key := range keys {
 		providerKeys[key] = struct{}{}
 	}
-	return s.resolvePolicies(userID, providerKeys)
+	return s.resolvePolicies(userID, providerKeys, true)
 }
 
 // resolvePolicies computes effective policies for userID, invoking registered
 // providers after native roles are resolved and before server caps are
 // applied. Provider failures return ErrEffectivePolicyProvider with the failed
-// providers' keys restored to native results. Native role-input failures return
-// their wrapped repository error without invoking providers. An unreadable
+// providers' keys restored to native results. Checked conditional-role input
+// failures suppress providers and return the wrapped repository error; legacy
+// unchecked resolution preserves the priority cascade but does not cache
+// provider results from partial inputs. An unreadable
 // instance base (`meta.policies`) is reported as a wrapped error too: falling
 // back to the native default silently would answer "allowed" for a base
 // override the admin may have set to deny. Concurrent failures (base and
 // role input) are joined, so neither cause is dropped.
-func (s *Service) resolvePolicies(userID string, providerKeys map[string]struct{}) (out map[string]any, err error) {
+func (s *Service) resolvePolicies(userID string, providerKeys map[string]struct{}, checked bool) (out map[string]any, err error) {
 	providers := s.snapshotPolicyProviders()
+	partialInputs := false
 	// applyMetaBasePolicies が base を mutate するため共有 cache ではなく clone を使う。
 	base := DefaultPoliciesClone()
 	if baseErr := s.applyMetaBasePolicies(base); baseErr != nil {
@@ -245,12 +249,25 @@ func (s *Service) resolvePolicies(userID string, providerKeys map[string]struct{
 		// **1 回の読取から roles と activeAssignments を共に得る。** repository が読めない
 		// ときは activeAssignments を空で埋めた snapshot を渡さず、provider を起動する
 		// 前に checked error にする。
-		snapshot, err := s.resolveUserRoleSnapshot(userID)
-		if err != nil {
-			return s.applyServerCaps(base), fmt.Errorf("role: effective policy inputs: %w", err)
+		snapshot, roleErr := s.resolveUserRoleSnapshot(userID)
+		if roleErr != nil {
+			return s.applyServerCaps(base), fmt.Errorf("role: effective policy inputs: %w", roleErr)
 		}
 		roles = snapshot.roles
 		activeAssignments = snapshot.activeAssignments
+		if snapshot.conditionalErr != nil {
+			if checked {
+				// Conditional roles can contribute both permits and denials, so checked
+				// consumers must not let providers observe an incomplete role set.
+				providers = nil
+				conditionalErr := fmt.Errorf("role: conditional policy inputs: %w", snapshot.conditionalErr)
+				defer func() { err = joinBasePolicyError(conditionalErr, err) }()
+			} else {
+				// Preserve the legacy unchecked priority cascade, but isolate any provider
+				// work from complete-input cache entries and flights.
+				partialInputs = true
+			}
+		}
 	}
 	if len(roles) == 0 && len(providers) == 0 {
 		return s.applyServerCaps(base), nil
@@ -301,7 +318,7 @@ func (s *Service) resolvePolicies(userID string, providerKeys map[string]struct{
 	var providersWG sync.WaitGroup
 	for i, p := range providers {
 		providersWG.Add(1)
-		go func() {
+		go func(partialInputs bool) {
 			defer providersWG.Done()
 			providerRoleIDs := make([]string, len(roleIDs))
 			copy(providerRoleIDs, roleIDs)
@@ -314,8 +331,9 @@ func (s *Service) resolvePolicies(userID string, providerKeys map[string]struct{
 					RoleIDs:           providerRoleIDs,
 					ActiveAssignments: providerAssignments,
 				},
+				partialInputs,
 			)
-		}()
+		}(partialInputs)
 	}
 	providersWG.Wait()
 
@@ -456,14 +474,15 @@ func recordPolicyReplacementConflict(runtime *policyReplacementConflictRuntime, 
 		"pairs", pairs)
 }
 
-func resolvePolicyProviderCached(provider policyProvider, req plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, bool) {
+func resolvePolicyProviderCached(provider policyProvider, req plugin.EffectivePolicyRequest, partialInputs bool) ([]plugin.EffectivePolicyContribution, bool) {
 	if provider.runtime.disabled.Load() {
 		return nil, false
 	}
 	key := policyProviderCacheKey{
-		userID:      req.UserID,
-		roleIDs:     encodePolicyProviderRoleIDs(req.RoleIDs),
-		assignments: encodePolicyProviderAssignments(req.ActiveAssignments),
+		userID:        req.UserID,
+		roleIDs:       encodePolicyProviderRoleIDs(req.RoleIDs),
+		assignments:   encodePolicyProviderAssignments(req.ActiveAssignments),
+		partialInputs: partialInputs,
 	}
 
 	var flight *policyProviderFlight
@@ -522,7 +541,7 @@ func finishPolicyProviderFlight(runtime *policyProviderRuntime, key policyProvid
 	defer runtime.cacheMu.Unlock()
 	flight.contributions = clonePolicyContributions(contributions)
 	flight.ok = ok
-	if ok && !runtime.disabled.Load() &&
+	if ok && !key.partialInputs && !runtime.disabled.Load() &&
 		runtime.globalEpoch == flight.globalEpoch &&
 		runtime.userEpoch[userID] == flight.userEpoch {
 		runtime.cachePut(key, contributions)

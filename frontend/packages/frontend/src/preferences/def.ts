@@ -179,6 +179,10 @@ export const PREF_DEF = definePreferences({
 	rememberNoteVisibility: {
 		default: false,
 	},
+	trackingParameterCleanerEnabled: {
+		accountDependent: true,
+		default: true,
+	},
 	reportError: {
 		default: false,
 	},
@@ -323,6 +327,10 @@ export const PREF_DEF = definePreferences({
 	},
 	showMediaListByGridInWideArea: {
 		default: false,
+	},
+	xTimelinePreviewMode: {
+		default: 'media' as 'ogp' | 'text' | 'media',
+		serverDependent: true,
 	},
 	notificationPosition: {
 		default: 'rightBottom' as 'leftTop' | 'leftBottom' | 'rightTop' | 'rightBottom',

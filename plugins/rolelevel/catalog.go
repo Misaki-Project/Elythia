@@ -122,6 +122,18 @@ func (c *Catalog) NormalizeConst(key string, value any) (any, error) {
 			return nil, invalid(CodeInvalidRangeValue, "policyRanges.value",
 				"%q は数値ですが %#v が渡されました (%s)", key, value, err)
 		}
+		if minimum, maximum, quota := fxTwitterQuotaBounds(key); quota {
+			var number float64
+			switch v := n.(type) {
+			case int64:
+				number = float64(v)
+			case float64:
+				number = v
+			}
+			if number < minimum || number > maximum || math.Trunc(number) != number {
+				return nil, invalid(CodeInvalidRangeValue, "policyRanges.value", "%s には %.0f〜%.0f の整数を指定してください", key, minimum, maximum)
+			}
+		}
 		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" || key == "hsrUidLimit" || key == "genshinUidLimit" {
 			minimum, maximum := 1.0, 1440.0
 			if key == "hsrUidLimit" || key == "genshinUidLimit" {
@@ -161,6 +173,17 @@ func (c *Catalog) NormalizeConst(key string, value any) (any, error) {
 		return items, nil
 	}
 	return nil, invalid(CodeUnknownPolicyKey, "policyRanges.key", "%q の kind が不正です", key)
+}
+
+func fxTwitterQuotaBounds(key string) (minimum, maximum float64, ok bool) {
+	switch key {
+	case "fxTwitterColdFetchesPerHour":
+		return 1, 10000, true
+	case "fxTwitterColdFetchesPerDay":
+		return 1, 100000, true
+	default:
+		return 0, 0, false
+	}
 }
 
 // AcceptsValue reports whether value is usable as a native policy value for key.

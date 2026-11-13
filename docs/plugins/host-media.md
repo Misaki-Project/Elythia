@@ -1,12 +1,14 @@
-# プラグインの認証付きメディアとロール参照
+# プラグインの認証付きメディアと checked role policy
 
-`plugin.Request`の必須メソッドは変わらない。ロールに応じたアクセスや制限が必要なプラグインは、任意の拡張`plugin.ActiveRoleRequest`へ型アサーションする。`ActiveRoleIDs()`は、認証済み利用者についてホストのロールサービスが評価した有効な手動・条件付きロールのIDを、重複を除いてソートして返す。匿名利用者には空の一覧を返す。認証済み利用者の取得失敗・サービス未配線はエラーになる。拡張が無い場合やエラーの場合、プラグインはロール制限を緩めず処理を拒否する。この参照によってロールの付与やポリシーは変更されない。
+`plugin.Request`と`plugin.Context`の必須メソッドは変わらない。native role policyを使って認可するプラグインは任意拡張`plugin.CheckedRolePolicyRequest`を使い、`CheckedRolePolicies(keys...)`で必要なキーだけを解決する。DB・provider・policy入力の取得失敗はエラーになり、プラグインは許可へ倒さず拒否する。バックグラウンド処理では`plugin.CheckedUserRolePolicyContext`を使い、投入時のactorのpolicyを処理直前に再確認できる。
 
-テスト用の`plugintest.Request`には`ActiveRoleIDs`と`ActiveRoleError`を指定できる。返された一覧の変更は後続の参照へ影響しない。
+`plugintest.Request`の`CheckedRolePolicies`と`CheckedRolePolicyError`、`Harness.WithCheckedUserRolePolicies`で成功値と失敗をテストできる。
 
 フロントエンドの`PluginHost.fetch(path, options)`は、ログイン中の利用者のBearer認証で同一オリジンのプラグインAPIを呼ぶ。`path`は`/api/plugin/<自分の名前>/`以下のルート相対パスに限る。外部URL、他プラグイン、ドットによる階層移動、エスケープされたパス、フラグメント、認証用の`i`クエリは拒否する。Cookieは送らず、リダイレクトは拒否する。呼び出し元のAuthorizationはホストの認証に置き換え、`signal`を含むその他のリクエスト設定は保持する。戻り値は`Response`なので、HTTPステータスを確認して`blob()`を呼ぶ。
 
 `PluginHost.openMedia(items, initialId?)`は、取得済みの`Blob`を既存のライトボックスで表示する。`PluginMediaItem`には`id`、`type`(`image`/`video`/`audio`)、`blob`、任意の寸法・ファイル名・`isSensitive`・`initiallyRevealed`を渡す。MIMEはホストのブラウザ表示用許可一覧と`type`の両方に一致する必要があり、SVGは含まない。生成したObject URLは閉じたときや起動失敗時に解放する。`initiallyRevealed`は呼び出し元で既に開示済みの項目だけに指定する。
+
+`plugin.Blob.WriteTimeout`は任意のレスポンス書き込み期限です。既定値の0は従来どおり期限を設定しません。正の値を設定すると、ホストはヘッダーや本文を書き始める前に現在のHTTPレスポンスへ期限を設定します。レスポンスライターが期限を適用できない場合や、負の値の場合は本文を送る前にエラーにします。期限はハンドラーからの応答書き込みとflushを保護し、グローバルなHTTPサーバー期限を変更しません。大きなBlobでは、許容サイズとクライアント速度を考慮した有限の値を選んでください。
 
 任意の`PluginMediaItem.alt`はBlobメディアの代替テキストとしてviewerへ引き継ぐ。`filename`は表示名・ダウンロード名として独立して扱い、代替テキストには使わない。既存のDriveFileがある場合は`comment`を優先し、それが未設定なら`alt`を使う。どちらも未指定なら従来どおり代替テキストを追加しない。
 
