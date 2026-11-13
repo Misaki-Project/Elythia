@@ -6,7 +6,7 @@
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/vue';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { nextTick } from 'vue';
-import plugin, { FxPreview, initApi, loadPreview, provider, statusID, truncatePostText } from '../../../../../plugins/fxtwitter-preview/frontend/index';
+import plugin, { FxPreview, initApi as initPluginApi, loadPreview, provider, statusID, truncatePostText } from '../../../../../plugins/fxtwitter-preview/frontend/index';
 import FxPreviewSkeleton from '../../../../../plugins/fxtwitter-preview/frontend/FxPreviewSkeleton.vue';
 import type { PreviewResponse } from '../../../../../plugins/fxtwitter-preview/frontend/api';
 import { setVideoPlaybackMode } from '../../../../../plugins/fxtwitter-preview/frontend/api';
@@ -68,6 +68,60 @@ function mockMediaFetch(): void {
 	}) as Response);
 }
 
+function preparedImageResponse(index = 0): Response {
+	return new Response(JSON.stringify({
+		url: `/api/plugin/fxtwitter-preview/public-media/${String(index + 1).padStart(32, '0')}.png`,
+		expiresAt: new Date(Date.now() + 60_000).toISOString(),
+		contentType: 'image/png',
+		size: new Blob(['image bytes']).size,
+	}), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+
+let publicMediaSequence = 0;
+const publicMediaBlobs = new Map<string, { blob: Blob; contentType: string }>();
+
+// Most legacy component tests modelled the old authenticated byte GET. Adapt
+// those fixtures at the API boundary so they keep exercising the same payload
+// and failure cases while the component now performs prepare + public GET.
+function initApi(api: PluginHost['api'], fetcher?: PluginHost['fetch'], openMedia?: PluginHost['openMedia']): void {
+	const adaptedFetcher: PluginHost['fetch'] = async (path, options) => {
+		if (path === '/api/plugin/fxtwitter-preview/media/video/prepare') {
+			const response = fetcher == null
+				? await window.fetch('/api/plugin/fxtwitter-preview/media/video', options)
+				: await fetcher('/api/plugin/fxtwitter-preview/media/video', options);
+			if (!response.ok) return response;
+			if (response.headers.get('Content-Type')?.toLowerCase().startsWith('application/json')) return response;
+			const blob = await response.blob();
+			const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase() || blob.type || 'video/mp4';
+			const url = `/api/plugin/fxtwitter-preview/public-media/${String(++publicMediaSequence).padStart(32, '0')}.mp4`;
+			publicMediaBlobs.set(url, { blob, contentType });
+			return new Response(JSON.stringify({ url, expiresAt: new Date(Date.now() + 60_000).toISOString(), contentType, size: blob.size }), {
+				status: 200, headers: { 'Content-Type': 'application/json' },
+			});
+		}
+		if (path !== '/api/plugin/fxtwitter-preview/media/prepare') {
+			return fetcher == null ? await window.fetch(path, options) : await fetcher(path, options);
+		}
+		const body = JSON.parse(String(options?.body)) as { noteId: string; postId: string; kind: string; index: number };
+		const oldPath = `/api/plugin/fxtwitter-preview/media/${encodeURIComponent(body.postId)}/${body.kind}/${body.index}?noteId=${encodeURIComponent(body.noteId)}`;
+		let response = fetcher == null
+			? await window.fetch(oldPath, { ...options, method: 'GET' })
+			: await fetcher(oldPath, { ...options, method: 'GET' });
+		if (response == null) response = await window.fetch(oldPath, { ...options, method: 'GET' });
+		if (!response.ok) return response;
+		if (response.headers.get('Content-Type')?.toLowerCase().startsWith('application/json')) return response;
+		const blob = await response.blob();
+		const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase() || blob.type || 'image/png';
+		const extension = ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'image/avif': 'avif' } as Record<string, string>)[contentType] ?? 'png';
+		const url = `/api/plugin/fxtwitter-preview/public-media/${String(++publicMediaSequence).padStart(32, '0')}.${extension}`;
+		publicMediaBlobs.set(url, { blob, contentType });
+		return new Response(JSON.stringify({ url, expiresAt: new Date(Date.now() + 60_000).toISOString(), contentType, size: blob.size }), {
+			status: 200, headers: { 'Content-Type': 'application/json' },
+		});
+	};
+	initPluginApi(api, adaptedFetcher, openMedia);
+}
+
 function setPreference(key: string, value: unknown): void {
 	preferState[key] = value;
 	if (preferReactive[key] != null) preferReactive[key].value = value;
@@ -75,6 +129,8 @@ function setPreference(key: string, value: unknown): void {
 
 describe('FxTwitter preview plugin', () => {
 	beforeEach(() => {
+		publicMediaSequence = 0;
+		publicMediaBlobs.clear();
 		vi.restoreAllMocks();
 		setPreference('nsfw', 'respect');
 		setPreference('confirmWhenRevealingSensitiveMedia', false);
@@ -90,6 +146,19 @@ describe('FxTwitter preview plugin', () => {
 		});
 		initApi(vi.fn() as PluginHost['api'], vi.fn() as PluginHost['fetch']);
 		mockMediaFetch();
+		vi.spyOn(window, 'fetch').mockImplementation(async (input, _init) => {
+			const url = typeof input === 'string' ? input : input instanceof URL ? input.pathname : new URL(input.url).pathname;
+			const prepared = publicMediaBlobs.get(url);
+			if (prepared?.contentType === 'video/mp4') return new Response(prepared.blob, { headers: { 'Content-Type': prepared.contentType, 'Content-Length': String(prepared.blob.size) } });
+			if (prepared != null) return {
+				ok: true,
+				status: 200,
+				headers: new Headers({ 'Content-Type': prepared.contentType, 'Content-Length': String(prepared.blob.size) }),
+				blob: async () => prepared.blob,
+			} as Response;
+			if (url.endsWith('.mp4')) return new Response(new Blob(['selected video'], { type: 'video/mp4' }), { headers: { 'Content-Type': 'video/mp4', 'Content-Length': '14' } });
+			return new Response(new Blob(['image bytes'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png', 'Content-Length': '11' } });
+		});
 		Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn((_: Blob) => `blob:fx-${crypto.randomUUID()}`) });
 		Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
 	});
@@ -741,8 +810,8 @@ describe('FxTwitter preview plugin', () => {
 	});
 
 	test('loads same-origin media with an authorization header and revokes object URLs', async () => {
-		const pluginFetch = vi.fn(async (_path: string, options?: RequestInit) => await fetchMock('/api/plugin/fxtwitter-preview/media/proxy', options));
-		initApi(vi.fn() as PluginHost['api'], pluginFetch as PluginHost['fetch']);
+	const pluginFetch = vi.fn(async (_path: string, _options?: RequestInit) => preparedImageResponse());
+		initPluginApi(vi.fn() as PluginHost['api'], pluginFetch as PluginHost['fetch']);
 		const data = {
 			state: 'ready' as const,
 			post: {
@@ -757,7 +826,8 @@ describe('FxTwitter preview plugin', () => {
 		expect(result.queryByRole('link', { name: 'Xで開く' })).toBeNull();
 		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 		for (const [path, init] of pluginFetch.mock.calls) {
-			expect(String(path)).toMatch(/^\/api\/plugin\/fxtwitter-preview\/media\//);
+			expect(String(path)).toBe('/api/plugin/fxtwitter-preview/media/prepare');
+			expect(JSON.parse(String(init?.body))).toMatchObject({ noteId: 'note-1', postId: '1234567890' });
 			expect(init?.signal).toBeInstanceOf(AbortSignal);
 		}
 		await waitFor(() => expect(result.getAllByRole('img').every(image => image.getAttribute('src')?.startsWith('blob:fx-'))).toBe(true));
@@ -825,7 +895,7 @@ describe('FxTwitter preview plugin', () => {
 		let mediaRequestCount = 0;
 		const pluginFetch = vi.fn(async () => ++mediaRequestCount === 1
 			? new Response('expired media', { status: 404 })
-			: new Response(new Blob(['image bytes'], { type: 'image/png' }), { headers: new Headers({ 'Content-Type': 'image/png' }) }));
+			: preparedImageResponse());
 		initApi(previewApi as PluginHost['api'], pluginFetch as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data, input, context } });
 		await waitFor(() => expect(result.getByText('メディアを読み込めませんでした。')).toBeTruthy());
@@ -1669,6 +1739,47 @@ describe('FxTwitter preview plugin', () => {
 		expect(result.getByRole('link', { name: 'YouTubeで開く' }).getAttribute('href')).toBe('https://www.youtube.com/watch?v=M7lc1UVf-VE');
 		const embedRequest = fetcher.mock.calls.find(([, options]) => options?.method === 'POST');
 		expect(JSON.parse(String(embedRequest?.[1]?.body))).toMatchObject({ target: 'main', postId: '1234567890' });
+	});
+
+	test('uses the authenticated poster route only for PRIVATE_MEDIA_ONLY', async () => {
+		const data = videoData();
+		const posterUrl = '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1';
+		Object.assign(data.post!.video!, { provider: 'youtube', providerVideoId: 'M7lc1UVf-VE', posterUrl });
+		const fetcher = vi.fn(async (path: string, options?: RequestInit) => {
+			if (path === '/api/plugin/fxtwitter-preview/media/prepare') return new Response(JSON.stringify({ error: { code: 'PRIVATE_MEDIA_ONLY', message: 'YouTube poster is private' } }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+			if (path === posterUrl) return new Response(new Blob(['youtube-poster'], { type: 'image/jpeg' }), { headers: { 'Content-Type': 'image/jpeg' } });
+			throw new Error(`unexpected fetch: ${path}`);
+		});
+		initPluginApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
+		const result = render(FxPreview, { props: { data, input, context } });
+
+		await waitFor(() => expect(result.getByRole('img').getAttribute('src')).toMatch(/^blob:fx-/));
+		expect(fetcher).toHaveBeenCalledTimes(2);
+		expect(fetcher.mock.calls[0][0]).toBe('/api/plugin/fxtwitter-preview/media/prepare');
+		expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toMatchObject({ noteId: 'note-1', postId: '1234567890', kind: 'poster', index: 0 });
+		expect(fetcher.mock.calls[1][0]).toBe(posterUrl);
+		expect(fetcher.mock.calls[1][1]).toMatchObject({ method: 'GET', cache: 'no-store' });
+		expect(fetcher.mock.calls[1][1]?.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	test('does not fall back for other prepare conflicts or non-YouTube poster URLs', async () => {
+		const data = videoData();
+		const posterUrl = '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1';
+		Object.assign(data.post!.video!, { provider: 'youtube', providerVideoId: 'M7lc1UVf-VE', posterUrl });
+		const fetcher = vi.fn(async (_path: string, _options?: RequestInit) => new Response(JSON.stringify({ error: { code: 'SOME_OTHER_CONFLICT' } }), { status: 409, headers: { 'Content-Type': 'application/json' } }));
+		initPluginApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
+		const result = render(FxPreview, { props: { data, input, context } });
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+		expect(fetcher.mock.calls[0][0]).toBe('/api/plugin/fxtwitter-preview/media/prepare');
+		expect(result.container.querySelector('[data-fx-video-target="main"] [data-video-poster-count]')?.getAttribute('data-video-poster-count')).toBe('0');
+
+		result.unmount();
+		const badData = videoData();
+		Object.assign(badData.post!.video!, { provider: 'youtube', providerVideoId: 'M7lc1UVf-VE', posterUrl: 'https://attacker.example/vi/M7lc1UVf-VE/hqdefault.jpg' });
+		fetcher.mockClear();
+		const bad = render(FxPreview, { props: { data: badData, input, context } });
+		await waitFor(() => expect(bad.getByText('video post')).toBeTruthy());
+		expect(fetcher).not.toHaveBeenCalled();
 	});
 
 	test('plays a quoted YouTube video with the quote target and outer cache post id', async () => {

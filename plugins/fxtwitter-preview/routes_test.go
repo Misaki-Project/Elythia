@@ -36,6 +36,10 @@ func TestPreviewRequiresLoginBeforeNativeOrExternalCall(t *testing.T) {
 	if err == nil || a.endpoint != "" || externalCalls != 0 {
 		t.Fatalf("anonymous media = %v, native endpoint = %q, external=%d", err, a.endpoint, externalCalls)
 	}
+	_, err = routes.Call(t, "POST /media/prepare", plugintest.Request{Body: `{"noteId":"note1","postId":"1234567890","kind":"image","index":0}`})
+	if err == nil || a.endpoint != "" || externalCalls != 0 {
+		t.Fatalf("anonymous media preparation = %v, native endpoint = %q, external=%d", err, a.endpoint, externalCalls)
+	}
 }
 
 func TestPublicEntryRewritesQuotedMediaToAuthorizedSameOriginRoutes(t *testing.T) {
@@ -563,6 +567,225 @@ func TestMediaRouteServesAuthorizedWarmCacheUnderSharedAdmission(t *testing.T) {
 	}
 	if blob.CacheControl != "private, no-store" || blob.WriteTimeout != mediaResponseWriteTimeout || mediaCalled {
 		t.Fatalf("cache response policy = cache:%q timeout:%s outbound:%v", blob.CacheControl, blob.WriteTimeout, mediaCalled)
+	}
+}
+
+func TestImagePrepareReusesPublishedDescriptorAfterFreshAuthorization(t *testing.T) {
+	db := migratedDB(t)
+	now := time.Now().UTC()
+	s := newStore(db, testConfig())
+	mediaCache(t, s, now, "https://pbs.twimg.com/media/test.png")
+	rawURL, fetchedAt, err := s.ResolveMediaDescriptor(context.Background(), "1234567890", "image", "0", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceKey, _, err := imageMediaSourceKey("1234567890", "image", "0", rawURL, fetchedAt, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRegistry, oldLimiter := processPublishedMediaRegistry, processMediaRequestLimiter
+	processPublishedMediaRegistry = newPublishedMediaRegistry(1<<20, 8, publishedMediaTTL, 50<<20, 4)
+	processMediaRequestLimiter = newMediaRequestLimiter(mediaUserRequestsPerMinute, mediaGlobalRequestsPerMinute)
+	t.Cleanup(func() {
+		processPublishedMediaRegistry, processMediaRequestLimiter = oldRegistry, oldLimiter
+	})
+	registered, err := processPublishedMediaRegistry.PublishForSource("image/png", tinyImage(t, "png"), sourceKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mediaRequests := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		mediaRequests++
+		return nil, errors.New("warm published registration should avoid upstream")
+	})}
+	api := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	h := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(api).WithHTTPClient(client).WithConfig(map[string]any{
+		"externalFetchEnabled": true, "staticImageMaxBytes": 1024,
+	})
+	routes := h.Routes(Plugin)
+	body := `{"noteId":"note1","postId":"1234567890","kind":"image","index":0}`
+	result, err := routes.Call(t, "POST /media/prepare", plugintest.Request{UserID: "u1", Body: body, CheckedRolePolicies: allowPreviewPolicies()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok || payload["url"] != "/api/plugin/fxtwitter-preview/public-media/"+registered.Token+".png" || payload["expiresAt"] != registered.ExpiresAt.Format(time.RFC3339Nano) {
+		t.Fatalf("prepare payload=%#v, expected opaque existing URL and original expiry", result)
+	}
+	if strings.Contains(payload["url"].(string), "noteId") || strings.Contains(payload["url"].(string), "1234567890") || mediaRequests != 0 {
+		t.Fatalf("public URL leaked descriptor or hit upstream: url=%q requests=%d", payload["url"], mediaRequests)
+	}
+	if _, err := routes.Call(t, "POST /media/prepare", plugintest.Request{UserID: "u1", Body: body, CheckedRolePolicies: map[string]any{}}); err == nil {
+		t.Fatal("warm public registration bypassed the current role policy")
+	}
+	if mediaRequests != 0 {
+		t.Fatalf("denied warm prepare made %d upstream requests", mediaRequests)
+	}
+}
+
+func TestImagePreparePublishesColdFetchThenServesPublicAndReusesIt(t *testing.T) {
+	db := migratedDB(t)
+	mediaCache(t, newStore(db, testConfig()), time.Now().UTC(), "https://pbs.twimg.com/media/test.png")
+	oldRegistry, oldLimiter, oldCache := processPublishedMediaRegistry, processMediaRequestLimiter, processMediaResponseCache
+	processPublishedMediaRegistry = newPublishedMediaRegistry(1<<20, 8, publishedMediaTTL, 50<<20, 4)
+	processMediaRequestLimiter = newMediaRequestLimiter(mediaUserRequestsPerMinute, mediaGlobalRequestsPerMinute)
+	processMediaResponseCache = newMediaResponseCache(mediaResponseCacheBytes, mediaResponseCacheEntries, mediaResponseCacheTTL)
+	t.Cleanup(func() {
+		processPublishedMediaRegistry, processMediaRequestLimiter, processMediaResponseCache = oldRegistry, oldLimiter, oldCache
+	})
+	image := tinyImage(t, "png")
+	mediaRequests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mediaRequests++
+		if r.URL.String() != "https://pbs.twimg.com/media/test.png" {
+			t.Fatalf("unexpected image URL: %s", r.URL)
+		}
+		return response(http.StatusOK, "image/png", string(image)), nil
+	})}
+	api := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	routes := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(api).WithHTTPClient(client).WithConfig(map[string]any{
+		"externalFetchEnabled": true, "staticImageMaxBytes": 1024,
+	}).Routes(Plugin)
+	body := `{"noteId":"note1","postId":"1234567890","kind":"image","index":0}`
+	prepare := func() (map[string]any, error) {
+		result, err := routes.Call(t, "POST /media/prepare", plugintest.Request{UserID: "u1", Body: body, CheckedRolePolicies: allowPreviewPolicies()})
+		if err != nil {
+			return nil, err
+		}
+		payload, ok := result.(map[string]any)
+		if !ok {
+			t.Fatalf("prepare response=%#v", result)
+		}
+		return payload, nil
+	}
+	first, err := prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mediaRequests != 1 || first["contentType"] != "image/png" || first["size"] != int64(len(image)) {
+		t.Fatalf("cold prepare=%#v upstream requests=%d", first, mediaRequests)
+	}
+	filename := strings.TrimPrefix(first["url"].(string), "/api/plugin/fxtwitter-preview/public-media/")
+	publicResult, err := routes.Call(t, "GET /public-media/:filename", plugintest.Request{Params: map[string]string{"filename": filename}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicBlob, ok := publicResult.(plugin.Blob)
+	if !ok || publicBlob.ContentType != "image/png" || string(publicBlob.Body) != string(image) {
+		t.Fatalf("public image did not return acquired bytes: %#v", publicResult)
+	}
+	second, err := prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second["url"] != first["url"] || second["expiresAt"] != first["expiresAt"] || mediaRequests != 1 {
+		t.Fatalf("warm prepare changed expiry/token or refetched: first=%#v second=%#v upstream=%d", first, second, mediaRequests)
+	}
+}
+
+func TestYouTubePosterPrepareIsPrivateAndDoesNotCreatePublicEntry(t *testing.T) {
+	db := migratedDB(t)
+	now := time.Now().UTC()
+	s := newStore(db, testConfig())
+	lease, err := s.AcquireFetch(context.Background(), "1234567890", "u1", now)
+	if err != nil || lease == nil {
+		t.Fatalf("seed lease=%#v err=%v", lease, err)
+	}
+	posterURL := "https://img.youtube.com/vi/abcdefghijk/0.jpg"
+	posterExpiry := now.Add(time.Hour)
+	post := PublicPost{
+		ID: lease.PostID, Text: "youtube poster", Author: PublicAuthor{Name: "A", ScreenName: "a"}, HasVideo: true,
+		Video:  &PublicVideo{Provider: "youtube", ProviderVideoID: "abcdefghijk", PosterURL: posterURL, PosterExpiresAt: &posterExpiry},
+		Videos: []PublicVideoMetadata{{Provider: "youtube", ProviderVideoID: "abcdefghijk", PosterURL: posterURL, PosterExpiresAt: &posterExpiry}},
+	}
+	if _, err := s.CompleteReady(context.Background(), *lease, post, now); err != nil {
+		t.Fatal(err)
+	}
+	oldRegistry, oldLimiter := processPublishedMediaRegistry, processMediaRequestLimiter
+	processPublishedMediaRegistry = newPublishedMediaRegistry(1<<20, 8, publishedMediaTTL, 50<<20, 4)
+	processMediaRequestLimiter = newMediaRequestLimiter(mediaUserRequestsPerMinute, mediaGlobalRequestsPerMinute)
+	t.Cleanup(func() { processPublishedMediaRegistry, processMediaRequestLimiter = oldRegistry, oldLimiter })
+	image := tinyImage(t, "jpeg")
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		if r.URL.String() != posterURL {
+			t.Fatalf("unexpected poster URL: %s", r.URL)
+		}
+		return response(http.StatusOK, "image/jpeg", string(image)), nil
+	})}
+	api := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	routes := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(api).WithHTTPClient(client).WithConfig(map[string]any{
+		"externalFetchEnabled": true, "staticImageMaxBytes": 1024,
+	}).Routes(Plugin)
+	prepared, err := routes.Call(t, "POST /media/prepare", plugintest.Request{
+		UserID: "u1", Body: `{"noteId":"note1","postId":"1234567890","kind":"poster","index":0}`,
+		CheckedRolePolicies: allowPreviewPolicies(),
+	})
+	status, code := plugin.ExtractStatusError(err)
+	if status == nil || status.Status != http.StatusConflict || code != "PRIVATE_MEDIA_ONLY" || requests != 0 || processPublishedMediaRegistry.Stats().Entries != 0 {
+		t.Fatalf("YouTube prepare=%#v status=%#v code=%q fetches=%d registry=%+v", prepared, status, code, requests, processPublishedMediaRegistry.Stats())
+	}
+	privateResult, err := routes.Call(t, "GET /media/:postId/:kind/:index", plugintest.Request{
+		UserID: "u1", Params: map[string]string{"postId": "1234567890", "kind": "poster", "index": "0"},
+		Query: map[string]string{"noteId": "note1"}, CheckedRolePolicies: allowPreviewPolicies(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, ok := privateResult.(plugin.Blob)
+	if !ok || blob.CacheControl != "private, no-store" || blob.ContentType != "image/jpeg" || requests != 1 || processPublishedMediaRegistry.Stats().Entries != 0 {
+		t.Fatalf("legacy private poster=%#v fetches=%d registry=%+v", privateResult, requests, processPublishedMediaRegistry.Stats())
+	}
+}
+
+func TestAnonymousPublicMediaRouteServesOnlyRegisteredBytes(t *testing.T) {
+	now := time.Now().UTC()
+	oldRegistry := processPublishedMediaRegistry
+	processPublishedMediaRegistry = newPublishedMediaRegistry(1<<20, 8, publishedMediaTTL, 50<<20, 1)
+	t.Cleanup(func() { processPublishedMediaRegistry = oldRegistry })
+	media, err := processPublishedMediaRegistry.Publish("image/png", tinyImage(t, "png"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamRequests := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		upstreamRequests++
+		return nil, errors.New("public media route must not fetch upstream")
+	})}
+	db := migratedDB(t)
+	h := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithHTTPClient(client).WithConfig(map[string]any{"externalFetchEnabled": true})
+	routes := h.Routes(Plugin)
+	result, err := routes.Call(t, "GET /public-media/:filename", plugintest.Request{Params: map[string]string{"filename": media.Token + ".png"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, ok := result.(plugin.Blob)
+	if !ok || blob.ContentType != "image/png" || string(blob.Body) != string(media.Body) || !strings.HasPrefix(blob.CacheControl, "public, max-age=") || !strings.Contains(blob.CacheControl, "s-maxage=") || !strings.Contains(blob.CacheControl, "must-revalidate") || !strings.Contains(blob.CacheControl, "no-transform") {
+		t.Fatalf("public media response=%#v", result)
+	}
+	for _, filename := range []string{strings.Repeat("0", 32) + ".png", media.Token + ".jpg", media.Token + ".svg", "../../" + media.Token + ".png"} {
+		_, err := routes.Call(t, "GET /public-media/:filename", plugintest.Request{Params: map[string]string{"filename": filename}})
+		if err == nil {
+			t.Errorf("invalid public media filename %q was served", filename)
+		}
+	}
+	_, err = routes.Call(t, "GET /public-media/:filename", plugintest.Request{Params: map[string]string{"filename": strings.Repeat("f", 32) + ".png"}})
+	status, _ := plugin.ExtractStatusError(err)
+	if status == nil || status.Status != http.StatusNotFound {
+		t.Fatalf("unregistered public URL status=%#v err=%v", status, err)
+	}
+	expired, err := processPublishedMediaRegistry.Publish("image/png", []byte("expired bytes"), time.Now().UTC().Add(-publishedMediaTTL-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = routes.Call(t, "GET /public-media/:filename", plugintest.Request{Params: map[string]string{"filename": expired.Token + ".png"}})
+	status, _ = plugin.ExtractStatusError(err)
+	if status == nil || status.Status != http.StatusNotFound {
+		t.Fatalf("expired public URL status=%#v err=%v", status, err)
+	}
+	if upstreamRequests != 0 {
+		t.Fatalf("public media route made %d upstream requests", upstreamRequests)
 	}
 }
 

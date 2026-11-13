@@ -5,6 +5,7 @@ package fxtwitterpreview
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/url"
@@ -167,7 +168,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		return map[string]any{"state": "pending", "nextPollAt": now.Add(2 * time.Second)}, nil
 	})
 
-	r.GET("/media/:postId/:kind/:index", func(req plugin.Request) (any, error) {
+	handleImageMedia := func(req plugin.Request, noteID, postID, kind, rawIndex string, prepare bool) (any, error) {
 		if err := requireUser(req); err != nil {
 			return nil, err
 		}
@@ -177,8 +178,6 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if _, err := requirePreviewPolicy(req); err != nil {
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		noteID := req.Query("noteId")
-		postID := req.Param("postId")
 		if noteID == "" || !statusIDPattern.MatchString(postID) {
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
@@ -189,9 +188,32 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		rawURL, fetchedAt, err := s.ResolveMediaDescriptor(req.Context(), postID, req.Param("kind"), req.Param("index"), now)
+		rawURL, fetchedAt, err := s.ResolveMediaDescriptor(req.Context(), postID, kind, rawIndex, now)
 		if err != nil {
 			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		sourceKey, u, err := imageMediaSourceKey(postID, kind, rawIndex, rawURL, fetchedAt, cfg.StaticImageMaxBytes)
+		if err != nil {
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		if prepare && u.Host == "img.youtube.com" {
+			return nil, plugin.NewCodedStatusError(http.StatusConflict, "media requires the authenticated private route", "PRIVATE_MEDIA_ONLY")
+		}
+		if prepare {
+			if _, err := requirePreviewPolicy(req); err != nil ||
+				verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+				return nil, plugin.ErrNotFound("media unavailable")
+			}
+			currentURL, currentFetchedAt, resolveErr := s.ResolveMediaDescriptor(req.Context(), postID, kind, rawIndex, time.Now().UTC())
+			currentKey, _, keyErr := imageMediaSourceKey(postID, kind, rawIndex, currentURL, currentFetchedAt, cfg.StaticImageMaxBytes)
+			if resolveErr != nil || keyErr != nil || currentKey != sourceKey {
+				return nil, plugin.ErrNotFound("media unavailable")
+			}
+			if media, ok := processPublishedMediaRegistry.FindBySource(sourceKey, time.Now().UTC()); ok {
+				if residualPublicCacheControl(media.ExpiresAt, time.Now().UTC()) != "" {
+					return publishedMediaPayload(media), nil
+				}
+			}
 		}
 		waitBudget := mediaQueueWaitBudget(mediaRequestCapacity, mediaBufferCapacity, mediaUserActiveLimit, cfg.StaticImageMaxBytes, cfg.RequestTimeout, mediaQueueWaitTimeout)
 		waitCtx, cancelWait := context.WithTimeout(req.Context(), waitBudget)
@@ -218,17 +240,31 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			releaseUser()
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		rawURL, fetchedAt, err = s.ResolveMediaDescriptor(waitCtx, postID, req.Param("kind"), req.Param("index"), time.Now().UTC())
+		rawURL, fetchedAt, err = s.ResolveMediaDescriptor(waitCtx, postID, kind, rawIndex, time.Now().UTC())
 		if err != nil {
 			releaseAdmission()
 			releaseUser()
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		u, err := url.Parse(rawURL)
-		if err != nil || u.Scheme != "https" || !allowedMediaHost(u.Host) || u.User != nil {
+		sourceKey, u, err = imageMediaSourceKey(postID, kind, rawIndex, rawURL, fetchedAt, cfg.StaticImageMaxBytes)
+		if err != nil {
 			releaseAdmission()
 			releaseUser()
 			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		if prepare && u.Host == "img.youtube.com" {
+			releaseAdmission()
+			releaseUser()
+			return nil, plugin.NewCodedStatusError(http.StatusConflict, "media requires the authenticated private route", "PRIVATE_MEDIA_ONLY")
+		}
+		if prepare {
+			if media, ok := processPublishedMediaRegistry.FindBySource(sourceKey, time.Now().UTC()); ok {
+				if residualPublicCacheControl(media.ExpiresAt, time.Now().UTC()) != "" {
+					releaseAdmission()
+					releaseUser()
+					return publishedMediaPayload(media), nil
+				}
+			}
 		}
 		key := mediaCacheKey{PostID: postID, SourceURL: u.String(), MaxBytes: cfg.StaticImageMaxBytes}
 		cacheable := fetchedAt != nil
@@ -237,6 +273,20 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		}
 		if cacheable {
 			if blob, ok := processMediaResponseCache.Get(key, time.Now().UTC()); ok {
+				if prepare {
+					if !imagePreparationStillAuthorized(req, noteID, postID, kind, rawIndex, sourceKey, s, ctx, cfg, requirePreviewPolicy) {
+						releaseAdmission()
+						releaseUser()
+						if imagePreparationIsPrivateOnly(req, noteID, postID, kind, rawIndex, s, ctx, cfg, requirePreviewPolicy) {
+							return nil, plugin.NewCodedStatusError(http.StatusConflict, "media requires the authenticated private route", "PRIVATE_MEDIA_ONLY")
+						}
+						return nil, plugin.ErrNotFound("media unavailable")
+					}
+					result, publishErr := publishPreparedImageMedia(blob, sourceKey, u.Host)
+					releaseAdmission()
+					releaseUser()
+					return result, publishErr
+				}
 				blob.CacheControl = "private, no-store"
 				blob.WriteTimeout = mediaResponseWriteTimeout
 				releaseMediaWhenRequestEnds(req.Context(), releaseAdmission, releaseUser)
@@ -248,17 +298,66 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		blob, releaseMedia, err := fetchMediaWithReservation(fetchCtx, ctx.HTTP(), u, cfg.StaticImageMaxBytes, processMediaAdmission, releaseAdmission)
 		if err != nil {
 			releaseUser()
-			ctx.Logger().Warn("Fx preview media unavailable", "postId", postID, "kind", req.Param("kind"), "err", err)
+			ctx.Logger().Warn("Fx preview media unavailable", "postId", postID, "kind", kind, "err", err)
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		if prepare && !imagePreparationStillAuthorized(req, noteID, postID, kind, rawIndex, sourceKey, s, ctx, cfg, requirePreviewPolicy) {
+			releaseMedia()
+			releaseUser()
+			if imagePreparationIsPrivateOnly(req, noteID, postID, kind, rawIndex, s, ctx, cfg, requirePreviewPolicy) {
+				return nil, plugin.NewCodedStatusError(http.StatusConflict, "media requires the authenticated private route", "PRIVATE_MEDIA_ONLY")
+			}
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
 		if cacheable {
 			processMediaResponseCache.Set(key, blob, time.Now().UTC())
 		}
+		if prepare {
+			result, publishErr := publishPreparedImageMedia(blob, sourceKey, u.Host)
+			releaseMedia()
+			releaseUser()
+			return result, publishErr
+		}
 		releaseMediaWhenRequestEnds(req.Context(), releaseMedia, releaseUser)
 		return blob, nil
+	}
+	r.GET("/media/:postId/:kind/:index", func(req plugin.Request) (any, error) {
+		return handleImageMedia(req, req.Query("noteId"), req.Param("postId"), req.Param("kind"), req.Param("index"), false)
+	})
+	r.POST("/media/prepare", func(req plugin.Request) (any, error) {
+		var body struct {
+			NoteID string `json:"noteId"`
+			PostID string `json:"postId"`
+			Kind   string `json:"kind"`
+			Index  int    `json:"index"`
+		}
+		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) || body.Index < 0 {
+			return nil, plugin.NewCodedStatusError(http.StatusBadRequest, "invalid media request", "INVALID_REQUEST")
+		}
+		return handleImageMedia(req, body.NoteID, body.PostID, body.Kind, strconv.Itoa(body.Index), true)
+	})
+	r.GET("/public-media/:filename", func(req plugin.Request) (any, error) {
+		token, extension, ok := parsePublishedMediaFilename(req.Param("filename"))
+		if !ok {
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		media, release, state := processPublishedMediaRegistry.Acquire(token, extension, time.Now().UTC())
+		switch state {
+		case publishedMediaBusy:
+			return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "public media capacity is busy; retry shortly", "PUBLIC_MEDIA_BUSY")
+		case publishedMediaMissing:
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		cacheControl := residualPublicCacheControl(media.ExpiresAt, time.Now().UTC())
+		if cacheControl == "" {
+			release()
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		releaseMediaWhenRequestEnds(req.Context(), release)
+		return plugin.Blob{ContentType: media.ContentType, Body: media.Body, CacheControl: cacheControl, WriteTimeout: mediaResponseWriteTimeout}, nil
 	})
 
-	r.POST("/media/video", func(req plugin.Request) (any, error) {
+	handleVideoMedia := func(req plugin.Request, body videoMediaRequest, prepare bool) (any, error) {
 		if err := requireUser(req); err != nil {
 			return nil, err
 		}
@@ -268,17 +367,6 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if _, err := requirePreviewPolicy(req); err != nil {
 			return nil, plugin.ErrNotFound("video unavailable")
 		}
-		var body struct {
-			AuthToken string `json:"i,omitempty"`
-			NoteID    string `json:"noteId"`
-			PostID    string `json:"postId"`
-			Target    string `json:"target"`
-			Index     int    `json:"index"`
-			Token     string `json:"token"`
-		}
-		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) || (body.Target != "main" && body.Target != "quote") || body.Index < 0 || body.Index >= maxFxVideoItems || !embedNoncePattern.MatchString(body.Token) {
-			return nil, plugin.NewCodedStatusError(http.StatusBadRequest, "invalid video request", "INVALID_REQUEST")
-		}
 		if err := verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), body.NoteID, body.PostID); err != nil {
 			return nil, plugin.ErrNotFound("video unavailable")
 		}
@@ -286,8 +374,25 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if err != nil {
 			return nil, plugin.ErrNotFound("video unavailable")
 		}
+		sourceKey := publishedMediaSourceKey("video", body.PostID, body.Target, strconv.Itoa(body.Index), rawURL)
 		if !processNativeVideoLimiter.Allow(req.UserID(), time.Now().UTC()) {
 			return nil, plugin.NewCodedStatusError(http.StatusTooManyRequests, "video playback request limit exceeded; try again in a minute", "VIDEO_RATE_LIMITED")
+		}
+		if prepare {
+			if _, err := requirePreviewPolicy(req); err != nil ||
+				verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), body.NoteID, body.PostID) != nil {
+				return nil, plugin.ErrNotFound("video unavailable")
+			}
+			currentURL, resolveErr := s.ResolveNativeVideoSource(req.Context(), body.PostID, body.Token, body.Target, body.Index, time.Now().UTC())
+			currentKey := publishedMediaSourceKey("video", body.PostID, body.Target, strconv.Itoa(body.Index), currentURL)
+			if resolveErr != nil || currentKey != sourceKey {
+				return nil, plugin.ErrNotFound("video unavailable")
+			}
+			if media, ok := processPublishedMediaRegistry.FindBySource(sourceKey, time.Now().UTC()); ok {
+				if residualPublicCacheControl(media.ExpiresAt, time.Now().UTC()) != "" {
+					return publishedMediaPayload(media), nil
+				}
+			}
 		}
 		releaseUser, err := processNativeVideoRequestGate.acquire(req.Context(), req.UserID(), nativeVideoMaxBytes)
 		if err != nil {
@@ -307,8 +412,53 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			}
 			return nil, plugin.NewCodedStatusError(http.StatusBadGateway, "video is unavailable for in-app playback; open the post on X", "VIDEO_UNAVAILABLE")
 		}
+		if prepare {
+			if req.Context().Err() != nil {
+				releaseVideo()
+				releaseUser()
+				return nil, plugin.ErrNotFound("video unavailable")
+			}
+			if _, err := requirePreviewPolicy(req); err != nil ||
+				verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), body.NoteID, body.PostID) != nil {
+				releaseVideo()
+				releaseUser()
+				return nil, plugin.ErrNotFound("video unavailable")
+			}
+			currentURL, resolveErr := s.ResolveNativeVideoSource(req.Context(), body.PostID, body.Token, body.Target, body.Index, time.Now().UTC())
+			currentKey := publishedMediaSourceKey("video", body.PostID, body.Target, strconv.Itoa(body.Index), currentURL)
+			if resolveErr != nil || currentKey != sourceKey {
+				releaseVideo()
+				releaseUser()
+				return nil, plugin.ErrNotFound("video unavailable")
+			}
+			result, publishErr := publishPreparedMedia(blob, sourceKey)
+			releaseVideo()
+			releaseUser()
+			return result, publishErr
+		}
 		releaseMediaWhenRequestEnds(req.Context(), releaseVideo, releaseUser)
 		return blob, nil
+	}
+	parseVideoMediaRequest := func(req plugin.Request) (videoMediaRequest, error) {
+		var body videoMediaRequest
+		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) || (body.Target != "main" && body.Target != "quote") || body.Index < 0 || body.Index >= maxFxVideoItems || !embedNoncePattern.MatchString(body.Token) {
+			return videoMediaRequest{}, plugin.NewCodedStatusError(http.StatusBadRequest, "invalid video request", "INVALID_REQUEST")
+		}
+		return body, nil
+	}
+	r.POST("/media/video", func(req plugin.Request) (any, error) {
+		body, err := parseVideoMediaRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		return handleVideoMedia(req, body, false)
+	})
+	r.POST("/media/video/prepare", func(req plugin.Request) (any, error) {
+		body, err := parseVideoMediaRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		return handleVideoMedia(req, body, true)
 	})
 
 	r.POST("/embed/shell", func(req plugin.Request) (any, error) {
@@ -575,4 +725,124 @@ func publicFetchError(class string) string {
 
 func mediaPath(postID, kind string, index int, noteID string) string {
 	return "/api/plugin/fxtwitter-preview/media/" + postID + "/" + kind + "/" + strconv.Itoa(index) + "?noteId=" + url.QueryEscape(noteID)
+}
+
+type videoMediaRequest struct {
+	AuthToken string `json:"i,omitempty"`
+	NoteID    string `json:"noteId"`
+	PostID    string `json:"postId"`
+	Target    string `json:"target"`
+	Index     int    `json:"index"`
+	Token     string `json:"token"`
+}
+
+func imageMediaSourceKey(postID, kind, rawIndex, rawURL string, fetchedAt *time.Time, maxBytes int) ([32]byte, *url.URL, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || !allowedMediaHost(u.Host) || u.User != nil || u.Fragment != "" {
+		return [32]byte{}, nil, errors.New("media URL is not allowlisted")
+	}
+	fetchedAtKey := ""
+	if fetchedAt != nil {
+		fetchedAtKey = fetchedAt.UTC().Format(time.RFC3339Nano)
+	}
+	key := publishedMediaSourceKey(postID, kind, rawIndex, u.String(), fetchedAtKey, strconv.Itoa(maxBytes))
+	return key, u, nil
+}
+
+func imagePreparationStillAuthorized(
+	req plugin.Request,
+	noteID, postID, kind, rawIndex string,
+	expectedKey [32]byte,
+	s *store,
+	ctx plugin.Context,
+	cfg config,
+	requirePolicy func(plugin.Request) (coldFetchBudget, error),
+) bool {
+	if req.Context().Err() != nil {
+		return false
+	}
+	if _, err := requirePolicy(req); err != nil ||
+		verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+		return false
+	}
+	rawURL, fetchedAt, err := s.ResolveMediaDescriptor(req.Context(), postID, kind, rawIndex, time.Now().UTC())
+	if err != nil {
+		return false
+	}
+	currentKey, _, err := imageMediaSourceKey(postID, kind, rawIndex, rawURL, fetchedAt, cfg.StaticImageMaxBytes)
+	return err == nil && currentKey == expectedKey
+}
+
+func imagePreparationIsPrivateOnly(
+	req plugin.Request,
+	noteID, postID, kind, rawIndex string,
+	s *store,
+	ctx plugin.Context,
+	cfg config,
+	requirePolicy func(plugin.Request) (coldFetchBudget, error),
+) bool {
+	if req.Context().Err() != nil {
+		return false
+	}
+	if _, err := requirePolicy(req); err != nil ||
+		verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+		return false
+	}
+	rawURL, fetchedAt, err := s.ResolveMediaDescriptor(req.Context(), postID, kind, rawIndex, time.Now().UTC())
+	if err != nil {
+		return false
+	}
+	_, u, err := imageMediaSourceKey(postID, kind, rawIndex, rawURL, fetchedAt, cfg.StaticImageMaxBytes)
+	return err == nil && u.Host == "img.youtube.com"
+}
+
+func publishPreparedMedia(blob plugin.Blob, sourceKey [32]byte) (any, error) {
+	media, err := processPublishedMediaRegistry.PublishForSource(blob.ContentType, blob.Body, sourceKey, time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, errPublishedMediaTooLarge) {
+			return nil, plugin.NewCodedStatusError(http.StatusRequestEntityTooLarge, "media exceeds the public delivery limit", "PUBLIC_MEDIA_TOO_LARGE")
+		}
+		if errors.Is(err, errPublishedMediaType) {
+			return nil, plugin.NewCodedStatusError(http.StatusBadGateway, "media type is unavailable for public delivery", "PUBLIC_MEDIA_TYPE_UNAVAILABLE")
+		}
+		return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "public media capacity is busy; retry shortly", "PUBLIC_MEDIA_BUSY")
+	}
+	if residualPublicCacheControl(media.ExpiresAt, time.Now().UTC()) == "" {
+		return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "public media capacity is busy; retry shortly", "PUBLIC_MEDIA_BUSY")
+	}
+	return publishedMediaPayload(media), nil
+}
+
+func publishPreparedImageMedia(blob plugin.Blob, sourceKey [32]byte, sourceHost string) (any, error) {
+	if sourceHost != "pbs.twimg.com" {
+		return nil, plugin.NewCodedStatusError(http.StatusConflict, "media requires the authenticated private route", "PRIVATE_MEDIA_ONLY")
+	}
+	return publishPreparedMedia(blob, sourceKey)
+}
+
+func publishedMediaPayload(media publishedMedia) map[string]any {
+	return map[string]any{
+		"url":         "/api/plugin/fxtwitter-preview/public-media/" + media.Token + "." + media.Extension,
+		"expiresAt":   media.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		"contentType": media.ContentType,
+		"size":        media.Size,
+	}
+}
+
+func parsePublishedMediaFilename(filename string) (token, extension string, ok bool) {
+	if len(filename) < 36 {
+		return "", "", false
+	}
+	token = filename[:32]
+	decoded, err := hex.DecodeString(token)
+	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != token || filename[32] != '.' {
+		return "", "", false
+	}
+	extension = filename[33:]
+	switch extension {
+	case "jpg", "png", "gif", "webp", "avif", "mp4":
+		return token, extension, true
+	default:
+		return "", "", false
+	}
 }

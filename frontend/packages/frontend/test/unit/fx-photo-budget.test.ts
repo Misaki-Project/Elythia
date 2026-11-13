@@ -14,9 +14,7 @@ vi.mock('@/server-plugins.generated.js', () => ({ serverPlugins: [] }));
 
 const input = { kind: 'url', href: 'https://x.com/alice/status/1234567890' } satisfies PreviewInput;
 const context: PreviewContext = { detail: true, revealed: true, active: true, inViewport: true, source: { kind: 'note', noteId: 'note-1' } };
-const IMAGE_BYTES = 20 * 1024 * 1024;
-
-type PendingFetch = { path: string; resolve: (response: Response) => void };
+const IMAGE_BYTES = 1024 * 1024;
 
 function mediaUrl(kind: 'image' | 'quote-image', index: number): string {
 	return `/api/plugin/fxtwitter-preview/media/1234567890/${kind}/${index}?noteId=note-1`;
@@ -52,7 +50,7 @@ describe('FxPreview shared photo request queue', () => {
 	] as const)('serializes mixed photo-grid requests when $largeTarget is large', async ({ largeTarget, mainCount, quoteCount }) => {
 		let activeRequests = 0;
 		let maxActiveRequests = 0;
-		const pending: PendingFetch[] = [];
+		let descriptorId = 0;
 		const blob = new Blob(['test-only image'], { type: 'image/png' });
 		Object.defineProperty(blob, 'size', { configurable: true, value: IMAGE_BYTES });
 		const createUrl = vi.fn((_blob: Blob) => `blob:photo-budget-${Math.random()}`);
@@ -60,41 +58,42 @@ describe('FxPreview shared photo request queue', () => {
 		Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createUrl });
 		Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeUrl });
 
-		const fetcher = vi.fn((_path: string, _options?: RequestInit): Promise<Response> => new Promise(resolve => {
+		const fetcher = vi.fn((_path: string, _options?: RequestInit) => {
+			const url = `/api/plugin/fxtwitter-preview/public-media/${'a'.repeat(31)}${++descriptorId}.png`;
+			return Promise.resolve(new Response(JSON.stringify({
+				url,
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				contentType: 'image/png',
+				size: IMAGE_BYTES,
+			}), { headers: { 'Content-Type': 'application/json' } }));
+		});
+		const publicFetcher = vi.spyOn(window, 'fetch').mockImplementation(async (input: RequestInfo | URL): Promise<Response> => {
 			activeRequests++;
 			maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
-			pending.push({
-				path: _path,
-				resolve: response => { activeRequests--; resolve(response); },
-			});
-		}));
-		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
-		const view = render(FxPreview, { props: { data: previewData(mainCount, quoteCount), input, context } });
-
-		await waitFor(() => expect(pending.length).toBeGreaterThan(0));
-		expect(pending).toHaveLength(1);
-		expect(activeRequests).toBe(1);
-		for (let completed = 0; completed < 6; completed++) {
-			const request = pending.shift()!;
-			request.resolve({
+			await new Promise(resolve => setTimeout(resolve, 0));
+			activeRequests--;
+			return {
 				ok: true,
 				status: 200,
 				headers: new Headers({ 'Content-Type': 'image/png', 'Content-Length': String(IMAGE_BYTES) }),
 				blob: async () => blob,
-			} as Response);
-			if (completed < 5) {
-				await waitFor(() => expect(pending.length).toBeGreaterThan(0));
-				expect(pending).toHaveLength(1);
-				expect(activeRequests).toBe(1);
-			}
-		}
+			} as Response;
+		});
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
+		const view = render(FxPreview, { props: { data: previewData(mainCount, quoteCount), input, context } });
 
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(6));
+		const expectedRequests = mainCount + quoteCount;
+		await waitFor(() => expect(publicFetcher).toHaveBeenCalledTimes(expectedRequests));
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(expectedRequests));
+		await waitFor(() => expect(activeRequests).toBe(0));
 		expect(activeRequests).toBe(0);
 		expect(maxActiveRequests).toBe(1);
 		const requestPaths = fetcher.mock.calls.map(([path]) => path);
-		expect(requestPaths.some(path => path.includes('/image/'))).toBe(true);
-		expect(requestPaths.some(path => path.includes('/quote-image/'))).toBe(true);
+		expect(requestPaths.every(path => path === '/api/plugin/fxtwitter-preview/media/prepare')).toBe(true);
+		const preparedKinds = fetcher.mock.calls.map(([, options]) => JSON.parse(String(options?.body)).kind);
+		expect(preparedKinds.some(kind => kind === 'image')).toBe(true);
+		expect(preparedKinds.some(kind => kind === 'quote-image')).toBe(true);
+		expect(publicFetcher.mock.calls.every(([path]) => String(path).includes('/public-media/'))).toBe(true);
 		expect(view.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(0);
 		expect(view.container.querySelectorAll('[data-fx-media-grid]').length).toBeGreaterThan(0);
 	});

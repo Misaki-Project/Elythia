@@ -64,6 +64,65 @@ export function fetchPluginResource(path: string, options?: RequestInit): Promis
 	return rawFetch(path, options);
 }
 
+export type PreparedPublicMedia = {
+	url: string;
+	expiresAt: number;
+	contentType: string;
+	size: number;
+};
+
+const publicMediaBasePath = '/api/plugin/fxtwitter-preview/public-media/';
+const publicMediaPathPattern = /^\/api\/plugin\/fxtwitter-preview\/public-media\/[a-f0-9]{32}\.(?:jpg|png|gif|webp|avif|mp4)$/;
+const imageContentTypes = new Map([
+	['image/jpeg', 'jpg'],
+	['image/png', 'png'],
+	['image/gif', 'gif'],
+	['image/webp', 'webp'],
+	['image/avif', 'avif'],
+]);
+
+/** Validate server metadata before an opaque public media URL is fetched. */
+export function parsePreparedPublicMedia(value: unknown, kind: 'image' | 'video', maxBytes: number): PreparedPublicMedia | null {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+	const media = value as Record<string, unknown>;
+	if (typeof media.url !== 'string' || typeof media.expiresAt !== 'string' || typeof media.contentType !== 'string' ||
+		!Number.isSafeInteger(media.size) || (media.size as number) <= 0 || (media.size as number) > maxBytes) return null;
+	const expiresAt = Date.parse(media.expiresAt);
+	if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
+	const url = validatedPublicMediaPath(media.url);
+	if (url == null) return null;
+	const contentType = media.contentType.toLowerCase();
+	const extension = contentType === 'video/mp4' ? 'mp4' : imageContentTypes.get(contentType);
+	if (extension == null || (kind === 'video' ? contentType !== 'video/mp4' : contentType === 'video/mp4')) return null;
+	if (!url.endsWith(`.${extension}`)) return null;
+	return { url, expiresAt, contentType, size: media.size as number };
+}
+
+/** Fetches a prepared, same-origin public media URL without session credentials or headers. */
+export function fetchPublicMedia(value: string, signal: AbortSignal): Promise<Response> {
+	const path = validatedPublicMediaPath(value);
+	if (path == null) return Promise.reject(new Error('Invalid public media URL'));
+	return window.fetch(path, {
+		method: 'GET',
+		mode: 'same-origin',
+		credentials: 'omit',
+		redirect: 'error',
+		cache: 'default',
+		signal,
+	});
+}
+
+function validatedPublicMediaPath(value: string): string | null {
+	if (!value.startsWith(publicMediaBasePath) || !publicMediaPathPattern.test(value)) return null;
+	try {
+		const parsed = new URL(value, window.location.origin);
+		if (parsed.origin !== window.location.origin || parsed.pathname !== value || parsed.search !== '' || parsed.hash !== '' || parsed.username !== '' || parsed.password !== '') return null;
+		return parsed.pathname;
+	} catch {
+		return null;
+	}
+}
+
 export type Capabilities = {
 	externalFetchEnabled: boolean;
 	canUseFxTwitterPreview: boolean;

@@ -32,6 +32,19 @@ function makeApi() {
 	return fetcher;
 }
 
+function preparedVideo(blob: Blob): Response {
+	return new Response(JSON.stringify({
+		url: `/api/plugin/fxtwitter-preview/public-media/${'a'.repeat(32)}.mp4`,
+		expiresAt: new Date(Date.now() + 60_000).toISOString(),
+		contentType: 'video/mp4',
+		size: blob.size,
+	}), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+
+function mockPublicVideoFetch(...responses: Response[]): void {
+	vi.spyOn(window, 'fetch').mockImplementation(async () => responses.shift() ?? new Response('unexpected public media request', { status: 500 }));
+}
+
 function renderVideo(ctx = context, overrides: Record<string, unknown> = {}) {
 	const guard = defineComponent({
 		emits: ['update:revealed'],
@@ -212,9 +225,10 @@ test('fits the modal within its available viewport and enables the play button o
 test('native proxy requests only the selected video and opens it in the media viewer', async () => {
 	setTimelinePreference('media');
 	const payload = new Blob(['selected video'], { type: 'video/mp4' });
-	const fetcher = vi.fn(async (_path: string, _options?: RequestInit) => new Response(payload, { status: 200, headers: { 'Content-Type': 'video/mp4' } }));
+	const fetcher = vi.fn(async (_path: string, _options?: RequestInit) => preparedVideo(payload));
 	const mediaViewer = vi.fn(async (_items: Parameters<PluginHost['openMedia']>[0], _initialId?: string) => undefined);
 	initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], mediaViewer as PluginHost['openMedia']);
+	mockPublicVideoFetch(new Response(payload, { status: 200, headers: { 'Content-Type': 'video/mp4', 'Content-Length': String(payload.size) } }));
 	const view = renderVideo(context, {
 		video: { provider: 'x', embedToken: '0123456789abcdef0123456789abcdef', playbackAvailable: true },
 		posterSrc: 'https://example.test/poster-2.jpg', cachePostId: 'post-1', contentPostId: 'post-1',
@@ -223,7 +237,8 @@ test('native proxy requests only the selected video and opens it in the media vi
 	await fireEvent.click(await waitFor(() => view.getByRole('button', { name: '動画を再生' })));
 	await waitFor(() => expect(mediaViewer).toHaveBeenCalledTimes(1));
 	expect(fetcher).toHaveBeenCalledTimes(1);
-	expect(fetcher.mock.calls[0][0]).toBe('/api/plugin/fxtwitter-preview/media/video');
+	expect(fetcher.mock.calls[0][0]).toBe('/api/plugin/fxtwitter-preview/media/video/prepare');
+	expect(fetcher.mock.calls[0][1]?.cache).toBe('no-store');
 	expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toEqual({
 		noteId: 'note-1', postId: 'post-1', target: 'main', index: 1, token: '0123456789abcdef0123456789abcdef',
 	});
@@ -236,13 +251,14 @@ test('native proxy requests only the selected video and opens it in the media vi
 test('native proxy refreshes an expired selected-video capability before sending the request', async () => {
 	setTimelinePreference('media');
 	const payload = new Blob(['selected video'], { type: 'video/mp4' });
-	const fetcher = vi.fn(async (_path: string, _options?: RequestInit) => new Response(payload, { status: 200, headers: { 'Content-Type': 'video/mp4' } }));
+	const fetcher = vi.fn(async (_path: string, _options?: RequestInit) => preparedVideo(payload));
 	const mediaViewer = vi.fn(async () => undefined);
 	const refreshPlayback = vi.fn(async () => ({
 		video: { provider: 'x' as const, embedToken: 'renewed-token', playbackAvailable: true },
 		videoIndex: 0,
 	}));
 	initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], mediaViewer as PluginHost['openMedia']);
+	mockPublicVideoFetch(new Response(payload, { status: 200, headers: { 'Content-Type': 'video/mp4' } }));
 	const view = renderVideo(context, {
 		video: { provider: 'x', embedToken: 'expired-token', embedExpiresAt: '2000-01-01T00:00:00.000Z', playbackAvailable: true },
 		cachePostId: 'post-1', contentPostId: 'post-1', videoIndex: 1, playbackMode: 'nativeProxy', refreshPlayback,
@@ -258,13 +274,14 @@ test('native proxy refreshes a rejected capability once and retries the refreshe
 	const payload = new Blob(['selected video'], { type: 'video/mp4' });
 	const fetcher = vi.fn()
 		.mockResolvedValueOnce(new Response('expired', { status: 404 }))
-		.mockResolvedValueOnce(new Response(payload, { status: 200, headers: { 'Content-Type': 'video/mp4' } }));
+		.mockResolvedValueOnce(preparedVideo(payload));
 	const mediaViewer = vi.fn(async () => undefined);
 	const refreshPlayback = vi.fn(async () => ({
 		video: { provider: 'x' as const, embedToken: 'renewed-token', playbackAvailable: true },
 		videoIndex: 0,
 	}));
 	initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], mediaViewer as PluginHost['openMedia']);
+	mockPublicVideoFetch(new Response(payload, { status: 200, headers: { 'Content-Type': 'video/mp4' } }));
 	const view = renderVideo(context, {
 		video: { provider: 'x', embedToken: 'old-token', playbackAvailable: true },
 		cachePostId: 'post-1', contentPostId: 'post-1', videoIndex: 1, playbackMode: 'nativeProxy', refreshPlayback,
@@ -275,6 +292,26 @@ test('native proxy refreshes a rejected capability once and retries the refreshe
 	expect(fetcher).toHaveBeenCalledTimes(2);
 	expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toMatchObject({ index: 1, token: 'old-token' });
 	expect(JSON.parse(String(fetcher.mock.calls[1][1]?.body))).toMatchObject({ index: 0, token: 'renewed-token' });
+});
+
+test('a public video cache miss repeats the authenticated prepare once before loading bytes', async () => {
+	setTimelinePreference('media');
+	const payload = new Blob(['selected video'], { type: 'video/mp4' });
+	const fetcher = vi.fn(async (_path: string, _options?: RequestInit) => preparedVideo(payload));
+	const mediaViewer = vi.fn(async () => undefined);
+	const publicFetch = vi.spyOn(window, 'fetch')
+		.mockResolvedValueOnce(new Response('expired public media', { status: 404 }))
+		.mockResolvedValueOnce(new Response(payload, { status: 200, headers: { 'Content-Type': 'video/mp4', 'Content-Length': String(payload.size) } }));
+	initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], mediaViewer as PluginHost['openMedia']);
+	const view = renderVideo(context, {
+		video: { provider: 'x', embedToken: '0123456789abcdef0123456789abcdef', playbackAvailable: true },
+		cachePostId: 'post-1', contentPostId: 'post-1', videoIndex: 0, playbackMode: 'nativeProxy',
+	});
+	await fireEvent.click(await waitFor(() => view.getByRole('button', { name: '動画を再生' })));
+	await waitFor(() => expect(mediaViewer).toHaveBeenCalledTimes(1));
+	expect(fetcher).toHaveBeenCalledTimes(2);
+	expect(publicFetch).toHaveBeenCalledTimes(2);
+	expect(fetcher.mock.calls.every(([path]) => path === '/api/plugin/fxtwitter-preview/media/video/prepare')).toBe(true);
 });
 
 test('native proxy mode preserves YouTube official embed playback', async () => {

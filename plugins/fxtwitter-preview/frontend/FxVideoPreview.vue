@@ -53,7 +53,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import MkModal from '@/components/MkModal.vue';
 import { MkSensitiveMediaGuard } from '@/plugin-api.js';
 import type { PreviewContext } from '@/plugin-api.js';
-import { apiSessionEpoch, fetchPluginResource, openPluginMedia } from './api.js';
+import { apiSessionEpoch, fetchPluginResource, fetchPublicMedia, openPluginMedia, parsePreparedPublicMedia } from './api.js';
 import type { PluginMediaItem } from '@/plugin-api.js';
 import type { PublicVideo } from './api.js';
 
@@ -286,28 +286,45 @@ async function playOfficialVideo(current: number, noteId: string, video: PublicV
 async function playNativeVideo(current: number, noteId: string, video: PublicVideo, videoIndex: number | undefined, signal: AbortSignal, refreshOnRejection: boolean): Promise<void> {
 	if (!Number.isSafeInteger(videoIndex) || (videoIndex ?? -1) < 0) throw new Error('video index is unavailable');
 	try {
-		const response = await fetchPluginResource('/api/plugin/fxtwitter-preview/media/video', {
-			method: 'POST',
-			cache: 'no-store',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ noteId, postId: props.cachePostId, target: props.target, index: videoIndex, token: video.embedToken }),
-			signal,
-		});
-		if (response.status === 404 && refreshOnRejection && !signal.aborted && current === generation) {
-			const renewed = await refreshCapability(video, videoIndex, current, signal);
-			if (renewed != null) return await playNativeVideo(current, noteId, renewed.video, renewed.videoIndex, signal, false);
+		let response: Response | null = null;
+		let expectedSize = 0;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			if (signal.aborted || current !== generation || !canPlay.value) return;
+			const preparedResponse = await fetchPluginResource('/api/plugin/fxtwitter-preview/media/video/prepare', {
+				method: 'POST',
+				cache: 'no-store',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ noteId, postId: props.cachePostId, target: props.target, index: videoIndex, token: video.embedToken }),
+				signal,
+			});
+			if (preparedResponse.status === 404 && refreshOnRejection && !signal.aborted && current === generation) {
+				const renewed = await refreshCapability(video, videoIndex, current, signal);
+				if (renewed != null) return await playNativeVideo(current, noteId, renewed.video, renewed.videoIndex, signal, false);
+			}
+			if (preparedResponse.status === 429) {
+				errorMessage.value = '動画の再生が混み合っています。少し待ってからお試しください。';
+				throw new Error('Video playback is rate limited');
+			}
+			if (preparedResponse.status === 401 || preparedResponse.status === 403 || !preparedResponse.ok) throw new Error('Video preparation is unavailable');
+			let preparedData: unknown;
+			try { preparedData = await preparedResponse.json(); } catch { throw new Error('Video preparation is invalid'); }
+			const prepared = parsePreparedPublicMedia(preparedData, 'video', 32 * 1024 * 1024);
+			if (prepared == null) throw new Error('Video preparation is invalid');
+			expectedSize = prepared.size;
+			response = await fetchPublicMedia(prepared.url, signal);
+			if (response.status === 404 && attempt === 0) continue;
+			break;
 		}
+		if (response == null) throw new Error('Video response is unavailable');
+		if (signal.aborted || current !== generation || !canPlay.value) return;
+		if (response.status === 401 || response.status === 403 || !response.ok) throw new Error('Video response is unavailable or invalid');
 		const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
 		const contentLength = response.headers.get('Content-Length');
-		if (response.status === 429) {
-			errorMessage.value = '動画の再生が混み合っています。少し待ってからお試しください。';
-			throw new Error('Video playback is rate limited');
-		}
-		if (!response.ok || contentType !== 'video/mp4' || (contentLength != null && (!/^\d+$/.test(contentLength) || Number(contentLength) > 32 * 1024 * 1024))) {
+		if (contentType !== 'video/mp4' || (contentLength != null && (!/^\d+$/.test(contentLength) || Number(contentLength) !== expectedSize))) {
 			throw new Error('Video response is unavailable or invalid');
 		}
 		const blob = await readBoundedVideo(response, signal);
-		if (blob.size === 0 || blob.size > 32 * 1024 * 1024 || blob.type.split(';', 1)[0]?.trim().toLowerCase() !== 'video/mp4') throw new Error('Video response is too large or invalid');
+		if (blob.size === 0 || blob.size !== expectedSize || blob.size > 32 * 1024 * 1024 || blob.type.split(';', 1)[0]?.trim().toLowerCase() !== 'video/mp4') throw new Error('Video response is too large or invalid');
 		if (current !== generation || signal.aborted || !canPlay.value) return;
 		const item: PluginMediaItem = {
 			id: `${props.contentPostId}:${videoIndex}`,

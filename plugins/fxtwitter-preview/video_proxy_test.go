@@ -379,6 +379,61 @@ func TestNativeVideoProxyRouteRechecksPolicyLinkCapabilityAndFreshness(t *testin
 	}
 }
 
+func TestNativeVideoPreparePublishesValidatedBytesAndReusesWarmSource(t *testing.T) {
+	db, _, postID, token := nativeVideoRouteFixture(t)
+	api := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
+	fetches := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		fetches++
+		if r.URL.String() != "https://video.twimg.com/main-0.mp4" {
+			t.Fatalf("unexpected video URL: %s", r.URL)
+		}
+		return response(http.StatusOK, "video/mp4", string(mp4FTYP())), nil
+	})}
+	oldRegistry, oldLimiter := processPublishedMediaRegistry, processNativeVideoLimiter
+	processPublishedMediaRegistry = newPublishedMediaRegistry(1<<20, 8, publishedMediaTTL, 50<<20, 4)
+	processNativeVideoLimiter = newVideoProxyLimiter(nativeVideoUserPerMinute, nativeVideoGlobalPerMinute)
+	t.Cleanup(func() { processPublishedMediaRegistry, processNativeVideoLimiter = oldRegistry, oldLimiter })
+	routes := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(api).WithHTTPClient(client).WithConfig(map[string]any{
+		"externalFetchEnabled": true, "videoPlaybackMode": "nativeProxy",
+	}).Routes(Plugin)
+	body := `{"noteId":"note1","postId":"` + postID + `","target":"main","index":0,"token":"` + token + `"}`
+	request := func() (any, error) {
+		return routes.Call(t, "POST /media/video/prepare", plugintest.Request{UserID: "u1", Body: body, CheckedRolePolicies: allowPreviewPolicies()})
+	}
+	first, err := request()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPayload, ok := first.(map[string]any)
+	if !ok || fetches != 1 || firstPayload["contentType"] != "video/mp4" {
+		t.Fatalf("first prepare=%#v fetches=%d", first, fetches)
+	}
+	if _, err := routes.Call(t, "POST /media/video/prepare", plugintest.Request{UserID: "u1", Body: body, CheckedRolePolicies: map[string]any{}}); err == nil {
+		t.Fatal("warm video registration bypassed the current role policy")
+	}
+	if fetches != 1 {
+		t.Fatalf("denied warm video prepare fetched upstream: %d", fetches)
+	}
+	second, err := request()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPayload := second.(map[string]any)
+	if secondPayload["url"] != firstPayload["url"] || secondPayload["expiresAt"] != firstPayload["expiresAt"] || fetches != 1 {
+		t.Fatalf("warm prepare changed public registration or fetched again: first=%#v second=%#v fetches=%d", first, second, fetches)
+	}
+	filename := strings.TrimPrefix(firstPayload["url"].(string), "/api/plugin/fxtwitter-preview/public-media/")
+	publicResult, err := routes.Call(t, "GET /public-media/:filename", plugintest.Request{Params: map[string]string{"filename": filename}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicBlob, ok := publicResult.(plugin.Blob)
+	if !ok || publicBlob.ContentType != "video/mp4" || string(publicBlob.Body) != string(mp4FTYP()) || !strings.HasPrefix(publicBlob.CacheControl, "public, max-age=") || fetches != 1 {
+		t.Fatalf("public video=%#v fetches=%d", publicResult, fetches)
+	}
+}
+
 func TestNativeVideoProxyRouteRejectsGlobalDisableAndRateLimitsValidRequests(t *testing.T) {
 	db, _, postID, token := nativeVideoRouteFixture(t)
 	api := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}

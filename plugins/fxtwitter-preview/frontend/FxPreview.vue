@@ -134,7 +134,7 @@ import { MkA, MkTime, MkUrl } from '@/plugin-api.js';
 import type { PluginMediaItem, PreviewContext, PreviewInput } from '@/plugin-api.js';
 import FxMediaGrid from './FxMediaGrid.vue';
 import FxVideoPreview from './FxVideoPreview.vue';
-import { apiSessionEpoch, fetchPluginResource, openPluginMedia, truncatePostText, videoPlaybackMode } from './api.js';
+import { apiSessionEpoch, fetchPluginResource, fetchPublicMedia, openPluginMedia, parsePreparedPublicMedia, truncatePostText, videoPlaybackMode } from './api.js';
 import { loadPreview } from './preview-loader.js';
 import type { PreviewResponse, PublicTextEntity, PublicVideo } from './api.js';
 import { retainResource } from './media-cache.js';
@@ -612,35 +612,82 @@ async function fetchMedia(path: string, signal: AbortSignal, kind: string, index
 	if (expected == null || url.origin !== expected.origin || url.pathname !== expected.pathname || url.hash !== '' ||
 		url.username !== '' || url.password !== '' || url.searchParams.size !== 1 ||
 		url.searchParams.getAll('noteId').length !== 1 || url.searchParams.get('noteId') !== props.context.source?.noteId) return emptyMediaResult();
+	const noteId = url.searchParams.get('noteId');
+	const postId = viewData.value.post?.id;
+	if (noteId == null || postId == null) return emptyMediaResult();
+	for (let attempt = 0; attempt < 2; attempt++) {
+		if (signal.aborted || expectedMediaUrl(kind, index)?.pathname !== expected.pathname || expectedMediaUrl(kind, index)?.search !== expected.search) return emptyMediaResult();
+		let prepare: Response;
+		try {
+			prepare = await fetchPluginResource('/api/plugin/fxtwitter-preview/media/prepare', {
+				method: 'POST',
+				cache: 'no-store',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ noteId, postId, kind, index }),
+				signal,
+			});
+		} catch {
+			return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable');
+		}
+		if (signal.aborted) return emptyMediaResult();
+		if (prepare.status === 409 && (kind === 'poster' || kind === 'quote-poster')) {
+			let errorCode: unknown;
+			try { errorCode = (await prepare.json() as { error?: { code?: unknown } }).error?.code; } catch { return failedMediaResult('retryable'); }
+			if (errorCode !== 'PRIVATE_MEDIA_ONLY') return failedMediaResult('retryable');
+			return await fetchPrivatePoster(expected, signal, kind, index, maxBytes);
+		}
+		if (prepare.status === 401 || prepare.status === 403) return failedMediaResult('blocked');
+		if (!prepare.ok) return failedMediaResult(prepare.status === 404 && (kind === 'image' || kind === 'quote-image') ? 'refresh' : 'retryable');
+		let metadata: unknown;
+		try { metadata = await prepare.json(); } catch { return failedMediaResult('retryable'); }
+		const prepared = parsePreparedPublicMedia(metadata, 'image', MAX_IMAGE_BYTES);
+		if (prepared == null) return failedMediaResult('retryable');
+		if (prepared.size > maxBytes) return failedMediaResult('budget');
+		let response: Response;
+		try { response = await fetchPublicMedia(prepared.url, signal); } catch {
+			return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable');
+		}
+		if (signal.aborted) return emptyMediaResult();
+		if (response.status === 401 || response.status === 403) return failedMediaResult('blocked');
+		if (response.status === 404 && attempt === 0) continue;
+		if (!response.ok) return failedMediaResult(response.status === 404 && (kind === 'image' || kind === 'quote-image') ? 'refresh' : 'retryable');
+		const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
+		if (contentType !== prepared.contentType) return failedMediaResult('retryable');
+		const contentLength = response.headers.get('Content-Length');
+		if (contentLength != null) {
+			if (!/^\d+$/.test(contentLength) || Number(contentLength) !== prepared.size) return failedMediaResult('retryable');
+		}
+		let blob: Blob;
+		try { blob = await response.blob(); } catch { return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable'); }
+		const blobType = blob.type.split(';', 1)[0]?.trim().toLowerCase();
+		if (signal.aborted) return emptyMediaResult();
+		if (blob.size > MAX_IMAGE_BYTES || blob.size !== prepared.size || blobType !== prepared.contentType) return failedMediaResult('retryable');
+		if (blob.size > maxBytes) return failedMediaResult('budget');
+		try { return { media: { src: URL.createObjectURL(blob), blob }, failure: null }; } catch { return failedMediaResult('retryable'); }
+	}
+	return failedMediaResult(kind === 'image' || kind === 'quote-image' ? 'refresh' : 'retryable');
+}
+
+async function fetchPrivatePoster(expected: URL, signal: AbortSignal, kind: string, index: number, maxBytes: number): Promise<MediaFetchResult> {
 	let response: Response;
 	try {
-		response = await fetchPluginResource(`${url.pathname}${url.search}`, {
-			method: 'GET',
-			cache: 'no-store',
-			signal,
-		});
+		response = await fetchPluginResource(`${expected.pathname}${expected.search}`, { method: 'GET', cache: 'no-store', signal });
 	} catch {
 		return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable');
 	}
-	if (signal.aborted) return emptyMediaResult();
+		if (signal.aborted || expectedMediaUrl(kind, index)?.pathname !== expected.pathname || expectedMediaUrl(kind, index)?.search !== expected.search) return emptyMediaResult();
 	if (response.status === 401 || response.status === 403) return failedMediaResult('blocked');
-	if (response.status === 404 && (kind === 'image' || kind === 'quote-image')) return failedMediaResult('refresh');
 	if (!response.ok) return failedMediaResult('retryable');
 	const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
-	if (contentType == null || !['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'].includes(contentType)) return failedMediaResult('retryable');
+	if (!['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType ?? '')) return failedMediaResult('retryable');
 	const contentLength = response.headers.get('Content-Length');
-	if (contentLength != null) {
-		if (!/^\d+$/.test(contentLength)) return failedMediaResult('retryable');
-		const length = Number(contentLength);
-		if (length > MAX_IMAGE_BYTES) return failedMediaResult('retryable');
-		if (length > maxBytes) return failedMediaResult('budget');
-	}
+	if (contentLength != null && (!/^\d+$/.test(contentLength) || Number(contentLength) > maxBytes)) return failedMediaResult('budget');
 	let blob: Blob;
 	try { blob = await response.blob(); } catch { return signal.aborted ? emptyMediaResult() : failedMediaResult('retryable'); }
+	if (signal.aborted || expectedMediaUrl(kind, index)?.pathname !== expected.pathname || expectedMediaUrl(kind, index)?.search !== expected.search) return emptyMediaResult();
 	const blobType = blob.type.split(';', 1)[0]?.trim().toLowerCase();
-	if (signal.aborted) return emptyMediaResult();
-	if (blob.size > MAX_IMAGE_BYTES || blobType !== contentType) return failedMediaResult('retryable');
-	if (blob.size > maxBytes) return failedMediaResult('budget');
+	if (blob.size > MAX_IMAGE_BYTES || blob.size > maxBytes) return failedMediaResult('budget');
+	if (blob.size === 0 || blobType !== contentType || (contentLength != null && blob.size !== Number(contentLength))) return failedMediaResult('retryable');
 	try { return { media: { src: URL.createObjectURL(blob), blob }, failure: null }; } catch { return failedMediaResult('retryable'); }
 }
 
