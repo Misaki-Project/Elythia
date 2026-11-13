@@ -28,12 +28,6 @@ export const provider: PreviewProvider<PreviewResponse> = {
 	component: FxPreview,
 };
 
-const anonymousProvider: PreviewProvider<PreviewResponse> = {
-	...provider,
-	presentation: () => 'disabled',
-	load: async () => ({ state: 'disabled' }),
-};
-
 export default definePlugin({
 	name: 'fxtwitter-preview',
 	pages: [{ path: '/', component: AdminPage, admin: true, navTitle: 'FxTwitter preview', navIcon: 'ti ti-brand-x' }],
@@ -45,9 +39,7 @@ export default definePlugin({
 			if (apiSessionEpoch.value !== sessionEpoch) return;
 			setVideoPlaybackMode(capabilities.videoPlaybackMode);
 			if (!capabilities.externalFetchEnabled) return;
-			if (host.me == null) {
-				host.preview.register(anonymousProvider);
-			} else if (capabilities.canUseFxTwitterPreview === true) {
+			if (host.me != null && capabilities.canUseFxTwitterPreview === true) {
 				host.preview.register(provider);
 			}
 		} catch (err) {

@@ -49,7 +49,7 @@ describe('FxPreview shared photo request queue', () => {
 	it.each([
 		{ largeTarget: 'main', mainCount: 5, quoteCount: 4 },
 		{ largeTarget: 'quote', mainCount: 4, quoteCount: 5 },
-	] as const)('serializes mixed carousel and grid image requests when $largeTarget is large', async ({ largeTarget, mainCount, quoteCount }) => {
+	] as const)('serializes mixed photo-grid requests when $largeTarget is large', async ({ largeTarget, mainCount, quoteCount }) => {
 		let activeRequests = 0;
 		let maxActiveRequests = 0;
 		const pending: PendingFetch[] = [];
@@ -95,7 +95,7 @@ describe('FxPreview shared photo request queue', () => {
 		const requestPaths = fetcher.mock.calls.map(([path]) => path);
 		expect(requestPaths.some(path => path.includes('/image/'))).toBe(true);
 		expect(requestPaths.some(path => path.includes('/quote-image/'))).toBe(true);
-		expect(view.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(1);
-		expect(view.container.querySelectorAll('[data-fx-media-grid]')).toHaveLength(1);
+		expect(view.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(0);
+		expect(view.container.querySelectorAll('[data-fx-media-grid]').length).toBeGreaterThan(0);
 	});
 });

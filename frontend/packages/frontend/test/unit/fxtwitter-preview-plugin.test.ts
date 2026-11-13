@@ -118,17 +118,15 @@ describe('FxTwitter preview plugin', () => {
 		expect(statusID({ kind: 'file', file: { id: 'f', name: 'x', size: 1, url: '/x', declaredMimeType: 'video/mp4', detectedMimeType: null } })).toBeNull();
 	});
 
-	test('registers for anonymous viewers when public capabilities enable external fetch', async () => {
+	test('does not register an Fx provider for anonymous viewers even if capability data allows it', async () => {
 		const disabled = host(vi.fn(async () => ({ externalFetchEnabled: false, canUseFxTwitterPreview: false })) as PluginHost['api']);
 		await plugin.setup(disabled.host);
 		expect(disabled.providers).toHaveLength(0);
 
-		const anonymousAPI = vi.fn(async () => ({ externalFetchEnabled: true, canUseFxTwitterPreview: false }));
+		const anonymousAPI = vi.fn(async () => ({ externalFetchEnabled: true, canUseFxTwitterPreview: true }));
 		const enabled = host(anonymousAPI as PluginHost['api'], null);
 		await plugin.setup(enabled.host);
-		expect(enabled.providers).toHaveLength(1);
-		expect(enabled.providers[0].presentation?.(input, { ...context, detail: false })).toBe('disabled');
-		await expect(enabled.providers[0].load(input, { ...context, detail: false }, new AbortController().signal)).resolves.toEqual({ state: 'disabled' });
+		expect(enabled.providers).toHaveLength(0);
 		expect(anonymousAPI).toHaveBeenCalledTimes(1);
 
 		vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -1095,6 +1093,29 @@ describe('FxTwitter preview plugin', () => {
 		}
 	});
 
+	test.each([5, 6, 7, 20])('uses the fixed centered-cover grid for %i images and marks only the remaining photos', async count => {
+		const fetcher = vi.fn(async (path: string) => new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+		const data = videoData();
+		data.post!.hasVideo = false;
+		delete data.post!.video;
+		data.post!.images = Array.from({ length: count }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
+		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch']);
+		const result = render(FxPreview, { props: { data, input, context } });
+		const expectedVisible = Math.min(count, 6);
+		await waitFor(() => expect(result.container.querySelector('[data-fx-media-grid]')?.getAttribute('data-image-count')).toBe(String(expectedVisible)));
+		expect(result.container.querySelector('[data-fx-media-grid]')?.getAttribute('data-total-image-count')).toBe(String(count));
+		expect(result.container.querySelector('[data-fx-photo-carousel]')).toBeNull();
+		expect(result.container.querySelectorAll('[data-fx-media-grid] img')).toHaveLength(expectedVisible);
+		const grid = result.container.querySelector('[data-fx-media-grid]')!;
+		if (count === 5) expect(grid.className).toContain('fiveImages');
+		else if (count === 6) expect(grid.className).toContain('sixImages');
+		else expect(grid.className).toContain('manyImages');
+		const cover = window.getComputedStyle(grid.querySelector('img')!);
+		expect(cover.objectFit).toBe('cover');
+		expect(cover.objectPosition).toMatch(/center|50% 50%/);
+		if (count > 6) expect(result.getByText(`+${count - 6}`)).toBeTruthy();
+	});
+
 	test('renders four 16:9 image buttons and opens authorized blobs in the host lightbox', async () => {
 		const pluginFetch = vi.fn(async (_path: string, options?: RequestInit) => await fetchMock('/api/plugin/fxtwitter-preview/media/proxy', options));
 		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
@@ -1116,7 +1137,7 @@ describe('FxTwitter preview plugin', () => {
 		expect(openMedia.mock.calls[0][1]).toBe('1234567890:2');
 	});
 
-	test('loads large main and quoted galleries on demand and opens each complete gallery in original order', async () => {
+	test('renders six main and quoted photos and opens each complete gallery in original order', async () => {
 		const fetcher = vi.fn(async (path: string) => new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
 		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
 		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
@@ -1133,28 +1154,24 @@ describe('FxTwitter preview plugin', () => {
 			})),
 		};
 		const result = render(FxPreview, { props: { data, input, context } });
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
-		expect(result.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(2);
-		expect(result.container.querySelectorAll('[data-fx-photo-carousel] img')).toHaveLength(4);
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(12));
+		expect(result.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(0);
+		expect(result.container.querySelectorAll('[data-fx-media-grid]')).toHaveLength(2);
 		const requestedIndexes = (kind: string) => fetcher.mock.calls
 			.map(([path]) => String(path))
 			.filter(path => path.includes(`/${kind}/`))
 			.map(path => Number(path.match(new RegExp(`/${kind}/(\\d+)`))?.[1]));
-		expect(requestedIndexes('image')).toEqual([0, 1]);
-		expect(requestedIndexes('quote-image')).toEqual([0, 1]);
-		expect(result.container.querySelectorAll('[data-fx-photo-carousel] [data-photo-index]')).toHaveLength(40);
-
-		const mainCarousel = result.container.querySelectorAll('[data-fx-photo-carousel]')[0];
-		await fireEvent.click(mainCarousel.querySelector('[data-photo-next]')!);
-		await waitFor(() => expect(requestedIndexes('image')).toEqual([0, 1, 2]));
-		await fireEvent.click(result.getByRole('button', { name: 'main 2を拡大' }));
+		expect(requestedIndexes('image')).toEqual([0, 1, 2, 3, 4, 5]);
+		expect(requestedIndexes('quote-image')).toEqual([0, 1, 2, 3, 4, 5]);
+		expect([...result.container.querySelectorAll('[data-fx-media-grid]')].map(grid => grid.getAttribute('data-image-count'))).toEqual(['6', '6']);
+		await fireEvent.click(result.getByRole('button', { name: /main 6/ }));
 		await waitFor(() => expect(openMedia).toHaveBeenCalledTimes(1));
 		expect(openMedia.mock.calls[0][0]).toHaveLength(20);
 		expect(openMedia.mock.calls[0][0].map(item => item.alt)).toEqual(Array.from({ length: 20 }, (_, index) => `main ${index + 1}`));
 		expect(openMedia.mock.calls[0][0].map(item => item.id)).toEqual(Array.from({ length: 20 }, (_, index) => `1234567890:${index}`));
-		expect(openMedia.mock.calls[0][1]).toBe('1234567890:1');
+		expect(openMedia.mock.calls[0][1]).toBe('1234567890:5');
 
-		await fireEvent.click(result.getByRole('button', { name: 'quote 1を拡大' }));
+		await fireEvent.click(result.getByRole('button', { name: 'quote 1' }));
 		await waitFor(() => expect(openMedia).toHaveBeenCalledTimes(2));
 		expect(openMedia.mock.calls[1][0]).toHaveLength(20);
 		expect(openMedia.mock.calls[1][0].map(item => item.alt)).toEqual(Array.from({ length: 20 }, (_, index) => `quote ${index + 1}`));
@@ -1179,15 +1196,13 @@ describe('FxTwitter preview plugin', () => {
 			images: Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/quote-image/${index}?noteId=note-1`, alt: `quote ${index + 1}` })),
 		};
 		const result = render(FxPreview, { props: { data, input, context } });
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
-		const mainCarousel = result.container.querySelectorAll('[data-fx-photo-carousel]')[0];
-		await fireEvent.click(mainCarousel.querySelector('[data-photo-next]')!);
-		await fireEvent.click(result.getByRole('button', { name: 'main 2を拡大' }));
-		await waitFor(() => expect(mainCarousel.textContent).toContain('写真全体がメモリ上限を超えるため'));
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(10));
+		await fireEvent.click(result.getByRole('button', { name: 'main 2' }));
+		await waitFor(() => expect(result.container.textContent).toContain('写真全体がメモリ上限を超えるため、ギャラリーを開けません。'));
 		expect(openMedia).not.toHaveBeenCalled();
 	});
 
-	test.each(['main', 'quote'] as const)('shares the 64 MiB photo budget when the %s gallery is large and the other remains a grid', async largeTarget => {
+	test.each(['main', 'quote'] as const)('shares the 64 MiB photo budget across %s and the other grid', async largeTarget => {
 		const retainedSize = 20 * 1024 * 1024;
 		const fetcher = vi.fn(async () => {
 			const blob = new Blob(['small test body'], { type: 'image/png' });
@@ -1205,44 +1220,44 @@ describe('FxTwitter preview plugin', () => {
 			images: Array.from({ length: largeTarget === 'quote' ? 5 : 4 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/quote-image/${index}?noteId=note-1`, alt: `quote ${index + 1}` })),
 		};
 		const result = render(FxPreview, { props: { data, input, context } });
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(6));
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(9));
 		await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledTimes(3));
-		const grid = result.container.querySelector('[data-fx-media-grid]');
-		expect(grid?.getAttribute('data-image-count')).toBe('3');
-		expect(result.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(1);
+		const grids = [...result.container.querySelectorAll('[data-fx-media-grid]')];
+		expect(grids.some(grid => grid.getAttribute('data-image-count') === '3')).toBe(true);
+		expect(result.container.querySelectorAll('[data-fx-photo-carousel]')).toHaveLength(0);
 		await fireEvent.click(result.getByRole('button', { name: largeTarget === 'main' ? 'quote 1' : 'main 1' }));
 		await waitFor(() => expect(result.container.textContent).toContain('写真全体がメモリ上限を超えるため、ギャラリーを開けません。'));
 		expect(openMedia).not.toHaveBeenCalled();
 	});
 
-	test('aborts an explicit large gallery load offscreen and retains successful carousel photos on return', async () => {
-		const pendingThird: { resolve?: (response: Response) => void } = {};
-		const fetcher = vi.fn(async (path: string, _options?: RequestInit) => path.includes('/image/2')
-			? await new Promise<Response>(resolve => { pendingThird.resolve = resolve; })
+	test('aborts an explicit large gallery load offscreen and retains successful grid photos on return', async () => {
+		const pendingSeventh: { resolve?: (response: Response) => void } = {};
+		const fetcher = vi.fn(async (path: string, _options?: RequestInit) => path.includes('/image/6')
+			? await new Promise<Response>(resolve => { pendingSeventh.resolve = resolve; })
 			: new Response(new Blob([path], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
 		const openMedia = vi.fn<PluginHost['openMedia']>(async () => undefined);
 		initApi(vi.fn() as PluginHost['api'], fetcher as PluginHost['fetch'], openMedia);
 		const data = videoData();
 		data.post!.hasVideo = false;
 		delete data.post!.video;
-		data.post!.images = Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
+		data.post!.images = Array.from({ length: 7 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
 		const result = render(FxPreview, { props: { data, input, context } });
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
-		await fireEvent.click(result.getByRole('button', { name: 'photo 1を拡大' }));
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(3));
-		const thirdRequest = fetcher.mock.calls.find(([path]) => String(path).includes('/image/2'))!;
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(6));
+		await fireEvent.click(result.getByRole('button', { name: 'photo 1' }));
+		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(7));
+		const seventhRequest = fetcher.mock.calls.find(([path]) => String(path).includes('/image/6'))!;
 		await result.rerender({ data, input, context: { ...context, active: false, inViewport: false } });
-		expect(thirdRequest[1]?.signal?.aborted).toBe(true);
+		expect(seventhRequest[1]?.signal?.aborted).toBe(true);
 		await result.rerender({ data, input, context });
 		await Promise.resolve();
-		expect(fetcher).toHaveBeenCalledTimes(3);
-		pendingThird.resolve?.(new Response(new Blob(['late image'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
+		expect(fetcher).toHaveBeenCalledTimes(7);
+		pendingSeventh.resolve?.(new Response(new Blob(['late image'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
 		await Promise.resolve();
 		expect(openMedia).not.toHaveBeenCalled();
-		expect(result.container.querySelectorAll('[data-fx-photo-carousel] img')).toHaveLength(2);
+		expect(result.container.querySelectorAll('[data-fx-media-grid] img')).toHaveLength(6);
 	});
 
-	test('retries a transient carousel photo failure explicitly and retains it across viewport reentry', async () => {
+	test('retries a transient grid photo failure explicitly and retains it across viewport reentry', async () => {
 		let imageZeroRequests = 0;
 		const fetcher = vi.fn(async (path: string) => {
 			if (path.includes('/image/0') && ++imageZeroRequests === 1) return new Response('temporary media failure', { status: 503 });
@@ -1255,18 +1270,19 @@ describe('FxTwitter preview plugin', () => {
 		data.post!.images = Array.from({ length: 5 }, (_, index) => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`, alt: `photo ${index + 1}` }));
 		const result = render(FxPreview, { props: { data, input, context } });
 		await waitFor(() => expect(result.getByRole('button', { name: '再試行' })).toBeTruthy());
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(result.container.querySelectorAll('[data-fx-media-grid] img')).toHaveLength(4));
+		expect(fetcher.mock.calls.filter(([path]) => path.includes('/image/0'))).toHaveLength(1);
 		await fireEvent.click(result.getByRole('button', { name: '再試行' }));
-		await waitFor(() => expect(result.getByRole('button', { name: 'photo 1を拡大' })).toBeTruthy());
-		expect(fetcher).toHaveBeenCalledTimes(3);
+		await waitFor(() => expect(result.container.querySelector('[data-fx-media-grid] img[alt="photo 1"]')).toBeTruthy());
+		expect(fetcher).toHaveBeenCalledTimes(6);
 		await result.rerender({ data, input, context: { ...context, active: false, inViewport: false } });
 		await result.rerender({ data, input, context });
 		await Promise.resolve();
-		expect(fetcher).toHaveBeenCalledTimes(3);
-		expect(result.getByRole('button', { name: 'photo 1を拡大' })).toBeTruthy();
+		expect(fetcher).toHaveBeenCalledTimes(6);
+		expect(result.container.querySelector('[data-fx-media-grid] img[alt="photo 1"]')).toBeTruthy();
 	});
 
-	test('refreshes an expired carousel photo through the authorized preview request only after an explicit visible retry', async () => {
+	test('refreshes an expired grid photo through the authorized preview request only after an explicit visible retry', async () => {
 		let previewRefreshes = 0;
 		const data = videoData();
 		data.post!.hasVideo = false;
@@ -1293,14 +1309,13 @@ describe('FxTwitter preview plugin', () => {
 		await result.rerender({ data, input, context });
 		await fireEvent.click(result.getByRole('button', { name: '再試行' }));
 		await waitFor(() => expect(previewApi).toHaveBeenCalledTimes(1));
-		await waitFor(() => expect(result.getByRole('button', { name: 'photo 1を拡大' })).toBeTruthy());
-		await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
+		await waitFor(() => expect(result.container.querySelector('[data-fx-media-grid] img[alt="photo 1"]')).toBeTruthy());
 		expect(fetcher.mock.calls.filter(([path]) => path.includes('/image/0'))).toHaveLength(2);
 		expect(previewApi).toHaveBeenCalledWith('plugin/fxtwitter-preview/preview', { noteId: 'note-1', postId: '1234567890' }, expect.anything());
 		expect(openMedia).not.toHaveBeenCalled();
 	});
 
-	test.each([401, 403])('does not offer carousel refresh for an unauthorized %i media response', async status => {
+	test.each([401, 403])('does not offer photo refresh for an unauthorized %i media response', async status => {
 		const data = videoData();
 		data.post!.hasVideo = false;
 		delete data.post!.video;
@@ -1309,7 +1324,7 @@ describe('FxTwitter preview plugin', () => {
 		const fetcher = vi.fn(async () => new Response('not authorized', { status }));
 		initApi(previewApi, fetcher as PluginHost['fetch']);
 		const result = render(FxPreview, { props: { data, input, context } });
-		await waitFor(() => expect(result.getAllByText('画像を表示できません')).toHaveLength(2));
+		await waitFor(() => expect(result.getByText('一部の画像を表示する権限を確認できません。')).toBeTruthy());
 		expect(result.queryByRole('button', { name: '再試行' })).toBeNull();
 		expect(result.queryByRole('button', { name: 'メディアを再取得' })).toBeNull();
 		expect(previewApi).not.toHaveBeenCalled();

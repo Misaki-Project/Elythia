@@ -7,20 +7,24 @@ SPDX-License-Identifier: AGPL-3.0-only
 <MkSensitiveMediaGuard v-model:revealed="revealed" :isSensitive="isSensitive" kind="image">
 	<div
 		data-fx-media-grid
-		:class="[$style.mediaGrid, { [$style.singleImage]: images.length === 1, [$style.twoImages]: images.length === 2, [$style.threeImages]: images.length === 3, [$style.fourImages]: images.length === 4 }]"
-		:data-image-count="images.length"
+		:class="[$style.mediaGrid, { [$style.singleImage]: visibleImages.length === 1, [$style.twoImages]: visibleImages.length === 2, [$style.threeImages]: visibleImages.length === 3, [$style.fourImages]: visibleImages.length === 4, [$style.fiveImages]: visibleImages.length === 5, [$style.sixImages]: visibleImages.length === 6 && totalImageCount === 6, [$style.manyImages]: totalImageCount > 6 }]"
+		:data-image-count="visibleImages.length"
+		:data-total-image-count="totalImageCount"
 		:style="singleImageStyle"
 	>
 		<button
-			v-for="image in images"
+			v-for="image in visibleImages"
 			:key="image.index"
 			type="button"
 			class="_button"
 			:class="$style.mediaTile"
-			:aria-label="image.alt || `画像 ${image.index + 1}`"
+			:disabled="image.src == null"
+			:aria-label="`${image.alt || `画像 ${image.index + 1}`}${image.index === 5 && remainingCount > 0 ? `、残り ${remainingCount} 枚` : ''}`"
 			@click="$emit('open', image.index)"
 		>
-			<img :src="image.src" :alt="image.alt" loading="lazy">
+			<img v-if="image.src" :src="image.src" :alt="image.alt" loading="lazy" style="object-fit: cover; object-position: center">
+			<span v-else :class="$style.photoPlaceholder" aria-hidden="true"></span>
+			<span v-if="image.index === 5 && remainingCount > 0" :class="$style.remainingOverlay" aria-hidden="true">+{{ remainingCount }}</span>
 		</button>
 	</div>
 </MkSensitiveMediaGuard>
@@ -32,7 +36,7 @@ import { MkSensitiveMediaGuard } from '@/plugin-api.js';
 
 export type FxRenderedImage = {
 	index: number;
-	src: string;
+	src: string | null;
 	alt: string;
 	width?: number;
 	height?: number;
@@ -40,6 +44,7 @@ export type FxRenderedImage = {
 
 const props = defineProps<{
 	images: FxRenderedImage[];
+	totalImageCount?: number;
 	isSensitive?: boolean;
 }>();
 
@@ -48,6 +53,9 @@ defineEmits<{
 }>();
 
 const revealed = defineModel<boolean>('revealed', { default: false });
+const visibleImages = computed(() => props.images.slice(0, 6));
+const totalImageCount = computed(() => props.totalImageCount ?? props.images.length);
+const remainingCount = computed(() => Math.max(0, totalImageCount.value - 6));
 const singleImageStyle = computed<Record<string, string> | undefined>(() => {
 	const image = props.images.length === 1 ? props.images[0] : null;
 	if (image == null) return undefined;
@@ -66,6 +74,7 @@ const singleImageStyle = computed<Record<string, string> | undefined>(() => {
 }
 
 .mediaTile {
+	position: relative;
 	min-width: 0;
 	aspect-ratio: 16 / 9;
 	overflow: hidden;
@@ -116,5 +125,63 @@ const singleImageStyle = computed<Record<string, string> | undefined>(() => {
 
 .fourImages {
 	grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+
+.fiveImages,
+.sixImages,
+.manyImages {
+	grid-template-rows: repeat(2, minmax(0, 1fr));
+	aspect-ratio: 16 / 9;
+}
+
+.fiveImages {
+	grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.fiveImages .mediaTile {
+	aspect-ratio: auto;
+}
+
+.fiveImages .mediaTile:nth-child(-n + 2) {
+	grid-column: span 3;
+}
+
+.fiveImages .mediaTile:nth-child(n + 3) {
+	grid-column: span 2;
+}
+
+.sixImages,
+.manyImages {
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.fiveImages .mediaTile,
+.sixImages .mediaTile,
+.manyImages .mediaTile {
+	display: block;
+	align-self: stretch;
+	min-height: 0;
+	width: 100%;
+	height: 100%;
+	padding: 0;
+	text-align: inherit;
+}
+
+.photoPlaceholder {
+	display: block;
+	width: 100%;
+	height: 100%;
+	background: var(--MI_THEME-bg);
+}
+
+.remainingOverlay {
+	position: absolute;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	background: rgb(0 0 0 / 62%);
+	color: #fff;
+	font-size: clamp(1.5rem, 5vw, 3rem);
+	font-weight: 700;
 }
 </style>

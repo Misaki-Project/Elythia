@@ -32,10 +32,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</button>
 	</div>
 	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
-	<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.images?.length ?? 0) > 4" :key="`photo-carousel:${currentOwnerKey}`" v-model:revealed="imagesRevealed" :images="photoCarouselImages" :isSensitive="viewData.post.isSensitive" :viewerLoading="photoViewerLoading.main" :viewerError="photoViewerError.main" :retryDisabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @visible="loadPhotoWindow('main', $event)" @retry="retryPhoto('main', $event)" @open="openPhotoGallery('main', $event)"/>
-	<FxMediaGrid v-else-if="showAttachmentMedia && renderedImages.length" :key="`images:${viewData.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="viewData.post.isSensitive" @open="openImage"/>
-	<p v-if="mainPhotoGridStatus" :class="$style.mediaError" role="status">{{ mainPhotoGridStatus }} <button v-if="mainPhotoGridRetryable" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @click.stop="retrySmallPhotoGrid('main')">再試行</button></p>
-	<p v-if="photoViewerError.main && (viewData.post.images?.length ?? 0) <= 4" :class="$style.mediaError" role="status">{{ photoViewerError.main }}</p>
+	<FxMediaGrid v-if="showAttachmentMedia && renderedImages.length" :key="`images:${currentOwnerKey}:${viewData.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :totalImageCount="viewData.post.images.length" :isSensitive="viewData.post.isSensitive" @open="openImage"/>
+	<p v-if="mainPhotoGridStatus" :class="$style.mediaError" role="status">{{ mainPhotoGridStatus }} <button v-if="mainPhotoGridRetryable" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @click.stop="retryPhotoGrid('main')">再試行</button></p>
+	<p v-if="photoViewerLoading.main" :class="$style.mediaError" role="status" aria-busy="true">ギャラリーを準備しています…</p>
+	<p v-else-if="photoViewerError.main" :class="$style.mediaError" role="status">{{ photoViewerError.main }}</p>
 	<FxVideoPreview
 		v-if="showAttachmentMedia && mainVideo && videoPlaybackMode !== 'nativeProxy'"
 		:key="`video:${viewData.post.id}`"
@@ -68,10 +68,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</header>
 		<p :class="$style.quoteText"><template v-for="segment in quoteTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template></p>
 		<p v-if="!showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
-		<FxPhotoCarousel v-if="showAttachmentMedia && (viewData.post.quote.images?.length ?? 0) > 4" :key="`quote-photo-carousel:${currentOwnerKey}:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="quotePhotoCarouselImages" :isSensitive="viewData.post.quote.isSensitive" :viewerLoading="photoViewerLoading.quote" :viewerError="photoViewerError.quote" :retryDisabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @visible="loadPhotoWindow('quote', $event)" @retry="retryPhoto('quote', $event)" @open="openPhotoGallery('quote', $event)"/>
-		<FxMediaGrid v-else-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="viewData.post.quote.isSensitive" @open="openQuoteImage"/>
-		<p v-if="quotePhotoGridStatus" :class="$style.mediaError" role="status">{{ quotePhotoGridStatus }} <button v-if="quotePhotoGridRetryable" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @click.stop="retrySmallPhotoGrid('quote')">再試行</button></p>
-		<p v-if="photoViewerError.quote && (viewData.post.quote.images?.length ?? 0) <= 4" :class="$style.mediaError" role="status">{{ photoViewerError.quote }}</p>
+		<FxMediaGrid v-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${currentOwnerKey}:${viewData.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :totalImageCount="viewData.post.quote.images.length" :isSensitive="viewData.post.quote.isSensitive" @open="openQuoteImage"/>
+		<p v-if="quotePhotoGridStatus" :class="$style.mediaError" role="status">{{ quotePhotoGridStatus }} <button v-if="quotePhotoGridRetryable" type="button" class="_button" :disabled="retryLoading || retryWaitMs > 0 || !canRetryMedia" @click.stop="retryPhotoGrid('quote')">再試行</button></p>
+		<p v-if="photoViewerLoading.quote" :class="$style.mediaError" role="status" aria-busy="true">ギャラリーを準備しています…</p>
+		<p v-else-if="photoViewerError.quote" :class="$style.mediaError" role="status">{{ photoViewerError.quote }}</p>
 		<FxVideoPreview
 			v-if="showAttachmentMedia && quoteVideo && videoPlaybackMode !== 'nativeProxy'"
 			:key="`quote-video:${viewData.post.quote.id}`"
@@ -133,8 +133,6 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { MkA, MkTime, MkUrl } from '@/plugin-api.js';
 import type { PluginMediaItem, PreviewContext, PreviewInput } from '@/plugin-api.js';
 import FxMediaGrid from './FxMediaGrid.vue';
-import FxPhotoCarousel from './FxPhotoCarousel.vue';
-import type { FxCarouselImage } from './FxPhotoCarousel.vue';
 import FxVideoPreview from './FxVideoPreview.vue';
 import { apiSessionEpoch, fetchPluginResource, openPluginMedia, truncatePostText, videoPlaybackMode } from './api.js';
 import { loadPreview } from './preview-loader.js';
@@ -192,7 +190,8 @@ let mediaLoadGeneration = 0;
 const avatarSrc = ref<string | null>(null);
 const imageSources = ref<Array<string | null>>([]);
 const imageBlobs = ref<Array<Blob | null>>([]);
-const photoStates = ref<{ main: Array<FxCarouselImage['state']>; quote: Array<FxCarouselImage['state']> }>({ main: [], quote: [] });
+type PhotoState = 'loading' | 'blocked' | 'budget' | 'error' | 'refresh' | undefined;
+const photoStates = ref<{ main: PhotoState[]; quote: PhotoState[] }>({ main: [], quote: [] });
 const photoViewerLoading = ref<{ main: boolean; quote: boolean }>({ main: false, quote: false });
 const photoViewerError = ref<{ main: string | null; quote: string | null }>({ main: null, quote: null });
 const photoObjectUrls = new Set<string>();
@@ -201,7 +200,6 @@ const photoPromises = new Map<string, Promise<void>>();
 let photoQueue: Promise<void> = Promise.resolve();
 let photoBytes = 0;
 let photoGeneration = 0;
-const photoCenters: Record<PhotoTarget, number> = { main: 0, quote: 0 };
 let photoViewerController: AbortController | null = null;
 let photoViewerGeneration = 0;
 const MAX_PHOTO_BYTES = 64 * 1024 * 1024;
@@ -225,13 +223,14 @@ function hasSharedPhotoBudget(): boolean {
 }
 function photoGridReady(target: PhotoTarget): boolean {
 	const data = photoTargetData(target);
-	if (data == null || data.images.length === 0 || data.images.length > 4 || !hasSharedPhotoBudget()) return true;
+	if (data == null || data.images.length === 0 || !hasSharedPhotoBudget()) return true;
 	const blobs = photoBlobRef(target).value;
-	return data.images.every((_, index) => blobs[index] != null || ['blocked', 'budget', 'error', 'refresh'].includes(photoStates.value[target][index] ?? ''));
+	const visibleCount = Math.min(data.images.length, 6);
+	return data.images.slice(0, visibleCount).every((_, index) => blobs[index] != null || ['blocked', 'budget', 'error', 'refresh'].includes(photoStates.value[target][index] ?? ''));
 }
 function photoGridStatus(target: PhotoTarget): string | null {
 	const data = photoTargetData(target);
-	if (!hasSharedPhotoBudget() || data == null || data.images.length === 0 || data.images.length > 4) return null;
+	if (!hasSharedPhotoBudget() || data == null || data.images.length === 0) return null;
 	const states = photoStates.value[target].slice(0, data.images.length);
 	if (states.includes('blocked')) return '一部の画像を表示する権限を確認できません。';
 	if (states.includes('budget')) return '写真全体がメモリ上限を超えるため、一部の画像とギャラリーを表示できません。';
@@ -245,24 +244,22 @@ const mainPhotoGridRetryable = computed(() => photoStates.value.main.some(state 
 const quotePhotoGridRetryable = computed(() => photoStates.value.quote.some(state => state === 'error' || state === 'refresh'));
 const renderedImages = computed(() => {
 	if (!photoGridReady('main')) return [];
-	return (viewData.value.post?.images ?? []).flatMap((image, index) => {
-	const src = imageSources.value[index];
-	return src == null ? [] : [{ index, src, alt: image.alt ?? '', width: image.width, height: image.height }];
+	const images = viewData.value.post?.images ?? [];
+	const visible = images.slice(0, hasSharedPhotoBudget() ? 6 : images.length);
+	return visible.flatMap((image, index) => {
+		const src = imageSources.value[index];
+		return (hasSharedPhotoBudget() && images.length > 4) || src != null ? [{ index, src: src ?? null, alt: image.alt ?? '', width: image.width, height: image.height }] : [];
 	});
 });
 const renderedQuoteImages = computed(() => {
 	if (!photoGridReady('quote')) return [];
-	return (viewData.value.post?.quote?.images ?? []).flatMap((image, index) => {
-	const src = quoteImageSources.value[index];
-	return src == null ? [] : [{ index, src, alt: image.alt ?? '', width: image.width, height: image.height }];
+	const images = viewData.value.post?.quote?.images ?? [];
+	const visible = images.slice(0, hasSharedPhotoBudget() ? 6 : images.length);
+	return visible.flatMap((image, index) => {
+		const src = quoteImageSources.value[index];
+		return (hasSharedPhotoBudget() && images.length > 4) || src != null ? [{ index, src: src ?? null, alt: image.alt ?? '', width: image.width, height: image.height }] : [];
+	});
 });
-});
-const photoCarouselImages = computed<FxCarouselImage[]>(() => (viewData.value.post?.images ?? []).map((image, index) => ({
-	index, src: imageSources.value[index] ?? null, alt: image.alt ?? '', width: image.width, height: image.height, state: photoStates.value.main[index],
-})));
-const quotePhotoCarouselImages = computed<FxCarouselImage[]>(() => (viewData.value.post?.quote?.images ?? []).map((image, index) => ({
-	index, src: quoteImageSources.value[index] ?? null, alt: image.alt ?? '', width: image.width, height: image.height, state: photoStates.value.quote[index],
-})));
 const mainVideo = computed<PublicVideo | null>(() => viewData.value.post?.video ?? viewData.value.post?.videos?.[0] ?? null);
 const quoteVideo = computed<PublicVideo | null>(() => viewData.value.post?.quote?.video ?? viewData.value.post?.quote?.videos?.[0] ?? null);
 const mainVideos = computed<PublicVideo[]>(() => withPrimaryToken(viewData.value.post?.videos, viewData.value.post?.video));
@@ -577,8 +574,6 @@ function clearPhotoResources(): void {
 	photoStates.value = { main: [], quote: [] };
 	photoViewerLoading.value = { main: false, quote: false };
 	photoViewerError.value = { main: null, quote: null };
-	photoCenters.main = 0;
-	photoCenters.quote = 0;
 }
 
 function clearMedia(): void {
@@ -657,7 +652,7 @@ async function loadIdentity(): Promise<MediaLoadFailure | null> {
 	if (identityLease != null && identityKey === nextKey) {
 		const lease = identityLease;
 		const current = identityGeneration;
-		const bundle = await lease.promise;
+			const bundle = await lease.promise;
 		if (current !== identityGeneration || identityLease !== lease) return null;
 		identityFailure = bundle.failure;
 		avatarSrc.value = bundle.avatar?.src ?? null;
@@ -772,7 +767,7 @@ function photoTargetData(target: PhotoTarget): { id: string; images: Array<{ url
 function photoSourceRef(target: PhotoTarget) { return target === 'main' ? imageSources : quoteImageSources; }
 function photoBlobRef(target: PhotoTarget) { return target === 'main' ? imageBlobs : quoteImageBlobs; }
 
-function setPhotoState(target: PhotoTarget, index: number, state: FxCarouselImage['state']): void {
+function setPhotoState(target: PhotoTarget, index: number, state: PhotoState): void {
 	const next = { ...photoStates.value, [target]: [...photoStates.value[target]] };
 	while (next[target].length <= index) next[target].push(undefined);
 	next[target][index] = state;
@@ -816,12 +811,10 @@ function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Pr
 	else signal?.addEventListener('abort', abortFromCaller, { once: true });
 	setPhotoState(target, index, 'loading');
 	const work = photoQueue.then(async () => {
-		const outsideCarouselWindow = data.images.length > 4 && !photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1;
-		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || outsideCarouselWindow) return;
+		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos()) return;
 		const remaining = Math.max(0, MAX_PHOTO_BYTES - photoBytes);
 		const result = await fetchMedia(data.images[index].url, controller.signal, data.kind, index, remaining);
-		const outsideCarouselWindowAfterFetch = data.images.length > 4 && !photoViewerLoading.value[target] && Math.abs(index - photoCenters[target]) > 1;
-		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos() || outsideCarouselWindowAfterFetch) {
+		if (controller.signal.aborted || generation !== photoGeneration || owner !== ownerKey() || !canLoadPhotos()) {
 			if (result.media != null) URL.revokeObjectURL(result.media.src);
 			return;
 		}
@@ -854,40 +847,24 @@ function loadPhoto(target: PhotoTarget, index: number, signal?: AbortSignal): Pr
 	});
 }
 
-function loadPhotoWindow(target: PhotoTarget, center: number): void {
+function loadPhotoWindow(target: PhotoTarget): void {
 	const data = photoTargetData(target);
-	if (data == null || data.images.length === 0 || !Number.isSafeInteger(center)) return;
-	if (data.images.length <= 4) {
-		if (!hasSharedPhotoBudget()) return;
-		photoCenters[target] = 0;
-	} else {
-		photoCenters[target] = Math.max(0, Math.min(data.images.length - 1, center));
-	}
+	if (data == null || data.images.length === 0 || !hasSharedPhotoBudget()) return;
 	if (!canLoadPhotos() || photoViewerLoading.value[target]) return;
-	const desired = data.images.length <= 4 ? data.images.map((_, index) => index) : [photoCenters[target], photoCenters[target] - 1, photoCenters[target] + 1];
+	const desired = data.images.slice(0, data.images.length <= 4 ? data.images.length : 6).map((_, index) => index);
 	for (const index of desired) {
-		if (index >= 0 && index < data.images.length && photoStates.value[target][index] !== 'error') void loadPhoto(target, index);
+		if (photoStates.value[target][index] !== 'error') void loadPhoto(target, index);
 	}
 }
 
-function retryPhoto(target: PhotoTarget, index: number): void {
-	if (photoStates.value[target][index] === 'blocked' || photoStates.value[target][index] === 'budget') return;
-	photoViewerError.value = { ...photoViewerError.value, [target]: null };
-	if (photoStates.value[target][index] === 'refresh') {
-		if (canRetryMedia.value && retryWaitMs.value === 0) void retryPreview();
-		return;
-	}
-	void loadPhoto(target, index);
-}
-
-function retrySmallPhotoGrid(target: PhotoTarget): void {
+function retryPhotoGrid(target: PhotoTarget): void {
 	const data = photoTargetData(target);
-	if (data == null || data.images.length > 4 || !hasSharedPhotoBudget()) return;
+	if (data == null || !hasSharedPhotoBudget()) return;
 	if (photoStates.value[target].includes('refresh')) {
 		if (canRetryMedia.value && retryWaitMs.value === 0) void retryPreview();
 		return;
 	}
-	for (let index = 0; index < data.images.length; index++) {
+	for (let index = 0; index < Math.min(data.images.length, 6); index++) {
 		if (photoStates.value[target][index] === 'error') void loadPhoto(target, index);
 	}
 }
@@ -955,14 +932,14 @@ async function loadMedia(): Promise<void> {
 	const targets: PhotoTarget[] = ['main', 'quote'];
 	if (hasSharedPhotoBudget()) {
 		for (const target of targets) {
-			if ((photoTargetData(target)?.images.length ?? 0) <= 4) loadPhotoWindow(target, 0);
+			if ((photoTargetData(target)?.images.length ?? 0) <= 4) loadPhotoWindow(target);
 		}
 		for (const target of targets) {
-			if ((photoTargetData(target)?.images.length ?? 0) > 4) loadPhotoWindow(target, photoCenters[target]);
+			if ((photoTargetData(target)?.images.length ?? 0) > 4) loadPhotoWindow(target);
 		}
 	} else {
-		loadPhotoWindow('main', photoCenters.main);
-		loadPhotoWindow('quote', photoCenters.quote);
+		loadPhotoWindow('main');
+		loadPhotoWindow('quote');
 	}
 	const failures = results.flatMap(result => result.status === 'fulfilled' ? [result.value] : ['retryable' as const]);
 	const failure = combineMediaFailures(...failures);

@@ -19,13 +19,13 @@ vi.mock('@/server-plugins.generated.js', () => ({ serverPlugins: [] }));
 const xUrl = 'https://x.com/alice/status/1234567890';
 const source = { kind: 'note' as const, noteId: 'note-ogp-1' };
 
-function host(api: PluginHost['api']): { host: PluginHost; providers: PreviewProvider[] } {
+function host(api: PluginHost['api'], me: PluginHost['me'] = { id: 'user-1', username: 'user-1', host: null }): { host: PluginHost; providers: PreviewProvider[] } {
 	const providers: PreviewProvider[] = [];
 	return {
 		providers,
 		host: {
 			name: 'fxtwitter-preview',
-			me: { id: 'user-1', username: 'user-1', host: null },
+			me,
 			api,
 			fetch: vi.fn() as PluginHost['fetch'],
 			openMedia: vi.fn() as PluginHost['openMedia'],
@@ -53,7 +53,7 @@ function setTimelineMode(mode: 'ogp' | 'text' | 'media'): void {
 	if (preferReactive.xTimelinePreviewMode != null) preferReactive.xTimelinePreviewMode.value = mode;
 }
 
-async function mountWithRegisteredProvider(canUseFxTwitterPreview: boolean) {
+async function mountWithRegisteredProvider(canUseFxTwitterPreview: boolean, me?: PluginHost['me']) {
 	const api = vi.fn(async (path: string) => {
 		if (path.endsWith('/capabilities')) return {
 			externalFetchEnabled: true,
@@ -72,7 +72,7 @@ async function mountWithRegisteredProvider(canUseFxTwitterPreview: boolean) {
 		};
 		throw new Error(`unexpected API path: ${path}`);
 	}) as PluginHost['api'];
-	const enabled = host(api);
+	const enabled = host(api, me);
 	await plugin.setup(enabled.host);
 	if (enabled.providers.length > 0) {
 		await launchServerPlugins([{
@@ -134,6 +134,17 @@ describe('FxTwitter OGP fallback actions', () => {
 	test('keeps the standard X action when checked permission leaves no Fx provider', async () => {
 		mockStandardUrlPreview();
 		await mountWithRegisteredProvider(false);
+		const result = renderFallback();
+
+		await waitFor(() => expect(result.getByText('Standard OGP card')).toBeTruthy());
+		expect(result.getByRole('button', { name: i18n.ts.expandTweet })).toBeTruthy();
+		expect(result.getAllByRole('button')).toHaveLength(1);
+	});
+
+	test('keeps the standard X renderer for anonymous viewers even if capability data allows Fx preview', async () => {
+		mockStandardUrlPreview();
+		const anonymous = await mountWithRegisteredProvider(true, null);
+		expect(anonymous.providers).toHaveLength(0);
 		const result = renderFallback();
 
 		await waitFor(() => expect(result.getByText('Standard OGP card')).toBeTruthy());
