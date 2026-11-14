@@ -37,7 +37,7 @@ function data(): PreviewResponse & { post: PublicPost } {
 function fixtureHost(me: PluginHost['me'] = { id: 'u1', username: 'u1', host: null }): PluginHost {
 	// The public PluginHost contract names this authenticated resource method fetch.
 	// eslint-disable-next-line id-denylist
-	return { name: 'fxtwitter-preview', me, api: api as PluginHost['api'], fetch: media as PluginHost['fetch'], openMedia: viewer, slot() {}, preview: { register() {} } };
+	return { name: 'fxtwitter-preview', me, api: api as PluginHost['api'], fetch: media as PluginHost['fetch'], openMedia: viewer, slot() {}, preview: { register() {} }, postForm: { registerPasteTransform() {} } };
 }
 
 async function register() {
@@ -649,7 +649,7 @@ test.each([
 test.each(['unavailable', 'disabled', 'pending'] as const)('legacy %s response never revives its body', async state => {
 	const response = data();
 	response.post.videos = [];
-	response.post.video = { provider: 'youtube', providerVideoId: 'abcdefghijk' };
+	Object.assign(response.post, { video: { provider: 'youtube', providerVideoId: 'abcdefghijk' } });
 	const original = JSON.stringify(response);
 	api.mockResolvedValue({ ...response, state, body: 'private audit body' });
 	if (state === 'pending') vi.useFakeTimers();
