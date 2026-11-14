@@ -291,6 +291,10 @@ func validateForceFlags(set map[string]bool, track string) string {
 // 理由で受けない。
 func (e env) forceTrack(logger *slog.Logger, cfg *config.Config, track string, version uint) int {
 	log := logger.With("track", track)
+	if track == trackCore && version == 117 {
+		log.Error("refusing to force core version 117; reconcile legacy migration history first")
+		return 1
+	}
 	dir := e.coreDir
 	if track == trackLocal {
 		dir = e.localDir
@@ -413,6 +417,13 @@ func (e env) runTrack(logger *slog.Logger, cfg *config.Config, track, direction 
 		return 1
 	}
 	defer m.Close()
+
+	if track == trackCore {
+		if err := refuseLegacy117(dir, dbURL, m); err != nil {
+			logDBError(log, cfg, "migration history check failed", err)
+			return 1
+		}
+	}
 
 	switch {
 	case direction == "up" && steps > 0:

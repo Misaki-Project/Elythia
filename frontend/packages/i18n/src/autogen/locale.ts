@@ -7,6 +7,12 @@ export interface Locale extends ILocale {
      * 日本語
      */
     "_lang_": string;
+    "trackingParameterCleanerEnabled": string;
+    "gameRankings": string;
+    "gameRankingTabLabel": string;
+    "gameRankingEmpty": string;
+    "genshinGameName": string;
+    "hsrGameName": string;
     /**
      * ノートでつながるネットワーク
      */
@@ -6126,6 +6132,11 @@ export interface Locale extends ILocale {
         "paletteForReaction": string;
     };
     "_settings": {
+        "fxTwitterPreviewMode": string;
+        "fxTwitterPreviewModeDescription": string;
+        "fxTwitterPreviewModeOgp": string;
+        "fxTwitterPreviewModeText": string;
+        "fxTwitterPreviewModeMedia": string;
         /**
          * ドライブの管理と設定、使用量の確認、ファイルをアップロードする際の設定を行えます。
          */
@@ -8086,6 +8097,216 @@ export interface Locale extends ILocale {
             };
         };
     };
+    "_roleLevel": {
+        /**
+         * レベルロール
+         */
+        "title": string;
+        /**
+         * ここではレベルロールの経験値曲線を設定します。レベル別ポリシーは、下にある各ポリシーの編集欄で設定できます。
+         */
+        "editorDescription": string;
+        /**
+         * 開始レベル
+         */
+        "baseLevel": string;
+        /**
+         * 経験値曲線
+         */
+        "experienceCurve": string;
+        /**
+         * 区間 {n}
+         */
+        "segment": ParameterizedString<"n">;
+        /**
+         * 計算方法
+         */
+        "calculation": string;
+        /**
+         * 上昇レベル数
+         */
+        "levelUps": string;
+        /**
+         * 基本必要経験値
+         */
+        "baseExperience": string;
+        /**
+         * 段階ごとの加算値
+         */
+        "additionalExperience": string;
+        /**
+         * 指数
+         */
+        "exponential": string;
+        /**
+         * 経験値区間を追加
+         */
+        "addSegment": string;
+        /**
+         * レベル別ポリシー
+         */
+        "policyRanges": string;
+        /**
+         * レベルごとに適用するポリシーを設定します。
+         */
+        "policyRangesDescription": string;
+        /**
+         * このポリシーに適用するレベル範囲を設定します。範囲は連続し、開始レベルと最大レベルまでを常に覆います。
+         */
+        "perPolicyRangesDescription": string;
+        /**
+         * {count} 件のレベルポリシー
+         */
+        "policyRangeCount": ParameterizedString<"count">;
+        /**
+         * ポリシー範囲 {n}
+         */
+        "range": ParameterizedString<"n">;
+        /**
+         * 適用方法
+         */
+        "rangeType": string;
+        /**
+         * 開始段階
+         */
+        "startStage": string;
+        /**
+         * 終了段階
+         */
+        "endStage": string;
+        /**
+         * 開始レベル
+         */
+        "startPolicyLevel": string;
+        /**
+         * 終了レベル
+         */
+        "endPolicyLevel": string;
+        /**
+         * ポリシーキー
+         */
+        "policyKey": string;
+        /**
+         * 固定値
+         */
+        "constantValue": string;
+        /**
+         * 基準値
+         */
+        "multiplierBase": string;
+        /**
+         * 段階ごとの加算値
+         */
+        "multiplierAdditional": string;
+        /**
+         * ポリシー範囲を追加
+         */
+        "addRange": string;
+        /**
+         * このポリシーに範囲を追加
+         */
+        "addPolicyRange": string;
+        /**
+         * 固定
+         */
+        "constant": string;
+        /**
+         * 線形
+         */
+        "linear": string;
+        /**
+         * 段階加算
+         */
+        "multiplier": string;
+        /**
+         * 変更なし
+         */
+        "noPolicyChange": string;
+        /**
+         * 他のポリシーに影響されません
+         */
+        "noPolicyChangeDescription": string;
+        /**
+         * 影響情報
+         */
+        "impactInformation": string;
+        /**
+         * 計算式:
+         */
+        "formula": string;
+        /**
+         * Lv.{level}: {value}
+         */
+        "policySimulation": ParameterizedString<"level" | "value">;
+        /**
+         * Lv.{level}: {cost} XP ({from} ～ {to} XP)
+         */
+        "experienceSimulation": ParameterizedString<"level" | "cost" | "from" | "to">;
+        /**
+         * Lv.{level}: MAX ({from} ～ XP)
+         */
+        "experienceSimulationMax": ParameterizedString<"level" | "from">;
+        /**
+         * 通常値を使用
+         */
+        "useBasePolicy": string;
+        /**
+         * レベル {level}
+         */
+        "level": ParameterizedString<"level">;
+        /**
+         * 経験値 {current} / {next}
+         */
+        "experience": ParameterizedString<"current" | "next">;
+        /**
+         * 最大レベル
+         */
+        "maxLevel": string;
+        /**
+         * 経験値を編集
+         */
+        "editExperience": string;
+        /**
+         * 経験値を設定
+         */
+        "setExperience": string;
+        /**
+         * 経験値を加算
+         */
+        "addExperience": string;
+        /**
+         * 経験値を加減算
+         */
+        "adjustExperience": string;
+        /**
+         * 経験値を減算
+         */
+        "subtractExperience": string;
+        /**
+         * 経験値を乗算
+         */
+        "multiplyExperience": string;
+        /**
+         * 表示する
+         */
+        "showOnProfile": string;
+        /**
+         * 非表示にする
+         */
+        "hideOnProfile": string;
+        /**
+         * レベル設定を削除
+         */
+        "removeConfiguration": string;
+        /**
+         * 旧形式のレベルロールです。保存するとプラグイン形式へ移行します。
+         */
+        "legacyRoleNotice": string;
+        /**
+         * レベル情報を取得できませんでした。サーバーのrole-level設定を確認してください。
+         */
+        "unavailable": string;
+    };
     "_role": {
         /**
          * ロールの作成
@@ -9769,6 +9990,10 @@ export interface Locale extends ILocale {
          * モデレーションノートを操作する
          */
         "write:admin:user-note": string;
+        /**
+         * ロール経験値を変更する
+         */
+        "write:admin:role-level-experience": string;
         /**
          * ロールを操作する
          */
@@ -15067,6 +15292,21 @@ export interface Locale extends ILocale {
         "ldSignatureSeenAt": string;
     };
     "_mkgoRolePolicy": {
+        "canUseFxTwitterPreview": string;
+        "canUseFxTwitterPreview_caption": string;
+        "fxTwitterColdFetchesPerHour": string;
+        "fxTwitterColdFetchesPerHour_caption": string;
+        "fxTwitterColdFetchesPerDay": string;
+        "fxTwitterColdFetchesPerDay_caption": string;
+        "genshinUidLimit": string;
+        "genshinUidLimit_caption": string;
+        "genshinRefreshRange_caption": string;
+        "genshinRefreshIntervalMinutes": string;
+        "genshinRefreshIntervalMinutes_caption": string;
+        "hsrUidLimit": string;
+        "hsrUidLimit_caption": string;
+        "hsrRefreshIntervalMinutes": string;
+        "hsrRefreshIntervalMinutes_caption": string;
         /**
          * カスタム絵文字の登録を申請できる
          */

@@ -5,7 +5,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <template>
 <div class="_selectable">
-	<div :class="$style.label" @click="focus"><slot name="label"></slot></div>
+	<div :id="`${id}-label`" :class="$style.label" @click="focus"><slot name="label"></slot></div>
 	<div :class="[$style.input, { [$style.inline]: inline, [$style.disabled]: disabled, [$style.focused]: focused }]">
 		<div ref="prefixEl" :class="$style.prefix"><slot name="prefix"></slot></div>
 		<input
@@ -13,6 +13,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			v-model="v"
 			v-adaptive-border
 			:class="$style.inputCore"
+			:aria-labelledby="$slots.label ? `${id}-label` : undefined"
 			:type="type"
 			:disabled="disabled"
 			:required="required"

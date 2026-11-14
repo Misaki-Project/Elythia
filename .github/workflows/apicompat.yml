@@ -145,7 +145,11 @@ jobs:
       # `pluginbuild` が skip する (#2701)。自前プラグインを `plugins/` に置いた
       # 手元で回すと 19 行混入するが、clean checkout では起きない。
       - name: Regenerate api-compat.md
-        run: make apicompat APICOMPAT_CONFIG=tests/upstream-e2e/mkgo.yml
+        run: |
+          config="$RUNNER_TEMP/apicompat.yml"
+          cp tests/upstream-e2e/mkgo.yml "$config"
+          printf '\nplugins:\n  role-level:\n    enabled: false\n' >> "$config"
+          make apicompat APICOMPAT_CONFIG="$config"
 
       - name: Check for drift
         run: |

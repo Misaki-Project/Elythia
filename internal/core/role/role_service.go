@@ -3,6 +3,7 @@ package role
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"math"
@@ -241,6 +242,14 @@ const (
 // (#300 3-5)。
 const roleCacheTTL = 5 * time.Minute
 
+// conditionalRoleErrorCacheTTL briefly caches conditional-role lookup errors
+// to bound repeated repository reads while allowing recovery checks promptly.
+const conditionalRoleErrorCacheTTL = time.Second
+
+// maxConditionalRoleErrorCacheEntries caps the existing role-cache map size
+// when admitting new conditional-error entries. Successful snapshots keep their policy.
+const maxConditionalRoleErrorCacheEntries = 1024
+
 // roleCacheEntry は per-user の roles snapshot + 失効時刻。
 type roleCacheEntry struct {
 	// snapshot は roles と activeAssignments の組。**1 回の ListByUser から共に
@@ -298,6 +307,7 @@ func cloneRoles(roles []*model.Role) []*model.Role {
 type userRoleSnapshot struct {
 	roles             []*model.Role
 	activeAssignments []activeRoleAssignment
+	conditionalErr    error
 }
 
 // clone は cache entry と呼び出し側のどちらかが他の変更を観測しないよう値を複製
@@ -306,6 +316,7 @@ func (s userRoleSnapshot) clone() userRoleSnapshot {
 	return userRoleSnapshot{
 		roles:             cloneRoles(s.roles),
 		activeAssignments: cloneActiveRoleAssignments(s.activeAssignments),
+		conditionalErr:    s.conditionalErr,
 	}
 }
 
@@ -572,10 +583,10 @@ func (s *Service) resolveUserRoleSnapshot(userID string) (userRoleSnapshot, erro
 	// formula 評価で絞り込む。assigned roles と matched conditional の和集合
 	// を返す。upstream TS の getUserRoles と同じ順 (assigned が先)。
 	//
-	// roleRepo / userRepo どちらかが未配線なら、conditional 評価は skip して
-	// assigned のみを返す (= 旧挙動)。test 経路で userRepo 未注入のケースに
-	// 配慮した soft-fail。
-	condRoles := s.evaluateConditionalRoles(userID, assignedRoles)
+	// 条件付きロールの入力を確認できないときも、既存の GetUserRoles 向けに
+	// 手動割当ロールの結果は返す。不完全な snapshot は短い TTL で保持し、
+	// checked consumer へ conditionalErr をそのまま伝える。
+	condRoles, conditionalErr := s.evaluateConditionalRoles(userID, assignedRoles)
 	roles := append(assignedRoles, condRoles...)
 
 	// #2106 S5: cache 失効を「TTL」と「最も早い assignment expiresAt」の min にする。
@@ -584,17 +595,39 @@ func (s *Service) resolveUserRoleSnapshot(userID string) (userRoleSnapshot, erro
 	// role/policy として効き続けてしまう (upstream は getUserAssigns で read 毎に
 	// expiresAt を再 filter)。entry を soonest expiry で drop すれば、次 read が
 	// 再 fetch して DB filter が期限切れ assignment を除外する。
-	cacheExpiry := time.Now().Add(roleCacheTTL)
+	now := time.Now()
+	cacheExpiry := now.Add(roleCacheTTL)
 	for _, a := range assignments {
 		if a.ExpiresAt != nil && a.ExpiresAt.Before(cacheExpiry) {
 			cacheExpiry = *a.ExpiresAt
 		}
 	}
+	if conditionalErr != nil {
+		errorExpiry := now.Add(conditionalRoleErrorCacheTTL)
+		if errorExpiry.Before(cacheExpiry) {
+			cacheExpiry = errorExpiry
+		}
+	}
 
-	snapshot := userRoleSnapshot{roles: roles, activeAssignments: activeAssignments}
+	snapshot := userRoleSnapshot{roles: roles, activeAssignments: activeAssignments, conditionalErr: conditionalErr}
 	s.userRoleCacheMu.Lock()
 	if s.allUserRoleEpoch == allEpoch && s.userRoleEpoch[userID] == userEpoch {
-		s.userRoleCache[userID] = &roleCacheEntry{snapshot: snapshot.clone(), expiresAt: cacheExpiry}
+		mayPublish := true
+		if conditionalErr != nil {
+			existing := s.userRoleCache[userID]
+			if existing != nil &&
+				time.Now().Before(existing.expiresAt) && existing.snapshot.conditionalErr == nil {
+				// 遅れて失敗した lookup が、新しい成功済み snapshot を上書きしないようにする。
+				mayPublish = false
+			}
+			if existing == nil && len(s.userRoleCache) >= maxConditionalRoleErrorCacheEntries {
+				// エラーキーの上限に達した後は、負の cache はベストエフォートとする。
+				mayPublish = false
+			}
+		}
+		if mayPublish {
+			s.userRoleCache[userID] = &roleCacheEntry{snapshot: snapshot.clone(), expiresAt: cacheExpiry}
+		}
 	}
 	s.userRoleCacheMu.Unlock()
 	return snapshot.clone(), nil
@@ -621,6 +654,33 @@ func (s *Service) GetUserRoles(userID string) ([]*model.Role, error) {
 		return nil, err
 	}
 	return snapshot.roles, nil
+}
+
+// GetUserRolesStrict resolves a fresh, complete role set for authorization
+// decisions. It does not use the lenient role cache, so a stale partial
+// conditional-role result can never grant a plugin permission.
+func (s *Service) GetUserRolesStrict(userID string) ([]*model.Role, error) {
+	if userID == "" {
+		return nil, nil
+	}
+	if s.assignmentRepo == nil || s.roleRepo == nil {
+		return nil, errors.New("active role repositories are unavailable")
+	}
+	assignments, err := s.assignmentRepo.ListByUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	assigned := make([]*model.Role, 0, len(assignments))
+	for _, assignment := range assignments {
+		if assignment != nil && assignment.Role != nil {
+			assigned = append(assigned, assignment.Role)
+		}
+	}
+	conditional, err := s.evaluateConditionalRoles(userID, assigned)
+	if err != nil {
+		return nil, err
+	}
+	return cloneRoles(append(assigned, conditional...)), nil
 }
 
 func (s *Service) finishUserRoleFlight(userID string) {
@@ -714,18 +774,13 @@ func (s *Service) GetUserAssign(userID, roleID string, at time.Time) (*model.Rol
 }
 
 // evaluateConditionalRoles returns the subset of `target=conditional`
-// roles whose `condFormula` evaluates to true for the user. Best-effort:
-// when prerequisites are missing (no userRepo wired, role list fetch
-// fails, user lookup fails, formula JSON malformed) we return nil so
-// callers fall back to assigned roles only. Matches upstream TS where
-// evalCond swallows all errors as false.
-func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role) []*model.Role {
-	if s.userRepo == nil {
-		return nil
-	}
+// roles whose `condFormula` evaluates to true for the user. Repository lookup
+// failures are returned separately so checked policy consumers can fail closed;
+// legacy callers may keep using the assigned-role fallback.
+func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role) ([]*model.Role, error) {
 	allRoles, err := s.listRolesCached()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list roles for conditional evaluation: %w", err)
 	}
 	// 早期 short-circuit: conditional role が 1 つも無いなら user fetch を
 	// 省略する (= upstream TS と同 optimization)。これで大多数のインスタンス
@@ -738,11 +793,17 @@ func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role
 		}
 	}
 	if !hasCond {
-		return nil
+		return nil, nil
+	}
+	if s.userRepo == nil {
+		return nil, errors.New("conditional role user lookup is unavailable")
 	}
 	user, err := s.userRepo.FindByID(userID)
-	if err != nil || user == nil {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("lookup user for conditional evaluation: %w", err)
+	}
+	if user == nil {
+		return nil, errors.New("conditional role user lookup returned no user")
 	}
 	matched := make([]*model.Role, 0)
 	for _, r := range allRoles {
@@ -751,7 +812,8 @@ func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role
 		}
 		var formula CondFormula
 		// CondFormula は datatypes.JSON。未設定だと "{}" が入っていて
-		// type が空文字列のため EvalCond で false に倒れる。
+		// type が空文字列のため EvalCond で false に倒れる。既存挙動と同じく
+		// malformed JSON はこのロールだけ不一致として扱う。
 		if err := json.Unmarshal(r.CondFormula, &formula); err != nil {
 			continue
 		}
@@ -759,7 +821,7 @@ func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role
 			matched = append(matched, r)
 		}
 	}
-	return matched
+	return matched, nil
 }
 
 // isRootUser checks if the user is the root user.
@@ -1590,6 +1652,9 @@ func aggregatePolicyValues(key string, baseVal any, values []any) any {
 		}
 		return false
 	case int:
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" {
+			return minNumber(values, baseVal)
+		}
 		return maxNumber(values, baseVal)
 	case float64:
 		// 基本ポリシーの小数を残す key (coerceBasePolicy) は、base が float64 に
@@ -1761,6 +1826,27 @@ func maxNumber(values []any, base any) any {
 	return best.normalized
 }
 
+// minNumber picks the minimum host-int-compatible value. The game refresh
+// interval policies intentionally become more restrictive as roles combine.
+func minNumber(values []any, base any) any {
+	var best intBaseNumeric
+	found := false
+	for _, v := range values {
+		candidate, ok := intBaseNumber(v)
+		if !ok || !candidate.integer || candidate.intValue < 1 || candidate.intValue > 1440 {
+			continue
+		}
+		if !found || candidate.lessThan(best) {
+			best = candidate
+			found = true
+		}
+	}
+	if !found {
+		return base
+	}
+	return best.normalized
+}
+
 type intBaseNumeric struct {
 	integer    bool
 	intValue   int64
@@ -1803,6 +1889,19 @@ func (n intBaseNumeric) greaterThan(other intBaseNumeric) bool {
 		return compareIntToFraction(n.intValue, other.floatValue) > 0
 	}
 	return compareIntToFraction(other.intValue, n.floatValue) < 0
+}
+
+func (n intBaseNumeric) lessThan(other intBaseNumeric) bool {
+	if n.integer && other.integer {
+		return n.intValue < other.intValue
+	}
+	if !n.integer && !other.integer {
+		return n.floatValue < other.floatValue
+	}
+	if n.integer {
+		return compareIntToFraction(n.intValue, other.floatValue) < 0
+	}
+	return compareIntToFraction(other.intValue, n.floatValue) > 0
 }
 
 // compareIntToFraction compares exact i with finite, in-range, non-integral f.

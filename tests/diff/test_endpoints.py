@@ -13,6 +13,40 @@ import base64
 
 from diff_core import DEFAULT_IGNORE_KEYS, diff_json, format_diffs
 
+# These are intentional Elythia policy additions. Misskey's TypeScript server
+# does not expose them, so the three comparisons below assert their exact
+# values and permit only these seven missing_in_ts paths.
+ELYTHIA_ROLE_POLICY_VALUES = {
+    "canUseFxTwitterPreview": True,
+    "fxTwitterColdFetchesPerDay": 600,
+    "fxTwitterColdFetchesPerHour": 100,
+    "genshinRefreshIntervalMinutes": 10,
+    "genshinUidLimit": 1,
+    "hsrRefreshIntervalMinutes": 10,
+    "hsrUidLimit": 1,
+}
+ELYTHIA_ROLE_POLICY_PATHS = {
+    f"$.policies.{key}" for key in ELYTHIA_ROLE_POLICY_VALUES
+}
+
+
+def assert_parity_with_elythia_role_policies(mkgo, ts, *, ignore_keys):
+    policies = mkgo.get("policies")
+    assert isinstance(policies, dict)
+    assert all(type(policies.get(key)) is type(expected) and policies.get(key) == expected for key, expected in ELYTHIA_ROLE_POLICY_VALUES.items())
+
+    diffs = diff_json(mkgo, ts, ignore_keys=ignore_keys)
+    actual_paths = {d.path for d in diffs if d.kind == "missing_in_ts"}
+    assert actual_paths & ELYTHIA_ROLE_POLICY_PATHS == ELYTHIA_ROLE_POLICY_PATHS, format_diffs(diffs)
+    for diff in diffs:
+        if diff.path not in ELYTHIA_ROLE_POLICY_PATHS:
+            continue
+        key = diff.path.removeprefix("$.policies.")
+        assert diff.kind == "missing_in_ts", format_diffs(diffs)
+        assert type(diff.mkgo) is type(ELYTHIA_ROLE_POLICY_VALUES[key]) and diff.mkgo == ELYTHIA_ROLE_POLICY_VALUES[key] and diff.ts is None, format_diffs(diffs)
+    unexpected = [d for d in diffs if d.path not in ELYTHIA_ROLE_POLICY_PATHS]
+    assert not unexpected, format_diffs(unexpected)
+
 # meta carries a lot of operator-specific config (names, urls, versions, limits
 # that depend on the instance config). Ignore those so the diff focuses on
 # structural/value parity of the shared fields.
@@ -85,8 +119,7 @@ META_IGNORE = DEFAULT_IGNORE_KEYS | {
 def test_meta_value_parity(mkgo, ts):
     mk = mkgo.json("meta", {"detail": True})
     tj = ts.json("meta", {"detail": True})
-    diffs = diff_json(mk, tj, ignore_keys=META_IGNORE)
-    assert not diffs, format_diffs(diffs)
+    assert_parity_with_elythia_role_policies(mk, tj, ignore_keys=META_IGNORE)
 
 
 def test_note_packing_parity(mkgo, ts):
@@ -148,8 +181,7 @@ USER_IGNORE = DEFAULT_IGNORE_KEYS | {
 def test_user_packing_parity(mkgo, ts):
     mk = mkgo.json("users/show", {"username": "alice"})
     tj = ts.json("users/show", {"username": "alice"})
-    diffs = diff_json(mk, tj, ignore_keys=USER_IGNORE)
-    assert not diffs, format_diffs(diffs)
+    assert_parity_with_elythia_role_policies(mk, tj, ignore_keys=USER_IGNORE)
 
 
 def test_note_with_reaction_parity(mkgo, ts):
@@ -342,8 +374,7 @@ def test_rich_profile_parity(mkgo, ts):
         c.json("i/update", update)
     mk = mkgo.json("users/show", {"username": "alice"})
     tj = ts.json("users/show", {"username": "alice"})
-    diffs = diff_json(mk, tj, ignore_keys=USER_IGNORE)
-    assert not diffs, format_diffs(diffs)
+    assert_parity_with_elythia_role_policies(mk, tj, ignore_keys=USER_IGNORE)
 
 
 def test_locked_follow_request_parity(mkgo, ts):

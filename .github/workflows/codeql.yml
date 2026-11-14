@@ -18,7 +18,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, codex/upstream-34ec-ci-base-20261114]
   schedule:
     # 他の schedule (queue-bench 17:30 / dropin-frontend 19:00) と重ならない枠。
     - cron: "30 20 * * 1"

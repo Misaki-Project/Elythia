@@ -1873,6 +1873,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	w.handlers = hSvcs
 	s.builtHandlers = hSvcs
 	usersHandler := hSvcs.users
+	if roleLevelPluginEnabled(plugins, s.config.Plugins) {
+		usersHandler.SetProfileRoleVisibilityReader(roleLevelProfileVisibilityReader{db: s.db})
+	}
 	iHandler := hSvcs.i
 	webhookHandler := hSvcs.webhook
 	notificationsHandler := hSvcs.notifications

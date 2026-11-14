@@ -71,12 +71,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 							</MkFukidashi>
 						</div>
 						<div v-if="user.roles.length > 0" class="roles">
-							<span v-for="role in user.roles" :key="role.id" v-tooltip="role.description" class="role" :style="{ '--color': role.color ?? '' }">
-								<MkA v-adaptive-bg :to="`/roles/${role.id}`">
-									<img v-if="role.iconUrl" style="height: 1.3em; vertical-align: -22%;" :src="role.iconUrl"/>
-									{{ role.name }}
-								</MkA>
-							</span>
+							<MkRoleLevelBadge v-for="role in user.roles" :key="role.id" :role="role" :level="roleLevels.get(role.id)"/>
 						</div>
 						<div v-if="iAmModerator" class="moderationNote">
 							<MkTextarea v-if="editModerationNote || (moderationNote != null && moderationNote !== '')" v-model="moderationNote" manualSave @savingStateChange="(changed) => { isModerationNoteDirty = changed; }">
@@ -194,6 +189,7 @@ import MkOmit from '@/components/MkOmit.vue';
 import MkInfo from '@/components/MkInfo.vue';
 import MkButton from '@/components/MkButton.vue';
 import MkPluginSlot from '@/components/MkPluginSlot.vue';
+import MkRoleLevelBadge from '@/components/MkRoleLevelBadge.vue';
 import { getUserMenu } from '@/utility/get-user-menu.js';
 import number from '@/filters/number.js';
 import { userPage } from '@@/js/user.js';
@@ -212,6 +208,8 @@ import MkSparkle from '@/components/MkSparkle.vue';
 import { prefer } from '@/preferences.js';
 import MkPullToRefresh from '@/components/MkPullToRefresh.vue';
 import { isBirthday } from '@/utility/is-birthday.js';
+import { roleLevelApi } from '@/utility/role-level-api.js';
+import type { RoleLevelPublicProfileResponse, RoleLevelUserRole } from '@/utility/role-level-api.js';
 import type XTimeline_TypeReferenceOnly from './index.timeline.vue';
 
 function calcAge(birthdate: string): number {
@@ -247,6 +245,19 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
 	(ev: 'showMoreFiles'): void;
 }>();
+
+const roleLevels = ref(new Map<string, RoleLevelUserRole>());
+
+async function loadRoleLevels() {
+	try {
+		const result = await roleLevelApi<RoleLevelPublicProfileResponse>('plugin/role-level/users/show', { userId: props.user.id });
+		roleLevels.value = new Map(result.roles.map(role => [role.roleId, role]));
+	} catch {
+		roleLevels.value = new Map();
+	}
+}
+
+watch(() => props.user.id, () => { void loadRoleLevels(); }, { immediate: true });
 
 const router = useRouter();
 

@@ -16,7 +16,7 @@ name: Dependency review
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, codex/upstream-34ec-ci-base-20261114]
 
 permissions:
   contents: read

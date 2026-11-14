@@ -345,6 +345,13 @@ export const PREF_DEF = definePreferences({
 			code: false,
 		} as DataSaverStore,
 	},
+	fxTwitterPreviewMode: {
+		default: 'media' as 'ogp' | 'text' | 'media',
+	},
+	trackingParameterCleanerEnabled: {
+		accountDependent: true,
+		default: true,
+	},
 	hemisphere: {
 		default: hemisphere as 'N' | 'S',
 	},

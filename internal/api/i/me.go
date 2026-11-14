@@ -331,11 +331,10 @@ func (h *Handler) EnrichSelf(ctx context.Context, u *model.User, profile *model.
 	}
 	h.fillUnreadFields(ctx, u, resp)
 	h.fillPinnedFields(ctx, u, profile, resp)
-	isAdmin, isMod, policies, roles := h.rolePayload(u.ID)
+	isAdmin, isMod, policies, _ := h.rolePayload(u.ID)
 	resp["isAdmin"] = isAdmin
 	resp["isModerator"] = isMod
 	resp["policies"] = policies
-	resp["roles"] = roles
 	resp["isSilenced"] = h.isSilenced(u.ID)
 }
 

@@ -172,3 +172,28 @@ func TestValidateContributionsReplacementTieUsesRoleID(t *testing.T) {
 	}
 	assert.False(t, ValidateContributions([]string{"mentionLimit"}, []string{"r1"}, same))
 }
+
+func TestGenshinAndHSRRolePolicyDefaultsAndBounds(t *testing.T) {
+	defaults := Defaults()
+	require.Equal(t, 10, defaults["genshinRefreshIntervalMinutes"])
+	require.Equal(t, 10, defaults["hsrRefreshIntervalMinutes"])
+	require.Equal(t, 1, defaults["genshinUidLimit"])
+	require.Equal(t, 1, defaults["hsrUidLimit"])
+
+	for _, key := range []string{"genshinRefreshIntervalMinutes", "hsrRefreshIntervalMinutes"} {
+		for _, value := range []any{1, int64(1440), float64(10)} {
+			assert.True(t, ValidatePolicyValue(key, value), key)
+		}
+		for _, value := range []any{0, 1441, "10", 1.5} {
+			assert.False(t, ValidatePolicyValue(key, value), key)
+		}
+	}
+	for _, key := range []string{"genshinUidLimit", "hsrUidLimit"} {
+		for _, value := range []any{0, 1, int64(100), float64(1)} {
+			assert.True(t, ValidatePolicyValue(key, value), key)
+		}
+		for _, value := range []any{-1, 101, "1", 1.5} {
+			assert.False(t, ValidatePolicyValue(key, value), key)
+		}
+	}
+}
