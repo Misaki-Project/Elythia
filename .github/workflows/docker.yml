@@ -11,7 +11,7 @@ name: Docker
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, codex/upstream-34ec-ci-base-20261114]
     # このリポジトリのリリースタグは `1.1.1` 形式で `v` 接頭辞を付けない。
     # `v*` だけだと一度も一致せず、リリースを打ってもバージョン付き image が
     # publish されない状態だった (1.0.0 / 1.1.0 が GHCR に存在しなかった)。

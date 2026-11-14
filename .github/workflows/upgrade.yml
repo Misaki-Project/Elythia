@@ -14,7 +14,7 @@ name: Upgrade from the previous release
 
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, codex/upstream-34ec-ci-base-20261114]
     paths:
       - "migration/**"
       - "internal/**"

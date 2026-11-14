@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, codex/upstream-34ec-ci-base-20261114]
   pull_request:
     branches: [main, develop]
 

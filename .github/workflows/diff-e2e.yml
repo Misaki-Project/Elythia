@@ -22,7 +22,7 @@ name: Diff e2e
 
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, codex/upstream-34ec-ci-base-20261114]
     # レスポンスの値に影響しうる変更だけを対象にする。
     paths:
       - "internal/**"
