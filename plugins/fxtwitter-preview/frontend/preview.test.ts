@@ -695,7 +695,7 @@ test('cached Blob load settling after abort cannot publish a URL', async () => {
 	let finish!: () => void;
 	publicImageResponse = () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
 		finish = () => { controller.enqueue(new TextEncoder().encode('png')); controller.close(); };
-	} }), { headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } }));
+	} }), { headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } });
 	const response = data(); response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
 	const view = card(response); await waitFor(() => expect(finish).toBeTypeOf('function'));
 	await view.rerender({ context: { ...context, active: false } }); finish();
