@@ -74,6 +74,7 @@ const levelRoleResponse = await roleLevelApi<{ roles: RoleLevelConfig[] }>('plug
 const levelRoleConfigs = Array.isArray(levelRoleResponse?.roles) ? levelRoleResponse.roles : [];
 const levelRoleIds = new Set(levelRoleConfigs.map(role => role.roleId));
 for (const role of roles) if (isLegacyLevelRole(role as { target: string })) levelRoleIds.add(role.id);
+
 function isLevelRole(role: { id: string; target: string }) {
 	return levelRoleIds.has(role.id) || isLegacyLevelRole(role);
 }

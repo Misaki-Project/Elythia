@@ -38,7 +38,7 @@ describe('原神の取得間隔ポリシーの管理画面配線', () => {
 	it('不正な値をpolicyモデルへ渡さない', () => {
 		for (const value of [1, 10, 1440]) expect(isGenshinRefreshInterval(value)).toBe(true);
 		for (const value of [0, 1441, 1.5, NaN, Infinity, '', null, '10', true]) expect(isGenshinRefreshInterval(value)).toBe(false);
-		expect(form).toContain('if (isGenshinRefreshInterval(value)) genshinRefreshIntervalModel.value = value;');
+		expect(form).toMatch(/set:\s*\(value:\s*number\)\s*=>\s*\{\s*if\s*\(Number\.isInteger\(value\)\s*&&\s*value\s*>=\s*1\s*&&\s*value\s*<=\s*1440\)\s*genshinRefreshIntervalMinutesModel\.value\s*=\s*value;/);
 	});
 	it('レベル付きロールも数値と認識して定数・倍率の結果を検証する', () => {
 		expect(levelForm).toContain(`'${key}'`);
@@ -65,7 +65,7 @@ describe('原神の取得間隔ポリシーの管理画面配線', () => {
 		expect(levelForm).toContain('normalizeRefreshRanges();');
 	});
 	it('日本語ラベルと説明を生成localeにも含める', () => {
-		const source = read('locales/ja-JP.yml');
+		const source = read('locales-elythia/ja-JP.yml');
 		const generated = read('packages/i18n/src/autogen/locale.ts');
 		for (const suffix of ['', '_caption']) {
 			expect(source).toContain(`${key}${suffix}:`);

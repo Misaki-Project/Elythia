@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -189,5 +191,256 @@ func TestDecodeInventoryRejectsTrailingJSON(t *testing.T) {
 	data = append(data, []byte(" {}")...)
 	if _, err := decodeInventory(data); err == nil {
 		t.Fatal("trailing JSON object passed inventory decoder")
+	}
+}
+
+func TestCompareRejectsFailClosedInventoryDrift(t *testing.T) {
+	tests := []struct {
+		name   string
+		want   string
+		mutate func(*inventory, *inventory, *migrationAdditions)
+	}{
+		{"source revision", "INVENTORY_REVISION_MISMATCH", func(actual, _ *inventory, _ *migrationAdditions) { actual.SourceRevision = strings.Repeat("b", 40) }},
+		{"baseline format", "CORE_MIGRATIONS_DIFFER", func(_, baseline *inventory, _ *migrationAdditions) { baseline.Format = "unknown" }},
+		{"empty source core history", "CORE_MIGRATIONS_DIFFER", func(actual, _ *inventory, _ *migrationAdditions) { actual.CoreMigrations = nil }},
+		{"unapproved core migration", "CORE_MIGRATIONS_DIFFER", func(actual, _ *inventory, additions *migrationAdditions) {
+			item := coreMigration{Version: 142, Path: "migration/000142_reviewed_change.up.sql", SHA256: strings.Repeat("a", 64)}
+			actual.CoreMigrations = append(actual.CoreMigrations, item)
+			additions.CoreMigrations = []coreMigration{{Version: 143, Path: item.Path, SHA256: item.SHA256}}
+		}},
+		{"invalid core path", "CORE_MIGRATIONS_DIFFER", func(actual, _ *inventory, additions *migrationAdditions) {
+			item := coreMigration{Version: 142, Path: "migration/local/000142_wrong_track.up.sql", SHA256: strings.Repeat("a", 64)}
+			actual.CoreMigrations = append(actual.CoreMigrations, item)
+			additions.CoreMigrations = []coreMigration{item}
+		}},
+		{"invalid core hash", "CORE_MIGRATIONS_DIFFER", func(actual, _ *inventory, additions *migrationAdditions) {
+			item := coreMigration{Version: 142, Path: "migration/000142_reviewed_change.up.sql", SHA256: "bad"}
+			actual.CoreMigrations = append(actual.CoreMigrations, item)
+			additions.CoreMigrations = []coreMigration{item}
+		}},
+		{"unapproved local migration", "LOCAL_MIGRATIONS_DIFFER", func(actual, _ *inventory, _ *migrationAdditions) {
+			actual.LocalMigrations = append(actual.LocalMigrations, coreMigration{Version: 2, Path: "migration/local/000002_reviewed_change.up.sql", SHA256: strings.Repeat("a", 64)})
+		}},
+		{"plugin set", "PLUGIN_SET_DIFFER", func(actual, _ *inventory, _ *migrationAdditions) {
+			actual.Plugins["unexpected"] = pluginEntry{SourceRef: "external@pin", Version: "1.0.0"}
+		}},
+		{"missing approved plugin version", "PLUGIN_MIGRATIONS_DIFFER", func(_, _ *inventory, additions *migrationAdditions) {
+			entry := additions.Plugins["hsr"]
+			entry.Version = ""
+			additions.Plugins["hsr"] = entry
+		}},
+		{"invalid plugin migration sequence", "APPROVED_PLUGIN_MIGRATION_SEQUENCE_INVALID", func(_, _ *inventory, additions *migrationAdditions) {
+			entry := additions.Plugins["tracking-parameter-cleaner"]
+			entry.Migrations = []migration{{Version: 2, SQLHash: strings.Repeat("a", 64)}}
+			additions.Plugins["tracking-parameter-cleaner"] = entry
+		}},
+		{"invalid plugin migration hash", "APPROVED_PLUGIN_MIGRATION_SEQUENCE_INVALID", func(_, _ *inventory, additions *migrationAdditions) {
+			entry := additions.Plugins["tracking-parameter-cleaner"]
+			entry.Migrations = []migration{{Version: 1, SQLHash: "bad"}}
+			additions.Plugins["tracking-parameter-cleaner"] = entry
+		}},
+		{"actual plugin version", "PLUGIN_MIGRATIONS_DIFFER", func(actual, _ *inventory, _ *migrationAdditions) {
+			entry := actual.Plugins["hsr"]
+			entry.Version += "-changed"
+			actual.Plugins["hsr"] = entry
+		}},
+		{"local plugin source revision", "LOCAL_PLUGIN_REVISION_MISMATCH", func(actual, _ *inventory, _ *migrationAdditions) {
+			entry := actual.Plugins["fxtwitter-preview"]
+			entry.SourceRef = "local@wrong"
+			actual.Plugins["fxtwitter-preview"] = entry
+		}},
+		{"external plugin pin", "EXTERNAL_PLUGIN_PIN_MISMATCH", func(actual, _ *inventory, _ *migrationAdditions) {
+			entry := actual.Plugins["hsr"]
+			entry.SourceRef += "-changed"
+			actual.Plugins["hsr"] = entry
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseline := loadBaseline(t)
+			additions := loadAdditions(t)
+			actual := withCandidateRevision(baseline)
+			tt.mutate(&actual, &baseline, &additions)
+			err := compare(actual, baseline, additions, testRevision)
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("compare error = %v, want %s", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeAdditionsRejectsInvalidJSON(t *testing.T) {
+	valid := []byte("{\"format\":\"elythia-production-migration-additions/v2\",\"core_migrations\":[],\"local_migrations\":[],\"plugins\":{}}")
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{"malformed", []byte("{\"format\":")},
+		{"unknown field", []byte("{\"format\":\"elythia-production-migration-additions/v2\",\"unexpected\":true}")},
+		{"trailing value", append(append([]byte(nil), valid...), []byte(" {}")...)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeAdditions(tt.data); err == nil {
+				t.Fatal("invalid additions JSON passed decoder")
+			}
+		})
+	}
+}
+
+func TestComparePluginRegistryRejectsInvalidBundles(t *testing.T) {
+	valid := strings.Join([]string{
+		"pluginbuild: dir=plugins/rolelevel name=role-level (role.example/plugin, frontend=false)",
+		"pluginbuild: dir=plugins/genshin name=genshin (gen.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/fedwatch name=fedwatch (fed.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/hsr name=hsr (hsr.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/fxtwitter-preview name=fxtwitter-preview (fx.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/tracking-parameter-cleaner name=tracking-parameter-cleaner (cleaner.example/plugin, frontend=true)",
+	}, "\n")
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{"duplicate directory", valid + "\npluginbuild: dir=plugins/rolelevel name=role-level (role.example/plugin, frontend=false)", "PLUGIN_REGISTRY_DIFFER"},
+		{"unknown directory", valid + "\npluginbuild: dir=plugins/extra name=extra (extra.example/plugin, frontend=false)", "PLUGIN_REGISTRY_DIFFER"},
+		{"malformed registration", valid + "\npluginbuild: dir=plugins/rolelevel", "PLUGIN_REGISTRY_DIFFER"},
+		{"incomplete bundle", strings.Replace(valid, "\npluginbuild: dir=plugins/hsr name=hsr (hsr.example/plugin, frontend=true)", "", 1), "PLUGIN_REGISTRY_INCOMPLETE"},
+		{"Fx frontend omitted", strings.Replace(valid, "dir=plugins/fxtwitter-preview name=fxtwitter-preview (fx.example/plugin, frontend=true)", "dir=plugins/fxtwitter-preview name=fxtwitter-preview (fx.example/plugin, frontend=false)", 1), "PLUGIN_FRONTEND_REGISTRATION_MISSING"},
+		{"cleaner frontend omitted", strings.Replace(valid, "dir=plugins/tracking-parameter-cleaner name=tracking-parameter-cleaner (cleaner.example/plugin, frontend=true)", "dir=plugins/tracking-parameter-cleaner name=tracking-parameter-cleaner (cleaner.example/plugin, frontend=false)", 1), "PLUGIN_FRONTEND_REGISTRATION_MISSING"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := comparePluginRegistry(tt.output)
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("registry error = %v, want %s", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestProductionInventoryMainHelperProcess(t *testing.T) {
+	if os.Getenv("CHECKPRODINVENTORY_HELPER") != "1" {
+		return
+	}
+	var args []string
+	if err := json.Unmarshal([]byte(os.Getenv("CHECKPRODINVENTORY_ARGS")), &args); err != nil {
+		t.Fatal(err)
+	}
+	flag.CommandLine = flag.NewFlagSet("checkproductioninventory", flag.ExitOnError)
+	os.Args = append([]string{"checkproductioninventory"}, args...)
+	main()
+}
+
+func TestProductionInventoryCLI(t *testing.T) {
+	type files struct {
+		inventory []byte
+		baseline  []byte
+		additions []byte
+		registry  []byte
+	}
+	baselineBytes, err := os.ReadFile(filepath.Join("..", "..", ".github", "release", "production-migration-baseline.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	additionsBytes, err := os.ReadFile(filepath.Join("..", "..", ".github", "release", "approved-production-migration-additions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualBytes, err := json.Marshal(withCandidateRevision(loadBaseline(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := []byte(strings.Join([]string{
+		"pluginbuild: dir=plugins/rolelevel name=role-level (role.example/plugin, frontend=false)",
+		"pluginbuild: dir=plugins/genshin name=genshin (gen.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/fedwatch name=fedwatch (fed.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/hsr name=hsr (hsr.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/fxtwitter-preview name=fxtwitter-preview (fx.example/plugin, frontend=true)",
+		"pluginbuild: dir=plugins/tracking-parameter-cleaner name=tracking-parameter-cleaner (cleaner.example/plugin, frontend=true)",
+	}, "\n"))
+	cases := []struct {
+		name        string
+		mutate      func(*files)
+		revision    string
+		wantCode    string
+		wantSuccess bool
+	}{
+		{"success", func(*files) {}, testRevision, "", true},
+		{"invalid revision", func(*files) {}, "not-a-sha", "ARGUMENTS_INVALID", false},
+		{"baseline hash mismatch", func(f *files) { f.baseline = append(append([]byte(nil), f.baseline...), ' ') }, testRevision, "BASELINE_HASH_MISMATCH", false},
+		{"additions hash mismatch", func(f *files) { f.additions = append(append([]byte(nil), f.additions...), ' ') }, testRevision, "APPROVED_ADDITIONS_HASH_MISMATCH", false},
+		{"inventory unreadable", func(*files) {}, testRevision, "INVENTORY_UNREADABLE", false},
+		{"plugin registry mismatch", func(f *files) {
+			f.registry = []byte("pluginbuild: dir=plugins/rolelevel name=role-level (role.example/plugin, frontend=false)")
+		}, testRevision, "PLUGIN_REGISTRY_INCOMPLETE", false},
+		{"pluginbuild output unreadable", func(*files) {}, testRevision, "PLUGINBUILD_OUTPUT_UNREADABLE", false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := files{
+				inventory: append([]byte(nil), actualBytes...),
+				baseline:  append([]byte(nil), baselineBytes...),
+				additions: append([]byte(nil), additionsBytes...),
+				registry:  append([]byte(nil), registry...),
+			}
+			tt.mutate(&payload)
+			dir := t.TempDir()
+			inventoryPath := filepath.Join(dir, "inventory.json")
+			baselinePath := filepath.Join(dir, "baseline.json")
+			additionsPath := filepath.Join(dir, "additions.json")
+			registryPath := filepath.Join(dir, "pluginbuild.log")
+			for path, data := range map[string][]byte{inventoryPath: payload.inventory, baselinePath: payload.baseline, additionsPath: payload.additions, registryPath: payload.registry} {
+				if err := os.WriteFile(path, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{
+				"--inventory=" + inventoryPath, "--baseline=" + baselinePath,
+				"--approved-additions=" + additionsPath, "--pluginbuild-output=" + registryPath,
+				"--revision=" + tt.revision,
+			}
+			if tt.name == "inventory unreadable" {
+				args[0] = "--inventory=" + filepath.Join(dir, "missing-inventory.json")
+			}
+			if tt.name == "pluginbuild output unreadable" {
+				args[3] = "--pluginbuild-output=" + filepath.Join(dir, "missing-pluginbuild.log")
+			}
+			argsJSON, err := json.Marshal(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantSuccess {
+				savedArgs, savedFlags, savedStdout := os.Args, flag.CommandLine, os.Stdout
+				outputFile, err := os.CreateTemp(t.TempDir(), "cli-output-*.txt")
+				if err != nil {
+					t.Fatal(err)
+				}
+				restoreGlobals := func() {
+					os.Args, flag.CommandLine, os.Stdout = savedArgs, savedFlags, savedStdout
+				}
+				defer restoreGlobals()
+				flag.CommandLine = flag.NewFlagSet("checkproductioninventory", flag.ExitOnError)
+				os.Args = append([]string{"checkproductioninventory"}, args...)
+				os.Stdout = outputFile
+				main()
+				restoreGlobals()
+				if err := outputFile.Close(); err != nil {
+					t.Fatal(err)
+				}
+				output, err := os.ReadFile(outputFile.Name())
+				if err != nil || !strings.Contains(string(output), "PRODUCTION_INVENTORY_OK core=") {
+					t.Fatalf("CLI success output = %q, error = %v", output, err)
+				}
+				return
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestProductionInventoryMainHelperProcess$")
+			cmd.Env = append(os.Environ(), "CHECKPRODINVENTORY_HELPER=1", "CHECKPRODINVENTORY_ARGS="+string(argsJSON))
+			output, runErr := cmd.CombinedOutput()
+			text := string(output)
+			if runErr == nil || !strings.Contains(text, tt.wantCode) {
+				t.Fatalf("CLI output = %q, error = %v, want code %s", text, runErr, tt.wantCode)
+			}
+		})
 	}
 }

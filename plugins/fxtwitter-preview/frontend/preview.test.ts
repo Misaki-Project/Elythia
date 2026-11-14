@@ -24,6 +24,8 @@ let api: ReturnType<typeof vi.fn>;
 let media: ReturnType<typeof vi.fn>;
 let viewer = vi.fn<PluginHost['openMedia']>();
 let intersect: (visible: boolean) => void;
+let publicImageResponse: () => Response | Promise<Response>;
+let publicVideoResponse: () => Response | Promise<Response>;
 const videoURL = '/api/plugin/fxtwitter-preview/media/video/1234567890/main/0?noteId=note-1&token=opaque-token';
 const quoteVideoURL = '/api/plugin/fxtwitter-preview/media/video/1234567890/quote/0?noteId=note-1&token=opaque-token';
 const videoDescriptor = (playbackUrl = videoURL, mediaIdentity = 'x-video-main') => ({ provider: 'x' as const, mediaIdentity, playbackAvailable: true, playbackUrl, durationMs: 65_000 });
@@ -65,6 +67,14 @@ function previewCalls() {
 	return api.mock.calls.filter(call => call[0].endsWith('/preview'));
 }
 
+function prepareCalls(kind?: string) {
+	return api.mock.calls.filter(call => call[0].endsWith('/media/prepare') && (kind == null || call[1]?.kind === kind));
+}
+
+function publicFetchCalls() {
+	return fetchMock.mock.calls.filter(([url]) => String(url).includes('/public-media/'));
+}
+
 function retryButton(view: ReturnType<typeof retryCard>): HTMLButtonElement {
 	const button = view.container.querySelector<HTMLButtonElement>('[data-fx-preview-retry]');
 	expect(button).not.toBeNull();
@@ -84,19 +94,38 @@ function must<T>(value: T | null | undefined): T {
 }
 
 beforeEach(() => {
-	api = vi.fn(async (path: string, _params: Record<string, string>) => {
+	api = vi.fn(async (path: string, params: Record<string, string>) => {
 		if (path.endsWith('/capabilities')) return { externalFetchEnabled: true };
 		if (path.endsWith('/preview')) return data();
-		if (path.endsWith('/media/prepare')) return { url: '/api/plugin/fxtwitter-preview/public-media/0123456789abcdef0123456789abcdef.mp4', contentType: 'video/mp4', expiresAt: '2026-11-14T00:10:00Z', size: 3 };
+		if (path.endsWith('/media/prepare')) {
+			const isVideo = params.kind === 'video';
+			return {
+				url: `/api/plugin/fxtwitter-preview/public-media/0123456789abcdef0123456789abcdef.${isVideo ? 'mp4' : 'png'}`,
+				contentType: isVideo ? 'video/mp4' : 'image/png',
+				expiresAt: '2026-11-14T00:10:00Z',
+				size: 3,
+			};
+		}
 		throw new Error(`unexpected ${path}`);
 	});
 	media = vi.fn(async () => new Response(new Blob(['png'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
 	viewer = vi.fn(async () => undefined);
+	publicImageResponse = () => new Response('png', { status: 200, headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } });
+	publicVideoResponse = () => new Response('mp4', { status: 200, headers: { 'Content-Type': 'video/mp4', 'Content-Length': '3' } });
 	initApi(api as PluginHost['api'], media as PluginHost['fetch'], viewer);
 	Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => `blob:fx-${crypto.randomUUID()}`) });
 	Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
 	Object.defineProperty(window.document, 'visibilityState', { configurable: true, value: 'visible' });
-	fetchMock.mockIf(/\/api\/plugin\/fxtwitter-preview\/public-media\/.*\.mp4$/, { status: 200, body: 'mp4', headers: { 'Content-Type': 'video/mp4', 'Content-Length': '3' } });
+	fetchMock.mockIf(request => {
+		const pathname = new URL(request.url).pathname;
+		return pathname === '/url' || pathname.startsWith('/api/plugin/fxtwitter-preview/public-media/');
+	}, request => {
+		const url = new URL(request.url);
+		if (url.pathname === '/url') return new Response(JSON.stringify({ url: input.href, player: { url: null, width: null, height: null, allow: [] } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+		if (url.pathname.endsWith('.png')) return publicImageResponse();
+		if (url.pathname.endsWith('.mp4')) return publicVideoResponse();
+		return new Response('', { status: 404 });
+	});
 	vi.stubGlobal('IntersectionObserver', class {
 		constructor(callback: IntersectionObserverCallback) { intersect = visible => callback([{ isIntersecting: visible } as IntersectionObserverEntry], this as unknown as IntersectionObserver); }
 		observe() { intersect(true); }
@@ -104,6 +133,9 @@ beforeEach(() => {
 	});
 	preferState.nsfw = 'respect';
 	preferState.confirmWhenRevealingSensitiveMedia = false;
+	preferState.fxTwitterPreviewMode = 'media';
+	const fxModePreference = preferReactive.fxTwitterPreviewMode ??= ref('media');
+	fxModePreference.value = 'media';
 	// The host test helper's Record type is wider than its lazily created runtime entries.
 	const nsfwPreference = Object.entries(preferReactive).find(([key]) => key === 'nsfw')?.[1];
 	if (nsfwPreference != null) nsfwPreference.value = 'respect';
@@ -132,11 +164,12 @@ test('OGP mode keeps the host URL card and waits for an explicit Fx action', asy
 	await register();
 	const view = coordinate();
 	const manual = await view.findByRole('button', { name: 'FxTwitter' });
-	expect(view.container.querySelector(`a[href="${input.href}"]`)).toBeTruthy();
+	const nativeTweet = view.container.querySelector<HTMLIFrameElement>('iframe[src^="https://platform.twitter.com/embed/index.html"]');
+	expect(nativeTweet?.src).toContain('id=1234567890');
 	expect(api.mock.calls.filter(call => call[0].endsWith('/preview'))).toHaveLength(0);
-	expect(view.container.querySelector('iframe')).toBeNull();
 	await fireEvent.click(manual);
 	await waitFor(() => expect(api.mock.calls.filter(call => call[0].endsWith('/preview'))).toHaveLength(1));
+	expect(view.container.querySelector('iframe[src^="https://platform.twitter.com/embed/index.html"]')?.getAttribute('src')).toContain('id=1234567890');
 });
 test('provider authorization failure returns to the host standard URL preview', async () => {
 	api.mockImplementation(async path => {
@@ -149,8 +182,13 @@ test('provider authorization failure returns to the host standard URL preview', 
 	if (preference != null) preference.value = 'media';
 	const view = coordinate();
 	await waitFor(() => expect(api.mock.calls.some(call => call[0].endsWith('/preview'))).toBe(true));
-	await waitFor(() => expect(view.container.querySelector('a[href="https://x.com/alice/status/1234567890"]')).toBeTruthy());
-	expect(view.container.querySelector('iframe')).toBeNull();
+	const nativeTweet = await waitFor(() => {
+		const iframe = view.container.querySelector<HTMLIFrameElement>('iframe[src^="https://platform.twitter.com/embed/index.html"]');
+		expect(iframe?.src).toContain('id=1234567890');
+		return iframe;
+	});
+	expect(nativeTweet).not.toBeNull();
+	expect(prepareCalls('video')).toHaveLength(0);
 });
 test.each([{ detail: false }, { revealed: false }, { active: false }, { inViewport: false }, { source: null }])('direct loader refuses gated context %j', async patch => {
 	await expect(loadPreview(input, { ...context, ...patch }, new AbortController().signal)).rejects.toThrow();
@@ -254,7 +292,7 @@ test('retry overrides are discarded on note ownership change and use only the ne
 });
 
 test.each(['success', 'failure'] as const)('main and quote photos coexist with their videos after image %s', async result => {
-	if (result === 'failure') media.mockRejectedValue(new Error('image failed'));
+	if (result === 'failure') publicImageResponse = () => new Response('', { status: 503 });
 	const view = card(mixedData()); await flushPreview();
 	if (result === 'success') {
 		expect(view.container.querySelector('img[alt="main photo"]')).toBeTruthy();
@@ -264,7 +302,10 @@ test.each(['success', 'failure'] as const)('main and quote photos coexist with t
 	expect(view.container.querySelector('[data-fx-video-target="quote"] [data-fx-video-play]')).toBeTruthy();
 	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeTruthy();
 	expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeTruthy();
-	expect(view.container.querySelector('iframe')).toBeNull(); expect(api).not.toHaveBeenCalled();
+	expect(view.container.querySelector('iframe')).toBeNull();
+	expect(prepareCalls().map(call => call[1]?.kind)).toEqual(expect.arrayContaining(['image', 'quote-image']));
+	expect(prepareCalls('video')).toHaveLength(0);
+	expect(publicFetchCalls().every(([, options]) => options?.credentials === 'omit')).toBe(true);
 });
 
 test('a newly mounted pending card respects the server retry time without issuing work', async () => {
@@ -294,7 +335,7 @@ test('main and quoted videos open as separate native viewer items without embedd
 	await fireEvent.click(buttons[1]);
 	await waitFor(() => expect(viewer).toHaveBeenCalledTimes(2));
 	expect(viewer.mock.calls[1][0][0]).toMatchObject({ type: 'video', id: '9876543210:video:0', filename: 'x-9876543210-1.mp4' });
-	expect(api.mock.calls.filter(call => call[0].endsWith('/media/prepare')).map(call => call[1])).toEqual([
+	expect(prepareCalls('video').map(call => call[1])).toEqual([
 		expect.objectContaining({ noteId: 'note-1', postId: '1234567890', kind: 'video', target: 'main', index: 0, playbackUrl: videoURL }),
 		expect.objectContaining({ noteId: 'note-1', postId: '1234567890', kind: 'video', target: 'quote', index: 0, playbackUrl: quoteVideoURL }),
 	]);
@@ -372,11 +413,11 @@ test.each(['deleted', 'unknown'])('quoted unavailable %s stays separate from the
 });
 test('media is revoked and late media cannot revive after source-note switch', async () => {
 	let finish!: (value: Response) => void;
-	media.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+	publicImageResponse = () => new Promise(resolve => { finish = resolve; });
 	const response = data(); response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1', alt: 'accurate alt' }];
 	const view = card(response);
-	await waitFor(() => expect(media).toHaveBeenCalledTimes(1));
-	const signal = media.mock.calls[0][1].signal;
+	await waitFor(() => expect(publicFetchCalls()).toHaveLength(1));
+	const signal = publicFetchCalls()[0][1]?.signal as AbortSignal;
 	await view.rerender({ context: { ...context, source: null } });
 	expect(signal.aborted).toBe(true);
 	finish(new Response(new Blob(['png'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png' } }));
@@ -385,9 +426,11 @@ test('media is revoked and late media cannot revive after source-note switch', a
 	expect(URL.createObjectURL).not.toHaveBeenCalled();
 });
 test.each(['image/svg+xml', 'text/html', 'application/octet-stream'])('unsafe Blob MIME %s never reaches an image or viewer', async mime => {
-	media.mockResolvedValue(new Response(new Blob(['unsafe'], { type: mime }), { headers: { 'Content-Type': mime } }));
+	publicImageResponse = () => new Response('bad', { status: 200, headers: { 'Content-Type': mime, 'Content-Length': '3' } });
 	const response = data(); response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
-	const view = card(response); await nextTick(); await nextTick(); await nextTick();
+	const view = card(response);
+	await waitFor(() => expect(publicFetchCalls()).toHaveLength(1));
+	await waitFor(() => expect(view.getByText(/メディアを読み込めませんでした/)).toBeTruthy());
 	expect(URL.createObjectURL).not.toHaveBeenCalled();
 	expect(view.container.querySelector('img')).toBeNull(); expect(viewer).not.toHaveBeenCalled();
 });
@@ -446,13 +489,14 @@ test('ready photos remain owned offscreen and re-entry does not refetch them', a
 	await waitFor(() => expect(view.container.querySelector('img[alt="retained offscreen photo"]')).toBeTruthy());
 	const image = must(view.container.querySelector('img[alt="retained offscreen photo"]'));
 	const objectUrl = image.getAttribute('src');
-	const fetchCount = media.mock.calls.length;
+	const fetchCount = publicFetchCalls().length;
+	const prepareCount = prepareCalls('image').length;
 	await view.rerender({ context: { ...context, inViewport: false } });
 	expect(view.container.querySelector('img[alt="retained offscreen photo"]')?.getAttribute('src')).toBe(objectUrl);
 	await view.rerender({ context });
 	expect(view.container.querySelector('img[alt="retained offscreen photo"]')?.getAttribute('src')).toBe(objectUrl);
-	expect(media).toHaveBeenCalledTimes(fetchCount);
-	expect(api).not.toHaveBeenCalled();
+	expect(publicFetchCalls()).toHaveLength(fetchCount);
+	expect(prepareCalls('image')).toHaveLength(prepareCount);
 });
 test('CW collapse aborts an in-flight video prepare before public bytes reach the viewer', async () => {
 	let finish!: (value: { url: string; contentType: string; expiresAt: string; size: number }) => void;
@@ -503,7 +547,8 @@ test('safe authenticated Blob opens with separate filename, accurate alt and sen
 	await fireEvent.click(view.getByRole('button', { name: 'image description' }));
 	expect(viewer).toHaveBeenCalledWith([expect.objectContaining({ type: 'image', filename: 'x-1234567890-1', alt: 'image description', isSensitive: true, initiallyRevealed: true, width: 600, height: 400 })], '1234567890:0');
 	expect(viewer.mock.calls[0][0][0].blob.type).toBe('image/png');
-	expect(media.mock.calls[0][1]).toMatchObject({ method: 'GET', cache: 'no-store', signal: expect.any(AbortSignal) });
+	expect(prepareCalls('image')[0][1]).toMatchObject({ noteId: 'note-1', postId: '1234567890', kind: 'image', index: 0 });
+	expect(publicFetchCalls()[0][1]).toMatchObject({ method: 'GET', credentials: 'omit', mode: 'same-origin', cache: 'default', signal: expect.any(AbortSignal) });
 });
 test.each([
 	'https://evil.example/api/plugin/fxtwitter-preview/media/video/1234567890/main/0?noteId=note-1&token=opaque',
@@ -522,7 +567,9 @@ test.each([
 test('unsupported external video stays a source link without a playback request', async () => {
 	const response = data(); response.post.videos = []; response.post.video = { provider: 'external' };
 	const view = card(response); await nextTick(); await nextTick();
-	expect(view.container.querySelector('[data-fx-video-play],iframe')).toBeNull(); expect(api).not.toHaveBeenCalled();
+	const play = view.container.querySelector<HTMLButtonElement>('[data-fx-video-play]');
+	expect(play).not.toBeNull(); expect(play?.disabled).toBe(true);
+	expect(view.container.querySelector('iframe')).toBeNull(); expect(prepareCalls('video')).toHaveLength(0);
 	expect(view.queryByText('メディアを読み込めませんでした。')).toBeNull();
 	expect(view.getByText('Xで投稿を開く').getAttribute('href')).toBe('https://x.com/i/status/1234567890');
 });
@@ -602,10 +649,17 @@ test.each([
 	{ failure: 'rejected', kind: 'image' }, { failure: 'http', kind: 'image' }, { failure: 'mime', kind: 'image' }, { failure: 'blob', kind: 'image' },
 	{ failure: 'rejected', kind: 'avatar' }, { failure: 'http', kind: 'avatar' }, { failure: 'mime', kind: 'avatar' }, { failure: 'blob', kind: 'avatar' },
 ] as const)('expected media $kind $failure failure is visible with body and source fallback', async ({ failure, kind }) => {
-	if (failure === 'rejected') media.mockRejectedValue(new Error('fetch failed'));
-	if (failure === 'http') media.mockResolvedValue(new Response('', { status: 503 }));
-	if (failure === 'mime') media.mockResolvedValue(new Response(new Blob(['unsafe'], { type: 'text/html' }), { headers: { 'Content-Type': 'text/html' } }));
-	if (failure === 'blob') media.mockResolvedValue({ ok: true, headers: new Headers({ 'Content-Type': 'image/png' }), blob: async () => { throw new Error('blob failed'); } });
+	if (kind === 'image') {
+		if (failure === 'rejected') publicImageResponse = () => Promise.reject(new Error('fetch failed'));
+		if (failure === 'http') publicImageResponse = () => new Response('', { status: 503 });
+		if (failure === 'mime') publicImageResponse = () => new Response('bad', { status: 200, headers: { 'Content-Type': 'text/html', 'Content-Length': '3' } });
+		if (failure === 'blob') publicImageResponse = () => new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error('blob failed')); } }), { headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } });
+	} else {
+		if (failure === 'rejected') media.mockRejectedValue(new Error('fetch failed'));
+		if (failure === 'http') media.mockResolvedValue(new Response('', { status: 503 }));
+		if (failure === 'mime') media.mockResolvedValue(new Response(new Blob(['unsafe'], { type: 'text/html' }), { headers: { 'Content-Type': 'text/html' } }));
+		if (failure === 'blob') media.mockResolvedValue({ ok: true, headers: new Headers({ 'Content-Type': 'image/png' }), blob: async () => { throw new Error('blob failed'); } });
+	}
 	const response = data();
 	response.post.video = { provider: 'external' };
 	if (kind === 'image') response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
@@ -620,11 +674,11 @@ test.each([
 
 test.each(['inactive', 'source', 'session'] as const)('late media failure after %s cannot publish an old error', async change => {
 	let reject!: (reason: Error) => void;
-	media.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+	publicImageResponse = () => new Promise((_resolve, fail) => { reject = fail; });
 	const response = data(); response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
 	const view = card(response);
-	await waitFor(() => expect(media).toHaveBeenCalledTimes(1));
-	const signal = media.mock.calls[0][1].signal;
+	await waitFor(() => expect(publicFetchCalls()).toHaveLength(1));
+	const signal = publicFetchCalls()[0][1]?.signal as AbortSignal;
 	if (change === 'inactive') await view.rerender({ context: { ...context, active: false } });
 	if (change === 'source') await view.rerender({ data: { state: 'ready', post: { ...response.post, images: [], video: undefined } }, context: { ...context, source: { kind: 'note', noteId: 'note-2' } } });
 	if (change === 'session') initApi(api as PluginHost['api'], media as PluginHost['fetch'], viewer);
@@ -638,11 +692,13 @@ test.each(['inactive', 'source', 'session'] as const)('late media failure after 
 	expect(URL.createObjectURL).not.toHaveBeenCalled();
 });
 test('cached Blob load settling after abort cannot publish a URL', async () => {
-	let finish!: (value: Blob) => void;
-	media.mockResolvedValue({ ok: true, headers: new Headers({ 'Content-Type': 'image/png' }), blob: () => new Promise(resolve => { finish = resolve; }) });
+	let finish!: () => void;
+	publicImageResponse = () => new Response(new ReadableStream<Uint8Array>({ start(controller) {
+		finish = () => { controller.enqueue(new TextEncoder().encode('png')); controller.close(); };
+	} }), { headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } }));
 	const response = data(); response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
 	const view = card(response); await waitFor(() => expect(finish).toBeTypeOf('function'));
-	await view.rerender({ context: { ...context, active: false } }); finish(new Blob(['png'], { type: 'image/png' }));
+	await view.rerender({ context: { ...context, active: false } }); finish();
 	await nextTick(); await nextTick(); expect(URL.createObjectURL).not.toHaveBeenCalled(); expect(view.container.querySelector('img')).toBeNull();
 });
 test('moderator page accurately labels normalized body and retention semantics', async () => {
@@ -733,7 +789,20 @@ test.each([{ detail: false }, { revealed: false }, { active: false }, { inViewpo
 test('current coordinator KeepAlive deactivation disposes ready media without creating an iframe', async () => {
 	const response = data();
 	response.post.author.avatarUrl = '/api/plugin/fxtwitter-preview/media/1234567890/avatar/0?noteId=note-1';
-	api.mockImplementation(async path => path.endsWith('/capabilities') ? { externalFetchEnabled: true } : path.endsWith('/preview') ? response : { url: '/api/plugin/fxtwitter-preview/public-media/0123456789abcdef0123456789abcdef.mp4', contentType: 'video/mp4', expiresAt: '2026-11-14T00:10:00Z', size: 3 });
+	api.mockImplementation(async (path, params) => {
+		if (path.endsWith('/capabilities')) return { externalFetchEnabled: true };
+		if (path.endsWith('/preview')) return response;
+		if (path.endsWith('/media/prepare')) {
+			const isVideo = params.kind === 'video';
+			return {
+				url: `/api/plugin/fxtwitter-preview/public-media/0123456789abcdef0123456789abcdef.${isVideo ? 'mp4' : 'png'}`,
+				contentType: isVideo ? 'video/mp4' : 'image/png',
+				expiresAt: '2026-11-14T00:10:00Z',
+				size: 3,
+			};
+		}
+		throw new Error(`unexpected ${path}`);
+	});
 	await register();
 	const shown = ref(true);
 	// This independent wrapper exercises the real coordinator's KeepAlive lifecycle.

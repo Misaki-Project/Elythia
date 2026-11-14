@@ -62,13 +62,13 @@ SPDX-License-Identifier: AGPL-3.0-only
 										{ value: 'text', label: i18n.ts._settings.fxTwitterPreviewModeText },
 										{ value: 'media', label: i18n.ts._settings.fxTwitterPreviewModeMedia },
 										]">
-											<template #label><SearchLabel>{{ i18n.ts._settings.fxTwitterPreviewMode }}</SearchLabel></template>
+											<template #label>{{ i18n.ts._settings.fxTwitterPreviewMode }}</template>
 											<template #caption><SearchText>{{ i18n.ts._settings.fxTwitterPreviewModeDescription }}</SearchText></template>
 										</MkSelect>
 									</MkPreferenceContainer>
 									<MkPreferenceContainer k="trackingParameterCleanerEnabled">
 										<MkSwitch v-model="trackingParameterCleanerEnabled">
-											<template #label><SearchLabel>{{ i18n.ts.trackingParameterCleanerEnabled }}</SearchLabel></template>
+										<template #label>{{ i18n.ts.trackingParameterCleanerEnabled }}</template>
 										</MkSwitch>
 									</MkPreferenceContainer>
 								</div>

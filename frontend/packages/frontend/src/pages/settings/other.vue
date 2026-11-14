@@ -177,7 +177,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { computed, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import XMigration from './migration.vue';
 import XFederation from './federation.vue';
 import MkSwitch from '@/components/MkSwitch.vue';
