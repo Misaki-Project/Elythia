@@ -233,6 +233,7 @@ export const ROUTE_TABLE: RouteEntry[] = [
   { route: '/about', kind: 'public', area: 'misc', path: at('/about'), marker: () => ({ title: 'Instance Information', text: 'Overview' }) },
   { route: '/about-misskey', kind: 'public', area: 'misc', path: at('/about-misskey'), marker: () => ({ title: 'About Misskey' }) },
   { route: '/about-elythia', kind: 'public', area: 'misc', path: at('/about-elythia'), marker: () => ({ title: 'About Elythia', testId: 'about-elythia-server-source' }) },
+  { route: '/game-rankings', kind: 'public', area: 'misc', path: at('/game-rankings'), marker: () => ({ testId: 'game-rankings', text: 'No game rankings are available.' }) },
   { route: '/contact', kind: 'public', area: 'misc', path: at('/contact'), marker: () => ({ title: 'Contact', text: 'Device information' }) },
   { route: '/ads', kind: 'public', area: 'misc', path: at('/ads'), marker: () => ({ title: 'Advertisements' }) },
   { route: '/invite', kind: 'public', area: 'misc', path: at('/invite'), marker: () => ({ title: 'Invite', api: 'invite/limit' }), signedOut: callsSignedInApi },
