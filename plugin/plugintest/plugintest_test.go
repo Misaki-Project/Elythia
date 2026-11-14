@@ -93,6 +93,60 @@ func TestCall_PassesRequestFields(t *testing.T) {
 	assert.Equal(t, "zzz", m["q"])
 }
 
+func TestActiveRoleRequestFakeReturnsConfiguredRolesAndErrors(t *testing.T) {
+	lookupErr := errors.New("active role lookup failed")
+	var active plugin.ActiveRoleRequest
+	def := plugin.Definition{Routes: func(_ plugin.Context, router plugin.Router) error {
+		router.POST("/active-roles", func(req plugin.Request) (any, error) {
+			active, _ = req.(plugin.ActiveRoleRequest)
+			if active == nil {
+				return nil, errors.New("active role extension is unavailable")
+			}
+			return active.ActiveRoleIDs()
+		})
+		return nil
+	}}
+	h := plugintest.New(t).Routes(def)
+	result, err := h.Call(t, "POST /active-roles", plugintest.Request{UserID: "viewer", ActiveRoleIDs: []string{"r2", "r1"}})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"r2", "r1"}, result)
+
+	_, err = h.Call(t, "POST /active-roles", plugintest.Request{UserID: "viewer", ActiveRoleError: lookupErr})
+	assert.ErrorIs(t, err, lookupErr)
+}
+
+func TestCheckedRolePolicyFakesProjectKeysAndPropagateErrors(t *testing.T) {
+	lookupErr := errors.New("policy lookup failed")
+	checkedContext, ok := plugintest.New(t).
+		WithCheckedUserRolePolicies(map[string]any{"policyA": true, "private": "hidden"}, nil).
+		Context().(plugin.CheckedUserRolePolicyContext)
+	require.True(t, ok)
+	got, err := checkedContext.CheckedUserRolePolicies("actor", "policyA")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"policyA": true}, got)
+
+	request := plugintest.Request{UserID: "viewer", CheckedRolePolicies: map[string]any{"policyA": true, "private": "hidden"}}
+	var checkedRequest plugin.CheckedRolePolicyRequest
+	def := plugin.Definition{Routes: func(_ plugin.Context, router plugin.Router) error {
+		router.POST("/check", func(req plugin.Request) (any, error) {
+			checkedRequest, ok = req.(plugin.CheckedRolePolicyRequest)
+			if !ok {
+				return nil, errors.New("checked role policy extension is unavailable")
+			}
+			return checkedRequest.CheckedRolePolicies("policyA")
+		})
+		return nil
+	}}
+	h := plugintest.New(t).Routes(def)
+	result, err := h.Call(t, "POST /check", request)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"policyA": true}, result)
+
+	request.CheckedRolePolicyError = lookupErr
+	_, err = h.Call(t, "POST /check", request)
+	require.ErrorIs(t, err, lookupErr)
+}
+
 // Body 未指定でも Bind が壊れないこと (空 body を明示しないテストが書ける)。
 func TestCall_EmptyBodyIsUsable(t *testing.T) {
 	h := plugintest.New(t).Routes(samplePlugin)

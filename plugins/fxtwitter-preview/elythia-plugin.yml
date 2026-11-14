@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: syuilo and misskey-project
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: fxtwitter-preview
+apiVersion: 1
+# Phase 2 ships the server implementation for review, but does not bundle or enable it.
+disabled: true

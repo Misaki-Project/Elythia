@@ -51,6 +51,30 @@ SPDX-License-Identifier: AGPL-3.0-only
 							</MkSwitch>
 						</SearchMarker>
 
+						<SearchMarker :keywords="['X', 'Twitter', 'FxTwitter', 'preview', 'プレビュー', 'tracking', 'parameter', 'cleaner']">
+							<MkFolder>
+								<template #label><SearchLabel>{{ i18n.ts._settings.fxTwitterPreviewMode }}</SearchLabel></template>
+								<template #icon><SearchIcon><i class="ti ti-brand-x"></i></SearchIcon></template>
+								<div class="_gaps_m">
+									<MkPreferenceContainer k="fxTwitterPreviewMode">
+										<MkSelect v-model="fxTwitterPreviewMode" :items="[
+										{ value: 'ogp', label: i18n.ts._settings.fxTwitterPreviewModeOgp },
+										{ value: 'text', label: i18n.ts._settings.fxTwitterPreviewModeText },
+										{ value: 'media', label: i18n.ts._settings.fxTwitterPreviewModeMedia },
+										]">
+											<template #label><SearchLabel>{{ i18n.ts._settings.fxTwitterPreviewMode }}</SearchLabel></template>
+											<template #caption><SearchText>{{ i18n.ts._settings.fxTwitterPreviewModeDescription }}</SearchText></template>
+										</MkSelect>
+									</MkPreferenceContainer>
+									<MkPreferenceContainer k="trackingParameterCleanerEnabled">
+										<MkSwitch v-model="trackingParameterCleanerEnabled">
+											<template #label><SearchLabel>{{ i18n.ts.trackingParameterCleanerEnabled }}</SearchLabel></template>
+										</MkSwitch>
+									</MkPreferenceContainer>
+								</div>
+							</MkFolder>
+						</SearchMarker>
+
 						<MkDisableSection :disabled="realtimeMode">
 							<SearchMarker :keywords="['polling', 'interval']">
 								<MkPreferenceContainer k="pollingInterval">
@@ -914,6 +938,8 @@ const $i = ensureSignin();
 
 const lang = ref(miLocalStorage.getItem('lang'));
 const dataSaver = ref(prefer.s.dataSaver);
+const fxTwitterPreviewMode = prefer.model('fxTwitterPreviewMode');
+const trackingParameterCleanerEnabled = prefer.model('trackingParameterCleanerEnabled');
 const realtimeMode = store.model('realtimeMode');
 
 const overridedDeviceKind = prefer.model('overridedDeviceKind');

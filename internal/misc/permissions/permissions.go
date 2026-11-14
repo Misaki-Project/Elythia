@@ -6,6 +6,9 @@
 // retained verbatim for parity.
 package permissions
 
+// WriteRoleLevelExperience is the app scope for the single XP mutation route.
+const WriteRoleLevelExperience = "write:admin:role-level-experience"
+
 // All is the ordered list of known permission kinds, matching upstream
 // misskey-js `permissions` exactly.
 var All = []string{
@@ -65,6 +68,7 @@ var All = []string{
 	"write:admin:unsuspend-user",
 	"write:admin:meta",
 	"write:admin:user-note",
+	WriteRoleLevelExperience,
 	"write:admin:roles",
 	"read:admin:roles",
 	"write:admin:relays",

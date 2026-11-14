@@ -1,0 +1,134 @@
+name: Misaki plugin compatibility
+
+on:
+  workflow_call:
+    outputs:
+      source_revision:
+        description: "source commit validated by plugin compatibility tests"
+        value: ${{ jobs.plugin-regressions.outputs.source_revision }}
+      migration_inventory_sha256:
+        description: "migration inventory validated against the production baseline"
+        value: ${{ jobs.plugin-regressions.outputs.migration_inventory_sha256 }}
+  pull_request:
+  push:
+    branches: [Misaki-develop]
+
+permissions:
+  contents: read
+
+jobs:
+  plugin-regressions:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: mk
+          POSTGRES_PASSWORD: mk
+          POSTGRES_DB: misskey_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U mk -d misskey_test"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      TEST_DB_HOST: localhost
+      TEST_DB_PORT: '5432'
+      TEST_DB_NAME: misskey_test
+      TEST_DB_USER: mk
+      TEST_DB_PASS: mk
+      MK_PLUGIN_TESTS_REQUIRE_DB: '1'
+    outputs:
+      source_revision: ${{ steps.inventory.outputs.source_revision }}
+      migration_inventory_sha256: ${{ steps.inventory.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Resolve pinned production plugins
+        run: |
+          set -euo pipefail
+          bash .github/scripts/resolve-production-plugins.sh .
+      - name: Vet, race tests and build production plugins and selected Fx
+        run: |
+          set -euo pipefail
+          for dir in plugins/rolelevel plugins/genshin plugins/fedwatch plugins/hsr plugins/fxtwitter-preview plugins/tracking-parameter-cleaner; do
+            (
+              cd "$dir"
+              # 外部プラグインの依存台帳は本体SDKのreplaceに合わせて準備する。
+              # runner上の変更をログへ残し、ソースや固定refには手を入れない。
+              if [ "$dir" = plugins/fedwatch ] || [ "$dir" = plugins/hsr ]; then
+                GOWORK=off go mod tidy
+                git diff -- go.mod go.sum
+              fi
+              GOWORK=off go mod download all
+              export GOWORK=off GOFLAGS=-mod=readonly
+              go vet ./...
+              go test ./... -v -race -count=1 -shuffle=3
+              go build ./...
+            )
+          done
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: frontend/package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: frontend/.node-version
+      - name: Generate plugin frontend wiring
+        id: wiring
+        run: |
+          set -euo pipefail
+          out=$(GOWORK=off go run ./tools/pluginbuild -include-disabled-dir plugins/fxtwitter-preview)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" > "$RUNNER_TEMP/pluginbuild-output.txt"
+          for dir in plugins/rolelevel plugins/genshin plugins/fedwatch plugins/hsr plugins/fxtwitter-preview plugins/tracking-parameter-cleaner; do
+            case "$out" in
+              *"dir=$dir "*) ;;
+              *) echo "::error::required production plugin directory was not registered: $dir"; exit 1 ;;
+            esac
+          done
+      - name: Verify production plugin registration and migrations
+        id: inventory
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse HEAD)
+          if [ "$revision" != "$GITHUB_SHA" ]; then
+            echo "checked out source differs from the workflow commit" >&2
+            exit 1
+          fi
+          go run -tags productioninventory ./tools/migrationinventory -revision "$revision" > "$RUNNER_TEMP/migration-inventory.json"
+          GOWORK=off go run ./tools/checkproductioninventory \
+            -inventory "$RUNNER_TEMP/migration-inventory.json" \
+            -baseline .github/release/production-migration-baseline.json \
+            -approved-additions .github/release/approved-production-migration-additions.json \
+            -pluginbuild-output "$RUNNER_TEMP/pluginbuild-output.txt" \
+            -revision "$revision"
+          inventory_sha=$(sha256sum "$RUNNER_TEMP/migration-inventory.json" | awk '{print $1}')
+          echo "source_revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "sha256=$inventory_sha" >> "$GITHUB_OUTPUT"
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Check plugin frontend regressions
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          # vitest設定も生成済みi18nを参照するため、workspace全体を先にビルドする。
+          pnpm build
+          pnpm --filter frontend exec vitest run --globals --config vitest.config.plugins.ts --maxWorkers=1
+          pnpm --filter frontend exec vitest run --config vitest.config.unit.ts test/unit/game-ranking-pages.test.ts test/unit/game-ranking-ui.test.ts test/unit/hsr-policy.test.ts
+      - name: Check selected Fx frontend source
+        run: |
+          set -euo pipefail
+          node plugins/fxtwitter-preview/frontend/check-frontend.mjs lint
+          node plugins/fxtwitter-preview/frontend/check-frontend.mjs spdx
+          pnpm --dir frontend/packages/frontend exec vue-tsc --noEmit -p ../../../plugins/fxtwitter-preview/frontend/tsconfig.json
+      - name: Check integrated production frontend
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          pnpm --no-bail --filter frontend --filter sw --filter misskey-js run typecheck
+          pnpm --filter frontend run eslint
+          pnpm --filter misskey-js api-prod

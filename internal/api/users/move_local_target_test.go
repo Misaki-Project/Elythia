@@ -14,6 +14,7 @@ import (
 func TestShow_MoveTargetResolution(t *testing.T) {
 	localMoveURI := "https://local.example/users/destination"
 	remoteMoveURI := "https://remote.example/users/destination"
+	oldOriginMoveURI := "https://old.example/users/destination"
 	unknownMoveURI := "https://unknown.example/users/destination"
 	remoteHost := "remote.example"
 
@@ -42,6 +43,25 @@ func TestShow_MoveTargetResolution(t *testing.T) {
 				AvatarDecorations: datatypes.JSON([]byte("[]")),
 			},
 			wantMovedTo: "destination",
+		},
+		{
+			name:       "restored local source to local destination",
+			movedToURI: &oldOriginMoveURI,
+			destination: &model.User{
+				ID: "destination", Username: "destination", UsernameLower: "destination",
+				AvatarDecorations: datatypes.JSON([]byte("[]")),
+			},
+			wantMovedTo: "destination",
+		},
+		{
+			name:       "remote source cannot use old-origin path fallback",
+			sourceHost: &remoteHost,
+			movedToURI: &oldOriginMoveURI,
+			destination: &model.User{
+				ID: "destination", Username: "destination", UsernameLower: "destination",
+				AvatarDecorations: datatypes.JSON([]byte("[]")),
+			},
+			wantMovedTo: nil,
 		},
 		{
 			name:       "known remote destination",

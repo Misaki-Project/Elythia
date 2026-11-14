@@ -49,10 +49,9 @@ jobs:
       # ことになるので、意図的に行わないと踏めない形として許容している。
       #
       # **逆に、正規表現を緩めないこと。** `disabled: True` / `yes` / 行末コメント
-      # 付きは parser では disabled と読まれるがここでは落ちる。安全側に倒れて
-      # いるだけなので実害は無い。「誤検知」と見て緩めると、parser とのズレが
-      # 今度は**危険側**に開く。
-      - name: Check bundled plugins are disabled by default
+      # 付きは parser では disabled と読まれるがここでは落ちる。意図的に既定有効に
+      # する製品 plugin は次の exact path allowlist だけで許可する。
+      - name: Check bundled plugin defaults and exact enabled allowlist
         run: |
           files=$(git ls-files 'plugins/*/elythia-plugin.yml')
           # **空でも緑にしない。** `plugins/` の移動や marker 名の変更で列挙が
@@ -66,11 +65,18 @@ jobs:
           for f in $files; do
             if grep -qE '^disabled:[[:space:]]*true[[:space:]]*$' "$f"; then
               echo "ok   $f"
-            else
-              echo "FAIL $f — 'disabled: true' の行 (完全一致) がありません。disabled を含む行:"
-              grep -n disabled "$f" || echo "  (無し)"
-              fail=1
+              continue
             fi
+            case "$f" in
+              plugins/rolelevel/elythia-plugin.yml|plugins/tracking-parameter-cleaner/elythia-plugin.yml)
+                echo "ok   $f (explicitly enabled product plugin)"
+                ;;
+              *)
+                echo "FAIL $f — 'disabled: true' の行 (完全一致) がありません。disabled を含む行:"
+                grep -n disabled "$f" || echo "  (無し)"
+                fail=1
+                ;;
+            esac
           done
           [ "$fail" -eq 0 ] || exit 1
 

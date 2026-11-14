@@ -65,6 +65,16 @@ on:
         required: false
         type: boolean
         default: true
+      include_fxtwitter:
+        description: "disabled manifest の FxTwitter preview を明示的に bundle に含める"
+        required: false
+        type: boolean
+        default: false
+      production_profile:
+        description: "core141/local1 と固定 production plugin inventory を検証する"
+        required: false
+        type: boolean
+        default: false
     secrets:
       plugin_token:
         description: "private なプラグインを clone するための token"
@@ -76,6 +86,12 @@ on:
       digest:
         description: "push した image の digest"
         value: ${{ jobs.build.outputs.digest }}
+      source_revision:
+        description: "実際に checkout して build した source commit"
+        value: ${{ jobs.build.outputs.source_revision }}
+      migration_inventory_sha256:
+        description: "production migration inventory の SHA256"
+        value: ${{ jobs.build.outputs.migration_inventory_sha256 }}
 
 jobs:
   build:
@@ -87,6 +103,8 @@ jobs:
     outputs:
       image: ${{ steps.target.outputs.tags }}
       digest: ${{ steps.build.outputs.digest }}
+      source_revision: ${{ steps.source.outputs.revision }}
+      migration_inventory_sha256: ${{ steps.inventory.outputs.sha256 }}
     steps:
       # frontend/ は本体に入っている (#3379)。
       - name: Checkout mk-go
@@ -99,6 +117,39 @@ jobs:
           # 残すと `.git/config` に token が載ったまま、第三者のプラグインの
           # コードが走る。
           persist-credentials: false
+
+      - name: Record checked out source revision
+        id: source
+        env:
+          EXPECTED_REVISION: ${{ inputs.mk_ref }}
+          EXPECTED_REPOSITORY: ${{ inputs.mk_repository }}
+          PRODUCTION_PROFILE: ${{ inputs.production_profile }}
+        run: |
+          set -eu
+          if [ "$PRODUCTION_PROFILE" = "true" ]; then
+            if [ "$EXPECTED_REPOSITORY" != "Misaki-Project/Elythia" ] || [ "${#EXPECTED_REVISION}" -ne 40 ]; then
+              echo "production profile requires Misaki-Project/Elythia at a full commit SHA" >&2
+              exit 1
+            fi
+          fi
+          revision=$(git rev-parse HEAD)
+          case "$revision" in
+            *[!0-9a-f]*|'') echo "checked out revision is invalid" >&2; exit 1 ;;
+          esac
+          if [ "${#revision}" -ne 40 ]; then
+            echo "checked out revision is not a full commit SHA" >&2
+            exit 1
+          fi
+          if [ "${#EXPECTED_REVISION}" -eq 40 ]; then
+            case "$EXPECTED_REVISION" in
+              *[!0-9a-f]*) echo "requested source SHA is invalid" >&2; exit 1 ;;
+            esac
+            if [ "$EXPECTED_REVISION" != "$revision" ]; then
+              echo "checked out revision differs from requested SHA" >&2
+              exit 1
+            fi
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -130,14 +181,27 @@ jobs:
           MK_PLUGINS: ${{ inputs.plugins }}
         run: |
           set -eu
-          if [ -n "${PLUGIN_TOKEN:-}" ]; then
+          if [ "${{ inputs.production_profile }}" = "true" ]; then
+            normalized=$(printf '%s\n' "$MK_PLUGINS" | awk 'NF { if (NF != 3) exit 1; print $1 " " $2 " " $3 }')
+            expected=$(printf '%s\n' \
+              'genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 9a50079ec9d198ab44e4b9ff24d0a408109c09da' \
+              'fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8' \
+              'hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git 820068d720654650d5dc05d4136ad9f32f677fef')
+            if [ "$normalized" != "$expected" ]; then
+              echo "production plugin requests differ from their reviewed pins" >&2
+              exit 1
+            fi
+            bash .github/scripts/resolve-production-plugins.sh .
+          elif [ -n "${PLUGIN_TOKEN:-}" ]; then
             key="url.https://x-access-token:${PLUGIN_TOKEN}@github.com/.insteadOf"
             trap 'rc=$?; git config --global --unset-all "$key" || rc=1; exit "$rc"' EXIT
             git config --global "$key" "https://github.com/"
           else
             echo "plugin_token が渡されていないので URL 書き換えは設定しません"
           fi
-          printf '%s\n' "$MK_PLUGINS" | go run ./tools/pluginresolve
+          if [ "${{ inputs.production_profile }}" != "true" ]; then
+            printf '%s\n' "$MK_PLUGINS" | go run ./tools/pluginresolve
+          fi
 
       # プラグインの配線を生成し、要求したプラグインが実際に組み込まれるかを
       # 突き合わせる。生成は Dockerfile 側でも走る (冪等)。
@@ -147,8 +211,22 @@ jobs:
           MK_PLUGINS: ${{ inputs.plugins }}
         run: |
           set -eu
-          out=$(GOWORK=off go run ./tools/pluginbuild)
+          if [ "${{ inputs.include_fxtwitter }}" = "true" ]; then
+            out=$(GOWORK=off go run ./tools/pluginbuild -include-disabled-dir plugins/fxtwitter-preview)
+          else
+            out=$(GOWORK=off go run ./tools/pluginbuild)
+          fi
           printf '%s\n' "$out"
+          printf '%s\n' "$out" > "$RUNNER_TEMP/pluginbuild-output.txt"
+
+          if [ "${{ inputs.production_profile }}" = "true" ]; then
+            for dir in plugins/rolelevel plugins/genshin plugins/fedwatch plugins/hsr plugins/fxtwitter-preview plugins/tracking-parameter-cleaner; do
+              case "$out" in
+                *"dir=$dir "*) ;;
+                *) echo "::error::required production plugin directory was not registered: $dir"; exit 1 ;;
+              esac
+            done
+          fi
 
           # **要求したプラグインが実際に組み込まれたかを突き合わせる。**
           # pluginbuild は elythia-plugin.yml が `disabled: true` のプラグインを
@@ -185,6 +263,23 @@ jobs:
               esac
             done < "$RUNNER_TEMP/requested.txt"
           fi
+
+      - name: Verify production migration inventory
+        id: inventory
+        if: inputs.production_profile
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          set -eu
+          go run -tags productioninventory ./tools/migrationinventory -revision "$SOURCE_REVISION" > "$RUNNER_TEMP/migration-inventory.json"
+          GOWORK=off go run ./tools/checkproductioninventory \
+            -inventory "$RUNNER_TEMP/migration-inventory.json" \
+            -baseline .github/release/production-migration-baseline.json \
+            -approved-additions .github/release/approved-production-migration-additions.json \
+            -pluginbuild-output "$RUNNER_TEMP/pluginbuild-output.txt" \
+            -revision "$SOURCE_REVISION"
+          inventory_sha=$(sha256sum "$RUNNER_TEMP/migration-inventory.json" | awk '{print $1}')
+          echo "sha256=$inventory_sha" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -238,12 +333,16 @@ jobs:
           context: .
           file: ./Dockerfile.bundled
           platforms: linux/amd64
+          build-args: |
+            PLUGIN_INCLUDE_DISABLED_DIR=${{ inputs.include_fxtwitter && 'plugins/fxtwitter-preview' || '' }}
           push: ${{ inputs.push }}
           tags: ${{ steps.target.outputs.tags }}
           labels: |
             org.opencontainers.image.title=mk-go
             org.opencontainers.image.description=mk-go built with operator-selected plugins
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.revision }}
+            io.elythia.production.profile=${{ inputs.production_profile && 'core141-fx6-v1' || 'generic' }}
           cache-from: type=gha
           # **mode=min にする。** max は中間 stage をすべて書き出すので、
           # `COPY . .` 済みの builder stage (build context が `du -sm` で 421 MB、プラグインのソース込み) が

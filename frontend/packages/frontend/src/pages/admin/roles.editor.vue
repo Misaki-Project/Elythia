@@ -35,7 +35,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<template #caption><div v-html="i18n.ts._role.descriptionOfPermission.replaceAll('\n', '<br>')"></div></template>
 	</MkSelect>
 
-	<MkSelect v-model="role.target" :items="[{ label: i18n.ts._role.manual, value: 'manual' }, { label: i18n.ts._role.conditional, value: 'conditional' }]" :readonly="readonly">
+	<MkSelect v-model="role.target" :items="[{ label: i18n.ts._role.manual, value: 'manual' }, { label: i18n.ts._role.conditional, value: 'conditional' }, { label: i18n.ts._roleLevel.title, value: 'manualLevel' }]" :readonly="readonly">
 		<template #label><i class="ti ti-users"></i> {{ i18n.ts._role.assignTarget }}</template>
 		<template #caption><div v-html="i18n.ts._role.descriptionOfAssignTarget.replaceAll('\n', '<br>')"></div></template>
 	</MkSelect>
@@ -45,6 +45,12 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<div class="_gaps">
 			<RolesEditorFormula v-model="role.condFormula"/>
 		</div>
+	</MkFolder>
+
+	<MkInfo v-if="role.target === 'manualLevel' && role.levelConfig.revision === 0" warn>{{ i18n.ts._roleLevel.legacyRoleNotice }}</MkInfo>
+	<MkFolder v-if="role.target === 'manualLevel'" defaultOpen>
+		<template #label><i class="ti ti-chart-bar"></i> {{ i18n.ts._roleLevel.title }}</template>
+		<XLevelEditor v-model="role.levelConfig" :readonly="readonly" />
 	</MkFolder>
 
 	<MkSwitch v-model="role.preserveAssignmentOnMoveAccount" :readonly="readonly">
@@ -85,6 +91,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				:isBaseRole="false"
 				:roleQuery="q"
 				:readonly="readonly"
+				:levelConfig="role.target === 'manualLevel' ? role.levelConfig : undefined"
 			/>
 		</div>
 	</FormSlot>
@@ -105,16 +112,22 @@ import MkFolder from '@/components/MkFolder.vue';
 import MkSwitch from '@/components/MkSwitch.vue';
 import FormSlot from '@/components/form/slot.vue';
 import XPolicyEditor from './roles.policy-editor.vue';
+import XLevelEditor from './roles.level-editor.vue';
+import MkInfo from '@/components/MkInfo.vue';
 import { i18n } from '@/i18n.js';
 import { instance } from '@/instance.js';
 import { deepClone } from '@/utility/clone.js';
 import { ensureAccountDeletionRolePolicies } from '@/utility/account-delete-policy.js';
 import type { PolicyMeta } from './roles.policy-editor.vue';
+import { defaultRoleLevelConfig } from '@/utility/role-level-api.js';
+import type { RoleLevelConfig } from '@/utility/role-level-api.js';
 
-type RoleLike = Pick<Misskey.entities.Role, 'name' | 'description' | 'isAdministrator' | 'isModerator' | 'color' | 'iconUrl' | 'target' | 'isPublic' | 'isExplorable' | 'asBadge' | 'canEditMembersByModerator' | 'displayOrder' | 'preserveAssignmentOnMoveAccount'> & {
+type RoleLike = Omit<Pick<Misskey.entities.Role, 'name' | 'description' | 'isAdministrator' | 'isModerator' | 'color' | 'iconUrl' | 'target' | 'isPublic' | 'isExplorable' | 'asBadge' | 'canEditMembersByModerator' | 'displayOrder' | 'preserveAssignmentOnMoveAccount'>, 'target'> & {
 	id?: Misskey.entities.Role['id'] | null;
+	target: Misskey.entities.Role['target'] | 'manualLevel';
 	condFormula: any;
 	policies: any;
+	levelConfig: RoleLevelConfig;
 };
 
 const emit = defineEmits<{
@@ -152,10 +165,18 @@ const mkGoRolePolicyKeys: string[] = [
 	'emojiApplicationMaxPerWeek',
 	'emojiApplicationMaxPerMonth',
 	'emojiApplicationMaxPending',
+	'genshinRefreshIntervalMinutes',
+	'hsrRefreshIntervalMinutes',
+	'genshinUidLimit',
+	'hsrUidLimit',
+	'canUseFxTwitterPreview',
+	'fxTwitterColdFetchesPerHour',
+	'fxTwitterColdFetchesPerDay',
 ];
 
 const role = ref((() => {
 	const base = deepClone(props.modelValue);
+	base.levelConfig ??= defaultRoleLevelConfig(base.id ?? '');
 	ensureAccountDeletionRolePolicies(base.policies, instance.policies);
 	// fill missing policy
 	for (const ROLE_POLICY of mkGoRolePolicyKeys) {

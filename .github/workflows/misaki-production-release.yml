@@ -1,0 +1,207 @@
+name: Misaki production release
+
+# Manual, stable-release path only. The image is built and pushed only after
+# the production plugin suite and migration inventory pass for this exact SHA.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Stable version tag (for example v2.0.1); the tag must not already exist"
+        required: true
+        type: string
+
+concurrency:
+  group: misaki-production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.check.outputs.revision }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate release request
+        id: check
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_REPOSITORY: Misaki-Project/Elythia
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]; then
+            echo "release workflow must run in $EXPECTED_REPOSITORY" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/Misaki-develop" ]; then
+            echo "run this workflow from Misaki-develop after the candidate is reviewed and merged" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must be a stable vMAJOR.MINOR.PATCH value" >&2
+            exit 1
+          fi
+          revision=$(git rev-parse HEAD)
+          if [ "$revision" != "$GITHUB_SHA" ]; then
+            echo "checked out source differs from workflow commit" >&2
+            exit 1
+          fi
+          set +e
+          git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "release tag already exists; refusing to overwrite it" >&2
+            exit 1
+          elif [ "$tag_status" -ne 2 ]; then
+            echo "could not verify release tag availability" >&2
+            exit 1
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  validate:
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/misaki-plugin-compat.yml
+
+  build:
+    needs: [preflight, validate]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-with-plugins.yml
+    with:
+      mk_repository: Misaki-Project/Elythia
+      mk_ref: ${{ needs.preflight.outputs.revision }}
+      plugins: |
+        genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 9a50079ec9d198ab44e4b9ff24d0a408109c09da
+        fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8
+        hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git 820068d720654650d5dc05d4136ad9f32f677fef
+      image: ghcr.io/misaki-project/mk-genshin
+      tags: elythia-${{ needs.preflight.outputs.release_tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+      push: true
+      include_fxtwitter: true
+      production_profile: true
+
+  publish-release:
+    needs: [preflight, validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET_REPOSITORY: Misaki-Project/Elythia
+      IMAGE_REPOSITORY: ghcr.io/misaki-project/mk-genshin
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      EXPECTED_REVISION: ${{ needs.preflight.outputs.revision }}
+      VALIDATED_REVISION: ${{ needs.validate.outputs.source_revision }}
+      BUILT_REVISION: ${{ needs.build.outputs.source_revision }}
+      VALIDATED_INVENTORY_SHA: ${{ needs.validate.outputs.migration_inventory_sha256 }}
+      BUILT_INVENTORY_SHA: ${{ needs.build.outputs.migration_inventory_sha256 }}
+      IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+      EXPECTED_PLATFORM: linux/amd64
+    steps:
+      - name: Log in to GHCR for immutable image verification
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify pulled immutable image profile and source
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+          docker pull --platform "$EXPECTED_PLATFORM" "$image_ref" >/dev/null
+          docker image inspect "$image_ref" > "$RUNNER_TEMP/image-inspect.json"
+          python3 - <<'PY'
+          import json, os
+          image = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "image-inspect.json"), encoding="utf-8"))[0]
+          expected_os, expected_arch = os.environ["EXPECTED_PLATFORM"].split("/", 1)
+          labels = image.get("Config", {}).get("Labels") or {}
+          expected_ref = os.environ["IMAGE_REPOSITORY"] + "@" + os.environ["IMAGE_DIGEST"]
+          if expected_ref not in (image.get("RepoDigests") or []):
+              raise SystemExit("IMAGE_REPO_DIGEST_MISMATCH")
+          if image.get("Os") != expected_os or image.get("Architecture") != expected_arch:
+              raise SystemExit("IMAGE_PLATFORM_MISMATCH")
+          if labels.get("org.opencontainers.image.revision") != os.environ["EXPECTED_REVISION"]:
+              raise SystemExit("IMAGE_REVISION_MISMATCH")
+          if labels.get("io.elythia.production.profile") != "core141-fx6-v1":
+              raise SystemExit("IMAGE_PROFILE_MISMATCH")
+          PY
+
+      - name: Recheck all build bindings and create manifest
+        run: |
+          set -euo pipefail
+          [ "$VALIDATED_REVISION" = "$EXPECTED_REVISION" ]
+          [ "$BUILT_REVISION" = "$EXPECTED_REVISION" ]
+          [ -n "$VALIDATED_INVENTORY_SHA" ]
+          [ "$VALIDATED_INVENTORY_SHA" = "$BUILT_INVENTORY_SHA" ]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          python3 - <<'PY'
+          import json, os, re
+          revision = os.environ["EXPECTED_REVISION"]
+          if not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise SystemExit("SOURCE_REVISION_INVALID")
+          document = {
+              "schemaVersion": 1,
+              "tag": os.environ["RELEASE_TAG"],
+              "image": os.environ["IMAGE_REPOSITORY"] + "@" + os.environ["IMAGE_DIGEST"],
+              "revision": revision,
+              "platform": os.environ["EXPECTED_PLATFORM"],
+          }
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "elythia-image-manifest.json"), "w", encoding="utf-8", newline="\n") as stream:
+              json.dump(document, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+          PY
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Production bundle for ${RELEASE_TAG}.
+
+          Source revision: ${EXPECTED_REVISION}
+          Image: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}
+          Platform: linux/amd64
+          Migration history and all production plugin registrations passed the compatibility gate.
+          EOF
+
+      - name: Create immutable source tag and draft release
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$TARGET_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" \
+            -f "sha=$EXPECTED_REVISION" >/dev/null
+          gh release create "$RELEASE_TAG" \
+            --repo "$TARGET_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --target "$EXPECTED_REVISION" \
+            --title "$RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/elythia-image-manifest.json" \
+            --repo "$TARGET_REPOSITORY"
+
+      - name: Verify uploaded asset then publish
+        run: |
+          set -euo pipefail
+          release_json=$(gh api "repos/$TARGET_REPOSITORY/releases/tags/$RELEASE_TAG")
+          release_id=$(printf '%s' "$release_json" | jq -r '.id')
+          printf '%s' "$release_json" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["tag_name"] == __import__("os").environ["RELEASE_TAG"]; assert r["draft"] is True; assert r["prerelease"] is False; a=[x for x in r["assets"] if x["name"] == "elythia-image-manifest.json"]; assert len(a) == 1 and a[0].get("state") == "uploaded"; assert a[0].get("digest") == "sha256:" + __import__("hashlib").sha256(open(__import__("os").path.join(__import__("os").environ["RUNNER_TEMP"],"elythia-image-manifest.json"),"rb").read()).hexdigest()'
+          tag_ref=$(gh api "repos/$TARGET_REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          printf '%s' "$tag_ref" | python3 -c 'import json,sys,os; r=json.load(sys.stdin); assert r["object"]["type"] == "commit"; assert r["object"]["sha"] == os.environ["EXPECTED_REVISION"]'
+          gh api --method PATCH "repos/$TARGET_REPOSITORY/releases/$release_id" \
+            -F draft=false -f make_latest=true >/dev/null
+          gh api "repos/$TARGET_REPOSITORY/releases/$release_id" \
+            --jq 'select(.draft == false and .prerelease == false) | .tag_name' | grep -Fx "$RELEASE_TAG"
+          latest_json=$(gh api "repos/$TARGET_REPOSITORY/releases/latest")
+          export EXPECTED_RELEASE_ID="$release_id"
+          printf '%s' "$latest_json" | python3 -c 'import hashlib,json,os,sys; r=json.load(sys.stdin); assert r["id"] == int(os.environ["EXPECTED_RELEASE_ID"]); assert r["tag_name"] == os.environ["RELEASE_TAG"]; assert r["draft"] is False and r["prerelease"] is False; a=[x for x in r["assets"] if x["name"] == "elythia-image-manifest.json"]; assert len(a) == 1 and a[0].get("state") == "uploaded"; expected="sha256:"+hashlib.sha256(open(os.path.join(os.environ["RUNNER_TEMP"],"elythia-image-manifest.json"),"rb").read()).hexdigest(); assert a[0].get("digest") == expected'
