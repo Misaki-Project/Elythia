@@ -168,7 +168,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 						<XRoleLevelValue :level="roleLevelByRoleId.get(role.id)!"/>
 						<button v-tooltip="i18n.ts._roleLevel.setExperience" class="_button" :class="$style.roleLevelAction" :aria-label="i18n.ts._roleLevel.setExperience" @click="changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'set')"><i class="ti ti-equal"></i></button>
 						<button v-tooltip="i18n.ts._roleLevel.adjustExperience" class="_button" :class="$style.roleLevelAction" :aria-label="i18n.ts._roleLevel.adjustExperience" @click="changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'add')">±</button>
-						<button v-tooltip="i18n.ts._roleLevel.multiplyExperience" class="_button" :class="$style.roleLevelAction" :aria-label="i18n.ts._roleLevel.multiplyExperience" @click="changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'multiplier')">＊</button>
+						<button v-tooltip="i18n.ts._roleLevel.multiplyExperience" class="_button" :class="$style.roleLevelAction" :aria-label="i18n.ts._roleLevel.multiplyExperience" @click="changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'multiplier')">*</button>
 					</div>
 					<button class="_button" @click="toggleRoleItem(role)"><i class="ti ti-chevron-down"></i></button>
 					<button v-if="role.target === 'manual' || (role.target as string) === 'manualLevel'" class="_button" :class="$style.roleUnassign" @click="unassignRole(role, $event)"><i class="ti ti-x"></i></button>

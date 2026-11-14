@@ -165,9 +165,11 @@ const mediaSummary = computed(() => formatMediaSummary((props.data.post?.images 
 const quoteMediaSummary = computed(() => formatMediaSummary((props.data.post?.quote?.images ?? []).length, props.data.post?.quote?.videos?.length ?? (props.data.post?.quote?.video ? 1 : 0)));
 const authorProfileUrl = computed(() => props.data.post?.author.profileUrl ?? null);
 const quoteAuthorProfileUrl = computed(() => props.data.post?.quote?.author.profileUrl ?? null);
+
 function xStatusUrl(id?: string): string | null {
 	return id != null && /^[0-9]{2,20}$/.test(id) ? `https://x.com/i/status/${id}` : null;
 }
+
 const mediaErrorLinks = computed(() => {
 	const post = props.data.post;
 	if (post == null) return [];
