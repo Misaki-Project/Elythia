@@ -169,7 +169,8 @@ test('OGP mode keeps the host URL card and waits for an explicit Fx action', asy
 	expect(api.mock.calls.filter(call => call[0].endsWith('/preview'))).toHaveLength(0);
 	await fireEvent.click(manual);
 	await waitFor(() => expect(api.mock.calls.filter(call => call[0].endsWith('/preview'))).toHaveLength(1));
-	expect(view.container.querySelector('iframe[src^="https://platform.twitter.com/embed/index.html"]')?.getAttribute('src')).toContain('id=1234567890');
+	await waitFor(() => expect(view.getByText('public body')).toBeTruthy());
+	expect(view.container.querySelector('iframe[src^="https://platform.twitter.com/embed/index.html"]')).toBeNull();
 });
 test('provider authorization failure returns to the host standard URL preview', async () => {
 	api.mockImplementation(async path => {
@@ -293,15 +294,23 @@ test('retry overrides are discarded on note ownership change and use only the ne
 
 test.each(['success', 'failure'] as const)('main and quote photos coexist with their videos after image %s', async result => {
 	if (result === 'failure') publicImageResponse = () => new Response('', { status: 503 });
-	const view = card(mixedData()); await flushPreview();
+	const view = card(mixedData());
+	await waitFor(() => {
+		expect(view.container.querySelector('[data-fx-video-target="main"] [data-fx-video-play]')).toBeTruthy();
+		expect(view.container.querySelector('[data-fx-video-target="quote"] [data-fx-video-play]')).toBeTruthy();
+	});
 	if (result === 'success') {
-		expect(view.container.querySelector('img[alt="main photo"]')).toBeTruthy();
-		expect(view.container.querySelector('img[alt="quote photo"]')).toBeTruthy();
+		await waitFor(() => {
+			expect(view.container.querySelector('img[alt="main photo"]')).toBeTruthy();
+			expect(view.container.querySelector('img[alt="quote photo"]')).toBeTruthy();
+		});
+		expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeNull();
+		expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeNull();
+	} else {
+		await waitFor(() => expect(view.getByText(/^メディアを読み込めませんでした。/)).toBeTruthy());
+		expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeTruthy();
+		expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeTruthy();
 	}
-	expect(view.container.querySelector('[data-fx-video-target="main"] [data-fx-video-play]')).toBeTruthy();
-	expect(view.container.querySelector('[data-fx-video-target="quote"] [data-fx-video-play]')).toBeTruthy();
-	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeTruthy();
-	expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeTruthy();
 	expect(view.container.querySelector('iframe')).toBeNull();
 	expect(prepareCalls().map(call => call[1]?.kind)).toEqual(expect.arrayContaining(['image', 'quote-image']));
 	expect(prepareCalls('video')).toHaveLength(0);
@@ -344,6 +353,7 @@ test('main and quoted videos open as separate native viewer items without embedd
 	]));
 	expect(fetchMock.mock.calls.every(([, options]) => options?.credentials === 'omit')).toBe(true);
 	expect(view.container.querySelector('iframe')).toBeNull();
+	expect(view.queryByText('Xで投稿を開く')).toBeNull();
 });
 test('unrevealed detail CW opens, collapses, aborts, and rejects its late result', async () => {
 	let finish!: (value: PreviewResponse) => void;
@@ -404,7 +414,7 @@ test.each(['deleted', 'suspended', 'private', 'blocked', 'unavailable', 'unknown
 });
 test.each(['deleted', 'unknown'])('quoted unavailable %s stays separate from the outer post', async reason => {
 	const response = data(); Object.assign(response.post, { quoteUnavailableReason: reason });
-	api.mockResolvedValue(response);
+	api.mockResolvedValueOnce(response);
 	const normalized = await loadPreview(input, context, new AbortController().signal);
 	expect(normalized.post).toHaveProperty('quoteUnavailableReason', reason);
 	const view = card(normalized);
@@ -563,15 +573,28 @@ test.each([
 	await waitFor(() => expect(view.getByRole('status').textContent).toContain('動画を読み込めませんでした'));
 	expect(api.mock.calls.filter(call => call[0].endsWith('/media/prepare'))).toHaveLength(0);
 	expect(viewer).not.toHaveBeenCalled();
+	expect(view.getByText('Xで投稿を開く').getAttribute('href')).toBe('https://x.com/i/status/1234567890');
 });
-test('unsupported external video stays a source link without a playback request', async () => {
+test('unsupported external video has no playback or source link', async () => {
 	const response = data(); response.post.videos = []; response.post.video = { provider: 'external' };
 	const view = card(response); await nextTick(); await nextTick();
 	const play = view.container.querySelector<HTMLButtonElement>('[data-fx-video-play]');
 	expect(play).not.toBeNull(); expect(play?.disabled).toBe(true);
 	expect(view.container.querySelector('iframe')).toBeNull(); expect(prepareCalls('video')).toHaveLength(0);
-	expect(view.queryByText('メディアを読み込めませんでした。')).toBeNull();
-	expect(view.getByText('Xで投稿を開く').getAttribute('href')).toBe('https://x.com/i/status/1234567890');
+	expect(view.queryByRole('status')).toBeNull();
+	expect(view.queryByText('Xで投稿を開く')).toBeNull();
+});
+
+test('quoted video playback failure links to the quoted post identity', async () => {
+	const response = data();
+	response.post.quote = { id: '9876543210', url: 'https://x.com/bob/status/9876543210', text: 'quoted body', author: { name: 'Bob', screenName: 'bob' }, images: [], videos: [videoDescriptor('/invalid-capability')], hasVideo: true };
+	const view = card(response);
+	const button = must(await waitFor(() => view.container.querySelector<HTMLButtonElement>('[data-fx-video-target="quote"] [data-fx-video-play]')));
+	await fireEvent.click(button);
+	const quoteVideo = view.container.querySelector('[data-fx-video-target="quote"]');
+	await waitFor(() => expect(quoteVideo?.querySelector('[role="status"]')?.textContent).toContain('動画を読み込めませんでした'));
+	expect(quoteVideo?.querySelector('a[href="https://x.com/i/status/9876543210"]')?.textContent).toBe('Xで引用投稿を開く');
+	expect(quoteVideo?.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeNull();
 });
 
 test.each([
@@ -590,7 +613,7 @@ test.each([
 	imagePost.images = [{ url: `/api/plugin/fxtwitter-preview/media/1234567890/${target === 'main' ? 'quote-image' : 'image'}/0?noteId=note-1`, alt: 'retained image' }];
 	const original = JSON.stringify(response);
 	Object.freeze(legacy); Object.freeze(response.post.quote); Object.freeze(response.post); Object.freeze(response);
-	api.mockResolvedValue(response);
+	api.mockResolvedValueOnce(response);
 	const pending = loadPreview(input, context, new AbortController().signal);
 	await expect(pending).resolves.toMatchObject({ state });
 	const normalized = await pending;
@@ -609,8 +632,8 @@ test.each([
 	await waitFor(() => expect(view.container.querySelector('img[alt="retained image"]')).toBeTruthy());
 	expect(view.getByText('public body')).toBeTruthy();
 	expect(view.getByText('quoted public body')).toBeTruthy();
-	expect(view.container.querySelector('a[href="https://x.com/alice/status/1234567890"]')).toBeTruthy();
-	expect(view.container.querySelector('a[href="https://x.com/bob/status/9876543210"]')).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeNull();
+	expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeNull();
 	expect(view.container.querySelector('[data-fx-video-play],iframe')).toBeNull();
 });
 
@@ -665,11 +688,22 @@ test.each([
 	if (kind === 'image') response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];
 	if (kind === 'avatar') response.post.author.avatarUrl = '/api/plugin/fxtwitter-preview/media/1234567890/avatar/0?noteId=note-1';
 	const view = card(response);
-	await waitFor(() => expect(view.queryByText('メディアを読み込めませんでした。')).toBeTruthy());
+	await waitFor(() => expect(view.getByText(/^メディアを読み込めませんでした。/)).toBeTruthy());
 	expect(view.getByText('public body')).toBeTruthy();
-	expect(view.container.querySelector(`a[href="${input.href}"]`)).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')?.getAttribute('rel')).toBe('nofollow noopener noreferrer');
 	expect(view.container.querySelector('img,iframe')).toBeNull();
 	expect(URL.createObjectURL).not.toHaveBeenCalled();
+});
+
+test('quoted image failure links only to the quoted post', async () => {
+	publicImageResponse = () => Promise.reject(new Error('fetch failed'));
+	const response = data();
+	response.post.quote = { id: '9876543210', url: 'https://x.com/bob/status/9876543210', text: 'quoted body', author: { name: 'Bob', screenName: 'bob' }, images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/quote-image/0?noteId=note-1' }], hasVideo: false };
+	const view = card(response);
+	await waitFor(() => expect(view.getByText('メディアを読み込めませんでした。通信または容量上限を確認して再試行してください。')).toBeTruthy());
+	expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeTruthy();
+	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeNull();
 });
 
 test.each(['inactive', 'source', 'session'] as const)('late media failure after %s cannot publish an old error', async change => {
@@ -687,8 +721,10 @@ test.each(['inactive', 'source', 'session'] as const)('late media failure after 
 	reject(new Error('late fetch failure'));
 	// Drain the rejected fetch and resource-bundle promises before asserting absence.
 	await new Promise(resolve => { window.setTimeout(resolve); }); await nextTick();
-	expect(view.queryByText('メディアを読み込めませんでした。')).toBeNull();
+	expect(view.queryByRole('status')).toBeNull();
 	expect(view.container.querySelector('img')).toBeNull();
+	expect(view.queryByText('Xで投稿を開く')).toBeNull();
+	expect(view.queryByText('Xで引用投稿を開く')).toBeNull();
 	expect(URL.createObjectURL).not.toHaveBeenCalled();
 });
 test('cached Blob load settling after abort cannot publish a URL', async () => {

@@ -23,6 +23,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			<span v-else :class="$style.duration">動画 {{ index + 1 }}</span>
 			<span v-if="state === 'loading'" :class="$style.status">準備中…</span>
 			<span v-else-if="state === 'error'" :class="$style.status" role="status">{{ terminalError ? '動画へのアクセスが許可されていません。' : '動画を読み込めませんでした。' }}</span>
+			<a v-if="state === 'error' && postHref" :class="$style.sourceLink" :href="postHref" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ sourceLinkLabel }}</a>
 			<button v-if="state === 'error' && !terminalError" type="button" class="_button" :class="$style.retry" @click.stop="play">再試行</button>
 		</figcaption>
 	</figure>
@@ -61,6 +62,8 @@ let posterObjectUrl: string | null = null;
 let generation = 0;
 
 const sourceNoteId = computed(() => props.context.source?.kind === 'note' ? props.context.source.noteId : null);
+const postHref = computed(() => /^[0-9]{2,20}$/.test(props.contentPostId) ? `https://x.com/i/status/${props.contentPostId}` : null);
+const sourceLinkLabel = computed(() => props.target === 'quote' ? 'Xで引用投稿を開く' : 'Xで投稿を開く');
 const canAccess = computed(() => props.context.detail && props.context.revealed && props.context.active && revealed.value && sourceNoteId.value != null);
 const canLoad = computed(() => canAccess.value && props.context.inViewport);
 const canPlay = computed(() => canLoad.value && activeVideo.value.provider === 'x' && activeVideo.value.playbackAvailable === true && activeVideo.value.playbackUrl != null);
@@ -239,5 +242,6 @@ onBeforeUnmount(() => {
 .details { display: flex; min-height: 2em; align-items: center; gap: 10px; padding-top: 5px; color: var(--MI_THEME-fgTransparentWeak); font-size: 0.82em; }
 .duration { flex: 0 0 auto; }
 .status { min-width: 0; overflow-wrap: anywhere; }
+.sourceLink { color: var(--MI_THEME-link); white-space: nowrap; }
 .retry { margin-inline-start: auto; color: var(--MI_THEME-accent); }
 </style>

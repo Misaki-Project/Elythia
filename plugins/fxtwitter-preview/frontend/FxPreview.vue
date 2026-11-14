@@ -68,6 +68,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 	<div v-if="mediaLoadFailed" :class="$style.mediaError" role="status">
 		<span>メディアを読み込めませんでした。通信または容量上限を確認して再試行してください。</span>
 		<button v-if="attachmentLoadFailed && photoRetryable" type="button" class="_button" @click="retryVisiblePhotos">写真を再試行</button>
+		<a v-for="link in mediaErrorLinks" :key="link.href" :href="link.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ link.label }}</a>
 	</div>
 	<footer :class="$style.footer">
 		<span aria-label="返信"><i class="ti ti-arrow-back-up"></i> {{ formatCount(data.post.replies) }}</span>
@@ -104,6 +105,8 @@ type LoadedMedia = { src: string; blob: Blob };
 type IdentityBundle = {
 	avatar: LoadedMedia | null;
 	quoteAvatar: LoadedMedia | null;
+	mainFailed: boolean;
+	quoteFailed: boolean;
 	objectUrls: string[];
 	failed: boolean;
 };
@@ -135,6 +138,8 @@ const quoteImageBlobs = ref<Array<Blob | null>>([]);
 const quoteImageStates = ref<Array<'loading' | 'error' | 'forbidden' | 'limit' | undefined>>([]);
 const quoteImagesRevealed = ref(false);
 const identityLoadFailed = ref(false);
+const identityMainFailed = ref(false);
+const identityQuoteFailed = ref(false);
 const attachmentLoadFailed = ref(false);
 const photoRetryBlocked = ref(false);
 const mediaLoadFailed = computed(() => [identityLoadFailed.value, attachmentLoadFailed.value].includes(true));
@@ -160,6 +165,20 @@ const mediaSummary = computed(() => formatMediaSummary((props.data.post?.images 
 const quoteMediaSummary = computed(() => formatMediaSummary((props.data.post?.quote?.images ?? []).length, props.data.post?.quote?.videos?.length ?? (props.data.post?.quote?.video ? 1 : 0)));
 const authorProfileUrl = computed(() => props.data.post?.author.profileUrl ?? null);
 const quoteAuthorProfileUrl = computed(() => props.data.post?.quote?.author.profileUrl ?? null);
+function xStatusUrl(id?: string): string | null {
+	return id != null && /^[0-9]{2,20}$/.test(id) ? `https://x.com/i/status/${id}` : null;
+}
+const mediaErrorLinks = computed(() => {
+	const post = props.data.post;
+	if (post == null) return [];
+	const mainFailed = identityMainFailed.value || imageStates.value.some(state => state === 'error' || state === 'forbidden' || state === 'limit');
+	const quoteFailed = identityQuoteFailed.value || quoteImageStates.value.some(state => state === 'error' || state === 'forbidden' || state === 'limit');
+	const links = [
+		mainFailed ? { href: xStatusUrl(post.id), label: 'Xで投稿を開く' } : null,
+		quoteFailed ? { href: xStatusUrl(post.quote?.id), label: 'Xで引用投稿を開く' } : null,
+	].filter((link): link is { href: string; label: string } => link?.href != null);
+	return links.filter((link, index) => links.findIndex(candidate => candidate.href === link.href) === index);
+});
 const repostCount = computed(() => Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, props.data.post?.reposts ?? 0) + Math.max(0, props.data.post?.quotes ?? 0)));
 
 const countFormatter = new Intl.NumberFormat();
@@ -217,6 +236,8 @@ function clearIdentity(): void {
 	avatarSrc.value = null;
 	quoteAvatarSrc.value = null;
 	identityLoadFailed.value = false;
+	identityMainFailed.value = false;
+	identityQuoteFailed.value = false;
 }
 
 function clearAttachments(): void {
@@ -291,19 +312,19 @@ async function loadIdentity(): Promise<void> {
 	const current = identityGeneration;
 	const quote = post.quote;
 	const lease = retainResource<IdentityBundle>(nextKey, async signal => {
-		let failed = false;
-		const loadOne = async (path?: string): Promise<LoadedMedia | null> => {
-			if (path == null) return null;
+		const loadOne = async (path?: string): Promise<{ media: LoadedMedia | null; failed: boolean }> => {
+			if (path == null) return { media: null, failed: false };
 			const value = await fetchPrivateMedia(path, signal).catch(() => null);
-			if (value == null && !signal.aborted) failed = true;
-			return value;
+			return { media: value, failed: value == null && !signal.aborted };
 		};
-		const [avatar, quoteAvatar] = await Promise.all([
+		const [mainIdentity, quoteIdentity] = await Promise.all([
 			loadOne(post.author.avatarUrl),
 			loadOne(quote?.author.avatarUrl),
 		]);
+		const avatar = mainIdentity.media;
+		const quoteAvatar = quoteIdentity.media;
 		const objectUrls = [avatar, quoteAvatar].flatMap(value => value == null ? [] : [value.src]);
-		return { avatar, quoteAvatar, objectUrls, failed };
+		return { avatar, quoteAvatar, mainFailed: mainIdentity.failed, quoteFailed: quoteIdentity.failed, objectUrls, failed: mainIdentity.failed || quoteIdentity.failed };
 	}, bundle => {
 		for (const objectUrl of bundle.objectUrls) URL.revokeObjectURL(objectUrl);
 	});
@@ -315,8 +336,14 @@ async function loadIdentity(): Promise<void> {
 		avatarSrc.value = bundle.avatar?.src ?? null;
 		quoteAvatarSrc.value = bundle.quoteAvatar?.src ?? null;
 		identityLoadFailed.value = bundle.failed;
+		identityMainFailed.value = bundle.mainFailed;
+		identityQuoteFailed.value = bundle.quoteFailed;
 	} catch {
-		if (current === identityGeneration && identityLease === lease) identityLoadFailed.value = true;
+		if (current === identityGeneration && identityLease === lease) {
+			identityLoadFailed.value = true;
+			identityMainFailed.value = post.author.avatarUrl != null;
+			identityQuoteFailed.value = quote?.author.avatarUrl != null;
+		}
 	}
 }
 

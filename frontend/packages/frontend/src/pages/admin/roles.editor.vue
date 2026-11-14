@@ -127,11 +127,15 @@ type RoleLike = Omit<Pick<Misskey.entities.Role, 'name' | 'description' | 'isAdm
 	target: Misskey.entities.Role['target'] | 'manualLevel';
 	condFormula: any;
 	policies: any;
+	levelConfig?: RoleLevelConfig;
+};
+
+type PreparedRoleLike = Omit<RoleLike, 'levelConfig'> & {
 	levelConfig: RoleLevelConfig;
 };
 
 const emit = defineEmits<{
-	(ev: 'update:modelValue', v: RoleLike): void;
+	(ev: 'update:modelValue', v: PreparedRoleLike): void;
 }>();
 
 const props = defineProps<{
@@ -174,9 +178,10 @@ const mkGoRolePolicyKeys: string[] = [
 	'fxTwitterColdFetchesPerDay',
 ];
 
-const role = ref((() => {
+const role = ref<PreparedRoleLike>((() => {
 	const base = deepClone(props.modelValue);
-	base.levelConfig ??= defaultRoleLevelConfig(base.id ?? '');
+	const levelConfig = base.levelConfig ?? defaultRoleLevelConfig(base.id ?? '');
+	base.levelConfig = levelConfig;
 	ensureAccountDeletionRolePolicies(base.policies, instance.policies);
 	// fill missing policy
 	for (const ROLE_POLICY of mkGoRolePolicyKeys) {
@@ -190,7 +195,7 @@ const role = ref((() => {
 			};
 		}
 	}
-	return base;
+	return { ...base, levelConfig };
 })());
 const rolePolicyValues = computed<any>({
 	get: () => {
@@ -258,6 +263,7 @@ const save = throttle(100, () => {
 		canEditMembersByModerator: role.value.canEditMembersByModerator,
 		preserveAssignmentOnMoveAccount: role.value.preserveAssignmentOnMoveAccount,
 		policies: role.value.policies,
+		levelConfig: role.value.levelConfig,
 	};
 
 	emit('update:modelValue', data);
