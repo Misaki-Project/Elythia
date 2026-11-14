@@ -2557,7 +2557,6 @@ _permissions:
   "write:admin:unsuspend-user": "ユーザーの凍結を解除する"
   "write:admin:meta": "インスタンスのメタデータを操作する"
   "write:admin:user-note": "モデレーションノートを操作する"
-  "write:admin:role-level-experience": "ロール経験値を変更する"
   "write:admin:roles": "ロールを操作する"
   "read:admin:roles": "ロールを見る"
   "write:admin:relays": "リレーを操作する"

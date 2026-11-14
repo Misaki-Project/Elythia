@@ -276,6 +276,7 @@ export type PluginPage = {
 
 	/** ナビゲーションに項目を出すときのラベル。省くと出さない。 */
 	navTitle?: string;
+	explore?: boolean;
 
 	/** ナビ項目のアイコン (例: 'ti ti-device-gamepad')。 */
 	navIcon?: string;
@@ -479,6 +480,11 @@ export function collectPages(plugins: PluginDefinition[], admin: boolean): PageR
 		}
 	}
 	return out;
+}
+
+/** Collects explicitly opted-in plugin pages for the Explore page. */
+export function collectExplorePages(plugins: PluginDefinition[]): PageRegistration[] {
+	return collectPages(plugins, false).filter(page => page.explore === true && Boolean(page.navTitle));
 }
 
 /** Returns the mounts registered for a slot, ordered by plugin name. */

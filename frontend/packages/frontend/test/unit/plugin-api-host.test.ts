@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import {
 	_resetPasteTransformsForTest,
 	_resetPreviewsForTest,
+	collectExplorePages,
 	launchServerPlugins,
 } from '@/plugin-api.js';
 import type { PluginHost } from '@/plugin-api.js';
@@ -46,6 +47,19 @@ afterEach(() => {
 	window.fetch = originalWindowFetch;
 });
 
+describe('plugin page collection', () => {
+	test('includes only opted-in public pages with navigation labels', () => {
+		const component = {} as never;
+		const pages = collectExplorePages([
+			{ name: 'opted-in', setup() {}, pages: [{ path: '/explore', component, explore: true, navTitle: 'Explore' }] },
+			{ name: 'navigation-only', setup() {}, pages: [{ path: '/settings', component, navTitle: 'Settings' }] },
+			{ name: 'missing-label', setup() {}, pages: [{ path: '/hidden', component, explore: true }] },
+			{ name: 'admin', setup() {}, pages: [{ path: '/admin', component, explore: true, navTitle: 'Admin', admin: true }] },
+		]);
+
+		expect(pages.map(page => page.plugin)).toEqual(['opted-in']);
+	});
+});
 describe('plugin host fetch', () => {
 	test('uses the session only for this plugin root-relative path', async () => {
 		const fetchSpy = vi.spyOn(window, 'fetch').mockResolvedValue(new Response('{}'));

@@ -2482,7 +2482,6 @@ _permissions:
   "write:admin:unsuspend-user": "Unsuspend user"
   "write:admin:meta": "Manage server metadata"
   "write:admin:user-note": "Manage moderation note"
-  "write:admin:role-level-experience": "Change role experience"
   "write:admin:roles": "Manage roles"
   "read:admin:roles": "View roles"
   "write:admin:relays": "Manage relays"

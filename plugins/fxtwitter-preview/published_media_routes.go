@@ -37,7 +37,7 @@ func registerPublishedMediaRoutes(ctx plugin.Context, r plugin.Router, s *store,
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
 		var body publishedMediaPrepareRequest
-		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) || body.Index < 0 {
+		if err := plugin.BindStrict(req, &body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) || body.Index < 0 {
 			return nil, plugin.NewCodedStatusError(http.StatusBadRequest, "invalid media prepare request", "INVALID_REQUEST")
 		}
 		maxIndex := maxFxPhotoItems

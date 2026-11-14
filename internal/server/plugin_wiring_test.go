@@ -89,6 +89,35 @@ func (e customPluginErrorCode) Unwrap() error { return e.err }
 
 func (e customPluginErrorCode) PluginErrorCode() string { return e.code }
 
+func TestPluginBindStrictRejectsUnknownAndTrailingJSON(t *testing.T) {
+	type requestBody struct {
+		Value string "json:\"value\""
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "valid", body: "{\"value\":\"ok\"}", want: http.StatusOK},
+		{name: "whitespace after value", body: "{\"value\":\"ok\"}  ", want: http.StatusOK},
+		{name: "empty", body: "", want: http.StatusBadRequest},
+		{name: "unknown field", body: "{\"value\":\"ok\",\"extra\":true}", want: http.StatusBadRequest},
+		{name: "trailing value", body: "{\"value\":\"ok\"} {}", want: http.StatusBadRequest},
+		{name: "malformed trailing value", body: "{\"value\":\"ok\"} x", want: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serveWrapped(t, func(req plugin.Request) (any, error) {
+				var body requestBody
+				if err := plugin.BindStrict(req, &body); err != nil {
+					return nil, plugin.Errorf(http.StatusBadRequest, "invalid JSON")
+				}
+				return body, nil
+			}, tc.body)
+			assert.Equal(t, tc.want, rec.Code)
+		})
+	}
+}
+
 func TestWrapPluginHandler_JSONResult(t *testing.T) {
 	rec := serveWrapped(t, func(plugin.Request) (any, error) {
 		return map[string]string{"hello": "world"}, nil
@@ -933,55 +962,56 @@ func TestSetupPlugins_EffectivePolicyStartupOrderAndRegistration(t *testing.T) {
 }
 
 func TestSetupPlugins_CheckedPolicyResolversReachContextAndRoute(t *testing.T) {
-	const userID = "policy-viewer"
+	const policyKey = "canSearchNotes"
+	svc, _, _ := newEffectivePolicyTestService(t)
+
 	var contextPolicies map[string]any
 	var contextErr error
-	var requestPolicies map[string]any
-
 	def := plugin.Definition{
 		Name:       "checked-policy",
 		APIVersion: plugin.APIVersion,
 		EffectivePolicies: func(plugin.Context, plugin.EffectivePolicyInvalidator) (plugin.EffectivePolicyRegistration, error) {
 			return plugin.EffectivePolicyRegistration{
-				Keys: []string{"canSearchNotes"},
+				Keys: []string{policyKey},
 				Resolve: func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
-					return []plugin.EffectivePolicyContribution{{Key: "canSearchNotes", Value: false}}, nil
+					return []plugin.EffectivePolicyContribution{{Key: policyKey, Priority: 1, Value: false}}, nil
 				},
 			}, nil
 		},
 		Routes: func(ctx plugin.Context, r plugin.Router) error {
-			contextPolicies, contextErr = ctx.(plugin.CheckedUserRolePolicyContext).CheckedUserRolePolicies(userID, "canSearchNotes")
+			checkedContext, ok := ctx.(plugin.CheckedUserRolePolicyContext)
+			if !ok {
+				return errors.New("checked role policy context is unavailable")
+			}
+			contextPolicies, contextErr = checkedContext.CheckedUserRolePolicies("u1", policyKey)
 			r.GET("/checked", func(req plugin.Request) (any, error) {
-				checked, ok := req.(plugin.CheckedRolePolicyRequest)
+				checkedRequest, ok := req.(plugin.CheckedRolePolicyRequest)
 				if !ok {
 					return nil, errors.New("checked role policy request is unavailable")
 				}
-				var err error
-				requestPolicies, err = checked.CheckedRolePolicies("canSearchNotes")
-				return requestPolicies, err
+				return checkedRequest.CheckedRolePolicies(policyKey)
 			})
 			return nil
 		},
 	}
 
-	svc, _, _ := newEffectivePolicyTestService(t)
 	s, api := newPluginTestServer(config.RoleServer)
 	s.roleService = svc
 	s.echo.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			c.Set(string(middleware.UserContextKey), &model.User{ID: userID})
+			c.Set(string(middleware.UserContextKey), &model.User{ID: "u1"})
 			return next(c)
 		}
 	})
 	require.NoError(t, s.setupPlugins(api, []plugin.Definition{def}, noopStorage))
 
-	require.NoError(t, contextErr, "setupPlugins must provide the role service to plugin.Context")
-	assert.Equal(t, map[string]any{"canSearchNotes": false}, contextPolicies)
+	require.NoError(t, contextErr)
+	assert.Equal(t, map[string]any{policyKey: false}, contextPolicies, "setupPlugins must wire the preparation context to the role service")
 
 	rec := httptest.NewRecorder()
 	s.echo.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/plugin/checked-policy/checked", nil))
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, map[string]any{"canSearchNotes": false}, requestPolicies, "setupPlugins must provide the role service to plugin routes")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"canSearchNotes":false}`, rec.Body.String(), "setupPlugins must wire the registered route to the role service")
 }
 
 func TestSetupPlugins_PreparesAllPluginsBeforeAnyCallback(t *testing.T) {

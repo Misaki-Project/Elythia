@@ -1093,4 +1093,5 @@ _roleLevel:
   removeConfiguration: "レベル設定を削除"
   legacyRoleNotice: "旧形式のレベルロールです。保存するとプラグイン形式へ移行します。"
   unavailable: "レベル情報を取得できませんでした。サーバーのrole-level設定を確認してください。"
-
+_permissions:
+  "write:admin:role-level-experience": "ロール経験値を変更する"

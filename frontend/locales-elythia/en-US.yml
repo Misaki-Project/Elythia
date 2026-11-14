@@ -1110,4 +1110,5 @@ _roleLevel:
   removeConfiguration: "Remove level configuration"
   legacyRoleNotice: "This is a legacy level role. Saving it migrates it to the plugin format."
   unavailable: "Could not load level information. Check the server's role-level configuration."
-
+_permissions:
+  "write:admin:role-level-experience": "Change role experience"

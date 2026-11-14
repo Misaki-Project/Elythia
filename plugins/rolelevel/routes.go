@@ -92,7 +92,7 @@ func validatePageOffset(field string, offset int) error {
 // bindJSON decodes exactly one strict JSON value and maps decode failures to validation.
 // BindStrict rejects unknown fields and trailing JSON values consistently in host and tests.
 func bindJSON(req plugin.Request, v any) error {
-	if err := req.BindStrict(v); err != nil {
+	if err := plugin.BindStrict(req, v); err != nil {
 		return codedErrorf(http.StatusBadRequest, CodeValidationFailed,
 			"リクエスト JSON を解読できません: %v", err)
 	}

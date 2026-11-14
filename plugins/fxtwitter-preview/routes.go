@@ -50,7 +50,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			NoteID    string `json:"noteId"`
 			PostID    string `json:"postId"`
 		}
-		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) {
+		if err := plugin.BindStrict(req, &body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) {
 			return nil, plugin.NewCodedStatusError(http.StatusBadRequest, "invalid noteId or postId", "INVALID_REQUEST")
 		}
 		if !cfg.ExternalFetchEnabled {
@@ -297,7 +297,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			Lang      string `json:"lang"`
 			Nonce     string `json:"nonce"`
 		}
-		if err := req.BindStrict(&body); err != nil {
+		if err := plugin.BindStrict(req, &body); err != nil {
 			return nil, plugin.Errorf(http.StatusBadRequest, "invalid embed request")
 		}
 		if body.Target == "" {
@@ -334,7 +334,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			AuthToken string `json:"i,omitempty"`
 			PostID    string `json:"postId"`
 		}
-		if err := req.BindStrict(&body); err != nil || !statusIDPattern.MatchString(body.PostID) {
+		if err := plugin.BindStrict(req, &body); err != nil || !statusIDPattern.MatchString(body.PostID) {
 			return nil, plugin.Errorf(http.StatusBadRequest, "valid postId required")
 		}
 		items, err := s.ListAudit(req.Context(), body.PostID)
@@ -356,7 +356,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			Reason     string `json:"reason"`
 			Confirm    bool   `json:"confirm"`
 		}
-		if err := req.BindStrict(&body); err != nil {
+		if err := plugin.BindStrict(req, &body); err != nil {
 			return nil, plugin.Errorf(http.StatusBadRequest, "target, selection, reason, and confirmation are required")
 		}
 		validSelection := statusIDPattern.MatchString(body.PostID) || (body.Target == "audit" && body.PostID == "" && body.SnapshotID != nil)
@@ -392,7 +392,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		var body struct {
 			AuthToken string `json:"i,omitempty"`
 		}
-		if err := req.BindStrict(&body); err != nil {
+		if err := plugin.BindStrict(req, &body); err != nil {
 			return nil, plugin.Errorf(http.StatusBadRequest, "invalid request")
 		}
 		return s.ReadRateLimitSettingsResponse(req.Context())
@@ -407,7 +407,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			Revision      int64  `json:"revision"`
 			GlobalPerHour int    `json:"globalPerHour"`
 		}
-		if err := req.BindStrict(&body); err != nil || body.Revision < 1 {
+		if err := plugin.BindStrict(req, &body); err != nil || body.Revision < 1 {
 			return nil, plugin.Errorf(http.StatusBadRequest, "invalid rate limit settings")
 		}
 		settings := rateLimitSettings{

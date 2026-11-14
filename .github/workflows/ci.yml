@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, codex/upstream-34ec-ci-base-20261114]
-  pull_request:
     branches: [main, develop]
+  pull_request:
+    branches: [main, develop, codex/upstream-34ec-ci-base-20261114]
 
 # GITHUB_TOKEN の既定権限を最小化する。全jobはcheckout/build/testのみで
 # リポジトリへの書き込みやPR/issueへの操作を行わないため、workflow直下で
