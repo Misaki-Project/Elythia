@@ -634,7 +634,16 @@ test.each([
 	expect(view.getByText('quoted public body')).toBeTruthy();
 	expect(view.container.querySelector('a[href="https://x.com/i/status/1234567890"]')).toBeNull();
 	expect(view.container.querySelector('a[href="https://x.com/i/status/9876543210"]')).toBeNull();
-	expect(view.container.querySelector('[data-fx-video-play],iframe')).toBeNull();
+	const playButton = await waitFor(() => {
+		const button = view.container.querySelector<HTMLButtonElement>(`[data-fx-video-target="${target}"] [data-fx-video-play]`);
+		expect(button).not.toBeNull();
+		expect(button?.disabled).toBe(true);
+		return button;
+	});
+	expect(playButton).not.toBeNull();
+	expect(prepareCalls('video')).toHaveLength(0);
+	expect(viewer).not.toHaveBeenCalled();
+	expect(view.container.querySelector('iframe')).toBeNull();
 });
 
 test.each(['unavailable', 'disabled', 'pending'] as const)('legacy %s response never revives its body', async state => {
