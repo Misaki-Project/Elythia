@@ -42,6 +42,10 @@ var handlerNilAllowed = map[string]string{
 	// テストだけが SetClockForTest (export_test.go) で入れる。本番では常に nil で、
 	// now() は time.Now を使う。
 	"admin.clock": "テスト専用の seam。setupRoutes は入れず、nil のとき time.Now を使う",
+	// profile role privacy is wired only when the role-level plugin is both
+	// linked into this server binary and enabled. The generic internal/server
+	// test binary does not link that separate plugin module.
+	"users.profileRoleVisibility": "role-level plugin が未登録または無効の構成では setter を呼ばない。plugin 有効時は setupRoutes が DB reader を配線する",
 	// 1:1 のメッセージをプラグインへ届ける口 (#3469)。setupRoutes は
 	// newPluginNotificationDispatcher が nil でないとき (通知を受け取るプラグインが
 	// 居るとき) だけ SetMessageObserver を呼ぶ。テストの組み立てはプラグインを登録しない。

@@ -45,6 +45,8 @@ jobs:
           go-version-file: go.mod
 
       - name: Upgrade and verify
+        env:
+          UPGRADE_FROM: '2.1.0'
         run: make upgrade-test
 
       - name: Upload logs on failure

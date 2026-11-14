@@ -55,11 +55,14 @@ if (props.id) {
 		roleId: props.id,
 	});
 	const levelResponse = await roleLevelApi<{ role: RoleLevelConfig }>('plugin/role-level/admin/roles/show', { roleId: props.id }).catch(() => null);
-	hadLevelConfig = levelResponse != null;
+	const levelConfig = levelResponse?.role && typeof levelResponse.role === 'object' && levelResponse.role.roleId === props.id
+		? levelResponse.role
+		: null;
+	hadLevelConfig = levelConfig !== null;
 	data.value = {
 		...role.value,
-		target: levelResponse != null || isLegacyLevelRole(role.value as { target: string }) ? 'manualLevel' : role.value.target,
-		levelConfig: levelResponse?.role ?? defaultRoleLevelConfig(props.id),
+		target: levelConfig !== null || isLegacyLevelRole(role.value as { target: string }) ? 'manualLevel' : role.value.target,
+		levelConfig: levelConfig ?? defaultRoleLevelConfig(props.id),
 	};
 } else {
 	data.value = {

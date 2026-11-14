@@ -16,10 +16,10 @@ func rangeCfg(ranges ...PolicyRange) Config {
 
 func TestFxTwitterQuotaRangesKeepIntegerBoundaries(t *testing.T) {
 	tests := []struct {
-		name string
-		key string
+		name             string
+		key              string
 		base, additional float64
-		wantErr bool
+		wantErr          bool
 	}{
 		{"hour valid endpoints", "fxTwitterColdFetchesPerHour", 100, 25, false},
 		{"day upper endpoint", "fxTwitterColdFetchesPerDay", 100000, 0, false},

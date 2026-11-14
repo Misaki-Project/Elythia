@@ -71,6 +71,10 @@ func TestRestoreCommandEndToEnd(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, m.Up())
 		_, _ = m.Close()
+		localM, err := gomigrate.New("file://"+filepath.Join(rsCoreMigrations, "local"), strings.Replace(url("app", "app-pass", db), "postgres://", "pgx5://", 1)+"&x-migrations-table=schema_migrations_local")
+		require.NoError(t, err)
+		require.NoError(t, localM.Up())
+		_, _ = localM.Close()
 		exec1(db, `INSERT INTO "user" ("id", "username", "usernameLower") VALUES ('u1', 'root', 'root')`,
 			`INSERT INTO meta ("id", "rootUserId") SELECT 'x', 'u1' WHERE NOT EXISTS (SELECT 1 FROM meta)`,
 			`UPDATE meta SET "rootUserId" = 'u1'`,

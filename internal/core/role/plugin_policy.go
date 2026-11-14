@@ -249,8 +249,7 @@ func (s *Service) resolvePolicies(userID string, providerKeys map[string]struct{
 				conditionalErr := fmt.Errorf("role: conditional policy inputs: %w", snapshot.conditionalErr)
 				defer func() { err = joinBasePolicyError(conditionalErr, err) }()
 			} else {
-				// 従来の unchecked provider 評価は維持し、入力が揃った場合の cache 項目や
-				// in-flight 処理とは分離する。
+				// 従来の未checked経路は維持し、完全な入力の cache / flight とは分離する。
 				partialInputs = true
 			}
 		}

@@ -177,7 +177,7 @@ func run(root, pluginDir string, inc include) error {
 
 	backend := backendPlugins(found)
 	if len(backend) == 0 {
-		// フロントエンド専用プラグインの場合、古い Go 登録情報や workspace を残さない。
+		// frontend-only plugin では、古い Go 登録や workspace を残さない。
 		if err := removeIfExists(genPath); err != nil {
 			return err
 		}

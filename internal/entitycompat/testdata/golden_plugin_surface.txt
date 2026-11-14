@@ -32,6 +32,8 @@ plugin/plugintest:   field ManagedAccount.Suspended bool
 plugin/plugintest:   field PeerSend.Host string
 plugin/plugintest:   field PeerSend.ID string
 plugin/plugintest:   field PeerSend.Payload json.RawMessage
+plugin/plugintest:   field Request.ActiveRoleError error
+plugin/plugintest:   field Request.ActiveRoleIDs []string
 plugin/plugintest:   field Request.Administrator bool
 plugin/plugintest:   field Request.Body string
 plugin/plugintest:   field Request.CheckedRolePolicies map[string]any
@@ -148,6 +150,7 @@ plugin:   method Accounts.Create(context.Context, string) (Account, error)
 plugin:   method Accounts.Delete(context.Context, string) error
 plugin:   method Accounts.List(context.Context) ([]Account, error)
 plugin:   method Accounts.UpdateProfile(context.Context, string, ProfileUpdate) error
+plugin:   method ActiveRoleRequest.ActiveRoleIDs() ([]string, error)
 plugin:   method Caller.Call(context.Context, string, any) (json.RawMessage, error)
 plugin:   method CheckedRolePolicyRequest.CheckedRolePolicies(...string) (map[string]any, error)
 plugin:   method CheckedUserRolePolicyContext.CheckedUserRolePolicies(string, ...string) (map[string]any, error)
@@ -188,6 +191,7 @@ plugin:   method Secrets.Get(context.Context, string) (string, error)
 plugin:   method Secrets.Set(context.Context, string, string) error
 plugin:   method Storage.DB() *sql.DB
 plugin:   method Storage.Migrate(context.Context, []Migration) error
+plugin:   method StrictRequest.BindStrict(any) error
 plugin: const APIVersion
 plugin: const NotificationChatMessage
 plugin: const NotificationFollow
@@ -208,6 +212,7 @@ plugin: func (*APIError) Error() string
 plugin: func (*StatusError) Error() string
 plugin: func (Definition) Validate() error
 plugin: func (EffectivePolicyRegistration) Validate() error
+plugin: func BindStrict(Request, any) error
 plugin: func ErrNotFound(string, ...any) *StatusError
 plugin: func Errorf(int, string, ...any) *StatusError
 plugin: func ExtractStatusError(error) (*StatusError, string)
@@ -223,6 +228,7 @@ plugin: type APIError struct
 plugin: type Account struct
 plugin: type Accounts interface
 plugin: type ActiveRoleAssignment struct
+plugin: type ActiveRoleRequest interface
 plugin: type Blob struct
 plugin: type Caller interface
 plugin: type CheckedRolePolicyRequest interface
@@ -257,6 +263,7 @@ plugin: type SecretSpec struct
 plugin: type Secrets interface
 plugin: type StatusError struct
 plugin: type Storage interface
+plugin: type StrictRequest interface
 plugin: var ErrAccountNotFound
 plugin: var ErrAccountSuspended
 plugin: var ErrBadPeerPayload

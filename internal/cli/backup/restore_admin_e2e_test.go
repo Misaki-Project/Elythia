@@ -638,6 +638,10 @@ func setupRestoreE2E(t *testing.T) *restoreE2E {
 	require.NoError(t, err)
 	require.NoError(t, m.Up())
 	_, _ = m.Close()
+	localM, err := gomigrate.New("file://"+filepath.Join(rsCoreMigrations, "local"), strings.Replace(r.url("app", "app-pass", "elythia"), "postgres://", "pgx5://", 1)+"&x-migrations-table=schema_migrations_local")
+	require.NoError(t, err)
+	require.NoError(t, localM.Up())
+	_, _ = localM.Close()
 	seedAdminUsers(t, r)
 	r.exec("elythia", `INSERT INTO note ("id", "userId", "visibility") VALUES ('n_before', 'u1', 'public')`)
 

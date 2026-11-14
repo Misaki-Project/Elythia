@@ -229,14 +229,13 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			// 任意の endpoint へ抜けられる)。upstream が
 			// 「`kind` 無し + 資格情報要」で app token を一律拒否するのと
 			// 同じ側に倒す。
-			var group *echo.Group
+			var groupMiddleware echo.MiddlewareFunc = middleware.RejectAppToken()
 			if def.Name == "role-level" {
 				// Keep the one established XP app-token exception, and deny all
 				// other role-level endpoints through the group gate.
-				group = api.Group(pluginRoutePrefix+def.Name, roleLevelAppTokenGate())
-			} else {
-				group = api.Group(pluginRoutePrefix+def.Name, middleware.RejectAppToken())
+				groupMiddleware = roleLevelAppTokenGate()
 			}
+			group := api.Group(pluginRoutePrefix+def.Name, groupMiddleware)
 			if needsRoutes {
 				r := &pluginRouter{group: group, roles: s.pluginRoles}
 				if s.roleService != nil {

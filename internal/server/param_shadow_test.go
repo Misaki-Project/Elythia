@@ -423,7 +423,7 @@ var apiRegistrationAllowed = map[string]string{
 	// 設定画面のキャッシュの削除からGETで呼ぶ。本文を読まないので本文の検査は要らない。
 	`api.Any("/clear-browser-cache", meta.ClearBrowserCache)`: "router.go",
 	// プラグインのroute(/api/plugin/<名前>/...)。Elythia独自で、goldenに無い。
-	`api.Group(pluginRoutePrefix+def.Name, middleware.RejectAppToken())`: "plugin_wiring.go",
+	`api.Group(pluginRoutePrefix+def.Name, groupMiddleware)`: "plugin_wiring.go",
 	// 上の登録をするsetupPluginsへ、/apiのgroupを渡す。
 	`s.setupPlugins(api.Group, registeredPlugins, openPluginStorage)`: "router.go",
 }
