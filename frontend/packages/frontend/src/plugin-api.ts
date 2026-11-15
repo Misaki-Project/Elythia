@@ -54,6 +54,7 @@ export { default as MkTime } from '@/components/global/MkTime.vue';
 // ルーターやダイアログをAPIモジュールの読み込みだけで初期化しない。
 export const MkA = defineAsyncComponent(() => import('@/components/global/MkA.vue'));
 export const MkUrl = defineAsyncComponent(() => import('@/components/global/MkUrl.vue'));
+export const MkSensitiveMediaGuard = defineAsyncComponent(() => import('@/components/MkSensitiveMediaGuard.vue'));
 export { default as PageWithHeader } from '@/components/global/PageWithHeader.vue';
 /**
  * サーバープラグインの秘密の値 (API キーなど) の入力欄 (Elythia #3470)。
