@@ -360,7 +360,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes, 'genshinRefreshIntervalMinutes'])" v-model:policyMeta="genshinRefreshIntervalMinutesMeta" :levelConfig="levelConfig" policyKey="genshinRefreshIntervalMinutes" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes, 'genshinRefreshIntervalMinutes'])" v-model:policyMeta="genshinRefreshIntervalMinutesMeta" :levelConfig="levelConfig" policyKey="genshinRefreshIntervalMinutes" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="genshinRefreshIntervalMinutes">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes }}</template>
 			<template #valueText>{{ genshinRefreshIntervalMinutes }}</template>
 			<template #default="{ disabled }">
@@ -371,21 +371,21 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts.genshinGameName, 'Genshin', 'genshinUidLimit'])" v-model:policyMeta="genshinUidLimitMeta" :levelConfig="levelConfig" policyKey="genshinUidLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts.genshinGameName, 'Genshin', 'genshinUidLimit'])" v-model:policyMeta="genshinUidLimitMeta" :levelConfig="levelConfig" policyKey="genshinUidLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="genshinUidLimit">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.genshinUidLimit }}</template>
 			<template #valueText>{{ genshinUidLimit }}</template>
 			<template #editor="{ disabled }">
 				<MkInput v-model="genshinUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #label>{{ i18n.ts._mkgoRolePolicy.genshinUidLimit }}</template><template #caption>{{ i18n.ts._mkgoRolePolicy.genshinUidLimit_caption }}</template></MkInput>
 			</template>
 		</XFolder>
-		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrUidLimit'])" v-model:policyMeta="hsrUidLimitMeta" :levelConfig="levelConfig" policyKey="hsrUidLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrUidLimit'])" v-model:policyMeta="hsrUidLimitMeta" :levelConfig="levelConfig" policyKey="hsrUidLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="hsrUidLimit">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.hsrUidLimit }}</template>
 			<template #valueText>{{ hsrUidLimit }}</template>
 			<template #default="{ disabled }">
 				<MkInput v-model="hsrUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #label>{{ i18n.ts._mkgoRolePolicy.hsrUidLimit }}</template><template #caption>{{ i18n.ts._mkgoRolePolicy.hsrUidLimit_caption }}</template></MkInput>
 			</template>
 		</XFolder>
-		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrRefreshIntervalMinutes'])" v-model:policyMeta="hsrRefreshIntervalMinutesMeta" :levelConfig="levelConfig" policyKey="hsrRefreshIntervalMinutes" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrRefreshIntervalMinutes'])" v-model:policyMeta="hsrRefreshIntervalMinutesMeta" :levelConfig="levelConfig" policyKey="hsrRefreshIntervalMinutes" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="hsrRefreshIntervalMinutes">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.hsrRefreshIntervalMinutes }}</template>
 			<template #valueText>{{ hsrRefreshIntervalMinutes }}</template>
 			<template #default="{ disabled }">
