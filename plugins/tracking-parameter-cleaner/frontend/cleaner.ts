@@ -24,12 +24,12 @@ const opaqueQueryKeys = new Set([
 ]);
 
 const siteTrackingKeys = new Map<string, ReadonlySet<string>>([
-	['x.com', new Set(['s', 't', 'ref_src', 'ref_url'])],
-	['www.x.com', new Set(['s', 't', 'ref_src', 'ref_url'])],
-	['mobile.x.com', new Set(['s', 't', 'ref_src', 'ref_url'])],
-	['twitter.com', new Set(['s', 't', 'ref_src', 'ref_url'])],
-	['www.twitter.com', new Set(['s', 't', 'ref_src', 'ref_url'])],
-	['mobile.twitter.com', new Set(['s', 't', 'ref_src', 'ref_url'])],
+	['x.com', new Set(['s', 't', 'a', 'ref_src', 'ref_url'])],
+	['www.x.com', new Set(['s', 't', 'a', 'ref_src', 'ref_url'])],
+	['mobile.x.com', new Set(['s', 't', 'a', 'ref_src', 'ref_url'])],
+	['twitter.com', new Set(['s', 't', 'a', 'ref_src', 'ref_url'])],
+	['www.twitter.com', new Set(['s', 't', 'a', 'ref_src', 'ref_url'])],
+	['mobile.twitter.com', new Set(['s', 't', 'a', 'ref_src', 'ref_url'])],
 	['youtube.com', new Set(['si'])],
 	['www.youtube.com', new Set(['si'])],
 	['m.youtube.com', new Set(['si'])],
