@@ -32,7 +32,7 @@ name: Playwright
 
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, ci/elythia-2.2-upstream-base-20261115]
     # backend の API 形状・DB schema・spec 自体・起動まわりを触る変更だけを
     # 対象にする。ドキュメントのみの PR で待たされないようにする。
     paths:
