@@ -65,8 +65,7 @@
       "button-name"
     ],
     "admin /admin/users": [
-      "button-name",
-      "label"
+      "button-name"
     ],
     "admin /admin/settings": [
       "button-name",
@@ -81,8 +80,7 @@
       "button-name"
     ],
     "admin /admin/federation": [
-      "button-name",
-      "label"
+      "button-name"
     ],
     "admin /admin/ip-search": [
       "button-name"
@@ -94,8 +92,7 @@
       "button-name"
     ],
     "admin /admin/files": [
-      "button-name",
-      "label"
+      "button-name"
     ],
     "admin /admin/database": [
       "button-name"
