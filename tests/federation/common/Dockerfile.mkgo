@@ -17,6 +17,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
 COPY . .
+
+# Product Playwright runs opt in to the enabled bundled plugins. Other stacks
+# retain their previous behavior and use any generated host artifacts in the
+# build context. pluginbuild writes the ignored go.work and registration file
+# inside this build stage when the Playwright opt-in is set.
+ARG BUILD_PRODUCT_PLUGINS=false
+RUN if [ "$BUILD_PRODUCT_PLUGINS" = "true" ]; then GOWORK=off go run ./tools/pluginbuild; fi
+
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /app/built/elythia ./cmd/elythia
