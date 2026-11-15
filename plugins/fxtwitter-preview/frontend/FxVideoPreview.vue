@@ -64,7 +64,7 @@ let generation = 0;
 const sourceNoteId = computed(() => props.context.source?.kind === 'note' ? props.context.source.noteId : null);
 const postHref = computed(() => /^[0-9]{2,20}$/.test(props.contentPostId) ? `https://x.com/i/status/${props.contentPostId}` : null);
 const sourceLinkLabel = computed(() => props.target === 'quote' ? 'Xで引用投稿を開く' : 'Xで投稿を開く');
-const canAccess = computed(() => props.context.detail && props.context.revealed && props.context.active && revealed.value && sourceNoteId.value != null);
+const canAccess = computed(() => props.context.revealed && props.context.active && revealed.value && sourceNoteId.value != null);
 const canLoad = computed(() => canAccess.value && props.context.inViewport);
 const canPlay = computed(() => canLoad.value && activeVideo.value.provider === 'x' && activeVideo.value.playbackAvailable === true && activeVideo.value.playbackUrl != null);
 const durationLabel = computed(() => formatDuration(activeVideo.value.durationMs));

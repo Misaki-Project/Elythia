@@ -149,14 +149,14 @@ function setTimelineAutoOpen(value: boolean): void {
 	preferReactive.fxTwitterPreviewTimelineAutoOpen.value = value;
 }
 
-test('timeline opens the Fx text card automatically by default without loading media', async () => {
+test('timeline opens the Fx card automatically by default with the same media as the note detail', async () => {
 	await register();
 	const view = coordinate({ detail: false });
 	await waitFor(() => expect(view.getByText('public body')).toBeTruthy());
 	expect(previewCalls()).toHaveLength(1);
 	expect(previewCalls()[0][1]).toEqual({ noteId: 'note-1', postId: '1234567890' });
-	expect(prepareCalls()).toHaveLength(0);
-	expect(media).not.toHaveBeenCalled();
+	await waitFor(() => expect(view.container.querySelector<HTMLButtonElement>('[data-fx-video-play]')?.disabled).toBe(false));
+	expect(prepareCalls('video')).toHaveLength(0);
 });
 
 test('timeline waits for the Fx action when automatic opening is off, and details still open automatically', async () => {
@@ -459,13 +459,13 @@ test('viewer rejection can be retried without retaining an unused video object U
 	await waitFor(() => expect(viewer).toHaveBeenCalledTimes(2));
 	expect(URL.createObjectURL).not.toHaveBeenCalled();
 });
-test('timeline cannot start video playback even if mounted directly', async () => {
+test('timeline plays video after an explicit play action like the note detail', async () => {
 	const view = card(data(), { ...context, detail: false });
 	await nextTick();
-	const play = view.container.querySelector('[data-fx-video-play]');
-	if (play) await fireEvent.click(play);
-	expect(api).not.toHaveBeenCalled();
-	expect(viewer).not.toHaveBeenCalled();
+	expect(fetchMock).not.toHaveBeenCalled();
+	await fireEvent.click(must(view.container.querySelector<HTMLButtonElement>('[data-fx-video-play]')));
+	await waitFor(() => expect(viewer).toHaveBeenCalledTimes(1));
+	expect(view.container.querySelector('iframe')).toBeNull();
 });
 
 test.each(['deleted', 'suspended', 'private', 'blocked', 'unavailable', 'unknown', 'fetch_failed'])('backend unavailable reason %s survives normalization without public audit fallback', async reason => {
@@ -888,7 +888,7 @@ test.each(['pending', 'rejected', 'invalid'] as const)('administrator form stays
 	}
 });
 
-test.each([{ detail: false }, { revealed: false }, { active: false }, { inViewport: false }, { source: null }])('populated media cannot start work in gated context %j', async patch => {
+test.each([{ revealed: false }, { active: false }, { inViewport: false }, { source: null }])('populated media cannot start work in gated context %j', async patch => {
 	const response = data();
 	response.post.author.avatarUrl = '/api/plugin/fxtwitter-preview/media/1234567890/avatar/0?noteId=note-1';
 	response.post.images = [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }];

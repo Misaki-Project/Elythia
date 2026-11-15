@@ -213,15 +213,84 @@ test('blocks photo retry when refreshed quote identity or sensitivity changed', 
 	expect(hostApi.mock.calls.filter(call => call[1]?.kind === 'image' || call[1]?.kind === 'quote-image')).toHaveLength(2);
 });
 
-test('does not mount individual video controls in text or compact mode', () => {
+test('text mode summarizes media instead of mounting it, and the timeline mounts video like the detail', async () => {
 	const video = { provider: 'x' as const, playbackAvailable: true, playbackUrl: `/api/plugin/fxtwitter-preview/media/video/1234567890/main/0?noteId=note-1&token=${'3'.repeat(32)}` };
-	const post = makePost({ hasVideo: true, videos: [video] });
-	const text = card(post, { ...context, preferenceValue: 'text' });
-	expect(text.queryByRole('button', { name: '動画を再生' })).toBeNull();
-	text.unmount();
-	const compact = card(post, { ...context, detail: false });
-	expect(compact.queryByRole('button', { name: '動画を再生' })).toBeNull();
-	expect(compact.getByText('動画1件')).toBeTruthy();
+	const post = makePost({ hasVideo: true, videos: [video], images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }] });
+	for (const detail of [true, false]) {
+		const text = card(post, { ...context, detail, preferenceValue: 'text' });
+		expect(text.queryByRole('button', { name: '動画を再生' })).toBeNull();
+		expect(text.container.querySelector('[data-fx-media-grid]')).toBeNull();
+		expect(text.getByText('画像1件・動画1件')).toBeTruthy();
+		text.unmount();
+	}
+	const timeline = card(post, { ...context, detail: false });
+	expect(await timeline.findByRole('button', { name: '動画を再生' })).toBeTruthy();
+	await waitFor(() => expect(timeline.container.querySelector('[data-fx-media-grid]')).not.toBeNull());
+	expect(timeline.queryByText('画像1件・動画1件')).toBeNull();
+});
+
+test.each([
+	{ detail: true, preferenceValue: 'media' },
+	{ detail: false, preferenceValue: 'media' },
+	{ detail: true, preferenceValue: 'text' },
+	{ detail: false, preferenceValue: 'text' },
+])('shows the author icon in every mode and place %j', async patch => {
+	const post = makePost({ author: { name: 'Alice', screenName: 'alice', avatarUrl: '/api/plugin/fxtwitter-preview/media/1234567890/avatar/0?noteId=note-1' } });
+	const view = card(post, { ...context, ...patch });
+	await waitFor(() => expect(view.container.querySelector('header img')?.getAttribute('src')).toMatch(/^blob:fx-/));
+	expect(hostFetch.mock.calls.some(([path]) => String(path).includes('/avatar/0'))).toBe(true);
+});
+
+test('the timeline loads photos in media mode like the note detail', async () => {
+	const post = makePost({ images: [0, 1].map(index => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1` })) });
+	const view = card(post, { ...context, detail: false });
+	await waitFor(() => expect(view.container.querySelectorAll('[data-fx-media-grid] img')).toHaveLength(2));
+	expect(hostApi.mock.calls.filter(call => call[1]?.kind === 'image')).toHaveLength(2);
+	await fireEvent.click(view.container.querySelectorAll('[data-fx-media-grid] button')[1]);
+	await waitFor(() => expect(openMedia).toHaveBeenCalledOnce());
+	expect(openMedia.mock.calls[0][1]).toBe('1234567890:1');
+});
+
+test('a failed timeline photo can be retried like in the note detail', async () => {
+	const post = makePost({ images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }] });
+	hostApi.mockImplementation(async (path: string, params: Record<string, unknown>) => {
+		if (path.endsWith('/preview')) return { state: 'ready', post };
+		return { url: mediaURL(Number(params.index ?? 0)), contentType: 'image/png', size: 3, expiresAt: '2026-11-15T00:00:00Z' };
+	});
+	let publicAttempt = 0;
+	vi.stubGlobal('fetch', async () => {
+		publicAttempt++;
+		if (publicAttempt === 1) return new Response(null, { status: 503 });
+		return new Response(new Blob(['abc'], { type: 'image/png' }), { status: 200, headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } });
+	});
+	const view = card(post, { ...context, detail: false });
+	await waitFor(() => expect(view.container.querySelector('[data-photo-state="error"]')).not.toBeNull());
+	await fireEvent.click(view.getByRole('button', { name: '写真を再試行' }));
+	await waitFor(() => expect(view.container.querySelector('[data-photo-state="error"]')).toBeNull());
+	expect(publicAttempt).toBe(2);
+});
+
+test('the note detail shows the whole text, and the timeline truncates it with a link to the note', () => {
+	const long = Array.from({ length: 8 }, (_, line) => `line ${line + 1}`).join('\n');
+	const detail = card(makePost({ text: long }));
+	expect(detail.container.querySelector('p')?.textContent).toBe(long);
+	expect(detail.queryByText('もっと見る')).toBeNull();
+	detail.unmount();
+	const timeline = card(makePost({ text: long }), { ...context, detail: false });
+	expect(timeline.container.querySelector('p')?.textContent).not.toContain('line 6');
+	expect(timeline.getByText('もっと見る').getAttribute('href')).toBe('/notes/note-1');
+});
+
+test.each([
+	{ width: 600, height: 1200, aspect: '1' },
+	{ width: 1000, height: 1000, aspect: '1' },
+	{ width: 1600, height: 800, aspect: '2' },
+	{ width: 5000, height: 1000, aspect: String(16 / 9) },
+])('a single photo keeps its ratio but is never taller than square %j', ({ width, height, aspect }) => {
+	const post = makePost({ images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1', width, height }] });
+	const view = card(post);
+	const grid = view.container.querySelector<HTMLElement>('[data-fx-media-grid]');
+	expect(grid?.style.getPropertyValue('--fx-single-aspect')).toBe(aspect);
 });
 
 test('does not play a refreshed quote video after the quote identity changes', async () => {

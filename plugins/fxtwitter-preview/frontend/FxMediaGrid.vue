@@ -64,7 +64,8 @@ const singleImageStyle = computed<Record<string, string> | undefined>(() => {
 	const image = props.images.length === 1 ? props.images[0] : null;
 	if (image == null) return undefined;
 	const natural = image.width != null && image.height != null && image.width > 0 && image.height > 0 ? image.width / image.height : 16 / 9;
-	const ratio = Number.isFinite(natural) && natural >= 0.25 && natural <= 4 ? natural : 16 / 9;
+	// 縦長の画像は1:1までにする。横長は元の比で、極端なものだけ16:9に戻す。
+	const ratio = Number.isFinite(natural) && natural <= 4 ? Math.max(1, natural) : 16 / 9;
 	return { '--fx-single-aspect': String(ratio) };
 });
 </script>
@@ -110,6 +111,8 @@ const singleImageStyle = computed<Record<string, string> | undefined>(() => {
 }
 
 .singleImage {
+	// 幅を明示しないと、高さの上限が縦横比を通して幅にも効き、枠が縮んで左に寄る。
+	width: 100%;
 	grid-template-columns: minmax(0, 1fr);
 	aspect-ratio: var(--fx-single-aspect, 16 / 9);
 	max-height: min(360px, 50vh);

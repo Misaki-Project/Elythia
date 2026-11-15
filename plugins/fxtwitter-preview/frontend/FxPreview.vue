@@ -18,11 +18,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 			<template v-else><strong>{{ data.post.author.name }}</strong><span>@{{ data.post.author.screenName }}</span></template>
 		</div>
 	</header>
-	<p :class="$style.text"><template v-for="segment in displayedTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template><span v-if="textSummary.truncated && !expanded">…</span></p>
+	<p :class="$style.text"><template v-for="segment in displayedTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template><span v-if="textSummary.truncated && !context.detail">…</span></p>
 	<a v-if="textSummary.truncated && !context.detail" :class="$style.more" :href="noteHref ?? undefined">もっと見る</a>
-	<button v-else-if="textSummary.truncated && !expanded" type="button" class="_button" :class="$style.more" @click="expanded = true">もっと見る</button>
 	<p v-if="data.stale" :class="$style.stale">一時的に取得できないため、前回取得した内容を表示しています。</p>
-	<p v-if="!isTextMode && !showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
+	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
 	<FxMediaGrid v-if="showAttachmentMedia && renderedImages.length" :key="`images:${data.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="data.post.isSensitive" @open="openImage"/>
 	<FxVideoPreview
 		v-for="(video, index) in mainVideos"
@@ -50,7 +49,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</div>
 		</header>
 		<p :class="$style.quoteText"><template v-for="segment in quoteTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template></p>
-		<p v-if="!isTextMode && !showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
+		<p v-if="!showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
 		<FxMediaGrid v-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${data.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="data.post.quote.isSensitive" @open="openQuoteImage"/>
 		<FxVideoPreview
 			v-for="(video, index) in quoteVideos"
@@ -100,7 +99,6 @@ import { fetchPreparedPublicBlob } from './public-media.js';
 import type { PreparedPublicMedia } from './public-media.js';
 
 const props = defineProps<{ data: PreviewResponse; input: PreviewInput; context: PreviewContext }>();
-const expanded = ref(false);
 type LoadedMedia = { src: string; blob: Blob };
 type IdentityBundle = {
 	avatar: LoadedMedia | null;
@@ -151,9 +149,10 @@ const previewMode = computed(() => {
 	return value === 'text' || value === 'ogp' || value === 'media' ? value : 'media';
 });
 const isTextMode = computed(() => previewMode.value === 'text');
-const showAttachmentMedia = computed(() => props.context.detail && previewMode.value === 'media');
+const showAttachmentMedia = computed(() => previewMode.value === 'media');
 const textSummary = computed(() => truncatePostText(props.data.post?.text ?? ''));
-const displayedText = computed(() => expanded.value ? props.data.post?.text ?? '' : textSummary.value.text);
+// ノートの詳細では全文を出す。タイムラインでは省略し、「もっと見る」でノートの詳細へ移る。
+const displayedText = computed(() => props.context.detail ? props.data.post?.text ?? '' : textSummary.value.text);
 const displayedTextSegments = computed(() => richTextSegments(displayedText.value, props.data.post?.textEntities ?? []));
 const quoteTextSegments = computed(() => richTextSegments(props.data.post?.quote?.text ?? '', props.data.post?.quote?.textEntities ?? []));
 const noteHref = computed(() => props.context.source?.kind === 'note' ? `/notes/${encodeURIComponent(props.context.source.noteId)}` : null);
@@ -303,10 +302,6 @@ async function fetchPreparedImage(path: string, kind: 'image' | 'quote-image', i
 async function loadIdentity(): Promise<void> {
 	const post = props.data.post;
 	const source = props.context.source;
-	if (isTextMode.value) {
-		clearIdentity();
-		return;
-	}
 	if (post == null || source?.kind !== 'note') return;
 	const nextKey = `${apiSession.value}:${source.noteId}:${post.id}:identity`;
 	if (identityLease != null && identityKey === nextKey) return;
@@ -423,7 +418,7 @@ async function loadAttachments(): Promise<void> {
 async function loadMedia(): Promise<void> {
 	const post = props.data.post;
 	const source = props.context.source;
-	if (!props.context.detail || !props.context.revealed || !props.context.active || (props.data.state !== 'ready' && props.data.state !== 'stale') || post == null || source?.kind !== 'note') {
+	if (!props.context.revealed || !props.context.active || (props.data.state !== 'ready' && props.data.state !== 'stale') || post == null || source?.kind !== 'note') {
 		clearMedia();
 		return;
 	}
@@ -434,7 +429,7 @@ async function loadMedia(): Promise<void> {
 async function retryVisiblePhotos(): Promise<void> {
 	const initialPost = props.data.post;
 	const bundle = attachmentBundle;
-	if (initialPost == null || bundle == null || props.context.source?.kind !== 'note' || !props.context.detail || !props.context.active || !props.context.revealed || !props.context.inViewport) return;
+	if (initialPost == null || bundle == null || props.context.source?.kind !== 'note' || !props.context.active || !props.context.revealed || !props.context.inViewport) return;
 	viewerController?.abort();
 	const controller = new AbortController();
 	viewerController = controller;
@@ -497,7 +492,7 @@ async function openGallery(target: 'main' | 'quote', selectedIndex: number): Pro
 	const isQuote = target === 'quote';
 	const content = isQuote ? quote : post;
 	const descriptors = content?.images ?? [];
-	if (post == null || content == null || selectedIndex < 0 || selectedIndex >= descriptors.length || !props.context.detail || !props.context.active || !props.context.revealed || !props.context.inViewport || props.context.source?.kind !== 'note') return;
+	if (post == null || content == null || selectedIndex < 0 || selectedIndex >= descriptors.length || !props.context.active || !props.context.revealed || !props.context.inViewport || props.context.source?.kind !== 'note') return;
 	const generation = attachmentGeneration;
 	const noteId = props.context.source.noteId;
 	const controller = new AbortController();
@@ -516,7 +511,7 @@ async function openGallery(target: 'main' | 'quote', selectedIndex: number): Pro
 		controller.signal,
 	).catch(() => null);
 	if (viewerController === controller) viewerController = null;
-	if (result == null || controller.signal.aborted || generation !== attachmentGeneration || props.context.source?.noteId !== noteId || props.data.post?.id !== post.id || !props.context.detail || !props.context.active || !props.context.revealed || !props.context.inViewport) {
+	if (result == null || controller.signal.aborted || generation !== attachmentGeneration || props.context.source?.noteId !== noteId || props.data.post?.id !== post.id || !props.context.active || !props.context.revealed || !props.context.inViewport) {
 		if (result != null) {
 			const retained = new Set([...imageSources.value, ...quoteImageSources.value].filter((value): value is string => value != null));
 			for (const item of result.items) if (item != null && !retained.has(item.src)) URL.revokeObjectURL(item.src);
@@ -576,7 +571,6 @@ watch(() => [props.data, props.context.source?.noteId, props.context.revealed, p
 watch(() => props.data, () => { photoRetryBlocked.value = false; });
 watch(() => props.context.inViewport, visible => { if (!visible) viewerController?.abort(); });
 watch(apiSession, () => { clearMedia(); });
-watch(() => props.data.post?.id, () => { expanded.value = false; });
 onMounted(() => {
 	void loadMedia();
 });
@@ -591,7 +585,8 @@ onBeforeUnmount(() => { clearMedia(); });
 .identity { display: flex; min-width: 0; flex: 1; flex-direction: column; line-height: 1.25; }
 .identity span { color: var(--MI_THEME-fgTransparentWeak); overflow: hidden; text-overflow: ellipsis; }
 .identityLink { display: flex; min-width: 0; flex-direction: column; color: inherit; text-decoration: none; }
-.postTime { flex: 0 0 auto; color: var(--MI_THEME-fgTransparentWeak); font-size: 0.82em; }
+.postTime { display: block; padding: 6px 14px 10px; color: var(--MI_THEME-fgTransparentWeak); font-size: 0.82em; }
+.quote .postTime { padding: 6px 10px 10px; }
 .xMark { display: grid; width: 44px; height: 44px; place-items: center; border-radius: 50%; color: var(--MI_THEME-fg); text-decoration: none; font-size: 1.8em; font-weight: 700; }
 .text { margin: 0; padding: 8px 14px 14px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
 .mediaSummary { margin: -8px 14px 14px; color: var(--MI_THEME-fgTransparentWeak); font-size: 0.9em; }
