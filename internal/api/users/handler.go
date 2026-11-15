@@ -112,8 +112,7 @@ type Handler struct {
 	driveFileRepo repository.DriveFileRepository
 	// featuredRanking は users/featured-notes の per-user engagement ランキング
 	// (#1687)。nil 時 (= 未配線 / test) は SQL count-DESC fallback を使う。
-	featuredRanking       FeaturedRankingReader
-	profileRoleVisibility ProfileRoleVisibilityReader
+	featuredRanking FeaturedRankingReader
 	// selfPacker は閲覧者自身を MeDetailed へ昇格させ、/api/i の handler で未読・
 	// role・ピン留めを埋める (#3784)。未配線なら補完せずに昇格だけする。
 	selfPacker *meself.Packer
@@ -124,69 +123,6 @@ type Handler struct {
 	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
 	// 持つ (#3790、#3792)。組み立てで渡す。
 	entityPacker *entity.Packer
-}
-
-// ProfileRoleVisibilityReader returns role IDs a user chose not to expose on
-// their public profile. It is optional when the role-level plugin is disabled.
-type ProfileRoleVisibilityReader interface {
-	HiddenProfileRoleIDs(ctx context.Context, userID string) (map[string]struct{}, error)
-}
-
-// SetProfileRoleVisibilityReader wires the optional public-profile visibility source.
-func (h *Handler) SetProfileRoleVisibilityReader(r ProfileRoleVisibilityReader) {
-	h.profileRoleVisibility = r
-}
-
-// applyProfileRoleVisibility filters both role payloads before serialization.
-// A lookup failure hides all role data rather than exposing a role the owner hid.
-func (h *Handler) applyProfileRoleVisibility(ctx context.Context, userID string, detailed *entity.UserDetailed) {
-	if h.profileRoleVisibility == nil || detailed == nil {
-		return
-	}
-	hidden, err := h.profileRoleVisibility.HiddenProfileRoleIDs(ctx, userID)
-	if err != nil {
-		detailed.Roles = []any{}
-		empty := []any{}
-		detailed.BadgeRoles = &empty
-		return
-	}
-	if len(hidden) == 0 {
-		return
-	}
-	hiddenNames := make(map[string]struct{}, len(hidden))
-	roles := make([]any, 0, len(detailed.Roles))
-	for _, raw := range detailed.Roles {
-		role, ok := raw.(map[string]any)
-		if !ok {
-			roles = append(roles, raw)
-			continue
-		}
-		roleID, _ := role["id"].(string)
-		if _, hide := hidden[roleID]; hide {
-			if name, ok := role["name"].(string); ok {
-				hiddenNames[name] = struct{}{}
-			}
-			continue
-		}
-		roles = append(roles, raw)
-	}
-	detailed.Roles = roles
-	if detailed.BadgeRoles == nil || len(hiddenNames) == 0 {
-		return
-	}
-	badges := make([]any, 0, len(*detailed.BadgeRoles))
-	for _, raw := range *detailed.BadgeRoles {
-		badge, ok := raw.(map[string]any)
-		if ok {
-			if name, ok := badge["name"].(string); ok {
-				if _, hide := hiddenNames[name]; hide {
-					continue
-				}
-			}
-		}
-		badges = append(badges, raw)
-	}
-	detailed.BadgeRoles = &badges
 }
 
 // SetSelfPacker wires the Packer that promotes the viewer's own entry into
@@ -707,7 +643,6 @@ func (h *Handler) Show(c echo.Context) error {
 	}
 
 	detailed := h.entityPacker.PackUserDetailed(bundle.User, bundle.Profile, h.idGen)
-	h.applyProfileRoleVisibility(c.Request().Context(), bundle.User.ID, &detailed)
 	h.applyModerationNote(&detailed, iAmModerator, bundle.Profile)
 	// moderator が他ユーザーを見るときは twoFactorEnabled/usePasswordLessLogin/
 	// securityKeys を出す (upstream UserEntityService、#1781)。self-view は下の

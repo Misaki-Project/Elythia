@@ -46,10 +46,10 @@ services:
   mkgo:
     build:
       context: ../..
-      # Dedicated product image: generate the enabled bundled plugins before
-      # building the server binary. The other integration stacks retain the
-      # shared tests/federation/common/Dockerfile.mkgo.
-      dockerfile: tests/playwright/Dockerfile.mkgo
+      # tests/federation/common/Dockerfile.mkgo は migrate + server を両方
+      # build して entrypoint で migrate up を走らせる。Playwright phase 1
+      # は federation 不要なので最小 binary 起動 + migrate up で十分。
+      dockerfile: tests/federation/common/Dockerfile.mkgo
     environment:
       TZ: Asia/Tokyo
     volumes:

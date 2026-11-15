@@ -9,7 +9,6 @@
 
 import { expect, test } from '@playwright/test';
 import { callChecked, checkResponse, compileResponseSchemas, knownDateBug, responseSchemas } from '../../../fixtures/api_schema';
-import { ROLE_LEVEL_RESPONSE_SCHEMAS } from '../../../fixtures/role_level_response_schemas';
 import { isTsBackend } from '../../../fixtures/backend';
 
 const ELYTHIA = { tags: ['Elythia'] };
@@ -59,21 +58,6 @@ const doc = {
 const DATE = '2026-11-09T01:02:03.456Z';
 const GO_DATE = '2026-11-09T01:02:03.456789Z';
 const own = { id: 'a1', createdAt: DATE };
-const pluginEndpoint = 'plugin/role-level/users/show';
-const pluginContract = {
-  components: {
-    PluginUser: { type: 'object', properties: { userId: { type: 'string' }, roles: { type: 'array', items: { type: 'object' } } }, required: ['userId', 'roles'] },
-  },
-  endpoints: { [pluginEndpoint]: { $ref: '#/components/schemas/PluginUser' } },
-};
-const pluginDoc = {
-  paths: { [`/${pluginEndpoint}`]: { post: { ...ELYTHIA } } },
-  components: { schemas: {} },
-};
-const roleLevelDoc = {
-  paths: Object.fromEntries(Object.keys(ROLE_LEVEL_RESPONSE_SCHEMAS.endpoints).map((endpoint) => [`/${endpoint}`, { post: { ...ELYTHIA } }])),
-  components: { schemas: {} },
-};
 
 test.describe('the response check of the Elythia endpoints', () => {
   const schemas = compileResponseSchemas(doc);
@@ -148,44 +132,6 @@ test.describe('the response check of the Elythia endpoints', () => {
     expect(() => checkResponse(schemas, 'own/empty', 204, '', { knownBug: '#4091' })).toThrow(/204 has none/);
   });
 
-  test('a plugin response uses its explicit test contract and route drift fails closed', () => {
-    const schemas = compileResponseSchemas(pluginDoc, pluginContract);
-    expect(checkResponse(schemas, pluginEndpoint, 200, JSON.stringify({ userId: 'u1', roles: [] }))).toEqual({ userId: 'u1', roles: [] });
-    expect(() => checkResponse(schemas, pluginEndpoint, 200, JSON.stringify({ userId: 'u1', roles: [], extra: true }))).toThrow(/unevaluated properties \(extra\)/);
-
-    const noPluginRoute = { ...pluginDoc, paths: {} };
-    expect(() => compileResponseSchemas(noPluginRoute, pluginContract)).toThrow(/test-owned RoleLevel response schemas have no registered route/);
-    const newPluginRoute = {
-      ...pluginDoc,
-      paths: { ...pluginDoc.paths, '/plugin/role-level/users/new-route': { post: { ...ELYTHIA } } },
-    };
-    expect(() => compileResponseSchemas(newPluginRoute, pluginContract)).toThrow(/RoleLevel routes have no test-owned response schema/);
-    const getPluginRoute = {
-      ...pluginDoc,
-      paths: { [`/${pluginEndpoint}`]: { post: { ...ELYTHIA }, get: { ...ELYTHIA } } },
-    };
-    expect(() => compileResponseSchemas(getPluginRoute, pluginContract)).toThrow(/RoleLevel route must expose POST only/);
-  });
-
-  test('RoleLevel audit states and policy values reject unlisted shapes', () => {
-    const schemas = compileResponseSchemas(roleLevelDoc, ROLE_LEVEL_RESPONSE_SCHEMAS);
-    const auditEndpoint = 'plugin/role-level/admin/audit';
-    const audit = {
-      id: '1', actorId: 'admin', operation: 'change-exp', roleId: 'r1', userId: 'u1', assignmentId: 'a1',
-      beforeExperience: 10, afterExperience: 20, before: { experience: 10 }, after: { experience: 20 }, note: null, createdAt: '2026-11-15T00:00:00Z',
-    };
-    expect(checkResponse(schemas, auditEndpoint, 200, JSON.stringify({ entries: [audit] }))).toEqual({ entries: [audit] });
-    expect(() => checkResponse(schemas, auditEndpoint, 200, JSON.stringify({ entries: [{ ...audit, before: { experience: 10, secret: 'not part of the audit contract' } }] }))).toThrow(/secret/);
-    const pruned = { ...audit, operation: 'prune-orphans', before: { deleted: 1, rows: [{ assignmentId: 'a1', userId: 'u1', experience: 10 }] }, after: { deleted: 1 } };
-    expect(checkResponse(schemas, auditEndpoint, 200, JSON.stringify({ entries: [pruned] }))).toEqual({ entries: [pruned] });
-
-    const role = { roleId: 'r1', baseLevel: 1, experienceCurve: null, policyRanges: [{ type: 'const', key: 'policy', start: 1, end: 2, value: ['a', 'b'] }], revision: 1, updatedBy: 'admin', createdAt: '', updatedAt: '' };
-    const rolesEndpoint = 'plugin/role-level/admin/roles/list';
-    expect(checkResponse(schemas, rolesEndpoint, 200, JSON.stringify({ roles: [role], memberCounts: { r1: 1 }, memberCountsTruncated: { r1: false } }))).toBeDefined();
-    const unsafeRole = { ...role, policyRanges: [{ ...role.policyRanges[0], value: { secret: 'not a supported policy value' } }] };
-    expect(() => checkResponse(schemas, rolesEndpoint, 200, JSON.stringify({ roles: [unsafeRole], memberCounts: {}, memberCountsTruncated: {} }))).toThrow(/value|anyOf/);
-  });
-
   test('knownDateBug marks a body as the known bug only while it has a date in the Go format', () => {
     expect(knownDateBug(JSON.stringify({ ...own, createdAt: GO_DATE }), '#4091')).toEqual({ knownBug: '#4091' });
     expect(knownDateBug(JSON.stringify([own, { ...own, createdAt: GO_DATE }]), '#4091')).toEqual({ knownBug: '#4091' });
@@ -204,6 +150,9 @@ test.describe('the response check of the Elythia endpoints', () => {
 test.describe('the response types of the server', () => {
   test.skip(isTsBackend, '/api.json の Elythia の operation は Elythia にしか無い');
 
+  // 宣言の無いものは、ここに番号と一緒に挙げる。宣言が付いたら外す
+  const PENDING: Record<string, string> = {};
+
   test('every Elythia endpoint has a response type to check against', async ({ request }) => {
     const schemas = await responseSchemas(request);
     // 抽出が空振りしても緑にならないよう、実在するものを名指しで要求する
@@ -219,7 +168,12 @@ test.describe('the response types of the server', () => {
       } catch (e) {
         error = (e as Error).message;
       }
-      if (error != null) failed.push(error);
+      const pending = PENDING[endpoint];
+      if (pending == null && error != null) failed.push(error);
+      if (pending != null && error == null) failed.push(`${endpoint}: has a response type now; remove it from PENDING (${pending})`);
+    }
+    for (const endpoint of Object.keys(PENDING)) {
+      if (!schemas.elythiaEndpoints.includes(endpoint)) failed.push(`${endpoint}: not in /api.json; remove it from PENDING`);
     }
     expect(failed).toEqual([]);
   });

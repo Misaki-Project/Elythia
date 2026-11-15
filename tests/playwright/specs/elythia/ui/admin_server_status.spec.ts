@@ -63,15 +63,13 @@ test.describe('admin: server status', () => {
     expect(Number(await metrics.getAttribute('data-goroutines')), 'goroutine の数が出ない').toBeGreaterThan(0);
   });
 
-  test('server plugins: bundled plugins are listed', coversRoutes('/admin/server-plugins'), async ({ page, request, baseURL }) => {
+  test('server plugins: none built in', coversRoutes('/admin/server-plugins'), async ({ page, request, baseURL }) => {
     const root = rootFixture();
-    // RoleLevel と追跡パラメータ除去はこの製品に同梱する。他のサンプルは既定でビルド対象外。
-    const { plugins } = await expectApiOk(request, 'admin/server-plugins', { i: root.token }) as { plugins: { name: string }[] };
-    const pluginNames = plugins.map(plugin => plugin.name).sort();
-    expect(pluginNames, '組み込みプラグインの一覧が製品構成と一致しない').toEqual(['role-level', 'tracking-parameter-cleaner']);
+    // このスタックはプラグインを組み込まずにビルドする
+    const { plugins } = await expectApiOk(request, 'admin/server-plugins', { i: root.token }) as { plugins: unknown[] };
+    expect(plugins, 'プラグインが組み込まれている (前提)').toEqual([]);
     await signinAdmin(page, baseURL!, root);
     await gotoRoute(page, baseURL!, '/admin/server-plugins');
-    await expect(page.getByTestId('server-plugins-empty')).toHaveCount(0);
-    for (const name of pluginNames) await expect(page.getByText(name, { exact: true })).toBeVisible();
+    await expect(page.getByTestId('server-plugins-empty')).toBeVisible();
   });
 });

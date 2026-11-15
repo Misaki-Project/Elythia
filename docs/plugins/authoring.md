@@ -105,29 +105,6 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 
 **フロントから呼ぶものは POST にする。** `host.api`（= `misskeyApi`）は POST 固定で、Misskey 本体の API も POST 基本。`GET` は `<img>` から読ませる場合などに使う。
 
-### JSON リクエストを厳密に読む
-
-入力に定義外のフィールドや複数の JSON 値を許さない場合は `plugin.BindStrict` を使う。
-これは `StrictRequest` を実装した host request にだけ対応し、未対応ならエラーを返す。
-その場合に通常の `Bind` へフォールバックせず、必ず失敗として扱うこと。
-
-```go
-type createRequest struct {
-	Name string `json:"name"`
-}
-
-r.POST("/create", func(req plugin.Request) (any, error) {
-	var body createRequest
-	if err := plugin.BindStrict(req, &body); err != nil {
-		return nil, plugin.Errorf(http.StatusBadRequest, "入力が正しくありません")
-	}
-	return map[string]any{"name": body.Name}, nil
-})
-```
-
-厳密な decode は未知のフィールド、末尾の余分な JSON 値、JSON の構文・型エラーを拒否する。
-リクエスト形式を拡張するときは、受け付ける構造体も明示的に更新する。
-
 ### エラー
 
 ```go
@@ -1424,12 +1401,6 @@ type Request interface
   UserID() string
   IsModerator() bool
   IsAdministrator() bool
-
-type StrictRequest interface
-  Request
-  BindStrict(any) error
-
-func BindStrict(Request, any) error
 
 type CheckedRolePolicyRequest interface
   Request

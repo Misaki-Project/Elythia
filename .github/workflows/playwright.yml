@@ -32,7 +32,7 @@ name: Playwright
 
 on:
   pull_request:
-    branches: [develop, main, ci/elythia-2.2-upstream-base-20261115]
+    branches: [develop, main]
     # backend の API 形状・DB schema・spec 自体・起動まわりを触る変更だけを
     # 対象にする。ドキュメントのみの PR で待たされないようにする。
     paths:
@@ -238,12 +238,13 @@ jobs:
       # pnpm-lock.yaml hash をキーに使うので、Misskey upstream を pin し
       # 直さない限り cache hit で pnpm install + build をまるごと skip
       # (5-10 min → 数秒に短縮)。
-      # **cache key は frontend/・plugins/・pluginbuild・Go module 定義の SHA で取る。**
-      # plugin の manifest / frontend/index.ts、registry generator、Go module の
-      # どれが変わっても古い generated plugin registry / built bundle を再利用しない。
-      - name: Resolve frontend and plugin build input SHAs
+      # **cache key は frontend/ の木の SHA で取る。** `pnpm-lock.yaml` の
+      # hash だと、frontend/ のソースを変えても lock が動かない限り cache hit に
+      # なり、**古い `built/` が使われる** (#2786 で実際に踏んだ。fork の
+      # `boot.js` を直したのに CI では反映されず spec が落ちた)。
+      - name: Resolve frontend tree SHA
         id: misskey-sha
-        run: echo "sha=$(git rev-parse HEAD:frontend)-$(git rev-parse HEAD:plugins)-$(git rev-parse HEAD:tools/pluginbuild)-$(git rev-parse HEAD:go.mod)-$(git rev-parse HEAD:go.sum)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD:frontend)" >> "$GITHUB_OUTPUT"
 
       - name: Cache misskey workspace (built + node_modules)
         id: cache-misskey

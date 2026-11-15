@@ -30,8 +30,6 @@ import { definePage } from '@/page.js';
 import MkButton from '@/components/MkButton.vue';
 import { rolesCache } from '@/cache.js';
 import { useRouter } from '@/router.js';
-import { defaultRoleLevelConfig, isLegacyLevelRole, roleLevelApi } from '@/utility/role-level-api.js';
-import type { RoleLevelConfig } from '@/utility/role-level-api.js';
 
 const router = useRouter();
 
@@ -39,31 +37,20 @@ const props = defineProps<{
 	id?: string;
 }>();
 
-type RoleLike = Omit<Pick<Misskey.entities.Role, 'name' | 'description' | 'isAdministrator' | 'isModerator' | 'color' | 'iconUrl' | 'target' | 'isPublic' | 'isExplorable' | 'asBadge' | 'canEditMembersByModerator' | 'displayOrder' | 'preserveAssignmentOnMoveAccount'>, 'target'> & {
-	target: Misskey.entities.Role['target'] | 'manualLevel';
+type RoleLike = Pick<Misskey.entities.Role, 'name' | 'description' | 'isAdministrator' | 'isModerator' | 'color' | 'iconUrl' | 'target' | 'isPublic' | 'isExplorable' | 'asBadge' | 'canEditMembersByModerator' | 'displayOrder' | 'preserveAssignmentOnMoveAccount'> & {
 	condFormula: any;
 	policies: any;
-	levelConfig: RoleLevelConfig;
 };
 
 const role = ref<Misskey.entities.Role | null>(null);
 const data = ref<RoleLike | null>(null);
-let hadLevelConfig = false;
 
 if (props.id) {
 	role.value = await misskeyApi('admin/roles/show', {
 		roleId: props.id,
 	});
-	const levelResponse = await roleLevelApi<{ role: RoleLevelConfig }>('plugin/role-level/admin/roles/show', { roleId: props.id }).catch(() => null);
-	const levelConfig = levelResponse?.role && typeof levelResponse.role === 'object' && levelResponse.role.roleId === props.id
-		? levelResponse.role
-		: null;
-	hadLevelConfig = levelConfig !== null;
-	data.value = {
-		...role.value,
-		target: levelConfig !== null || isLegacyLevelRole(role.value as { target: string }) ? 'manualLevel' : role.value.target,
-		levelConfig: levelConfig ?? defaultRoleLevelConfig(props.id),
-	};
+
+	data.value = role.value;
 } else {
 	data.value = {
 		name: 'New Role',
@@ -81,45 +68,26 @@ if (props.id) {
 		displayOrder: 0,
 		preserveAssignmentOnMoveAccount: false,
 		policies: {},
-		levelConfig: defaultRoleLevelConfig(),
-	};
-}
-
-function cleanLevelConfig(config: RoleLevelConfig, roleId: string) {
-	return {
-		roleId,
-		baseLevel: Number(config.baseLevel),
-		experienceCurve: config.experienceCurve.map(curve => ({ type: curve.type, levelUps: Number(curve.levelUps), base: Number(curve.base), additional: Number(curve.additional ?? 0), ...(curve.type === 'exponential' ? { exponential: Number(curve.exponential ?? 1) } : {}) })),
-		policyRanges: config.policyRanges.map(range => ({ type: range.type, start: Number(range.start), end: Number(range.end), ...(range.key ? { key: range.key } : {}), ...(range.type === 'const' ? { value: range.value } : {}), ...(range.type === 'multiplier' ? { base: Number(range.base ?? 0), additional: Number(range.additional ?? 0) } : {}) })),
-		revision: Number(config.revision),
 	};
 }
 
 async function save() {
 	if (data.value === null) return;
 	rolesCache.delete();
-	const isLevelRole = data.value.target === 'manualLevel';
-	const { levelConfig, ...nativeData } = data.value;
-	const nativeTarget: 'manual' | 'conditional' = isLevelRole ? 'manual' : nativeData.target === 'conditional' ? 'conditional' : 'manual';
-	const nativePayload = { ...nativeData, target: nativeTarget };
 	if (role.value) {
-		await os.apiWithDialog('admin/roles/update', {
+		os.apiWithDialog('admin/roles/update', {
 			roleId: role.value.id,
-			...nativePayload,
+			...data.value,
 		});
-		if (isLevelRole) {
-			await roleLevelApi('plugin/role-level/admin/roles/update', cleanLevelConfig(levelConfig, role.value.id));
-		} else if (hadLevelConfig) {
-			await roleLevelApi('plugin/role-level/admin/roles/delete', { roleId: role.value.id, revision: levelConfig.revision });
-		}
 		router.push('/admin/roles/:id', {
 			params: {
 				id: role.value.id,
 			},
 		});
 	} else {
-		const created = await os.apiWithDialog('admin/roles/create', { ...nativePayload });
-		if (isLevelRole) await roleLevelApi('plugin/role-level/admin/roles/update', cleanLevelConfig(levelConfig, created.id));
+		const created = await os.apiWithDialog('admin/roles/create', {
+			...data.value,
+		});
 		router.push('/admin/roles/:id', {
 			params: {
 				id: created.id,

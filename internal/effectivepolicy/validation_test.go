@@ -2,7 +2,6 @@ package effectivepolicy
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"testing"
 
@@ -154,81 +153,6 @@ func TestAccountDeletionPolicyDefaultsAndTypes(t *testing.T) {
 		assert.True(t, ValidatePolicyValue(key, false), key)
 		assert.False(t, ValidatePolicyValue(key, "true"), key)
 		assert.False(t, ValidatePolicyValue(key, 1), key)
-	}
-}
-
-func TestPluginPolicyDefaultsAndBounds(t *testing.T) {
-	defaults := Defaults()
-	for key, want := range map[string]any{
-		"canUseFxTwitterPreview":        true,
-		"fxTwitterColdFetchesPerHour":   100,
-		"fxTwitterColdFetchesPerDay":    600,
-		"genshinRefreshIntervalMinutes": 10,
-		"genshinUidLimit":               1,
-		"hsrRefreshIntervalMinutes":     10,
-		"hsrUidLimit":                   1,
-	} {
-		assert.Equal(t, want, defaults[key], key)
-	}
-
-	resolver := func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
-		return nil, nil
-	}
-	keys := []string{
-		"canUseFxTwitterPreview",
-		"fxTwitterColdFetchesPerHour", "fxTwitterColdFetchesPerDay",
-		"genshinRefreshIntervalMinutes", "genshinUidLimit",
-		"hsrRefreshIntervalMinutes", "hsrUidLimit",
-	}
-	require.NoError(t, ValidateRegistration(plugin.EffectivePolicyRegistration{Keys: keys, Resolve: resolver}))
-
-	cases := []struct {
-		key   string
-		value any
-		valid bool
-	}{
-		{key: "canUseFxTwitterPreview", value: true, valid: true},
-		{key: "canUseFxTwitterPreview", value: false, valid: true},
-		{key: "canUseFxTwitterPreview", value: "true"},
-		{key: "canUseFxTwitterPreview", value: 1},
-		{key: "fxTwitterColdFetchesPerHour", value: 1, valid: true},
-		{key: "fxTwitterColdFetchesPerHour", value: 10000, valid: true},
-		{key: "fxTwitterColdFetchesPerHour", value: int64(1), valid: true},
-		{key: "fxTwitterColdFetchesPerHour", value: float64(10000), valid: true},
-		{key: "fxTwitterColdFetchesPerHour", value: 0},
-		{key: "fxTwitterColdFetchesPerHour", value: 10001},
-		{key: "fxTwitterColdFetchesPerHour", value: float64(1.5)},
-		{key: "fxTwitterColdFetchesPerHour", value: "1"},
-		{key: "fxTwitterColdFetchesPerDay", value: 1, valid: true},
-		{key: "fxTwitterColdFetchesPerDay", value: 100000, valid: true},
-		{key: "fxTwitterColdFetchesPerDay", value: 0},
-		{key: "fxTwitterColdFetchesPerDay", value: 100001},
-		{key: "genshinRefreshIntervalMinutes", value: 1, valid: true},
-		{key: "genshinRefreshIntervalMinutes", value: 1440, valid: true},
-		{key: "genshinRefreshIntervalMinutes", value: int64(1440), valid: true},
-		{key: "genshinRefreshIntervalMinutes", value: 0},
-		{key: "genshinRefreshIntervalMinutes", value: 1441},
-		{key: "genshinRefreshIntervalMinutes", value: float64(1.5)},
-		{key: "genshinRefreshIntervalMinutes", value: "10"},
-		{key: "hsrRefreshIntervalMinutes", value: 1, valid: true},
-		{key: "hsrRefreshIntervalMinutes", value: 1440, valid: true},
-		{key: "hsrRefreshIntervalMinutes", value: 0},
-		{key: "hsrRefreshIntervalMinutes", value: 1441},
-		{key: "genshinUidLimit", value: 0, valid: true},
-		{key: "genshinUidLimit", value: 100, valid: true},
-		{key: "genshinUidLimit", value: -1},
-		{key: "genshinUidLimit", value: 101},
-		{key: "hsrUidLimit", value: 0, valid: true},
-		{key: "hsrUidLimit", value: 100, valid: true},
-		{key: "hsrUidLimit", value: -1},
-		{key: "hsrUidLimit", value: 101},
-	}
-	for _, tc := range cases {
-		t.Run(tc.key+"/"+fmt.Sprint(tc.value), func(t *testing.T) {
-			assert.Equal(t, tc.valid, ValidatePolicyValue(tc.key, tc.value))
-			assert.Equal(t, tc.valid, ValidateContributions([]string{tc.key}, nil,
-				[]plugin.EffectivePolicyContribution{{Key: tc.key, Value: tc.value}}))
-		})
 	}
 }
 

@@ -20,7 +20,6 @@ import { type Principal, randomUsername, signupUser } from '../../../../fixtures
 import { pageBody } from '../../../../fixtures/route_check';
 import { coversPrefs, expectHappens, type PrefRow, prefTitle, runPrefRow } from '../../../../fixtures/settings_table';
 import { distinctPNG, uploadPNG } from '../../../../fixtures/ui_drive';
-import { openPostForm } from '../../../../fixtures/ui_post_form';
 import { gotoRoute } from '../../../../fixtures/ui_route';
 import { apiOk, postNote, runTag, waitForApiBody } from '../../../../fixtures/ui_timeline';
 
@@ -49,36 +48,9 @@ async function followButtonOf(page: Page, baseURL: string, other: Principal): Pr
   return button;
 }
 
-/** Pastes a link whose tracking parameter should be removed when the cleaner is enabled. */
-async function pasteWasPrevented(page: Page): Promise<boolean> {
-	await openPostForm(page);
-	return page.getByTestId('post-form-text').evaluate((node) => {
-		const clipboardData = new DataTransfer();
-		clipboardData.setData('text', 'https://x.com/example/status/123456?s=20');
-		const event = new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true });
-		node.dispatchEvent(event);
-		return event.defaultPrevented;
-	});
-}
-
 test.describe('settings: preferences (General)', () => {
   test.setTimeout(60_000);
   const ROWS: PrefRow[] = [
-    {
-      key: 'fxTwitterPreviewMode', route: ROUTE, control: { kind: 'select', label: 'Text' }, value: 'text',
-      effect: { skip: 'FxTwitter の表示モードごとの描画と標準 fallback は plugins/fxtwitter-preview/frontend/preview.test.ts で確認する。この行では選択値の保存と再読み込み後の復元を確認する' },
-    },
-    {
-      key: 'trackingParameterCleanerEnabled', route: ROUTE, control: { kind: 'switch', on: false }, value: false,
-      pre: { trackingParameterCleanerEnabled: true },
-      setup: async ({ page }) => {
-        // 既定の有効状態で変換が起きることを先に確かめ、未登録の cleaner が off 時の確認を偽陽性にしない。
-        expect(await pasteWasPrevented(page), '有効な追跡パラメータ除去が貼り付けを変換しなかった').toBe(true);
-      },
-      effect: async ({ page }) => {
-        expect(await pasteWasPrevented(page), '無効にした追跡パラメータ除去が貼り付けを変換した').toBe(false);
-      },
-    },
     {
       key: 'showTitlebar', route: ROUTE, control: { kind: 'switch', on: true }, value: true,
       effect: async ({ page }) => {

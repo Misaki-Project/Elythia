@@ -113,21 +113,6 @@ type Request interface {
 	IsAdministrator() bool
 }
 
-// StrictRequest is an optional extension for handlers that require strict JSON decoding.
-type StrictRequest interface {
-	Request
-	BindStrict(v any) error
-}
-
-// BindStrict applies strict JSON decoding when the request supports it.
-func BindStrict(req Request, v any) error {
-	strict, ok := req.(StrictRequest)
-	if !ok {
-		return fmt.Errorf("strict JSON binding is unavailable")
-	}
-	return strict.BindStrict(v)
-}
-
 // CheckedRolePolicyRequest is an optional request extension for plugins whose
 // authorization depends on role policies. CheckedRolePolicies resolves only the
 // requested keys and returns resolver errors instead of an unchecked fallback.

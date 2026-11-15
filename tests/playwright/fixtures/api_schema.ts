@@ -6,8 +6,7 @@
 // Elythia 独自の API の応答を、/api.json の宣言の型で照合する (#4093)。
 //
 // - 型は実行中のサーバーの /api.json から取る。宣言 (internal/api/paramschema/
-//   elythia_apidoc.json) から組み立てたものなので、宣言と応答の食い違いがそのまま落ちる。
-//   plugin endpoint は host に schema を持たないため、test fixture の明示的な宣言を使う
+//   elythia_apidoc.json) から組み立てたものなので、宣言と応答の食い違いがそのまま落ちる
 // - date-time は本家の書式 (ミリ秒 3 桁と Z) で判定する。ajv-formats の date-time は
 //   Go の既定の書式 (RFC3339Nano) も通し、#4091 のずれを見つけられないため。有り得ない
 //   日時は、ajv-formats の判定でも落とす
@@ -19,7 +18,6 @@ import { expect } from '@playwright/test';
 import Ajv2020, { type ErrorObject, type ValidateFunction } from 'ajv/dist/2020';
 import addFormats from 'ajv-formats';
 import { baseURL } from './api';
-import { ROLE_LEVEL_RESPONSE_SCHEMAS } from './role_level_response_schemas';
 
 /** The tag /api.json puts on the Elythia endpoints. */
 export const ELYTHIA_TAG = 'Elythia';
@@ -31,7 +29,6 @@ export const UPSTREAM_DATE_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
 const OPEN_SUFFIX = '__open';
 const COMPONENT_PREFIX = '#/components/schemas/';
 const DEFS_ID = 'components';
-const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace']);
 // これだけを持つ object か配列の schema は、値の形を何も決めていない (`{}` や `{ type: 'object' }`)
 const UNTYPED_KEYS = new Set(['type', 'description', 'example']);
 
@@ -45,12 +42,6 @@ interface Operation {
 interface OpenAPIDoc {
   paths: Record<string, { post?: Operation }>;
   components: { schemas: Record<string, Schema> };
-}
-
-/** Test-owned response schemas for plugin APIs absent from the host API docs. */
-export interface TestOwnedResponseSchemas {
-  components: Record<string, Schema>;
-  endpoints: Record<string, Schema>;
 }
 
 /** What a response of an endpoint is checked against. */
@@ -164,8 +155,8 @@ function newAjv(dateTime: 'upstream' | 'loose'): Ajv2020 {
   return ajv;
 }
 
-/** Compiles response schemas from /api.json plus explicitly supplied test contracts. */
-export function compileResponseSchemas(doc: OpenAPIDoc, testOwned?: TestOwnedResponseSchemas): ResponseSchemas {
+/** Compiles the response schemas of an /api.json document. */
+export function compileResponseSchemas(doc: OpenAPIDoc): ResponseSchemas {
   const elythiaComponents = elythiaOnlyComponents(doc);
   const defs: Record<string, unknown> = {};
   for (const [name, schema] of Object.entries(doc.components.schemas)) {
@@ -176,40 +167,12 @@ export function compileResponseSchemas(doc: OpenAPIDoc, testOwned?: TestOwnedRes
     defs[name] = closeSchema(schema, elythiaComponents);
     defs[`${name}${OPEN_SUFFIX}`] = closeSchema(schema, elythiaComponents, true);
   }
-  const testComponentNames = new Set(Object.keys(testOwned?.components ?? {}));
-  for (const [name, schema] of Object.entries(testOwned?.components ?? {})) {
-    if (name in defs) throw new Error(`test response schema component ${name} shadows /api.json`);
-    defs[name] = closeSchema(schema, testComponentNames);
-    defs[`${name}${OPEN_SUFFIX}`] = closeSchema(schema, testComponentNames, true);
-  }
   const ajvs = { strict: newAjv('upstream'), loose: newAjv('loose') };
   for (const ajv of Object.values(ajvs)) ajv.addSchema({ $id: DEFS_ID, $defs: rewriteRefs(defs) });
 
   const elythiaEndpoints = Object.entries(doc.paths)
     .filter(([, item]) => item.post?.tags?.includes(ELYTHIA_TAG))
     .map(([path]) => path.slice(1));
-  if (testOwned != null) {
-    const roleLevelEndpoints = Object.entries(doc.paths)
-      .filter(([path]) => path.startsWith('/plugin/role-level/'))
-      .map(([path, item]) => {
-        const methods = Object.keys(item).filter((method) => HTTP_METHODS.has(method));
-        if (methods.length !== 1 || methods[0] !== 'post') {
-          throw new Error(`${path.slice(1)}: RoleLevel route must expose POST only (found ${methods.join(', ') || 'no HTTP method'})`);
-        }
-        if (!item.post?.tags?.includes(ELYTHIA_TAG)) throw new Error(`${path.slice(1)}: RoleLevel route is not tagged as Elythia`);
-        return path.slice(1);
-      })
-      .sort();
-    const declaredRoleLevelEndpoints = Object.keys(testOwned.endpoints).sort();
-    const missing = roleLevelEndpoints.filter((endpoint) => !testOwned.endpoints[endpoint]);
-    const stale = declaredRoleLevelEndpoints.filter((endpoint) => !roleLevelEndpoints.includes(endpoint));
-    if (missing.length > 0 || stale.length > 0) {
-      throw new Error([
-        ...(missing.length > 0 ? [`RoleLevel routes have no test-owned response schema: ${missing.join(', ')}`] : []),
-        ...(stale.length > 0 ? [`test-owned RoleLevel response schemas have no registered route: ${stale.join(', ')}`] : []),
-      ].join('\n'));
-    }
-  }
   const cache = new Map<string, ExpectedResponse>();
   return {
     elythiaEndpoints,
@@ -220,14 +183,6 @@ export function compileResponseSchemas(doc: OpenAPIDoc, testOwned?: TestOwnedRes
       const op = doc.paths[`/${endpoint}`]?.post;
       if (op == null) throw new Error(`${endpoint} is not in /api.json`);
       if (!op.tags?.includes(ELYTHIA_TAG)) throw new Error(`${endpoint} is not an Elythia endpoint; only those are checked`);
-      const testOwnedSchema = testOwned?.endpoints[endpoint];
-      if (testOwnedSchema != null) {
-        if (isUntyped(testOwnedSchema)) throw new Error(`${endpoint}: test-owned response schema has no shape`);
-        const schema = rewriteRefs(closeSchema(testOwnedSchema, new Set([...elythiaComponents, ...testComponentNames]))) as Schema;
-        const exp: ExpectedResponse = { status: 200, schema, strict: ajvs.strict.compile(schema), loose: ajvs.loose.compile(schema) };
-        cache.set(endpoint, exp);
-        return exp;
-      }
       const res = op.responses ?? {};
       let exp: ExpectedResponse;
       if (res['200'] != null) {
@@ -254,7 +209,7 @@ export function responseSchemas(request: APIRequestContext): Promise<ResponseSch
   loaded ??= (async () => {
     const resp = await request.get(`${baseURL()}/api.json`, { failOnStatusCode: false });
     if (resp.status() !== 200) throw new Error(`GET /api.json: ${resp.status()}`);
-    return compileResponseSchemas(await resp.json() as OpenAPIDoc, ROLE_LEVEL_RESPONSE_SCHEMAS);
+    return compileResponseSchemas(await resp.json() as OpenAPIDoc);
   })();
   // 取り損ねた結果を使い回さない (次のテストで取り直す)
   loaded.catch(() => { loaded = undefined; });
@@ -263,13 +218,7 @@ export function responseSchemas(request: APIRequestContext): Promise<ResponseSch
 
 /** Formats ajv errors for an assertion message. */
 export function describeErrors(errors: ErrorObject[] | null | undefined): string {
-  return (errors ?? []).map((e) => {
-    const params = e.params as { additionalProperty?: string; unevaluatedProperty?: string };
-    const extra = e.keyword === 'unevaluatedProperties' ? params.unevaluatedProperty
-      : e.keyword === 'additionalProperties' ? params.additionalProperty
-        : undefined;
-    return `${e.instancePath || '/'} ${e.message}${extra == null ? '' : ` (${extra})`}`;
-  }).join('; ');
+  return (errors ?? []).map((e) => `${e.instancePath || '/'} ${e.message}${e.keyword === 'unevaluatedProperties' ? ` (${String((e.params as { unevaluatedProperty?: string }).unevaluatedProperty)})` : ''}`).join('; ');
 }
 
 /** Options of {@link checkResponse}. */

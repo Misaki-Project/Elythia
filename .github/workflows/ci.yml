@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop, ci/elythia-2.2-upstream-base-20261115]
+    branches: [main, develop]
 
 # GITHUB_TOKEN の既定権限を最小化する。全jobはcheckout/build/testのみで
 # リポジトリへの書き込みやPR/issueへの操作を行わないため、workflow直下で
@@ -52,7 +52,7 @@ jobs:
       # 付きは parser では disabled と読まれるがここでは落ちる。安全側に倒れて
       # いるだけなので実害は無い。「誤検知」と見て緩めると、parser とのズレが
       # 今度は**危険側**に開く。
-      - name: Check bundled plugin defaults and exact enabled allowlist
+      - name: Check bundled plugins are disabled by default
         run: |
           files=$(git ls-files 'plugins/*/elythia-plugin.yml')
           # **空でも緑にしない。** `plugins/` の移動や marker 名の変更で列挙が
@@ -66,18 +66,11 @@ jobs:
           for f in $files; do
             if grep -qE '^disabled:[[:space:]]*true[[:space:]]*$' "$f"; then
               echo "ok   $f"
-              continue
+            else
+              echo "FAIL $f — 'disabled: true' の行 (完全一致) がありません。disabled を含む行:"
+              grep -n disabled "$f" || echo "  (無し)"
+              fail=1
             fi
-            case "$f" in
-              plugins/rolelevel/elythia-plugin.yml|plugins/tracking-parameter-cleaner/elythia-plugin.yml)
-                echo "ok   $f (explicitly enabled product plugin)"
-                ;;
-              *)
-                echo "FAIL $f — 'disabled: true' の行 (完全一致) がありません。disabled を含む行:"
-                grep -n disabled "$f" || echo "  (無し)"
-                fail=1
-                ;;
-            esac
           done
           [ "$fail" -eq 0 ] || exit 1
 
