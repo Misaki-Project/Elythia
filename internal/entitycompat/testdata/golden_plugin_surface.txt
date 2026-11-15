@@ -188,6 +188,7 @@ plugin:   method Secrets.Get(context.Context, string) (string, error)
 plugin:   method Secrets.Set(context.Context, string, string) error
 plugin:   method Storage.DB() *sql.DB
 plugin:   method Storage.Migrate(context.Context, []Migration) error
+plugin:   method StrictRequest.BindStrict(any) error
 plugin: const APIVersion
 plugin: const NotificationChatMessage
 plugin: const NotificationFollow
@@ -208,6 +209,7 @@ plugin: func (*APIError) Error() string
 plugin: func (*StatusError) Error() string
 plugin: func (Definition) Validate() error
 plugin: func (EffectivePolicyRegistration) Validate() error
+plugin: func BindStrict(Request, any) error
 plugin: func ErrNotFound(string, ...any) *StatusError
 plugin: func Errorf(int, string, ...any) *StatusError
 plugin: func ExtractStatusError(error) (*StatusError, string)
@@ -257,6 +259,7 @@ plugin: type SecretSpec struct
 plugin: type Secrets interface
 plugin: type StatusError struct
 plugin: type Storage interface
+plugin: type StrictRequest interface
 plugin: var ErrAccountNotFound
 plugin: var ErrAccountSuspended
 plugin: var ErrBadPeerPayload
