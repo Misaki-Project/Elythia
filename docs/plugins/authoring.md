@@ -1402,9 +1402,17 @@ type Request interface
   IsModerator() bool
   IsAdministrator() bool
 
+type StrictRequest interface
+  Request
+  BindStrict(any) error
+
+func BindStrict(Request, any) error
+
 type CheckedRolePolicyRequest interface
   Request
   CheckedRolePolicies(...string) (map[string]any, error)
+
+plugin.Request 自体は strict method を要求しません。Strict JSON を要求する handler は plugin.BindStrict(req, &body) を使います。これは StrictRequest 実装が無ければエラーを返し、通常の Bind にはフォールバックしません。
 
 type Storage interface
   DB() *sql.DB

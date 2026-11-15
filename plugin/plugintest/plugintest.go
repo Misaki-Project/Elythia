@@ -727,6 +727,24 @@ func (r *fakeRequest) Bind(v any) error {
 	}
 	return nil
 }
+func (r *fakeRequest) BindStrict(v any) error {
+	dec := json.NewDecoder(strings.NewReader(r.body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		if err == io.EOF {
+			return errors.New("リクエストボディが空です")
+		}
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
 
 // plugintestActiveRoleIDs は request の assignment が覆う role ID をソート・重複除去
 // して返す。置換が名乗ってよい target を harness 側で判定するために使う
