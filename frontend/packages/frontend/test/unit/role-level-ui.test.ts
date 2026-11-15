@@ -93,7 +93,7 @@ describe('role-level UI integration points', () => {
 		const scope = 'write:admin:role-level-experience';
 		expect(permissions).toContain(scope);
 		expect(permissions.filter(permission => permission === scope)).toHaveLength(1);
-		expect(read('locales/ja-JP.yml')).toContain('"write:admin:role-level-experience": "ロールの経験値を変更する"');
+		expect(read('locales-elythia/ja-JP.yml')).toContain('"write:admin:role-level-experience": "ロールの経験値を変更する"');
 		expect(read('packages/frontend/src/components/MkTokenGenerateWindow.vue')).toContain("p.startsWith('write:admin')");
 	});
 	test('plugin adapter keeps credentials out of strict request bodies', () => {
