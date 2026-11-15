@@ -1403,6 +1403,8 @@ type Request interface
   IsModerator() bool
   IsAdministrator() bool
 
+func BindStrict(Request, any) error
+
 type CheckedRolePolicyRequest interface
   Request
   CheckedRolePolicies(...string) (map[string]any, error)

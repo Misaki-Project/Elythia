@@ -116,6 +116,12 @@ type Request interface {
 	IsAdministrator() bool
 }
 
+// BindStrict decodes exactly one JSON value from req's body, rejecting unknown
+// fields and trailing values. It is the function form of [Request.BindStrict].
+func BindStrict(req Request, v any) error {
+	return req.BindStrict(v)
+}
+
 // CheckedRolePolicyRequest is an optional request extension for plugins whose
 // authorization depends on role policies. CheckedRolePolicies resolves only the
 // requested keys and returns resolver errors instead of an unchecked fallback.

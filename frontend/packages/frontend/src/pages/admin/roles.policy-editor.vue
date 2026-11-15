@@ -619,26 +619,6 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes, 'genshinRefreshIntervalMinutes'])" v-model:policyMeta="genshinRefreshIntervalMinutesMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="genshinRefreshIntervalMinutes" data-policy-key="genshinRefreshIntervalMinutes">
-			<template #label>{{ i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes }}</template>
-			<template #valueText>{{ genshinRefreshIntervalMinutes }}</template>
-			<template #default="{ disabled }"><MkInput v-model="genshinRefreshIntervalMinutes" type="number" :min="1" :max="1440" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes_caption }}</template></MkInput></template>
-		</XFolder>
-		<XFolder v-if="matchQuery(['Genshin', i18n.ts.genshinGameName, 'genshinUidLimit'])" v-model:policyMeta="genshinUidLimitMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="genshinUidLimit" data-policy-key="genshinUidLimit">
-			<template #label>{{ i18n.ts._mkgoRolePolicy.genshinUidLimit }}</template>
-			<template #valueText>{{ genshinUidLimit }}</template>
-			<template #default="{ disabled }"><MkInput v-model="genshinUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.genshinUidLimit_caption }}</template></MkInput></template>
-		</XFolder>
-		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrUidLimit'])" v-model:policyMeta="hsrUidLimitMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="hsrUidLimit" data-policy-key="hsrUidLimit">
-			<template #label>{{ i18n.ts._mkgoRolePolicy.hsrUidLimit }}</template>
-			<template #valueText>{{ hsrUidLimit }}</template>
-			<template #default="{ disabled }"><MkInput v-model="hsrUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.hsrUidLimit_caption }}</template></MkInput></template>
-		</XFolder>
-		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrRefreshIntervalMinutes'])" v-model:policyMeta="hsrRefreshIntervalMinutesMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="hsrRefreshIntervalMinutes" data-policy-key="hsrRefreshIntervalMinutes">
-			<template #label>{{ i18n.ts._mkgoRolePolicy.hsrRefreshIntervalMinutes }}</template>
-			<template #valueText>{{ hsrRefreshIntervalMinutes }}</template>
-			<template #default="{ disabled }"><MkInput v-model="hsrRefreshIntervalMinutes" type="number" :min="1" :max="1440" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.hsrRefreshIntervalMinutes_caption }}</template></MkInput></template>
-		</XFolder>
 		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canUseFxTwitterPreview, 'canUseFxTwitterPreview'])" v-model:policyMeta="canUseFxTwitterPreviewMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="canUseFxTwitterPreview" data-policy-key="canUseFxTwitterPreview">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.canUseFxTwitterPreview }}</template>
 			<template #valueText>{{ canUseFxTwitterPreview ? i18n.ts.yes : i18n.ts.no }}</template>
@@ -847,18 +827,6 @@ const emojiApplicationMaxPerMonthMeta = mkGoPolicyMeta('emojiApplicationMaxPerMo
 // 審査待ちの上限 (#2977)。既定 0 = 無制限。
 const emojiApplicationMaxPending = mkGoPolicyValue('emojiApplicationMaxPending', 0);
 const emojiApplicationMaxPendingMeta = mkGoPolicyMeta('emojiApplicationMaxPending');
-const genshinRefreshIntervalMinutesModel = mkGoPolicyValue('genshinRefreshIntervalMinutes', 10);
-const genshinRefreshIntervalMinutes = computed({ get: () => genshinRefreshIntervalMinutesModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 1 && value <= 1440) genshinRefreshIntervalMinutesModel.value = value; } });
-const genshinRefreshIntervalMinutesMeta = mkGoPolicyMeta('genshinRefreshIntervalMinutes');
-const genshinUidLimitModel = mkGoPolicyValue('genshinUidLimit', 1);
-const genshinUidLimit = computed({ get: () => genshinUidLimitModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 0 && value <= 100) genshinUidLimitModel.value = value; } });
-const genshinUidLimitMeta = mkGoPolicyMeta('genshinUidLimit');
-const hsrUidLimitModel = mkGoPolicyValue('hsrUidLimit', 1);
-const hsrUidLimit = computed({ get: () => hsrUidLimitModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 0 && value <= 100) hsrUidLimitModel.value = value; } });
-const hsrUidLimitMeta = mkGoPolicyMeta('hsrUidLimit');
-const hsrRefreshIntervalMinutesModel = mkGoPolicyValue('hsrRefreshIntervalMinutes', 10);
-const hsrRefreshIntervalMinutes = computed({ get: () => hsrRefreshIntervalMinutesModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 1 && value <= 1440) hsrRefreshIntervalMinutesModel.value = value; } });
-const hsrRefreshIntervalMinutesMeta = mkGoPolicyMeta('hsrRefreshIntervalMinutes');
 const canUseFxTwitterPreview = mkGoPolicyValue('canUseFxTwitterPreview', true);
 const canUseFxTwitterPreviewMeta = mkGoPolicyMeta('canUseFxTwitterPreview');
 const fxTwitterColdFetchesPerHourModel = mkGoPolicyValue('fxTwitterColdFetchesPerHour', 100);
