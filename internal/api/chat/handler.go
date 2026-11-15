@@ -663,24 +663,35 @@ func (h *Handler) AttachedChatMessages(c echo.Context) error {
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
+	isMod := h.isModerator(user.ID)
+	// 本家と同じく、moderator 以外はチャットを読めるかを先に見る (#3369)。本家の
+	// checkChatAvailability は素の Error で500になるが、他の chat/* の
+	// RequireChatAvailability と同じ403 ROLE_PERMISSION_DENIED にする。
+	if !isMod && h.chatAvail != nil {
+		policy, _ := h.chatAvail.GetUserPolicies(user.ID)["chatAvailability"].(string)
+		if !middleware.ChatAvailabilityAllows(policy, "read") {
+			return c.JSON(http.StatusForbidden, apierr.RolePermissionDenied())
+		}
+	}
 	if h.fileRepo == nil {
 		return c.JSON(http.StatusOK, []any{})
 	}
+	// 本家 attached-chat-messages.ts の文言は`No such file.` (#3369。以前は
+	// `Some files are not found.`)。
 	file, err := h.fileRepo.FindByID(req.FileID)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return apierr.JSONInternalError(c)
 	}
 	if err != nil || file == nil {
-		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "Some files are not found.", "485ce26d-f5d2-4313-9783-e689d131eafb"))
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "485ce26d-f5d2-4313-9783-e689d131eafb"))
 	}
 	// owner-scope: moderator 以外は自分の file のみ参照可 (他人の private chat
 	// の添付を覗けないようにする)。
-	isMod := h.moderatorChecker != nil && h.moderatorChecker.IsModerator(user.ID)
 	if !isMod && (file.UserID == nil || *file.UserID != user.ID) {
-		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "Some files are not found.", "485ce26d-f5d2-4313-9783-e689d131eafb"))
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "485ce26d-f5d2-4313-9783-e689d131eafb"))
 	}
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -760,16 +771,16 @@ func (h *Handler) RoomsShow(c echo.Context) error {
 func (h *Handler) RoomsUpdate(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req struct {
-		RoomID      string `json:"roomId"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		RoomID      string  `json:"roomId"`
+		Name        *string `json:"name"`
+		Description *string `json:"description"`
 	}
 	if err := c.Bind(&req); err != nil || req.RoomID == "" {
 		return apierr.JSONInvalidParam(c)
 	}
 	// upstream paramDef は name maxLength:256 / description maxLength:1024
 	// (chat/rooms/update.ts)。
-	if utf8.RuneCountInString(req.Name) > 256 || utf8.RuneCountInString(req.Description) > 1024 {
+	if (req.Name != nil && utf8.RuneCountInString(*req.Name) > 256) || (req.Description != nil && utf8.RuneCountInString(*req.Description) > 1024) {
 		return apierr.JSONInvalidParam(c)
 	}
 	room, err := h.repo.FindRoomByID(req.RoomID)
@@ -781,11 +792,14 @@ func (h *Handler) RoomsUpdate(c echo.Context) error {
 		// upstream chat/rooms/update.ts:30 の noSuchRoom id に揃える (#1771)。
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "fcdb0f92-bda6-47f9-bd05-343e0e020932"))
 	}
-	if req.Name != "" {
-		room.Name = req.Name
+	// 本家の ChatService.updateRoom は送られた値をそのまま set するので、空文字で
+	// 名前や説明を消せる (#3369)。以前は空文字を無視していたので、部屋の説明を
+	// 消す手段が無かった。欠けた項目は本家と同じく変えない。
+	if req.Name != nil {
+		room.Name = *req.Name
 	}
-	if req.Description != "" {
-		room.Description = req.Description
+	if req.Description != nil {
+		room.Description = *req.Description
 	}
 	if err := h.repo.UpdateRoom(room); err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
@@ -1044,14 +1058,74 @@ func (h *Handler) RoomsTransferOwnership(c echo.Context) error {
 // MessagesCreate handles POST /api/chat/messages/create.
 // service が wire されていれば streaming 配信も同時に行う。
 func (h *Handler) MessagesCreate(c echo.Context) error {
-	user := middleware.GetUser(c)
-	var req struct {
-		Text     *string `json:"text"`
-		ToUserID *string `json:"toUserId"`
-		ToRoomID *string `json:"toRoomId"`
-		FileID   *string `json:"fileId"`
+	return h.messagesCreate(c, messageDestAuto)
+}
+
+// messageDest is the kind of recipient a message-creating route accepts.
+type messageDest int
+
+const (
+	// messageDestAuto picks the room when toRoomId is set and the user
+	// otherwise (Elythia's own chat/messages/create).
+	messageDestAuto messageDest = iota
+	// messageDestUser reads only toUserId (chat/messages/create-to-user).
+	messageDestUser
+	// messageDestRoom reads only toRoomId (chat/messages/create-to-room).
+	messageDestRoom
+)
+
+// messageCreateRequest is the body shared by the message-creating routes.
+type messageCreateRequest struct {
+	Text     *string
+	ToUserID *string
+	ToRoomID *string
+	FileID   *string
+}
+
+// bindMessageCreate binds the body with only the fields dest reads.
+//
+// 本家の create-to-user の paramDef に toRoomId は無く、create-to-room に toUserId は
+// 無い。どちらも知らない項目として無視するので、route ごとに読む項目を分ける
+// (#3369)。以前は共有の構造体で両方を読み、create-to-user に toRoomId を付けると
+// 部屋へ投稿し、create-to-room の型の違う toUserId を400にしていた。
+func bindMessageCreate(c echo.Context, dest messageDest) (messageCreateRequest, error) {
+	var out messageCreateRequest
+	switch dest {
+	case messageDestUser:
+		var req struct {
+			Text     *string `json:"text"`
+			ToUserID *string `json:"toUserId"`
+			FileID   *string `json:"fileId"`
+		}
+		err := c.Bind(&req)
+		out = messageCreateRequest{Text: req.Text, ToUserID: req.ToUserID, FileID: req.FileID}
+		return out, err
+	case messageDestRoom:
+		var req struct {
+			Text     *string `json:"text"`
+			ToRoomID *string `json:"toRoomId"`
+			FileID   *string `json:"fileId"`
+		}
+		err := c.Bind(&req)
+		out = messageCreateRequest{Text: req.Text, ToRoomID: req.ToRoomID, FileID: req.FileID}
+		return out, err
+	default:
+		var req struct {
+			Text     *string `json:"text"`
+			ToUserID *string `json:"toUserId"`
+			ToRoomID *string `json:"toRoomId"`
+			FileID   *string `json:"fileId"`
+		}
+		err := c.Bind(&req)
+		out = messageCreateRequest{Text: req.Text, ToUserID: req.ToUserID, ToRoomID: req.ToRoomID, FileID: req.FileID}
+		return out, err
 	}
-	if err := c.Bind(&req); err != nil {
+}
+
+func (h *Handler) messagesCreate(c echo.Context, dest messageDest) error {
+	user := middleware.GetUser(c)
+	req, err := bindMessageCreate(c, dest)
+	if err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
 	if h.svc == nil {
@@ -1120,10 +1194,7 @@ func (h *Handler) MessagesCreate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("CONTENT_REQUIRED", "Content required. You need to set text or fileId.", contentRequiredID))
 	}
 
-	var (
-		msg *model.ChatMessage
-		err error
-	)
+	var msg *model.ChatMessage
 	if toRoom {
 		msg, err = h.svc.CreateMessageToRoom(c.Request().Context(), user.ID, *req.ToRoomID, text, fileID)
 	} else {
@@ -1809,12 +1880,12 @@ func (h *Handler) MembersUpdateMembership(c echo.Context) error {
 
 // MessagesCreateToUser handles POST /api/chat/messages/create-to-user.
 func (h *Handler) MessagesCreateToUser(c echo.Context) error {
-	return h.MessagesCreate(c)
+	return h.messagesCreate(c, messageDestUser)
 }
 
 // MessagesCreateToRoom handles POST /api/chat/messages/create-to-room.
 func (h *Handler) MessagesCreateToRoom(c echo.Context) error {
-	return h.MessagesCreate(c)
+	return h.messagesCreate(c, messageDestRoom)
 }
 
 // UserTimeline handles POST /api/chat/messages/user-timeline.
@@ -2182,31 +2253,60 @@ func (h *Handler) History(c echo.Context) error {
 	// 計算して各 message に isRead を載せる (#1749)。packMessageDetailed 自体は
 	// isRead を出さない (#861) ため、history endpoint でのみ上乗せする。
 	out := h.packMessagesDetailed(msgs, user.ID)
-	for i, m := range msgs {
-		out[i]["isRead"] = h.historyItemIsRead(user.ID, m, req.Room)
+	isRead := h.historyIsRead(user.ID, msgs, req.Room)
+	for i := range msgs {
+		out[i]["isRead"] = isRead[i]
 	}
 	return h.jsonOK(c, out)
 }
 
-// historyItemIsRead reports whether the conversation represented by a history
-// item has no unread messages for meID. Mirrors upstream getRoomReadStateMap /
+// historyIsRead reports, for each history item, whether its conversation has
+// no unread messages for meID. Mirrors upstream getRoomReadStateMap /
 // getUserReadStateMap (mk-go は reads 配列から会話単位で導出する)。クエリ失敗時は
 // upstream の `?? false` と同じく未読 (false) 扱いにする。
-func (h *Handler) historyItemIsRead(meID string, m *model.ChatMessage, room bool) bool {
-	if room {
-		if m.ToRoomID == nil {
-			return true
+//
+// 会話ごとに 1 本ずつ引いていたのを、まとめて 1 本にした (#3990)。
+func (h *Handler) historyIsRead(meID string, msgs []*model.ChatMessage, room bool) []bool {
+	out := make([]bool, len(msgs))
+	keys := make([]string, len(msgs))
+	has := make([]bool, len(msgs))
+	var ids []string
+	for i, m := range msgs {
+		if room {
+			if m.ToRoomID == nil {
+				// 部屋の無い項目は未読を持ちえないので既読 (従来どおり)。
+				out[i] = true
+				continue
+			}
+			keys[i] = *m.ToRoomID
+		} else {
+			// 1-on-1: 相手 = 自分が sender なら toUser、そうでなければ fromUser。
+			keys[i] = m.FromUserID
+			if keys[i] == meID && m.ToUserID != nil {
+				keys[i] = *m.ToUserID
+			}
 		}
-		unread, err := h.repo.HasUnreadInRoom(meID, *m.ToRoomID)
-		return err == nil && !unread
+		has[i] = true
+		ids = append(ids, keys[i])
 	}
-	// 1-on-1: 相手 = 自分が sender なら toUser、そうでなければ fromUser。
-	otherID := m.FromUserID
-	if otherID == meID && m.ToUserID != nil {
-		otherID = *m.ToUserID
+	if len(ids) == 0 {
+		return out
 	}
-	unread, err := h.repo.HasUnreadFromUser(meID, otherID)
-	return err == nil && !unread
+	var (
+		unread map[string]bool
+		err    error
+	)
+	if room {
+		unread, err = h.repo.UnreadInRooms(meID, ids)
+	} else {
+		unread, err = h.repo.UnreadFromUsers(meID, ids)
+	}
+	for i := range msgs {
+		if has[i] {
+			out[i] = err == nil && !unread[keys[i]]
+		}
+	}
+	return out
 }
 
 // UnreadCount handles POST /api/chat/unread-count.

@@ -23,10 +23,13 @@ import { callApi } from '../../../fixtures/api';
 import { isTsBackend } from '../../../fixtures/backend';
 import { type RootFixture, uiSigninAsRoot } from '../../../fixtures/ui_auth';
 import { clickSwitchByLabel } from '../../../fixtures/ui_click';
+import { coversRoutes } from '../../../fixtures/ui_route';
 
 // i18n.ts.emailRequiredForSignup の en-US 値。playwright.config.ts で
 // locale を en-US に固定しているのでこの表記で引ける。
-const EMAIL_REQUIRED_LABEL = 'Require email address for sign-up';
+// ラベルは「(Recommended)」まで含めた全体で引く (#4025。switch はラベルの完全一致で
+// 引く。以前の「含む」での一致は、この後ろの文字を気にせずに通っていた)
+const EMAIL_REQUIRED_LABEL = 'Require email address for sign-up (Recommended)';
 
 test.describe('UI: /admin/moderation emailRequiredForSignup toggle flow', () => {
   let root: RootFixture;
@@ -35,7 +38,7 @@ test.describe('UI: /admin/moderation emailRequiredForSignup toggle flow', () => 
   });
   test.setTimeout(60_000);
 
-  test('toggle emailRequiredForSignup switch → /api/admin/update-meta', async ({
+  test('toggle emailRequiredForSignup switch → /api/admin/update-meta', coversRoutes('/admin/moderation'), async ({
     page,
     baseURL,
     request,

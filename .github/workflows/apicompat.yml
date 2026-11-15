@@ -18,6 +18,10 @@
 # 依存が要る。本家の取得を前提にする検査なので、frontend workflowではなく
 # こちらに置く。
 #
+# **frontend/locales が本家と同じこと (#4071) もここで見る。** Elythia の語は
+# frontend/locales-elythia に置き、本家のファイルは本家のまま持つ。比べる相手の本家が
+# 要るので、frontend workflow ではなくこちらに置く。
+#
 # **required check には含めない。** 判定材料に本家の内容が入るので、こちらの
 # コードを触っていない PR でも upstream の bump で赤くなりうる (`vulncheck` と同じ理由)。
 name: apicompat
@@ -38,6 +42,9 @@ on:
       - 'docs/api-compat.md'
       - 'Makefile'
       - 'frontend/pnpm-lock.yaml'
+      # frontend/locales が本家と同じか (#4071)
+      - 'frontend/locales/**'
+      - 'frontend/scripts/check-locale-upstream.mjs'
       - '.github/workflows/apicompat.yml'
   workflow_dispatch:
 
@@ -114,7 +121,7 @@ jobs:
       # upstream-checkのparamdef-genは、本家の.tsをfrontend/のTypeScriptで読み、
       # 照合のcorpusをfrontend/のajvで作る(#3673)。frontend workflowと同じ手順で
       # 依存だけを入れる(buildはしない)。
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: frontend/package.json
 

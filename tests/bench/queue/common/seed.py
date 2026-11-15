@@ -2,8 +2,9 @@
 
 Creates per-stack local users + admin tokens, inserts synthetic followers
 (pointing at blackhole by default or an isolated delivery receiver when
-enabled), inserts the faker actor as a remote user for inbound bench, and
-writes the bundle to /state/seed.json for subsequent driver runs.
+enabled), inserts the faker actors as remote users for inbound bench,
+registers those remote hosts as known instances, and writes the bundle to
+/state/seed.json for subsequent driver runs.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import string
 import sys
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import psycopg
@@ -38,8 +40,10 @@ STACKS = {stack: STACKS[stack] for stack in selected_stacks}
 
 FAKER_URL = os.environ.get("FAKER_URL", "")
 FAKER_HOST = os.environ.get("FAKER_HOST", "")
-FAKER_BASE_HTTPS = os.environ.get("FAKER_BASE_HTTPS", "")
-FAKER_ACTOR_PATH = "/users/bench-sender"
+# 受信の計測で活動を送る投稿者の数 (#4138)。1 人から 1 万件を送ると、受信側で
+# 同じ利用者の行への書き込みが行ロックの順番待ちになり、処理の速さではなく
+# 順番待ちを測ってしまうので、既定は 1000 人 (1 万件なら 1 人 10 件)。
+INBOUND_ACTORS = int(os.environ.get("INBOUND_ACTORS", "1000"))
 SEED_FAKER = os.environ.get("QUEUE_BENCH_SEED_FAKER", "1") == "1"
 OUTBOUND_FOLLOWERS = int(os.environ.get("OUTBOUND_FOLLOWERS", "100"))
 DELIVERY_MODE = os.environ.get("QUEUE_BENCH_DELIVERY", "0") == "1"
@@ -114,6 +118,33 @@ def enable_federation(stack: str, db_host: str) -> None:
             )
 
 
+def lift_rate_limit_rows(cur: Any) -> None:
+    """Turn off the per-user API rate limits through the base role policy.
+
+    本家は production では API の利用者ごとの制限が効き、notes/create は 1 時間に
+    300 件まで (#4140)。outbound は 1 回に 100 件投稿するので、1 時間に 3 回目で
+    429 になる。Elythia はベンチでは MK_DISABLEENDPOINTRATELIMITS で外している
+    ので、本家も bench-compare と同じく基本ロールの rateLimitFactor を 0 にする。
+    meta は app を再起動すると読み直される (queue-bench-seed が再起動する)。
+    """
+    cur.execute(
+        """
+        UPDATE meta SET policies = policies || '{"rateLimitFactor": 0}'::jsonb
+        RETURNING 1
+        """
+    )
+    if len(cur.fetchall()) != 1:
+        raise RuntimeError("could not turn off the rate limits: meta has no single row")
+
+
+def lift_rate_limits(stack: str, db_host: str) -> None:
+    print(f"  [{stack}] setting rateLimitFactor=0...", flush=True)
+    with psycopg.connect(host=db_host, user=DB_USER, password=DB_PASS, dbname=DB_NAME) as conn:
+        with conn.cursor() as cur:
+            lift_rate_limit_rows(cur)
+        conn.commit()
+
+
 def insert_fixture_followers(stack: str, db_host: str, local_user_id: str, count: int,
                              inbox_base: str = "http://blackhole") -> list[dict[str, str]]:
     """Insert N remote follower users that point at a local fixture, then
@@ -160,69 +191,146 @@ def insert_fixture_followers(stack: str, db_host: str, local_user_id: str, count
     return followers
 
 
-def fetch_faker_actor() -> dict[str, Any]:
-    r = httpx.get(f"{FAKER_BASE_HTTPS}{FAKER_ACTOR_PATH}", timeout=10, verify=False)
+def fixture_hosts(receiver_url: str, faker_host: str) -> list[str]:
+    """Remote hosts the bench talks to: follower users, their inboxes, and the faker."""
+    hosts = {"blackhole", urlparse(receiver_url).hostname or ""}
+    if faker_host:
+        hosts.add(faker_host)
+    hosts.discard("")
+    return sorted(hosts)
+
+
+def insert_fixture_instance_rows(cur: Any, hosts: list[str]) -> None:
+    """Register the remote hosts in the instance table, as servers already known.
+
+    本家は初めての相手に配送・受信するとき instance の行を作るが、同じ相手への
+    ジョブが同時に走ると作成が競合し、一意制約の違反で失敗して再試行 (最初は
+    約 60 秒後) に回る (#4140)。実測では初回の outbound で 1 万件のうち 121 件が
+    そうなり、drain が 8.7 秒から 72.4 秒に延びた。実際の連合で同時に届く相手の
+    多くは既に知っているサーバーなので、両方の stack に先に登録しておく。
+    """
+    cur.executemany(
+        """
+        INSERT INTO instance (id, host, "firstRetrievedAt")
+        VALUES (%s, %s, now())
+        ON CONFLICT DO NOTHING
+        """,
+        [(aidx_id("in"), host) for host in hosts],
+    )
+
+
+def insert_fixture_instances(stack: str, db_host: str, hosts: list[str]) -> None:
+    print(f"  [{stack}] registering remote hosts: {', '.join(hosts)}", flush=True)
+    with psycopg.connect(host=db_host, user=DB_USER, password=DB_PASS, dbname=DB_NAME) as conn:
+        with conn.cursor() as cur:
+            insert_fixture_instance_rows(cur, hosts)
+        conn.commit()
+
+
+def fetch_faker_actors(count: int) -> dict[str, Any]:
+    """List the faker's first `count` actors and their shared public key."""
+    r = httpx.get(f"{FAKER_URL}/actors", params={"count": count}, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-def insert_faker_actor(stack: str, db_host: str, faker_actor: dict[str, Any]) -> str:
-    """Pre-seed the faker actor as a remote user on the receiver stack
+def faker_actor_rows(faker: dict[str, Any]) -> list[dict[str, str]]:
+    """Turn the faker's actor list into the rows to insert on a receiver.
+
+    Each actor gets its own user id; the key pem is shared (the faker signs
+    with one key pair) but the key id is per actor.
+    """
+    pem = faker["publicKeyPem"]
+    rows = []
+    for actor in faker["actors"]:
+        rows.append({
+            "id": aidx_id("fk"),
+            "username": actor["username"],
+            "usernameLower": actor["username"].lower(),
+            "uri": actor["id"],
+            "inbox": actor["inbox"],
+            "keyId": actor["keyId"],
+            "keyPem": pem,
+        })
+    if len({r["id"] for r in rows}) != len(rows):
+        raise RuntimeError("generated duplicate user ids for the faker actors; run the seed again")
+    return rows
+
+
+def faker_state(faker: dict[str, Any]) -> dict[str, Any]:
+    """What seed.json records about the faker actors.
+
+    driver はここの数を faker に渡す。登録した投稿者と送る投稿者を揃えるため。
+    """
+    return {
+        "actors": len(faker["actors"]),
+        "first_actor_uri": faker["actors"][0]["id"],
+    }
+
+
+def insert_faker_actors(stack: str, db_host: str, faker: dict[str, Any]) -> int:
+    """Pre-seed the faker actors as remote users on the receiver stack
     so inbox processing does not require a fresh actor fetch / verify
-    round-trip."""
-    print(f"  [{stack}] inserting faker actor...", flush=True)
-    fid = aidx_id("fk")
-    username = "bench-sender"
-    uri = faker_actor["id"]
-    inbox = faker_actor["inbox"]
-    pubkey_pem = faker_actor["publicKey"]["publicKeyPem"]
-    key_id = faker_actor["publicKey"]["id"]
+    round-trip. Returns the number of actors inserted."""
+    rows = faker_actor_rows(faker)
+    print(f"  [{stack}] inserting {len(rows)} faker actors...", flush=True)
 
     with psycopg.connect(host=db_host, user=DB_USER, password=DB_PASS, dbname=DB_NAME) as conn:
-        conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO "user" (id, username, "usernameLower", host,
-                                    uri, inbox)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) DO UPDATE SET inbox = EXCLUDED.inbox
-                """,
-                (fid, username, username.lower(), FAKER_HOST, uri, inbox),
-            )
-            # public key が user_publickey 等の別テーブルに置かれる場合があるので、
-            # 主要 schema (mk-go / Misskey) 両対応で best-effort upsert する。
-            cur.execute(
-                """
-                SELECT to_regclass('public.user_publickey') IS NOT NULL,
-                       to_regclass('public.user_keypair') IS NOT NULL
-                """
-            )
-            row = cur.fetchone()
-            has_pubkey, has_keypair = row if row else (False, False)
-            if has_pubkey:
-                cur.execute(
-                    """
-                    INSERT INTO user_publickey ("userId", "keyId", "keyPem")
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT ("userId") DO UPDATE
-                    SET "keyId" = EXCLUDED."keyId",
-                        "keyPem" = EXCLUDED."keyPem"
-                    """,
-                    (fid, key_id, pubkey_pem),
-                )
-            elif has_keypair:
-                # Misskey TS uses user_keypair with publicKey/privateKey columns
-                cur.execute(
-                    """
-                    INSERT INTO user_keypair ("userId", "publicKey", "privateKey")
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT ("userId") DO UPDATE
-                    SET "publicKey" = EXCLUDED."publicKey"
-                    """,
-                    (fid, pubkey_pem, ""),
-                )
-    return fid
+            insert_faker_actor_rows(cur, rows)
+        conn.commit()
+    return len(rows)
+
+
+def insert_faker_actor_rows(cur: Any, rows: list[dict[str, str]]) -> None:
+    """Insert the faker actors and their public keys with one cursor.
+
+    lastFetchedAt を今にして、取得済みの投稿者として登録する。無いと Elythia は
+    投稿者ごとに最初の活動で actor を同期で取りに行き、その取得を計測に含めて
+    しまう (本家も無いと処理の後に裏で取り直す)。実際の連合でも、投稿が届く
+    相手の多くは既に知っている投稿者。
+    """
+    cur.executemany(
+        """
+        INSERT INTO "user" (id, username, "usernameLower", host,
+                            uri, inbox, "lastFetchedAt")
+        VALUES (%s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (id) DO UPDATE SET inbox = EXCLUDED.inbox
+        """,
+        [(r["id"], r["username"], r["usernameLower"], FAKER_HOST, r["uri"], r["inbox"]) for r in rows],
+    )
+    # public key が user_publickey 等の別テーブルに置かれる場合があるので、
+    # 主要 schema (mk-go / Misskey) 両対応で best-effort upsert する。
+    cur.execute(
+        """
+        SELECT to_regclass('public.user_publickey') IS NOT NULL,
+               to_regclass('public.user_keypair') IS NOT NULL
+        """
+    )
+    row = cur.fetchone()
+    has_pubkey, has_keypair = row if row else (False, False)
+    if has_pubkey:
+        cur.executemany(
+            """
+            INSERT INTO user_publickey ("userId", "keyId", "keyPem")
+            VALUES (%s, %s, %s)
+            ON CONFLICT ("userId") DO UPDATE
+            SET "keyId" = EXCLUDED."keyId",
+                "keyPem" = EXCLUDED."keyPem"
+            """,
+            [(r["id"], r["keyId"], r["keyPem"]) for r in rows],
+        )
+    elif has_keypair:
+        # Misskey TS uses user_keypair with publicKey/privateKey columns
+        cur.executemany(
+            """
+            INSERT INTO user_keypair ("userId", "publicKey", "privateKey")
+            VALUES (%s, %s, %s)
+            ON CONFLICT ("userId") DO UPDATE
+            SET "publicKey" = EXCLUDED."publicKey"
+            """,
+            [(r["id"], r["keyPem"], "") for r in rows],
+        )
 
 
 def main() -> int:
@@ -233,13 +341,9 @@ def main() -> int:
     for stack, info in STACKS.items():
         wait_health(info["url"])
 
-    faker_actor = fetch_faker_actor() if SEED_FAKER else None
-    if faker_actor:
-        state["faker"] = {
-            "actor_uri": faker_actor["id"],
-            "inbox": faker_actor["inbox"],
-            "publicKeyId": faker_actor["publicKey"]["id"],
-        }
+    faker = fetch_faker_actors(INBOUND_ACTORS) if SEED_FAKER else None
+    if faker:
+        state["faker"] = faker_state(faker)
 
     for stack, info in STACKS.items():
         url = info["url"]
@@ -264,14 +368,16 @@ def main() -> int:
                 target_note_uri = f"{url}/notes/{note_id}"
 
         enable_federation(stack, info["db_host"])
+        lift_rate_limits(stack, info["db_host"])
         receiver_url = DELIVERY_RECEIVERS[stack] if DELIVERY_MODE else "http://blackhole"
         followers = insert_fixture_followers(
             stack, info["db_host"], user_id, OUTBOUND_FOLLOWERS, receiver_url,
         )
-        faker_remote_id = (
-            insert_faker_actor(stack, info["db_host"], faker_actor)
-            if faker_actor
-            else ""
+        insert_fixture_instances(stack, info["db_host"], fixture_hosts(receiver_url, FAKER_HOST if faker else ""))
+        faker_actor_count = (
+            insert_faker_actors(stack, info["db_host"], faker)
+            if faker
+            else 0
         )
 
         stack_state: dict[str, Any] = {
@@ -280,7 +386,7 @@ def main() -> int:
             "token": token,
             "user_id": user_id,
             "follower_count": len(followers),
-            "faker_remote_user_id": faker_remote_id,
+            "faker_actor_count": faker_actor_count,
         }
         if DELIVERY_MODE:
             stack_state["delivery_enabled"] = True

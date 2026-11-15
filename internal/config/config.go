@@ -15,13 +15,13 @@ import (
 
 // MkGoVersion is the mk-go version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MkGoVersion=2.1.0"
-var MkGoVersion = "2.1.0-misaki.1"
+//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MkGoVersion=2.2.0"
+var MkGoVersion = "2.2.0-misaki.1"
 
 // MisskeyVersion is the compatible Misskey version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MisskeyVersion=2026.10.1"
-var MisskeyVersion = "2026.10.1"
+//	go build -ldflags "-X github.com/elythia-network/elythia/internal/config.MisskeyVersion=2026.11.0"
+var MisskeyVersion = "2026.11.0"
 
 // MkGoCommit is the source revision this binary was built from (short hash).
 //
@@ -186,13 +186,6 @@ type Source struct {
 	Socket      string `mapstructure:"socket"`
 	ChmodSocket string `mapstructure:"chmodSocket"`
 	DisableHSTS bool   `mapstructure:"disableHsts"`
-	// DisableParamShadow stops running upstream's paramDef validation in
-	// front of the API handlers to count disagreements (#3677). The
-	// endpoints that reject with it (#3742) keep validating.
-	DisableParamShadow bool `mapstructure:"disableParamShadow"`
-	// ParamShadowLogSeconds is the interval of the summary the param shadow
-	// validation writes to the log. Unset or non-positive means 600.
-	ParamShadowLogSeconds int `mapstructure:"paramShadowLogSeconds"`
 	// BcryptCost は account password のハッシュ強度 (work factor)。
 	// 未設定なら password.DefaultCost。範囲外の値は警告して既定に落とす。
 	BcryptCost *int `mapstructure:"bcryptCost"`
@@ -452,10 +445,6 @@ type Config struct {
 
 	DisableHSTS bool
 	BcryptCost  int
-	// DisableParamShadow: true なら本家のparamDefでの検証だけの実行 (#3677) を止める。
-	DisableParamShadow bool
-	// ParamShadowLogSeconds: 検証だけの実行の件数をログに出す間隔 (秒)。既定 600。
-	ParamShadowLogSeconds int
 	// NoteHookConcurrency: 0 なら実行時に既定 (GOMAXPROCS x 2) を使う。
 	NoteHookConcurrency int
 	// MediaProxyConcurrency: 0 なら実行時に既定 (GOMAXPROCS / 2、最低 1) を使う。
@@ -619,10 +608,6 @@ func (c *Config) ProvidesTarball() bool {
 
 const defaultMaxFileSize int64 = 262144000
 
-// DefaultParamShadowLogSeconds is the default paramShadowLogSeconds: the
-// param shadow validation (#3677) writes its summary every 10 minutes.
-const DefaultParamShadowLogSeconds = 600
-
 // Load reads the Misskey YAML configuration and returns a resolved Config.
 // Environment variables with the prefix MK_ override YAML values.
 // Nested keys use underscore separation (e.g. MK_DB_HOST overrides db.host).
@@ -685,8 +670,6 @@ func bindEnvKeys(v *viper.Viper) {
 		// 運用/セキュリティ系: 既存ymlから環境変数オーバーライドできるようにする
 		"trustProxy",
 		"disableHsts",
-		"disableParamShadow",
-		"paramShadowLogSeconds",
 		"bcryptCost",
 		"noteHookConcurrency",
 		"mediaProxyConcurrency",
@@ -739,10 +722,6 @@ func resolve(src *Source) (*Config, error) {
 	// ハッシュを量産すると、気づいた時点で全員のパスワードが弱い。
 	bcryptCost := password.DefaultCost
 	// 0 以下は「未設定」として driver 既定に委ねる。
-	paramShadowLogSeconds := DefaultParamShadowLogSeconds
-	if src.ParamShadowLogSeconds > 0 {
-		paramShadowLogSeconds = src.ParamShadowLogSeconds
-	}
 	queueIdlePollSeconds := 0
 	if src.QueueIdlePollSeconds != nil && *src.QueueIdlePollSeconds > 0 {
 		queueIdlePollSeconds = *src.QueueIdlePollSeconds
@@ -870,6 +849,9 @@ func resolve(src *Source) (*Config, error) {
 	if err := validateProxyURL("proxySmtp", src.ProxySMTP, smtpProxySchemes); err != nil {
 		return nil, err
 	}
+	if err := validateJobConcurrency(src); err != nil {
+		return nil, err
+	}
 
 	cfg := &Config{
 		Version:     MisskeyVersion,
@@ -887,8 +869,6 @@ func resolve(src *Source) (*Config, error) {
 		DriveURL:    fmt.Sprintf("%s://%s/files", scheme, host),
 
 		DisableHSTS:                 src.DisableHSTS,
-		DisableParamShadow:          src.DisableParamShadow,
-		ParamShadowLogSeconds:       paramShadowLogSeconds,
 		BcryptCost:                  bcryptCost,
 		NoteHookConcurrency:         noteHookConcurrency,
 		MediaProxyConcurrency:       mediaProxyConcurrency,
@@ -1123,6 +1103,29 @@ var (
 	httpProxySchemes = []string{"http", "https", "socks5", "socks5h"}
 	smtpProxySchemes = []string{"http", "https", "socks5", "socks5h"}
 )
+
+// validateJobConcurrency rejects a negative `<queue>JobConcurrency`. Zero
+// (or unset) keeps meaning "the default, or auto-scale when enabled".
+//
+// 負の値は使われずに既定の数になるのに、自動調整 (jobQueueAutoScale) の対象からは
+// 外れる (対象は未設定か 0 のときだけ) ので、書いた値とも既定とも違う動きになる。
+// 本家 2026.11.0 (#18081) も不正な値なら起動を止める (#4164)。本家は 0 でも止めるが、
+// Elythia では 0 を「未設定・自動」として受ける (docs/divergence/config.md)。
+func validateJobConcurrency(src *Source) error {
+	for _, c := range []struct {
+		key string
+		v   *int
+	}{
+		{"deliverJobConcurrency", src.DeliverJobConcurrency},
+		{"inboxJobConcurrency", src.InboxJobConcurrency},
+		{"relationshipJobConcurrency", src.RelationshipJobConcurrency},
+	} {
+		if c.v != nil && *c.v < 0 {
+			return fmt.Errorf("%s は 0 以上にしてください (%d でした。0 か未設定なら既定の数か自動調整になります)", c.key, *c.v)
+		}
+	}
+	return nil
+}
 
 // validateProxyURL rejects a proxy setting the consumer cannot use.
 //

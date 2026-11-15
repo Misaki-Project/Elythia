@@ -150,6 +150,8 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	// TS本家ApNoteService.tsと同じ3段フォールバックでtext抽出:
 	// 1. source.content (MFM) → 2. _misskey_content → 3. content (HTML→MFM変換)
 	var fullText *string
+	// 引用を付けたときに保存する本文 (「RE: <URL>」を除いたもの)。判定には使わない。
+	var textWithoutQuoteInline *string
 	if apNote.Source != nil &&
 		apNote.Source.MediaType == "text/x.misskeymarkdown" &&
 		apNote.Source.Content != "" {
@@ -172,13 +174,19 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 		if text != "" {
 			fullText = &text
 		}
+		if apNote.MisskeyQuote != "" || apNote.QuoteURL != "" {
+			stripped := mfm.FromHTMLWithoutQuoteInline(apNote.Content)
+			textWithoutQuoteInline = &stripped
+		}
 	}
 	// 保存するのは切った本文、禁止語・連合のルール・本文からの hashtag の判定は
 	// 切る前の全文で行う (本家 ApNoteService は checkProhibitedWordsContain を
 	// 全文で見てから NoteCreateService.create で切る)。
+	// 切った後に前後の空白を削り、空なら本文無しにする (本家と同じ、#3369)。
 	if fullText != nil {
-		clipped := clipRemoteNoteText(*fullText)
-		note.Text = &clipped
+		if stored := storedRemoteNoteText(*fullText); stored != "" {
+			note.Text = &stored
+		}
 	}
 	if apNote.Summary != "" {
 		// **列の上限で切り、NUL を落とす。** CW は**相手が自由に決められる値**で、
@@ -220,7 +228,9 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	// 本家はリモートの投稿も NoteCreateService.create を通すので、ローカル投稿と
 	// 同じ降格が掛かる。判定は禁止語と同じく切る前の全文で行う (本家も切る前に
 	// 判定する)。編集 (Update) の取り込みでも同じ判定で降格する (UpdateRemoteNote)。
-	if note.Visibility == model.NoteVisibilityPublic && r.containsSensitiveWords(fullText, note.CW) {
+	// 当たらなければ、本家と同じく投稿者のロールの canPublicNote でも降格する (#3369)。
+	if note.Visibility == model.NoteVisibilityPublic &&
+		(r.containsSensitiveWords(fullText, note.CW) || r.authorCannotPublicNote(actor.ID)) {
 		note.Visibility = model.NoteVisibilityHome
 	}
 	// 連合のルール (#3090)。禁止語と同じく**行を作る前**に評価する。ここより後ろは
@@ -428,6 +438,17 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 		note.RenoteID = &quoted.ID
 		note.RenoteUserID = &quoted.UserID
 		note.RenoteUserHost = quoted.UserHost
+		// 引用を付けたので、本文の「RE: <URL>」を除いて保存する (本家 2026.11.0 #18063、#4164)。
+		// 本家は引用のフィールドがあるだけで除くが、Elythia は引用を付けたときに限る。
+		// フォロワー限定などで引用を付けない (上) ときに除くと、引用だった手がかりが
+		// 本文から消えるため (docs/divergence/federation.md)。判定 (禁止語など) は
+		// 除く前の全文で済ませてある。
+		if textWithoutQuoteInline != nil {
+			note.Text = nil
+			if stored := storedRemoteNoteText(*textWithoutQuoteInline); stored != "" {
+				note.Text = &stored
+			}
+		}
 	}
 	// AP Note Tag配列からカスタム絵文字を抽出してDBにupsert
 	if actor.Host != nil {
@@ -504,6 +525,10 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 		}
 		return nil, false, err
 	}
+	// 本家はリモートの投稿も NoteCreateService を通すので、投稿者の notesCount を
+	// 1 増やす (#3928)。ephemeral に入れた時点では数えず (投稿者の行が DB に無い
+	// ことがある)、DB に入れたここで数える。失敗はベストエフォートで無視。
+	r.incrementAuthorNotesCount(actor.ID)
 	// ローカルノートへの返信の場合、repliesCount を増やす。
 	// これにより timeline や API 上の「返信数」表示が federated reply も
 	// 含むようになる。失敗はベストエフォートで無視。

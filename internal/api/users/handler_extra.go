@@ -305,7 +305,7 @@ func (h *Handler) Reactions(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "userId is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -708,6 +708,9 @@ func (h *Handler) UpdateMemo(c echo.Context) error {
 			Memo:         *req.Memo,
 		}
 		if err := h.memoRepo.CreateOrUpdate(memo); err != nil {
+			if repository.IsRejectedValue(err) {
+				return apierr.JSONInvalidParam(c)
+			}
 			return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 		}
 	}

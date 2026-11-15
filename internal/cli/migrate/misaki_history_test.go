@@ -28,7 +28,7 @@ func TestMisakiHistory_MigrationTracksAreUnique(t *testing.T) {
 		name, dir string
 		latest    uint
 	}{
-		{"core", core, 138},
+		{"core", core, 143},
 		{"local", filepath.Join(core, "local"), 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,7 +133,7 @@ func TestMisakiHistory_Legacy117ReachesSameSchemaAsFresh(t *testing.T) {
 	assert.Equal(t, []int64{1}, legacy.versions(t, "schema_migrations_local"))
 	code, out := legacy.migrate(t, "-direction", "up")
 	require.Equal(t, 0, code, out)
-	assert.Equal(t, []int64{138}, legacy.versions(t, "schema_migrations"))
+	assert.Equal(t, []int64{143}, legacy.versions(t, "schema_migrations"))
 	assert.Equal(t, []int64{1}, legacy.versions(t, "schema_migrations_local"))
 	assert.True(t, legacy.columnExists(t, "user", "accountCreatedAt"), "core117 must not be skipped")
 
@@ -162,7 +162,7 @@ func TestMisakiHistory_UpAcceptsCanonical117(t *testing.T) {
 	require.True(t, f.columnExists(t, "user", "accountCreatedAt"))
 	code, out = f.migrate(t, "-direction", "up")
 	require.Equal(t, 0, code, out)
-	assert.Equal(t, []int64{138}, f.versions(t, "schema_migrations"))
+	assert.Equal(t, []int64{143}, f.versions(t, "schema_migrations"))
 	assert.Equal(t, []int64{1}, f.versions(t, "schema_migrations_local"))
 }
 

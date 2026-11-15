@@ -1,4 +1,4 @@
-{"misskeyVersion":"2026.10.1","ajv":"8.20.0","paramdefsSha256":"43501ca65ab8a7af82bbb1fa20b1225046e72222718fb6cc8b2e2626e2a696f2","elythiaParamdefsSha256":"42fd7c29deb26b5002a98aa205b91cae931ffa88fe6f7c0cd65ee875415c174d","cases":3749}
+{"misskeyVersion":"2026.11.0","ajv":"8.20.0","paramdefsSha256":"8e9d75274b84160bd15122d93e5662877ff8eb088ad349388bd505938f4834ef","elythiaParamdefsSha256":"984eb91ad7c7af6e9ec8babc6b8416f386eb391e223a3ea62d92a49e222f0e90","cases":3887}
 {"ep":"admin/backup/delete"}
 {"in":{"password":"hello","id":"hello"},"ok":true}
 {"in":{},"ok":false,"path":"#/required","msg":"must have required property 'password'"}
@@ -3004,6 +3004,39 @@
 {"in":{"uploadId":"ａｂｃ"},"ok":false,"path":"#/properties/uploadId/format","msg":"must match format \"misskey:id\""}
 {"in":{"uploadId":"abc\u0000"},"ok":false,"path":"#/properties/uploadId/format","msg":"must match format \"misskey:id\""}
 {"in":{"uploadId":{"bad":1}},"ok":false,"path":"#/properties/uploadId/type","msg":"must be string"}
+{"ep":"drive/files/create-chunked/append"}
+{"in":{"uploadId":"hello","index":0},"ok":true}
+{"in":{},"ok":false,"path":"#/required","msg":"must have required property 'uploadId'"}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"uploadId":"hello","index":0,"unknownProperty":1},"ok":true}
+{"in":{"index":0},"ok":false,"path":"#/required","msg":"must have required property 'uploadId'"}
+{"in":{"uploadId":null,"index":0},"ok":false,"path":"#/properties/uploadId/type","msg":"must be string"}
+{"in":{"uploadId":123,"index":0},"ok":false,"path":"#/properties/uploadId/type","msg":"must be string"}
+{"in":{"uploadId":true,"index":0},"ok":false,"path":"#/properties/uploadId/type","msg":"must be string"}
+{"in":{"uploadId":[],"index":0},"ok":false,"path":"#/properties/uploadId/type","msg":"must be string"}
+{"in":{"uploadId":"","index":0},"ok":false,"path":"#/properties/uploadId/minLength","msg":"must NOT have fewer than 1 characters"}
+{"in":{"uploadId":"a","index":0},"ok":true}
+{"in":{"uploadId":"😀","index":0},"ok":true}
+{"in":{"uploadId":"x-y","index":0},"ok":true}
+{"in":{"uploadId":"hello"},"ok":false,"path":"#/required","msg":"must have required property 'index'"}
+{"in":{"uploadId":"hello","index":null},"ok":false,"path":"#/properties/index/type","msg":"must be integer"}
+{"in":{"uploadId":"hello","index":1.5},"ok":false,"path":"#/properties/index/type","msg":"must be integer"}
+{"in":{"uploadId":"hello","index":10.0},"ok":true}
+{"in":{"uploadId":"hello","index":1e1},"ok":true}
+{"in":{"uploadId":"hello","index":1e400},"ok":false,"path":"#/properties/index/type","msg":"must be integer"}
+{"in":{"uploadId":"hello","index":-0},"ok":true}
+{"in":{"uploadId":"hello","index":"1"},"ok":false,"path":"#/properties/index/type","msg":"must be integer"}
+{"in":{"uploadId":"hello","index":true},"ok":false,"path":"#/properties/index/type","msg":"must be integer"}
+{"in":{"uploadId":"hello","index":-1},"ok":false,"path":"#/properties/index/minimum","msg":"must be >= 0"}
+{"in":{"uploadId":"hello","index":-0.5},"ok":false,"path":"#/properties/index/type","msg":"must be integer"}
+{"in":{"uploadId":"hello","index":0.0},"ok":true}
+{"in":{"uploadId":{"bad":1},"index":{"bad":1}},"ok":false,"path":"#/properties/uploadId/type","msg":"must be string"}
+{"in":{"index":{"bad":1}},"ok":false,"path":"#/required","msg":"must have required property 'uploadId'"}
 {"ep":"drive/files/create-chunked/finish"}
 {"in":{"uploadId":"abc123"},"ok":true}
 {"in":{},"ok":false,"path":"#/required","msg":"must have required property 'uploadId'"}
@@ -3638,6 +3671,115 @@
 {"in":{"federationStatus":""},"ok":false,"path":"#/properties/federationStatus/enum","msg":"must be equal to one of the allowed values"}
 {"in":{"federationStatus":"x-y"},"ok":false,"path":"#/properties/federationStatus/enum","msg":"must be equal to one of the allowed values"}
 {"in":{"federationStatus":{"bad":1}},"ok":false,"path":"#/properties/federationStatus/type","msg":"must be string"}
+{"ep":"reversi/claim-time-is-up"}
+{"in":{"gameId":"abc123"},"ok":true}
+{"in":{},"ok":false,"path":"#/required","msg":"must have required property 'gameId'"}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"gameId":"abc123","unknownProperty":1},"ok":true}
+{"in":{"gameId":null},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":123},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":true},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":[]},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":""},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"x-y"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"ABC"},"ok":true}
+{"in":{"gameId":"0"},"ok":true}
+{"in":{"gameId":"a_b"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"a-b"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"a b"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":" abc"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc\n"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"日本"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"ａｂｃ"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc\u0000"},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":{"bad":1}},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"ep":"reversi/put-stone"}
+{"in":{"gameId":"abc123","pos":0},"ok":true}
+{"in":{},"ok":false,"path":"#/required","msg":"must have required property 'gameId'"}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"gameId":"abc123","pos":0,"unknownProperty":1},"ok":true}
+{"in":{"pos":0},"ok":false,"path":"#/required","msg":"must have required property 'gameId'"}
+{"in":{"gameId":null,"pos":0},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":123,"pos":0},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":true,"pos":0},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":[],"pos":0},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":"","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"x-y","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"ABC","pos":0},"ok":true}
+{"in":{"gameId":"0","pos":0},"ok":true}
+{"in":{"gameId":"a_b","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"a-b","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"a b","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":" abc","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc\n","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"日本","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"ａｂｃ","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc\u0000","pos":0},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc123"},"ok":false,"path":"#/required","msg":"must have required property 'pos'"}
+{"in":{"gameId":"abc123","pos":null},"ok":false,"path":"#/properties/pos/type","msg":"must be integer"}
+{"in":{"gameId":"abc123","pos":1.5},"ok":false,"path":"#/properties/pos/type","msg":"must be integer"}
+{"in":{"gameId":"abc123","pos":10.0},"ok":true}
+{"in":{"gameId":"abc123","pos":1e1},"ok":true}
+{"in":{"gameId":"abc123","pos":1e400},"ok":false,"path":"#/properties/pos/type","msg":"must be integer"}
+{"in":{"gameId":"abc123","pos":-0},"ok":true}
+{"in":{"gameId":"abc123","pos":"1"},"ok":false,"path":"#/properties/pos/type","msg":"must be integer"}
+{"in":{"gameId":"abc123","pos":true},"ok":false,"path":"#/properties/pos/type","msg":"must be integer"}
+{"in":{"gameId":"abc123","pos":-1},"ok":false,"path":"#/properties/pos/minimum","msg":"must be >= 0"}
+{"in":{"gameId":"abc123","pos":-0.5},"ok":false,"path":"#/properties/pos/type","msg":"must be integer"}
+{"in":{"gameId":"abc123","pos":0.0},"ok":true}
+{"in":{"gameId":"abc123","pos":0,"id":null},"ok":false,"path":"#/properties/id/type","msg":"must be string"}
+{"in":{"gameId":"abc123","pos":0,"id":123},"ok":false,"path":"#/properties/id/type","msg":"must be string"}
+{"in":{"gameId":"abc123","pos":0,"id":true},"ok":false,"path":"#/properties/id/type","msg":"must be string"}
+{"in":{"gameId":"abc123","pos":0,"id":[]},"ok":false,"path":"#/properties/id/type","msg":"must be string"}
+{"in":{"gameId":"abc123","pos":0,"id":""},"ok":true}
+{"in":{"gameId":"abc123","pos":0,"id":"x-y"},"ok":true}
+{"in":{"gameId":"abc123","pos":0,"id":"hello"},"ok":true}
+{"in":{"gameId":{"bad":1},"pos":{"bad":1}},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":"abc123","pos":{"bad":1},"id":{"bad":1}},"ok":false,"path":"#/properties/pos/type","msg":"must be integer"}
+{"in":{"id":{"bad":1}},"ok":false,"path":"#/required","msg":"must have required property 'gameId'"}
+{"ep":"reversi/ready"}
+{"in":{"gameId":"abc123","ready":false},"ok":true}
+{"in":{},"ok":false,"path":"#/required","msg":"must have required property 'gameId'"}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"gameId":"abc123","ready":false,"unknownProperty":1},"ok":true}
+{"in":{"ready":false},"ok":false,"path":"#/required","msg":"must have required property 'gameId'"}
+{"in":{"gameId":null,"ready":false},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":123,"ready":false},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":true,"ready":false},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":[],"ready":false},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"gameId":"","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"x-y","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"ABC","ready":false},"ok":true}
+{"in":{"gameId":"0","ready":false},"ok":true}
+{"in":{"gameId":"a_b","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"a-b","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"a b","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":" abc","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc\n","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"日本","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"ａｂｃ","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc\u0000","ready":false},"ok":false,"path":"#/properties/gameId/format","msg":"must match format \"misskey:id\""}
+{"in":{"gameId":"abc123"},"ok":false,"path":"#/required","msg":"must have required property 'ready'"}
+{"in":{"gameId":"abc123","ready":null},"ok":false,"path":"#/properties/ready/type","msg":"must be boolean"}
+{"in":{"gameId":"abc123","ready":0},"ok":false,"path":"#/properties/ready/type","msg":"must be boolean"}
+{"in":{"gameId":"abc123","ready":"true"},"ok":false,"path":"#/properties/ready/type","msg":"must be boolean"}
+{"in":{"gameId":{"bad":1},"ready":{"bad":1}},"ok":false,"path":"#/properties/gameId/type","msg":"must be string"}
+{"in":{"ready":{"bad":1}},"ok":false,"path":"#/required","msg":"must have required property 'gameId'"}
 {"ep":"roles/assignment-show"}
 {"in":{"roleId":"abc123"},"ok":true}
 {"in":{},"ok":false,"path":"#/required","msg":"must have required property 'roleId'"}

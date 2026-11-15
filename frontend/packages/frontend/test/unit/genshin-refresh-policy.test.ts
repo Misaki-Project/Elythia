@@ -65,7 +65,7 @@ describe('原神の取得間隔ポリシーの管理画面配線', () => {
 		expect(levelForm).toContain('normalizeRefreshRanges();');
 	});
 	it('日本語ラベルと説明を生成localeにも含める', () => {
-		const source = read('locales/ja-JP.yml');
+		const source = read('locales-elythia/ja-JP.yml');
 		const generated = read('packages/i18n/src/autogen/locale.ts');
 		for (const suffix of ['', '_caption']) {
 			expect(source).toContain(`${key}${suffix}:`);

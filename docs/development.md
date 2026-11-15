@@ -62,7 +62,7 @@ make dev
 | `make check` | `fmt` → `lint` → `actionlint` → `golangci-lint` → `test`。コミット前に必須 |
 | `make gates` | 静的 parity ゲートを一括実行 (内訳は下の「静的 parity ゲート」表) |
 | `make version` | Elythia / 互換 Misskey / 追従している本家 (`UPSTREAM_MISSKEY_VERSION`) のバージョンを表示 |
-| `make frontend-check` | `frontend/` の型チェック (`vue-tsc --noEmit`)、**`frontend/` のソースを読むゲート**、**eslint** (#2906)。ビルド成果物を作らないので安全。ゲートは `frontend/` を本体で追跡するようになった (#3379) ので skip せず `make test` でも走るが、frontend を触ったときに手元でまとめて回せるよう、ここにも残している。**vitest は入っていない** (`make frontend-test`)。CI に同名の job はもう無く、CI では `frontend` workflow (`.github/workflows/frontend.yml`) が型・eslint・vitest・`emoji-regex-check` などを回す。同梱サンプル入りの統合バイナリの build は required の `build` job にある (#3379) |
+| `make frontend-check` | `frontend/` の型チェック (`vue-tsc --noEmit`)、**`frontend/` のソースを読むゲート**、`emoji-regex-check` (#3324)、Elythia のファイルが `misskey-js` を直接 import していないかの検査 (#4028)、ja-JP の語が en-US にもあるかの検査 (#4047)、全ルートの Playwright の spec への対応付け (`playwright-route-check`、#4035)、設定のページの `prefer.model` のキーの Playwright の設定の表への対応付け (`playwright-settings-check`、#4056)、管理画面の `admin/update-meta` のキーとロールのポリシーのキーの Playwright の管理画面の表への対応付け (`playwright-admin-settings-check`、#4066)、**eslint** (#2906)。ビルド成果物を作らないので安全。ゲートは `frontend/` を本体で追跡するようになった (#3379) ので skip せず `make test` でも走るが、frontend を触ったときに手元でまとめて回せるよう、ここにも残している。**vitest は入っていない** (`make frontend-test`)。CI に同名の job はもう無く、CI では `frontend` workflow (`.github/workflows/frontend.yml`) が型・eslint・vitest・`emoji-regex-check` などを回す。同梱サンプル入りの統合バイナリの build は required の `build` job にある (#3379) |
 | `make diff-check` | 差分比較ハーネスを作り直して実行 (クリーン DB 前提のため) |
 | `make playwright-check` | Playwright を作り直して実行 (同上) |
 | `make e2e-down-all` | 検証用スタックを一括撤去。**本番 project `mk` は対象外** |
@@ -137,13 +137,20 @@ cd mk && docker compose up -d
 | `make actionlint` | GitHub Actions の workflow を検査 (式の typo・存在しない `needs` 参照・`runs-on` の誤り・`run:` の中のシェルを shellcheck 経由で)。**CodeQL の `actions` とは別物** — あちらは script injection などのセキュリティを見るが、式が壊れているかは見ない。`lint` job から `make` 経由で呼ぶので、版の定義は Makefile に 1 つだけ置く |
 | `make test` | `go test ./... -v -race -count=1 -shuffle=3` (CI と同じテスト実行条件。PostgreSQL が要る → [testing.md](testing.md)) |
 | `make test-fast` | `-race` 抜き (反復用)。**コミット前の検査ではない** — CI で落ちるものが手元で緑になる |
+| `make upgrade-test` `upgrade-down` | 前のリリースで作ったDBを、今のコードが引き継げるかを確かめる(`UPGRADE_FROM`、[testing.md](testing.md#前のリリースからの更新-4123)) |
+| `make schemathesis-test` `schemathesis-down` | `/api.json`の宣言から入力を作り、全エンドポイントへ送る(`SCHEMATHESIS_MAX_EXAMPLES` / `SCHEMATHESIS_ARGS`、[testing.md](testing.md#apijson-から入力を作る検査-4118)) |
+| `make fuzz` | 画像デコーダ以外の fuzz (`FUZZTIME` / `FUZZ` / `FUZZPARALLEL`、[testing.md](testing.md#fuzz-4116)) |
 | `make fuzz-imagedecode` | 画像デコーダの fuzz (`FUZZTIME` / `FUZZ` / `FUZZPARALLEL`)。デコーダの依存を上げたら回す ([testing.md](testing.md#画像デコーダの-fuzz-3480)) |
 | `make frontend-test` | fork frontend の vitest (#2844) |
 | `make plugin-vet` | 同梱プラグインを`go vet` + 既定無効を検査（CIの`build` jobの2 step相当） |
 | `make plugin-test` | 同梱プラグインのテスト (別 module なので `./...` に含まれない) |
 | `make plugin-doc-check` | `docs/plugins/authoring.md` の Go スニペットが実際にコンパイルできるか |
 | `make emoji-regex-check` | `make emoji-regex` の生成物と snapshot (正規表現と mfm-js / emoji-data の版) が、`frontend/` の `@elythia-network/mfm` から作り直したものと一致するか。node_modules が要るので `make gates` には入れず、手元では `make frontend-check` から、CI では `frontend` workflow の `frontend-lint` job から呼ばれる (#3324) |
-| `make frontend-lint` | fork frontend の eslint。CI `frontend` workflow の `frontend-lint` job の eslint step のうち frontend の分と同じで、範囲は `package.json` の script が持つ (`--quiet "src/**/*.{ts,vue}"`)。`make frontend-check` から呼ばれる (#2906)。実測 55 秒 |
+| `make route-coverage` | テストの層のアクセスログか `route-hits.json` を集計し、どの `/api` のエンドポイントが 2xx・3xx で通ったかを Markdown で出す (#4037)。`ROUTE_INPUTS` (必須、`.json` は集計済みとして足す)、`ROUTE_LAYER`、`ROUTE_OUT` (集計を JSON で書く)、`ROUTE_REQUIRE` (2xx で通っていなければ落とすエンドポイント、既定 `notes/create`)。`ROUTE_FLAGS` には `-gate -layers <層,...>` (`uncovered.tsv` との突き合わせ、#4039) か `-layers <層,...> -write-uncovered <パス>` (`uncovered.tsv` を作り直す。リダイレクトで書かない) を渡す。CI の `upstream-backend-e2e`・`playwright`・`diff-e2e` の `API coverage` job が使う。読み方は [ci.md](ci.md#api-の通過の集計-4037) |
+| `make playwright-route-check` | frontend の全ルート (`router.definition.ts` の `ROUTE_DEF`) が、Playwright の spec の宣言 (`coversRoutes`) か、許可リスト・保留のリストのどれかに載っているか。`tests/playwright` の node_modules が要るので `make gates` には入れず、手元では `make frontend-check` から、CI では `frontend` workflow の `frontend-lint` job から呼ばれる (#4035)。書き方は [playwright.md](playwright.md#ルートと-spec-の対応付け-4035) |
+| `make playwright-settings-check` | 設定のページ (`pages/settings/*.vue`) の `prefer.model` のキーが、Playwright の設定の表の宣言 (`coversPrefs`) か、許可リスト (`tests/playwright/settings-coverage-allowlist.tsv`) に載っているか (#4056)。`playwright-route-check` と同じく、`make frontend-check` と CI の `frontend` workflow から回す |
+| `make playwright-admin-settings-check` | 管理画面 (`pages/admin/*.vue` と `pages/instance-info.vue`) が `admin/update-meta` で書くキーと、ロールのポリシーの編集画面 (`roles.policy-editor.vue`) のキーが、Playwright の管理画面の表の宣言 (`coversMeta` / `coversPolicies`) か、許可リスト (`tests/playwright/admin-settings-coverage-allowlist.tsv`) に載っているか (#4066)。`playwright-settings-check` と同じく、`make frontend-check` と CI の `frontend` workflow から回す |
+| `make frontend-lint` | fork frontend の eslint。CI `frontend` workflow の `frontend-lint` job の eslint step のうち frontend と frontend-embed の分と同じで、範囲は `package.json` の script が持つ (`--quiet "src/**/*.{ts,vue}" "public/loader/*.js"`。起動画面のスクリプトを含める、#3954)。`make frontend-check` から呼ばれる (#2906)。実測 70 秒 (#3954 で frontend-embed を足す前は 55 秒) |
 | `make frontend-test` | fork frontend の vitest (`test/unit/**/*.test.ts`)。CI `frontend` workflow の `frontend-test` job の frontend unit tests step と同じ |
 | `make plugin-dev` | プラグインを編集しながら動かす (`PLUGIN=plugins/status`) |
 
@@ -194,7 +201,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 |---|---|
 | `make shapecheck` | レスポンス形状の drift。`make shapecheck-gen` で golden snapshot を再生成、`make shapecheck-report` でレポート出力 |
 | `make errorid-check` | error id / HTTP status / kind の drift。id gate は **`internal/server` に inline endpoint が復活したら落とす** (#2791 で全 14 件を `internal/api` へ移設済み。closure は gate から漏れる) |
-| `make perm-check` | router middleware の権限が Misskey 本家より緩くないか (アクセス階層 / `secure` の双方向 / OAuth scope の 3 本)。あわせて、`allowGet`のGETのrouteと`cacheSec`の`Cache-Control`の表が本家と一致するかも見る |
+| `make perm-check` | router middleware の権限が Misskey 本家より緩くないか (アクセス階層 / `secure` の双方向 / OAuth scope / ロールのpolicyの 4 本)。あわせて、`allowGet`のGETのrouteと`cacheSec`の`Cache-Control`の表が本家と一致するかも見る |
 | `make wiring-check` | router / server で配線しないと効かないもの (FTT のトグル、global な security header、プラグイン peer の本文上限 / rate limit / catchall / 専用キュー / enqueuer、Web Push の producer 配線、chart management の logger を配線時に解決する形、ドライブ使用量の集計と route (#3053)、IP 履歴の記録 3 本 (#3103)、IP からの関連アカウント検索の repository と route (#3104)、`criticalWiringCount` の実数照合) が外れていないか。判定は AST 照合なので `//` でも `/* */` でも落ちる (#2856)。**既知の限界**: `if cond { ... }` の条件付き配線、未参照の関数の中に置かれた同じ配線、`e := e.Group(...)` のようにレシーバを同名でシャドウする形は素通りする |
 | `make catalog-check` | `pg_indexes` 等のシステムカタログのクエリが `schemaname` で絞られているか (#2777)、`indexdef` / `pg_get_indexdef` を WHERE に書いていないか (#3365)。`FROM` / `JOIN` / カンマで並べた FROM、`pg_catalog.` の修飾、引用符で囲んだ名前を拾う。判定は文字列リテラル単位で、葉がすべて文字列の `+` の連結はつないでから見る (変数を挟む連結はつながず、リテラルごとに判定する。GORM の builder は見ない)。`migration/` の SQL は、コメントを外し、引用符の外の `;` で文に分けて、文ごとに判定する (#3369。テストでは各パッケージの schema に並行して流れるため。DO ブロックの本体の中も文ごとに分ける)。`E'...'` の `\'` とドル引用 (`$$...$$`、`$tag$...$tag$`) は PostgreSQL と同じに読み、直前が `DO` / `AS` のドル引用だけを本体として中まで読む。閉じのタグは直前の文字に関係なく閉じる (`END$$` も閉じる)。ただし本体の中の文字列・コメント・引用符付き識別子に現れたタグでは閉じないので、そこだけは PostgreSQL より遅く閉じる (PostgreSQL はそこで閉じて構文エラーになるので、差が出るのは適用できない SQL だけ)。単一引用符で書いた関数の本体 (`AS '...'`) は文字列として扱い、中を 1 つの文として見る (既知の限界。今の migration には無い)。引用符・ドル引用・ブロックコメントが閉じていないファイルは、取りこぼさないようそれ自体を違反として落とす。`-- unscoped:` は、その文の `;` より前に書いたときだけ効く (`;` の後ろの同じ行に書いた注記は、どの文にも効かない)。#3365 の検査は最初の `WHERE` より後ろに語として出るかだけを見るので、`JOIN ... ON` や `WHERE` の無い `HAVING` に書いた形は拾わず、逆に `ORDER BY` で読む安全な形も落とす。**CTE や副問い合わせで定義に別名を付け (`indexdef AS d`)、外側の `WHERE` で比べる形も拾わない**が、これは安全な形ではない (PG18 の実測で、`MATERIALIZED` でない CTE と副問い合わせはインライン化され、`pg_get_indexdef` の条件が index の pg_class の scan の Filter まで押し下げられる)。Go のソースでは、カンマの後の `pg_indexes` は SQL の外 (地の文、コメント、文字列) でも拾う (migration はコメントを外してから見るので、コメントの中は拾わない)。落ちたら SELECT 句で読み、並べ替えや絞り込みは Go の側で行う (migration では、定義を `array_agg` などで配列に読み切ってから比べる。`000068` が例。`MATERIALIZED` を付けた CTE も、絞った後に読む形になる。ただしゲートは `MATERIALIZED` の有無を見ない) |
 | `make notfound-check` | repository の lookup error を種別を見ずに 4xx にしている箇所を検出する (#2792)。**allowlist は件数で持つ** — key が `<file>:<func>` なので、同じ関数に足しても key が変わらない。増えたら新規流入、減ったら陳腐化として落ちる。**既知の限界**: **lookup が別ブロックに hoist されている形は射程外** — lookup と `if` のペアリングは「同じブロック内の後続 3 文」で見るので、`goroutine` に切り出して結果を外側の変数へ書く形 (`note_create_service.go` の reply / renote 先取得) は距離ではなくブロックが違うため掛からない。`lookupIfLookahead` を広げても増えない / **service 呼び出しの潰しは射程外** — `h.svc.Show(...)` の err を種別を見ずに 4xx にする形は api / core どちらの述語にも掛からない (lookup メソッドの呼び出ししか見ないため)。数え方: gate の `condChecksErrNonNil` / `bodyReturns4xx` をレシーバが `*svc` / `*Service` の `Show` / `Get` / `Find` / `Resolve` / `Fetch` / `Lookup` / `Require` 呼び出しに向け直して `internal/api` + `internal/server` + `internal/activitypub` を走査すると **29 件** (`ap/handler.go` 7 / `following/*` 7 / `users/*` 5 / `channels/*` 5 / `flash` 2 / `clips` 2 / ほか)。**AP の 404 はリモートに「消えた」と解釈されうる**。`notes/state` / `notes/conversation` / `antennas/show` の 3 件は #2799 で潰した / **重複チェックを DB 障害で skip する形も射程外** — `if dup, err := repo.Find(...); err == nil && dup != nil` は err を握り潰しているので `condMentionsErr` に掛からない。接続断のあいだ重複が作られる。**DB 側の backstop は無い** — 例えば `sw_subscription` に unique index は無く (`000020` が張るのは非 unique、`000068` がそれも落とす)、重複行は恒久的に残って web push が二重配信される。#2792 は handler 側の guard で塞いだだけなので、そこを外すと再発する。signup / page / reaction / poll などにも同じ形が残る / 同じ関数で 1 件直して 1 件足すと件数が変わらず素通りする / 4xx 以外への潰し (204 を返す `invite/handler.go:Delete` など) と `x, _ := repo.Find(...)` の握り潰しは対象外 / lookup メソッド名が `Find` で始まらず `Get` でもないもの (`metaRepo.Fetch()` など) は射程外 / 4xx を返すのが `if` の外や `else` 側にある形、`return h.notFound(c)` のような自前ヘルパー、`switch { case err != nil: ... }` も対象外。`internal/server` の該当は現在 0 件 (非テストの `internal/server/**` で `.Find*(` が 35、`.Get(` を足して 55。うち gate の述語に掛かったのは 2 件で、それも潰した) |
@@ -221,6 +228,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 |---|---|---|
 | `make playwright-up` `playwright-test` `playwright-down` `playwright-logs` | Elythia backend に対する Playwright spec | — |
 | `make playwright-ts-up` `playwright-ts-test` `playwright-ts-down` | 同じ spec を Misskey TS backend に対して実行し、drop-in 互換を担保する | — |
+| `make playwright-backup-up` `playwright-backup-test` `playwright-backup-down` | バックアップの取得・検証・戻す操作の spec を、デーモン付きの専用のスタックで実行する (#4102) | [Playwright e2e](playwright.md#独自の-api-の応答の照合-4093) |
 | `make diff-up` `diff-test` `diff-down` `diff-logs` | Elythia と TS に同一リクエストを投げてレスポンスを値レベルで diff | [差分比較ハーネス](diff-e2e.md) |
 | `make dropin-up` `dropin-test` `dropin-down` `dropin-logs` | TS 2 インスタンスの federation smoke | [Drop-in e2e](dropin-e2e.md) |
 | `make dropin-mk-up` `dropin-mk-test` `dropin-mk-down` `dropin-mk-logs` | 上記の backend を Elythia に差し替えた overlay | 同上 |
@@ -332,7 +340,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 - **golangci-lint** (`make golangci-lint`) — errcheck / govet / ineffassign / staticcheck
 
 #### frontendジョブ (`.github/workflows/frontend.yml`)
-- `ci.yml`ではなく別のworkflowにあり、pathsで絞らずに毎回起動する。`changes`ジョブが差分からfrontendに関係する変更か (`frontend/`・`plugins/`・`plugin/`・`tools/pluginbuild/`・`tools/emojiregex/`・workflow自身・`Makefile`・`go.mod` / `go.sum`。リネームは移動元と移動先の両方を見る) を判定し、関係なければ`frontend-lint` / `frontend-test`をskipする
+- `ci.yml`ではなく別のworkflowにあり、pathsで絞らずに毎回起動する。`changes`ジョブが差分からfrontendに関係する変更か (`frontend/`・`plugins/`・`plugin/`・`tools/pluginbuild/`・`tools/emojiregex/`・`tests/playwright/`・workflow自身・`Makefile`・`go.mod` / `go.sum`。リネームは移動元と移動先の両方を見る) を判定し、関係なければ`frontend-lint` / `frontend-test`をskipする
 - `frontend`ジョブは`if: always()`で両者を束ねる集約ジョブ。関係しない差分では成功し、関係する差分では両方の成功を要求する。`changes`が落ちたら失敗する
 - 中身と手元での再現は[ci.md](ci.md)にある。手元用の`make frontend-check`は残っているが、CIの同名ジョブは#3379で無くなった
 
@@ -345,7 +353,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 | `vulncheck` | CI | 依存・Go stdlib の**到達可能な**既知脆弱性 + Go version の pin 整合 |
 | `plugin-tests` | CI | 同梱プラグインのテスト (別 module なので `go list ./...` に入らない) |
 | `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない) |
-| `spec (Elythia 1/4)` 〜 `4/4` | Playwright | ブラウザからの統合互換。TS backend での実行は `workflow_dispatch` のみ |
+| `spec (Elythia 1/11)` 〜 `11/11`、`spec (Elythia backup/1)` | Playwright | ブラウザからの統合互換。`backup/1` はバックアップの spec を専用のスタックで流す (#4102)。TS backend での実行は `workflow_dispatch` のみ |
 | `e2e (1/4)` 〜 `4/4` | Upstream backend e2e | 本家の backend e2e が Elythia に対して通るか |
 | `diff` | Diff e2e | Elythia と TS の**レスポンスの値**が一致するか |
 | `swap-test` / `elythia-born` / `ed25519-verify` / `federation` / `federation-mastodon` | Drop-in e2e | 切替・TS へ戻す経路の測定・Ed25519・実連合 (Misskey TS / Mastodon) の 5 シナリオ |
@@ -472,11 +480,11 @@ make federation-mastodon-e2e # 本物の Mastodon と引用の承認 (FEP-044f) 
 make diff-check              # Elythia と TS のレスポンスを値レベルで diff (#2078)
 make playwright-check        # Playwright を作り直して実行
 make frontend-check          # frontend/ の型チェック + frontend/ を読むゲート + eslint
-make frontend-lint           # eslint だけ (CI と同じ範囲、実測 55 秒)
+make frontend-lint           # eslint だけ (CI と同じ範囲、実測 70 秒)
 make e2e-down-all            # 検証用スタックを一括撤去 (**本番 project `mk` は対象外**)
 ```
 
-**上記は全体ではない。** `make help` が全 150 target を出す (`^名前:.*##` の行を数えた)。一覧と説明は
+**上記は全体ではない。** `make help` が全 165 target を出す (`^名前:.*##` の行を数えた)。一覧と説明は
 このファイルの上の節、CI 上の対応は [docs/ci.md](ci.md)。
 
 エントリポイント：

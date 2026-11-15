@@ -85,13 +85,20 @@ func (h *Handler) Users(c echo.Context) error {
 	if h.userRepo == nil || req.host == "" {
 		return c.JSON(http.StatusOK, []any{})
 	}
-	users, err := h.userRepo.ListUsers(model.UserListFilter{
+	filter := model.UserListFilter{
 		Origin:   "remote",
 		Hostname: req.host,
 		Limit:    req.limit,
 		SinceID:  req.sinceID,
 		UntilID:  req.untilID,
-	})
+	}
+	// カーソルが無いときは、本家の makePaginationQuery と同じく新しい順 (id の降順)
+	// に返す (#3369)。ListUsers は Sort もカーソルも無いと古い順に並べる。
+	// カーソルがあるときは ListUsers が Sort を無視して paginationOrder で並べる。
+	if req.sinceID == "" && req.untilID == "" {
+		filter.Sort = "+createdAt"
+	}
+	users, err := h.userRepo.ListUsers(filter)
 	if err != nil {
 		return apierr.JSONInternalError(c)
 	}
@@ -206,7 +213,7 @@ func parseHostPage(c echo.Context) (hostPageRequest, bool) {
 	// sinceDate / untilDate を aidx prefix に正規化して cursor 値に落とす
 	// (#1732、upstream makePaginationQuery 互換)。
 	// **列に入らないカーソルもここで ok=false にする (#3025)。**
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return req, false
 	}

@@ -5,7 +5,6 @@
 import type { PageRegistration } from '@/plugin-api.js';
 
 export const gameRankingsPath = '/game-rankings';
-export const gameRankingLabels: Record<string, string> = { genshin: '原神', hsr: 'スターレイル' };
 
 export function isGameRankingPage(page: PageRegistration): boolean {
 	return !page.admin && (page.plugin === 'genshin' || page.plugin === 'hsr') && page.path === '/rankings';

@@ -1,0 +1,4 @@
+{
+	"extends": "../../../frontend/packages/frontend/tsconfig.json",
+	"include": ["./**/*.ts", "./**/*.vue", "../../../frontend/packages/frontend/@types/**/*.ts", "../../../frontend/packages/frontend/src/**/*.d.ts"]
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -645,9 +647,9 @@ func TestLocalSandbox(t *testing.T) {
 
 func TestVerifyReportsFsckDriftAsWarning(t *testing.T) {
 	e := getVerifyEnv(t)
-	// notesCount を実際の件数 (0) とずらしたユーザーを置く。元の DB にあるずれで、
+	// followersCount を実際の件数 (0) とずらしたユーザーを置く。元の DB にあるずれで、
 	// バックアップの欠陥ではないので、段は通して警告に残す。
-	require.NoError(t, e.db.Exec(`INSERT INTO "user" (id, username, "usernameLower", "avatarDecorations", "notesCount") VALUES ('verifydrift1', 'drift', 'drift', '[]', 5)`).Error)
+	require.NoError(t, e.db.Exec(`INSERT INTO "user" (id, username, "usernameLower", "avatarDecorations", "followersCount") VALUES ('verifydrift1', 'drift', 'drift', '[]', 5)`).Error)
 	t.Cleanup(func() { require.NoError(t, e.db.Exec(`DELETE FROM "user" WHERE id = 'verifydrift1'`).Error) })
 	dump := e.dump(t)
 	s := newMemStorage()
@@ -734,9 +736,11 @@ func TestVerifyGenerationsTakenByTake(t *testing.T) {
 	require.NoError(t, err)
 	closeGorm(gdb)
 	// CountRows が扱う形 (拡張、別の schema と引用の要る名前、分割表) を、
-	// Elythia の schema に足す。
+	// Elythia の schema に足す。pg_stat_statements は、Elythia が起動のときに
+	// 作ることがある (#3909)。作るのに読み込みは要らない (view を読むときに要る)。
 	p.exec(t,
 		`CREATE EXTENSION pg_trgm`,
+		`CREATE EXTENSION pg_stat_statements`,
 		`CREATE SCHEMA other`,
 		`CREATE TABLE other."Weird Name" (x int)`,
 		`INSERT INTO other."Weird Name" VALUES (1), (2), (3)`,
@@ -775,6 +779,9 @@ func TestVerifyGenerationsTakenByTake(t *testing.T) {
 			require.NoError(t, err)
 			// 前提: 拡張と locale が記録され、verify がそれを使う経路を通る。
 			require.True(t, slices.ContainsFunc(meta.Extensions, func(x ExtensionInfo) bool { return x.Name == "pg_trgm" }), "%+v", meta.Extensions)
+			// pg_stat_statements は dump に入れない (TestTake_LeavesPgStatStatementsOut)。
+			// 入っている DB からでも、確かめる処理は通る。
+			require.False(t, slices.ContainsFunc(meta.Extensions, func(x ExtensionInfo) bool { return x.Name == "pg_stat_statements" }), "%+v", meta.Extensions)
 			require.NotEmpty(t, meta.DatabaseLocale.Collate)
 			require.Equal(t, int64(3), meta.RowCounts[`other.Weird Name`])
 			require.Equal(t, tc.encrypt, meta.Encrypted)
@@ -1251,6 +1258,24 @@ func TestVerifySandboxSpaceCheck(t *testing.T) {
 // That is a defect of the generation and is recorded in verify.json.
 func TestVerifyDetectsDumpThatDoesNotRestore(t *testing.T) {
 	e := getVerifyEnv(t)
+	damaged := damagedDump(t, e)
+	meta := plainMeta(damaged)
+	meta.RowCounts = map[string]int64{"public.big": 100000}
+	s := newMemStorage()
+	putGeneration(t, s, meta, damaged)
+
+	res, err := Verify(context.Background(), s, testGenID, e.opts())
+	require.NoError(t, err)
+	requireFailedAt(t, res, StageRestorable, "pg_restore failed")
+	assert.Equal(t, res, readVerifyJSON(t, s, testGenID))
+	e.sandbox.assertNoLeftovers(t)
+}
+
+// damagedDump returns a dump whose TOC is intact (pg_restore --list passes)
+// but whose table data is damaged, so that only the restore fails. The
+// table is public.big with 100000 rows.
+func damagedDump(t *testing.T, e *verifyEnv) []byte {
+	t.Helper()
 	// 表のデータが dump の大半を占めるようにし、真ん中を壊せばデータの塊に当たるようにする。
 	p := newDatabase(t)
 	p.exec(t,
@@ -1265,16 +1290,95 @@ func TestVerifyDetectsDumpThatDoesNotRestore(t *testing.T) {
 	for i := len(damaged) * 45 / 100; i < len(damaged)*55/100; i++ {
 		damaged[i] ^= 0x5a
 	}
-	meta := plainMeta(damaged)
-	meta.RowCounts = map[string]int64{"public.big": 100000}
-	s := newMemStorage()
-	putGeneration(t, s, meta, damaged)
+	return damaged
+}
 
-	res, err := Verify(context.Background(), s, testGenID, e.opts())
-	require.NoError(t, err)
-	requireFailedAt(t, res, StageRestorable, "pg_restore failed")
-	assert.Equal(t, res, readVerifyJSON(t, s, testGenID))
-	e.sandbox.assertNoLeftovers(t)
+// TestVerifyTreatsRestoreFailureFromNewerServerAsEnvironment: when pg_restore
+// rejects a dump taken from a newer PostgreSQL server than the throwaway one,
+// verification could not judge the generation, so it is an environment error
+// and verify.json is not written (#4152). A dump from a newer server that
+// restores is judged as usual, and a rejected dump from the same version is a
+// defect of the generation.
+func TestVerifyTreatsRestoreFailureFromNewerServerAsEnvironment(t *testing.T) {
+	e := getVerifyEnv(t)
+	// 使い捨てのサーバーは取ったDBと同じコンテナで動くので、版も同じ
+	var num int
+	var version string
+	require.NoError(t, e.db.Raw("SELECT current_setting('server_version_num')::int, current_setting('server_version')").Row().Scan(&num, &version))
+	newer := fmt.Sprint(num + 1)
+
+	t.Run("newer server, rejected", func(t *testing.T) {
+		damaged := damagedDump(t, e)
+		meta := plainMeta(damaged)
+		meta.RowCounts = map[string]int64{"public.big": 100000}
+		meta.PostgresVersionNum, meta.PostgresVersion = num+1, newer
+		s := newMemStorage()
+		putGeneration(t, s, meta, damaged)
+
+		res, err := Verify(context.Background(), s, testGenID, e.opts())
+		require.ErrorContains(t, err, "pg_restore rejected the dump (details in the log), which was taken from PostgreSQL "+newer+", newer than the throwaway server ("+version+")")
+		// 環境の誤りは daemon の失敗の通知で外へ送られるので、pg_restore の誤りの文面を入れない
+		assert.NotContains(t, err.Error(), "pg_restore failed")
+		var se *stageError
+		assert.False(t, errors.As(err, &se), "an environment error must not carry a stage failure")
+		assert.False(t, res.OK)
+		assert.NotContains(t, s.objects, Key(testGenID, VerifyFile))
+		e.sandbox.assertNoLeftovers(t)
+	})
+
+	t.Run("newer server, restored", func(t *testing.T) {
+		dump := e.dump(t)
+		meta := e.buildMeta(t, testGenID, dump, e.bundled.Core, false)
+		meta.PostgresVersionNum, meta.PostgresVersion = num+1, newer
+		s := newMemStorage()
+		putGeneration(t, s, meta, dump)
+
+		res, err := Verify(context.Background(), s, testGenID, e.opts())
+		require.NoError(t, err)
+		assert.True(t, res.OK)
+		e.sandbox.assertNoLeftovers(t)
+	})
+
+	t.Run("same server, rejected", func(t *testing.T) {
+		damaged := damagedDump(t, e)
+		meta := plainMeta(damaged)
+		meta.RowCounts = map[string]int64{"public.big": 100000}
+		meta.PostgresVersionNum, meta.PostgresVersion = num, version
+		s := newMemStorage()
+		putGeneration(t, s, meta, damaged)
+
+		res, err := Verify(context.Background(), s, testGenID, e.opts())
+		require.NoError(t, err)
+		requireFailedAt(t, res, StageRestorable, "pg_restore failed")
+		e.sandbox.assertNoLeftovers(t)
+	})
+}
+
+// errRow is a pgx.Row whose Scan fails.
+type errRow struct{ err error }
+
+func (r errRow) Scan(...any) error { return r.err }
+
+// errQueryer is a Queryer whose queries fail.
+type errQueryer struct{ err error }
+
+func (q errQueryer) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, q.err }
+
+func (q errQueryer) QueryRow(context.Context, string, ...any) pgx.Row { return errRow(q) }
+
+// TestOlderServerErrorWhenVersionUnreadable: when the version of the throwaway
+// server cannot be read after pg_restore failed, the generation cannot be
+// judged, so it is an environment error. A meta.json without the version is
+// not checked and does not query the server.
+func TestOlderServerErrorWhenVersionUnreadable(t *testing.T) {
+	q := errQueryer{err: errors.New("conn closed")}
+
+	err := olderServerError(context.Background(), q, Meta{PostgresVersionNum: 180007})
+	require.ErrorContains(t, err, "the version of the throwaway server could not be read: conn closed")
+	var se *stageError
+	assert.False(t, errors.As(err, &se))
+
+	assert.NoError(t, olderServerError(context.Background(), q, Meta{}))
 }
 
 func TestCreateStagingIsPrivate(t *testing.T) {

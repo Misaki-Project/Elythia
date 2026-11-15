@@ -123,18 +123,31 @@ var ErrConflictingKeys = errors.New("activitypub: conflicting json-ld keys")
 // Returns ErrConflictingKeys if two source keys collapse to the same canonical
 // name with different values.
 func Normalize(body []byte) ([]byte, error) {
+	normalized, _, err := NormalizeDecoded(body)
+	return normalized, err
+}
+
+// NormalizeDecoded is Normalize that also returns body as encoding/json decoded
+// it into an `any`, before normalization. Normalization builds new values and
+// never modifies the decoded one, so callers may inspect it as the raw body
+// (decoded is nil when body is empty or err is non-nil).
+func NormalizeDecoded(body []byte) (normalized []byte, decoded any, err error) {
 	if len(body) == 0 {
-		return body, nil
+		return body, nil, nil
 	}
 	var raw any
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	normalized, err := normalizeValue(raw)
+	out, err := normalizeValue(raw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return json.Marshal(normalized)
+	normalized, err = json.Marshal(out)
+	if err != nil {
+		return nil, nil, err
+	}
+	return normalized, raw, nil
 }
 
 // setCanonical writes one canonical key, refusing a second source key that
@@ -230,6 +243,18 @@ func normalizeValue(v any) (any, error) {
 	}
 }
 
+// isTermLocalName reports whether the part of a key after the AS or security
+// IRI can be a term of the vocabulary.
+//
+// `#@type` (JSON-LD の予約語) や `#https://www.w3.org/ns/activitystreams#actor`
+// (IRI がもう一度続く) を短縮すると、出力に予約語や IRI のキーが残り、もう一度
+// 正規化すると type・id・actor に変わる。正規化が冪等でなくなり、正規化した本文を
+// 外へ送る経路 (Accept に入れる Follow) では、受け取った側に送り手の書いていない
+// actor が現れる (#4116 の fuzz)。そうした名前はキーのまま残す。
+func isTermLocalName(local string) bool {
+	return local != "" && !strings.ContainsAny(local, "@:/#")
+}
+
 // canonicalKey resolves a JSON property name to its canonical short form.
 // 戻り値の bool は「マッピングが見つかったか」を示す。
 func canonicalKey(k string) (string, bool) {
@@ -237,13 +262,14 @@ func canonicalKey(k string) (string, bool) {
 		return v, true
 	}
 	// AS IRI の直記述 ("https://www.w3.org/ns/activitystreams#type") を短縮。
-	if local, ok := strings.CutPrefix(k, asPrefix); ok && local != "" {
+	// 語彙の語でない名前は短縮しない (isTermLocalName)。
+	if local, ok := strings.CutPrefix(k, asPrefix); ok && isTermLocalName(local) {
 		if v, ok := canonicalTerms[local]; ok {
 			return v, true
 		}
 		return local, true
 	}
-	if local, ok := strings.CutPrefix(k, secPrefix); ok && local != "" {
+	if local, ok := strings.CutPrefix(k, secPrefix); ok && isTermLocalName(local) {
 		if v, ok := canonicalTerms["sec:"+local]; ok {
 			return v, true
 		}

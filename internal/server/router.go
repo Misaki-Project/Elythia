@@ -70,6 +70,7 @@ import (
 	coretranslate "github.com/elythia-network/elythia/internal/core/translate"
 	coretwofactor "github.com/elythia-network/elythia/internal/core/twofactor"
 	coreurlpreview "github.com/elythia-network/elythia/internal/core/urlpreview"
+	coreuser "github.com/elythia-network/elythia/internal/core/user"
 	"github.com/elythia-network/elythia/internal/core/userpack"
 	corewebhook "github.com/elythia-network/elythia/internal/core/webhook"
 	corewebpush "github.com/elythia-network/elythia/internal/core/webpush"
@@ -576,6 +577,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// local 限定にする upstream 互換 remap (#1064) のため、自 hostname を
 	// Service に渡す。空文字なら remap は "." 一致のみになる。
 	userService.SetSelfHostname(s.config.Hostname)
+	// meUpdated の movedTo / alsoKnownAs を /api/i と同じく利用者の ID に解決する (#4059)
+	userService.SetMoveTargetResolver(coreuser.NewMoveTargetResolver(userRepo, activitypub.NewURLBuilder(s.config.URL).LocalUserIDFromURI))
 	followingService.SetRelationReloadPublisher(relationReloadPublisher)
 	followingService.SetMainStreamPublisher(mainStreamPublisher)
 	followingService.SetChartHook(chartHooks)
@@ -677,13 +680,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// roleAssigned 通知 (#1559): local public role 割当時に発火し、entity 側で
 	// read 時に packed role へ解決する。lookup は role 削除済なら (nil,false)。
 	roleService.SetRoleAssignNotifier(notificationHook)
-	roleNotifLookup := func(roleID string) (map[string]any, bool) {
-		r, err := roleRepo.FindByID(roleID)
-		if err != nil || r == nil {
-			return nil, false
-		}
-		return entity.PackRole(r, roleService.CountAssignedUsers(roleID), idGen, corerole.DefaultPolicies()), true
-	}
+	roleNotifLookup := newRoleNotifLookup(roleRepo, roleService, idGen)
 	// abuseReport 通知の現在の状態を read 時に引く (#2868)。通知は作成時点しか
 	// 持たないので、他のモデレーターが対処しても通知欄は「未対応」のまま残る。
 	// 通報が消えていれば通知ごと drop する (roleAssigned と同じ形)。
@@ -1107,6 +1104,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 連合 inbox 経由の invite 受信時にも local 被招待者の reversi stream に
 	// `invited` を push する (#417 P2: リアルタイム招待)。
 	federationProcessor.SetReversiStreamPublisher(reversiPublisher)
+	// instance actor に見せなかった Announce の対象を、actor をフォローして
+	// いるローカルの利用者の鍵で取り直す (#3916)。連合に出していない利用者の鍵は
+	// 使わない (coreSvcs.localFederation で判定)。
+	federationProcessor.SetFollowerFetchKeys(corefederation.NewLocalFollowerKeys(followingRepo, userRepo, keypairRepo, blockingRepo,
+		apURLs, coreSvcs.localFederation))
 
 	// users/show 経由で host が指定されたリモートユーザーをローカル DB に
 	// キャッシュが無くても解決できるようにする (#269)。webfinger で actor URI
@@ -1241,8 +1243,17 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	noteDeliveryHook.SetQuoteOutbox(quoteOutbox)
 	federationProcessor.SetQuoteAnswerHandler(quoteOutbox)
 	apRenderer.SetQuoteApprovalResolver(quoteOutbox.ApprovalURI)
-	// 保留のまま残った QuoteRequest を毎分確かめて送り直す (#3238)。
+	// 保留のまま残った QuoteRequest を、予定の時刻のジョブで確かめて送り直す (#3238)。
+	// 予定を書くたびにその時刻のジョブを積む (#3994。以前は毎分の cron、今は 2 分ごとの
+	// 保険)。期限の前に走ったジョブ (管理画面の promote) は、期限の時刻に積み直す。
+	if s.queueClient != nil {
+		quoteOutbox.SetResendScheduler(s.queueClient)
+		archiveAnnouncementsProc.SetScheduler(s.queueClient)
+	}
 	resendQuoteRequestsProcessor := processors.NewResendQuoteRequestsProcessor(quoteOutbox)
+	if s.queueClient != nil {
+		resendQuoteRequestsProcessor.SetRequeuer(s.queueClient)
+	}
 	// ブロックした相手の引用に出していた承認を取り消す (#3234 段階 4)。
 	blockingService.SetQuoteRevoker(corefederation.NewQuoteRevoker(quoteAuthorizationRepo, userRepo, noteRepo,
 		quoteRequestDeliveryHook, noteDeliveryHook, apURLs))
@@ -1460,9 +1471,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// gateが利用者を戻す。
 	api.Use(middleware.HideAppUserWithoutRead())
 	// 本家のparamDefで引数を検証する。本家かElythiaの宣言のあるendpointは、
-	// テストのモードでだけ登録するreset-dbを除いてすべて本家と同じ400で拒否し
-	// (#3742、#3890で宣言から決める形にした。paramEnforcedEndpoints)、reset-dbでは
-	// 応答を変えずに、handlerと判定が分かれた件数を数える(#3677)。検証そのものは
+	// テストのモードでだけ登録するreset-dbを除いてすべて本家と同じ400で拒否する
+	// (#3742、#3890で宣言から決める形にした。paramEnforcedEndpoints)。検証そのものは
 	// routeのmiddlewareの末尾(withParamShadow)で走る。
 	if mw := s.paramShadowMiddleware(); mw != nil {
 		api.Use(mw)
@@ -1494,7 +1504,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// Frontend SPA shell — AP resource handlers fall back to this when the
 	// request prefers HTML over application/activity+json, and the final
 	// catch-all route at the bottom of RegisterRoutes uses the same handler.
-	frontend := frontendHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector)
+	frontend := frontendHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector, adRepo)
 
 	// URL preview endpoint
 	//
@@ -1710,6 +1720,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 下で setter を呼び、recordCriticalWiring が起動時に入れ忘れを見ていた。
 	//   - noteHider と entityPacker: 投稿を返すときに、閲覧者の見てはいけない中身を
 	//     隠し、メディアの URL をプロキシへ書き換える (#3786 / #3790)
+	//   - noteFieldResolver: 上で作った共通の resolver。添付ファイル・リアクション・
+	//     投票・チャンネルを埋める。handler の中で作り直すと、ここで付けた lookup が
+	//     抜ける (#4044)
 	//   - roleService: LocalTimeline / GlobalTimeline / HybridTimeline で
 	//     ltlAvailable / gtlAvailable role policy を gate する (#1026)。匿名 viewer に
 	//     対しては GetUserPolicies("") が base policies を返すので、admin が
@@ -1732,7 +1745,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	//   - followingRepo: HTL の「返信先が followers 限定の投稿」ガード (upstream
 	//     timeline.ts の noteFilter)
 	notesHandler := notes.NewHandler(noteRepo, noteCreateService, noteDeleteService, noteQueryService, timelineService, reactionService, pollService, searchService, idGen,
-		noteHider, entityPacker, roleService, func() string { return metaUGCVisibility(metaRepo) },
+		noteHider, entityPacker, noteFieldResolver, roleService, func() string { return metaUGCVisibility(metaRepo) },
 		driveFileRepo, metaRepo, blockingRepo, mutingRepo, renoteMutingRepo, channelMutingRepo, followingRepo)
 	notesHandler.SetLocalFederationObserver(coreSvcs.localFederation)
 	notesHandler.SetPiningRepo(piningRepo)
@@ -1749,7 +1762,6 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	}
 	notesHandler.SetPollRepo(pollRepo)                     // #1538: polls/recommendation
 	notesHandler.SetThreadMutingRepo(noteThreadMutingRepo) // #1538: thread-muting write
-	notesHandler.SetNoteReactionRepo(reactionRepo)
 	notesHandler.SetChannelRepo(channelRepo)
 	// home timeline で follow 中 channel の note を含める (#1686)。
 	notesHandler.SetChannelFollowingRepo(channelFollowingRepo)
@@ -1758,7 +1770,6 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	notesHandler.SetInstanceRepo(instanceRepo)
 	notesHandler.SetEmojiRepo(emojiRepo)
 	notesHandler.SetReactionReader(reactionCountWriter)
-	notesHandler.SetDriveFolderRepo(driveFolderRepo)
 	notesHandler.SetUserRepo(userRepo)
 	notesHandler.SetModeratorChecker(roleService) // #1538: moderator note delete
 	notesHandler.SetUserListRepo(userListRepo)
@@ -2089,6 +2100,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		userRepo:                userRepo,
 		noteRepo:                noteRepo,
 		metaRepo:                metaRepo,
+		instanceRepo:            instanceRepo,
 		followingRepo:           followingRepo,
 		followRequestRepo:       followRequestRepo,
 		userRelationRepo:        userRelationRepo,
@@ -2121,6 +2133,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		sigCapBuffer:            sigCapBuffer,
 		rateLimiter:             rateLimiter,
 		setupDetector:           setupDetector,
+		adRepo:                  adRepo,
 		chunkedUploadCapability: chunkedUploadCapability,
 		frontend:                frontend,
 		streamRevokePublisher:   streamRevokePublisher,
@@ -2248,6 +2261,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		keypairExtraRepo:             keypairExtraRepo,
 		instanceRepo:                 instanceRepo,
 		antennaRepo:                  antennaRepo,
+		pollVoteRepo:                 pollVoteRepo,
 		clipRepo:                     clipRepo,
 		userListRepo:                 userListRepo,
 		reversiRepo:                  reversiRepo,
@@ -2353,6 +2367,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	)
 	checkModeratorsActivityProcessor := processors.NewCheckModeratorsActivityProcessor(modActivitySvc)
 
+	// 日次のcleanが、相手がリモートの未開始の対局を消すときに相手へ知らせる(#3956)。
+	// 配送の一式(SetFederationDelivererなど)は下のreversi/*の配線でServiceに入る。
+	// 渡すのはポインタなので順番は問わないが、processorへのsetterは登録より前に置く。
+	cleanGenericProcessor.SetOutdatedFederatedGameCanceler(reversiService)
+
 	// queue の handler の登録 (#3690)。組み込みの job 種別とそれを受ける processor の
 	// 対応は builtinQueueHandlers (wiring_queue.go) の一覧にだけ書き、ここで 1 回
 	// 登録する。登録は driver の map に入れるだけで、読まれるのは queueServer.Start
@@ -2407,6 +2426,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	announcementHandler := apiannouncements.NewHandler(announcementRepo, idGen, entityPacker) // #3796
 	announcementHandler.SetMainStreamPublisher(mainStreamPublisher)
 	announcementHandler.SetBroadcastPublisher(broadcastPublisher) // global announcementCreated (#2056)
+	// 自動アーカイブの期限の時刻にジョブを積む (#3994)。queueClient が nil のまま
+	// interface に入れると nil にならないので分ける。
+	if s.queueClient != nil {
+		announcementHandler.SetArchiveScheduler(s.queueClient)
+	}
 
 	// 管理画面の API と、DB のバックアップの管理画面 (#3901 で関数へ移した。呼ぶ位置と
 	// 中の文の順は元のまま。作った handler と service は同じ名前で受ける)。
@@ -2499,6 +2523,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	reversiHandler.SetService(reversiService)
 	reversiHandler.SetFederation(s.config.URL, deliverService, reversiFedCache, userRepo)
 	reversiHandler.SetStreamPublisher(reversiPublisher)
+	// 招待が受けられたら、招待した人の reversi stream に matched を流す (#3946)。
+	// 連合の Join も Service を通るので、包んで流す役 (Handler) を Service に渡す
+	reversiService.SetMatchedNotifier(reversiHandler)
 	// #417 P3: reversi 連合対応ホストのみ Invite を送る。Federation check
 	// 用の HTTP client は SSRF-safe transport + timeout を明示的に渡す
 	// (既存の webfingerClient と同じ設定を流用)。
@@ -2694,6 +2721,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	}); d != nil {
 		notificationHook.SetCreatedObserver(d)
 		chatService.SetMessageObserver(d)
+		// リバーシの招待と対局の進み (#3942)。どちらも通知を作らないので、招待を
+		// 作る所 (API と連合の受信) と対局の stream に出す所から直に呼ぶ。
+		reversiService.SetGameObserver(d)
+		reversiHandler.SetInviteObserver(d)
+		federationProcessor.SetReversiInviteObserver(d)
 	}
 	// 消したプラグインのデータが残っていないかを知らせる (#2479)。
 	// 自動では消さないので、残っていること自体を見えるようにする。
@@ -2713,6 +2745,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 実装が出揃うまで pass-through にしている。実装漏れは warn ログで検知する。
 	api.Any("/*", apiCatchall)
 
+	// clear-browser-cache — 本家が endpoint の仕組みの外で fastify.all に直接
+	// 登録する route (ApiServerService.ts)。どのメソッドでも受け、GET と POST
+	// 以外は handler が 405 を返す。endpoint ではないので、本文の検査
+	// (apiRoutes の requireObjectBody) と引数の検証を通さない (#3926)。
+	api.Any("/clear-browser-cache", meta.ClearBrowserCache)
+
 	// フロントエンドの配信と SPA の catchall (#3901 で関数へ移した。呼ぶ位置と中の文の順は
 	// 元のまま。プラグインの準備に失敗したときの return より後)。
 	s.wireFrontendRoutes(frontendRoutesDeps{
@@ -2725,6 +2763,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		proxyAccountResolver:    proxyAccountResolver,
 		localHost:               localHost,
 		setupDetector:           setupDetector,
+		adRepo:                  adRepo,
 		chunkedUploadCapability: chunkedUploadCapability,
 		frontend:                frontend,
 		notesHandler:            notesHandler,
@@ -2834,6 +2873,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		webPushNotePacker: webPushNotePacker,
 		webPushUserPacker: webPushUserPacker,
 		noteFieldResolver: noteFieldResolver,
+
+		proxyService:   proxyService,
+		proxyAllowlist: coreSvcs.proxyAllowlist,
 	}
 	s.recordCriticalWiring([]criticalWiring{
 		// 投稿を包む部品の Packer (#3790)。無い部品はリモートのメディアの URL を生のまま出す。
@@ -2866,6 +2908,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"共有 packer で組む一覧 (federation・following・roles・admin) の pinnedNotes などが空、movedTo / alsoKnownAs が null のまま返る"},
 		{"following.blockingChecker", followingService.HasBlockingChecker(),
 			"ブロック関係を無視してフォローが成立する (自分がブロックした相手・自分をブロックしている相手の両方。後者は inbox の Follow も通す)"},
+		{"following.followingEstablisher", followingService.HasFollowingEstablisher(),
+			"フォローの行の作成・削除と、申請の削除・カウントの増減が別々に書かれ、途中で失敗するとフォローの行だけが残る (再試行も既にフォロー済みで止まる)、承認で申請だけが消える、解除で行だけが消えてカウントと配送が欠ける (#3911、#3369)"},
 	})
 }
 

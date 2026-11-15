@@ -25,7 +25,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				-->
 				<!-- mk-go: 受け付けていないときは招待制と出さない (#3186)。招待コードも使えないので。 -->
 				<MkInfo v-if="registrationClosed" warn>{{ i18n.ts._mkgoRegistration.closedNotice }}</MkInfo>
-				<MkInfo v-else-if="approvalRequiredForSignup" warn>このサーバーの登録は承認制です。申請すると管理者が確認し、承認されると登録できます。</MkInfo>
+				<MkInfo v-else-if="approvalRequiredForSignup" warn>{{ i18n.ts._mkgoSignupApplication.approvalRequiredNotice }}</MkInfo>
 				<MkInfo v-else-if="instance.disableRegistration" warn>{{ i18n.ts.invitationRequiredToRegister }}</MkInfo>
 				<MkInfo v-if="instance.federation === 'specified'" warn>{{ i18n.ts.federationSpecified }}</MkInfo>
 				<MkInfo v-else-if="instance.federation === 'none'" warn>{{ i18n.ts.federationDisabled }}</MkInfo>
@@ -37,7 +37,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</div>
 		</div>
 	</div>
-	<div v-if="stats && instance.clientOptions.showActivitiesForVisitor !== false" :class="$style.stats">
+	<div v-if="stats && instance.clientOptions.showActivitiesForVisitor !== false" :class="$style.stats" data-testid="visitor-stats">
 		<div :class="[$style.statsItem, $style.panel]">
 			<div :class="$style.statsItemLabel">{{ i18n.ts.users }}</div>
 			<div :class="$style.statsItemCount"><MkNumber :value="stats.originalUsersCount"/></div>
@@ -49,11 +49,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 	</div>
 	<div v-if="instance.policies.ltlAvailable && instance.clientOptions.showTimelineForVisitor !== false" :class="[$style.tl, $style.panel]">
 		<div :class="$style.tlHeader">{{ i18n.ts.letsLookAtTimeline }}</div>
-		<div :class="$style.tlBody">
+		<div :class="$style.tlBody" data-testid="visitor-timeline">
 			<MkStreamingNotesTimeline src="local"/>
 		</div>
 	</div>
-	<div v-if="instance.clientOptions.showActivitiesForVisitor !== false" :class="$style.panel">
+	<div v-if="instance.clientOptions.showActivitiesForVisitor !== false" :class="$style.panel" data-testid="visitor-active-users">
 		<XActiveUsersChart/>
 	</div>
 </div>
@@ -63,7 +63,6 @@ SPDX-License-Identifier: AGPL-3.0-only
 import { defineAsyncComponent, ref } from 'vue';
 import * as Misskey from 'misskey-js';
 import { instanceName } from '@@/js/config.js';
-import type { MenuItem } from '@/types/menu.js';
 import MkButton from '@/components/MkButton.vue';
 import MkStreamingNotesTimeline from '@/components/MkStreamingNotesTimeline.vue';
 import MkInfo from '@/components/MkInfo.vue';
@@ -79,8 +78,6 @@ const registrationClosed = isRegistrationClosed();
 import MkNumber from '@/components/MkNumber.vue';
 import { openInstanceMenu } from '@/ui/_common_/common.js';
 
-// mk-go: グラフ (chart.js 一式) とダイアログ (webauthn・captcha) は、出すとき・開くときだけ読む。
-// エントランスの中のダッシュボードも、グラフが出るまで chart.js を待たなくてよい。
 const XActiveUsersChart = defineAsyncComponent(() => import('@/components/MkVisitorDashboard.ActiveUsersChart.vue'));
 
 const stats = ref<Misskey.entities.StatsResponse | null>(null);
@@ -91,16 +88,16 @@ if (instance.clientOptions.showActivitiesForVisitor !== false) {
 	});
 }
 
-function signin() {
-	const { dispose } = os.popup(defineAsyncComponent(() => import('@/components/MkSigninDialog.vue')), {
+async function signin() {
+	const { dispose } = await os.popupAsyncWithDialog(import('@/components/MkSigninDialog.vue').then((x) => x.default), {
 		autoSet: true,
 	}, {
 		closed: () => dispose(),
 	});
 }
 
-function signup() {
-	const { dispose } = os.popup(defineAsyncComponent(() => import('@/components/MkSignupDialog.vue')), {
+async function signup() {
+	const { dispose } = await os.popupAsyncWithDialog(import('@/components/MkSignupDialog.vue').then((x) => x.default), {
 		autoSet: true,
 	}, {
 		closed: () => dispose(),

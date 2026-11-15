@@ -17,50 +17,59 @@ SPDX-License-Identifier: AGPL-3.0-only
 			<MkInfo v-if="registrationClosed" warn>{{ i18n.ts._mkgoRegistration.closedNotice }}</MkInfo>
 			<MkInfo v-if="fatal" warn>{{ fatal }}</MkInfo>
 
+			<!--
+				承認制でないサーバーでは、申請も照会もできない (どちらの API も 503 を返す)。
+				フォームを出すと準備 (form-token) が失敗するので、案内だけを出す (#4101)。
+				登録を閉じているときは上の案内と重なるので出さない。
+			-->
+			<template v-if="!approvalRequired">
+				<MkInfo v-if="!registrationClosed" data-testid="signup-application-not-approval">{{ i18n.ts._mkgoRegistration.approvalNotEnabled }}</MkInfo>
+			</template>
+
 			<!-- 申請直後: コードを 1 度だけ見せる -->
-			<template v-if="issuedCode">
+			<template v-else-if="issuedCode">
 				<MkInfo warn>
-					<div><b>このコードを控えてください。</b>二度と表示されません。</div>
-					<div>登録の状況を確認したり、承認後に登録したりするのに必要です。失くした場合は申請し直してください。</div>
+					<div><b>{{ i18n.ts._mkgoSignupApplication.saveCodeTitle }}</b>{{ i18n.ts._mkgoSignupApplication.saveCodeNotShownAgain }}</div>
+					<div>{{ i18n.ts._mkgoSignupApplication.saveCodeDescription }}</div>
 				</MkInfo>
-				<MkInput v-model="issuedCode" readonly>
-					<template #label>クレームコード</template>
+				<MkInput v-model="issuedCode" readonly data-testid="signup-application-issued-code">
+					<template #label>{{ i18n.ts._mkgoSignupApplication.claimCode }}</template>
 				</MkInput>
-				<MkButton primary rounded @click="beginLookup">
-					<i class="ti ti-check"></i> 控えました
+				<MkButton primary rounded data-testid="signup-application-ack" @click="beginLookup">
+					<i class="ti ti-check"></i> {{ i18n.ts._mkgoSignupApplication.savedCode }}
 				</MkButton>
 			</template>
 
 			<!-- 確認メールを送った -->
 			<template v-else-if="confirmationSent">
-				<MkInfo>{{ emailAddress }} に確認メールを送りました。リンクを開くと登録が完了します。</MkInfo>
+				<MkInfo>{{ i18n.tsx._mkgoSignupApplication.confirmationSent({ email: emailAddress }) }}</MkInfo>
 				<div :class="$style.note">
-					届かない場合は迷惑メールを確認してください。アドレスを間違えた場合は、同じクレームコードでもう一度登録してください。<b>やり直すと前のリンクは無効になります。</b>
+					{{ i18n.ts._mkgoSignupApplication.confirmationNotArrived }}<b>{{ i18n.ts._mkgoSignupApplication.confirmationLinkInvalidated }}</b>
 				</div>
 				<MkButton rounded @click="confirmationSent = false">
-					<i class="ti ti-arrow-back"></i> 登録の入力に戻る
+					<i class="ti ti-arrow-back"></i> {{ i18n.ts._mkgoSignupApplication.backToRegistration }}
 				</MkButton>
 			</template>
 
 			<!-- 申請の状態を表示 -->
 			<template v-else-if="application">
 				<template v-if="application.status === 'pending'">
-					<MkInfo>申請を受け付けました。審査までしばらくお待ちください。</MkInfo>
+					<MkInfo data-testid="signup-application-status" data-status="pending">{{ i18n.ts._mkgoSignupApplication.pending }}</MkInfo>
 					<div :class="$style.note">
-						結果はこのページでコードを入力すると確認できます。
-						<template v-if="application.expiresAt">
-							この申請は<MkTime :time="application.expiresAt" mode="detail"/>まで有効です。
-						</template>
+						{{ i18n.ts._mkgoSignupApplication.checkResultWithCode }}
+						<I18n v-if="application.expiresAt" :src="i18n.ts._mkgoSignupApplication.validUntil">
+							<template #time><MkTime :time="application.expiresAt" mode="detail"/></template>
+						</I18n>
 					</div>
 					<MkButton rounded :disabled="busy" @click="refresh">
-						<i class="ti ti-refresh"></i> 状態を確認する
+						<i class="ti ti-refresh"></i> {{ i18n.ts._mkgoSignupApplication.checkStatus }}
 					</MkButton>
 				</template>
 
 				<template v-else-if="application.status === 'approved'">
-					<MkInfo>申請が承認されました。アカウントを作成してください。</MkInfo>
+					<MkInfo data-testid="signup-application-status" data-status="approved">{{ i18n.ts._mkgoSignupApplication.approved }}</MkInfo>
 
-					<MkInput v-model="username" :disabled="busy" pattern="^[a-zA-Z0-9_]+$">
+					<MkInput v-model="username" :disabled="busy" pattern="^[a-zA-Z0-9_]+$" data-testid="signup-application-username">
 						<template #label>{{ i18n.ts.username }}</template>
 						<template #prefix>@</template>
 						<template v-if="usernameError" #caption>
@@ -71,42 +80,42 @@ SPDX-License-Identifier: AGPL-3.0-only
 							</span>
 						</template>
 					</MkInput>
-					<MkInput v-model="password" type="password" :disabled="busy">
+					<MkInput v-model="password" type="password" :disabled="busy" data-testid="signup-application-password">
 						<template #label>{{ i18n.ts.password }}</template>
 						<template #prefix><i class="ti ti-lock"></i></template>
 					</MkInput>
 					<MkInput v-if="emailRequired" v-model="emailAddress" type="email" :disabled="busy">
 						<template #label>{{ i18n.ts.emailAddress }}</template>
 						<template #prefix><i class="ti ti-mail"></i></template>
-						<template #caption>確認メールを送ります。リンクを開くと登録が完了します。</template>
+						<template #caption>{{ i18n.ts._mkgoSignupApplication.emailConfirmationCaption }}</template>
 					</MkInput>
 
-					<MkButton primary rounded :disabled="busy || username === '' || usernameError != null || password === '' || (emailRequired && emailAddress === '')" @click="register">
+					<MkButton primary rounded :disabled="busy || username === '' || usernameError != null || password === '' || (emailRequired && emailAddress === '')" data-testid="signup-application-register" @click="register">
 						<i class="ti ti-user-plus"></i> {{ i18n.ts.signup }}
 					</MkButton>
 				</template>
 
 				<template v-else-if="application.status === 'rejected'">
-					<MkInfo warn>この申請は承認されませんでした。</MkInfo>
-					<MkButton rounded @click="restart">もう一度申請する</MkButton>
+					<MkInfo warn data-testid="signup-application-status" data-status="rejected">{{ i18n.ts._mkgoSignupApplication.rejected }}</MkInfo>
+					<MkButton rounded @click="restart">{{ i18n.ts._mkgoSignupApplication.applyAgain }}</MkButton>
 				</template>
 
 				<template v-else-if="application.status === 'expired'">
-					<MkInfo warn>申請の期限が切れました。</MkInfo>
-					<MkButton rounded @click="restart">もう一度申請する</MkButton>
+					<MkInfo warn data-testid="signup-application-status" data-status="expired">{{ i18n.ts._mkgoSignupApplication.expired }}</MkInfo>
+					<MkButton rounded @click="restart">{{ i18n.ts._mkgoSignupApplication.applyAgain }}</MkButton>
 				</template>
 
 				<template v-else-if="application.status === 'completed'">
-					<MkInfo>この申請では既に登録が完了しています。</MkInfo>
+					<MkInfo data-testid="signup-application-status" data-status="completed">{{ i18n.ts._mkgoSignupApplication.completed }}</MkInfo>
 				</template>
 			</template>
 
 			<!-- 入口: 申請する / コードで戻る -->
 			<template v-else>
 				<div class="_gaps_s">
-					<div>このサーバーの登録は承認制です。申請すると管理者が確認します。</div>
+					<div>{{ i18n.ts._mkgoSignupApplication.approvalRequired }}</div>
 					<div :class="$style.note">
-						申請するとクレームコードが 1 度だけ表示されます。<b>結果の確認と登録に必要なので、必ず控えてください。</b>
+						{{ i18n.ts._mkgoSignupApplication.codeShownOnce }}<b>{{ i18n.ts._mkgoSignupApplication.keepCode }}</b>
 					</div>
 				</div>
 
@@ -117,11 +126,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 				-->
 				<MkFolder v-if="!registrationClosed" :defaultOpen="true">
 					<template #icon><i class="ti ti-send"></i></template>
-					<template #label>申請する</template>
+					<template #label>{{ i18n.ts._mkgoSignupApplication.apply }}</template>
 
 					<div class="_gaps_m">
 						<MkInfo v-if="form.length === 0">
-							このサーバーは申請項目を設定していません。そのまま申請できます。
+							{{ i18n.ts._mkgoSignupApplication.noFormFields }}
 						</MkInfo>
 						<template v-for="(field, i) in form" :key="i">
 							<MkTextarea v-if="field.type === 'textarea'" v-model="answers[i]" :disabled="busy">
@@ -136,33 +145,33 @@ SPDX-License-Identifier: AGPL-3.0-only
 						<MkCaptcha v-if="instance.enableRecaptcha" ref="recaptcha" v-model="reCaptchaResponse" provider="recaptcha" :sitekey="instance.recaptchaSiteKey"/>
 						<MkCaptcha v-if="instance.enableTurnstile" ref="turnstile" v-model="turnstileResponse" provider="turnstile" :sitekey="instance.turnstileSiteKey"/>
 						<MkCaptcha v-if="instance.enableTestcaptcha" ref="testcaptcha" v-model="testcaptchaResponse" provider="testcaptcha" :sitekey="null"/>
-						<MkButton primary rounded :disabled="busy || waitingForForm || captchaIncomplete" @click="apply">
-							<i class="ti ti-send"></i> 申請する
+						<MkButton primary rounded :disabled="busy || waitingForForm || captchaIncomplete" data-testid="signup-application-apply" @click="apply">
+							<i class="ti ti-send"></i> {{ i18n.ts._mkgoSignupApplication.apply }}
 						</MkButton>
 						<div v-if="waitingForForm" style="font-size: 0.9em; opacity: 0.8;">
-							フォームを開いた直後は送信できません。少し待ってから送信してください。
+							{{ i18n.ts._mkgoSignupApplication.waitBeforeSubmit }}
 						</div>
 						<div v-if="formTokenFailed" class="_gaps_s">
 							<div style="font-size: 0.9em; opacity: 0.8;">
-								フォームの準備に失敗しました。そのまま送信もできますが、うまくいかない場合は読み込み直してください。
+								{{ i18n.ts._mkgoSignupApplication.formTokenFailed }}
 							</div>
 							<MkButton rounded @click="fetchFormToken">
-								<i class="ti ti-refresh"></i> 読み込み直す
+								<i class="ti ti-refresh"></i> {{ i18n.ts._mkgoSignupApplication.reload }}
 							</MkButton>
 						</div>
 					</div>
 				</MkFolder>
 
-				<MkFolder :defaultOpen="false">
+				<MkFolder :defaultOpen="false" data-testid="signup-application-lookup-folder">
 					<template #icon><i class="ti ti-key"></i></template>
-					<template #label>コードで状況を確認する</template>
+					<template #label>{{ i18n.ts._mkgoSignupApplication.lookupByCode }}</template>
 
 					<div class="_gaps_m">
-						<MkInput v-model="claimCode" :disabled="busy" @enter="refresh">
-							<template #label>クレームコード</template>
+						<MkInput v-model="claimCode" :disabled="busy" data-testid="signup-application-lookup-code" @enter="refresh">
+							<template #label>{{ i18n.ts._mkgoSignupApplication.claimCode }}</template>
 						</MkInput>
-						<MkButton rounded :disabled="busy || claimCode === ''" @click="refresh">
-							<i class="ti ti-search"></i> 確認する
+						<MkButton rounded :disabled="busy || claimCode === ''" data-testid="signup-application-lookup" @click="refresh">
+							<i class="ti ti-search"></i> {{ i18n.ts._mkgoSignupApplication.check }}
 						</MkButton>
 					</div>
 				</MkFolder>
@@ -173,7 +182,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue';
 import type * as Elythia from 'elythia-js';
 import MkButton from '@/components/MkButton.vue';
 import MkFolder from '@/components/MkFolder.vue';
@@ -212,6 +221,9 @@ const emailRequired = computed(() => instance.emailRequiredForSignup === true);
 const busy = ref(false);
 const fatal = ref<string | null>(null);
 const registrationClosed = isRegistrationClosed();
+// Elythia 独自の meta (#2556)。型は elythia-js の MetaDetailed が持つ (#3418)。
+// 端末に残った古い meta で組み上がった後に、boot の取り直しで変わりうるので追従する
+const approvalRequired = computed(() => instance.approvalRequiredForSignup === true);
 const application = ref<Elythia.SignupApplicationView | null>(null);
 // **有効な provider のトークンを全部送る (#3037 レビュー)。**
 //
@@ -275,8 +287,13 @@ async function fetchFormToken() {
 	}
 }
 
+// 承認制が有効になった時点で 1 度だけ取る (古い meta では無効のまま始まることがある)
+watch(approvalRequired, (required) => {
+	if (required && !registrationClosed && !formTokenLoaded.value) void fetchFormToken();
+});
+
 onMounted(() => {
-	if (!registrationClosed) void fetchFormToken();
+	if (approvalRequired.value && !registrationClosed) void fetchFormToken();
 	ticker = window.setInterval(() => { now.value = Date.now(); }, 500);
 });
 
@@ -349,24 +366,24 @@ function captchaParams() {
 function message(err: unknown): string {
 	const code = (err as { code?: string } | null)?.code;
 	switch (code) {
-		case 'NO_SUCH_APPLICATION': return 'そのコードの申請は見つかりませんでした。入力を確認してください。';
-		case 'NOT_APPROVED': return 'この申請はまだ承認されていません。';
-		case 'ANSWER_REQUIRED': return '必須の項目が入力されていません。';
-		case 'ANSWER_TOO_LONG': return '入力が長すぎる項目があります。';
-		case 'FORM_CHANGED': return '申請フォームが変更されました。ページを再読み込みしてやり直してください。';
-		case 'CAPTCHA_FAILED': return '認証に失敗しました。やり直してください。';
-		case 'FORM_TOKEN_INVALID': return 'フォームの有効期限が切れました。もう一度送信してください。';
-		case 'FORM_TOKEN_TOO_SOON': return '送信が早すぎます。少し待ってからもう一度送信してください。';
-		case 'DENIED_USERNAME': return 'そのユーザー名は使えません。';
-		case 'EMAIL_UNAVAILABLE': return 'そのメールアドレスは使えません。';
-		case 'UNAVAILABLE': return 'このサーバーでは承認制の登録を受け付けていません。';
+		case 'NO_SUCH_APPLICATION': return i18n.ts._mkgoSignupApplication._errors.noSuchApplication;
+		case 'NOT_APPROVED': return i18n.ts._mkgoSignupApplication._errors.notApproved;
+		case 'ANSWER_REQUIRED': return i18n.ts._mkgoSignupApplication._errors.answerRequired;
+		case 'ANSWER_TOO_LONG': return i18n.ts._mkgoSignupApplication._errors.answerTooLong;
+		case 'FORM_CHANGED': return i18n.ts._mkgoSignupApplication._errors.formChanged;
+		case 'CAPTCHA_FAILED': return i18n.ts._mkgoSignupApplication._errors.captchaFailed;
+		case 'FORM_TOKEN_INVALID': return i18n.ts._mkgoSignupApplication._errors.formTokenInvalid;
+		case 'FORM_TOKEN_TOO_SOON': return i18n.ts._mkgoSignupApplication._errors.formTokenTooSoon;
+		case 'DENIED_USERNAME': return i18n.ts._mkgoSignupApplication._errors.unusableUsername;
+		case 'EMAIL_UNAVAILABLE': return i18n.ts._mkgoSignupApplication._errors.emailUnavailable;
+		case 'UNAVAILABLE': return i18n.ts._mkgoSignupApplication._errors.unavailable;
 		case 'REGISTRATION_CLOSED': return i18n.ts._mkgoRegistration.closedNotice;
-		case 'INVALID_USERNAME': return 'そのユーザー名は使えません。';
-		case 'USED_USERNAME': return 'そのユーザー名は既に使われています。';
-		case 'USERNAME_TOO_SHORT': return `ユーザー名は${minimumUsernameLength.value}文字以上にしてください。`;
-		case 'DUPLICATED_USERNAME': return 'そのユーザー名は既に使われています。';
-		case 'PASSWORD_TOO_LONG': return 'パスワードが長すぎます。';
-		default: return '処理に失敗しました。時間をおいて試してください。';
+		case 'INVALID_USERNAME': return i18n.ts._mkgoSignupApplication._errors.unusableUsername;
+		case 'USED_USERNAME': return i18n.ts._mkgoSignupApplication._errors.usedUsername;
+		case 'USERNAME_TOO_SHORT': return i18n.tsx._mkgoSignupApplication._errors.usernameTooShort({ n: minimumUsernameLength.value });
+		case 'DUPLICATED_USERNAME': return i18n.ts._mkgoSignupApplication._errors.usedUsername;
+		case 'PASSWORD_TOO_LONG': return i18n.ts._mkgoSignupApplication._errors.passwordTooLong;
+		default: return i18n.ts._mkgoSignupApplication._errors.unknown;
 	}
 }
 
@@ -441,7 +458,7 @@ async function register() {
 			confirmationSent.value = true;
 			return;
 		}
-		await os.alert({ type: 'success', text: 'アカウントを作成しました。' });
+		await os.alert({ type: 'success', text: i18n.ts._mkgoSignupApplication.accountCreated });
 		await login(res.token);
 	} catch (err) {
 		fatal.value = message(err);
@@ -455,7 +472,7 @@ const headerActions = computed(() => []);
 const headerTabs = computed(() => []);
 
 definePage(() => ({
-	title: '登録の申請',
+	title: i18n.ts._mkgoSignupApplication.title,
 	icon: 'ti ti-user-plus',
 }));
 </script>

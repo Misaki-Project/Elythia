@@ -136,7 +136,7 @@ describe('canPurgeAccount is editable in the role policy admin UI', () => {
 describe('canPurgeAccount locale entries', () => {
 	test('ja-JP has a label and a caption under _mkgoRolePolicy', () => {
 		// ja-JP だけが手で編集する配信元。他言語を要求すると Crowdin を待つことになる。
-		const block = mkgoRolePolicyBlock(readRepoFile('locales/ja-JP.yml'));
+		const block = mkgoRolePolicyBlock(readRepoFile('locales-elythia/ja-JP.yml'));
 		for (const suffix of ['', '_caption']) {
 			expect(block, `ja-JP に _mkgoRolePolicy.${KEY}${suffix} が無い`).toMatch(
 				new RegExp(`^\\s*${KEY}${suffix}:\\s*"\\S[^"]*"\\s*$`, 'm'),

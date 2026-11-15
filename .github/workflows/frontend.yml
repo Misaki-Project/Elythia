@@ -5,7 +5,8 @@
 # 本家の運用向けのもの (docker / release / labeler など) は持ってこない。
 #
 # - frontend-lint: 10 workspace の eslint、typecheck (frontend / sw / misskey-js / elythia-js)、
-#   check-dts、SPDX ヘッダー、locale の検証、misskey-js の API レポート
+#   check-dts、SPDX ヘッダー、Elythia のファイルの import (#4028)、ルートと Playwright の spec の対応付け (#4035)、
+#   en-US の語の抜け (#4047)、locale の検証、misskey-js の API レポート
 # - frontend-test: 本番設定でのビルド、frontend の vitest、misskey-js のテスト
 # - frontend: 上の 2 つを集約する。**required check はこの名前だけ** (`test` と
 #   同じ形。job を足しても branch protection を触らずに済む、#3379)
@@ -78,6 +79,7 @@ jobs:
           # frontend のビルドが import する生成物は plugins/ から pluginbuild が作り、
           # job は make plugins-all (Makefile / go.mod) を通す。絵文字の正規表現は
           # tools/emojiregex が生成し、frontend/ の MFM の解析器と突き合わせる。
+          # tests/playwright/ は、spec の宣言と frontend のルートを突き合わせる (#4035)。
           #
           # **パイプで grep -q に渡さない。** grep -q は最初の一致で抜けるので、
           # 一覧がパイプのバッファ (約 64KiB) を超えると書き手が SIGPIPE で落ち、
@@ -89,7 +91,7 @@ jobs:
           # 切るのは、日本語などのパスが "frontend/\346..." と引用されて ^frontend/ に
           # 一致しなくなるため。
           files=$(git -c core.quotePath=false diff --no-renames --name-only "$base" HEAD)
-          if grep -qE '^(frontend/|plugins/|plugin/|tools/pluginbuild/|tools/emojiregex/|\.github/workflows/frontend\.yml$|Makefile$|go\.(mod|sum)$)' <<< "$files"; then
+          if grep -qE '^(frontend/|plugins/|plugin/|tools/pluginbuild/|tools/emojiregex/|tests/playwright/|\.github/workflows/frontend\.yml$|Makefile$|go\.(mod|sum)$)' <<< "$files"; then
             echo "frontend=true" >> "$GITHUB_OUTPUT"
           else
             echo "frontend=false" >> "$GITHUB_OUTPUT"
@@ -103,7 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: frontend/package.json
 
@@ -156,6 +158,62 @@ jobs:
       - name: SPDX headers
         run: node scripts/check-spdx.mjs --ci
 
+      - name: check-elythia-imports self test
+        run: node --test scripts/check-elythia-imports.test.mjs
+
+      # Elythia が書いたファイルは misskey-js を直接 import しない (#4028)
+      - name: Elythia imports
+        run: node scripts/check-elythia-imports.mjs
+
+      # 本家の語に Elythia の語 (frontend/locales-elythia) を重ねる処理 (#4071)
+      - name: i18n overlay self test
+        run: node --test scripts/i18n-overlay.test.mjs
+
+      - name: check-locale-coverage self test
+        run: node --test scripts/check-locale-coverage.test.mjs
+
+      # ja-JP の語は en-US にもある (#4047)。無い語は英語の UI でも日本語のまま出る
+      - name: en-US locale coverage
+        run: node scripts/check-locale-coverage.mjs
+
+      - name: check-locale-overrides self test
+        run: node --test scripts/check-locale-overrides.test.mjs
+
+      # Elythia の語が本家の語を書き換える・消すのは、一覧にあるものだけ (#4071)
+      - name: Locale overrides
+        run: node scripts/check-locale-overrides.mjs
+
+      # 本家のファイルとの比較そのものは、本家を取得する apicompat (make upstream-check) で回す
+      - name: check-locale-upstream self test
+        run: node --test scripts/check-locale-upstream.test.mjs
+
+      - name: check-hardcoded-japanese self test
+        run: node --test scripts/check-hardcoded-japanese.test.mjs
+
+      # 画面の文言を日本語で直書きしない (#4070)。英語の UI でも日本語のまま出る
+      - name: Hardcoded Japanese
+        run: node scripts/check-hardcoded-japanese.mjs
+
+      # frontend の全ルートが、どこかの Playwright spec に対応付いているか (#4035)。
+      # spec の一覧は playwright の `test --list` に解かせるので、tests/playwright の
+      # 依存を入れる (ブラウザは要らない)。frontend だけを変えた PR でも spec の書き
+      # 忘れを拾うため、playwright.yml ではなく required のこの job で回す。
+      - name: Install Playwright spec dependencies
+        working-directory: tests/playwright
+        run: npm ci --no-audit --no-fund
+
+      - name: Route coverage
+        working-directory: .
+        run: make playwright-route-check
+
+      - name: Settings coverage
+        working-directory: .
+        run: make playwright-settings-check
+
+      - name: Admin settings coverage
+        working-directory: .
+        run: make playwright-admin-settings-check
+
       - name: Verify locales
         run: pnpm --filter i18n run verify
 
@@ -177,7 +235,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: frontend/package.json
 

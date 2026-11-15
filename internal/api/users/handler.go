@@ -320,21 +320,9 @@ func (h *Handler) SetServerURL(u string) {
 // FindByURI. Used by UserDetailed.ResolveMoveTargets to fill movedTo /
 // alsoKnownAs. Returns ("", false) when unwired or unknown.
 func (h *Handler) resolveUserIDByURI(uri string) (string, bool) {
-	if h.userRepo == nil {
-		return "", false
-	}
-	if id := activitypub.NewURLBuilder(h.serverURL).LocalUserIDFromURI(uri); id != "" {
-		u, err := h.userRepo.FindByID(id)
-		if err != nil || u == nil {
-			return "", false
-		}
-		return u.ID, true
-	}
-	u, err := h.userRepo.FindByURI(uri)
-	if err == nil && u != nil {
-		return u.ID, true
-	}
-	return "", false
+	// 解決の実装は meUpdated と同じ user.NewMoveTargetResolver に寄せる。片方だけを直すと、
+	// /api/i・users/show・meUpdated の結果が食い違う (#4064)
+	return user.NewMoveTargetResolver(h.userRepo, activitypub.NewURLBuilder(h.serverURL).LocalUserIDFromURI)(uri)
 }
 
 // resolveLocalMoveTarget also accepts a restored local actor URI whose origin no
@@ -1060,12 +1048,15 @@ func (h *Handler) Following(c echo.Context) error {
 
 // jsonNoSuchUserForRelations returns the NO_SUCH_USER error with the id
 // upstream assigns to users/followers / users/following (別 id が振られている)。
+//
+// 本家のこのエラーは httpStatusCode を持たないので 400 (#3369)。404 を明示して
+// いるのは users/show だけ。
 func jsonNoSuchUserForRelations(c echo.Context, followers bool) error {
 	nsuID := "63e4aba4-4156-4e53-be25-c9559e42d71b" // users/following
 	if followers {
 		nsuID = "27fa5435-88ab-43de-9360-387de88727cd" // users/followers
 	}
-	return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_USER", "No such user.", nsuID))
+	return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", nsuID))
 }
 
 func (h *Handler) listRelations(c echo.Context, followers bool) error {
@@ -1122,7 +1113,7 @@ func (h *Handler) listRelations(c echo.Context, followers bool) error {
 		return jsonNoSuchUserForRelations(c, followers)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}

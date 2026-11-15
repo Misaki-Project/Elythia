@@ -90,7 +90,7 @@ curl -i -X POST http://localhost/api/meta -H 'Content-Type: application/json' -d
 | `Dockerfile.bundled` を専用のビルダーで (参考) | +35MB (イメージの取り込み分) | 最大 4.7GiB |
 | `deploy/uds/Dockerfile.mkgo` (`make uds-build` が `mkgo` に使うもの) を専用のビルダーで、キャッシュが空の状態から | +17MB | 最大 2.37GiB、終わった後も 405MiB |
 
-**`mkgo` だけを専用のビルダーにする理由。** 専用のビルダーは dockerd の image store を見ず、`FROM` をレジストリから引き直します。`deploy/postgres-bigm/Dockerfile` の `FROM postgres:18-alpine` は digest で固定していないので、専用のビルダーでビルドすると最初の 1 回で新しい base を取りに行き、イメージが変わります。すると次の `docker compose up -d` で本番の PostgreSQL のコンテナが作り直されます。既定のビルダーは手元の base とキャッシュを使うので、イメージは変わりません。
+**`mkgo` だけを専用のビルダーにする理由。** 専用のビルダーは dockerd の image store とキャッシュを見ず、`FROM` をレジストリから引き直します。`deploy/postgres-bigm/Dockerfile` の `FROM` は digest で固定しているので base は変わりませんが、専用のビルダーでビルドすると最初の 1 回で `RUN` の層 (`apk add` と pg_bigm のビルド) を作り直すので、イメージが変わりえます。変われば、次の `docker compose up -d` で本番の PostgreSQL のコンテナが作り直されます。既定のビルダーは手元のキャッシュを使うので、キャッシュを消していなければイメージは変わりません。
 
 - **ビルダーは消さずに止めます。** 止めればメモリは全部戻り、キャッシュはビルダーの volume に残ります。`docker buildx rm` は volume ごと消すので、キャッシュも消えます。止めたビルダーは buildx では使われていないもの (inactive) に数えられるので、`docker buildx rm --all-inactive` でも消えます
 - 最初の 1 回だけビルダーを作ります。そのビルドはキャッシュが空なので時間がかかり、`mkgo` のイメージも作り直されます
@@ -293,12 +293,21 @@ Recv-Q、または `total_connections_received` の秒単位の差分) は**測�
 で絞ったもの)。18:42:44 のものが特別だと考える根拠は無い。並べて書くと同じ
 珍しさに見えるので注意。
 
+**#3969 からは `Saving...` はログに出ない。** 同梱の `deploy/uds/valkey/valkey.conf`
+に `save ""` を足し、RDB の定期的な書き出しを止めた。AOF が有効なとき起動時に
+読むのは AOF で、RDB のファイルは使われていなかった。上の件数は変更前の記録。
+fork が無くなったわけではなく、AOF の書き直し (`Background append only file rewriting started`)
+は今のまま fork する。止まるときの RDB の書き出し (`Saving the final RDB snapshot before exiting.`)
+も無くなるので、`/data` に前からある `dump.rdb` は変更前の時点のまま更新されない。
+valkey は設定ファイルを起動時にだけ読むので、既に動いている環境に反映するには
+valkey を作り直すか、`docker exec mk-valkey-1 valkey-cli -s /run/valkey/valkey.sock config set save ""` を流す。
+
 **fsync 遅延も fork も `slowlog` では見えない。** slowlog はコマンドの実行時間
 だけを測るので、AOF flush・fork・serverCron のようなコマンド外のイベントループ
 停止は原理的に載らない。再発時に見るべきものは順に:
 
 ```
-# イベントループ停止。Saving... は定期実行なので fsync だけを見る
+# イベントループ停止。fsync の警告だけを見る (#3969 より前のログにある Saving... は定期実行)
 docker logs mk-valkey-1 | grep -i "fsync is taking too long"
 docker exec mk-valkey-1 valkey-cli -s /run/valkey/valkey.sock info persistence \
   | grep aof_delayed_fsync   # 再起動でリセットされるのでログの件数とは一致しない

@@ -502,6 +502,22 @@ func TestRoomsUpdate_WithDescription(t *testing.T) {
 	assert.Equal(t, "desc", repo.Rooms["r1"].Description)
 }
 
+// 本家の updateRoom と同じく、空文字の name・description で値を消せる。欠けた
+// 項目は変えない (#3369)。
+func TestRoomsUpdate_EmptyStringsClearAndAbsentKeeps(t *testing.T) {
+	h, repo := newTestHandler()
+	repo.Rooms["r1"] = &model.ChatRoom{ID: "r1", Name: "old", Description: "desc", OwnerID: "u1"}
+
+	rec := post(h.RoomsUpdate, `{"roomId":"r1","description":""}`, u1)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "", repo.Rooms["r1"].Description)
+	assert.Equal(t, "old", repo.Rooms["r1"].Name, "an absent name must not change")
+
+	rec = post(h.RoomsUpdate, `{"roomId":"r1","name":""}`, u1)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "", repo.Rooms["r1"].Name)
+}
+
 type mockJoinedRepo struct{ *testutil.MockChatRepository }
 
 func (m *mockJoinedRepo) ListJoinedRooms(_, _, _ string, _ int) ([]*model.ChatRoom, error) {
@@ -692,6 +708,33 @@ func TestMessagesCreate_Service_ToRoom(t *testing.T) {
 	rec := post(h.MessagesCreate, `{"text":"hi","toRoomId":"r1"}`, u1)
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Len(t, repo.Messages, 1)
+}
+
+// 本家の create-to-user は toRoomId を知らない項目として無視し、DM を送る。
+// create-to-room は toUserId を無視するので、型の違う値でも400にしない (#3369)。
+func TestMessagesCreateToUserAndToRoom_IgnoreTheOtherTarget(t *testing.T) {
+	h, repo := newHandlerWithService(t)
+	repo.Rooms["r1"] = &model.ChatRoom{ID: "r1", OwnerID: "u1"}
+
+	rec := post(h.MessagesCreateToUser, `{"text":"hi","toUserId":"u2","toRoomId":"r1"}`, u1)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Len(t, repo.Messages, 1)
+	for _, m := range repo.Messages {
+		require.NotNil(t, m.ToUserID)
+		assert.Equal(t, "u2", *m.ToUserID)
+		assert.Nil(t, m.ToRoomID, "create-to-user must not post to the room")
+	}
+
+	rec = post(h.MessagesCreateToRoom, `{"text":"hi","toRoomId":"r1","toUserId":1}`, u1)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Len(t, repo.Messages, 2)
+
+	// 宛先の項目が無ければ、もう一方があっても400。
+	rec = post(h.MessagesCreateToUser, `{"text":"hi","toRoomId":"r1"}`, u1)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	rec = post(h.MessagesCreateToRoom, `{"text":"hi","toUserId":"u2"}`, u1)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Len(t, repo.Messages, 2)
 }
 
 func TestMessagesCreate_Service_NoTarget(t *testing.T) {
@@ -1614,6 +1657,125 @@ func TestHistory_IsRead_Room(t *testing.T) {
 	assert.Equal(t, false, resp[0]["isRead"], "未読 room message は isRead=false")
 }
 
+// batchReadRepo counts the read-state lookups chat/history makes and can fail
+// the batched one (#3990)。
+type batchReadRepo struct {
+	*historyRepo
+	batchCalls, singleCalls int
+	batchErr                error
+}
+
+func (r *batchReadRepo) UnreadFromUsers(readerID string, otherIDs []string) (map[string]bool, error) {
+	r.batchCalls++
+	if r.batchErr != nil {
+		return nil, r.batchErr
+	}
+	return r.historyRepo.UnreadFromUsers(readerID, otherIDs)
+}
+
+func (r *batchReadRepo) UnreadInRooms(readerID string, roomIDs []string) (map[string]bool, error) {
+	r.batchCalls++
+	if r.batchErr != nil {
+		return nil, r.batchErr
+	}
+	return r.historyRepo.UnreadInRooms(readerID, roomIDs)
+}
+
+func (r *batchReadRepo) HasUnreadFromUser(readerID, otherID string) (bool, error) {
+	r.singleCalls++
+	return r.historyRepo.HasUnreadFromUser(readerID, otherID)
+}
+
+func (r *batchReadRepo) HasUnreadInRoom(readerID, roomID string) (bool, error) {
+	r.singleCalls++
+	return r.historyRepo.HasUnreadInRoom(readerID, roomID)
+}
+
+func historyIsReadOf(t *testing.T, h *Handler, body string) []any {
+	t.Helper()
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(post(h.History, body, u1).Body.Bytes(), &resp))
+	out := make([]any, len(resp))
+	for i, r := range resp {
+		out[i] = r["isRead"]
+	}
+	return out
+}
+
+// #3990: DM の isRead は 1 本でまとめて引き、項目ごとの相手の決め方 (自分が
+// 送った項目は宛先、自分宛ての DM と宛先の無い自分の送信は自分) は従来どおり。
+func TestHistory_IsRead_DMBatch(t *testing.T) {
+	base := testutil.NewMockChatRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	me, peer2, peer3 := u1.ID, "u2", "u3"
+	msg := func(id, from string, to *string, reads ...string) *model.ChatMessage {
+		m := &model.ChatMessage{ID: id, FromUserID: from, ToUserID: to, Reads: model.StringArray(reads), Reactions: model.StringArray{}}
+		if m.Reads == nil {
+			m.Reads = model.StringArray{}
+		}
+		base.Messages[id] = m
+		return m
+	}
+	// u2 から未読がある。
+	h1 := msg("h1", peer2, &me)
+	// u3 からは既読だけ。自分が送った未読 (u3 がまだ読んでいない) は数えない。
+	msg("x1", peer3, &me, me)
+	h2 := msg("h2", me, &peer3)
+	// 自分宛ての DM が未読。
+	h3 := msg("h3", me, &me)
+	// 宛先の無い自分の送信は、相手 = 自分として引く (自分宛ての未読があるので未読)。
+	h4 := msg("h4", me, nil)
+	hr := &historyRepo{MockChatRepository: base, userHistory: []*model.ChatMessage{h1, h2, h3, h4}}
+	br := &batchReadRepo{historyRepo: hr}
+	h := NewHandler(br, idGen, nil, nil, nil)
+
+	assert.Equal(t, []any{false, true, false, false}, historyIsReadOf(t, h, `{}`))
+	assert.Equal(t, 1, br.batchCalls, "isRead must be looked up with one query")
+	assert.Zero(t, br.singleCalls)
+
+	// 自分宛ての未読を既読にすると、自分宛てと宛先の無い項目が既読になる。
+	h3.Reads = model.StringArray{me}
+	assert.Equal(t, []any{false, true, true, true}, historyIsReadOf(t, h, `{}`))
+
+	// 失敗したら、従来どおりすべて未読扱い。
+	br.batchErr = errors.New("db down")
+	assert.Equal(t, []any{false, false, false, false}, historyIsReadOf(t, h, `{}`))
+
+	// 履歴が空なら引かない。
+	br.batchErr, br.batchCalls = nil, 0
+	hr.userHistory = nil
+	assert.Empty(t, historyIsReadOf(t, h, `{}`))
+	assert.Zero(t, br.batchCalls)
+}
+
+// #3990: room の isRead も 1 本で引く。部屋の無い項目は従来どおり既読。
+func TestHistory_IsRead_RoomBatch(t *testing.T) {
+	base := testutil.NewMockChatRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	r1, r2 := "r1", "r2"
+	base.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "u2", ToRoomID: &r1, Reads: model.StringArray{}, Reactions: model.StringArray{}}
+	base.Messages["m2"] = &model.ChatMessage{ID: "m2", FromUserID: "u2", ToRoomID: &r2, Reads: model.StringArray{u1.ID}, Reactions: model.StringArray{}}
+	// 自分の送信は、自分にとって未読ではない。
+	base.Messages["m3"] = &model.ChatMessage{ID: "m3", FromUserID: u1.ID, ToRoomID: &r2, Reads: model.StringArray{}, Reactions: model.StringArray{}}
+	noRoom := &model.ChatMessage{ID: "m4", FromUserID: "u2", Reads: model.StringArray{}, Reactions: model.StringArray{}}
+	hr := &historyRepo{MockChatRepository: base, roomHistory: []*model.ChatMessage{base.Messages["m1"], base.Messages["m3"], noRoom}}
+	br := &batchReadRepo{historyRepo: hr}
+	h := NewHandler(br, idGen, nil, nil, nil)
+
+	assert.Equal(t, []any{false, true, true}, historyIsReadOf(t, h, `{"room":true}`))
+	assert.Equal(t, 1, br.batchCalls)
+	assert.Zero(t, br.singleCalls)
+
+	br.batchErr = errors.New("db down")
+	assert.Equal(t, []any{false, false, true}, historyIsReadOf(t, h, `{"room":true}`))
+
+	// 部屋の無い項目だけなら引かない。
+	br.batchErr, br.batchCalls = nil, 0
+	hr.roomHistory = []*model.ChatMessage{noRoom}
+	assert.Equal(t, []any{true}, historyIsReadOf(t, h, `{"room":true}`))
+	assert.Zero(t, br.batchCalls)
+}
+
 // --- #1747: list endpoint pagination (limit + id cursor) ---
 
 func decodeList(t *testing.T, rec *httptest.ResponseRecorder) []map[string]any {
@@ -2136,6 +2298,30 @@ func TestAttachedChatMessages_OwnerSeesMessages(t *testing.T) {
 	assert.Len(t, out, 2)
 }
 
+// 本家の drive/files/attached-chat-messages は makePaginationQuery に日付まで渡すので、
+// ID があれば日付を捨て、sinceId だけなら昇順で返す (#3369)。
+func TestAttachedChatMessages_IDCursorDropsDateCursor(t *testing.T) {
+	h, repo, fileRepo := attachedHandler(t)
+	owner := u1.ID
+	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner}
+	at := func(year int) time.Time { return time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC) }
+	msgID := func(year int) string { return id.AidxCutoffPrefix(at(year))[:8] + "msg00001" }
+	for _, year := range []int{2020, 2021, 2022} {
+		seedFileMsg(repo, msgID(year), "f1")
+	}
+
+	body := fmt.Sprintf(`{"fileId":"f1","sinceId":%q,"untilDate":%d}`, msgID(2020), at(2020).AddDate(0, 6, 0).UnixMilli())
+	rec := post(h.AttachedChatMessages, body, u1)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var out []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
+	got := make([]any, 0, len(out))
+	for _, m := range out {
+		got = append(got, m["id"])
+	}
+	assert.Equal(t, []any{msgID(2021), msgID(2022)}, got)
+}
+
 // 本家の paramDef は整数の値を持つ小数 (1e0、10.0) を integer として通す。
 // limit の値もそのまま効く (#3839)。
 func TestAttachedChatMessages_AcceptsIntegerValuedFractions(t *testing.T) {
@@ -2186,6 +2372,34 @@ func TestAttachedChatMessages_ModeratorSeesOthersFile(t *testing.T) {
 	var out []map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
 	assert.Len(t, out, 1)
+}
+
+// 本家と同じく、moderator 以外はチャットを読めないと拒否する。本家は500だが、
+// 他の chat/* と同じ403にする。moderator は読める (#3369)。
+func TestAttachedChatMessages_ChatAvailability(t *testing.T) {
+	h, repo, fileRepo := attachedHandler(t)
+	owner := u1.ID
+	fileRepo.Files["f1"] = &model.DriveFile{ID: "f1", UserID: &owner}
+	seedFileMsg(repo, "m1", "f1")
+
+	h.SetChatAvailabilityChecker(&stubChatAvailChecker{avail: "unavailable"})
+	rec := post(h.AttachedChatMessages, `{"fileId":"f1"}`, u1)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "ROLE_PERMISSION_DENIED")
+	rec = post(h.AttachedChatMessages, `{"fileId":"f1"}`, &model.User{ID: "mod1"})
+	assert.Equal(t, http.StatusOK, rec.Code, "a moderator is not checked")
+
+	h.SetChatAvailabilityChecker(&stubChatAvailChecker{avail: "readonly"})
+	rec = post(h.AttachedChatMessages, `{"fileId":"f1"}`, u1)
+	assert.Equal(t, http.StatusOK, rec.Code, "readonly can read")
+}
+
+// 本家 attached-chat-messages.ts と同じ文言。
+func TestAttachedChatMessages_NoSuchFileMessage(t *testing.T) {
+	h, _, _ := attachedHandler(t)
+	rec := post(h.AttachedChatMessages, `{"fileId":"ghost"}`, u1)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"message":"No such file."`)
 }
 
 func TestAttachedChatMessages_MissingFileID(t *testing.T) {

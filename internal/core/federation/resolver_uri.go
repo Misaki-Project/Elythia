@@ -2,7 +2,10 @@ package federation
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -80,6 +83,45 @@ func (r *Resolver) fetchObjectWithFinalURL(uri string) ([]byte, string, error) {
 	}
 	body, err := r.fetcher.FetchObject(uri)
 	return body, "", err
+}
+
+// keyedFetcher is implemented by APFetcher: a GET signed with the given key,
+// with no unsigned fallback.
+type keyedFetcher interface {
+	FetchObjectWithFinalURLSignedBy(uri string, key *activitypub.PrivateKey) ([]byte, string, error)
+}
+
+// fetchNoteWithFinalURL fetches a note: with the instance actor's key when
+// fetchKey is nil, and otherwise signed with fetchKey, a local user's key, with
+// no unsigned fallback and no redirect to another host (#3915).
+//
+// **先に instance actor で取る。** 利用者の鍵で取るのは、instance actor での
+// 取得が見えなかったとき (retryHiddenNote) だけ。最初から利用者の鍵で取ると、
+// 取りに行くたびに相手のサーバーへ「こちらの誰が見ようとしたか」が伝わる。
+func (r *Resolver) fetchNoteWithFinalURL(uri string, fetchKey *activitypub.PrivateKey) ([]byte, string, error) {
+	if fetchKey == nil {
+		return r.fetchObjectWithFinalURL(uri)
+	}
+	kf, ok := r.fetcher.(keyedFetcher)
+	if !ok {
+		return nil, "", ErrNoSigner
+	}
+	return kf.FetchObjectWithFinalURLSignedBy(uri, fetchKey)
+}
+
+// HiddenFromInstanceActor reports whether a fetch error means the object may
+// exist but was not shown to the instance actor: 401, 403 or 404. A server that
+// decides by the signer (followers-only, specified) answers one of these.
+func HiddenFromInstanceActor(err error) bool {
+	var se *activitypub.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
+	}
+	return false
 }
 
 // FetchNoteForVerification fetches a remote Note without ingesting it and
@@ -316,7 +358,8 @@ func isDefaultPortForScheme(scheme, port string) bool {
 
 // NormalizeGateHost returns the canonical host form used by the federation
 // gates (blockedHosts / silencedHosts / federationHosts) and by `instance.host`
-// for an absolute URL string. Returns "" when the URL has no host.
+// for an absolute URL string. Returns "" when the URL has no host, or a host
+// with a colon that is not an IP literal (no connection can reach it).
 //
 // **配送側と取り込み側で同じ規則を使うための唯一の入口。** 別パッケージ
 // (`internal/queue/processors`) の inbox URL 解釈もここを通す — 規則を写すと
@@ -325,6 +368,16 @@ func NormalizeGateHost(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Hostname() == "" {
 		return ""
+	}
+	// スキームの無い `//::0` (角括弧の無い IPv6) では、Hostname() がコロンだけの
+	// 名前を返し、HostPort が角括弧で囲んで `[:]:0` を作る。その値は URL として読み
+	// 直せず、正規化し直すと別の値になる (#4116 の fuzz)。どの接続先にも当たらない
+	// ので、ホストが無いものとして扱う。スキームの付いた URL では url.Parse が先に
+	// 断るので、inbox や actor の値はこれで変わらない
+	if h := u.Hostname(); strings.Contains(h, ":") {
+		if _, err := netip.ParseAddr(h); err != nil {
+			return ""
+		}
 	}
 	return punyHostPort(u)
 }

@@ -32,6 +32,9 @@ func refuseLegacy117(dir, databaseURL string, m migrator) error {
 	if err != nil {
 		return fmt.Errorf("read core migration version: %w", err)
 	}
+	if version == 117 && dirty {
+		return fmt.Errorf("legacy core migration version 117 is dirty; refusing to guess migration history")
+	}
 	// cfgからURLを作り直さず、migratorと同じ注入済みDSN/search_pathを使う。
 	return migrationhistory.CheckLegacy117(context.Background(), dir, databaseURL, version, dirty)
 }

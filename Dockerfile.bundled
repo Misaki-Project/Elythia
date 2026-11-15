@@ -26,7 +26,7 @@
 # と揃っていることを CI の `vulncheck` job が見る。tag だけでは中身が固定されない
 # ので digest を併記する (`Dockerfile` と同じ値。更新は dependabot の `docker` が
 # digest ごと上げる)。
-FROM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS plugingen
+FROM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS plugingen
 
 # git は go mod download 時の private module fetch に使う (通常の Dockerfile と同じ)。
 # plugins/ のプラグインが private な依存を持つ場合にここで要る。
@@ -70,7 +70,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # **Node の版は frontend/.node-version と揃える。** 揃っていることを
 # internal/entitycompat の bundled_node_version_test が見る。tag だけでは中身が
 # 固定されないので digest を併記する。
-FROM --platform=$BUILDPLATFORM node:26.12.1-trixie@sha256:a98e6fda54fdbb22d4238054cca9a2a113bcd1191c09193a535aae22f400aa8e AS frontend
+FROM --platform=$BUILDPLATFORM node:26.13.1-trixie@sha256:e18c3ccdf7d71619990b0e85639f506e2028a95410999cab24cc373cbd10e0ac AS frontend
 
 # frontend / sw / i18n / misskey-js など 7 パッケージが NODE_ENV を見ており、
 # production でないと minify されず _DEV_ フラグも立つ。
@@ -113,7 +113,7 @@ RUN --mount=type=cache,target=/pnpm-store \
     pnpm build-assets
 
 # Stage 4: Runtime
-FROM gcr.io/distroless/static-debian13:latest@sha256:15f8637509792e05b97d83451b0b6ccfa4abd548f997e406ac1e72c87fe1fa78
+FROM gcr.io/distroless/static-debian13:latest@sha256:1a64f46364620465ef9e9a8f5413757dfdf22695e050bbfd7303eeaf17a59383
 
 WORKDIR /app
 

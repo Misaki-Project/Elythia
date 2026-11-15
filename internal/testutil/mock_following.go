@@ -127,6 +127,18 @@ func (m *MockFollowingRepository) ListFollowers(userID string, limit, offset int
 	return paginate(sortFollowingsByIDDesc(m.followingsWhere(userID, true)), limit, offset), nil
 }
 
+// ListHomeTimelineFollowers mirrors the production repository: local and
+// non-hibernated followers only, ORDER BY id DESC, then LIMIT/OFFSET.
+func (m *MockFollowingRepository) ListHomeTimelineFollowers(followeeID string, limit, offset int) ([]*model.Following, error) {
+	var rows []*model.Following
+	for _, f := range m.followingsWhere(followeeID, true) {
+		if f.FollowerHost == nil && !f.IsFollowerHibernated {
+			rows = append(rows, f)
+		}
+	}
+	return paginate(sortFollowingsByIDDesc(rows), limit, offset), nil
+}
+
 // ListFollowersWithCursor mirrors the production repository: followeeId match,
 // sinceId/untilId in the query, paginationOrder.
 //
@@ -223,6 +235,28 @@ func (m *MockFollowingRepository) ListFollowersToNotify(userID string) ([]*model
 		}
 	}
 	return rows, nil
+}
+
+// FollowsAnyOnHost mirrors repository.followingRepository.FollowsAnyOnHost.
+func (m *MockFollowingRepository) FollowsAnyOnHost(followerID, host string) (bool, error) {
+	for _, f := range m.Followings {
+		if f.FollowerID == followerID && f.FolloweeHost != nil && *f.FolloweeHost == host {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ListLocalFollowerIDsLimit mirrors repository.followingRepository.ListLocalFollowerIDsLimit.
+func (m *MockFollowingRepository) ListLocalFollowerIDsLimit(followeeID string, limit int) ([]string, error) {
+	ids, err := m.ListLocalFollowerIDs(followeeID)
+	if err != nil || len(ids) <= limit {
+		return ids, err
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	return ids[:limit], nil
 }
 
 // ListLocalFollowerIDs mirrors repository.followingRepository.ListLocalFollowerIDs

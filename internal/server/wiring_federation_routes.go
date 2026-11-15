@@ -37,6 +37,7 @@ type federationRoutesDeps struct {
 	userRepo                repository.UserRepository
 	noteRepo                repository.NoteRepository
 	metaRepo                repository.MetaRepository
+	instanceRepo            repository.InstanceRepository
 	followingRepo           repository.FollowingRepository
 	followRequestRepo       repository.FollowRequestRepository
 	userRelationRepo        repository.UserRelationReader
@@ -69,6 +70,7 @@ type federationRoutesDeps struct {
 	sigCapBuffer            *coreinstance.CapabilityBuffer
 	rateLimiter             *middleware.RateLimiter
 	setupDetector           *meta.SetupDetector
+	adRepo                  repository.AdRepository
 	chunkedUploadCapability func() (int64, bool)
 	frontend                echo.HandlerFunc
 	streamRevokePublisher   *stream.StreamRevokePublisher
@@ -92,6 +94,7 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 	userRepo := d.userRepo
 	noteRepo := d.noteRepo
 	metaRepo := d.metaRepo
+	instanceRepo := d.instanceRepo
 	followingRepo := d.followingRepo
 	followRequestRepo := d.followRequestRepo
 	userRelationRepo := d.userRelationRepo
@@ -124,6 +127,7 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 	sigCapBuffer := d.sigCapBuffer
 	rateLimiter := d.rateLimiter
 	setupDetector := d.setupDetector
+	adRepo := d.adRepo
 	chunkedUploadCapability := d.chunkedUploadCapability
 	frontend := d.frontend
 	streamRevokePublisher := d.streamRevokePublisher
@@ -133,6 +137,13 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 	federationHandler := d.federationHandler
 
 	// ActivityPub resource endpoints
+	// ap/show は、instance actor に見せなかった投稿を照会した人の鍵で取り直す (#3915)。
+	// 取り直しは fetcher と resolver の型を見て行うので、満たさなくなったら
+	// ビルドで落ちるようにする (黙って取り直さなくなるのを防ぐ)。
+	var (
+		_ ap.KeyedRemoteFetcher = apFetcher
+		_ ap.KeyedNoteResolver  = federationResolver
+	)
 	apHandler.SetRemote(apFetcher, federationResolver)
 	apHandler.SetExternalRedirectPolicy(func() bool {
 		m, err := metaRepo.Fetch()
@@ -158,6 +169,13 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 		Memo:          userMemoRepo,
 		Relation:      userRelationRepo,
 	})
+	// 署名付きの GET に、見てよい人ならフォロワー限定・指名の投稿を返す (#3914)。
+	// 鍵は DB にあるものだけで引き、知らない keyId を取りに行かない。署名は受信と
+	// 同じく自ホスト (host:port) に縛る。署名した人のホストは、配送と同じ内容の
+	// 判定 (instanceService の CanFetchOptionalRemoteData。meta を読めないときは
+	// 見せない側) と配送停止のソフトウェアで絞る。
+	apHandler.SetFetchSigner(corefederation.NewSignedFetchAuthenticator(userRepo, federationResolver, s.config.Host),
+		instanceService, corefederation.NewSuspendedChecker(metaRepo, instanceRepo))
 	// AP リソース系エンドポイントは Accept ヘッダで content negotiation する。
 	// ブラウザからのリロード (Accept: text/html など) では SPA 用の HTML を
 	// 返したいので、フォールバックとして frontendHTML を注入しておく。
@@ -170,7 +188,7 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 	// permalink の SSR meta (#2345 の続き)。AP クライアントは Accept で
 	// 振り分けて従来どおり apHandler に渡す。
 	ssrMeta := newSSRMetaHandler(
-		s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector,
+		s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector, adRepo,
 		ssrMetaDeps{
 			User:         userRepo,
 			Note:         noteRepo,
@@ -312,7 +330,7 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 		// 本家 OAuth2ProviderService は NODE_ENV === 'test' のとき http の
 		// client_id を許可する (本番は https のみ)。TestMode を同じ用途で使う。
 		s.config.TestMode,
-		frontendConsentHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector),
+		frontendConsentHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector, adRepo),
 		// code 再利用で token を revoke したとき、auth cache に残った entry で
 		// 通り続けないよう即時失効させる (RFC6749 §4.1.2)。構築子の必須の引数 (#3823)。
 		s.auth,

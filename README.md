@@ -173,6 +173,7 @@ go test -race -count=1 -shuffle=3 -timeout 10m \
 | [シェイプドリフト検出](docs/shape-drift.md) | レスポンス形状・エラーID・権限のドリフトを検出する静的ゲート |
 | [本家 backend e2e](docs/upstream-backend-e2e.md) | Misskey 本家の `test/e2e/**` を本家ソースを正本として Elythia に向けて実行する (UserLite の期待DTOにローカル連合状態のみ追加) |
 | [プラグイン](docs/plugins/) | ビルド時組み込みプラグインの書き方・運用 |
+| [FxTwitter preview 導入手順（日本語）](docs/plugins/fxtwitter-install-ja.md) | 固定版ビルド・外部取得 OFF での検証・復旧 |
 | [プラグイン peer プロトコル](docs/plugin-peer-protocol.md) | Elythia 同士でだけ通じる署名付き HTTP チャネルの wire 仕様 |
 | [UDSデプロイ](docs/docker-uds.md) | UNIXドメインソケット構成 |
 | [queue-bench](docs/queue-bench.md) | BullMQ / mkq の 2-way 比較 (#563) |
@@ -180,7 +181,7 @@ go test -race -count=1 -shuffle=3 -timeout 10m \
 | [メディアプロキシの govips 評価](docs/mediaproxy-govips-evaluation.md) | 画像変換ライブラリの比較検討 |
 | [upstream追従手順](docs/upstream-catch-up.md) | Misskey TSの新リリース取り込み |
 | [設計メモ](docs/design/) | オートスケール、inbox verify、mkq等の設計判断 |
-| [upstream 差分](docs/update/) | Misskey TS 2026.3.2 → 2026.10.1 の backend 差分 (`<yyyymm><nn>diff.md`) と triage note |
+| [upstream 差分](docs/update/) | Misskey TS 2026.3.2 → 2026.11.0 の backend 差分 (`<yyyymm><nn>diff.md`) と triage note |
 
 ## ライセンス
 

@@ -139,7 +139,7 @@
 | 種類 | 参照元 | 移行先 |
 |---|---|---|
 | **自分たちの frontend** | `internal/frontendutil` の既定値 (`frontendBase = "third_party/misskey"`、`MISSKEY_FRONTEND_*` で上書き可)、`Dockerfile.bundled` (`built/`・`packages/frontend/assets`・`assets/`)、`compose.uds.yaml.example` の bind mount (`./third_party/misskey/built:/frontend`)、`tools/pluginbuild` / `plugindev` (`packages/frontend/src/server-plugins.generated.ts` などを書く)、`make frontend-check` / `frontend-test`、Playwright のビルド | `frontend/` |
-| **比較対象の本家** | tools 7 つ (`apicompat` / `erroriddiff` / `limitspec` (#3890 で消した) / `permspec` / `securespec` (以上 `packages/backend/src/server/api/endpoints`)、`schemadrift` (`packages/backend/migration`・`src/models`)、`shapediff` (`packages/misskey-js/src/autogen/types.ts`))、テスト 9 ファイル、本家 backend e2e (`tests/upstream-e2e`)、promo の確認 | `.cache/misskey/<版>/` (git 管理外) |
+| **比較対象の本家** | tools 7 つ (`apicompat` / `erroriddiff` / `limitspec` (#3890 で消した) / `permspec` / `securespec` (どちらも #3369 で消した) (以上 `packages/backend/src/server/api/endpoints`)、`schemadrift` (`packages/backend/migration`・`src/models`)、`shapediff` (`packages/misskey-js/src/autogen/types.ts`))、テスト 9 ファイル、本家 backend e2e (`tests/upstream-e2e`)、promo の確認 | `.cache/misskey/<版>/` (git 管理外) |
 | **本家の backend パッケージから借りているもの** | `Dockerfile` / `Dockerfile.bundled` が `packages/backend/assets` (favicon・アイコン = `static-assets`) と `packages/backend/node_modules/@misskey-dev/emoji-assets` (twemoji / fluent-emoji) を焼き込む | 下の D3 で決める |
 
 ### submodule を checkout している workflow (10 本)
@@ -180,7 +180,7 @@
 |---|---|
 | 取り込む | `package.json`、`pnpm-workspace.yaml`、`.node-version`、`patches/`、`scripts/`、`locales/`、`packages/` (`packages/backend` を除く)、`packages-private/`、`LICENSE`・`COPYING` (D12)、`.gitattributes` (改行を LF に揃える指定。本体には無い)、`.gitignore` (`built/` などの生成物)、`assets/` (`repo-assets/` へ。D3)、`packages/backend/assets/` (`assets/` へ。D3) |
 | 作り直す | `pnpm-lock.yaml` (D4) |
-| 取り込まない | `packages/backend` (アセットを除く)、`.github/`、`.config/`、`Dockerfile`、`Dockerfile.assets` (fork 独自。P4 で置き換える)、`compose*.yml`、`healthcheck.sh`、`Procfile`、`.dockerignore`・`.dockleignore` (本体の Dockerfile が持つ)、`.gitmodules`、文書類 (`CHANGELOG.md`・`CONTRIBUTING.md`・`README.md`・`CODE_OF_CONDUCT.md`・`ROADMAP.md`・`SECURITY.md`)、AI エージェント向けの設定 (`.agents/`・`.claude/`・`AGENTS.md`・`CLAUDE.md`)、エディタと bot の設定 (`.vscode/`・`.devcontainer/`・`.editorconfig`・`.vsls.json`・`.coderabbit.yaml`・`codecov.yml`・`crowdin.yml`・`renovate.json5`)、`idea/` |
+| 取り込まない | `packages/backend` (アセットを除く)、`.github/`、`.config/`、`Dockerfile`、`Dockerfile.assets` (fork 独自。P4 で置き換える)、`compose*.yml`、`healthcheck.sh`、`Procfile`、`.dockerignore`・`.dockleignore` (本体の Dockerfile が持つ)、`.gitmodules`、文書類 (`CHANGELOG.md`・`CONTRIBUTING.md`・`README.md`・`CODE_OF_CONDUCT.md`・`ROADMAP.md`・`SECURITY.md`・`docs/`。`docs/` は 2026.11.0 で `CONTRIBUTING.md` を分けた先、#4164)、AI エージェント向けの設定 (`.agents/`・`.claude/`・`AGENTS.md`・`CLAUDE.md`)、エディタと bot の設定 (`.vscode/`・`.devcontainer/`・`.editorconfig`・`.vsls.json`・`.coderabbit.yaml`・`codecov.yml`・`crowdin.yml`・`renovate.json5`)、`idea/`。あわせて、Elythia が後から `frontend/` から外したもの (Storybook 一式 #4027、本家の frontend の e2e #4025。一覧は `tools/upstreamsync` の `removedFromFrontend` と [乖離一覧](../divergence/frontend.md)) |
 
 - 取り込んだ `package.json` / `pnpm-workspace.yaml` からは `packages/backend` を外す。直下の `package.json` に残る backend 向けの script (`migrate` など) は動かないが、追従の衝突を減らすため消さずに置く。
 - `packages-private/diagnostics-backend` は `packages/backend` を測る道具なので、取り込んでも動かない。P4 で外すか残すかを決める。
@@ -202,7 +202,7 @@ P3 (#3378) で上のとおりにした (2026-10-05)。
 - 場所は `internal/upstreamsrc` が返す。**submodule へ戻す経路は作らなかった** — P4 で fork が消えたときに、黙って fork を読んでいたことが隠れるため。本家が無ければ「`make upstream-fetch` を実行する」と出して落ちる
 - skip を禁じる変数は `MK_UPSTREAM_REQUIRE`。本家を読むテストは今 `achievement` の 1 本で、`make upstream-check` (golden を本家から作り直して差分が無いこと + このテスト) が立てる。`apicompat` workflow が回す。#3673で`internal/api/paramschema`の`TestResponseMatchesUpstreamEndpointBase`が加わり、2本になった
 - 本家 backend e2e の 3 ファイルは `tests/upstream-e2e/harness/` に置き、実行のたびに本家の `packages/backend/` へコピーする。vitest の設定を本家の外に置いたまま走らせる形は、設定ファイルの import が設定ファイルの場所から解決されて失敗するので採らない
-- 試算: fork と本家は、比較対象として読むパス (`packages/backend/src` / `migration` / `misskey-js/src/autogen`) で差分が 0。本家から作り直した golden 11 個 (`make shapecheck-gen` が書く全て) は、commit 済みのものとバイト一致した
+- 試算: fork と本家は、比較対象として読むパス (`packages/backend/src` / `migration` / `misskey-js/src/autogen`) で差分が 0。本家から作り直した golden 11 個 (`make shapecheck-gen` が書く全て。#3369 で4つ消した) は、commit 済みのものとバイト一致した
 - `UPSTREAM_MISSKEY_VERSION`・`config.MisskeyVersion`・e2e の `misskey/misskey:<版>` が揃っていることを `TestUpstreamVersionIsConsistent` が見る
 
 ### D3. 本家 backend から借りているアセット

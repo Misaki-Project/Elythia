@@ -170,6 +170,9 @@ const mkGoRolePolicyKeys: string[] = [
 	'hsrRefreshIntervalMinutes',
 	'hsrUidLimit',
 	'genshinUidLimit',
+	'canUseFxTwitterPreview',
+	'fxTwitterColdFetchesPerHour',
+	'fxTwitterColdFetchesPerDay',
 ];
 
 const role = ref((() => {

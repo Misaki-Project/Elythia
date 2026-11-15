@@ -35,6 +35,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -48,13 +49,15 @@ import (
 
 // Harness builds the fake environment a plugin sees.
 type Harness struct {
-	t           *testing.T
-	name        string
-	config      map[string]any
-	db          *sql.DB
-	api         plugin.API
-	migrate     bool
-	invalidator plugin.EffectivePolicyInvalidator
+	t                    *testing.T
+	name                 string
+	config               map[string]any
+	db                   *sql.DB
+	api                  plugin.API
+	migrate              bool
+	invalidator          plugin.EffectivePolicyInvalidator
+	checkedUserPolicies  map[string]any
+	checkedUserPolicyErr error
 
 	// peer 経路 (#2537) の記録。Handle / OnReply はプラグインが登録し、
 	// テストは DeliverPeer / DeliverPeerReply から叩く。
@@ -120,6 +123,12 @@ func (h *Harness) WithDB(db *sql.DB) *Harness {
 // mk-go の API を呼ぶプラグインは自分でフェイクを渡すこと.
 func (h *Harness) WithAPI(api plugin.API) *Harness {
 	h.api = api
+	return h
+}
+
+// WithCheckedUserRolePolicies configures background role-policy checks.
+func (h *Harness) WithCheckedUserRolePolicies(values map[string]any, err error) *Harness {
+	h.checkedUserPolicies, h.checkedUserPolicyErr = values, err
 	return h
 }
 
@@ -331,6 +340,9 @@ func (h *Harness) Jobs(def plugin.Definition) *JobSet {
 	if err := def.Jobs(h.Context(), j); err != nil {
 		h.t.Fatalf("plugintest: Jobs に失敗しました: %v", err)
 	}
+	if j.err != nil {
+		h.t.Fatalf("plugintest: ジョブの登録に失敗しました: %v", j.err)
+	}
 	return j.set
 }
 
@@ -466,10 +478,10 @@ func (j *JobSet) lookup(name string) (plugin.JobHandler, error) {
 
 // Request describes one fake HTTP request.
 type Request struct {
-	// ActiveRoleIDs supplies the authenticated caller's server-derived role IDs.
-	ActiveRoleIDs []string
-	// ActiveRoleError simulates a failed role lookup; no IDs are returned on error.
-	ActiveRoleError error
+	// CheckedRolePolicies supplies the effective native policies returned by the host.
+	CheckedRolePolicies map[string]any
+	// CheckedRolePolicyError simulates a failed checked policy lookup.
+	CheckedRolePolicyError error
 	// UserID is what plugin.Request.UserID returns. 空文字は未認証。
 	UserID string
 	// Body is the raw JSON request body.
@@ -495,7 +507,7 @@ func (r Request) build() plugin.Request {
 	return &fakeRequest{
 		ctx: ctx, userID: r.UserID, body: body, params: r.Params, query: r.Query,
 		moderator: r.Moderator || r.Administrator, administrator: r.Administrator,
-		activeRoleIDs: append([]string(nil), r.ActiveRoleIDs...), activeRoleError: r.ActiveRoleError,
+		checkedRolePolicies: r.CheckedRolePolicies, checkedRolePolicyError: r.CheckedRolePolicyError,
 	}
 }
 
@@ -507,6 +519,21 @@ func (c *fakeContext) Name() string          { return c.h.name }
 func (c *fakeContext) Logger() *slog.Logger  { return slog.Default() }
 func (c *fakeContext) API() plugin.API       { return c.h.api }
 func (c *fakeContext) Config() plugin.Config { return &fakeConfig{values: c.h.config} }
+func (c *fakeContext) CheckedUserRolePolicies(userID string, keys ...string) (map[string]any, error) {
+	if userID == "" {
+		return nil, errors.New("plugintest: checked role policy lookup requires a user ID")
+	}
+	if c.h.checkedUserPolicyErr != nil {
+		return nil, c.h.checkedUserPolicyErr
+	}
+	policies := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := c.h.checkedUserPolicies[key]; ok {
+			policies[key] = value
+		}
+	}
+	return policies, nil
+}
 func (c *fakeContext) Storage() plugin.Storage {
 	return &fakeStorage{db: c.h.db}
 }
@@ -611,24 +638,60 @@ type fakeRouter struct{ handlers Handlers }
 func (r *fakeRouter) GET(path string, h plugin.Handler)  { r.handlers["GET "+path] = h }
 func (r *fakeRouter) POST(path string, h plugin.Handler) { r.handlers["POST "+path] = h }
 
-type fakeJobs struct{ set *JobSet }
+type fakeJobs struct {
+	set *JobSet
+	// err is the first registration the host would refuse.
+	err error
+}
 
-func (j *fakeJobs) Handle(name string, h plugin.JobHandler) { j.set.Handlers[name] = h }
+// jobNamePattern is the job names the host accepts.
+//
+// internal/queue の ValidPluginJobName と同じ規則。plugintest から internal/queue を
+// import すると、同梱のプラグインの module が queue の依存 (mkq など) まで要るように
+// なるので写して持ち、一致はテスト (TestValidJobNameMatchesTheHost) が見る。
+var jobNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+
+// validJobName reports whether the host accepts name as a job name.
+func validJobName(name string) bool { return jobNamePattern.MatchString(name) }
+
+// Handle records h like the host: a duplicated name and a name the host
+// refuses (reserved or malformed) fail the setup (#3369).
+func (j *fakeJobs) Handle(name string, h plugin.JobHandler) {
+	if j.err != nil {
+		return
+	}
+	if !validJobName(name) {
+		j.err = fmt.Errorf("ジョブ名 %q は使えません (英数字で始まり、英数字・ハイフン・アンダースコアだけ。_ で始まる名前は本体の予約)", name)
+		return
+	}
+	if _, dup := j.set.Handlers[name]; dup {
+		j.err = fmt.Errorf("ジョブ %q を2回登録しています", name)
+		return
+	}
+	j.set.Handlers[name] = h
+}
 
 func (j *fakeJobs) Schedule(cron string, name string, payload any) {
+	if j.err != nil {
+		return
+	}
+	if !validJobName(name) {
+		j.err = fmt.Errorf("ジョブ名 %q は使えません (英数字で始まり、英数字・ハイフン・アンダースコアだけ。_ で始まる名前は本体の予約)", name)
+		return
+	}
 	j.set.Schedules = append(j.set.Schedules, Schedule{Cron: cron, Name: name, Payload: payload})
 }
 
 type fakeRequest struct {
-	activeRoleIDs   []string
-	activeRoleError error
-	ctx             context.Context
-	userID          string
-	body            string
-	params          map[string]string
-	query           map[string]string
-	moderator       bool
-	administrator   bool
+	checkedRolePolicies    map[string]any
+	checkedRolePolicyError error
+	ctx                    context.Context
+	userID                 string
+	body                   string
+	params                 map[string]string
+	query                  map[string]string
+	moderator              bool
+	administrator          bool
 }
 
 func (r *fakeRequest) Context() context.Context { return r.ctx }
@@ -638,23 +701,20 @@ func (r *fakeRequest) IsModerator() bool        { return r.moderator }
 func (r *fakeRequest) IsAdministrator() bool    { return r.administrator }
 func (r *fakeRequest) Query(k string) string    { return r.query[k] }
 
-func (r *fakeRequest) ActiveRoleIDs() ([]string, error) {
+func (r *fakeRequest) CheckedRolePolicies(keys ...string) (map[string]any, error) {
 	if r.userID == "" {
-		return []string{}, nil
+		return nil, errors.New("checked role policies require authentication")
 	}
-	if r.activeRoleError != nil {
-		return nil, r.activeRoleError
+	if r.checkedRolePolicyError != nil {
+		return nil, r.checkedRolePolicyError
 	}
-	seen := make(map[string]bool, len(r.activeRoleIDs))
-	ids := make([]string, 0, len(r.activeRoleIDs))
-	for _, id := range r.activeRoleIDs {
-		if id != "" && !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
+	policies := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := r.checkedRolePolicies[key]; ok {
+			policies[key] = value
 		}
 	}
-	sort.Strings(ids)
-	return ids, nil
+	return policies, nil
 }
 
 func (r *fakeRequest) Bind(v any) error {

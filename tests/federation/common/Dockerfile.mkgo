@@ -6,7 +6,7 @@
 #
 # Build context must be the repository root.
 # `# syntax=` directive は BuildKit cache mount 用 (#432)。
-FROM golang:1.27.3-alpine AS builder
+FROM golang:1.27.4-alpine AS builder
 
 RUN apk add --no-cache git build-base
 
@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /app/built/elythia ./cmd/elythia
 
-FROM alpine:3.21
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata wget
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -20,6 +21,8 @@ import (
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/core/passwordguard"
 	"github.com/elythia-network/elythia/internal/core/strongauth"
+	"github.com/elythia-network/elythia/internal/misc/headreq"
+	"github.com/elythia-network/elythia/internal/misc/jsdate"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/go-webauthn/webauthn/protocol"
@@ -83,6 +86,34 @@ type memStorage struct {
 	accesses int
 	noSeek   bool
 	getErr   error
+	read     int64
+}
+
+// countingReader counts, on its memStorage, the bytes read from a Get body.
+type countingReader struct {
+	io.Reader
+	m *memStorage
+}
+
+func (r countingReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.m.mu.Lock()
+	r.m.read += int64(n)
+	r.m.mu.Unlock()
+	return n, err
+}
+
+type countingSeekCloser struct {
+	countingReader
+	io.Seeker
+}
+
+func (countingSeekCloser) Close() error { return nil }
+
+func (m *memStorage) bytesRead() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.read
 }
 
 func (m *memStorage) touch() { m.accesses++ }
@@ -95,10 +126,6 @@ func (m *memStorage) Put(_ context.Context, key string, r io.Reader) error {
 	return nil
 }
 
-type seekCloser struct{ *bytes.Reader }
-
-func (seekCloser) Close() error { return nil }
-
 func (m *memStorage) Get(_ context.Context, key string) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -110,10 +137,11 @@ func (m *memStorage) Get(_ context.Context, key string) (io.ReadCloser, error) {
 	if !ok {
 		return nil, backup.ErrNotFound
 	}
+	r := bytes.NewReader(b)
 	if m.noSeek {
-		return io.NopCloser(bytes.NewReader(b)), nil
+		return io.NopCloser(countingReader{r, m}), nil
 	}
-	return seekCloser{bytes.NewReader(b)}, nil
+	return countingSeekCloser{countingReader{r, m}, r}, nil
 }
 
 func (m *memStorage) Stat(_ context.Context, key string) (backup.ObjectInfo, error) {
@@ -164,7 +192,10 @@ func (c *control) Take(_ context.Context, ip string) (*backupadmin.Job, error) {
 func (c *control) Verify(_ context.Context, id, ip string) (*backupadmin.Job, error) {
 	c.calls++
 	c.ips = append(c.ips, ip)
-	return &backupadmin.Job{Kind: "verify", Trigger: "api", GenerationID: id}, c.err
+	// 応答に本家の書式 (ミリ秒 3 桁と Z) で出ることを見るため、UTC でない
+	// ナノ秒付きの時刻を返す (#4091)。
+	started := jsdate.NewTime(time.Date(2026, 10, 1, 13, 0, 0, 123_456_789, time.FixedZone("JST", 9*60*60)))
+	return &backupadmin.Job{Kind: "verify", Trigger: "api", GenerationID: id, StartedAt: started}, c.err
 }
 func (c *control) Status(context.Context) (*backupadmin.Status, error) {
 	return &backupadmin.Status{}, nil
@@ -263,6 +294,13 @@ func newFixture(t *testing.T, guardOnly bool) *fixture {
 	e.POST("/api/admin/backup/restore/candidates", hd.RestoreCandidates, chain...)
 	e.POST("/api/admin/backup/reauth-challenge", hd.ReauthChallenge, pre...)
 	e.GET("/backup-download", hd.ServeDownload)
+	// サーバーが GET のルートへ振り分けた HEAD と同じ形 (#3925)。
+	e.GET("/backup-download-head", hd.ServeDownload, func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			headreq.Mark(c)
+			return next(c)
+		}
+	})
 	return &fixture{e: e, storage: st, control: ctl, log: lg, secret: secret, keys: k, tokens: tokens}
 }
 
@@ -455,7 +493,7 @@ func TestOperationResponses(t *testing.T) {
 
 	rec = f.post(t, "/api/admin/backup/verify", native(adminID), auth(map[string]any{"id": gen1}))
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.JSONEq(t, `{"accepted":true,"job":{"kind":"verify","trigger":"api","generationId":"`+gen1+`","startedAt":"0001-01-01T00:00:00Z"}}`, rec.Body.String())
+	assert.JSONEq(t, `{"accepted":true,"job":{"kind":"verify","trigger":"api","generationId":"`+gen1+`","startedAt":"2026-10-01T04:00:00.123Z"}}`, rec.Body.String())
 	rec = f.post(t, "/api/admin/backup/take", native(adminID), auth(nil))
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, 2, f.control.calls)
@@ -512,6 +550,39 @@ func TestServeDownload(t *testing.T) {
 	f.storage.getErr = nil
 	delete(f.storage.objs, backup.Key(gen1, backup.DumpFile))
 	assert.Equal(t, http.StatusNotFound, get("/backup-download?token="+tok).Code)
+}
+
+// TestServeDownloadHEAD checks that a HEAD request, which the server routes to
+// the GET route and presents as GET, answers the headers without reading the
+// dump and without logging a download that did not happen (#3925).
+func TestServeDownloadHEAD(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	f := newFixture(t, false)
+	tok, err := f.tokens.Issue(context.Background(), backupadmin.DownloadGrant{Key: backup.Key(gen1, backup.DumpFile), FileName: "x.pgc"}, time.Minute)
+	require.NoError(t, err)
+
+	for _, noSeek := range []bool{false, true} {
+		f.storage.noSeek = noSeek
+		rec := httptest.NewRecorder()
+		f.e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/backup-download-head?token="+tok, nil))
+		require.Equal(t, http.StatusOK, rec.Code, "noSeek=%v", noSeek)
+		assert.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
+		assert.Contains(t, rec.Header().Get("Content-Disposition"), "x.pgc")
+		assert.Empty(t, rec.Body.String())
+		assert.Zero(t, f.storage.bytesRead(), "noSeek=%v", noSeek)
+	}
+	assert.NotContains(t, logs.String(), "backup downloaded")
+	assert.Contains(t, logs.String(), "backup download probed (HEAD)")
+
+	// GET は本文を読み、取られたことを記録する。
+	rec := httptest.NewRecorder()
+	f.e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/backup-download?token="+tok, nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, int64(len(dumpBytes())), f.storage.bytesRead())
+	assert.Contains(t, logs.String(), "backup downloaded")
 }
 
 // TestRestoreCandidatesReauthenticates checks that the listing of the kept

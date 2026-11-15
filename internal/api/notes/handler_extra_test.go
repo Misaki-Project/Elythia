@@ -139,7 +139,17 @@ func TestFavoritesCreate_AlreadyFavorited(t *testing.T) {
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic}
 	favRepo.Favorites["u1:n1"] = &model.NoteFavorite{ID: "f1", UserID: "u1", NoteID: "n1"}
 	rec := postExtra(h.FavoritesCreate, `{"noteId":"n1"}`, &model.User{ID: "u1"})
-	assert.Equal(t, http.StatusConflict, rec.Code)
+	// upstream の alreadyFavorited は httpStatusCode を持たないので400 (#4122)。
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	errObj, ok := resp["error"].(map[string]any)
+	require.True(t, ok, "error envelope")
+	assert.Equal(t, "ALREADY_FAVORITED", errObj["code"])
+	assert.Equal(t, "The note has already been marked as a favorite.", errObj["message"])
+	assert.Equal(t, "a402c12b-34dd-41d2-97d8-4d2ffd96a1a6", errObj["id"])
+	assert.Equal(t, "client", errObj["kind"])
+	assert.Len(t, favRepo.Favorites, 1, "duplicate favorite must not be inserted")
 }
 
 func TestFavoritesCreate_NoteNotFound(t *testing.T) {
@@ -504,6 +514,32 @@ func TestMentions_Success(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	require.Len(t, resp, 1)
 	assert.Equal(t, "n1", resp[0]["id"])
+}
+
+// 本家は並びを `(ps.sinceDate || ps.sinceId) ? 'ASC' : 'DESC'` で決めるので、
+// untilId と sinceDate を一緒に送ると、sinceDate を捨てて untilId だけで絞ったうえで
+// 古い順に返す (#3369)。
+func TestMentions_SinceDateOrdersAscendingWithUntilID(t *testing.T) {
+	h, noteRepo, _ := newExtraHandler(t)
+	for _, nid := range []string{"n1", "n2", "n3", "n4"} {
+		noteRepo.Notes[nid] = &model.Note{ID: nid, UserID: "u2", Visibility: "public", Mentions: []string{"u1"}, User: &model.User{ID: "u2"}}
+	}
+	ids := func(body string) []any {
+		rec := postExtra(h.Mentions, body, &model.User{ID: "u1"})
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		var resp []map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		out := make([]any, 0, len(resp))
+		for _, n := range resp {
+			out = append(out, n["id"])
+		}
+		return out
+	}
+	assert.Equal(t, []any{"n1", "n2", "n3"}, ids(`{"untilId":"n4","sinceDate":1779744000000}`))
+	assert.Equal(t, []any{"n3", "n2", "n1"}, ids(`{"untilId":"n4"}`))
+	assert.Equal(t, []any{"n3", "n2", "n1"}, ids(`{"untilId":"n4","sinceDate":0}`), "sinceDate の0は本家でも偽")
+	assert.Equal(t, []any{"n2", "n3", "n4"}, ids(`{"sinceId":"n1"}`))
+	assert.Equal(t, []any{"n2", "n3"}, ids(`{"sinceId":"n1","untilId":"n4"}`), "sinceId があれば untilId があっても昇順")
 }
 
 func TestMentions_InvalidJSON(t *testing.T) {
@@ -1335,7 +1371,7 @@ func TestUnrenote_DeleteError(t *testing.T) {
 
 type failingMentionsRepo struct{ *testutil.MockNoteRepository }
 
-func (f *failingMentionsRepo) ListMentions(_, _ string, _ bool, _ int, _, _ string) ([]*model.Note, error) {
+func (f *failingMentionsRepo) ListMentions(_, _ string, _ bool, _ int, _, _ string, _ bool) ([]*model.Note, error) {
 	return nil, testutil.ErrNotFound
 }
 
@@ -1390,9 +1426,10 @@ func TestTranslate_CWOnlyNote_IsTranslated(t *testing.T) {
 }
 
 // 空白のみ / 空文字は DeepL へ投げずに 204。判定が `text == nil` から
-// `strings.TrimSpace(text) == ""` に変わったことを固定する。
+// 「`text.trim()` が空」に変わったことを固定する。空白は JavaScript の集合
+// (U+FEFF を含む) で見る (#3369)。
 func TestTranslate_BlankText_204(t *testing.T) {
-	for _, txt := range []string{"", "   ", "\n\t "} {
+	for _, txt := range []string{"", "   ", "\n\t ", "\ufeff", " \ufeff\u3000"} {
 		h, noteRepo, sent := captureTranslateHandler(t)
 		v := txt
 		noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: &v}
@@ -1400,6 +1437,16 @@ func TestTranslate_BlankText_204(t *testing.T) {
 		assert.Equal(t, http.StatusNoContent, rec.Code, "空白のみは 204 (%q)", txt)
 		assert.Empty(t, *sent, "DeepL を呼ばない (%q)", txt)
 	}
+}
+
+// U+0085 は JavaScript の trim() が削らないので、それだけの本文も翻訳に回す (#3369)。
+func TestTranslate_NELOnlyText_IsTranslated(t *testing.T) {
+	h, noteRepo, sent := captureTranslateHandler(t)
+	v := "\u0085"
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: &v}
+	rec := postExtra(h.Translate, `{"noteId":"n1","targetLang":"en"}`, nil)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "\u0085", *sent)
 }
 
 // notConfiguredTranslator answers like a MetaDeepL whose meta has no key.

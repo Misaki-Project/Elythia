@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -70,6 +71,11 @@ type UserRepository interface {
 	// while "accountCreatedAt" is still NULL (#3465). The bool reports whether
 	// the row was updated.
 	SetAccountCreatedAtIfNull(userID string, createdAt time.Time) (bool, error)
+	// WakeFromHibernation clears "isHibernated" of a hibernated user and
+	// "isFollowerHibernated" of the follows the user makes, like upstream
+	// UserService.updateLastActiveDate (#4019). The bool reports whether the
+	// user was hibernated. A user who is not hibernated is not written.
+	WakeFromHibernation(userID string) (bool, error)
 	UpdateProfile(userID string, fields map[string]any) error
 	// UpdatePasswordIfCurrent replaces a profile password only when the stored
 	// hash still equals currentHash. The bool reports whether one row changed.
@@ -514,6 +520,30 @@ func (r *userRepository) UpdateUser(userID string, fields map[string]any) error 
 	return r.db.Model(&model.User{}).Where("id = ?", userID).Updates(fields).Error
 }
 
+// WakeFromHibernation implements UserRepository.
+//
+// 休眠は TS 版から移した DB にだけある (Elythia は休眠させない)。ストリーミングの
+// 接続のたび (接続時と 5 分ごと) に呼ばれるので、1 文にして往復を 1 回にする。休眠して
+// いない利用者では、条件付きの UPDATE が 0 行に当たるだけで何も書かない。フォローの行は、
+// 利用者の印を外したときだけ外す (本家と同じ)。1 文なので、片方だけ外れることは無い。
+func (r *userRepository) WakeFromHibernation(userID string) (bool, error) {
+	var woke int64
+	err := r.db.Raw(`
+		WITH w AS (
+			UPDATE "user" SET "isHibernated" = false
+			WHERE "id" = ? AND "isHibernated"
+			RETURNING "id"
+		), f AS (
+			UPDATE "following" SET "isFollowerHibernated" = false
+			WHERE "followerId" IN (SELECT "id" FROM w) AND "isFollowerHibernated"
+		)
+		SELECT count(*) FROM w`, userID).Scan(&woke).Error
+	if err != nil {
+		return false, fmt.Errorf("wake user %s from hibernation: %w", userID, err)
+	}
+	return woke > 0, nil
+}
+
 // SetAccountCreatedAtIfNull implements UserRepository.
 //
 // 列が空のときだけ書く。users/show から埋める経路 (フォローの受信) は、
@@ -755,45 +785,45 @@ func (r *userRepository) ListUsers(filter model.UserListFilter) ([]*model.User, 
 		)`)
 	}
 
-	// sort 方向は upstream admin/show-users.ts:99-110 に一致させる。'+' は
-	// 降順 (新しい/多い順)、'-' は昇順という Misskey の慣習で、key 名も
-	// follower 系は +follower/-follower (followersCount 列) を使う。
-	switch filter.Sort {
-	case "+createdAt":
-		q = q.Order("id DESC")
-	case "-createdAt":
-		q = q.Order("id ASC")
-	case "+updatedAt":
-		// public users.ts は updatedAt sort 時 IS NOT NULL を andWhere して NULL
-		// updatedAt user を除外する (#1975)。admin/show-users は NULLS LAST で
-		// 保持するため UpdatedAtSortNonNull は public /users のみ true。
-		if filter.UpdatedAtSortNonNull {
-			q = q.Where(`"updatedAt" IS NOT NULL`)
-		}
-		q = q.Order(`"updatedAt" DESC NULLS LAST`)
-	case "-updatedAt":
-		if filter.UpdatedAtSortNonNull {
-			q = q.Where(`"updatedAt" IS NOT NULL`)
-		}
-		q = q.Order(`"updatedAt" ASC NULLS FIRST`)
-	case "+lastActiveDate":
-		q = q.Order(`"lastActiveDate" DESC NULLS LAST`)
-	case "-lastActiveDate":
-		q = q.Order(`"lastActiveDate" ASC NULLS FIRST`)
-	case "+follower":
-		q = q.Order(`"followersCount" DESC`)
-	case "-follower":
-		q = q.Order(`"followersCount" ASC`)
-	default:
-		// cursor 指定時は下で id order を付けるので default order は付けない。
-		if filter.SinceID == "" && filter.UntilID == "" {
+	// cursor pagination (federation/users 等、#1732)。非空のときは Sort/Offset を
+	// 無視して id cursor で絞る (makePaginationQuery 互換)。以前は Sort の
+	// ORDER BY を先に付けていたので、両方を渡すと Sort の向きが勝っていた。
+	// 今の呼び出しは両方を渡さないが、型の約束どおりに Sort を付けない (#3369)。
+	cursor := filter.SinceID != "" || filter.UntilID != ""
+	if !cursor {
+		// sort 方向は upstream admin/show-users.ts:99-110 に一致させる。'+' は
+		// 降順 (新しい/多い順)、'-' は昇順という Misskey の慣習で、key 名も
+		// follower 系は +follower/-follower (followersCount 列) を使う。
+		switch filter.Sort {
+		case "+createdAt":
+			q = q.Order("id DESC")
+		case "-createdAt":
+			q = q.Order("id ASC")
+		case "+updatedAt":
+			// public users.ts は updatedAt sort 時 IS NOT NULL を andWhere して NULL
+			// updatedAt user を除外する (#1975)。admin/show-users は NULLS LAST で
+			// 保持するため UpdatedAtSortNonNull は public /users のみ true。
+			if filter.UpdatedAtSortNonNull {
+				q = q.Where(`"updatedAt" IS NOT NULL`)
+			}
+			q = q.Order(`"updatedAt" DESC NULLS LAST`)
+		case "-updatedAt":
+			if filter.UpdatedAtSortNonNull {
+				q = q.Where(`"updatedAt" IS NOT NULL`)
+			}
+			q = q.Order(`"updatedAt" ASC NULLS FIRST`)
+		case "+lastActiveDate":
+			q = q.Order(`"lastActiveDate" DESC NULLS LAST`)
+		case "-lastActiveDate":
+			q = q.Order(`"lastActiveDate" ASC NULLS FIRST`)
+		case "+follower":
+			q = q.Order(`"followersCount" DESC`)
+		case "-follower":
+			q = q.Order(`"followersCount" ASC`)
+		default:
 			q = q.Order("id ASC")
 		}
 	}
-
-	// cursor pagination (federation/users 等、#1732)。非空のときは Sort/Offset を
-	// 無視して id cursor で絞る (makePaginationQuery 互換)。
-	cursor := filter.SinceID != "" || filter.UntilID != ""
 	if filter.SinceID != "" {
 		q = q.Where(`"id" > ?`, filter.SinceID)
 	}

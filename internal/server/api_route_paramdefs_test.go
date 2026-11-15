@@ -32,10 +32,6 @@ var undeclaredAPIRoutes = map[string]string{
 	"*": "router.go: api.Any(\"/*\", apiCatchall)",
 	// 本家の旧いpathの互換。本家のendpointの一覧にもdirectRoutesにも無い。
 	"signin": "routes_auth.go: api.POST(\"/signin\", signinHandler.Signin)",
-	// Elythia独自の分割アップロードの本文はmultipartで、拒否の検証はJSONでない
-	// 本文を検証せずにhandlerへ渡す(SkipNotJSON)。宣言しても何も拒否しないので
-	// 宣言しない(#3877)。
-	"drive/files/create-chunked/append": "routes_drive.go: api.POST(\"/drive/files/create-chunked/append\", driveHandler.FilesCreateChunkedAppend, ...)",
 }
 
 // getRoutesWithoutAllowGet are the declared endpoints that Elythia also
@@ -89,6 +85,25 @@ func upstreamDirectRoutes(t *testing.T) map[string]bool {
 // namespaces of the plugins it was built with ("plugin/<name>/").
 func builtAPIRoutes(t *testing.T) (routes map[string]map[string]bool, pluginNamespaces []string) {
 	t.Helper()
+	echoRoutes, pluginNamespaces := builtEchoRoutes(t)
+	routes = map[string]map[string]bool{}
+	for _, r := range echoRoutes {
+		name, ok := strings.CutPrefix(r.Path, apiGroupPrefix+"/")
+		if !ok || r.Method == echo.RouteNotFound {
+			continue
+		}
+		if routes[name] == nil {
+			routes[name] = map[string]bool{}
+		}
+		routes[name][r.Method] = true
+	}
+	return routes, pluginNamespaces
+}
+
+// builtEchoRoutes builds the server like builtAPIRoutes does and returns every
+// echo route of it, with the namespaces of the plugins it was built with.
+func builtEchoRoutes(t *testing.T) (routes []*echo.Route, pluginNamespaces []string) {
+	t.Helper()
 	t.Setenv(config.EnvOnlyServer, "1")
 	t.Setenv(config.EnvOnlyQueue, "")
 	mr := miniredis.RunT(t)
@@ -116,18 +131,7 @@ func builtAPIRoutes(t *testing.T) (routes map[string]map[string]bool, pluginName
 	srv, err := newServer(cfg, serverIntegrationDB, clients, defs, noopStorage)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.Background())) })
-	routes = map[string]map[string]bool{}
-	for _, r := range srv.echo.Routes() {
-		name, ok := strings.CutPrefix(r.Path, apiGroupPrefix+"/")
-		if !ok || r.Method == echo.RouteNotFound {
-			continue
-		}
-		if routes[name] == nil {
-			routes[name] = map[string]bool{}
-		}
-		routes[name][r.Method] = true
-	}
-	return routes, pluginNamespaces
+	return srv.echo.Routes(), pluginNamespaces
 }
 
 // TestAPIRoutesHaveParamDefs is the gate of #3890: every /api route of the
@@ -167,6 +171,8 @@ func TestAPIRoutesHaveParamDefs(t *testing.T) {
 		"admin/backup/list": {http.MethodPost},
 		"signup":            {http.MethodPost},
 		"v1/instance/peers": {http.MethodGet},
+		// 本家は fastify.all で登録し、handler が GET と POST 以外を 405 にする (#3926)。
+		"clear-browser-cache": {http.MethodGet, http.MethodPost, http.MethodPut},
 	} {
 		for _, m := range methods {
 			require.True(t, routes[name][m], "the built server has no %s /api/%s", m, name)

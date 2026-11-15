@@ -19,7 +19,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<MkResult v-else-if="records != null && records.length === 0" type="empty" :text="i18n.ts._mkgoBubbleGame._versus.noHistory"/>
 
 		<template v-else-if="records != null">
-			<div v-for="r in records" :key="r.id" class="_panel" :class="$style.item">
+			<div v-for="r in records" :key="r.id" class="_panel" :class="$style.item" data-testid="versus-record" :data-match-id="r.id">
 				<div :class="$style.head">
 					<span :class="$style.outcome">{{ versusOutcomeLabel(outcomeOf(r)) }}</span>
 					<span style="opacity: 0.7;">{{ dropAndFusionModeLabel(r.gameMode) }}</span>
@@ -35,11 +35,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 				</div>
 				<div style="opacity: 0.8; font-size: 90%;">{{ versusReasonLabel(r.reason) }}</div>
 				<div :class="$style.foot">
-					<MkSwitch v-if="isMe" :modelValue="myPublic(r)" :class="$style.public" @update:modelValue="v => setPublic(r, v)">
+					<MkSwitch v-if="isMe" :modelValue="myPublic(r)" :class="$style.public" data-testid="versus-record-public" @update:modelValue="v => setPublic(r, v)">
 						<template #label>{{ i18n.ts._mkgoBubbleGame._versus.publicSwitch }}</template>
 						<template #caption>{{ r.isPublic ? i18n.ts._mkgoBubbleGame._versus.publicBoth : myPublic(r) ? i18n.ts._mkgoBubbleGame._versus.publicWaiting : '' }}</template>
 					</MkSwitch>
-					<MkButton rounded small @click="openReplay(r)"><i class="ti ti-player-play"></i> {{ i18n.ts._mkgoBubbleGame._versus.showReplay }}</MkButton>
+					<MkButton rounded small data-testid="versus-record-replay" @click="openReplay(r)"><i class="ti ti-player-play"></i> {{ i18n.ts._mkgoBubbleGame._versus.showReplay }}</MkButton>
 				</div>
 			</div>
 			<MkButton v-if="hasMore" :class="$style.more" rounded :wait="loadingMore" @click="loadMore">{{ i18n.ts.loadMore }}</MkButton>
@@ -50,7 +50,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <script lang="ts" setup>
 import { computed, onMounted, ref, shallowRef, triggerRef } from 'vue';
-import * as Misskey from 'misskey-js';
+import type * as Elythia from 'elythia-js';
 import { definePage } from '@/page.js';
 import MkButton from '@/components/MkButton.vue';
 import MkInfo from '@/components/MkInfo.vue';
@@ -77,7 +77,7 @@ const PAGE_SIZE = 20;
 const router = useRouter();
 const targetId = computed(() => props.userId ?? $i?.id ?? null);
 const isMe = computed(() => targetId.value != null && targetId.value === $i?.id);
-const targetUser = shallowRef<Misskey.entities.UserDetailed | null>(null);
+const targetUser = shallowRef<Elythia.entities.UserDetailed | null>(null);
 const records = shallowRef<VersusRecord[] | null>(null);
 const loadFailed = ref<'notFound' | 'error' | null>(null);
 const hasMore = ref(false);
@@ -87,7 +87,7 @@ function idOf(r: VersusRecord, i: number): string {
 	return i === 0 ? r.user1Id : r.user2Id;
 }
 
-function userOf(r: VersusRecord, i: number): Misskey.entities.UserLite | null {
+function userOf(r: VersusRecord, i: number): Elythia.entities.UserLite | null {
 	return i === 0 ? r.user1 : r.user2;
 }
 

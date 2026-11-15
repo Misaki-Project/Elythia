@@ -142,6 +142,7 @@ func (h *Handler) Create(c echo.Context) error {
 	if !h.eyeCatchingImageOK(req.EyeCatchingImageID, user.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "b7b97489-0f66-4b12-a5ff-b21bd63f6e1c"))
 	}
+	req.EyeCatchingImageID = nilIfEmpty(req.EyeCatchingImageID)
 	p, err := h.svc.Create(corepage.CreateInput{
 		OwnerID:             user.ID,
 		Title:               *req.Title,
@@ -163,9 +164,34 @@ func (h *Handler) Create(c echo.Context) error {
 		if errors.Is(err, corepage.ErrPageNameInvalid) {
 			return apierr.JSONInvalidParam(c)
 		}
+		if repository.IsRejectedValue(err) {
+			return apierr.JSONInvalidParam(c)
+		}
 		return apierr.JSONInternalError(c)
 	}
-	return c.JSON(http.StatusOK, h.pageToMap(p))
+	// upstream pages/create.ts は `pageEntityService.pack(page)` を返し、pack は
+	// 常に `user` (UserLite) を含む。pages/show と同じ経路で owner を付ける (#4121)。
+	// viewer を渡さない pack なので isLiked は出さない。
+	owner := user
+	if h.userSource != nil {
+		if bundle, oerr := h.userSource.ShowByID(p.UserID); oerr == nil && bundle != nil && bundle.User != nil {
+			owner = bundle.User
+		}
+	}
+	return c.JSON(http.StatusOK, h.pageToMapWithOwner(p, owner, nil))
+}
+
+// nilIfEmpty returns nil for an empty eyeCatchingImageId.
+//
+// 空文字は本家の paramDef (misskey:id) が拒否するが、検証を飛ばす大きな body では
+// handler まで届く。eyeCatchingImageId には drive_file への外部キーがある (000139)
+// ので、空文字を書くと外部キーの違反で 500 になる。画像の無い Page として NULL を
+// 書く (#3369)。
+func nilIfEmpty(s *string) *string {
+	if s == nil || *s == "" {
+		return nil
+	}
+	return s
 }
 
 // eyeCatchingImageOK reports whether imageID (when non-nil / non-empty) refers
@@ -343,7 +369,8 @@ func (h *Handler) Update(c echo.Context) error {
 		in.Summary = &req.Summary.Value
 	}
 	if req.EyeCatchingImageID.Present {
-		in.EyeCatchingImageID = &req.EyeCatchingImageID.Value
+		image := nilIfEmpty(req.EyeCatchingImageID.Value)
+		in.EyeCatchingImageID = &image
 	}
 	if req.Content != nil {
 		in.Content = req.Content
@@ -351,7 +378,7 @@ func (h *Handler) Update(c echo.Context) error {
 	if req.Variables != nil {
 		in.Variables = req.Variables
 	}
-	p, err := h.svc.Update(user.ID, req.PageID, in)
+	_, err := h.svc.Update(user.ID, req.PageID, in)
 	if err != nil {
 		switch {
 		case errors.Is(err, corepage.ErrPageNotFound):
@@ -367,9 +394,14 @@ func (h *Handler) Update(c echo.Context) error {
 		case errors.Is(err, corepage.ErrPageNameConflict):
 			return c.JSON(http.StatusBadRequest, apierr.Error("NAME_ALREADY_EXISTS", "The page name is already in use.", "2298a392-d4a1-44c5-9ebb-ac1aeaa5a9ab"))
 		}
+		if repository.IsRejectedValue(err) {
+			return apierr.JSONInvalidParam(c)
+		}
 		return apierr.JSONInternalError(c)
 	}
-	return c.JSON(http.StatusOK, h.pageToMap(p))
+	// 本家の pages/update は res を持たず、何も返さない (204)。以前はページを 200 で
+	// 返していたが、user が無く /api.json の宣言とも合わなかった (#4121)
+	return c.NoContent(http.StatusNoContent)
 }
 
 // DeleteRequest is the request body for pages/delete.
@@ -422,7 +454,7 @@ func (h *Handler) My(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -656,18 +688,6 @@ func (h *Handler) pagesToListForViewer(rows []*model.Page, ownerLookup func(user
 		out = append(out, h.pageToMapWithOwner(p, owner, &liked))
 	}
 	return out
-}
-
-// pageToMap delegates to entity.PackPage so the JSON shape (timestamp
-// format, field set) stays in sync between /api/pages/* and other places
-// that embed a page (e.g. pinnedPage on /api/i and /api/users/show).
-//
-// Use pageToMapWithOwner for list endpoints / detail views — they need
-// `page.user` populated or the frontend templates fail to render (#1134).
-// This bare variant remains for pinned-page embeds where the user context
-// is implicit (the embedding endpoint already returns the user separately).
-func (h *Handler) pageToMap(p *model.Page) map[string]any {
-	return entity.PackPage(p, h.idGen)
 }
 
 // pageToMapWithOwner enriches the page entity with `user` (UserLite) and

@@ -932,6 +932,20 @@ func TestUpdateFolder_HappyPath(t *testing.T) {
 	assert.Equal(t, "New", got.Name)
 }
 
+// An empty name leaves the folder name as it is, as upstream's
+// `if (ps.name)` does (#3369).
+func TestUpdateFolder_EmptyNameKeepsName(t *testing.T) {
+	svc, _, folderRepo := newSvc(t)
+	uid := "u1"
+	folderRepo.Folders["p"] = &model.DriveFolder{ID: "p", Name: "Old", UserID: &uid}
+
+	empty := ""
+	got, err := svc.UpdateFolder(&model.User{ID: "u1"}, "p", drive.UpdateFolderInput{Name: &empty})
+	require.NoError(t, err)
+	assert.Equal(t, "Old", got.Name)
+	assert.Equal(t, "Old", folderRepo.Folders["p"].Name)
+}
+
 func TestUpdateFolder_NotFound(t *testing.T) {
 	svc, _, _ := newSvc(t)
 	_, err := svc.UpdateFolder(&model.User{ID: "u1"}, "ghost", drive.UpdateFolderInput{})
@@ -1427,7 +1441,10 @@ func TestDeleteAllByHost_EmptyHost(t *testing.T) {
 // fakeObjectStorage stands in for a non-local backend. 実 S3 client は
 // テストから叩けないので、「ローカル FS ではない Storage」であることだけを
 // 満たす最小実装を使う。
+//
+// Upload は原本と代替画像を並行に書くので (#3996)、Put は同時に呼ばれうる。
 type fakeObjectStorage struct {
+	mu      sync.Mutex
 	objects map[string][]byte
 	deleted []string
 }
@@ -1441,11 +1458,15 @@ func (f *fakeObjectStorage) Put(accessKey string, body io.Reader) (string, error
 	if err != nil {
 		return "", err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.objects[accessKey] = b
 	return "https://cdn.example.test/" + accessKey, nil
 }
 
 func (f *fakeObjectStorage) Get(accessKey string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	b, ok := f.objects[accessKey]
 	if !ok {
 		return nil, drive.ErrObjectNotFound
@@ -1454,6 +1475,8 @@ func (f *fakeObjectStorage) Get(accessKey string) (io.ReadCloser, error) {
 }
 
 func (f *fakeObjectStorage) Delete(accessKey string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	delete(f.objects, accessKey)
 	f.deleted = append(f.deleted, accessKey)
 	return nil

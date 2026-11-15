@@ -116,8 +116,6 @@ func TestErrorPaths_CancelledContext(t *testing.T) {
 	// ad
 	_, err = NewAdRepository(db).ListActive(time.Now())
 	assert.Error(t, err)
-	_, err = NewAdRepository(db).List(10, 0)
-	assert.Error(t, err)
 
 	// auth_session
 	_, err = NewAuthSessionRepository(db).FindAppByID("x")
@@ -170,6 +168,10 @@ func TestErrorPaths_CancelledContext(t *testing.T) {
 	_, err = cr.HasUnreadFromUser("x", "y")
 	assert.Error(t, err)
 	_, err = cr.HasUnreadInRoom("x", "y")
+	assert.Error(t, err)
+	_, err = cr.UnreadFromUsers("x", []string{"y"})
+	assert.Error(t, err)
+	_, err = cr.UnreadInRooms("x", []string{"y"})
 	assert.Error(t, err)
 	_, err = cr.ListInvitationsByUser("x", false, "", "", 30)
 	assert.Error(t, err)

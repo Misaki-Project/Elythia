@@ -590,6 +590,17 @@ func (r *Resolver) fireNoteCreated(note *model.Note) {
 	safeGoFedHook(r.background, func() { r.noteChartHook.OnNoteCreated(note) })
 }
 
+// incrementAuthorNotesCount adds one to the author's notesCount after a
+// remote note has been stored in the database.
+func (r *Resolver) incrementAuthorNotesCount(userID string) {
+	if r.userRepo == nil {
+		return
+	}
+	if err := r.userRepo.IncrementNotesCount(userID, 1); err != nil {
+		slog.Warn("federation: failed to increment notesCount", "user", userID, "err", err)
+	}
+}
+
 // SetHashtagHook attaches a HashtagHook invoked after a remote note has
 // been ingested or updated, so the hashtag table mentionedUsersCount /
 // mentionedUserIds arrays stay in sync with /api/hashtags/list ranking
@@ -662,13 +673,13 @@ func (r *Resolver) resolveSuspensionChange(existing *model.User, actorSuspended 
 	if existing.IsSuspended == actorSuspended {
 		return false, false
 	}
-	// **削除済みの行には触らない** (#2973)。`admin/accounts/delete` は
-	// `isSuspended` と `isDeleted` を同時に立てるので、発信元由来の凍結が
-	// 残っている tombstone を発信元が解除できてしまう。inbound の gate は
-	// `isSuspended` と `isDeleted` の両方を見る (`processor.go` の dispatch 前
-	// チェック) が、ここで凍結を外させてはいけない。読み取り側 (packer や
-	// timeline) は `isSuspended` を見て隠すので、外れると削除したアカウントが
-	// 見えるようになる。
+	// **削除済みの行には触らない** (#2973)。削除した利用者の状態は、発信元では
+	// なくモデレーターが決める。リモートの利用者の削除は、#4106 から本家と同じく
+	// `isDeleted` だけを立てるが、それより前の削除と、凍結してから削除した行には
+	// 凍結が立っている。この凍結を外すのは管理画面の解除だけにする (発信元が
+	// 外せると、読み取り側 (packer や timeline) が `isSuspended` で隠していた
+	// アカウントが、モデレーターの知らないうちに見えるようになる)。inbound の
+	// gate は `isDeleted` を見て、削除済みの行から届くものを捨てる。
 	if existing.IsDeleted {
 		return false, false
 	}

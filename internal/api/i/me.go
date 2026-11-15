@@ -110,9 +110,9 @@ func (h *Handler) me(c echo.Context, allowSecrets bool) error {
 	// memo / moderationNote は UserDetailed.Memo (omitempty) / MeDetailed
 	// memo は PackMeDetailed (UserDetailed.Memo, #1259) が null で乗せるので
 	// override 不要。moderationNote は golden で `moderationNote?: string`
-	// (optional・null 不可、moderator が他者を見るとき専用) なので self-view
-	// (/api/i) では出さない。旧実装は `resp["moderationNote"]=nil` で null を出し
-	// golden 非互換だった (#1270 L3 で検出)。
+	// (optional・null 不可) なので null は出さない。旧実装は
+	// `resp["moderationNote"]=nil` で null を出し golden 非互換だった (#1270 L3 で
+	// 検出)。self が moderator のときは下で '' か本人の値を出す (#2094)。
 	// isSilenced は role policy 由来 (MeDetailed/UserDetailedNotMe 共通 field)。
 	// PackUserDetailed も Packer の silenced lookup で同値を埋めるが、/api/i は
 	// handler 層の roleProvider を権威ソースとして明示的に上書きする (両者とも
@@ -207,9 +207,8 @@ func (h *Handler) me(c echo.Context, allowSecrets bool) error {
 // 消えてしまう。
 func (h *Handler) rolePayload(userID string) (isAdmin bool, isMod bool, policies map[string]any, roles []any) {
 	policies = role.DefaultPolicies()
+	isAdmin, isMod = h.roleFlags(userID)
 	if h.roleProvider != nil {
-		isAdmin = h.roleProvider.IsAdministrator(userID)
-		isMod = h.roleProvider.IsModerator(userID)
 		policies = h.roleProvider.GetUserPolicies(userID)
 		if rs, err := h.roleProvider.GetUserRoles(userID); err == nil {
 			// 公開ロールだけを表示順に並べる (#3240)。本家 UserEntityService も
@@ -246,6 +245,15 @@ func (h *Handler) rolePayload(userID string) (isAdmin bool, isMod bool, policies
 	return isAdmin, isMod, policies, roles
 }
 
+// roleFlags resolves isAdmin / isModerator of MeDetailed for the given user
+// (false for both when the role provider is unwired).
+func (h *Handler) roleFlags(userID string) (isAdmin bool, isMod bool) {
+	if h.roleProvider == nil {
+		return false, false
+	}
+	return h.roleProvider.IsAdministrator(userID), h.roleProvider.IsModerator(userID)
+}
+
 // meDetailedWithUnread packs a MeDetailed for self-view stream/return paths
 // (i/update, meUpdated) and enriches it with authoritative unread values via
 // fillUnreadFields. Raw PackMeDetailed would emit the struct defaults
@@ -253,12 +261,24 @@ func (h *Handler) rolePayload(userID string) (isAdmin bool, isMod bool, policies
 // which the frontend's updateCurrentAccount would merge into `$i`,
 // clobbering the real badge/unread state. Going through fillUnreadFields keeps
 // those fields correct on every path (the same shape /api/i returns).
+// isAdmin / isModerator are filled the same way as /api/i (#4168).
 func (h *Handler) meDetailedWithUnread(ctx context.Context, u *model.User, profile *model.UserProfile) map[string]any {
 	me := h.entityPacker.PackMeDetailed(u, profile, h.idGen)
+	// packer は movedTo / alsoKnownAs を null のまま残すので、/api/i (Me) と同じく利用者の ID に
+	// 解決して入れる。i/update の応答と meUpdated は frontend が `$i` にそのまま merge するので、
+	// 解決しないと null で上書きされ、/api/i と食い違う (#4059)
+	me.ResolveMoveTargets(u, h.resolveUserIDByURI)
 	b, _ := json.Marshal(me)
 	resp := map[string]any{}
 	_ = json.Unmarshal(b, &resp)
 	h.fillUnreadFields(ctx, u, resp)
+	// isAdmin / isModerator は packer が role を知らず false のまま出すので、/api/i と
+	// 同じ値で埋める。meUpdated (フォロー申請の受信や 2FA の変更で流れる) は frontend が
+	// `$i` に merge して保存するので、false のままだと管理者・モデレーターのメニューから
+	// コントロールパネルが消え、保存された値で読み込み直すと管理画面が 404 になる (#4168)。
+	isAdmin, isMod := h.roleFlags(u.ID)
+	resp["isAdmin"] = isAdmin
+	resp["isModerator"] = isMod
 	// policies / roles はここでは足さない。この helper は meUpdated
 	// (ストリーミングの部分更新) でも使われ、そこに policies を混ぜると
 	// frontend の updateCurrentAccount が `$i.policies` を空で clobber

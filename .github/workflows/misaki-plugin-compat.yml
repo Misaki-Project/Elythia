@@ -42,10 +42,10 @@ jobs:
             'fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8' \
             'hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git 820068d720654650d5dc05d4136ad9f32f677fef' \
             | GOWORK=off go run ./tools/pluginresolve
-      - name: Vet, race tests and build every production plugin
+      - name: Vet, race tests and build production plugins and selected Fx
         run: |
           set -euo pipefail
-          for dir in plugins/rolelevel plugins/genshin plugins/fedwatch plugins/hsr; do
+          for dir in plugins/rolelevel plugins/genshin plugins/fedwatch plugins/hsr plugins/fxtwitter-preview; do
             (
               cd "$dir"
               # 外部プラグインの依存台帳は本体SDKのreplaceに合わせて準備する。
@@ -68,7 +68,7 @@ jobs:
         with:
           node-version-file: frontend/.node-version
       - name: Generate plugin frontend wiring
-        run: GOWORK=off go run ./tools/pluginbuild
+        run: GOWORK=off go run ./tools/pluginbuild -include-disabled-dir plugins/fxtwitter-preview
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
@@ -78,8 +78,14 @@ jobs:
           set -euo pipefail
           # vitest設定も生成済みi18nを参照するため、workspace全体を先にビルドする。
           pnpm build
-          pnpm --filter frontend exec vitest run --config vitest.config.plugins.ts
+          pnpm --filter frontend exec vitest run --globals --config vitest.config.plugins.ts --maxWorkers=1
           pnpm --filter frontend exec vitest run --config vitest.config.unit.ts test/unit/game-ranking-pages.test.ts test/unit/game-ranking-ui.test.ts test/unit/hsr-policy.test.ts
+      - name: Check selected Fx frontend source
+        run: |
+          set -euo pipefail
+          node plugins/fxtwitter-preview/frontend/check-frontend.mjs lint
+          node plugins/fxtwitter-preview/frontend/check-frontend.mjs spdx
+          pnpm --dir frontend/packages/frontend exec vue-tsc --noEmit -p ../../../plugins/fxtwitter-preview/frontend/tsconfig.json
       - name: Check integrated production frontend
         working-directory: frontend
         run: |

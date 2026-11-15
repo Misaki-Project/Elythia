@@ -11,8 +11,8 @@
 ```
 plugins/myplugin/
 ├── elythia-plugin.yml  これがあるものだけがプラグインとして扱われる
-├── go.mod              **必須**
-├── plugin.go
+├── go.mod              backend plugin では必須
+├── plugin.go           backend plugin では必須
 └── frontend/           UI が要る場合だけ
     └── index.ts
 ```
@@ -26,14 +26,18 @@ apiVersion: 1
 
 `apiVersion` はコンパイル前に検査される。合わないとビルドが止まり、理由が出る。
 
+Go側のcallbackを持たずフロントだけを配布する場合は `frontendOnly: true` を指定し、
+`frontend/index.ts` を置く。この場合、Go moduleや`plugin.go`は作らず、frontend bundle
+だけに含める。
+
 `disabled: true` を書くとビルドから除外される（詳細は[運営者向け](operating.md)）。この判定は `apiVersion` の検査より先に行われるので、ビルドが通らない状態のプラグインでも無効化はできる。
 
-### `go.mod`
+### `go.mod`（サーバープラグイン）
 
 ```
 module github.com/you/elythia-plugin-myplugin
 
-go 1.27.3
+go 1.27.4
 
 require github.com/elythia-network/elythia v0.0.0
 
@@ -42,7 +46,7 @@ replace github.com/elythia-network/elythia => ../..
 
 **`replace` は要る。** `make build` は生成される `go.work` で解決できるが、**`make plugin-test` は `GOWORK=off` で回す**ので、これが無いと `missing go.sum entry` で落ちる。同梱プラグインは全部この形。
 
-**独立した Go module である必要がある。** これは形式ではなく、Go の internal ルールにより「Elythia の内部パッケージを import できない」ことを保証する仕組み。`go.mod` を持たないディレクトリはビルド時にエラーになる。
+**サーバープラグインは独立した Go module である必要がある。** これは形式ではなく、Go の internal ルールにより「Elythia の内部パッケージを import できない」ことを保証する仕組み。`frontendOnly: true` のプラグインには Go module を置かない。
 
 依存を足すときは自分の module の中で `go get` する。**リポジトリのルートで `go mod tidy` を走らせないこと** — 生成物 `cmd/elythia/plugins_generated.go` が各プラグインのモジュール (上の例では `github.com/you/elythia-plugin-myplugin`) を import しており、private repo だと解決に失敗する。
 
@@ -119,8 +123,11 @@ return plugin.Blob{
 	ContentType:  "image/png",
 	Body:         data,
 	CacheControl: "public, max-age=86400",
+	WriteTimeout: 5 * time.Second,
 }, nil
 ```
+
+`WriteTimeout` はレスポンス本文の書き込み期限を指定する。0 は既存の書き込み期限設定を変更しない、正の値は host が書き込み期限として適用し、負の値は不正な設定として拒否する。
 
 主な用途は画像のプロキシ。本体の CSP は `img-src` を `'self' data: blob:` + 固定 2 host (upstream のクレジットページ用、#2892) に絞っているので、**プラグインが指す外部の画像は `<img>` で直接読めない**。同一オリジンで配信すれば CSP を緩めずに済む。
 
@@ -230,7 +237,7 @@ if res.Role.Target == "conditional" {
 return res.Assigned, nil
 ```
 
-`roles/assignment-show`では条件つきロールの有効判定はできない。認証済みの呼び出し元の有効な手動・条件つきロールIDを列挙する場合は、`req`を任意拡張の`plugin.ActiveRoleRequest`へ型アサーションして`ActiveRoleIDs()`を呼ぶ。未認証なら空の一覧を返し、取得に失敗した場合はIDを返さずエラーになる。未実装またはエラーの場合、ロールに応じたアクセスや制限を緩めず失敗として扱うこと。既存の`plugin.Request`に必須メソッドは増えない。詳細は[ホストのメディア契約](host-media.md)を参照。
+条件つきロールまで含めた実効的な判定は用意していない。条件式の評価は利用者ごとに全ロールを読み込む必要があり、この API の利点である「1 回引くだけで終わる」性質が失われるため。
 
 非公開ロールで `roles/assignment-show` を使うと、**付与されていない利用者には `NO_SUCH_ROLE`** が返る（存在の有無を漏らさないため）。条件つきかつ非公開のロールは、条件を満たす利用者にもこうなる。`admin/roles/assignment-show` にこの秘匿は無く、モデレーター以上なら非公開ロールも読める。
 
@@ -345,6 +352,8 @@ func retryUnlessClientError(err error) error {
 | `NotificationFollowRequest` | フォローリクエストが来た (承認制のとき) | (空) |
 | `NotificationReaction` | 投稿にリアクションされた (`Reaction` に絵文字) | リアクションされた投稿 |
 | `NotificationChatMessage` | 1:1 のチャットでメッセージが来た (`ChatMessageID`) | (空) |
+| `NotificationReversiInvited` | リバーシに招待された、またはランダムマッチで対局が組まれた (`GameID`) | (空) |
+| `NotificationReversiGame` | 対局者になっている対局が進んだ (`GameID`、`GameEvent`) | (空) |
 
 `UserID` は相手 (メンションした人・フォローした人・送った人。リモートの利用者のこともある)。`NoteVisibility` は mention / reply / quote のときだけ、通知を作った時点の投稿の公開範囲 (`public` / `home` / `followers` / `specified`) が入る (リアクションでは空)。**`specified` (ダイレクト) の投稿に公開の返事をしないこと** — 宛先の外へ本文が漏れる。本文などの中身は渡さないので、要るなら `AsUser(ev.AccountID)` で `notes/show` などを呼んで取る。その時点の可視性で判定されるので、消された投稿は取れない。
 
@@ -369,6 +378,75 @@ func retryUnlessClientError(err error) error {
 
 テストは `plugintest` の `Notifications` と `Notify` で、handler へ直接届けられる ([テスト](#テスト))。
 
+### リバーシ
+
+管理するアカウントでリバーシを遊べる (#3942)。招待と対局の進みは通知で届き、手は REST で打つ。管理するアカウントは streaming に繋げないので、本家のクライアントが websocket (`reversiGame` チャンネル) で送る操作を、同じ条件で受ける REST の入口を Elythia が足している。
+
+```go
+// onReversi は通知の handler から、リバーシの通知のときに呼ぶ。どの通知でも対局を
+// 読み直し、そのとき要ることをする (準備していなければ準備し、自分の番なら打つ)。
+// 招待の通知が届かなかったとき (ミュートした相手とランダムマッチで組まれたなど) や、
+// bot から招待した対局でも、対局の進みの通知で同じように動ける
+func onReversi(c context.Context, ctx plugin.Context, ev plugin.Notification) error {
+	bot := ctx.API().AsUser(ev.AccountID)
+	game, err := bot.Call(c, "reversi/show-game", map[string]any{"gameId": ev.GameID})
+	if err != nil {
+		return retryUnlessClientError(err) // 取り消された対局は 4xx
+	}
+	// 招待された側 (user2Id が自分) なら受ける。ランダムマッチで組まれた対局は、待って
+	// いた自分が user1Id なので受けなくてよい (受けると相手への新しい招待を作ることがある)
+	if ev.Type == plugin.NotificationReversiInvited && isInvitee(game, ev.AccountID) {
+		if _, err := bot.Call(c, "reversi/match", map[string]any{"userId": ev.UserID}); err != nil {
+			return retryUnlessClientError(err)
+		}
+	}
+	if needsReady(game, ev.AccountID) { // 始まっていなくて、自分がまだ準備していない
+		_, err := bot.Call(c, "reversi/ready", map[string]any{"gameId": ev.GameID, "ready": true})
+		return retryUnlessClientError(err)
+	}
+	pos, ok := chooseMove(game, ev.AccountID) // 始まっていて自分の番なら、置く場所を決める
+	if !ok {
+		return nil
+	}
+	_, err = bot.Call(c, "reversi/put-stone", map[string]any{"gameId": ev.GameID, "pos": pos})
+	return retryUnlessClientError(err) // 盤面が古くて打てない手は NOT_YOUR_TURN / INVALID_MOVE (4xx)
+}
+```
+
+使う endpoint:
+
+| endpoint | すること |
+|---|---|
+| `reversi/match` | 招待を受ける (`userId` に招待した相手)。本家と同じ |
+| `reversi/ready` | 準備完了を切り替える (`gameId`、`ready`)。両者がそろうと始まる。Elythia の追加 |
+| `reversi/put-stone` | 石を置く (`gameId`、`pos`。`id` は任意で、stream の `log` にそのまま載る)。手番でない・置けない場所は `NOT_YOUR_TURN` / `INVALID_MOVE` で断る。Elythia の追加 |
+| `reversi/claim-time-is-up` | 相手の手番の時間切れを申告する (`gameId`)。時間が残っていれば何もしない。Elythia の追加 |
+| `reversi/show-game` | 対局を読む。盤面は `logs` と `map` から組み立てる。本家と同じ |
+| `reversi/surrender` / `reversi/cancel-match` | 投了 / 始まる前の取り消し。本家と同じ |
+
+`ev.GameEvent` の値 (`plugin.ReversiGame*`) は、対局の stream に出るイベントと同じ:
+
+| 値 | いつ |
+|---|---|
+| `ReversiGameReadyStates` | どちらかが準備完了を切り替えた |
+| `ReversiGameSettings` | 始まる前に設定 (盤面など) が変わった。両者の準備完了は外れる |
+| `ReversiGameStarted` | 両者がそろって始まった |
+| `ReversiGameLog` | どちらかが石を置いた (自分の手でも届く) |
+| `ReversiGameEnded` | 終局した (置ける所が無くなった・投了・時間切れ) |
+| `ReversiGameCanceled` | 始まる前に取り消された。対局は消えているので `reversi/show-game` は失敗する |
+
+決まっていること:
+
+- **中身は載せない。** 盤面や手番は `reversi/show-game` で読み直す。通知は順序どおりとは限らず、同じものが二度届くこともあるので、届いた順に手を数えない
+- `UserID` は、招待では招待した相手、対局では対局の相手 (自分の手で起きたイベントでも相手)
+- **招待は、ミュート・ブロックしている相手からは届かない** (チャットと同じ判定)。対局の進みは、始めた対局なので相手をミュートしていても届く
+- 招待はこのサーバーの利用者からのものも、連合で届くものも同じに届く。連合の相手が招待を送り直しても、届くのは対局ごとに 1 回
+- 1 手ごとに `log` が届くので、両方の対局者を bot にすると、キューの handler が交互に呼ばれ続ける。手を打つ処理は短く保ち、時間のかかる探索はジョブに分ける ([ジョブ](#ジョブ))
+- **同じ対局の手は本体が直列にする。** handler は並行に動く (キューは同時に 2 本) ので、2 つの通知が同じ手番を見て両方が `reversi/put-stone` を呼ぶことがある。本体は対局ごとに手を 1 つずつ処理し、後から来た手は最新の盤面で確かめ直す。手番でなければ `NOT_YOUR_TURN`、置けなければ `INVALID_MOVE` で断る。相手がパスして自分の番が続いていれば、古い盤面で選んだ手でも置ける場所なら通る。投了も同じ順番に並ぶ
+- **bot から招待したときは、相手が受けたことを知らせる通知は無い。** 相手が準備すると `ReversiGameReadyStates` が届くので、そこで読み直して準備する (上の例の形)
+- **ランダムマッチ (`reversi/match` を `userId` 無しで呼ぶ) は、組まれるまで 10 秒ごとに呼び直す。** 待機列は呼び直し (heartbeat) が 15 秒途切れると消え、個々の待機は 30 秒で古いとみなされる。組まれると、待っていた側に `NotificationReversiInvited` が届く
+- **ランダムマッチの相手はミュート・ブロックを見ない** (本家と同じ)。ミュート・ブロックした相手と組まれると、招待の通知は届かないが、対局の進みの通知は届く
+
 ## ジョブ
 
 ```go
@@ -380,6 +458,8 @@ func jobs(ctx plugin.Context, j plugin.Jobs) error {
 	return nil
 }
 ```
+
+**ジョブ名は `^[A-Za-z0-9][A-Za-z0-9_-]*$` に合うこと** (英数字で始まり、英数字・ハイフン・アンダースコアだけ)。`_` で始まる名前 (`_peer`・`_notification` など) は本体が peer と通知の受け渡しに使う予約名で、プラグインは使えない。**規則に合わない名前を `Handle` や `Schedule` に渡すと、プラグインの設定の失敗として起動が失敗する** (#3369。以前は `daily.sync` のような名前でも `Handle` と `Schedule` は通り、`ctx.Queue()` で積むときだけ失敗していた)。同じ名前を `Handle` に 2 回渡しても、同じく起動が失敗する。
 
 task type は `plugin:<name>:<job>` として名前空間が付き、**プラグインごとの専用キュー
 `plugin:<name>`** で動く。遅い処理が連合の配送を止めることはないし、他のプラグインの
@@ -522,7 +602,7 @@ instance/server capはplugin集約の後に適用する。`chunkedUploadMaxConcu
 
 `Resolve`は、明示的なinvalidationの間は`UserID`、sorted active `RoleIDs`、`ActiveAssignments`だけで結果が決まる純粋関数として実装する。時刻、request固有情報、未通知の外部状態へ依存してはならない。**同じ`RoleIDs`でも`ActiveAssignments`が違えば結果が違ってもよい**ので、hostはproviderごとの成功結果cache keyにassignment IDを含める（付け外し / 再割り当ての直後に前の結果を返さないため）。cacheはoperator設定`effectivePolicyProviderCacheEntries`（既定10000件、providerごと）のLRUであり、eviction時は同じ入力を再解決する。
 
-plugin独自の書き込みでpolicy入力が変わった場合は、永続化のcommit成功後にだけ`inv.InvalidateUser`または`inv.InvalidateRole`を呼ぶ。失敗結果はcacheしない。in-flightの古いnative role/provider結果はinvalidation後のrequestへ返さず、cacheにも戻さない。conditional roleの対象userはassignment rowから列挙できないため、role invalidationは全userのrole/policy cacheを保守的に破棄する。匿名（空`UserID`）にはper-user invalidationが無いため、匿名結果に影響する状態変更では`InvalidateRole`を使う。
+plugin独自の書き込みでpolicy入力が変わった場合は、永続化のcommit成功後にだけ`inv.InvalidateUser`または`inv.InvalidateRole`を呼ぶ。provider失敗の結果はcacheしない。in-flightの古いnative role/provider結果はinvalidation後のrequestへ返さず、cacheにも戻さない。conditional roleの対象userはassignment rowから列挙できないため、role invalidationは全userのrole/policy cacheを保守的に破棄する。匿名（空`UserID`）にはper-user invalidationが無いため、匿名結果に影響する状態変更では`InvalidateRole`を使う。
 
 ## 設定
 
@@ -764,7 +844,9 @@ r.POST("/admin/stats", func(req plugin.Request) (any, error) {
 
 ### レート制限は一律の既定値
 
-本体の per-endpoint テーブルはプラグインのパスを持たないので、**登録したルートには一律の既定の上限が掛かる**（`internal/server/middleware/ratelimit_defs.go` の `PluginRouteDefaultLimit`、10 分に 600 回）。数えるのはルート（パスの型）ごとに、本体の endpoint と同じ単位（ログインしていれば利用者とIP、していなければIP）。超えると本体と同じ 429 `RATE_LIMIT_EXCEEDED` になる。`plugin.Router` には上限を宣言する口が無いので、ルートごとに値を変えることはできない。peer の受け口（`_peer`）には掛からない（専用の上限がある）。管理者が `disableEndpointRateLimits` で本体の上限を切ると、これも切れる。
+本体の per-endpoint テーブルはプラグインのパスを持たないので、**登録したルートには一律の既定の上限が掛かる**（`internal/server/middleware/ratelimit_defs.go` の `PluginRouteDefaultLimit`、10 分に 600 回）。数えるのはルート（パスの型）ごとに、本体の endpoint と同じ単位（ログインしていれば利用者とIP、していなければIP。ロールの `rateLimitFactor` が 0 以下の利用者は、本家と同じく利用者では数えずIPだけで数える。#4143）。超えると本体と同じ 429 `RATE_LIMIT_EXCEEDED` になる。`plugin.Router` には上限を宣言する口が無いので、ルートごとに値を変えることはできない。peer の受け口（`_peer`）には掛からない（専用の上限がある）。管理者が `disableEndpointRateLimits` で本体の上限を切ると、これも切れる。
+
+**`r.GET` で登録したルートは HEAD にも応える**（本家の Fastify と同じ。#3925）。`plugin.Request` はメソッドを持たないので、handler は HEAD を見分けられず、GET と同じく最後まで動く（返した本文は本体が捨てる）。状態を変える処理は GET に置かず、POST にする。
 
 この値は叩き続けるものを止めるためのもので、重い処理（画像の生成、外部への問い合わせ、集計クエリ）を守るには緩い。そういう処理は自分でも持つこと。素直なのは結果をキャッシュすることで、`Storage()` に置くか、プロセス内に持つ。
 
@@ -805,6 +887,22 @@ const abortable = host.api<T>('plugin/myplugin/preview', { url }, {
 **POST 固定。** 利用者のセッションがそのまま使われる。第3引数の`signal`へ
 `AbortSignal`を渡すと、画面の破棄などに合わせてリクエストを中止できる。
 
+ブラウザからプラグインのHTTP routeを呼ぶ場合は `host.fetch` を使う。
+パスは `/api/plugin/<自分のプラグイン名>/...` に限られ、同一オリジンと利用者の
+セッションを使う。外部URLへの通信には使えない。
+
+```ts
+const response = await host.fetch(`/api/plugin/${host.name}/media/${id}`, {
+	signal,
+});
+if (!response.ok) throw new Error(`media request failed: ${response.status}`);
+const blob = await response.blob();
+await host.openMedia([{ id, type: 'image', blob, alt: 'Preview' }], id);
+```
+
+`openMedia` はブラウザで表示できる画像・音声・動画MIMEだけを受け取り、ホストの
+メディアビューアへ渡す。表示用URLはビューアを閉じたときに解放される。
+
 ### プレビュー provider
 
 ノート内のURLカードをプラグイン独自の表示へ差し替える場合は、`setup`で
@@ -828,11 +926,55 @@ host.preview.register({
 - `id`はプラグイン内の名前で、hostが`<plugin名>:<id>`へ名前空間化する。同じ名前空間付きIDを二重登録すると例外になる。
 - `requiresDetail: true`に一致したURLは、タイムラインでは既存カードを取得せず元URLのリンクとして表示する。詳細画面かつCW展開済み・active・表示領域内になってから`load`を呼ぶ。
 - `load`には中止用の`AbortSignal`を渡す。取得中に非active・画面外・unmountになった場合は中止される。取得済みの表示は同じノートが所有する間、非activeや画面外になっても保持される。
-- `load`、読み込み表示、または本表示の描画に失敗した場合は元URLのリンクへ閉じ、別providerや既存URLカードへは戻らない。同じ所有キー（provider・URL・note source・detail）のままノートを表示している間は、viewport・タブ・KeepAliveへの復帰だけでは再試行しない。所有キーが変わる、CWを閉じて再展開する、または再mountされる（ノートを開き直す・ページを再読み込みする）場合は再試行する。
+- `load`、読み込み表示、または本表示の描画に失敗した場合、`presentation`のあるproviderは既存カードと再試行ボタンに戻り、それ以外は元URLのリンクへ閉じる。失敗したproviderを自動では再試行しない。所有キーが変わる、CWを閉じて再展開する、再mountされる、または利用者が再試行ボタンを押すと、もう一度取得する。
+
+`preferenceKey` を指定すると、既存のユーザー設定値を `context.preferenceValue` として
+受け取れる。`presentation` は `automatic`（既定）、`manual`、`disabled` のどれかを
+返す関数で、manualならユーザーが押すまで取得せず、disabledならproviderを呼ばない。
+再試行はホスト側のボタンから行われる。`manualLabel` は手動表示ボタンの文言を指定する。
+`disabled`では安全な元URLリンクを表示し、既存URLカードの取得も行わない。標準URLカードを残して展開操作を待つ場合は`manual`を使う。manualでは標準URLカードと展開ボタンを表示し、押された後にproviderを取得する。
+
+### 貼り付け変換
+
+投稿フォームへ貼り付けられたプレーンテキストに同期変換を登録できる。
+登録IDはプラグイン内で一意にし、変換は同期的に文字列を返すこと。
+
+```ts
+host.postForm.registerPasteTransform('normalize-example', text => text.trim());
+```
+
+複数登録は名前空間付きIDの順に適用する。変換が例外を投げる、または文字列以外を
+返した場合は、その変換前のテキストを保って貼り付けを続ける。`enabledPreferenceKey`
+で既存のboolean設定値を指定でき、設定が明示的にfalseの場合は変換を飛ばす。
+`notification`にはローカライズ済みメッセージを返す関数を渡せる。テキストが変わった
+貼り付け時に関数を呼ぶため、現在の言語設定に合わせられる。関数が失敗しても貼り付けは続く。
 
 現在providerを接続しているのは`MkNote` / `MkNoteDetailed`のURLだけで、チャット、
 URLプレビューポップアップ、ページ本文などは対象外。`PreviewInput`の`file`は将来の
 接続用に型だけを定義しており、現時点でfile入力を渡す画面は無い。
+
+### checked role policy
+
+HTTP routeでは `plugin.CheckedRolePolicyRequest`、バックグラウンド処理では
+`plugin.CheckedUserRolePolicyContext` に型アサーションして使う。指定したpolicy keyだけが
+返り、認可に関わるroleやproviderの解決に失敗した場合はerrorになる。認可判断に使うときは
+errorを許可扱いせず、fail closedにすること。
+
+条件付きロール評価の入力取得に失敗したsnapshotは、DB読み出しの連続を抑えるため最大1秒だけnegative cacheされる（best-effort）。成功分を含むrole cache全体が1024件以上なら、新しいerror entryは保存しない。既存キーの更新は許可される。飽和時は読み直しが残る場合がある。checked resolverはcache hitでも元の入力エラーを返し、providerを実行しない。入力が回復すればcache expiry後に再試行し、`InvalidateUser` / `InvalidateRole`による明示的な無効化はすぐ反映される。部分入力から得たprovider出力はcacheされない。
+
+```go
+checked, ok := req.(plugin.CheckedRolePolicyRequest)
+if !ok {
+	return nil, plugin.Errorf(http.StatusServiceUnavailable, "role policy check unavailable")
+}
+policies, err := checked.CheckedRolePolicies("policyKeyUsedByThisRoute")
+if err != nil {
+	return nil, plugin.Errorf(http.StatusServiceUnavailable, "role policy check unavailable")
+}
+if policies["policyKeyUsedByThisRoute"] != true {
+	return nil, plugin.Errorf(http.StatusForbidden, "not allowed")
+}
+```
 
 ## 他のインスタンスとやりとりする
 
@@ -1219,6 +1361,10 @@ type Context interface
   Go(func())
   GoContext(func(context.Context))
 
+type CheckedUserRolePolicyContext interface
+  Context
+  CheckedUserRolePolicies(string, ...string) (map[string]any, error)
+
 type Peer interface
   Send(context.Context, string, any) (string, error)
   Handle(PeerHandler)
@@ -1257,9 +1403,11 @@ type Request interface
   IsModerator() bool
   IsAdministrator() bool
 
-type ActiveRoleRequest interface
+func BindStrict(Request, any) error
+
+type CheckedRolePolicyRequest interface
   Request
-  ActiveRoleIDs() ([]string, error)
+  CheckedRolePolicies(...string) (map[string]any, error)
 
 type Storage interface
   DB() *sql.DB
@@ -1311,6 +1459,15 @@ const NotificationFollow
 const NotificationFollowRequest
 const NotificationReaction
 const NotificationChatMessage
+const NotificationReversiInvited
+const NotificationReversiGame
+
+const ReversiGameReadyStates
+const ReversiGameSettings
+const ReversiGameStarted
+const ReversiGameLog
+const ReversiGameEnded
+const ReversiGameCanceled
 
 type Notification struct
   ID            string
@@ -1321,12 +1478,14 @@ type Notification struct
   Reaction      string
   NoteVisibility string
   ChatMessageID string
+  GameID        string
+  GameEvent     string
   CreatedAt     time.Time
 
 type Handler func(Request) (any, error)
 type JobHandler func(context.Context, json.RawMessage) error
 type Migration struct { Version int; SQL string }
-type Blob struct { ContentType string; Body []byte; CacheControl string }
+type Blob struct { ContentType string; Body []byte; CacheControl string; WriteTimeout time.Duration }
 type StatusError struct { Status int; Message string }
 type APIError struct { Endpoint string; Status int; Body json.RawMessage }
 
@@ -1350,15 +1509,20 @@ definePlugin({ name, pages?, setup })
 host.slot(name, renderer)
 host.preview.register(provider)
 host.api<T>(endpoint, params, { signal? })
+host.fetch(path, options?)
+host.openMedia(items, initialId?)
+host.postForm.registerPasteTransform(id, transform, options?)
 
 PluginPage: { path, component, navTitle?, navIcon?, admin? }
 
 型: SlotName / SlotUser / SlotContext / SlotMount / SlotComponent / SlotRenderer
     PluginPage / PageRegistration / PluginUser / PreviewInput / PreviewContext
-    PreviewProvider / PreviewRegistration
+    PreviewPresentation / PreviewProvider / PreviewRegistration
+    PasteTextTransform / PasteTextTransformOptions / PluginMediaItem
 関数: getUsers(ids)
 再公開: MkInput / MkButton / MkFolder / MkLoading
         MkSelect / MkSwitch / MkAvatar / MkUserName / MkTime / PageWithHeader
+        MkA / MkUrl
         useMkSelect / definePage
         MkPluginSecrets (秘密の値の入力欄。props: plugin)
 ```

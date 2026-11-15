@@ -11,7 +11,8 @@
 // ones are the paramDef's required list. An endpoint whose paramDef has anyOf
 // has a union as its request type; each branch picks the member that requires
 // the branch's required properties and has the two checks, and one more checks
-// that the members picked make up the whole union.
+// that the members picked make up the whole union. The checks take the
+// property names of each type of a union, not only the common ones.
 // tsc fails on a mismatch.
 
 import type { ElythiaEndpoints } from './endpoints.js';
@@ -19,9 +20,11 @@ import type { ElythiaEndpoints } from './endpoints.js';
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
 type Check<T extends true> = T;
 type Req<E extends keyof ElythiaEndpoints> = NonNullable<ElythiaEndpoints[E]['req']>;
-// An index signature (misskey-js's EmptyRequest) names no property.
-type Keys<T> = string extends keyof T ? never : keyof T;
-type RequiredKeys<T> = { [K in Keys<T>]-?: Partial<Pick<T, K>> extends Pick<T, K> ? never : K }[Keys<T>];
+// An index signature (misskey-js's EmptyRequest) names no property. Both take
+// each type of a union on its own: keyof of a union names only the common
+// properties, so a property one type alone has would pass.
+type Keys<T> = T extends unknown ? (string extends keyof T ? never : keyof T) : never;
+type RequiredKeys<T> = T extends unknown ? { [K in Keys<T>]-?: Partial<Pick<T, K>> extends Pick<T, K> ? never : K }[Keys<T>] : never;
 type Member<T, K extends PropertyKey> = Extract<T, Record<K, unknown>>;
 
 export type ParamDefChecks = [
@@ -170,6 +173,8 @@ export type ParamDefChecks = [
 	Check<Equal<RequiredKeys<Req<'chat/unread-count'>>, never>>,
 	Check<Equal<Keys<Req<'drive/files/create-chunked/abort'>>, 'uploadId'>>,
 	Check<Equal<RequiredKeys<Req<'drive/files/create-chunked/abort'>>, 'uploadId'>>,
+	Check<Equal<Keys<Req<'drive/files/create-chunked/append'>>, 'chunk' | 'index' | 'uploadId'>>,
+	Check<Equal<RequiredKeys<Req<'drive/files/create-chunked/append'>>, 'chunk' | 'index' | 'uploadId'>>,
 	Check<Equal<Keys<Req<'drive/files/create-chunked/finish'>>, 'uploadId'>>,
 	Check<Equal<RequiredKeys<Req<'drive/files/create-chunked/finish'>>, 'uploadId'>>,
 	Check<Equal<Keys<Req<'drive/files/create-chunked/start'>>, 'comment' | 'folderId' | 'force' | 'isSensitive' | 'name' | 'size'>>,
@@ -190,6 +195,12 @@ export type ParamDefChecks = [
 	Check<Equal<RequiredKeys<Req<'i/flashs/likes'>>, never>>,
 	Check<Equal<Keys<Req<'i/update-federation'>>, 'federationStatus'>>,
 	Check<Equal<RequiredKeys<Req<'i/update-federation'>>, 'federationStatus'>>,
+	Check<Equal<Keys<Req<'reversi/claim-time-is-up'>>, 'gameId'>>,
+	Check<Equal<RequiredKeys<Req<'reversi/claim-time-is-up'>>, 'gameId'>>,
+	Check<Equal<Keys<Req<'reversi/put-stone'>>, 'gameId' | 'id' | 'pos'>>,
+	Check<Equal<RequiredKeys<Req<'reversi/put-stone'>>, 'gameId' | 'pos'>>,
+	Check<Equal<Keys<Req<'reversi/ready'>>, 'gameId' | 'ready'>>,
+	Check<Equal<RequiredKeys<Req<'reversi/ready'>>, 'gameId' | 'ready'>>,
 	Check<Equal<Keys<Req<'roles/assignment-show'>>, 'roleId'>>,
 	Check<Equal<RequiredKeys<Req<'roles/assignment-show'>>, 'roleId'>>,
 	Check<Equal<Keys<Req<'signup-application/apply'>>, 'answers' | 'formToken' | 'g-recaptcha-response' | 'hcaptcha-response' | 'm-captcha-response' | 'testcaptcha-response' | 'turnstile-response'>>,

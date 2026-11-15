@@ -138,6 +138,8 @@ dumpから戻す方法は、DBの大きさに比例して止まる時間が延�
 
 **[pg_bigm](#pg_bigm-日本語の部分一致検索を高速化)などの拡張を入れたDBは、戻す先のサーバーにも同じ拡張が要る。** dumpは`CREATE EXTENSION`を含むので、拡張の無いサーバー(素の`postgres:18-alpine`)へは戻らない。戻す前に止まる。バックアップ用のimageにpg_bigmが入っているのは`backup verify`のためで、戻す先はDBのサーバー(UDS構成なら`deploy/postgres-bigm`のimage)になる。拡張を作るにはsuperuserが要ることがある。
 
+**戻す先のサーバーは、バックアップを取ったときのDBのサーバーと同じか、新しい版にする。** マイナー版が上がっただけでも、新しいサーバーのdumpは古いサーバーに戻せないことがある(18.7のサーバーは列に`pg_attver`を付け、18.6はそれを戻せない。#4152)。戻せる版のずれのほうが多いので、戻す前には比べない。`pg_restore`が落ちたときに、メタ情報の`postgresVersionNum`が戻す先のサーバーより新しければ、取ったときの版と戻す先のサーバーの版、戻す先のサーバーを取ったときの版以上に上げる手立てを、誤りの先頭に出す(#4155)。`pg_restore`は1つのトランザクションで動くので、ほかの失敗と同じく何も残らない。止まったら、戻す先のサーバーの版を上げてから流し直す。
+
 dumpは、戻す前に一時ファイルへ落とす(暗号化した世代は復号したもの。持ち主だけが読める0600で作る)。`backup`サービスではコンテナの`/tmp`に置くので、dumpの大きさの空きが要る。別の場所に置くときは`-tmp-dir <ディレクトリ>`を渡す。一時ファイルは終わったときと中断(`SIGINT` / `SIGTERM`)のときに消すが、`SIGKILL`やOOMで落ちたときは残る。**バイナリを直接実行すると、ホストの`/tmp`に平文のdumpが残りうる。** 利用者のtokenや秘密鍵が入るので、暗号化したディスクの上のディレクトリを`-tmp-dir`で渡すか、落ちたときに`elythia-restore-*.pgc`を消す。
 
 **戻すのはDBだけで、ドライブのファイル(ローカルの`drive-files`とオブジェクトストレージ)は戻らない。** [DBのバックアップ](backup.md)はファイルを含まないため。バックアップより後に消したファイルは、戻したDBに行があるのに中身が無く、画像が切れる。バックアップより後に上げたファイルは、DBに行が無いまま保存先に残り、どこからも指されない。ファイルも同じ時点へ揃えたいときは、保存先の側(オブジェクトストレージのversioningやスナップショットなど)で戻す。
@@ -206,7 +208,7 @@ docker compose start backup-daemon
 
 UDS構成は、`app`を`mkgo`に読み替え(`backup-daemon`はそのまま)、`docker compose`に`-f compose.uds.yaml`を付ける(`docker compose -f compose.uds.yaml run --rm --no-deps backup restore ...`)。`compose.uds.yaml.example`の`backup`サービスは、DBのソケット(`pg_sock`)と、Redisの後始末のためにvalkeyのソケット(`valkey_sock`)をmountしている。`compose.uds.yaml`に複製しているなら、`valkey_sock`の行も足す。`mkgo`は起動のたびに`elythia migrate`を流す(`deploy/uds/mkgo-entrypoint.sh`)が、戻すときに当て終えているので、何も起きない。
 
-バイナリ直接実行では、サーバーと、常駐させているなら`elythia backup daemon`を止めてから(daemonは確かめ終わってから再開する)、`pg_restore`があるホストで、本体と同じ設定ファイルを渡して流す。`pg_restore`の版は、バックアップを取った`pg_dump`以上で、DBのサーバー以下にする(バックアップを取った`pg_dump`も戻す先のサーバーも18なら、18の`pg_restore`)。`pg_restore`の場所は`backup.tools.pgRestore`で変えられる。
+バイナリ直接実行では、サーバーと、常駐させているなら`elythia backup daemon`を止めてから(daemonは確かめ終わってから再開する)、`pg_restore`があるホストで、本体と同じ設定ファイルを渡して流す。`pg_restore`の版は、バックアップを取った`pg_dump`以上で、DBのサーバー以下にする(バックアップを取った`pg_dump`も戻す先のサーバーも18なら、18の`pg_restore`)。戻す先のサーバーは、バックアップを取ったときのDBのサーバーと同じか新しい版にする(マイナー版も含む。[戻すときに行うこと](#戻すときに行うこと)の後の説明)。`pg_restore`の場所は`backup.tools.pgRestore`で変えられる。
 
 ```bash
 sudo systemctl stop elythia
@@ -263,6 +265,71 @@ EXPLAIN SELECT id FROM note WHERE lower(text) LIKE '%検索語%';
 ```
 
 `fulltextSearch.provider` は `sqlLike` のままでよい。拡張を外す場合はインデックスを落とすだけで検索自体は動き続ける (seq scan に戻る)。
+
+## pg_stat_statements (重い SQL を測る)
+
+`pg_stat_statements` は PostgreSQL に付いている拡張で、実行された SQL を形ごとにまとめて、回数・合計時間・読んだブロック数を数え続ける。本番で 1 週間ほど取れば、1 回は速いが回数が多くて合計で重い SQL や、本番の行数で初めて遅くなる SQL を、数字で選べる (#3909)。
+
+**使うのは、PostgreSQL の設定に足して再起動するだけ。** `shared_preload_libraries` で `pg_stat_statements` が読み込まれていれば、Elythia が DB に繋ぐとき (起動のときと、メンテナンスの後に繋ぎ直すとき) に、その DB に拡張を作る (`CREATE EXTENSION pg_stat_statements WITH SCHEMA public`。同時に起動した別のプロセスが先に作っていれば、作られているとみなす)。読み込まれていなければ何もしない。migration には入れていない (拡張の作成には superuser が要り、migration は 1 回しか走らず、本体の migration は全員の DB で走るため)。
+
+1. `shared_preload_libraries` に足す。Docker Compose では PostgreSQL のサービス (UDS 構成の `compose.uds.yaml` では `postgres`、`docker-compose.yml` などでは `db`) に `command:` を足す。UDS 構成の `compose.uds.yaml.example` には、コメントで添えてある
+
+```yaml
+  postgres:   # docker-compose.yml などでは db
+    command: ["postgres",
+              "-c", "shared_preload_libraries=pg_stat_statements",
+              "-c", "pg_stat_statements.track_utility=off"]
+```
+
+   `postgresql.conf` で設定するなら `shared_preload_libraries = 'pg_stat_statements'` (ほかのライブラリがあればカンマで並べる)。`track_utility=off` の理由は下の「記録されるもの」
+
+2. PostgreSQL のコンテナを作り直す (UDS 構成なら `docker compose -f compose.uds.yaml up -d postgres`、`docker-compose.yml` なら `docker compose up -d db`)。**この設定は PostgreSQL を再起動しないと効かない**
+3. Elythia を再起動する。ログに `created the pg_stat_statements extension` が出れば作られている
+
+- **DB の利用者が superuser でないと、拡張を作れない。** 作れなかったときは、起動を止めずに警告を出し、superuser で実行する SQL をログに書く。superuser でこの DB に接続して `CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;` を実行する。拡張は `public` に作るので、`public` の schema を消した DB では作れない (その場合は schema を指定して作り、`elythia doctor` で確かめる)
+- 読み込まれているかは、`pg_settings` に `pg_stat_statements.max` があるかで見る (読み込まれたときにだけ定義される)。`shared_preload_libraries` そのものは superuser か `pg_read_all_settings` の一員しか読めないが、こちらは誰でも読める
+- `elythia doctor` と管理画面の `admin/self-check` の `pg-stat-statements` が、読み込みと拡張の食い違い (読み込まれているのに拡張が無い、拡張はあるのに読み込まれていない) を警告する。後者のときは `pg_stat_statements` の view を読むとエラーになる
+
+**読み方。** 合計時間の長い順に 20 件を出す (`psql` などで、Elythia の DB に接続して実行する):
+
+```sql
+SELECT calls,
+       round(total_exec_time::numeric, 1) AS total_ms,
+       round(mean_exec_time::numeric, 2) AS mean_ms,
+       rows,
+       shared_blks_hit + shared_blks_read AS blocks,
+       left(query, 160) AS query
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+測り始めをそろえるときは、`SELECT pg_stat_statements_reset();` で数字を 0 に戻す (superuser か、実行の権限を与えた利用者だけが実行できる)。
+
+**記録されるもの。**
+
+- `SELECT` / `INSERT` / `UPDATE` / `DELETE` の値は記録されない。`WHERE id = 'abc'` は `WHERE id = $1` の形にまとめて記録される。SQL の形そのもの (表と列の名前) は残る
+- **それ以外の文 (`CREATE ROLE ... PASSWORD '...'`、`ALTER ROLE ... PASSWORD` など) は、既定 (`pg_stat_statements.track_utility=on`) では値ごと記録される。** パスワードを含む文を DB で実行することがあるなら、上の例のように `track_utility=off` にする。記録は既定でサーバーの再起動をまたいで残る (`pg_stat_statements.save=on`)。消すには `pg_stat_statements_reset()` を実行する
+- **他の利用者の SQL の本文を読めるのは、superuser と `pg_read_all_stats` の一員だけ。** それ以外の利用者には `<insufficient privilege>` と表示される
+
+**ほかに知っておくこと。**
+
+- 拡張を作ると、DB の `public` に `pg_stat_statements` の view と関数が増える。Misskey の表には触れない
+- **バックアップには入れない。** 取るときに `pg_dump --exclude-extension=pg_stat_statements` を付ける (この拡張が入っているときだけ)。superuser でない DB の利用者では、戻すときに作れないため。戻した後に Elythia が DB に繋ぐとき、読み込まれていれば作り直す。`--exclude-extension` は pg_dump 17 からなので、それより前の pg_dump で取るときは従来どおり dump に入れ、警告のログを出す ([バックアップ](backup.md#拡張))
+- **やめるときは、`shared_preload_libraries` から外して PostgreSQL を再起動し、superuser で `DROP EXTENSION pg_stat_statements;` を実行する。** 外すだけでは拡張が残り、`elythia doctor` が警告する
+
+**あわせて `auto_explain` を使う。** 一定時間を超えた SQL の実行計画を PostgreSQL のログに出す。拡張を作らなくてよく、読み込むだけで効く:
+
+```yaml
+  postgres:
+    command: ["postgres",
+              "-c", "shared_preload_libraries=pg_stat_statements,auto_explain",
+              "-c", "pg_stat_statements.track_utility=off",
+              "-c", "auto_explain.log_min_duration=500ms"]
+```
+
+`auto_explain.log_analyze` を `on` にすると実際の行数と時間も出るが、すべての SQL に計測の負荷が掛かるので、本番では既定 (`off`) のままにする。
 
 ## Docker Compose (TCP)
 
@@ -351,7 +418,7 @@ make image-build       # ghcr.io/elythia-network/elythia:bundled をローカル
 `bundled` / `latest` は develop の最新を指す **可変タグ**。本番ではバージョンを固定する。**古い版に固定するときは、その版の compose を使う** (compose は同じ版の image の呼び方に合わせてある。2.0.0 で実行バイナリを `elythia` にまとめた、#3394)。
 
 ```bash
-MK_IMAGE=ghcr.io/elythia-network/elythia:2.1.0-bundled docker compose up -d
+MK_IMAGE=ghcr.io/elythia-network/elythia:2.2.0-bundled docker compose up -d
 ```
 
 **2.0.0 より前の版は、以前の置き場所 `ghcr.io/shiroha-a/mk` にある** ([タグの一覧](https://github.com/users/shiroha-a/packages/container/package/mk)。リポジトリを `Elythia-Network/elythia` へ移した 2.0.0 から、イメージの置き場所も変わった。#3394)。
@@ -386,7 +453,7 @@ gh workflow run docker.yml -f tag=1.1.0
 TS版Misskeyのイメージからアセットをコピーすることも可能:
 
 ```dockerfile
-FROM misskey/misskey:2026.10.1 AS misskey-assets
+FROM misskey/misskey:2026.11.0 AS misskey-assets
 FROM ghcr.io/elythia-network/elythia:latest
 COPY --from=misskey-assets /misskey/built /frontend
 COPY --from=misskey-assets /misskey/packages/frontend/assets /client-assets
@@ -487,32 +554,84 @@ make migrate-up
 ```
 
 ```
-  カウンタのずれ: 2 件
+  カウンタのずれ: 1343 件
     user.followersCount      1 件
-    user.notesCount          1 件
+    user.notesCount          1342 件 (集めたのは先頭の 1000 件)
 
-    user.followersCount  id=u1  記録 7 → 実際 0
-    user.notesCount  id=u1  記録 99 → 実際 2
+    user.followersCount  id=9xk2a1b3c4  記録 7 → 実際 0
+    user.notesCount  id=9xk2a1b3d0  記録 41 → 実際 42
+    user.notesCount  id=9xk2a1b3d1  記録 41 → 実際 42
+    user.notesCount  id=9xk2a1b3d2  記録 41 → 実際 42
+    user.notesCount  id=9xk2a1b3d3  記録 41 → 実際 42
+    ... 他 1338 件
 
   修正するには -fix を付けて再実行してください。
 ```
 
 **既定は読み取り専用**で、`-fix` を付けたときだけ書き戻す。ずれがあれば exit 1 を返す
-(`-fix` で直せば 0)。
+(`-fix` で全部直せば 0)。
+
+**集めるのは種類ごとに先頭の 1000 件まで** (id の順)。内訳の件数は上限とは別に数えた総数で、
+上限を超えた種類には「集めたのは先頭の N 件」と付く。`-fix` が直すのも集めた分だけなので、
+上限を超えていれば「残りの N 件は、もう一度 -fix を付けて実行すると直します」と出て exit 1 を
+返す。残りが無くなるまで繰り返す。
 
 ### 検査するもの
 
-| 対象 | 突き合わせ先 |
-|---|---|
-| `user.followersCount` / `followingCount` | `following` の実件数 |
-| `user.notesCount` | `note` の実件数 |
-| `note.repliesCount` / `renoteCount` | `note.replyId` / `renoteId` の実件数 |
-| `note.clippedCount` | `clip_note` の実件数 (列は smallint なので 32767 で頭打ち) |
-| `note.pageCount` | ページの content が参照する件数 (同上) |
-| 孤児行 | 存在しない user を参照する `note` / `drive_file` / `following` |
+カウンタは数え方で 2 種類に分かれる (#3927)。
+
+| 対象 | 突き合わせ先 | 報告するずれ | `-fix` |
+|---|---|---|---|
+| `user.followersCount` / `followingCount` | `following` の件数。相手が移行済み (`movedToUri` がある) の行は数えない。移行済みの利用者自身は検査しない | 大きい・小さいの両方 | 実件数で上書き |
+| `note.repliesCount` | `note.replyId` の件数 (列は smallint なので 32767 で頭打ち) | 大きい・小さいの両方 | 実件数で上書き |
+| `note.clippedCount` | `clip_note` の件数 (列は smallint なので 32767 で頭打ち) | 大きい・小さいの両方 | 実件数で上書き |
+| `note.pageCount` | ページの content が参照する件数 (同上) | 大きい・小さいの両方 | 実件数で上書き |
+| `user.notesCount` | `note.userId` の件数 | 記録が小さいときだけ | 実件数まで上げる (下げない) |
+| `note.renoteCount` | `note.renoteId` の件数のうち、対象の作者自身のリノートと bot のリノートを除いたもの (引用は数える。列は smallint なので 32767 で頭打ち) | 記録が小さいときだけ | 実件数まで上げる (下げない) |
+| 孤児行 | 存在しない user を参照する `note` / `drive_file` / `following` | 件数 | 消さない |
 
 これらのカウンタは増減で維持されており、増減はベストエフォート (戻り値を捨てる呼び出しが
 ある) なので失敗すればそのままずれる。
+
+**`notesCount` と `renoteCount` は増えるだけの値**で、行の件数と一致しないのが正常。本家は
+`notesCount` を投稿のたびに増やして削除では減らさず (`NoteCreateService.incNotesCountOfUser`。
+`NoteDeleteService` が減らすのは instance の `notesCount` だけ)、`renoteCount` は対象の作者でも
+bot でもない人のリノートでだけ増やして削除では減らさない。Elythia も同じ条件で増やす。そのため
+記録が実件数より大きいのは消した投稿やリノートの分で、`fsck` は記録が小さいとき (増やすのに
+失敗した分) だけを報告し、`-fix` も上げるだけにする。
+
+- **Elythia は受信した `Undo(Announce)` で `renoteCount` を 1 減らす** (本家との意図的な乖離。
+  [divergence/security.md](divergence/security.md))。このときはリノートの行も消すので、記録と
+  実件数が同じだけ下がり、「記録が小さい」とは出ない
+- **リノートした後に、リノートした人が bot になった・bot をやめたときは、本家の値と合わない。** 判定は今の
+  `isBot` で行い、リノートしたときの `isBot` は DB に残らないため。bot のときのリノートを後から
+  数える側 (bot をやめた) は「記録が小さい」と出て、`-fix` で足される
+- **リモートの利用者の `notesCount` も検査する。** 本家はリモートの投稿の受信でも増やし、Elythia も
+  #3928 から取り込みで増やす。それより前に取り込んだ投稿の分は数えていないので「記録が小さい」と
+  出て、`-fix` で取り込んだ件数まで上がる。`users/show` では元のサーバーの値に差し替えるので (#943)、
+  ここで上げた値が出るのは `ap/show`・`users/search` など、差し替えない場所
+
+**#3927 より前の版で `fsck -fix` を流したことがある DB** では、`notesCount` が消した投稿の分だけ
+下がり、`renoteCount` が作者自身のリノートと bot のリノートを含めた行の件数 (消えたリノートの分は
+引いた値) に書き換わっていることがある。どちらも今の版が数える実件数以上の値なので、今の版の
+`fsck` では「ずれ」として出ず、元の値にも戻せない (元の値は DB に残らない)。
+
+**移行したアカウントが絡むフォローは数えない。** 本家も Elythia も、どちらかが移行済みのフォローでは
+カウントを増減せず、移行のときに旧アカウントのローカルのフォロワーとフォロー先のカウントを
+1 ずつ減らす (行は残す)。
+`fsck` の実件数は、本家が移行済みの相手とのフォローを解除するときに数え直す式と同じ。
+
+移行のときに減らす相手は限られるので、本家でも次の場合は記録が大きいまま残り、`fsck` が
+「大きい」と報告する。`-fix` で下げる値は本家が解除のときに数え直す値と同じなので、直してよい。
+
+- 旧アカウントにローカルのフォロワーが 1 人もいない (減らす処理そのものを飛ばすので、旧アカウントの
+  フォロー先の `followersCount` も減らない)
+- 旧アカウントをフォローしていたのが proxy アカウント (減らす相手から除く)
+- ローカルの旧アカウントをフォローしていたリモートの利用者 (減らすのはローカルのフォロワーだけ)
+
+**`-fix` は負荷の低い時間に流す。** 上書きするカウンタ (`followersCount` / `followingCount` /
+`repliesCount` / `clippedCount` / `pageCount`) は検査した時点の件数で書き戻すので、検査から
+書き戻すまでの間に起きたフォローや返信の増減を失う。
 
 ### 孤児行は自動削除しない
 
@@ -585,13 +704,14 @@ worker 数は既定値がキューごとに違い、`stuck 検出` は**キュ�
 
 ```
   ok    config.url   https://example.com
-  ok    database     接続 ok / migration version 138
+  ok    database     接続 ok / migration version 143
   ok    database-health dead tuple と VACUUM に問題なし (122 テーブル)
+  ok    pg-stat-statements 使っていない (shared_preload_libraries に無い)
   ok    root user    meta.rootUserId 設定済み
   ok    redis        接続 ok
   FAIL  webfinger    status 403 (連合が無効)
         インスタンス設定の `federation` が `none` になっている。連合するなら管理画面で有効にする
-  ok    nodeinfo     elythia 2.1.0
+  ok    nodeinfo     elythia 2.2.0
   warn  actor        assertionMethod (Ed25519) が無い
         RSA だけでも連合できる。Ed25519 を公開すると対応実装との署名検証が軽くなる
   ok    tls          証明書の残り 68 日
@@ -606,6 +726,8 @@ warn は「見ておくべき」であって「壊れている」ではないた
 |---|---|
 | `config.url` | 絶対 URL か、https か |
 | `database` | 接続と、`schema_migrations` が同梱マイグレーションに追いついているか。fork の系列 (`migration/local/`) を同梱しているときは `schema_migrations_local` も見る ([fork の独自 migration](fork-migrations.md#doctor)) |
+| `database-health` | dead tuple が溜まった表や、VACUUM されていない表が無いか (警告だけ) |
+| `pg-stat-statements` | `pg_stat_statements` の読み込みと拡張が食い違っていないか (警告だけ。[pg_stat_statements](#pg_stat_statements-重い-sql-を測る)) |
 | `root user` | `meta.rootUserId` が設定されているか。**未設定だと root 判定が効かず**、`admin/accounts/create` の初回セットアップ判定がローカル利用者数のガードだけに依存する状態になる。指名し直すには DB を直接更新する (`update-meta` は `rootUserId` を受け付けない) |
 | `redis` | 接続 |
 | `webfinger` | **公開 URL 経由**で `acct:instance.actor@<host>` が引けるか |
@@ -1024,6 +1146,14 @@ ElythiaはMisskeyのSPAフロントエンドをそのまま配信する。フロ
 ```nginx
 upstream mkgo {
     server 127.0.0.1:3000;
+    # Elythia への接続を使い回す (下記の注意点を参照)
+    keepalive 32;
+}
+
+# WebSocket の要求にだけ `Connection: upgrade` を付け、それ以外は空にする
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
 }
 
 server {
@@ -1053,6 +1183,7 @@ server {
     location = /backup-download {
         proxy_pass http://mkgo;
         proxy_http_version 1.1;
+        proxy_set_header Connection "";
         proxy_buffering off;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -1065,7 +1196,7 @@ server {
         proxy_pass http://mkgo;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection $connection_upgrade;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -1078,7 +1209,9 @@ server {
 **注意点:**
 - `client_max_body_size`はElythiaの`maxFileSize`設定 (デフォルト250MB) 以上に設定する
 - `proxy_read_timeout 1d`はWebSocket (`/streaming`)のために必要
-- `Upgrade`/`Connection`ヘッダーはWebSocketパススルーに必要
+- `Upgrade`/`Connection`ヘッダーはWebSocketパススルーに必要。`Connection`は`map`で、WebSocketの要求のときだけ`upgrade`、それ以外は空にする
+- **`upstream`の`keepalive`と、各`location`の`proxy_http_version 1.1`と`Connection`の指定は、Elythiaへの接続を使い回すために要る。** どれかが無いと(nginxの既定はHTTP/1.0)、nginxはAPIや静的ファイルの要求のたびにElythiaへの接続を張り直して閉じる(`Connection`を指定しないと、nginxは`Connection: close`を送る)。隔離した環境で`POST /api/meta`を300件、1本の接続で順に流すと、Elythiaが受け入れた接続は、無いときの300回から1回になった(#3963)。nginxの待機中の接続は、`upstream`ブロックの`keepalive_timeout`の既定(60秒。`http`や`server`の階層にある、クライアント向けの同じ名前の指令とは別)で閉じ、ElythiaのIdleTimeout(120秒)より短いので、Elythiaが先に閉じた接続へ要求を送る形にはならない。`upstream`の`keepalive_timeout`を120秒以上にしないこと。この例より前の形を写した環境は、設定を直してnginxをreloadすれば反映される
+- **同じnginxのほかの設定に、同じ名前の`map $http_upgrade $connection_upgrade`が無いか確かめる。** nginxの公式のWebSocketの例は、同じ変数名で`'' close;`と書く。nginxは同じ変数の`map`が二度あっても`nginx -t`でエラーにせず、後から読まれた定義が勝つ。`'' close;`の方が勝つと、WebSocket以外の要求に`Connection: close`が付き、接続の使い回しが黙って効かなくなる(WebSocketはつながる)。あれば、この例と同じ`'' '';`に直すか、片方を消す
 - **アクセスログにクエリ文字列を出さない。** 同梱フロントは WebSocket を
   `/streaming?i=<トークン>` で開く。`i` はスコープ制限のないネイティブ
   ログイントークンなので、既定の `combined` (= `$request` を含む) のままだと
@@ -1126,10 +1259,11 @@ Cloudflareを経由する構成ではリクエストボディが**100MB (Free/Pr
 ```nginx
 upstream mkgo {
     server unix:/run/mkgo/mkgo.sock;
+    keepalive 32;
 }
 ```
 
-upstream以外の設定はTCP構成と同じ。
+upstream以外の設定はTCP構成と同じ。同梱の`deploy/uds/nginx/mkgo.conf`に、UDSの`upstream`と`keepalive`の実例がある(HTTPだけの構成なので、`listen`や`X-Forwarded-Proto`などはこの例と違う。TLSの足し方は[docker-uds.md](docker-uds.md#tls-を足したい場合))。
 
 ## オブジェクトストレージ
 
@@ -1160,7 +1294,7 @@ upstream以外の設定はTCP構成と同じ。
 
 既存のMisskey (TypeScript版)からの移行手順は[TS版からの移行ガイド](migration-from-ts.md)を参照。
 
-ElythiaはTS版のPostgreSQL/Redisをそのまま引き継いで起動できる。設定の`id`をTS版と揃えること、`migrate up`の前にバックアップを取ることなどの条件は移行ガイドにある。TS版へ戻すことは保証しない (#3191)。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 22 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
+ElythiaはTS版のPostgreSQL/Redisをそのまま引き継いで起動できる。設定の`id`をTS版と揃えること、`migrate up`の前にバックアップを取ることなどの条件は移行ガイドにある。TS版へ戻すことは保証しない (#3191)。マイグレーションはTS版テーブルに対して原則追加のみだが、例外が 23 件ある ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。
 
 ## アップデート
 
@@ -1295,11 +1429,11 @@ SELECT version, dirty FROM schema_migrations;
 
 ### 大きな表に index を足す migration
 
-`note` などの大きな表への index は、`CREATE INDEX CONCURRENTLY` で 1 ファイルに 1 本ずつ作る (例: `000054`、`000091`)。`000123`〜`000131` (#3590) も、`000126` を除いてこの形にしている。`000132` (#3612、`note_reaction` の `IDX_note_reaction_userId_id`) も同じ形。`000126` (`user` の `avatarId` / `bannerId`) は、TS 版から移った DB では作らないための条件を `DO` ブロックで書いており、`DO` の中では `CONCURRENTLY` が使えないので、普通の `CREATE INDEX` で作る。
+`note` などの大きな表への index は、`CREATE INDEX CONCURRENTLY` で 1 ファイルに 1 本ずつ作る (例: `000054`、`000091`)。`000123`〜`000131` (#3590) も、`000126` を除いてこの形にしている。`000132` (#3612、`note_reaction` の `IDX_note_reaction_userId_id`) と `000140` (#3369、`note` のチャンネルの部分 index `IDX_note_channelId_userId_id`)、`000141` (#4021、`following` の配信の部分 index `IDX_following_followeeId_id_home`)、`000142` (#4164、`drive_file` の本家と同じ index `IDX_55720b33a61a7c806a8215b825`。TS 版から移った DB には元からある) も同じ形。`000126` (`user` の `avatarId` / `bannerId`) は、TS 版から移った DB では作らないための条件を `DO` ブロックで書いており、`DO` の中では `CONCURRENTLY` が使えないので、普通の `CREATE INDEX` で作る。
 
 `CONCURRENTLY` は書き込みを止めないが、次の点に注意する。
 
-- **migration を流しているあいだ、Elythia は起動しない。** UDS の entrypoint と compose の `migrate` サービスは、migration を流し終えてからサーバーを起動する。作る時間は表の行数に比例する。検証用の DB (ノート 60 万件、`note` の本体 257MB、`note_unread` 10 万行、PostgreSQL 18、キャッシュに載った状態) では、`000123` (チャンネルの部分 index) が 0.34 秒、`000124` (`visibleUserIds` の GIN) が 0.39 秒、`000127` (`note_unread`) が 0.20 秒だった。本番の行数では測っていないので、`SELECT count(*) FROM note;` で見積もる
+- **migration を流しているあいだ、Elythia は起動しない。** UDS の entrypoint と compose の `migrate` サービスは、migration を流し終えてからサーバーを起動する。作る時間は表の行数に比例する。検証用の DB (ノート 60 万件、`note` の本体 257MB、`note_unread` 10 万行、PostgreSQL 18、キャッシュに載った状態) では、`000123` (チャンネルの部分 index) が 0.34 秒、`000124` (`visibleUserIds` の GIN) が 0.39 秒、`000127` (`note_unread`) が 0.20 秒だった。`000140` は、別の検証用の DB (ノート 200 万件、`note` の本体 333MB、うちチャンネル付き 11.7 万件、PostgreSQL 18.6、キャッシュに載った状態) で 0.53 秒だった。`000141` は、使い捨ての `following` (100 万行、本体 208MB、PostgreSQL 18.6、キャッシュに載った状態) で 0.77 秒だった。本番の行数では測っていないので、`SELECT count(*) FROM note;` (`000141` なら `following`) で見積もる
 - **止めずに済ませたいときは、旧版を動かしたまま同じ SQL を先に流してよい。** どれも `IF NOT EXISTS` なので、後で migration が流れたときは名前で何もしない。index を足すだけの migration に限る (旧版のサーバーが、知らない index があっても動くため)
 - **`000126` は、作るあいだ `user` への書き込みを止める。** 止まる時間は `user` の行数に比例する (規模の例: 利用者 22,000 人の DB で 2 本合わせて 50ms)。先に流すなら、書き込みの少ない時間帯にする。**`user` に書き込み中の長い transaction があると、`000126` はその終わりを待ち、待っているあいだも後から来た `user` への書き込みが全て後ろに並ぶ。** 下の `lock_timeout` を 0 にして流すときは、待ちが切られずに続くので、この意味でも書き込みの少ない時間帯を選ぶ
 - **`CONCURRENTLY` は、始まる前からある transaction が全て終わるのを待つ。** 長い transaction (バックアップの `pg_dump` など) が走っていると、その終わりまで進まない。待っているあいだも書き込みは止めないが、migration は終わらない
@@ -1319,7 +1453,7 @@ SELECT version, dirty FROM schema_migrations;
 - **途中で失敗すると、使えない (INVALID の) index が名前ごと残る。** 次に流すと `IF NOT EXISTS` が名前で何もしないので、**使えない index が残ったまま migration が成功扱いになる**。流し直す前に、INVALID の index が無いかを見る
 
   ```sql
-  -- 000123〜000132 (#3590 / #3612) の index に絞る。別の migration なら、その migration が作る名前に置き換える
+  -- 000123〜000132 (#3590 / #3612)、000140 (#3369)、000141 (#4021)、000142 (#4164) の index に絞る。別の migration なら、その migration が作る名前に置き換える
   SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
     JOIN pg_namespace n ON n.oid = i.relnamespace
    WHERE n.nspname = current_schema() AND NOT x.indisvalid
@@ -1327,7 +1461,8 @@ SELECT version, dirty FROM schema_migrations;
                        'IDX_user_avatarId', 'IDX_user_bannerId', 'IDX_e637cba4dc4410218c4251260e',
                        'IDX_antenna_note_unread_noteId', 'IDX_channel_note_unread_noteId',
                        'IDX_promo_read_noteId', 'IDX_following_followeeId_notify_normal',
-                       'IDX_note_reaction_userId_id');
+                       'IDX_note_reaction_userId_id', 'IDX_note_channelId_userId_id',
+                       'IDX_following_followeeId_id_home', 'IDX_55720b33a61a7c806a8215b825');
   ```
 
   名前で絞るのは、別の作業の index を消さないため。例えば `REINDEX CONCURRENTLY` の途中には `<名前>_ccnew` という INVALID の index ができ、その `REINDEX` が失敗するとそのまま残る。失敗して残ったものは作っている最中ではないので、下の `pg_stat_progress_create_index` の確認をすり抜ける。migration の index と取り違えて消すと、その作業の後始末の手がかりを失う
@@ -1643,6 +1778,54 @@ Elythia の `000001` も作るので、TS から引き継いだ DB でも Elythi
 deadlock で片方が失敗する (バッチ側は id の順に渡しているが、行を取る順は planner
 次第)。バッチが落ちたら `-from` で流し直せばよい。
 
+### `backfill channel-users-count` — チャンネルの `usersCount` を数え直す (#3369)
+
+チャンネルの `usersCount` (`channels/*` が返すチャンネルの `usersCount`。frontend は
+「{n}人が参加中」と出す) は、本家では**そのチャンネルに投稿した人の数**で、
+投稿を作ったときにその人の最初の投稿なら 1 足す。#3369 まで Elythia は**フォロー・解除で増減**して
+おり、投稿では増やしていなかった。#3369 から本家と同じく投稿で数えるようになったが、
+積むのは差分なので、それまでに入った値は直らない。このバッチで数え直す。
+
+**値は「いまそのチャンネルに投稿がある利用者の数」** (`note."channelId"` がそのチャンネルの行の
+`"userId"` を重複なく数える)。本家の値は足すだけの累積値で、投稿を消して投稿し直すとまた増える。
+その履歴は DB に残らないので復元できず、`backfill instance-counts` と同じく、いまの実数を正とする。
+
+**いつ流すか。** #3369 を含む版に上げた後に一度流す。**#3369 より前の Elythia を動かしたことがある DB**
+(Elythia 生まれの DB と、TS 版から移行した後に #3369 より前の Elythia を動かした DB) が対象。
+それより前の Elythia はフォローで増減し、投稿では数えていなかったので、フォローが無くても、
+その間にチャンネルへ初めて投稿した人の分が足りない。
+TS 版から移行してすぐ #3369 を含む版を使い始めた DB は、値が本家の数え方のままなので流さなくてよい。
+流しても実数に揃うだけ (本家の累積値は実数より大きいことがあるので、下がる行が出る)。
+
+```bash
+# まず差分を見る (書き込まない)
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill channel-users-count \
+  -config /app/.config/default.yml -dry-run
+
+# 実行
+docker compose run --rm --no-deps --entrypoint /app/elythia app backfill channel-users-count \
+  -config /app/.config/default.yml -batch 100 -sleep-ms 200
+```
+
+`--no-deps` と UDS 構成のサービス名は `backfill instance-counts` と同じ。**無指定で書き込み、
+`-dry-run` で抑止する**側の作法。冪等で、値が既に正しい行は書かない。
+
+出力は差分のある行ごとに `channel <チャンネルの id> usersCount <旧> -> <新>`、最後に
+`done [...]: scanned=<走査した channel 行> changed=<差分のあった行> usersCountDelta=<新 - 旧の合計>`。
+本実行の `changed` は書いた行数。中断したら `-from <最後に出た cursor>` で続きから流せる
+(失敗したバッチは 1 本の UPDATE なので、まるごと書かれていない)。
+
+**負荷とロック。** channel 行を id 順に `-batch` 件ずつ区切り、`backfill instance-counts` と同じく
+**数える SELECT と書く UPDATE の 2 文**で処理する。人数はチャンネルごとに note の
+`"IDX_note_channelId_userId_id"` (`000140`) の該当範囲だけを index only scan で読み、note の全件は走査しない。
+読む量の目安は「チャンネルに付いた投稿の総数」。
+
+**稼働中に流すと、少しずれうる。** 数えた後・書く前にそのチャンネルへ初めて投稿した人の分は、
+バッチの値で上書きされて失われる (書く時点で値が既に一致していればその行は書かない)。
+逆向きもある: 投稿の commit がバッチの集計より前で、その投稿の hook (非同期) がバッチの書き込みの
+後に走ると、集計に入った人をもう一度足して 1 多くなる。
+どちらも 1 チャンネルあたり 1 バッチの時間のあいだに初めて投稿した人数が上限で、もう一度流せば直る。
+
 ### `backfill hashtag-mentions` — 公開範囲を限ったノートだけで使われたタグの利用者を外す
 
 ハッシュタグの利用者 (`hashtag` の `mentioned{,Local,Remote}UserIds` と各数) は、本家と同じく
@@ -1799,7 +1982,8 @@ compose の `run` はサービスの volume をそのまま引き継ぐ。別の
 
 **既定は dry-run で、書き込みには `-apply` が要る。** 姉妹バッチ
 (`backfill remote-host` / `backfill note-tags` / `backfill avatar-public-url` /
-`backfill instance-counts` / `backfill hashtag-mentions` / `backfill chat-reads`) は
+`backfill instance-counts` / `backfill channel-users-count` / `backfill hashtag-mentions` /
+`backfill chat-reads`) は
 **逆** (無指定で書き込み、`-dry-run` で抑止) なので、手が覚えているほうで打たないこと。`-dry-run` と `-apply`
 を両方渡すと落ちる。
 

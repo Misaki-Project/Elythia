@@ -71,13 +71,15 @@ driver が入れ替わったことに気付けず、予約投稿の可否やレ�
 inbox が黙って消える。**新ビルドは起動を拒むので後から捌けない** — 切り替え前に
 **旧ビルドでそのキーが空になるまで回す**しかない。
 
+**同時実行数 (`deliverJobConcurrency` / `inboxJobConcurrency` / `relationshipJobConcurrency`) が負の値なら起動しない (#4164)。** upstream 2026.11.0 (#18081) と同じく、書き間違いに気付けるよう止める。**0 は受ける** (upstream は 1 未満を全て拒む)。Elythia では 0 を「未設定」と同じく既定の数、自動調整 (`jobQueueAutoScale`) を有効にしていればその対象として扱ってきたので、0 を書いた設定を起動できなくしないため。
+
 upstream は用途ごとに **10 queue** に分けるが、Elythia は **8 queue** に集約している (`internal/queue/driver/mkqdriver` の `QueueNames`)。処理する仕事は同じで、束ね方だけが違う。
 
 | upstream の queue | Elythia の実体 |
 |---|---|
 | `deliver` | `deliver` |
 | `inbox` | `inbox` |
-| `system` | `maintenance` (cron 群: chart tick/resync/clean, checkExpiredMutings, archiveAnnouncements, clean, cleanRemoteNotes, checkModeratorsActivity, instanceRefresh, retentionAggregate, chunkedUploadGc, orphanUserCleanup, orphanAttachmentCleanup) |
+| `system` | `maintenance` (cron 群: chart tick/resync/clean, checkExpiredMutings, archiveAnnouncements, clean, cleanRemoteNotes, checkModeratorsActivity, instanceRefresh, retentionAggregate, chunkedUploadGc, orphanUserCleanup, orphanAttachmentCleanup, resendQuoteRequests) |
 | `endedPollNotification` | **queue ではなく常駐 goroutine** (`corepoll.ExpiryWorker`、60 秒間隔) |
 | `postScheduledNote` | `deliver` の `note:postScheduled` |
 | `db` | `export` の `export` / `import` / `importCustomEmojis`、`deliver` の `maintenance:deleteAccount` |
@@ -89,17 +91,22 @@ upstream は用途ごとに **10 queue** に分けるが、Elythia は **8 queue
 
 `objectStorage` は `deleteFile` / `cleanRemoteFiles` とも upstream と同じ job 構成 (#2325)。振り分けも upstream に揃えてあり、ローカル FS 保存 (`storedInternal=true`) の実体は同期削除、object storage 上の実体だけを queue に逃がす。`clean-remote-files` は「job 1 本が内部でバッチ削除を回す」形も upstream と同じで、リモートキャッシュの件数ぶん job を積んで Redis を圧迫することはない。ただし Elythia はリモートメディアをキャッシュしないので、**Elythia が作った行に対しては対象が 0 件になる** (対象は `isLink=false` のリモート行で、それを作る経路が無い)。**TS 製の DB を引き継いだときだけ対象がある** (§5.5)。job 構成を upstream に揃えてあるのは drop-in 復路のため。
 
-**お知らせの自動アーカイブ (#3809) は、お知らせごとの遅延ジョブではなく毎分の定期処理で行う。**
+**お知らせの自動アーカイブ (#3809) は、本家と同じくお知らせごとの遅延ジョブで行う (#3994)。違うのは queue とジョブの中身。**
 本家 2026.10.1 は `system` queue に `archiveAnnouncement` ジョブ (job ID `archiveAnnouncement-<id>-<期限のミリ秒>`) を
 お知らせごとに予約し、期限・`isActive` の変更や削除で取り消して予約し直し、起動時に Redis から消えた分を
-予約し直す。Elythia はそのジョブを消費せず、`maintenance:archiveAnnouncements` (毎分) が `isActive` が true で
-期限を過ぎた行をまとめて `isActive = false` に落とし、`updatedAt` をその時刻にする (本家のジョブと同じ更新)。
-期限はそのときに保存されている値と比べるので、期限を延ばした行は落とさない (本家がジョブの予約時刻と保存値を
-照合するのと同じ意味)。API (`announcements`・`admin/announcements/list`・未読のお知らせ) は本家と同じく
-読むときに期限を見るので、見え方は本家と変わらない。違うのは、DB の `isActive` / `updatedAt` が変わるのが
-期限から最大でおよそ 1 分遅れる点 (`admin/announcements/list` の `updatedAt` に出る) だけ。TS の DB を
-引き継いだときに Redis に残っている本家の `archiveAnnouncement` ジョブは処理しないが、同じ行をこの定期処理が
-落とす。
+予約し直す。Elythia は作成と、期限か `isActive` を変えた更新のときに、`maintenance:archiveAnnouncements` を
+期限の時刻 (1 秒遅らせる) に積む。古い予定のジョブは取り消さない。ジョブは payload のお知らせだけでなく、
+そのときに `isActive` が true で期限を過ぎた行をまとめて `isActive = false` に落とし、`updatedAt` をその時刻にする
+(本家のジョブと同じ更新)。期限はそのときに保存されている値と比べるので、期限を延ばした・消した・お知らせを消した後に
+古いジョブが走っても、その行は落とさない (本家がジョブの予約時刻と保存値を照合するのと同じ意味)。起動時には
+queue を回すプロセスが同じジョブを 1 つ積み、期限を過ぎた行を落としてから、まだ期限の来ていない行のジョブを積み直す。
+加えて、プロセスが動いたままジョブだけが失われたとき (Redis のデータが消えた、管理画面から消した) の保険として、
+1 日 1 回 (00:10、プロセスの TZ) の cron で同じ処理を流す。API (`announcements`・`admin/announcements/list`・
+未読のお知らせ) は本家と同じく読むときに期限を見るので、見え方は本家と変わらない。違うのは、DB の `isActive` /
+`updatedAt` が変わるのが期限から 1 秒ほど遅れる点と、ジョブが失われたとき・管理画面の promote で期限の前に走らされたとき (期限前なので何もせずに終わり、積み直さない) には保険の cron まで最大 1 日遅れる点
+(`admin/announcements/list` の `updatedAt` に出る) だけ。#3994 より前は毎分の cron で、何もしない回の完了の
+記録を 7 日ぶん Redis にためていた。TS の DB を引き継いだときに Redis に残っている本家の `archiveAnnouncement`
+ジョブは処理しないが、同じ行を起動時のジョブが落とすか、まだ期限前なら積み直す。
 
 `note:postScheduled` / `maintenance:deleteAccount` が task type の接頭辞と違う `deliver` に載っているのは意図的なもの。いずれも実行結果が連合配送につながるジョブで、worker 2 本の `maintenance` より 16 本の `deliver` の方が捌ける。task type と queue の対応は `internal/queue/routing_test.go` が表として固定しており、変えると落ちる (#2327)。
 
@@ -110,6 +117,30 @@ cron の多重実行防止は **job option ではなく mkq の job ID 設計**�
 `relationship` は #2403 まで `deliver` に相乗りしていたが、専用 queue に分離した。大量 follow (アカウント移行 / import) が `deliver` の worker を占有して AP 配信そのものを詰まらせ、片方を絞るともう片方も絞られる状態だったため。worker 数は 4 で、upstream の 16 とは違う。relationship job は DB bound (following 行 + カウンタ + stream publish) で外向き HTTP は `deliver` へ再 enqueue されるだけなので、`db.maxOpenConns` (既定 25) を HTTP 経路と共有する以上 16 を割くと Web 側のテールレイテンシに響く。`relationshipJobConcurrency` / `relationshipJobPerSec` はこの分離で初めて実効を持つようになった (それ以前は config として読むだけの no-op)。
 
 `objectStorage` の worker 数だけは upstream の 16 に対し Elythia は 4。実体削除は S3 への I/O 待ちが主で 1 worker あたりの効率が良く、一括削除の並列度を job 数で稼ぐ設計でもないため、`deliver` と同じ理由 (worker 数 ≒ Redis 接続数) で抑えている。
+
+**流量の上限 (`<queue>JobPerSec`) は、設定しなければ設けない (#4141)。** 本家は設定が無くても上限を設ける (2026.10.1 の `QueueProcessorService.ts`)。
+
+| queue | 本家の既定 | Elythia の既定 |
+|---|---|---|
+| `deliver` | 128 件/秒 (`deliverJobPerSec ?? 128`) | 上限なし |
+| `inbox` | 32 件/秒 (`inboxJobPerSec ?? 32`) | 上限なし |
+| `relationship` | 64 件/秒 (`relationshipJobPerSec ?? 64`) | 上限なし |
+
+Elythia は、値が設定されて 0 より大きいときだけ上限を設ける (`internal/server/queue_factory.go` の `perQueueRatesFromConfig`)。これらの設定は #495 (deliver)・#534 (inbox)・#2403 (relationship) で効くようにしたが、どれも未設定は上限なしのままにした (#495 を閉じた PR #531 は「config 未設定時の挙動は従来どおり」としている)。本家の既定に揃えるかどうかを決めた記録は無い。
+
+本家から移る運営者は、`*JobPerSec` を書いていない設定ファイルのままだと流量が変わる。たとえば受信が一度に多く届くと、本家は 32 件/秒に抑えて処理するが、Elythia は inbox の worker (既定は 16) が空く限りすぐに処理するので、DB にかかる負荷の形が変わる。本家と同じ流量にしたいなら、上の値を設定ファイルに明示して書く (yml にキーが無いと `MK_*` の環境変数だけでは効かない。[configuration.md](../configuration.md#環境変数オーバーライド))。値は queue ごとに 1 本の Redis キーで数えるので、worker 数やプロセス数で割らずにそのまま書く ([configuration.md](../configuration.md))。キューのベンチ ([queue-bench.md](../queue-bench.md)) は、エンジンどうしを比べるために本家の上限を外して測っている (#4140)。
+
+**webhook の配送は、本家と流量の決まり方が違う (#4148)。** 本家 2026.10.1 は、ユーザーの webhook (`userWebhookDeliver`) とシステムの webhook (`systemWebhookDeliver`) を別の queue に分け、それぞれに worker の数と同じ値の流量の上限を、設定では変えられない定数で設ける (`QueueProcessorService.ts`)。
+
+| | 本家 | Elythia |
+|---|---|---|
+| ユーザーの webhook | `userWebhookDeliver` queue。worker 64、64 件/秒 | `webhook` queue の `webhook:user`。上限なし |
+| システムの webhook | `systemWebhookDeliver` queue。worker 16、16 件/秒 | `webhook` queue の `webhook:system`。上限なし |
+| worker の数 (プロセスごと) | 上の 64 と 16 (変えられない)。件数の上限は queue 単位なので、プロセスを増やしても 64 件/秒と 16 件/秒のまま | 2 つで合わせて 4 (`defaultQueueConcurrency`)。設定のキーは無く、`jobQueueAutoScale` を有効にしたときだけ伸縮する |
+| 流量の上限の設定 | 無い (定数) | 無い (`<queue>JobPerSec` は deliver / inbox / relationship だけ) |
+
+- **流量は、件数の上限ではなく worker の数で決まる。** 4 は、#1375 で hot な queue (inbox / deliver) を厚く、低頻度の queue を薄く配る既定にしたときの値 (それ以前の mkq の既定は 16 ÷ 6 queue で 2)。#1375 は本家の値を基準にしつつ、deliver を本家の 128 ではなく 16 に抑えた理由として「worker の数がおおむね Redis の接続の数になる」ことを挙げているが、webhook を本家の 64 にしなかった個別の理由の記録は無い。`jobQueueAutoScale` が無効 (既定) でプロセスが 1 つのとき、Elythia の流量はおおむね「4 ÷ 1 件あたりの処理時間」件/秒で、1 件あたりの時間には送り先の応答の待ちが入る (タイムアウトは本家と同じ 5 秒、#3263)。そのため、ユーザーの webhook は 1 件の平均が 62.5ms 未満、システムの webhook は 250ms 未満のときだけ本家の上限を超え、ふつうのインターネット越しの送り先では本家より流量が小さい。送り先がすべてタイムアウトすると、Elythia は 0.8 件/秒、本家 (これもプロセスが 1 つのとき) はユーザーの webhook で 12.8 件/秒 (64 ÷ 5) になる。queue を回すプロセス (役割を指定しないプロセスと `MK_ONLY_QUEUE` のプロセス。`MK_ONLY_SERVER` のプロセスは数えない) が N 個あると、Elythia の流量も閾値も N 倍になる
+- **2 つの種類が同じ worker を取り合う。** 本家は別々に数えるが、Elythia では、ユーザーの webhook がたくさん積まれると、通報などのシステムの webhook が後回しになる。1 つの queue にまとめた理由の記録は見つからなかった (webhook の配送を最初に実装した時点、asynq を直接使っていた頃からこの形)
 
 再試行は **Elythia の方が手厚い**。upstream は `attempts` を設定しないので単発試行で終わり、失敗した実体は failed job として残るだけで自動復旧しない。Elythia は指数バックオフ付きで 4 回まで再試行する (object storage の一時的な 5xx / タイムアウトは待てば回復するため)。queue 自体が使えないときは同期削除にフォールバックし、実体を取りこぼさない。
 

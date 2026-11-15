@@ -1,6 +1,8 @@
 package repository
 
 import (
+	"errors"
+
 	"github.com/elythia-network/elythia/internal/model"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -34,6 +36,13 @@ type FollowingRepository interface {
 	// 足すと呼び出しが空文字だらけになる。**上限も違う** (fanout 200 / CSV 500)
 	// ので、cursor 版の clamp を共有 body に置いてはいけない。
 	ListFollowersWithCursor(followeeID, sinceID, untilID string, limit, offset int) ([]*model.Following, error)
+	// ListHomeTimelineFollowers is ListFollowers narrowed to the followers whose
+	// home timeline receives the followee's notes: local (followerHost IS NULL)
+	// and not hibernated. Used by the note fanout (`core/timeline`).
+	//
+	// 本家 NoteCreateService.pushToTl と同じ条件で、配らない行を DB から読まない (#4021)。
+	// 部分 index `IDX_following_followeeId_id_home` (000141) が同じ述語を持つ。
+	ListHomeTimelineFollowers(followeeID string, limit, offset int) ([]*model.Following, error)
 	// ListFollowersToNotify returns Following rows where followeeId matches and
 	// notify='normal'. Used by note.CreateService to fan out 'note'
 	// notifications to followers who opted into post notifications (upstream
@@ -49,6 +58,14 @@ type FollowingRepository interface {
 	// 専用メソッドを分けている (ページング漏れが取りこぼしに直結するため)。
 	// proxy account の除外は caller 側で行う。
 	ListLocalFollowerIDs(followeeID string) ([]string, error)
+	// FollowsAnyOnHost reports whether followerID follows at least one user on
+	// host (followeeHost, in the stored form). ap/show uses it to decide whether
+	// the viewer's key may be shown to that host (#3915).
+	FollowsAnyOnHost(followerID, host string) (bool, error)
+	// ListLocalFollowerIDsLimit is ListLocalFollowerIDs returning at most limit
+	// ids, in the same (followerId) order. 受信で取り直すのに使うフォロワーを
+	// 選ぶとき (#3916) は先頭の数人しか見ないので、全件を読まない。
+	ListLocalFollowerIDsLimit(followeeID string, limit int) ([]string, error)
 	ListFollowing(userID string, limit, offset int) ([]*model.Following, error)
 
 	// ListFollowingWithCursor is ListFollowing paginated by sinceId/untilId
@@ -150,6 +167,144 @@ func (r *followingRepository) Create(f *model.Following) error {
 		return err
 	}
 	r.rc.Invalidate(RelationFollowing, f.FollowerID)
+	return nil
+}
+
+// FollowingEstablisher creates and deletes a following together with the
+// writes that must not be separated from it. It is implemented by the
+// repository returned from NewFollowingRepository; following.Service falls
+// back to separate writes for test doubles that do not implement it.
+type FollowingEstablisher interface {
+	// CreateEstablished deletes the follow request of the same pair, inserts
+	// f and, when opts.IncrementCounts is set, adds 1 to the follower's
+	// followingCount and the followee's followersCount, all in one
+	// transaction. It reports whether a follow request was deleted.
+	//
+	// When opts.RequireRequest is set and there is no follow request to
+	// delete, nothing is written: ErrFollowingAlreadyExists is returned when
+	// the pair already follows, ErrNotFound otherwise. A unique violation of
+	// the insert is returned as is, with nothing written.
+	CreateEstablished(f *model.Following, opts EstablishFollowingOpts) (requestDeleted bool, err error)
+	// DeleteEstablished deletes f and, when decrementCounts is set, subtracts
+	// 1 from the follower's followingCount and the followee's followersCount,
+	// in one transaction. When f is already gone, nothing is written and
+	// ErrNotFound is returned.
+	DeleteEstablished(f *model.Following, decrementCounts bool) error
+}
+
+// ErrFollowingAlreadyExists is returned by CreateEstablished with
+// RequireRequest when the request is gone because the pair already follows.
+var ErrFollowingAlreadyExists = errors.New("following already exists")
+
+// EstablishFollowingOpts selects the writes CreateEstablished makes.
+type EstablishFollowingOpts struct {
+	// IncrementCounts adds 1 to the users' following / followers counts.
+	IncrementCounts bool
+	// RequireRequest makes CreateEstablished fail with ErrNotFound when the
+	// pair has no follow request (accepting a request).
+	RequireRequest bool
+}
+
+// CreateEstablished implements FollowingEstablisher.
+//
+// 別々に書くと、フォローの行を作った後の申請の削除やカウントの加算が DB の
+// 障害で失敗したとき、行だけが残る。再試行は「既にフォロー済み」で止まり、
+// カウント・通知などを補えない (#3911)。承認では逆に、申請を消した後の作成が
+// 失敗すると申請だけが消える。どちらも 1 つのトランザクションにまとめて防ぐ。
+func (r *followingRepository) CreateEstablished(f *model.Following, opts EstablishFollowingOpts) (bool, error) {
+	// 利用者の削除 (user の行 → CASCADE で申請) とは書く順が逆なので、同じ組の
+	// フォローと削除が重なると片方がデッドロック (40P01) で落ちうる。削除される
+	// 利用者が絡むフォローはどのみち成立しないので、ここでは揃えない。
+	var requestDeleted bool
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where(`"followerId" = ? AND "followeeId" = ?`, f.FollowerID, f.FolloweeID).
+			Delete(&model.FollowRequest{})
+		if res.Error != nil {
+			return res.Error
+		}
+		requestDeleted = res.RowsAffected > 0
+		if opts.RequireRequest && !requestDeleted {
+			// 同じ申請を同時に承認したもう片方が先に成立させたときは、申請の
+			// 削除がその行のロックを待ってから 0 件になる。コミット済みの行は
+			// このトランザクションから見える (READ COMMITTED) ので、ここで
+			// primary を読んで「取り消された」と区別する。
+			var n int64
+			if err := tx.Model(&model.Following{}).
+				Where(`"followerId" = ? AND "followeeId" = ?`, f.FollowerID, f.FolloweeID).
+				Count(&n).Error; err != nil {
+				return err
+			}
+			if n > 0 {
+				return ErrFollowingAlreadyExists
+			}
+			return ErrNotFound
+		}
+		if err := tx.Create(f).Error; err != nil {
+			return err
+		}
+		if !opts.IncrementCounts {
+			return nil
+		}
+		return addFollowCounts(tx, f, 1)
+	})
+	if err != nil {
+		return false, err
+	}
+	r.rc.Invalidate(RelationFollowing, f.FollowerID)
+	return requestDeleted, nil
+}
+
+// DeleteEstablished implements FollowingEstablisher.
+//
+// 別々に書くと、行を消した後のカウントの減算が DB の障害で失敗したとき、行は
+// 消えたままカウント・配送・hook が欠け、再試行は「フォローしていない」で止まる。
+// また、同じ組の解除が同時に走ると、後の方は 0 件を消してカウントだけをもう
+// 一度減らしていた。消した件数を見て、0 件なら何も書かない (#3369)。
+func (r *followingRepository) DeleteEstablished(f *model.Following, decrementCounts bool) error {
+	// 利用者の削除 (user の行 → CASCADE で following) とは書く順が逆なので、
+	// CreateEstablished と同じく、同じ組の解除と削除が重なると片方がデッドロック
+	// (40P01) で落ちうる。ロールバックで状態は壊れず、再試行で済むので揃えない。
+	var owners []string
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Raw(`DELETE FROM "following" WHERE "id" = ? RETURNING "followerId"`, f.ID).
+			Scan(&owners).Error; err != nil {
+			return err
+		}
+		if len(owners) == 0 {
+			return ErrNotFound
+		}
+		if !decrementCounts {
+			return nil
+		}
+		return addFollowCounts(tx, f, -1)
+	})
+	if err != nil {
+		return err
+	}
+	r.rc.Invalidate(RelationFollowing, append(owners, f.FollowerID)...)
+	return nil
+}
+
+// addFollowCounts adds delta to the follower's followingCount and the
+// followee's followersCount of f within tx.
+//
+// **user の行は id の昇順でロックする。** A→B と B→A のフォロー (解除) が同時に
+// 走ると、書いた順にロックを取るので互いを待ってデッドロックになる。列が違う
+// だけなので、順序を入れ替えても結果は変わらない。
+func addFollowCounts(tx *gorm.DB, f *model.Following, delta int) error {
+	updates := []struct{ id, column string }{
+		{f.FollowerID, "followingCount"},
+		{f.FolloweeID, "followersCount"},
+	}
+	if updates[1].id < updates[0].id {
+		updates[0], updates[1] = updates[1], updates[0]
+	}
+	for _, u := range updates {
+		if err := tx.Model(&model.User{}).Where("id = ?", u.id).
+			UpdateColumn(u.column, gorm.Expr(`"`+u.column+`" + ?`, delta)).Error; err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -287,6 +442,12 @@ func (r *followingRepository) ListFollowers(userID string, limit, offset int) ([
 	return r.listRelationPage(`"followeeId" = ?`, userID, "", "", limit, offset)
 }
 
+func (r *followingRepository) ListHomeTimelineFollowers(followeeID string, limit, offset int) ([]*model.Following, error) {
+	// 述語は 000141 の部分 index と同じ形で書く。bind 変数を使わないので、prepared
+	// statement の generic plan でも index の述語を満たすと判定できる
+	return r.listRelationPage(`"followeeId" = ? AND "followerHost" IS NULL AND NOT "isFollowerHibernated"`, followeeID, "", "", limit, offset)
+}
+
 // ListFollowersToNotify returns Following rows where followeeId matches and
 // notify='normal'. note 通知の fan-out 対象を絞る (#1559)。`notify` 列は
 // null=OFF / 'normal'=ON という Misskey 互換 semantics で、TS NoteCreateService は
@@ -308,6 +469,31 @@ func (r *followingRepository) ListLocalFollowerIDs(followeeID string) ([]string,
 	if err := r.db.Model(&model.Following{}).
 		Where(`"followeeId" = ? AND "followerHost" IS NULL`, followeeID).
 		Order(`"followerId"`).
+		Pluck(`"followerId"`, &ids).Error; err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (r *followingRepository) FollowsAnyOnHost(followerID, host string) (bool, error) {
+	if !storable(followerID) || !storable(host) {
+		return false, nil
+	}
+	var exists bool
+	err := r.db.Raw(`SELECT EXISTS (SELECT 1 FROM "following" WHERE "followerId" = ? AND "followeeHost" = ?)`, followerID, host).
+		Scan(&exists).Error
+	return exists, err
+}
+
+func (r *followingRepository) ListLocalFollowerIDsLimit(followeeID string, limit int) ([]string, error) {
+	var ids []string
+	if limit <= 0 {
+		return ids, nil
+	}
+	if err := r.db.Model(&model.Following{}).
+		Where(`"followeeId" = ? AND "followerHost" IS NULL`, followeeID).
+		Order(`"followerId"`).
+		Limit(limit).
 		Pluck(`"followerId"`, &ids).Error; err != nil {
 		return nil, err
 	}

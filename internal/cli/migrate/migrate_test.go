@@ -117,6 +117,17 @@ func TestRun_Directions(t *testing.T) {
 	}
 }
 
+func TestRun_CoreDownRefusesUnverifiedLegacy117(t *testing.T) {
+	m := &fakeMigrator{version: 117}
+	e, out, _ := testEnv(t, m, nil)
+	e.coreDir = t.TempDir()
+	writeMigration(t, e.coreDir, "000117_user_account_created_at", "SELECT 1;", "SELECT 1;")
+	e.databaseURL = func(*config.Config) string { return "not-a-postgres-url" }
+	assert.Equal(t, 1, run(e, &bytes.Buffer{}, []string{"-config", writeConfig(t), "-direction", "down", "-track", "core"}))
+	assert.Contains(t, out.String(), "migration history check failed")
+	assert.Empty(t, m.calls, "must not roll back an unverified legacy 117")
+}
+
 func TestRun_NoChangeIsSuccess(t *testing.T) {
 	m := &fakeMigrator{err: gomigrate.ErrNoChange}
 	e, out, _ := testEnv(t, m, nil)

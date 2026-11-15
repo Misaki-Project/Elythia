@@ -61,9 +61,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 						:enableEmojiMenu="true"
 						:enableEmojiMenuReaction="true"
 					/>
-					<MkCwButton v-model="showContent" :text="appearNote.text" :renote="appearNote.renote" :files="appearNote.files" :poll="appearNote.poll" style="margin: 4px 0;"/>
+					<MkCwButton v-model="showContent" :text="appearNote.text" :renote="appearNote.renote" :files="appearNote.files" :poll="appearNote.poll" style="margin: 4px 0;" data-testid="note-cw-toggle"/>
 				</p>
-				<div v-show="appearNote.cw == null || showContent" :class="[{ [$style.contentCollapsed]: collapsed }]">
+				<div v-show="appearNote.cw == null || showContent" :class="[{ [$style.contentCollapsed]: collapsed }]" data-testid="note-content">
 					<div :class="$style.text">
 						<span v-if="appearNote.isHidden" style="opacity: 0.5">({{ i18n.ts.private }})</span>
 						<MkA v-if="appearNote.replyId" :class="$style.replyIcon" :to="`/notes/${appearNote.replyId}`"><i class="ti ti-arrow-back-up"></i></MkA>
@@ -112,10 +112,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 						/>
 					</div>
 					<div v-if="appearNote.renoteId" :class="$style.quote"><MkNoteSimple :note="appearNote?.renote ?? null" :class="$style.quoteNote"/></div>
-					<button v-if="isLong && collapsed" :class="$style.collapsed" class="_button" @click="collapsed = false">
+					<button v-if="isLong && collapsed" :class="$style.collapsed" class="_button" data-testid="note-show-more" @click="collapsed = false">
 						<span :class="$style.collapsedLabel">{{ i18n.ts.showMore }}</span>
 					</button>
-					<button v-else-if="isLong && !collapsed" :class="$style.showLess" class="_button" @click="collapsed = true">
+					<button v-else-if="isLong && !collapsed" :class="$style.showLess" class="_button" data-testid="note-show-less" @click="collapsed = true">
 						<span :class="$style.showLessLabel">{{ i18n.ts.showLess }}</span>
 					</button>
 				</div>
@@ -136,7 +136,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				</template>
 			</MkReactionsViewer>
 			<footer :class="$style.footer">
-				<button :class="$style.footerButton" class="_button" @click="reply()">
+				<button :class="$style.footerButton" class="_button" data-testid="note-reply" :aria-label="footerLabel(i18n.ts.reply, appearNote.repliesCount, true)" @click="reply()">
 					<i class="ti ti-arrow-back-up"></i>
 					<p v-if="appearNote.repliesCount > 0" :class="$style.footerButtonCount">{{ number(appearNote.repliesCount) }}</p>
 				</button>
@@ -145,6 +145,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 					ref="renoteButton"
 					:class="$style.footerButton"
 					class="_button"
+					data-testid="note-renote"
+					:aria-label="footerLabel(i18n.ts.renote, appearNote.renoteCount, true)"
 					@mousedown.prevent="renote()"
 				>
 					<i class="ti ti-repeat"></i>
@@ -153,7 +155,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				<button v-else :class="$style.footerButton" class="_button" disabled>
 					<i class="ti ti-ban"></i>
 				</button>
-				<button ref="reactButton" :class="$style.footerButton" class="_button" @click="handleToggleReact()">
+				<button ref="reactButton" :class="$style.footerButton" class="_button" data-testid="note-react" :aria-label="footerLabel(appearNote.reactionAcceptance === 'likeOnly' ? ($appearNote.myReaction != null ? i18n.ts.unlike : i18n.ts.like) : i18n.ts.reaction, $appearNote.reactionCount, appearNote.reactionAcceptance === 'likeOnly' || prefer.s.showReactionsCount)" @click="handleToggleReact()">
 					<i v-if="appearNote.reactionAcceptance === 'likeOnly' && $appearNote.myReaction != null" class="ti ti-heart-filled" style="color: var(--MI_THEME-love);"></i>
 					<i v-else-if="$appearNote.myReaction != null" class="ti ti-minus" style="color: var(--MI_THEME-accent);"></i>
 					<i v-else-if="appearNote.reactionAcceptance === 'likeOnly'" class="ti ti-heart"></i>
@@ -163,7 +165,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				<button v-if="prefer.s.showClipButtonInNoteFooter" ref="clipButton" :class="$style.footerButton" class="_button" @mousedown.prevent="clip()">
 					<i class="ti ti-paperclip"></i>
 				</button>
-				<button ref="menuButton" :class="$style.footerButton" class="_button" @mousedown.prevent="showMenu()">
+				<button ref="menuButton" :class="$style.footerButton" class="_button" data-testid="note-menu" :aria-label="i18n.ts.menu" @mousedown.prevent="showMenu()">
 					<i class="ti ti-dots"></i>
 				</button>
 			</footer>
@@ -214,7 +216,7 @@ import { i18n } from '@/i18n.js';
 import { userPage } from '@@/js/user.js';
 import { getNoteSummary } from '@/utility/get-note-summary.js';
 import { isEnabledUrlPreview } from '@/utility/url-preview.js';
-import { focusPrev, focusNext } from '@/utility/focus.js';
+import { focusPrev, focusNext, focusPrevItem, focusNextItem, isInWrappedItem } from '@/utility/focus.js';
 import number from '@/filters/number.js';
 import { DI } from '@/di.js';
 import type { Keymap } from '@/utility/hotkey.js';
@@ -229,6 +231,13 @@ import MkCwButton from '@/components/MkCwButton.vue';
 import MkPoll from '@/components/MkPoll.vue';
 import MkPluginUrlPreview from '@/components/MkPluginUrlPreview.vue';
 import MkInstanceTicker from '@/components/MkInstanceTicker.vue';
+
+// mk-go (#4082): フッターのボタンの読み上げる名前。aria-label はボタンの中の文字 (数) を上書きするので、
+// 数を出しているときは名前にも入れる。いいねだけを受け付けるノートでは、押したときの働きに合わせて
+// 「いいね」「いいねを解除」にする
+function footerLabel(label: string, count: number, shown: boolean): string {
+	return shown && count > 0 ? `${label} ${number(count)}` : label;
+}
 
 const props = withDefaults(defineProps<{
 	note: Misskey.entities.Note;
@@ -376,11 +385,13 @@ const keymap = {
 	},
 	'up|k|shift+tab': {
 		allowRepeat: true,
-		callback: () => focusPrev(rootEl.value),
+		// Elythia: 一覧の外側の箱の中にあるときは、箱をまたいで前後のノートへ移る (#3941)。
+		// それ以外 (ユーザーページや検索の一覧など) は本家と同じ
+		callback: () => (isInWrappedItem(rootEl.value) ? focusPrevItem(rootEl.value) : focusPrev(rootEl.value)),
 	},
 	'down|j|tab': {
 		allowRepeat: true,
-		callback: () => focusNext(rootEl.value),
+		callback: () => (isInWrappedItem(rootEl.value) ? focusNextItem(rootEl.value) : focusNext(rootEl.value)),
 	},
 } as const satisfies Keymap;
 </script>
@@ -585,7 +596,6 @@ const keymap = {
 	&.useSticky {
 		position: sticky !important;
 		top: calc(22px + var(--MI-stickyTop, 0px));
-		left: 0;
 	}
 }
 

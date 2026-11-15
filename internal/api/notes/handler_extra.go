@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/hashtag"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/jsstr"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
@@ -64,7 +64,9 @@ func (h *Handler) FavoritesCreate(c echo.Context) error {
 	}
 	exists, _ := h.favoriteRepo.Exists(user.ID, req.NoteID)
 	if exists {
-		return c.JSON(http.StatusConflict, apierr.Error("ALREADY_FAVORITED", "Already favorited.", "a402c12b-34dd-41d2-97d8-4d2ffd96a1a6"))
+		// upstream notes/favorites/create.ts の alreadyFavorited は httpStatusCode を
+		// 持たないので、kind client の既定どおり400で、messageも本家と揃える (#4122)。
+		return c.JSON(http.StatusBadRequest, apierr.Error("ALREADY_FAVORITED", "The note has already been marked as a favorite.", "a402c12b-34dd-41d2-97d8-4d2ffd96a1a6"))
 	}
 	now := time.Now()
 	fav := &model.NoteFavorite{
@@ -366,7 +368,7 @@ func (h *Handler) Mentions(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -383,7 +385,12 @@ func (h *Handler) Mentions(c echo.Context) error {
 	// 種別で埋まると limit 未満になる under-fill が起きていた。
 	// following=true のとき followee + 自分の note のみに絞る (upstream
 	// mentions.ts following param、#1554)。
-	notes, err := h.noteRepo.ListMentions(user.ID, req.Visibility, req.Following, limit, sinceID, untilID)
+	// 本家は並びを `(ps.sinceDate || ps.sinceId) ? 'ASC' : 'DESC'` で決める。
+	// makePaginationQuery が捨てた sinceDate も並びには効くので、カーソルとは別に
+	// 渡す (#3369)。日付の0は本家でも偽。
+	sinceDate := req.SinceDate.Int64Ptr()
+	ascending := req.SinceID != "" || (sinceDate != nil && *sinceDate != 0)
+	notes, err := h.noteRepo.ListMentions(user.ID, req.Visibility, req.Following, limit, sinceID, untilID, ascending)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
@@ -562,7 +569,7 @@ func (h *Handler) SearchByTag(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -767,11 +774,10 @@ func (h *Handler) Translate(c echo.Context) error {
 
 	// upstream は 2026.9.0 で判定を `note.text == null` から `text.trim() === ''`
 	// に変えた。空白のみ / 空文字は DeepL へ投げずに 204 (res optional → No Content)。
-	// **空白の集合は完全一致ではない** — JS の trim は U+FEFF を落とすが Go の
-	// unicode.IsSpace は落とさず、逆に Go は U+0085 を落とすが JS は落とさない。
-	// それだけで構成された本文でのみ分岐する。
+	// 空白は JavaScript の集合で見る (U+FEFF だけの本文は 204、U+0085 だけの本文は
+	// 翻訳に回す。#3369)。
 	// mk-go の旧 CANNOT_TRANSLATE は upstream に無い独自 error なので廃止済み (#1948-17)。
-	if strings.TrimSpace(text) == "" {
+	if !jsstr.HasNonSpace(text) {
 		return c.NoContent(http.StatusNoContent)
 	}
 

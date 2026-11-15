@@ -70,6 +70,13 @@ func (r *Resolver) shouldRefreshActor(u *model.User) bool {
 // 戻り値は actor document の取得・検証の error だけ。DB への書き込みの失敗は
 // 従来どおり握る (次の refresh で再試行される)。
 func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured bool, chain *resolveChain) error {
+	// **削除済みの行は取り直さない** (#4106)。本家の updatePerson と同じく何もせずに
+	// 戻る (`isDeleted: false` を条件に更新し、0 件なら skip)。取り直すと、削除した
+	// 利用者のプロフィールとピン留めを、相手が好きな内容に書き換えられる。削除済みの
+	// 状態は管理者が決めたもので、相手の document で変えない。
+	if existing.IsDeleted {
+		return nil
+	}
 	// background refresh は federation-loop 扱いで Strict (request host binding 有効)。
 	actor, err := r.fetchActor(uri, false)
 	if err != nil {
@@ -115,6 +122,13 @@ func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured b
 	// された場合にローカルの判定もずれないように)。
 	fields["isLocked"] = actor.ManuallyApproves.Bool()
 	existing.IsLocked = actor.ManuallyApproves.Bool()
+	// 猫と、探せるかどうかも追従する (#4022)。discoverable が無いときは今の値のまま
+	// (本家の updatePerson は undefined を書かない)
+	fields["isCat"] = actor.IsCat.Bool()
+	existing.IsCat = actor.IsCat.Bool()
+	explorable := remoteExplorable(actor, existing.IsExplorable)
+	fields["isExplorable"] = explorable
+	existing.IsExplorable = explorable
 	// **由来 (#2973) を見て決める。** `local` = モデレーターの判断には触らず、
 	// `remote` = こちらが actor を見て凍結した行だけが発信元の解除に追従する。
 	// 記録が無い行は解除方向では `local` 扱い (安全側)。

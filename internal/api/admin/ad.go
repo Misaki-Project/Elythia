@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"math"
 	"net/http"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/elythia-network/elythia/internal/api/pagination"
 	"github.com/elythia-network/elythia/internal/core/moderationlog"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/jsdate"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/labstack/echo/v4"
@@ -34,6 +36,14 @@ func (h *Handler) AdCreate(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.URL == "" || req.ImageURL == "" {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("Invalid parameters."))
 	}
+	// JavaScript の Date で表せない日時は 400 にする (#3369)。本家は Invalid Date の
+	// まま書き込んで 500 になる。以前は桁あふれした日時をそのまま保存していた。
+	if !jsdate.ValidMillis(int64(req.StartsAt)) || !jsdate.ValidMillis(int64(req.ExpiresAt)) {
+		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("Invalid parameters."))
+	}
+	if !fitsInt4(req.Ratio) || !fitsInt4(req.DayOfWeek) {
+		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("Invalid parameters."))
+	}
 	if req.Place == "" {
 		req.Place = "square"
 	}
@@ -57,6 +67,9 @@ func (h *Handler) AdCreate(c echo.Context) error {
 		ExpiresAt:   millisOrDefault(int64(req.ExpiresAt), time.Now().Add(30*24*time.Hour)),
 	}
 	if err := h.adRepo.Create(ad); err != nil {
+		if repository.IsRejectedValue(err) {
+			return apierr.JSONInvalidParam(c)
+		}
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	h.invalidateMetaResponseCache()
@@ -110,20 +123,25 @@ func (h *Handler) AdDelete(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	if req.ID == "" {
-		return c.NoContent(http.StatusNoContent)
+		return apierr.JSONInvalidParam(c)
 	}
-	// log info に snapshot を含めるため削除前に取得 (失敗時は log を諦める)
-	snapshot, _ := h.adRepo.FindByID(req.ID)
-	if err := h.adRepo.Delete(req.ID); err == nil {
-		// snapshot が取れたかどうかは moderation log の話で、cache とは無関係。
-		h.invalidateMetaResponseCache()
-		if snapshot != nil {
-			h.logModeration(c, moderationlog.LogDeleteAd, map[string]any{
-				"adId": req.ID,
-				"ad":   snapshot,
-			})
+	// 本家 ad/delete.ts と同じく、無い広告は NO_SUCH_AD にする (#3369)。以前は
+	// 何もせずに 204 を返していた。DB の障害は「無い」に丸めない (#2792)。
+	snapshot, err := h.adRepo.FindByID(req.ID)
+	if err != nil {
+		if repository.IsNotFound(err) {
+			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_AD", "No such ad.", "ccac9863-3a03-416e-b899-8a64041118b1"))
 		}
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
+	if err := h.adRepo.Delete(req.ID); err != nil {
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
+	h.invalidateMetaResponseCache()
+	h.logModeration(c, moderationlog.LogDeleteAd, map[string]any{
+		"adId": req.ID,
+		"ad":   snapshot,
+	})
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -153,7 +171,7 @@ func (h *Handler) AdList(c echo.Context) error {
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -191,13 +209,18 @@ func (h *Handler) AdUpdate(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.ID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("Invalid parameters."))
 	}
+	// JavaScript の Date で表せない日時は 400 にする (#3369、AdCreate と同じ)。
+	if (req.StartsAt != nil && !jsdate.ValidMillis(int64(*req.StartsAt))) || (req.ExpiresAt != nil && !jsdate.ValidMillis(int64(*req.ExpiresAt))) {
+		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("Invalid parameters."))
+	}
 	before, err := h.adRepo.FindByID(req.ID)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	if err != nil {
-		return c.JSON(http.StatusNotFound, apierr.NotFound())
+		// 本家 ad/update.ts の NO_SUCH_AD (400) に揃える (#3369)。以前は 404 NOT_FOUND。
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_AD", "No such ad.", "b7aa1727-1354-47bc-a182-3a9c3973d300"))
 	}
 	fields := map[string]any{}
 	if req.URL != nil {
@@ -215,6 +238,9 @@ func (h *Handler) AdUpdate(c echo.Context) error {
 	if req.Priority != nil {
 		fields["priority"] = *req.Priority
 	}
+	if (req.Ratio != nil && !fitsInt4(*req.Ratio)) || (req.DayOfWeek != nil && !fitsInt4(*req.DayOfWeek)) {
+		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("Invalid parameters."))
+	}
 	if req.Ratio != nil {
 		fields["ratio"] = int(*req.Ratio)
 	}
@@ -224,22 +250,22 @@ func (h *Handler) AdUpdate(c echo.Context) error {
 	if req.IsSensitive != nil {
 		fields["isSensitive"] = *req.IsSensitive
 	}
-	// pointer 型フィールドは nil (未指定) と 0 (明示的に 0) を区別できるので、
-	// 受け取った値をそのまま UnixMilli に変換する。Create 側と違い 0 を now に
-	// 読み替えない。本家の update.ts は`ps.expiresAt ? new Date(ps.expiresAt) :
-	// undefined`なので 0 を「変えない」として無視するが、Elythia は 0 を1970年
-	// (エポック)として保存する。以前からの差で、docs/divergence/approximations.md に
-	// 書いている(#3854)。
-	if req.StartsAt != nil {
+	// 本家の update.ts は`ps.expiresAt ? new Date(ps.expiresAt) : undefined`なので、
+	// 0 を「変えない」として無視する。Elythia も同じにする (#3369)。以前は 0 を
+	// 1970年 (エポック) として保存し、広告がすぐに期限切れになっていた。
+	if req.StartsAt != nil && *req.StartsAt != 0 {
 		fields["startsAt"] = time.UnixMilli(int64(*req.StartsAt))
 	}
-	if req.ExpiresAt != nil {
+	if req.ExpiresAt != nil && *req.ExpiresAt != 0 {
 		fields["expiresAt"] = time.UnixMilli(int64(*req.ExpiresAt))
 	}
 	if len(fields) == 0 {
 		return c.NoContent(http.StatusNoContent)
 	}
 	if err := h.adRepo.UpdateFields(req.ID, fields); err != nil {
+		if repository.IsRejectedValue(err) {
+			return apierr.JSONInvalidParam(c)
+		}
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	h.invalidateMetaResponseCache()
@@ -269,4 +295,14 @@ func millisOrDefault(ms int64, def time.Time) time.Time {
 		return def
 	}
 	return time.UnixMilli(ms)
+}
+
+// fitsInt4 reports whether n fits an int4 column (ad.ratio, ad.dayOfWeek,
+// role.displayOrder).
+//
+// 本家の宣言は integer だけで範囲を持たず、範囲外の値は DB のエラーで 500 になる。
+// pgx は送る前に落とすので、PostgreSQL のエラー (repository.IsRejectedValue) にも
+// ならない。ここで 400 にする (#4120)
+func fitsInt4(n jsnum.Int) bool {
+	return n >= math.MinInt32 && n <= math.MaxInt32
 }

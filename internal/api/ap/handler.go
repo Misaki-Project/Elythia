@@ -111,6 +111,13 @@ type Handler struct {
 	// entityPacker は利用者や投稿を包むときの依存 (role 由来の値、メディアのプロキシ等) を
 	// 持つ (#3790、#3792)。組み立てで渡す。
 	entityPacker *entity.Packer
+	// fetchSigner は /notes/:id と /notes/:id/activity の署名付き GET から、署名した
+	// リモートの利用者を特定する (#3914)。未配線なら公開の投稿だけを返す (従来どおり)。
+	fetchSigner FetchSignerAuthenticator
+	// fetchDelivery / fetchDeliverSoftware は、署名した人のホストへ配送するかの
+	// 判定 (#3914)。配送しない相手には見せない投稿を返さない。
+	fetchDelivery        DeliveryGate
+	fetchDeliverSoftware SoftwareSuspensionChecker
 }
 
 // SetLocalFederationObserver wires account-level availability and first-reference tracking.
@@ -168,17 +175,57 @@ func (h *Handler) seedAPNote(c echo.Context, note *model.Note) {
 	}
 }
 
-func (h *Handler) resolveAPUser(c echo.Context, userID string) (*model.User, error) {
+// lookupAPUser returns the user row for userID, reusing a row already read
+// while serving this request. Repository errors are returned unchanged.
+func (h *Handler) lookupAPUser(c echo.Context, userID string) (*model.User, error) {
 	memo := h.referenceMemo(c)
 	if user := memo.users[userID]; user != nil {
 		return user, nil
 	}
-	bundle, err := h.userService.ShowByID(userID)
+	// 参照の確認が見るのは利用者の行だけなので、profile は引かない (#3989)。
+	user, err := h.userService.FindByID(userID)
 	if err != nil {
 		return nil, err
 	}
-	memo.users[userID] = bundle.User
-	return bundle.User, nil
+	if user != nil {
+		memo.users[userID] = user
+	}
+	return user, nil
+}
+
+// resolveAPUser is lookupAPUser with a missing user reported as
+// coreuser.ErrUserNotFound, like userService.ShowByID.
+func (h *Handler) resolveAPUser(c echo.Context, userID string) (*model.User, error) {
+	user, err := h.lookupAPUser(c, userID)
+	if err != nil {
+		// **DB 障害を not-found に丸めない** (ShowByID と同じ、#2799)。
+		if repository.IsNotFound(err) {
+			return nil, coreuser.ErrUserNotFound
+		}
+		return nil, err
+	}
+	return user, nil
+}
+
+// resolveAPAuthor returns the author of n for the reference check, reusing the
+// author row the note query loaded with n.
+func (h *Handler) resolveAPAuthor(c echo.Context, n *model.Note) (*model.User, error) {
+	// queryService.Show は投稿と同じ読み取りで作者の行も読んでいる (hydrateNoteRelations)。
+	// 同じ要求の中なので、それを使い回して作者をもう一度引かない (#3989)。
+	h.seedAPUser(c, n.User)
+	return h.resolveAPUser(c, n.UserID)
+}
+
+// referenceRenderer returns the renderer for a response whose references are
+// checked. Mentioned users are looked up through the request memo, so the
+// check reuses the rows rendering read instead of reading them again (#3989).
+func (h *Handler) referenceRenderer(c echo.Context) *activitypub.Renderer {
+	if h.localFederationObserver == nil {
+		return h.renderer
+	}
+	return h.renderer.WithMentionUserLookup(func(userID string) (*model.User, error) {
+		return h.lookupAPUser(c, userID)
+	})
 }
 
 func (h *Handler) resolveAPNote(c echo.Context, noteID string) (*model.Note, error) {
@@ -598,7 +645,12 @@ func (h *Handler) UserByAcct(c echo.Context) error {
 // Content-Type before treating a response as an AP document, so a plain
 // application/json would cause them to reject it.
 func writeActivityJSON(c echo.Context, v any) error {
-	return c.Blob(http.StatusOK, `application/activity+json; charset=utf-8`, mustMarshal(v))
+	return writeActivityJSONBytes(c, mustMarshal(v))
+}
+
+// writeActivityJSONBytes writes an already serialized ActivityPub document.
+func writeActivityJSONBytes(c echo.Context, data []byte) error {
+	return c.Blob(http.StatusOK, `application/activity+json; charset=utf-8`, data)
 }
 
 type localAPReferences struct {
@@ -613,7 +665,7 @@ func extractLocalAPReferences(v any, urls *activitypub.URLBuilder) (localAPRefer
 	if err != nil {
 		return localAPReferences{}, err
 	}
-	users, notes := activitypub.ExtractLocalAPReferences(urls.BaseURL(), string(data))
+	users, notes := activitypub.ExtractLocalAPReferences(urls.BaseURL(), data)
 	return localAPReferences{users: users, notes: notes}, nil
 }
 
@@ -625,6 +677,17 @@ func (h *Handler) validateAPReferences(c echo.Context, v any) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return h.validateLocalAPReferences(c, refs)
+}
+
+// validateAPReferenceData is validateAPReferences for a document that is
+// already serialized. The caller checks that the observer is wired.
+func (h *Handler) validateAPReferenceData(c echo.Context, data []byte) (bool, error) {
+	users, notes := activitypub.ExtractLocalAPReferences(h.renderer.URLs().BaseURL(), data)
+	return h.validateLocalAPReferences(c, localAPReferences{users: users, notes: notes})
+}
+
+func (h *Handler) validateLocalAPReferences(c echo.Context, refs localAPReferences) (bool, error) {
 	users := make(map[string]*model.User, len(refs.users)+len(refs.notes))
 	reasons := make(map[string]string, len(refs.users)+len(refs.notes))
 	for _, userID := range refs.users {
@@ -687,7 +750,17 @@ func (h *Handler) validateAPReferences(c echo.Context, v any) (bool, error) {
 }
 
 func (h *Handler) writeAPJSON(c echo.Context, v any) error {
-	available, err := h.validateAPReferences(c, v)
+	if h.localFederationObserver == nil {
+		return writeActivityJSON(c, v)
+	}
+	// 参照の確認と応答に、同じ Marshal の結果を使う。以前は確認のためと応答のためで
+	// 2 回 Marshal していた (#3989)。
+	data, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("ap: validate response references", "err", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	available, err := h.validateAPReferenceData(c, data)
 	if err != nil {
 		slog.Error("ap: validate response references", "err", err)
 		return c.NoContent(http.StatusInternalServerError)
@@ -695,7 +768,7 @@ func (h *Handler) writeAPJSON(c echo.Context, v any) error {
 	if !available {
 		return c.NoContent(http.StatusNotFound)
 	}
-	return writeActivityJSON(c, v)
+	return writeActivityJSONBytes(c, data)
 }
 
 // wantsActivityJSON reports whether the caller prefers an AP document.
@@ -794,8 +867,32 @@ func (h *Handler) APIShow(c echo.Context) error {
 	// timeout) で失敗したときに立てる。webfinger fallback も失敗した場合に
 	// NO_SUCH_OBJECT ではなく REQUEST_FAILED (81b539cf) を返すための記録。
 	fetchRequestFailed := false
+	// **取り込み済みのリモートの投稿は、外へ取りに行かずに返す** (upstream の
+	// fetchAny も DB を先に引く、#3915)。取りに行くと、配送で届いているフォロワー
+	// 限定の投稿でも instance actor では見えず、照会した人の鍵で取り直すことに
+	// なり、要らないのに「誰が照会したか」を相手に伝える。見られない人には
+	// packNoteForAPI が隠す。
+	if h.noteRepo != nil {
+		if found, err := h.noteRepo.FindByURI(uri); err == nil && found.UserHost != nil {
+			// 包むのに作者と埋め込みが要るので、他の経路と同じく関係ごと読み直す。
+			if n, err := h.noteRepo.FindByIDWithRelations(found.ID); err == nil {
+				return c.JSON(http.StatusOK, map[string]any{
+					"type":   "Note",
+					"object": h.packNoteForAPI(middleware.GetUser(c), n),
+				})
+			}
+		}
+	}
 	if h.remoteFetcher != nil {
 		data, fetchErr := h.remoteFetcher.FetchObject(uri)
+		// instance actor に見せなかった (401 / 403 / 404) ものは、照会した人の鍵で
+		// 取り直す (#3915)。フォロワー限定・指名の投稿は、署名した人で見せるかを
+		// 決めるサーバーなら、これで取れる。取れたときだけ viewerKey が立ち、取り
+		// 込みでもその鍵を使う。
+		var viewerKey *activitypub.PrivateKey
+		if retried, key, retryErr, ok := h.refetchAsViewer(middleware.GetUser(c), uri, fetchErr); ok {
+			data, viewerKey, fetchErr = retried, key, retryErr
+		}
 		switch {
 		case fetchErr != nil:
 			// 404 / 410 は「不在」なので NO_SUCH_OBJECT 経路へ。それ以外は
@@ -808,12 +905,14 @@ func (h *Handler) APIShow(c echo.Context) error {
 			var parsed map[string]any
 			if json.Unmarshal(data, &parsed) != nil {
 				// fetch できたが JSON として不正 → RESPONSE_INVALID (70193c39)。
-				return c.JSON(http.StatusBadGateway, apierr.Error("RESPONSE_INVALID", "Response from remote server is invalid.", "70193c39-54f3-4813-82f0-70a680f7495b"))
+				// upstream ap/show.ts の responseInvalid / requestFailed は httpStatusCode を
+				// 持たないので、kind client の既定どおり400で返す (#4122)。
+				return c.JSON(http.StatusBadRequest, apierr.Error("RESPONSE_INVALID", "Response from remote server is invalid.", "70193c39-54f3-4813-82f0-70a680f7495b"))
 			}
 			// AP object は id 必須。欠落は upstream の `object.id == null` →
 			// responseInvalid に対応する。
 			if objID, _ := parsed["id"].(string); objID == "" {
-				return c.JSON(http.StatusBadGateway, apierr.Error("RESPONSE_INVALID", "Response from remote server is invalid.", "70193c39-54f3-4813-82f0-70a680f7495b"))
+				return c.JSON(http.StatusBadRequest, apierr.Error("RESPONSE_INVALID", "Response from remote server is invalid.", "70193c39-54f3-4813-82f0-70a680f7495b"))
 			}
 			// `type` は配列で来ることがある (JSON-LD の `@type` は配列表現が
 			// 正規)。string 決め打ちだと Note / Article / Question の分岐を
@@ -829,7 +928,7 @@ func (h *Handler) APIShow(c echo.Context) error {
 			// #2662)。
 			case "Note", "Question", "Article", "Audio", "Document", "Image", "Page", "Video", "Event":
 				if h.remoteResolver != nil {
-					if remoteNote, err := h.remoteResolver.ResolveNoteAllowCrossHost(uri); err == nil {
+					if remoteNote, err := h.resolveRemoteNote(uri, viewerKey); err == nil {
 						return c.JSON(http.StatusOK, map[string]any{
 							"type":   "Note",
 							"object": h.packNoteForAPI(middleware.GetUser(c), remoteNote),
@@ -874,7 +973,7 @@ func (h *Handler) APIShow(c echo.Context) error {
 	// fetch が transport 失敗 (5xx / network) だった場合は REQUEST_FAILED、
 	// それ以外 (404/410 / 純粋に不在) は NO_SUCH_OBJECT。
 	if fetchRequestFailed {
-		return c.JSON(http.StatusBadGateway, apierr.Error("REQUEST_FAILED", "Request failed.", "81b539cf-4f57-4b29-bc98-032c33c0792e"))
+		return c.JSON(http.StatusBadRequest, apierr.Error("REQUEST_FAILED", "Request failed.", "81b539cf-4f57-4b29-bc98-032c33c0792e"))
 	}
 	return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_OBJECT", "No such object.", "dc94d745-1262-4e63-a17d-fecaa57efc82"))
 }
@@ -994,7 +1093,12 @@ func (h *Handler) packNoteForAPI(viewer *model.User, n *model.Note) entity.NoteE
 	// から漏れる IDOR になる。ap/show は RequireAuth なので viewer は通常非 nil だが、
 	// nil でも notehide が fail-closed (followers/specified embed を hide) する。
 	arr := []entity.NoteEntity{h.entityPacker.PackNote(n, h.idGen)}
-	h.noteHider.HideEmbeds(viewer, arr)
+	// **投稿そのものも、見られない viewer には隠す** (upstream の pack は skipHide
+	// を付けずに呼ぶので、hideNote が投稿そのものにも掛かる)。ap/show は照会した人の
+	// 鍵で取り直して、フォロワー限定・指名の投稿を取り込む (#3915)。取り込んだ後に
+	// 別の利用者が同じ URL を照会し、相手のサーバーがそれを返したとき、こちらの
+	// フォローの記録では見られない人に本文を返さない。
+	h.noteHider.HideStoredNotes(viewer, arr)
 	return arr[0]
 }
 
@@ -1038,11 +1142,11 @@ func (h *Handler) Note(c echo.Context) error {
 		return c.NoContent(http.StatusForbidden)
 	}
 	noteID := c.Param("id")
-	// 公開ノートのみAPでフェッチ可能 (非ログインから取得されるため viewer=nil)。
-	// CanSeeNote(nil) は public / home を通すので、upstream の
-	// visibility ∈ {public, home} フィルタと一致する。
-	n, err := h.queryService.Show(nil, noteID)
-	if err != nil {
+	// 署名の無い GET には公開ノートだけを返す (viewer=nil)。CanSeeNote(nil) は
+	// public / home を通すので、upstream の visibility ∈ {public, home} フィルタと
+	// 一致する。それ以外は、署名した人が見てよいときだけ返す (#3914)。
+	n := h.showNoteForFetch(c, noteID)
+	if n == nil {
 		return c.NoContent(http.StatusNotFound)
 	}
 	h.seedAPNote(c, n)
@@ -1074,14 +1178,14 @@ func (h *Handler) Note(c echo.Context) error {
 		return h.redirectAP(c, http.StatusFound, *n.URI)
 	}
 	if h.localFederationObserver != nil {
-		author, err := h.userService.ShowByID(n.UserID)
+		author, err := h.resolveAPAuthor(c, n)
 		if err != nil {
 			if errors.Is(err, coreuser.ErrUserNotFound) {
 				return c.NoContent(http.StatusNotFound)
 			}
 			return c.NoContent(http.StatusInternalServerError)
 		}
-		available, err := h.requireAPUser(c, author.User, "note")
+		available, err := h.requireAPUser(c, author, "note")
 		if err != nil {
 			return c.NoContent(http.StatusInternalServerError)
 		}
@@ -1089,7 +1193,7 @@ func (h *Handler) Note(c echo.Context) error {
 			return c.NoContent(http.StatusNotFound)
 		}
 	}
-	note := h.renderer.RenderNote(n, h.idGen)
+	note := h.referenceRenderer(c).RenderNote(n, h.idGen)
 	return h.writeAPJSON(c, note)
 }
 
@@ -1127,13 +1231,14 @@ func (h *Handler) Featured(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	items := make([]any, 0, len(notes))
+	renderer := h.referenceRenderer(c)
 	for _, n := range notes {
 		h.seedAPNote(c, n)
 		// upstream featured の filter: !localOnly && visibility ∈ {public, home}。
 		if n.LocalOnly || (n.Visibility != model.NoteVisibilityPublic && n.Visibility != model.NoteVisibilityHome) {
 			continue
 		}
-		rn := h.renderer.RenderNote(n, h.idGen)
+		rn := renderer.RenderNote(n, h.idGen)
 		available, err := h.validateAPReferences(c, rn)
 		if err != nil {
 			slog.Error("ap: validate featured note references", "noteId", n.ID, "err", err)
@@ -1440,27 +1545,27 @@ func (h *Handler) NoteActivity(c echo.Context) error {
 	if h.federationDisabled() {
 		return c.NoContent(http.StatusForbidden)
 	}
-	n, err := h.queryService.Show(nil, c.Param("id"))
-	if err != nil {
+	n := h.showNoteForFetch(c, c.Param("id"))
+	if n == nil {
 		return c.NoContent(http.StatusNotFound)
 	}
 	h.seedAPNote(c, n)
 	// upstream は userHost: IsNull で**ローカル専用** (リモートノートの activity
-	// はこのサーバーの発行物ではないので、redirect でなく 404)。visibility ∈
-	// {public, home} は CanSeeNote(nil) が担保し、localOnly はここで弾く
-	// (Note と同じ)。
+	// はこのサーバーの発行物ではないので、redirect でなく 404)。visibility は
+	// showNoteForFetch が見て (署名の無い GET には public / home だけ)、localOnly は
+	// ここで弾く (Note と同じ)。
 	if n.UserHost != nil || n.LocalOnly {
 		return c.NoContent(http.StatusNotFound)
 	}
 	if h.localFederationObserver != nil {
-		authorBundle, err := h.userService.ShowByID(n.UserID)
+		author, err := h.resolveAPAuthor(c, n)
 		if err != nil {
 			if errors.Is(err, coreuser.ErrUserNotFound) {
 				return c.NoContent(http.StatusNotFound)
 			}
 			return c.NoContent(http.StatusInternalServerError)
 		}
-		available, err := h.requireAPUser(c, authorBundle.User, "note")
+		available, err := h.requireAPUser(c, author, "note")
 		if err != nil {
 			return c.NoContent(http.StatusInternalServerError)
 		}
@@ -1491,7 +1596,7 @@ func (h *Handler) packOutboxActivity(c echo.Context, author *model.User, n *mode
 		}
 		// target を解決できないときは Create にフォールバック (shape は valid のまま)。
 	}
-	create := h.renderer.RenderCreate(n, h.idGen)
+	create := h.referenceRenderer(c).RenderCreate(n, h.idGen)
 	create.Context = nil
 	return create
 }

@@ -34,6 +34,15 @@ SPDX-License-Identifier: AGPL-3.0-only
 			<div :class="$style.newBg2"></div>
 			<button class="_button" :class="$style.newButton" @click="releaseQueue()"><i class="ti ti-circle-arrow-up"></i> {{ i18n.ts.newNote }}</button>
 		</div>
+		<!--
+			Elythia: 古いものを読み足したら、遷移を切る (#3939)。読み足した項目はたいてい画面の下に
+			足されて見えないのに、出現の遷移の終わりを知るために Vue が項目ごとに getComputedStyle を
+			読み、そのたびにページ全体のスタイル再計算が走っていた (見える位置に足したときは、
+			出現の動きが付かないだけ)。移動のクラスも外すと、描いた後に
+			全件の位置を測り直す処理 (移動のアニメーションのため) も省かれる。描く前の全件の位置の
+			計測は TransitionGroup の作りで止められない。切る期間は deferOlderMounts の
+			quietTransitions を参照。
+		-->
 		<component
 			:is="prefer.s.animation ? TransitionGroup : 'div'"
 			:class="$style.notes"
@@ -41,7 +50,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 			:leaveActiveClass="$style.transition_x_leaveActive"
 			:enterFromClass="$style.transition_x_enterFrom"
 			:leaveToClass="$style.transition_x_leaveTo"
-			:moveClass="$style.transition_x_move"
+			:moveClass="quietTransitions() ? undefined : $style.transition_x_move"
+			:css="!quietTransitions()"
 			tag="div"
 		>
 			<template v-for="(note, i) in paginator.items.value" :key="note.id">
@@ -51,20 +61,27 @@ SPDX-License-Identifier: AGPL-3.0-only
 						<span style="height: 1em; width: 1px; background: var(--MI_THEME-divider);"></span>
 						<span>{{ getSeparatorInfo(paginator.items.value[i -1].createdAt, note.createdAt)?.nextText }} <i class="ti ti-chevron-down"></i></span>
 					</div>
-					<MkNote :class="$style.note" :note="note" :withHardMute="true"/>
+					<MkDeferredMount :defer="olderMounts.shouldDefer(note.id)" :unmountWhenFar="true" :class="$style.note">
+						<MkNote :note="note" :withHardMute="true"/>
+					</MkDeferredMount>
 				</div>
 				<div v-else-if="note._shouldInsertAd_" :data-scroll-anchor="note.id">
-					<MkNote :class="$style.note" :note="note" :withHardMute="true"/>
+					<MkDeferredMount :defer="olderMounts.shouldDefer(note.id)" :unmountWhenFar="true" :class="$style.note">
+						<MkNote :note="note" :withHardMute="true"/>
+					</MkDeferredMount>
 					<div :class="$style.ad">
 						<MkAd :preferForms="['horizontal', 'horizontal-big']"/>
 					</div>
 				</div>
-				<MkNote v-else :class="$style.note" :note="note" :withHardMute="true" :data-scroll-anchor="note.id"/>
+				<!-- Elythia: 古いものを読み足したときは、中身を数フレームに分けて組み立てる (#3937) -->
+				<MkDeferredMount v-else :defer="olderMounts.shouldDefer(note.id)" :unmountWhenFar="true" :class="$style.note" :data-scroll-anchor="note.id">
+					<MkNote :note="note" :withHardMute="true"/>
+				</MkDeferredMount>
 			</template>
 		</component>
 		<!-- mk-go: レート制限の理由と再試行 (#2955)。落とすだけだと「これで全部」に見える。 -->
 		<MkRateLimitedNotice :paginator="paginator"/>
-		<button v-show="paginator.canFetchOlder.value" key="_more_" v-appear="prefer.s.enableInfiniteScroll ? paginator.fetchOlder : null" :disabled="paginator.fetchingOlder.value" class="_button" :class="$style.more" @click="paginator.fetchOlder">
+		<button v-show="paginator.canFetchOlder.value" key="_more_" v-appear="prefer.s.enableInfiniteScroll ? olderMounts.fetchOlder : null" :disabled="paginator.fetchingOlder.value" class="_button" :class="$style.more" @click="olderMounts.fetchOlder">
 			<div v-if="!paginator.fetchingOlder.value">{{ i18n.ts.loadMore }}</div>
 			<MkLoading v-else :inline="true"/>
 		</button>
@@ -73,7 +90,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { computed, watch, onUnmounted, provide, useTemplateRef, TransitionGroup, onMounted, shallowRef, ref, markRaw } from 'vue';
+import { computed, watch, onUnmounted, provide, useTemplateRef, TransitionGroup, onMounted, onActivated, onDeactivated, shallowRef, ref, markRaw } from 'vue';
 import * as Misskey from 'misskey-js';
 import { useInterval } from '@@/js/use-interval.js';
 import { getScrollContainer, scrollToTop } from '@@/js/scroll.js';
@@ -89,6 +106,7 @@ import { instance } from '@/instance.js';
 import { prefer } from '@/preferences.js';
 import { store } from '@/store.js';
 import MkNote from '@/components/MkNote.vue';
+import MkDeferredMount from '@/components/MkDeferredMount.vue';
 import MkButton from '@/components/MkButton.vue';
 import { i18n } from '@/i18n.js';
 import { DI } from '@/di.js';
@@ -97,6 +115,8 @@ import { isSeparatorNeeded, getSeparatorInfo } from '@/utility/timeline-date-sep
 import { Paginator } from '@/utility/paginator.js';
 import { createReconnectResync, paginatorResyncOptions } from '@/utility/reconnect-resync.js';
 import { useTimelineUpdatePause } from '@/composables/use-timeline-update-pause.js';
+import { deferOlderMounts } from '@/utility/mount-scheduler.js';
+import { createFarItems, FAR_ITEMS } from '@/utility/far-items.js';
 
 const props = withDefaults(defineProps<{
 	src: BasicTimelineType | 'mentions' | 'directs' | 'list' | 'antenna' | 'channel' | 'role';
@@ -224,6 +244,13 @@ const { isPausing: isPausingUpdate, recordScrollPosition } = useTimelineUpdatePa
 	onActivatedAtTop: () => paginator.releaseQueue(),
 });
 
+const olderMounts = deferOlderMounts(() => paginator.fetchOlder(), () => paginator.items.value.map(x => x.id));
+const quietTransitions = () => olderMounts.quietTransitions({
+	newestId: paginator.items.value[0]?.id,
+	lastId: paginator.items.value.at(-1)?.id,
+	generation: paginator.generation,
+});
+
 function isTop() {
 	if (scrollContainer == null) return true;
 	if (rootEl.value == null) return true;
@@ -249,6 +276,22 @@ watch(rootEl, (el) => {
 		scrollContainer.addEventListener('scroll', onScrollContainerScroll, { passive: true }); // ほんとはscrollendにしたいけどiosが非対応
 	}
 }, { immediate: true });
+
+// Elythia: 画面から遠いノートを DOM から外す (#3941)。読んだ分を全部 mount したままだと、
+// 下へ読むほど DOM とメモリが増え続けていた。スクロールの容器が決まってから見始め、
+// KeepAlive で裏に回っている間は止める
+const farItems = createFarItems();
+provide(FAR_ITEMS, farItems);
+watch(rootEl, (el) => {
+	if (el) {
+		farItems.connect(scrollContainer, el);
+	} else {
+		farItems.disconnect();
+	}
+}, { immediate: true });
+onActivated(() => farItems.resume());
+onDeactivated(() => farItems.pause());
+onUnmounted(() => farItems.disconnect());
 
 onUnmounted(() => {
 	if (scrollContainer) {
@@ -475,8 +518,11 @@ defineExpose({
 .transition_x_enterActive {
 	transition: transform 0.7s cubic-bezier(0.23, 1, 0.32, 1), opacity 0.7s cubic-bezier(0.23, 1, 0.32, 1);
 
+	// Elythia: 中身を後回しにした項目は、外側の div にクラスが付くので中身にも掛ける (#3937)
 	&.note,
-	.note {
+	.note,
+	&.note > *,
+	.note > * {
 		/* Skip Note Rendering有効時、TransitionGroupでnoteを追加するときに一瞬がくっとなる問題を抑制する */
 		content-visibility: visible !important;
 	}
@@ -507,7 +553,9 @@ defineExpose({
 	background: var(--MI_THEME-panel);
 }
 
-.note:not(:empty) {
+// Elythia: 中身を後回しにした項目は外側の div に付くので、ハードミュートで中身が空の
+// div のときも線を出さない (#3937)
+.note:not(:empty):not(:has(> :only-child:empty)) {
 	border-bottom: solid 0.5px var(--MI_THEME-divider);
 }
 

@@ -16,11 +16,14 @@
 // - SPA は SSR を持たないため最初は loader だけが render され、後続で Vue
 //   が mount される。ここでは waitUntil: 'domcontentloaded' で loader が
 //   見える状態までで OK
-// - 未知 route も SPA fallback で index.html が返る (= status 200)。これは
-//   Vue Router 側でまた別の "not found" 表示にする想定なので status は 200
-//   でも問題なし
+// - 未知 route も SPA fallback で index.html が返る (= status 200)。router が
+//   not-found のページを出すので、status だけでは区別できない。
+//   not-found のページでないことを確かめる (#4025。以前は存在しない /login、
+//   /signup、/explore/featured、/featured を開いて緑になっていた。サインインと
+//   登録は `/` のダイアログで行う)
 
 import { expect, test } from '@playwright/test';
+import { gotoRoute } from '../../../../fixtures/ui_route';
 
 const PUBLIC_ROUTES = [
   { path: '/', label: 'home (logged-out fallback)' },
@@ -28,19 +31,14 @@ const PUBLIC_ROUTES = [
   { path: '/about-misskey', label: 'about-misskey (intro)' },
   { path: '/contact', label: 'contact' },
   { path: '/explore', label: 'explore' },
-  { path: '/explore/featured', label: 'explore/featured' },
-  { path: '/featured', label: 'featured timeline' },
-  { path: '/login', label: 'login form' },
-  { path: '/signup', label: 'signup form' },
 ];
 
 test.describe('smoke: SPA public route navigation', () => {
   for (const { path, label } of PUBLIC_ROUTES) {
     test(`navigate ${path} (${label})`, async ({ page, baseURL }) => {
-      const resp = await page.goto(`${baseURL}${path}`, { waitUntil: 'domcontentloaded' });
-      expect(resp, `goto ${path} returned null response`).not.toBeNull();
-      // SPA は index.html を返すので 200 (= mk-go の frontend.go fallback も同じ挙動)
-      expect(resp!.status(), `${path} should return 200 (SPA fallback)`).toBe(200);
+      // SPA は index.html を返すので 200 (= mk-go の frontend.go fallback も同じ挙動)。
+      // not-found のページでないことも gotoRoute が確かめる
+      await gotoRoute(page, baseURL!, path);
 
       // Vue mount 完了まで待つ。domcontentloaded の時点では loader spinner
       // しか出ていないので、それを pass 条件にすると動画上は真っ白の

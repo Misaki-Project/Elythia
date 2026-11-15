@@ -46,6 +46,10 @@ var handlerNilAllowed = map[string]string{
 	// newPluginNotificationDispatcher が nil でないとき (通知を受け取るプラグインが
 	// 居るとき) だけ SetMessageObserver を呼ぶ。テストの組み立てはプラグインを登録しない。
 	"chatService.messageObserver": "通知を受け取るプラグインが居ないときは配線しない (newPluginNotificationDispatcher が nil)",
+	// リバーシの招待をプラグインへ届ける口 (#3942)。chatService.messageObserver と同じく、
+	// newPluginNotificationDispatcher が nil でないときだけ setupRoutes が入れる。
+	"reversi.inviteObs":                    "通知を受け取るプラグインが居ないときは配線しない (newPluginNotificationDispatcher が nil)",
+	"federationProcessor.reversiInviteObs": "通知を受け取るプラグインが居ないときは配線しない (newPluginNotificationDispatcher が nil)",
 	// role-levelが未同梱か無効なら、プラグイン所有の非表示設定テーブルは読まない。
 	// setupRoutesはroleLevelPluginEnabledがtrueのときだけreaderを配線し、
 	// users/showと利用者一覧のroles/badgeRolesへプロフィールの非表示設定を適用する。
@@ -65,6 +69,9 @@ var handlerNilAllowed = map[string]string{
 	// とき (PublishNote / PublishNoteMany の packNote) に作る。組み立てた直後はまだ投稿を
 	// 流していないので nil (#3827)。
 	"notePublisher.cachedBody": "依存ではなく状態。最初に投稿を流すとき (packNote) に作るので、組み立てた直後は nil",
+	// 動画の静止画の生成 (videoThumbnailGenerator)。setupRoutes は設定が空でないときだけ
+	// SetVideoThumbnailGeneratorWithMode を呼び、そこで作る。テストの組み立ては設定しない。
+	"proxyService.videoThumbClient": "videoThumbnailGenerator を設定したときだけ SetVideoThumbnailGeneratorWithMode で作る",
 	// テストだけが feed_window_test.go で時刻を固定する。newFeedHandler は入れず、nil のとき
 	// time.Now を使う (#3827)。
 	"feed.now": "テスト専用の seam。newFeedHandler は入れず、nil のとき time.Now を使う",
@@ -178,6 +185,7 @@ func TestBuiltHandlersHaveNoNilDependencies(t *testing.T) {
 	assert.Equal(t, nilableFields(reflect.TypeFor[entity.Packer]()), len(nestedDepChecks["notes.entityPacker"]),
 		"entity.Packer の nil になりうる欄の数と nestedDepChecks の notes.entityPacker の一覧の数が合わない")
 	assertOnePacker(t, pv.FieldByName("notes").Elem().FieldByName("entityPacker"), hv, pv, cv)
+	assertSharedComponents(t, hv, pv, cv)
 
 	// 文字列の依存は nil にならないので、空でないことを名指しで見る。以前の起動時の
 	// 検査の述語が `!= ""` を見ていたもの (#3833)。
@@ -343,6 +351,8 @@ var requiredDepChecks = []string{
 	"notes.noteHider", "notes.entityPacker", "notes.policyProvider", "notes.ugcVisibilityFn",
 	"notes.driveFileRepo", "notes.metaRepo", "notes.blockingRepo", "notes.mutingRepo",
 	"notes.renoteMutingRepo", "notes.channelMutingRepo", "notes.userFollowingRepo",
+	// #4044 (notes の handler が共通の resolver を受け取る)。
+	"notes.noteFieldResolver",
 	// ここから #3833 (連合の部品)。
 	"metadataFetcher.fetcher",
 	"deliverService.hostBlocker", "noteDeleteHook.userRepo", "noteDeleteHook.noteRepo",
@@ -375,6 +385,9 @@ var requiredNonEmptyStrings = []string{
 // entitycompat の TestEntityPackerDepsAreWired も見る)。
 var nestedDepChecks = map[string][]string{
 	"admin.ipLookupAudit": {"repo", "idGen"},
+	// 招待が受けられたことを招待した人に知らせる役 (#3946)。無いと、招待した人の
+	// 画面が待ったまま進まない
+	"reversi.svc": {"matched"},
 	"notes.entityPacker": {
 		"mediaURL", "avatarDecoration", "emojiDecoration", "canChat", "userRoles",
 		"showRemoteBadges", "instanceIconURL", "silenced",
@@ -406,7 +419,7 @@ var requiredPackerHolders = []string{
 //
 // 照合するのは *entity.Packer 型の欄だけ。Packer を包む部品 (userpack.Packer・
 // NoteFieldResolver など) を作り直して 1 つの handler にだけ渡す誤りは、包む部品の
-// 型の欄や interface の欄に現れるので、ここでは捕まらない (既知の限界。#3834 の前から)。
+// 型の欄や interface の欄に現れるので、assertSharedComponents が見る (#3369 I16)。
 //
 // 見るのは apiHandlers・routeParts・coreParts の各部品の直下の欄だけ。部品の中の部品
 // まで reflect で辿ると、組み立ての後に動き出す goroutine が書き換える状態まで読んで
@@ -467,4 +480,102 @@ func isNilDep(v reflect.Value) bool {
 		}
 	}
 	return false
+}
+
+// sharedComponentAllowed lists the fields that hold a value of the type of a
+// routeParts or coreParts component but not that component, keyed by
+// "<component>.<field>". The reason says how the field gets its own value.
+var sharedComponentAllowed = map[string]string{
+	// NewNoteRepoPacker が構築子の中で、受け取った同じ Packer から push 用の resolver を
+	// 作る (folder と owner の lookup を渡さず、payload を小さくするため。#2737)。
+	"webPushNotePacker.files": "NewNoteRepoPacker が構築子の中で、同じ Packer から folder と owner の lookup の無い resolver を作る",
+}
+
+// requiredSharedChecks names fields assertSharedComponents must compare. 件数では
+// なく、実在する対象を名指しで要求する (docs/gates.md)。
+var requiredSharedChecks = []string{
+	"proxyService.allowlist",
+	"i.fieldRes", "chat.lites", "notifications.noteFieldResolver", "notes.noteFieldResolver",
+	"followingService.userPacker", "pages.userPacker", "webPushNotePacker.files",
+}
+
+// assertSharedComponents fails when a component built by setupRoutes holds,
+// directly or in an interface field, a value of the type of a routeParts or
+// coreParts component that is not that component (#3369 I6, I16).
+//
+// 組み立ての式や setter の呼び出しの文字列を照合するゲートは、setupRoutes の中で
+// 受け取った変数を後で別の値に書き換える形を見ない。組み立てた後の値で、同じ部品を
+// 共有すべき欄が、routeParts / coreParts に持たせた部品そのものを指しているかを
+// Pointer() で見る。型が同じ部品が 2 つ以上あるときは、どちらと照合すべきか
+// 決められないので見ない。
+//
+// 見るのは各部品の直下の欄だけ (assertOnePacker と同じ理由で、部品の中の部品までは
+// 辿らない)。
+//
+// containers の先頭は apiHandlers で、照合する側にだけ使う (共有の部品の表は
+// routeParts と coreParts から作る)。
+func assertSharedComponents(t *testing.T, containers ...reflect.Value) {
+	t.Helper()
+	type shared struct {
+		name string
+		ptr  uintptr
+	}
+	byType := map[reflect.Type]shared{}
+	ambiguous := map[reflect.Type]bool{}
+	for _, ct := range containers[1:] {
+		for i := range ct.NumField() {
+			comp := ct.Field(i)
+			if comp.Kind() != reflect.Pointer || comp.IsNil() {
+				continue
+			}
+			if _, dup := byType[comp.Type()]; dup {
+				ambiguous[comp.Type()] = true
+			}
+			byType[comp.Type()] = shared{name: ct.Type().Field(i).Name, ptr: comp.Pointer()}
+		}
+	}
+	for typ := range ambiguous {
+		delete(byType, typ)
+	}
+	checked := map[string]bool{}
+	used := map[string]bool{}
+	for _, ct := range containers {
+		for i := range ct.NumField() {
+			comp := ct.Field(i)
+			if comp.Kind() != reflect.Pointer || comp.IsNil() || comp.Elem().Kind() != reflect.Struct {
+				continue
+			}
+			compName := ct.Type().Field(i).Name
+			for j := range comp.Elem().NumField() {
+				f := comp.Elem().Field(j)
+				if f.Kind() == reflect.Interface && !f.IsNil() {
+					f = f.Elem()
+				}
+				if f.Kind() != reflect.Pointer || f.IsNil() {
+					continue
+				}
+				want, ok := byType[f.Type()]
+				if !ok || want.name == compName {
+					continue
+				}
+				key := compName + "." + comp.Elem().Type().Field(j).Name
+				checked[key] = true
+				if f.Pointer() == want.ptr {
+					continue
+				}
+				if _, ok := sharedComponentAllowed[key]; ok {
+					used[key] = true
+					continue
+				}
+				t.Errorf("%s が %s と別の %s を持っている。setupRoutes の中で作り直すか、別名を書き換えていないか確かめる。"+
+					"別の値でよいなら、どの経路で別の値になるかを sharedComponentAllowed に書く", key, want.name, f.Type())
+			}
+		}
+	}
+	for key := range sharedComponentAllowed {
+		assert.True(t, used[key], "sharedComponentAllowed に %s があるが、その欄は共有の部品と同じ値か、照合の対象でない", key)
+	}
+	for _, key := range requiredSharedChecks {
+		assert.True(t, checked[key], "%s を照合していない (部品を routeParts から外したか、型や欄の名前が変わっていないか)", key)
+	}
 }

@@ -55,7 +55,7 @@ func (h *Handler) DraftsList(c echo.Context) error {
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
+	sinceID, untilID, cursorOK := id.NormalizeCursorIDFirst(req.SinceID, req.UntilID, req.SinceDate.Int64Ptr(), req.UntilDate.Int64Ptr())
 	if !cursorOK {
 		return apierr.JSONInvalidParam(c)
 	}
@@ -256,7 +256,7 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 	}
 	// visibility / reactionAcceptance enum 検証 (drafts/create と共有、#1934)。"" /
 	// nil は「変更しない」セマンティクスなので許容し、非空の不正値のみ弾く。paramDef
-	// 相当なので draft 不在 (404) より先に 400 を返す。
+	// 相当なので draft 不在 (NO_SUCH_NOTE_DRAFT) より先に INVALID_PARAM を返す。
 	if err := validateNoteEnums(req.Visibility, req.ReactionAcceptance); err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", err.Error(), apierr.UUIDInvalidParam))
 	}
@@ -269,7 +269,9 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	if err != nil {
-		return c.JSON(http.StatusNotFound, apierr.NoSuchNoteDraft())
+		// upstream notes/drafts/update.ts の noSuchNoteDraft は httpStatusCode を
+		// 持たないので、kind client の既定どおり400で返す (#4122)。
+		return c.JSON(http.StatusBadRequest, apierr.NoSuchNoteDraft())
 	}
 	if req.Text != nil {
 		draft.Text = req.Text
@@ -592,9 +594,23 @@ func (h *Handler) allDraftFilesOwned(fileIDs []string, userID string) bool {
 	return true
 }
 
+// pollExpiresAt returns the poll's expiresAt as a time, or nil when it is
+// absent or 0.
+//
+// 本家は `ps.poll?.expiresAt ? new Date(...) : null` なので、0 (と -0) は期限なし
+// として受ける (#3369)。時刻 0 として読むと、期限切れとして断るか 1970 年を保存する。
+func (p *draftPoll) pollExpiresAt() *time.Time {
+	if p == nil || p.ExpiresAt == nil || *p.ExpiresAt == 0 {
+		return nil
+	}
+	t := time.UnixMilli(int64(*p.ExpiresAt))
+	return &t
+}
+
 // pollAlreadyExpired reports whether the poll's expiresAt is in the past.
 func pollAlreadyExpired(p *draftPoll, now time.Time) bool {
-	return p != nil && p.ExpiresAt != nil && time.UnixMilli(int64(*p.ExpiresAt)).Before(now)
+	t := p.pollExpiresAt()
+	return t != nil && t.Before(now)
 }
 
 // applyDraftPoll writes poll fields into the draft. nil clears the poll
@@ -612,12 +628,7 @@ func applyDraftPoll(d *model.NoteDraft, p *draftPoll) {
 	d.PollChoices = model.StringArray(p.Choices)
 	d.PollMultiple = p.Multiple
 	d.PollExpiredAfter = p.ExpiredAfter.Int64Ptr()
-	if p.ExpiresAt != nil {
-		t := time.UnixMilli(int64(*p.ExpiresAt))
-		d.PollExpiresAt = &t
-	} else {
-		d.PollExpiresAt = nil
-	}
+	d.PollExpiresAt = p.pollExpiresAt()
 }
 
 // DraftsDelete handles POST /api/notes/drafts/delete.
@@ -635,7 +646,8 @@ func (h *Handler) DraftsDelete(c echo.Context) error {
 	// upstream notes/drafts/delete.ts は存在チェックして無ければ
 	// `NO_SUCH_NOTE_DRAFT` を返す。silent 204 だと frontend が削除確認 UI
 	// で「該当 draft が無い」フィードバックを出せないので、本家挙動に合わせて
-	// 404 を返すよう修正 (#688 review follow-up)。
+	// エラーを返すよう修正 (#688 review follow-up)。upstream の noSuchNoteDraft は
+	// httpStatusCode を持たないので、kind client の既定どおり400で返す (#4122)。
 	// Delete は RowsAffected を返すので、Find → Delete の 2 query 化を避け
 	// つつ TOCTOU race も発生しない (DB 1 文で atomic に「あれば削除」)。
 	rowsAffected, err := h.draftRepo.Delete(req.DraftID, user.ID)
@@ -643,7 +655,7 @@ func (h *Handler) DraftsDelete(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	if rowsAffected == 0 {
-		return c.JSON(http.StatusNotFound, apierr.NoSuchNoteDraft())
+		return c.JSON(http.StatusBadRequest, apierr.NoSuchNoteDraft())
 	}
 	// delete に成功したら旧 delayed task も best-effort で clear する
 	// (#1045 Phase 2-C)。upstream は `clearSchedule(draftId)` を fire

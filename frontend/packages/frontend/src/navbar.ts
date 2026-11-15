@@ -218,11 +218,11 @@ export const navbarItemDef = reactive<{
  */
 const publicPluginPages = collectPages(serverPlugins, false);
 if (gameRankingPages(publicPluginPages).length > 0) {
-	navbarItemDef['game-rankings'] = { title: 'ゲームランキング', icon: 'ti ti-trophy', to: gameRankingsPath };
+	navbarItemDef['game-rankings'] = { title: i18n.ts.gameRankings, icon: 'ti ti-trophy', to: gameRankingsPath };
 	// 既存のカスタムナビ設定は壊さず、列挙される「もっと！」の入口は一つにする。
 	for (const page of gameRankingPages(publicPluginPages)) {
 		Object.defineProperty(navbarItemDef, `plugin:${page.plugin}`, {
-			value: { title: 'ゲームランキング', icon: 'ti ti-trophy', to: `${gameRankingsPath}?game=${page.plugin}` },
+			value: { title: i18n.ts.gameRankings, icon: 'ti ti-trophy', to: `${gameRankingsPath}?game=${page.plugin}` },
 			enumerable: false,
 			configurable: true,
 		});

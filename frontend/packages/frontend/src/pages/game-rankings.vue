@@ -4,11 +4,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 -->
 <template>
 <component :is="embedded ? 'div' : PageWithHeader">
-	<div class="_spacer" :class="$style.tabs">
-		<div role="tablist" aria-label="ゲーム" :class="$style.tabList">
-			<button v-for="(page, index) in pages" :id="`game-ranking-tab-${page.plugin}`" :key="page.plugin" type="button" class="_button" role="tab" :aria-selected="selected?.plugin === page.plugin" :aria-controls="`game-ranking-panel-${page.plugin}`" :tabindex="selected?.plugin === page.plugin ? 0 : -1" :class="[$style.tab, { [$style.active]: selected?.plugin === page.plugin }]" @click="game = page.plugin" @keydown="moveTab($event, index)">{{ gameRankingLabels[page.plugin] }}</button>
+	<div data-testid="game-rankings" class="_spacer" :class="$style.tabs">
+		<div role="tablist" :aria-label="i18n.ts.gameRankingTabLabel" :class="$style.tabList">
+			<button v-for="(page, index) in pages" :id="`game-ranking-tab-${page.plugin}`" :key="page.plugin" type="button" class="_button" role="tab" :aria-selected="selected?.plugin === page.plugin" :aria-controls="`game-ranking-panel-${page.plugin}`" :tabindex="selected?.plugin === page.plugin ? 0 : -1" :class="[$style.tab, { [$style.active]: selected?.plugin === page.plugin }]" @click="game = page.plugin" @keydown="moveTab($event, index)">{{ gameLabel(page.plugin) }}</button>
 		</div>
-		<p v-if="!selected">利用できるゲームランキングはありません。</p>
+		<p v-if="!selected">{{ i18n.ts.gameRankingEmpty }}</p>
 	</div>
 	<div v-if="selected" :id="`game-ranking-panel-${selected.plugin}`" role="tabpanel" :aria-labelledby="`game-ranking-tab-${selected.plugin}`">
 		<component :is="selected.component" :key="selected.plugin" :embedded="true"/>
@@ -21,7 +21,8 @@ import PageWithHeader from '@/components/global/PageWithHeader.vue';
 import { collectPages } from '@/plugin-api.js';
 import { serverPlugins } from '@/server-plugins.generated.js';
 import { definePage } from '@/page.js';
-import { gameRankingPages, gameRankingLabels } from '@/game-ranking-pages.js';
+import { i18n } from '@/i18n.js';
+import { gameRankingPages } from '@/game-ranking-pages.js';
 
 const props = withDefaults(defineProps<{ embedded?: boolean; initialGame?: string }>(), { embedded: false, initialGame: 'genshin' });
 const pages = gameRankingPages(collectPages(serverPlugins, false));
@@ -41,7 +42,13 @@ function moveTab(event: KeyboardEvent, index: number): void {
 	buttons?.[next].focus();
 }
 
-if (!props.embedded) definePage(() => ({ title: 'ゲームランキング', icon: 'ti ti-trophy' }));
+function gameLabel(plugin: string): string {
+	if (plugin === 'genshin') return i18n.ts.genshinGameName;
+	if (plugin === 'hsr') return i18n.ts.hsrGameName;
+	return plugin;
+}
+
+if (!props.embedded) definePage(() => ({ title: i18n.ts.gameRankings, icon: 'ti ti-trophy' }));
 </script>
 <style lang="scss" module>
 .tabs { --MI_SPACER-w: 800px; }

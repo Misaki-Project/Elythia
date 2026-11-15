@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
 	apmfm "github.com/elythia-network/elythia/internal/activitypub/mfm"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/identicon"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/google/uuid"
 
@@ -41,6 +43,15 @@ func NewURLBuilder(baseURL string) *URLBuilder {
 
 // BaseURL returns the canonical origin used by this builder.
 func (b *URLBuilder) BaseURL() string { return b.baseURL }
+
+// Host returns the host[:port] of the base URL, or "" when it does not parse.
+func (b *URLBuilder) Host() string {
+	u, err := url.Parse(b.baseURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
 
 // UserURI returns the canonical actor URI for a local user.
 func (b *URLBuilder) UserURI(userID string) string {
@@ -269,6 +280,15 @@ type MentionResolver interface {
 	ResolveMention(userID string) (name, uri string, err error)
 }
 
+// UserLookupMentionResolver is a MentionResolver that can derive a resolver
+// looking users up through a caller-supplied function (for example one that
+// reuses the rows already read while serving the same request, #3989). The
+// derived resolver must answer exactly like the original for the same rows.
+type UserLookupMentionResolver interface {
+	MentionResolver
+	WithUserLookup(find func(userID string) (*model.User, error)) MentionResolver
+}
+
 // FileResolver loads drive files by ID for rendering Note attachments.
 type FileResolver interface {
 	FindByIDs(ids []string) ([]*model.DriveFile, error)
@@ -431,6 +451,22 @@ func (r *Renderer) SetMentionResolver(mr MentionResolver) {
 	r.mentionResolver = mr
 }
 
+// WithMentionUserLookup returns a renderer that resolves mentioned users
+// through find, when the configured MentionResolver implements
+// UserLookupMentionResolver. Otherwise (no resolver, another implementation
+// or a nil find) it returns r itself. r is not modified, so the shared renderer
+// stays safe for concurrent use.
+func (r *Renderer) WithMentionUserLookup(find func(userID string) (*model.User, error)) *Renderer {
+	mr, ok := r.mentionResolver.(UserLookupMentionResolver)
+	if !ok || find == nil {
+		return r
+	}
+	// 要求ごとの浅いコピー。差し替えるのはメンションの引き方だけで、他の resolver は共有する。
+	cp := *r
+	cp.mentionResolver = mr.WithUserLookup(find)
+	return &cp
+}
+
 // SetFileResolver attaches a FileResolver for Note attachment rendering.
 func (r *Renderer) SetFileResolver(fr FileResolver) {
 	r.fileResolver = fr
@@ -491,7 +527,7 @@ func (r *Renderer) RenderPerson(u *model.User, profile *model.UserProfile, publi
 			PublicKeyPEM: APLenientString(publicKeyPEM),
 		},
 		ManuallyApproves: APTruthyBool(u.IsLocked),
-		Discoverable:     APLenientBool(u.IsExplorable),
+		Discoverable:     new(APLenientBool(u.IsExplorable)),
 		IsCat:            APLenientBool(u.IsCat),
 	}
 	// アカウントの作成日時を `published` として載せる (#3465)。upstream の
@@ -542,9 +578,9 @@ func (r *Renderer) RenderPerson(u *model.User, profile *model.UserProfile, publi
 	case isSystem && instanceIcon != "":
 		p.Icon = &Image{Type: "Image", URL: APLenientHref(instanceIcon)}
 	default:
-		// identicon URL は mk-go の /identicon/<username> route 規則に合わせる
-		// ((*entity.Packer).IdenticonURL と同一 seed なので REST avatarUrl と同じ画像)。
-		p.Icon = &Image{Type: "Image", URL: APLenientHref(r.urls.baseURL + "/identicon/" + u.Username)}
+		// API の avatarUrl ((*entity.Packer).FallbackAvatarURL) と同じ URL にする。種が
+		// 同じなので同じ絵になる。本家も getIdenticonUrl を使う (#4095)
+		p.Icon = &Image{Type: "Image", URL: APLenientHref(identicon.URL(r.urls.baseURL, u.Username, r.urls.Host()))}
 	}
 	switch {
 	case u.BannerURL != nil && *u.BannerURL != "":

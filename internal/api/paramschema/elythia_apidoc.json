@@ -1,0 +1,4857 @@
+{
+	"endpoints": {
+		"admin/backup/delete": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"freedBytes": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"admin/backup/download": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupDownload"
+				}
+			}
+		},
+		"admin/backup/list": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupOverview"
+				}
+			}
+		},
+		"admin/backup/reauth-challenge": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupReauthChallenge"
+				}
+			}
+		},
+		"admin/backup/restore/abort": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {}
+		},
+		"admin/backup/restore/candidates": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"database": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"databases": {
+							"type": "array",
+							"optional": false,
+							"nullable": false,
+							"items": {
+								"type": "object",
+								"optional": false,
+								"nullable": false,
+								"ref": "BackupKeptDatabase"
+							}
+						}
+					}
+				}
+			}
+		},
+		"admin/backup/restore/confirm": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {}
+		},
+		"admin/backup/restore/prepare": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"opId": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"ticket": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"status": {
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"ref": "BackupRestoreStatus"
+						}
+					}
+				}
+			}
+		},
+		"admin/backup/restore/status": {
+			"meta": {},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupRestoreStatus"
+				}
+			}
+		},
+		"admin/backup/take": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupJobAccepted"
+				}
+			}
+		},
+		"admin/backup/verify": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"secure": true
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupJobAccepted"
+				}
+			}
+		},
+		"admin/database-health": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"kind": "read:admin:table-stats"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "DatabaseHealthReport"
+				}
+			}
+		},
+		"admin/drive/usage": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:drive"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "DriveUsage"
+				}
+			}
+		},
+		"admin/emoji-application/approve": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "write:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "AdminEmojiApplication"
+				}
+			}
+		},
+		"admin/emoji-application/list": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "read:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "AdminEmojiApplication"
+					}
+				}
+			}
+		},
+		"admin/emoji-application/list-by-user": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "read:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"items": {
+							"type": "array",
+							"optional": false,
+							"nullable": false,
+							"items": {
+								"type": "object",
+								"optional": false,
+								"nullable": false,
+								"ref": "AdminEmojiApplication"
+							}
+						}
+					}
+				}
+			}
+		},
+		"admin/emoji-application/reject": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "write:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "AdminEmojiApplication"
+				}
+			}
+		},
+		"admin/emoji-application/related": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "read:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"counts": {
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"ref": "EmojiApplicationStatusCounts"
+						},
+						"items": {
+							"type": "array",
+							"optional": false,
+							"nullable": false,
+							"items": {
+								"type": "object",
+								"optional": false,
+								"nullable": false,
+								"ref": "RelatedEmojiApplication"
+							}
+						}
+					}
+				}
+			}
+		},
+		"admin/emoji-application/reset-user-quota": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "write:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"lastReset": {
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"ref": "EmojiApplicationQuotaReset"
+						}
+					}
+				}
+			}
+		},
+		"admin/emoji-application/user-summary": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "read:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"counts": {
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"ref": "EmojiApplicationStatusCounts"
+						},
+						"windows": {
+							"type": "array",
+							"optional": false,
+							"nullable": false,
+							"items": {
+								"type": "object",
+								"optional": false,
+								"nullable": false,
+								"ref": "EmojiApplicationQuotaWindow"
+							}
+						},
+						"pending": {
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"properties": {
+								"used": {
+									"type": "integer",
+									"optional": false,
+									"nullable": false
+								},
+								"limit": {
+									"type": "integer",
+									"optional": false,
+									"nullable": false
+								},
+								"unlimited": {
+									"type": "boolean",
+									"optional": false,
+									"nullable": false
+								}
+							}
+						},
+						"lastReset": {
+							"type": "object",
+							"optional": false,
+							"nullable": true,
+							"ref": "EmojiApplicationQuotaReset"
+						}
+					}
+				}
+			}
+		},
+		"admin/emoji/fetch-remote-meta": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canManageCustomEmojis",
+				"kind": "read:admin:emoji"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "RemoteEmojiMeta"
+				}
+			}
+		},
+		"admin/federation/check-host": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:server-info"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "RemoteCheckReport"
+				}
+			}
+		},
+		"admin/federation/clean-gone-instance": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "write:admin:federation"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "GoneInstanceCleanResult"
+				}
+			}
+		},
+		"admin/federation/close-delivery-breaker": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "write:admin:federation"
+			},
+			"doc": {}
+		},
+		"admin/federation/delivery-health": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:server-info"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "FederationHealthReport"
+				}
+			}
+		},
+		"admin/federation/gone-instances": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:server-info"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "GoneInstance"
+					}
+				}
+			}
+		},
+		"admin/federation/inbox-health": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:server-info"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "FederationHealthReport"
+				}
+			}
+		},
+		"admin/federation/rules/create": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"kind": "write:admin:meta"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "FederationRule"
+				}
+			}
+		},
+		"admin/federation/rules/delete": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"kind": "write:admin:meta"
+			},
+			"doc": {}
+		},
+		"admin/federation/rules/hits": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:meta"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "FederationRuleHit"
+					}
+				}
+			}
+		},
+		"admin/federation/rules/list": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:meta"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "FederationRule"
+					}
+				}
+			}
+		},
+		"admin/federation/rules/update": {
+			"meta": {
+				"requireCredential": true,
+				"requireAdmin": true,
+				"kind": "write:admin:meta"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "FederationRule"
+				}
+			}
+		},
+		"admin/ip/accounts": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"requiredRolePolicy": "canSearchIpHistory",
+				"kind": "read:admin:user-ips"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "IPAccountsResult"
+				}
+			}
+		},
+		"admin/ip/lookup-log": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"requiredRolePolicy": "canSearchIpHistory",
+				"kind": "read:admin:user-ips"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "IPLookupLogResult"
+				}
+			}
+		},
+		"admin/ip/related-accounts": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"requiredRolePolicy": "canSearchIpHistory",
+				"kind": "read:admin:user-ips"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "IPRelatedAccountsResult"
+				}
+			}
+		},
+		"admin/roles/assignment-show": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:roles"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "RoleAssignmentLookup"
+				}
+			}
+		},
+		"admin/self-check": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:server-info"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "SelfCheckReport"
+				}
+			}
+		},
+		"admin/server-metrics": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:server-info"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "ServerMetrics"
+				}
+			}
+		},
+		"admin/server-plugins": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:meta"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "ServerPluginList"
+				}
+			}
+		},
+		"admin/signup-application/approve": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "write:admin:invite-codes"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"ok": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"admin/signup-application/list": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "read:admin:invite-codes"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"applications": {
+							"type": "array",
+							"optional": false,
+							"nullable": false,
+							"items": {
+								"type": "object",
+								"optional": false,
+								"nullable": false,
+								"ref": "AdminSignupApplication"
+							}
+						},
+						"count": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"admin/signup-application/reject": {
+			"meta": {
+				"requireCredential": true,
+				"requireModerator": true,
+				"kind": "write:admin:invite-codes"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"ok": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"bubble-game/versus/accept": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BubbleVersusMatch"
+				}
+			}
+		},
+		"bubble-game/versus/cancel": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {}
+		},
+		"bubble-game/versus/decline": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {}
+		},
+		"bubble-game/versus/history": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:account"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BubbleVersusRecord"
+					}
+				}
+			}
+		},
+		"bubble-game/versus/invitations": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:account"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BubbleVersusMatch"
+					}
+				}
+			}
+		},
+		"bubble-game/versus/invite": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BubbleVersusMatch"
+				}
+			}
+		},
+		"bubble-game/versus/record": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BubbleVersusRecord"
+				}
+			}
+		},
+		"bubble-game/versus/report": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BubbleVersusMatch"
+				}
+			}
+		},
+		"bubble-game/versus/set-public": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {}
+		},
+		"bubble-game/versus/show": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BubbleVersusMatch"
+				}
+			}
+		},
+		"chat/messages": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:chat"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "ChatMessage"
+					}
+				}
+			}
+		},
+		"chat/messages/create": {
+			"meta": {
+				"requireCredential": true,
+				"prohibitMoved": true,
+				"kind": "write:chat"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "ChatMessage"
+				}
+			}
+		},
+		"chat/messages/reactions/create": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/messages/reactions/delete": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/messages/read": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/messages/update": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/rooms/invitations/accept": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/rooms/invitations/delete": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/rooms/invitations/reject": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/rooms/joined": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:chat"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "ChatRoom"
+					}
+				}
+			}
+		},
+		"chat/rooms/members/ban": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/rooms/members/update-membership": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/rooms/transfer-ownership": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/rooms/unmute": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:chat"
+			},
+			"doc": {}
+		},
+		"chat/unread-count": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:chat"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"count": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"drive/files/create-chunked/abort": {
+			"meta": {
+				"requireCredential": true,
+				"prohibitMoved": true,
+				"kind": "write:drive"
+			},
+			"doc": {}
+		},
+		"drive/files/create-chunked/append": {
+			"meta": {
+				"requireCredential": true,
+				"prohibitMoved": true,
+				"kind": "write:drive"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "ChunkAppendResult"
+				}
+			}
+		},
+		"drive/files/create-chunked/finish": {
+			"meta": {
+				"requireCredential": true,
+				"prohibitMoved": true,
+				"kind": "write:drive"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "DriveFile"
+				}
+			}
+		},
+		"drive/files/create-chunked/start": {
+			"meta": {
+				"requireCredential": true,
+				"prohibitMoved": true,
+				"kind": "write:drive"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "ChunkedUploadSession"
+				}
+			}
+		},
+		"emoji-application/cancel": {
+			"meta": {
+				"requireCredential": true
+			},
+			"doc": {}
+		},
+		"emoji-application/create": {
+			"meta": {
+				"requireCredential": true,
+				"requiredRolePolicy": "canRequestCustomEmojis"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "EmojiApplication"
+				}
+			}
+		},
+		"emoji-application/list-mine": {
+			"meta": {
+				"requireCredential": true
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "EmojiApplication"
+					}
+				}
+			}
+		},
+		"following/silent/list": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:following"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "SilentFollow"
+					}
+				}
+			}
+		},
+		"i/federation": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "AccountFederationState"
+				}
+			}
+		},
+		"i/flashs": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:flash"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "Flash"
+					}
+				}
+			}
+		},
+		"i/flashs/likes": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:flash-likes"
+			},
+			"doc": {
+				"res": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"properties": {
+							"id": {
+								"type": "string",
+								"optional": false,
+								"nullable": false,
+								"format": "id"
+							},
+							"flash": {
+								"type": "object",
+								"optional": false,
+								"nullable": false,
+								"ref": "Flash"
+							}
+						}
+					}
+				}
+			}
+		},
+		"i/update-federation": {
+			"meta": {
+				"requireCredential": true,
+				"secure": true,
+				"kind": "write:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "AccountFederationState"
+				}
+			}
+		},
+		"reversi/claim-time-is-up": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {}
+		},
+		"reversi/put-stone": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {}
+		},
+		"reversi/ready": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "write:account"
+			},
+			"doc": {}
+		},
+		"roles/assignment-show": {
+			"meta": {
+				"requireCredential": true,
+				"kind": "read:account"
+			},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "RoleAssignmentLookup"
+				}
+			}
+		},
+		"signup-application/apply": {
+			"meta": {},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"claimCode": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"application": {
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"ref": "SignupApplicationView"
+						}
+					}
+				}
+			}
+		},
+		"signup-application/form-token": {
+			"meta": {},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"token": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"minWaitSeconds": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"signup-application/register": {
+			"meta": {},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": true,
+					"nullable": false,
+					"allOf": [
+						{
+							"type": "object",
+							"ref": "MeDetailed"
+						},
+						{
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"properties": {
+								"token": {
+									"type": "string",
+									"optional": false,
+									"nullable": false
+								}
+							}
+						}
+					]
+				}
+			}
+		},
+		"signup-application/status": {
+			"meta": {},
+			"doc": {
+				"res": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"application": {
+							"type": "object",
+							"optional": false,
+							"nullable": false,
+							"ref": "SignupApplicationView"
+						}
+					}
+				}
+			}
+		}
+	},
+	"refs": {
+		"BubbleVersusMatch": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"gameMode": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"status": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"invited",
+						"accepted",
+						"playing",
+						"ended"
+					]
+				},
+				"seed": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"startAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"endedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"winnerId": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "id"
+				},
+				"reason": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"enum": [
+						"gameOver",
+						"surrender",
+						"timeUp",
+						"disconnected",
+						"invalidReport",
+						null
+					]
+				},
+				"user1Id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"user2Id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"user1": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "UserLite"
+				},
+				"user2": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "UserLite"
+				},
+				"user1Ready": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"user2Ready": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"user1Result": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "BubbleVersusResultSummary"
+				},
+				"user2Result": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "BubbleVersusResultSummary"
+				}
+			}
+		},
+		"BubbleVersusResultSummary": {
+			"type": "object",
+			"properties": {
+				"score": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"frame": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"reason": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"gameOver",
+						"surrender",
+						"timeUp",
+						"opponentEnded",
+						"invalidReport"
+					]
+				}
+			}
+		},
+		"BubbleVersusRecord": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"gameMode": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"startedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"endedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"winnerId": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "id"
+				},
+				"reason": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"gameOver",
+						"surrender",
+						"timeUp",
+						"disconnected",
+						"invalidReport"
+					]
+				},
+				"isPublic": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"user1Id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"user2Id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"user1": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "UserLite"
+				},
+				"user2": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "UserLite"
+				},
+				"user1Public": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"user2Public": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"user1Result": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "BubbleVersusRecordResult"
+				},
+				"user2Result": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "BubbleVersusRecordResult"
+				},
+				"seed": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"user1Logs": {
+					"type": "array",
+					"optional": true,
+					"nullable": true,
+					"items": {
+						"type": "array",
+						"optional": false,
+						"nullable": false,
+						"items": {
+							"type": "number",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				},
+				"user2Logs": {
+					"type": "array",
+					"optional": true,
+					"nullable": true,
+					"items": {
+						"type": "array",
+						"optional": false,
+						"nullable": false,
+						"items": {
+							"type": "number",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"BubbleVersusRecordResult": {
+			"type": "object",
+			"properties": {
+				"score": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"frame": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"reason": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"gameOver",
+						"surrender",
+						"timeUp",
+						"opponentEnded",
+						"invalidReport"
+					]
+				},
+				"gameVersion": {
+					"type": "integer",
+					"optional": false,
+					"nullable": true
+				}
+			}
+		},
+		"BackupMigrationState": {
+			"type": "object",
+			"properties": {
+				"table": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"version": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"dirty": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"missing": {
+					"type": "boolean",
+					"optional": true,
+					"nullable": false
+				}
+			}
+		},
+		"BackupStageResult": {
+			"type": "object",
+			"properties": {
+				"stage": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"readable",
+						"restorable",
+						"usable"
+					]
+				},
+				"ok": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"skipped": {
+					"type": "boolean",
+					"optional": true,
+					"nullable": false
+				},
+				"error": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"warnings": {
+					"type": "array",
+					"optional": true,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				}
+			}
+		},
+		"BackupRowMismatch": {
+			"type": "object",
+			"properties": {
+				"table": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"expected": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"actual": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"BackupVerifySummary": {
+			"type": "object",
+			"properties": {
+				"ok": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"verifiedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"stages": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupStageResult"
+					}
+				},
+				"mismatches": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupRowMismatch"
+					}
+				},
+				"error": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				}
+			}
+		},
+		"BackupGeneration": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"complete": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"metaError": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"size": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"objectCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"dumpSize": {
+					"type": "integer",
+					"optional": true,
+					"nullable": false
+				},
+				"encrypted": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"elythiaVersion": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"elythiaCommit": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"postgresVersion": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"database": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"migrations": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupMigrationState"
+					}
+				},
+				"verify": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "BackupVerifySummary"
+				}
+			}
+		},
+		"BackupJob": {
+			"type": "object",
+			"properties": {
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"take",
+						"verify",
+						"restore"
+					]
+				},
+				"trigger": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"schedule",
+						"api"
+					]
+				},
+				"generationId": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"startedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				}
+			}
+		},
+		"BackupVerifyResult": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"verifiedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"ok": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"stages": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupStageResult"
+					}
+				},
+				"mismatches": {
+					"type": "array",
+					"optional": true,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupRowMismatch"
+					}
+				},
+				"elythiaVersion": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"dumpSha256": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				}
+			}
+		},
+		"BackupJobResult": {
+			"type": "object",
+			"properties": {
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"take",
+						"verify",
+						"restore"
+					]
+				},
+				"trigger": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"schedule",
+						"api"
+					]
+				},
+				"generationId": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"startedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"finishedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"ok": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"stage": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"enum": [
+						"take",
+						"verify",
+						"prune"
+					]
+				},
+				"error": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"verify": {
+					"type": "object",
+					"optional": true,
+					"nullable": false,
+					"ref": "BackupVerifyResult"
+				},
+				"deleted": {
+					"type": "array",
+					"optional": true,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				}
+			}
+		},
+		"BackupOverview": {
+			"type": "object",
+			"properties": {
+				"storageType": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"s3",
+						"dir"
+					]
+				},
+				"generations": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupGeneration"
+					}
+				},
+				"usage": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"totalBytes": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"objectCount": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"generationCount": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"pricePerGbMonth": {
+							"type": "number",
+							"optional": false,
+							"nullable": true
+						},
+						"monthlyCost": {
+							"type": "number",
+							"optional": false,
+							"nullable": true
+						}
+					}
+				},
+				"service": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"configured": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false
+						},
+						"reachable": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false
+						},
+						"error": {
+							"type": "string",
+							"optional": true,
+							"nullable": false
+						},
+						"running": {
+							"type": "object",
+							"optional": false,
+							"nullable": true,
+							"ref": "BackupJob"
+						},
+						"nextRunAt": {
+							"type": "string",
+							"optional": false,
+							"nullable": true,
+							"format": "date-time"
+						},
+						"lastTake": {
+							"type": "object",
+							"optional": false,
+							"nullable": true,
+							"ref": "BackupJobResult"
+						},
+						"lastVerify": {
+							"type": "object",
+							"optional": false,
+							"nullable": true,
+							"ref": "BackupJobResult"
+						},
+						"latestUsable": {
+							"type": "object",
+							"optional": false,
+							"nullable": true,
+							"properties": {
+								"id": {
+									"type": "string",
+									"optional": false,
+									"nullable": false
+								},
+								"at": {
+									"type": "string",
+									"optional": false,
+									"nullable": false,
+									"format": "date-time"
+								}
+							}
+						},
+						"overdue": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false
+						},
+						"lastNotifyError": {
+							"type": "string",
+							"optional": true,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"BackupJobAccepted": {
+			"type": "object",
+			"properties": {
+				"accepted": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"job": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupJob"
+				}
+			}
+		},
+		"BackupDownload": {
+			"type": "object",
+			"properties": {
+				"url": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "url"
+				},
+				"expiresAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"via": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"storage",
+						"server"
+					]
+				},
+				"fileName": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"size": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"encrypted": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"BackupReauthChallenge": {
+			"type": "object",
+			"properties": {
+				"challenge": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"timeout": {
+					"type": "integer",
+					"optional": true,
+					"nullable": false
+				},
+				"rpId": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"allowCredentials": {
+					"type": "array",
+					"optional": true,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"properties": {
+							"type": {
+								"type": "string",
+								"optional": false,
+								"nullable": false
+							},
+							"id": {
+								"type": "string",
+								"optional": false,
+								"nullable": false
+							},
+							"transports": {
+								"type": "array",
+								"optional": true,
+								"nullable": false,
+								"items": {
+									"type": "string",
+									"optional": false,
+									"nullable": false
+								}
+							}
+						}
+					}
+				},
+				"userVerification": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"hints": {
+					"type": "array",
+					"optional": true,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"extensions": {
+					"type": "object",
+					"optional": true,
+					"nullable": false,
+					"additionalProperties": true
+				}
+			}
+		},
+		"BackupRestoreRecord": {
+			"type": "object",
+			"properties": {
+				"opId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"restore",
+						"rollback"
+					]
+				},
+				"step": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"preparing",
+						"ready",
+						"entering",
+						"switched",
+						"resuming",
+						"reverting",
+						"aborting",
+						"done",
+						"failed",
+						"expired",
+						"aborted",
+						"reverted",
+						"unknown"
+					]
+				},
+				"generationId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"database": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"target": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"before": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"aside": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"userId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"error": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"updatedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"readyAt": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"format": "date-time"
+				}
+			}
+		},
+		"BackupMaintenanceBlocker": {
+			"type": "object",
+			"properties": {
+				"server": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"pid": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"user": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"application": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"addr": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"sameRole": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"BackupMaintenanceState": {
+			"type": "object",
+			"properties": {
+				"phase": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"entering",
+						"held",
+						"resuming"
+					]
+				},
+				"opId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"manual",
+						"restore",
+						"rollback"
+					]
+				},
+				"reason": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"startedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"requestedBy": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"leaseUntil": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"heldAt": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"judgedAt": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"waitingFor": {
+					"type": "array",
+					"optional": false,
+					"nullable": true,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"blockers": {
+					"type": "array",
+					"optional": false,
+					"nullable": true,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupMaintenanceBlocker"
+					}
+				},
+				"terminated": {
+					"type": "array",
+					"optional": false,
+					"nullable": true,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupMaintenanceBlocker"
+					}
+				},
+				"judgeError": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"BackupRestoreStatus": {
+			"type": "object",
+			"properties": {
+				"record": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "BackupRestoreRecord"
+				},
+				"journal": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"properties": {
+							"at": {
+								"type": "string",
+								"optional": false,
+								"nullable": false,
+								"format": "date-time"
+							},
+							"step": {
+								"type": "string",
+								"optional": false,
+								"nullable": false
+							},
+							"message": {
+								"type": "string",
+								"optional": false,
+								"nullable": false
+							}
+						}
+					}
+				},
+				"maintenance": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "BackupMaintenanceState"
+				},
+				"final": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"BackupKeptDatabase": {
+			"type": "object",
+			"properties": {
+				"name": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"before_restore",
+						"rolled_back"
+					]
+				},
+				"at": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"size": {
+					"type": "integer",
+					"optional": false,
+					"nullable": true
+				},
+				"migrations": {
+					"type": "array",
+					"optional": false,
+					"nullable": true,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "BackupMigrationState"
+					}
+				},
+				"needsMigration": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"problem": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"enum": [
+						"migrationTooNew",
+						"migrationDirty",
+						"notElythia",
+						"unreadable"
+					]
+				}
+			}
+		},
+		"SelfCheckResult": {
+			"type": "object",
+			"properties": {
+				"name": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"status": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"ok",
+						"warn",
+						"fail",
+						"skip"
+					]
+				},
+				"detail": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"hint": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				}
+			}
+		},
+		"RemoteCheckReport": {
+			"type": "object",
+			"properties": {
+				"host": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"results": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "SelfCheckResult"
+					}
+				},
+				"ok": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"FederationHostHealth": {
+			"type": "object",
+			"properties": {
+				"host": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"success": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"failure": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"byClass": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"additionalProperties": {
+						"type": "integer"
+					}
+				},
+				"latencyP50Ms": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"latencyP95Ms": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"lastError": {
+					"type": "object",
+					"optional": true,
+					"nullable": false,
+					"properties": {
+						"at": {
+							"type": "string",
+							"optional": false,
+							"nullable": false,
+							"format": "date-time"
+						},
+						"class": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"status": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"message": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"DeliveryBreakerState": {
+			"type": "object",
+			"properties": {
+				"host": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"open": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"consecutiveFailures": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"openedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"nextProbeAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"probeIntervalSeconds": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"throttledUntil": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"reservedUntil": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				}
+			}
+		},
+		"FederationHealthReport": {
+			"type": "object",
+			"properties": {
+				"windowSeconds": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"hosts": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "FederationHostHealth"
+					}
+				},
+				"evictedHosts": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"breakers": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "DeliveryBreakerState"
+					}
+				}
+			}
+		},
+		"GoneInstance": {
+			"type": "object",
+			"properties": {
+				"host": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"suspendedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"followers": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"following": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"followRequests": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"GoneInstanceCleanResult": {
+			"type": "object",
+			"properties": {
+				"host": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"removedFollowers": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"removedFollowing": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"removedFollowRequests": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"remaining": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"FederationRule": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"updatedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"name": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"mode": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"disabled",
+						"record",
+						"enforce"
+					]
+				},
+				"target": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"note",
+						"activity"
+					]
+				},
+				"position": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"hosts": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"activityTypes": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"isBot": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": true
+				},
+				"newWithinHours": {
+					"type": "integer",
+					"optional": false,
+					"nullable": true
+				},
+				"patterns": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"hasAttachment": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": true
+				},
+				"tags": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"reject": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"stripMedia": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"sensitive": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"unlist": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"cw": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"hits": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"FederationRuleHit": {
+			"type": "object",
+			"properties": {
+				"ruleId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"host": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"subject": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"applied": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"at": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				}
+			}
+		},
+		"EmojiApplication": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"own",
+						"remote"
+					]
+				},
+				"status": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"pending",
+						"approved",
+						"rejected",
+						"canceled"
+					]
+				},
+				"name": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"category": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"aliases": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"license": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"isSensitive": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"comment": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"processedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"rejectReason": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"emojiId": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"format": "id"
+				},
+				"remoteHost": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"remoteName": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"preview": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "EmojiApplicationPreview"
+				}
+			}
+		},
+		"EmojiApplicationPreview": {
+			"type": "object",
+			"properties": {
+				"url": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"source": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"applicationFile",
+						"remoteEmoji",
+						"approvedEmoji"
+					]
+				},
+				"state": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"available",
+						"sourceGone",
+						"approvedEmojiGone",
+						"unknown"
+					]
+				}
+			}
+		},
+		"AdminEmojiApplication": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"userId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"own",
+						"remote"
+					]
+				},
+				"status": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"pending",
+						"approved",
+						"rejected",
+						"canceled"
+					]
+				},
+				"name": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"category": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"aliases": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"license": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"isSensitive": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"comment": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"processedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"rejectReason": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"emojiId": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"format": "id"
+				},
+				"remoteHost": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"remoteName": {
+					"type": "string",
+					"optional": true,
+					"nullable": false
+				},
+				"url": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"fileType": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"remoteGone": {
+					"type": "boolean",
+					"optional": true,
+					"nullable": true
+				},
+				"nameConflict": {
+					"optional": true,
+					"nullable": true,
+					"oneOf": [
+						{
+							"type": "object",
+							"properties": {
+								"emojiId": {
+									"type": "string",
+									"optional": false,
+									"nullable": false,
+									"format": "id"
+								},
+								"createdAt": {
+									"type": "string",
+									"optional": false,
+									"nullable": true,
+									"format": "date-time"
+								}
+							}
+						},
+						{
+							"type": "boolean",
+							"enum": [
+								false
+							]
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			}
+		},
+		"RelatedEmojiApplication": {
+			"type": "object",
+			"allOf": [
+				{
+					"type": "object",
+					"ref": "AdminEmojiApplication"
+				},
+				{
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"matchedBy": {
+							"type": "array",
+							"optional": false,
+							"nullable": false,
+							"items": {
+								"type": "string",
+								"optional": false,
+								"nullable": false,
+								"enum": [
+									"name",
+									"remoteSource",
+									"fileHash"
+								]
+							}
+						}
+					}
+				}
+			]
+		},
+		"EmojiApplicationStatusCounts": {
+			"type": "object",
+			"properties": {
+				"total": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"pending": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"approved": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"rejected": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"canceled": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"EmojiApplicationQuotaWindow": {
+			"type": "object",
+			"properties": {
+				"period": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"day",
+						"week",
+						"month"
+					]
+				},
+				"used": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"limit": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"unlimited": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"retryAt": {
+					"type": "string",
+					"optional": true,
+					"nullable": false,
+					"format": "date-time"
+				}
+			}
+		},
+		"EmojiApplicationQuotaReset": {
+			"type": "object",
+			"properties": {
+				"at": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"byId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"reason": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"RemoteEmojiMeta": {
+			"type": "object",
+			"oneOf": [
+				{
+					"type": "object",
+					"properties": {
+						"fetched": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false,
+							"enum": [
+								true
+							]
+						},
+						"emojiId": {
+							"type": "string",
+							"optional": false,
+							"nullable": false,
+							"format": "id"
+						},
+						"name": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"host": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"originalUrl": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"category": {
+							"type": "string",
+							"optional": true,
+							"nullable": false
+						},
+						"aliases": {
+							"type": "array",
+							"optional": true,
+							"nullable": false,
+							"items": {
+								"type": "string",
+								"optional": false,
+								"nullable": false
+							}
+						},
+						"license": {
+							"type": "string",
+							"optional": true,
+							"nullable": false
+						},
+						"isSensitive": {
+							"type": "boolean",
+							"optional": true,
+							"nullable": false
+						}
+					}
+				},
+				{
+					"type": "object",
+					"properties": {
+						"fetched": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false,
+							"enum": [
+								false
+							]
+						},
+						"reason": {
+							"type": "string",
+							"optional": false,
+							"nullable": false,
+							"enum": [
+								"unsupported",
+								"notFound",
+								"error"
+							]
+						},
+						"emojiId": {
+							"type": "string",
+							"optional": false,
+							"nullable": false,
+							"format": "id"
+						},
+						"name": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"host": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"originalUrl": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"license": {
+							"type": "string",
+							"optional": true,
+							"nullable": false
+						}
+					}
+				}
+			]
+		},
+		"SignupApplicationView": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"pending",
+						"approved",
+						"rejected",
+						"expired",
+						"completed"
+					]
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"expiresAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				}
+			}
+		},
+		"SignupApplicationAnswer": {
+			"type": "object",
+			"properties": {
+				"label": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"value": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"AdminSignupApplication": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"status": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"pending",
+						"approved",
+						"rejected",
+						"expired",
+						"completed"
+					]
+				},
+				"answers": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "SignupApplicationAnswer"
+					}
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"updatedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"expiresAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"processedById": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "id"
+				},
+				"processedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"usedById": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "id"
+				}
+			}
+		},
+		"DatabaseIndexStat": {
+			"type": "object",
+			"properties": {
+				"table": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"index": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"scans": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"sizeBytes": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"unique": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"primary": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"DatabaseTableStat": {
+			"type": "object",
+			"properties": {
+				"table": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"liveRows": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"deadRows": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"deadRatio": {
+					"type": "number",
+					"optional": false,
+					"nullable": false
+				},
+				"sizeBytes": {
+					"type": "integer",
+					"optional": false,
+					"nullable": true
+				},
+				"lastVacuum": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"lastAnalyze": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"modifiedSinceAnalyze": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"vacuuming": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"DatabaseHealthProblem": {
+			"type": "object",
+			"properties": {
+				"table": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"bloat",
+						"vacuum"
+					]
+				},
+				"detail": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"DatabaseHealthReport": {
+			"type": "object",
+			"properties": {
+				"generatedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"statsReset": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"replicasConfigured": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"autovacuumThreshold": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"autovacuumScaleFactor": {
+					"type": "number",
+					"optional": false,
+					"nullable": false
+				},
+				"autovacuumMaxThreshold": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"unusedIndexes": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "DatabaseIndexStat"
+					}
+				},
+				"tables": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "DatabaseTableStat"
+					}
+				},
+				"problems": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "DatabaseHealthProblem"
+					}
+				}
+			}
+		},
+		"DriveUsageBucket": {
+			"type": "object",
+			"properties": {
+				"count": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"size": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"linkCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"DriveUsageKindBucket": {
+			"type": "object",
+			"properties": {
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"attachment",
+						"avatar",
+						"banner",
+						"emoji",
+						"other"
+					]
+				},
+				"origin": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"local",
+						"remote"
+					]
+				},
+				"count": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"size": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"linkCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"DriveUsageHostBucket": {
+			"type": "object",
+			"properties": {
+				"host": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"count": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"size": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"linkCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"DriveUsageUserBucket": {
+			"type": "object",
+			"properties": {
+				"userId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"username": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"count": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"size": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"linkCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"DriveUsage": {
+			"type": "object",
+			"properties": {
+				"calculatedAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"elapsedMs": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"cached": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"cacheTtlSeconds": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"topLimit": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"source": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"database"
+					]
+				},
+				"total": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "DriveUsageBucket"
+				},
+				"local": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "DriveUsageBucket"
+				},
+				"remote": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "DriveUsageBucket"
+				},
+				"byKind": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "DriveUsageKindBucket"
+					}
+				},
+				"byHost": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "DriveUsageHostBucket"
+					}
+				},
+				"byUser": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "DriveUsageUserBucket"
+					}
+				}
+			}
+		},
+		"IPSearchAccount": {
+			"type": "object",
+			"properties": {
+				"user": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "UserLite"
+				},
+				"isSuspended": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"isDeleted": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"lastActiveDate": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"firstSeenAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"lastSeenAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"observationCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"IPAccountsResult": {
+			"type": "object",
+			"properties": {
+				"ip": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"loggingEnabled": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"hasAnyHistory": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"sinceDays": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"retentionDays": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"limit": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"offset": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"hasMore": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"droppedCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"accounts": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "IPSearchAccount"
+					}
+				}
+			}
+		},
+		"IPLookupLogEntry": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"user": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "UserLite"
+				},
+				"userId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"kind": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"ip",
+						"relatedAccounts",
+						"signins",
+						"userIps"
+					]
+				},
+				"ip": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"targetUser": {
+					"type": "object",
+					"optional": false,
+					"nullable": true,
+					"ref": "UserLite"
+				},
+				"targetUserId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"sinceDays": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"resultCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				}
+			}
+		},
+		"IPLookupLogResult": {
+			"type": "object",
+			"properties": {
+				"retentionDays": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"limit": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"offset": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"hasMore": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"entries": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "IPLookupLogEntry"
+					}
+				}
+			}
+		},
+		"IPRelatedSharedIP": {
+			"type": "object",
+			"properties": {
+				"ip": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"targetLastSeenAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"candidateLastSeenAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				},
+				"ipAccountCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"ipAccountCountIsLowerBound": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"elapsedDays": {
+					"type": "number",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"IPRelatedCandidate": {
+			"type": "object",
+			"properties": {
+				"user": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "UserLite"
+				},
+				"isSuspended": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"isDeleted": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"lastActiveDate": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"sharedIpCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"score": {
+					"type": "number",
+					"optional": false,
+					"nullable": false
+				},
+				"sharedIps": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "IPRelatedSharedIP"
+					}
+				}
+			}
+		},
+		"IPRelatedAccountsResult": {
+			"type": "object",
+			"properties": {
+				"user": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "UserLite"
+				},
+				"loggingEnabled": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"hasAnyHistory": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"sinceDays": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"retentionDays": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"halfLifeDays": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"targetIpCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"truncated": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"targetIpsTruncated": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"candidatesTruncated": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"limit": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"offset": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"hasMore": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"droppedCount": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"candidates": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "IPRelatedCandidate"
+					}
+				}
+			}
+		},
+		"RoleAssignmentLookup": {
+			"type": "object",
+			"properties": {
+				"assigned": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"expiresAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"role": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"id": {
+							"type": "string",
+							"optional": false,
+							"nullable": false,
+							"format": "id"
+						},
+						"target": {
+							"type": "string",
+							"optional": false,
+							"nullable": false,
+							"enum": [
+								"manual",
+								"conditional"
+							]
+						},
+						"isPublic": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false
+						},
+						"canEditMembersByModerator": {
+							"type": "boolean",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"SelfCheckReport": {
+			"type": "object",
+			"properties": {
+				"results": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "SelfCheckResult"
+					}
+				},
+				"ok": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"ServerMetrics": {
+			"type": "object",
+			"properties": {
+				"uptimeMs": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"version": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"misskey": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						},
+						"mkGo": {
+							"type": "string",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				},
+				"go": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"properties": {
+						"goroutines": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"gomaxprocs": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"heapAllocBytes": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"heapSysBytes": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"heapObjects": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"gcNum": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"lastGcPauseNs": {
+							"type": "integer",
+							"optional": false,
+							"nullable": false
+						},
+						"gcCpuFraction": {
+							"type": "number",
+							"optional": false,
+							"nullable": false
+						}
+					}
+				}
+			}
+		},
+		"ServerPluginInfo": {
+			"type": "object",
+			"properties": {
+				"name": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"version": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"apiVersion": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"enabled": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"routes": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"jobs": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"effectivePolicies": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				},
+				"migrations": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"schema": {
+					"type": "string",
+					"optional": false,
+					"nullable": false
+				},
+				"configKeys": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				},
+				"secrets": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				}
+			}
+		},
+		"ServerPluginList": {
+			"type": "object",
+			"properties": {
+				"plugins": {
+					"type": "array",
+					"optional": false,
+					"nullable": false,
+					"items": {
+						"type": "object",
+						"optional": false,
+						"nullable": false,
+						"ref": "ServerPluginInfo"
+					}
+				},
+				"orphanSchemas": {
+					"type": "array",
+					"optional": false,
+					"nullable": true,
+					"items": {
+						"type": "string",
+						"optional": false,
+						"nullable": false
+					}
+				}
+			}
+		},
+		"ChunkedUploadSession": {
+			"type": "object",
+			"properties": {
+				"uploadId": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"chunkSize": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"totalChunks": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"expiresAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "date-time"
+				}
+			}
+		},
+		"ChunkAppendResult": {
+			"type": "object",
+			"properties": {
+				"index": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"next": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"receivedBytes": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"totalSize": {
+					"type": "integer",
+					"optional": false,
+					"nullable": false
+				},
+				"completed": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		},
+		"SilentFollow": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"format": "id"
+				},
+				"createdAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"follower": {
+					"type": "object",
+					"optional": false,
+					"nullable": false,
+					"ref": "UserLite"
+				}
+			}
+		},
+		"AccountFederationState": {
+			"type": "object",
+			"properties": {
+				"federationStatus": {
+					"type": "string",
+					"optional": false,
+					"nullable": false,
+					"enum": [
+						"pending",
+						"off",
+						"on"
+					]
+				},
+				"federationEnabledAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"firstExternalReferenceAt": {
+					"type": "string",
+					"optional": false,
+					"nullable": true,
+					"format": "date-time"
+				},
+				"firstExternalReferenceReason": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"firstExternalReferenceHost": {
+					"type": "string",
+					"optional": false,
+					"nullable": true
+				},
+				"isSystemAccount": {
+					"type": "boolean",
+					"optional": false,
+					"nullable": false
+				}
+			}
+		}
+	}
+}

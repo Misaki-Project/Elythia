@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -505,7 +506,7 @@ func (m *MockAnnouncementRepository) ListForUser(userID string, activeOnly bool,
 	return result[:limit], nil
 }
 
-func (m *MockAnnouncementRepository) ListForAdmin(userID, status string, limit, offset int, sinceID, untilID string, now time.Time) ([]*model.Announcement, error) {
+func (m *MockAnnouncementRepository) ListForAdmin(userID, status string, limit int, sinceID, untilID string, now time.Time) ([]*model.Announcement, error) {
 	var result []*model.Announcement
 	for _, a := range m.Items {
 		if userID != "" {
@@ -539,13 +540,6 @@ func (m *MockAnnouncementRepository) ListForAdmin(userID, status string, limit, 
 	}
 	if limit <= 0 {
 		limit = 10
-	}
-	if sinceID == "" && untilID == "" {
-		if offset >= len(result) {
-			return nil, nil
-		}
-		end := min(offset+limit, len(result))
-		return result[offset:end], nil
 	}
 	if limit > len(result) {
 		limit = len(result)
@@ -662,6 +656,20 @@ func (m *MockAnnouncementRepository) ArchiveExpired(now time.Time) (int64, error
 		}
 	}
 	return n, nil
+}
+
+// ListScheduledArchives mirrors the repository: active announcements whose
+// autoArchiveAt is after now, ordered by id.
+func (m *MockAnnouncementRepository) ListScheduledArchives(now time.Time) ([]*model.Announcement, error) {
+	var out []*model.Announcement
+	for _, a := range m.Items {
+		if a.IsActive && a.AutoArchiveAt != nil && a.AutoArchiveAt.After(now) {
+			cp := *a
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 // announcementActiveNow mirrors the repository's read-time rule (#3809): an
@@ -968,8 +976,10 @@ func (m *MockAdRepository) ListActive(now time.Time) ([]*model.Ad, error) {
 		return nil, m.ListErr
 	}
 	rows := make([]*model.Ad, 0)
+	// 本物の ListActive と同じく、曜日の指定も見る (#3971)
+	day := 1 << int(now.Weekday())
 	for _, a := range m.Ads {
-		if !a.StartsAt.After(now) && a.ExpiresAt.After(now) {
+		if !a.StartsAt.After(now) && a.ExpiresAt.After(now) && (a.DayOfWeek == 0 || a.DayOfWeek&day != 0) {
 			rows = append(rows, a)
 		}
 	}
@@ -991,31 +1001,6 @@ func (m *MockAdRepository) FindByID(id string) (*model.Ad, error) {
 		return nil, ErrNotFound
 	}
 	return a, nil
-}
-
-func (m *MockAdRepository) List(limit, offset int) ([]*model.Ad, error) {
-	if m.ListErr != nil {
-		return nil, m.ListErr
-	}
-	rows := make([]*model.Ad, 0, len(m.Ads))
-	for _, a := range m.Ads {
-		rows = append(rows, a)
-	}
-	sortAdsByIDDesc(rows)
-	if limit <= 0 {
-		limit = 30
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	if offset >= len(rows) {
-		return []*model.Ad{}, nil
-	}
-	end := offset + limit
-	if end > len(rows) {
-		end = len(rows)
-	}
-	return rows[offset:end], nil
 }
 
 // ListFiltered applies the publishing filter + cursor pagination (#1545).

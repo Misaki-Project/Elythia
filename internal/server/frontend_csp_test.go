@@ -323,9 +323,9 @@ func TestApplyFrontendCSP_PassesMediaOrigins(t *testing.T) {
 
 // wantEsmShSources are the only esm.sh sources the policy may allow.
 var wantEsmShSources = []string{
-	"https://esm.sh/shiki@4.5.0/",
-	"https://esm.sh/@shikijs/langs@4.5.0/",
-	"https://esm.sh/@shikijs/themes@4.5.0/",
+	"https://esm.sh/shiki@4.6.0/",
+	"https://esm.sh/@shikijs/langs@4.6.0/",
+	"https://esm.sh/@shikijs/themes@4.6.0/",
 }
 
 // esm.sh の許可は**意図的な妥協**なので、増えていないことを固定する (#2425)。
@@ -440,7 +440,7 @@ func TestFrontendCSP_HashesCoverRenderedInlineScripts(t *testing.T) {
 		Version:                       "0.0.1-test",
 		FrontendContentSecurityPolicy: CSPModeEnforce,
 	}
-	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil)
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()

@@ -84,18 +84,40 @@ func TestPrivilegedPolicyKeysMatchAdminRoutes(t *testing.T) {
 }
 
 var (
-	policyConstRe       = regexp.MustCompile(`^\s*corerole\.(Policy\w+)\s*$`)
-	policyLiteralRe     = regexp.MustCompile(`^\s*"([^"]+)"\s*$`)
-	requireRolePolicyRe = regexp.MustCompile(`RequireRolePolicy\(`)
+	policyConstRe   = regexp.MustCompile(`^\s*corerole\.(Policy\w+)\s*$`)
+	policyLiteralRe = regexp.MustCompile(`^\s*"([^"]+)"\s*$`)
+	// RequireRolePolicyPublic (匿名も base の policy で評価する形。users/search) も
+	// policy で守る route なので一緒に読む。
+	requireRolePolicyRe = regexp.MustCompile(`RequireRolePolicy(Public)?\(`)
 )
 
 // requireRolePolicyArgs returns the policy argument of every
-// RequireRolePolicy call in the registration text.
-//
-// 引数は `(checker, policyKey)` の 2 つなので、括弧の深さを見て最後の 1 つを取る。
+// RequireRolePolicy / RequireRolePolicyPublic call in the registration text.
 func requireRolePolicyArgs(reg string) []string {
 	var out []string
-	for _, loc := range requireRolePolicyRe.FindAllStringIndex(reg, -1) {
+	for _, c := range requireRolePolicyCalls(reg) {
+		out = append(out, c.arg)
+	}
+	return out
+}
+
+// rolePolicyCall is one RequireRolePolicy / RequireRolePolicyPublic call.
+type rolePolicyCall struct {
+	// public is true for RequireRolePolicyPublic, which admits anonymous
+	// callers.
+	public bool
+	arg    string
+}
+
+// requireRolePolicyCalls returns every RequireRolePolicy /
+// RequireRolePolicyPublic call in the registration text with its policy
+// argument.
+//
+// 引数は `(checker, policyKey)` の 2 つなので、括弧の深さを見て最後の 1 つを取る。
+func requireRolePolicyCalls(reg string) []rolePolicyCall {
+	var out []rolePolicyCall
+	for _, loc := range requireRolePolicyRe.FindAllStringSubmatchIndex(reg, -1) {
+		public := loc[2] >= 0
 		depth := 1
 		start := loc[1]
 		last := start
@@ -106,7 +128,7 @@ func requireRolePolicyArgs(reg string) []string {
 			case ')', ']', '}':
 				depth--
 				if depth == 0 {
-					out = append(out, reg[last:i])
+					out = append(out, rolePolicyCall{public: public, arg: reg[last:i]})
 					i = len(reg)
 				}
 			case ',':

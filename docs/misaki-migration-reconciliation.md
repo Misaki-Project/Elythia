@@ -19,9 +19,9 @@
 | `000109_user_uri_index` | coreの`000108` |
 | `000110`〜`000116`のURL用index | coreの`000109`〜`000115` |
 | `000117_transferred_repository_url` | coreの`000116_transferred_repository_url` |
-| 上流の新しい`000117`〜`000138` | coreの`000117`〜`000138` |
+| 上流の新しい`000117`〜`000141` | coreの`000117`〜`000141` |
 
-本体は138本、localは1本です。新しい空DBは通常の`elythia migrate -direction up`でcore→localの順に適用します。空DBの台帳を手で変更する必要はありません。localは新しいオブジェクトを作らず、CherryPick由来の`avatar_decoration.host IS NOT NULL`の行だけを削除します。元の値を保存しないため復元できず、downは`SELECT 1`です。
+本体は141本、localは1本です。新しい空DBは通常の`elythia migrate -direction up`でcore→localの順に適用します。空DBの台帳を手で変更する必要はありません。localは新しいオブジェクトを作らず、CherryPick由来の`avatar_decoration.host IS NOT NULL`の行だけを削除します。元の値を保存しないため復元できず、downは`SELECT 1`です。
 
 ## 旧117まで適用済みのDBだけを移す
 
@@ -50,7 +50,7 @@
    SELECT 'local', version, dirty FROM schema_migrations_local;
    ```
 
-6. 新しい版の`elythia migrate -direction up`を実行する。core117〜138が当たり、既に記録したlocal1は再実行されない。`elythia doctor`、データの維持、core/localのオブジェクトを確認する。上流の新規移行も含めて新しい空DBへ適用した場合と、schemaを比較する。
+6. 新しい版の`elythia migrate -direction up`を実行する。core117〜141が当たり、既に記録したlocal1は再実行されない。`elythia doctor`、データの維持、core/localのオブジェクトを確認する。上流の新規移行も含めて新しい空DBへ適用した場合と、schemaを比較する。
 7. 復元先で成功し、バックアップと切り戻し手順を確認した後に、本番への適用を判断する。本番へ移す際も停止・確認・台帳変換・up・検証の順を守る。
 
 旧版で117まで適用していないDBには、この固定値のSQLを使いません。特に旧99〜105はcore98が未適用のままcore99以降が当たった飛び地になりえます。小さい番号へ戻して全てを再実行するとデータ移行も再実行されるため、個別に確認して別の手順を作ります。旧106〜116も実際の適用状態に応じた境界が必要です。`-force`は2台帳をまとめて変更できず、cleanな台帳の変換にも使いません。downで旧状態へ戻すこともしません。

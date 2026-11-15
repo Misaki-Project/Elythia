@@ -8,15 +8,15 @@ import (
 )
 
 // AdRepository provides data access for the `ad` table. ListActive is used by
-// /api/meta for timeline ad exposure; the rest supports the admin CRUD.
+// /api/meta and the meta embedded in the frontend HTML shells for timeline ad
+// exposure; the rest supports the admin CRUD.
 type AdRepository interface {
 	// ListActive returns ads whose window contains `now` (startsAt <= now
-	// < expiresAt). Ordering is by id DESC so newest ads come first.
+	// < expiresAt) and whose dayOfWeek includes the weekday of `now` (0 means
+	// every day). Ordering is by id DESC so newest ads come first.
 	ListActive(now time.Time) ([]*model.Ad, error)
 	Create(a *model.Ad) error
 	FindByID(id string) (*model.Ad, error)
-	// List returns ads ordered by id DESC with limit/offset pagination.
-	List(limit, offset int) ([]*model.Ad, error)
 	// ListFiltered returns ads with cursor pagination (sinceID/untilID) and an
 	// optional publishing filter (#1545, upstream admin/ad/list)。publishing が
 	// nil なら全件、true なら配信中 (startsAt<=now<expiresAt)、false なら非配信。
@@ -37,8 +37,12 @@ func NewAdRepository(db *gorm.DB) AdRepository {
 
 func (r *adRepository) ListActive(now time.Time) ([]*model.Ad, error) {
 	var ads []*model.Ad
+	// 曜日はビットの印で、日曜が 1<<0 (#3971)。本家の MetaEntityService と同じく
+	// now の地域時刻の曜日で絞る (本家は new Date().getDay() でサーバーの地域時刻)。
+	// 絞らないと、曜日を指定した広告が毎日出る
 	if err := r.db.
 		Where(`"startsAt" <= ? AND "expiresAt" > ?`, now, now).
+		Where(`("dayOfWeek" & ? > 0 OR "dayOfWeek" = 0)`, 1<<int(now.Weekday())).
 		Order(`id DESC`).
 		Find(&ads).Error; err != nil {
 		return nil, err
@@ -59,20 +63,6 @@ func (r *adRepository) FindByID(id string) (*model.Ad, error) {
 		return nil, err
 	}
 	return &a, nil
-}
-
-func (r *adRepository) List(limit, offset int) ([]*model.Ad, error) {
-	if limit <= 0 {
-		limit = 30
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	var ads []*model.Ad
-	if err := r.db.Order(`"id" DESC`).Limit(limit).Offset(offset).Find(&ads).Error; err != nil {
-		return nil, err
-	}
-	return ads, nil
 }
 
 func (r *adRepository) ListFiltered(publishing *bool, sinceID, untilID string, limit int, now time.Time) ([]*model.Ad, error) {

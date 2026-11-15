@@ -2,13 +2,13 @@
 
 Elythia が持つ「純正 Misskey (misskey-dev/misskey) には無い、または挙動が異なる」ものをまとめたリファレンスの目次。差分そのものは、領域ごとに [`docs/divergence/`](#領域ごとの差分) のファイルへ分けてある (#3414)。
 
-- 基準: **Elythia 2.1.0 (Misaki)** ⇔ Misskey TS `2026.10.1`
+- 基準: **Elythia 2.2.0 (Misaki)** ⇔ Misskey TS `2026.11.0`
 - 最終更新: 2026-10-07 (領域ごとのファイルへの分割、#3414)
 
 > ベースラインを固定したのは 1.0.0 (= Misskey TS `2026.7.0` 追従完了時点)。1.1.x は
 > upstream を追従したのではなく、**Elythia 側の独自変更と互換性 fix** を積んだもので、比較対象の
 > Misskey TS は 1.0.0 時点と同じ `2026.7.0` のままだった。**2026.9.0 への追従 (#2877) で
-> ベースラインを `2026.9.0` へ更新し、2026.9.1 への追従 (#3176) で `2026.9.1`、2026.10.0 への追従 (#3285) で `2026.10.0`、2026.10.1 への追従 (#3809) で `2026.10.1` へ上げた。**
+> ベースラインを `2026.9.0` へ更新し、2026.9.1 への追従 (#3176) で `2026.9.1`、2026.10.0 への追従 (#3285) で `2026.10.0`、2026.10.1 への追従 (#3809) で `2026.10.1`、2026.11.0 への追従 (#4164) で `2026.11.0` へ上げた。**
 > 個々の記述はまだ 2026.7.0 時点の観察に基づくものが
 > 混じりうるので、乖離を判断するときは本体の`frontend/`と固定した本体commitで確認すること。旧forkのpinは[frontendの履歴](divergence/frontend.md)と[Misaki固有の記録](divergence/misaki.md)に分けて残す。
 
@@ -32,7 +32,7 @@ Elythia は Misskey TS からの drop-in 移行 (Misskey TS の DB / Redis を�
 
 | 軸 | Elythia 独自 | cherrypick 由来 | 未実装 |
 |---|---|---|---|
-| API endpoint | GET variant 25 + alias 4 + 分割アップロード 4 + 承認制 7 + 絵文字の申請 10 + exact assignment lookup 2 + admin 観測 8 + 配送のブレーカー 1 + 消えたインスタンスの片付け 2 + 連合のルール 5 + IP 検索 3 + バブルゲームの対戦 10 + フォローの止め方 1 + DB のバックアップ 11 + アカウント単位の連合制御 2 + role-levelプラグイン 13 | chat 15 | **0** |
+| API endpoint | GET variant 25 + alias 4 + 分割アップロード 4 + 承認制 7 + 絵文字の申請 10 + exact assignment lookup 2 + admin 観測 8 + 配送のブレーカー 1 + 消えたインスタンスの片付け 2 + 連合のルール 5 + IP 検索 3 + バブルゲームの対戦 10 + フォローの止め方 1 + DB のバックアップ 11 + アカウント単位の連合制御 2 + role-levelプラグイン 13 + リバーシの対局操作 3 | chat 15 | **0** |
 | API レスポンスの additive field | 11 (`runtime` / `mkGoVersion` / `chunkedUpload` / `approvalRequiredForSignup` / `registrationClosed` / `signupApplicationForm` / `canRequestCustomEmojis` / `minimumUsernameLength` / `managedByPlugin` / `federationStatus` / `has<秘密の欄>` (`admin/meta` の 11 欄と `admin/captcha/current` の `hasSecretKey` を 1 つと数える。[security.md §7](divergence/security.md#7-意図的な安全側-divergence))) | reversi packed game の `crc32` 等 | — |
 | DB テーブル | 21 (+ bookkeeping 2) | 0 | 0 |
 | DB カラム | 33 (+ 未使用の残存列 3) | 3 | 0 |
@@ -40,9 +40,9 @@ Elythia は Misskey TS からの drop-in 移行 (Misskey TS の DB / Redis を�
 | config キー | 20 前後 | 0 | — |
 | fork frontend の独自変更 | 143 tag (`2026.7.0-mk.0` ～ `2026.10.0-mk.5`) | — | — |
 
-このサマリのfrontend tagは上流Elythiaの凍結した系列で、Misakiの履歴tagは[Misaki固有の記録](divergence/misaki.md#旧frontend-forkの履歴)に別掲する。API endpointは生成結果と同じく、Misakiで既定有効の`/api/plugin/role-level/*`の13ルートを含めて123件と数える (GET variant 25件 + chat拡張15件 + その他83件)。
+このサマリのfrontend tagは上流Elythiaの凍結した系列で、Misakiの履歴tagは[Misaki固有の記録](divergence/misaki.md#旧frontend-forkの履歴)に別掲する。API endpointは生成結果と同じく、role-levelの13ルートとupstream追加のreversi操作3ルートを含めて126件と数える (GET variant 25件 + chat拡張15件 + その他86件)。
 
-**upstream endpoint の未実装はゼロ** (coverage 100.0%、444/444)。DB schema も upstream の全テーブル・全共有カラムを superset で保持しており、逆方向の欠落は無い。
+**upstream endpoint の未実装はゼロ** (coverage 100.0%、446/446)。DB schema も upstream の全テーブル・全共有カラムを superset で保持しており、逆方向の欠落は無い。
 
 ## 領域ごとの差分
 
@@ -55,7 +55,7 @@ Elythia は Misskey TS からの drop-in 移行 (Misskey TS の DB / Redis を�
 | [`divergence/federation.md`](divergence/federation.md) | §3 | ActivityPub (連合) |
 | [`divergence/config.md`](divergence/config.md) | §4 / §4-1 / §4-3 | 設定・streaming・job queue |
 | [`divergence/frontend.md`](divergence/frontend.md) | §4-2 / §4-2b | frontend |
-| [`divergence/operations.md`](divergence/operations.md) | §5 / §5.5 / §5.6 / §5.7 / §5.8 | 運用・性能 |
+| [`divergence/operations.md`](divergence/operations.md) | §5 / §5.5 / §5.6 / §5.7 / §5.8 / §5.9 | 運用・性能 |
 | [`divergence/security.md`](divergence/security.md) | §6 / §7 | セキュリティと安全側の差分 |
 | [`divergence/approximations.md`](divergence/approximations.md) | §8 / §9 | 逆方向の差分と近似 |
 | [`divergence/misaki.md`](divergence/misaki.md) | Misaki固有 | 削除ポリシー・role-level・ゲームランキング・固定コミット・旧frontendの履歴 |
