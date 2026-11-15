@@ -240,7 +240,7 @@ test('eight pending polls settle with an explicit bounded retry that can become 
 	vi.useFakeTimers();
 	api.mockImplementation(async path => path.endsWith('/capabilities') ? { externalFetchEnabled: true } : { state: 'pending', post: data().post, body: 'audit body' });
 	await register(); const view = coordinate(); await flushPreview();
-	await vi.advanceTimersByTimeAsync(7 * 750); await flushPreview();
+	await vi.advanceTimersByTimeAsync(10_500); await flushPreview();
 	expect(previewCalls()).toHaveLength(8);
 	expect(retryButton(view).disabled).toBe(false);
 	expect(view.container.textContent).not.toContain('public body');
@@ -254,13 +254,17 @@ test('eight pending polls settle with an explicit bounded retry that can become 
 	expect(view.container.querySelector('[data-fx-preview-retry]')).toBeNull();
 });
 
-test('poll batches honor valid server nextPollAt and retain the minimum delay', async () => {
+test.each([-60_000, 0, 18_000, 3_600_000])('poll timing does not depend on the device clock (server is %i ms ahead)', async skew => {
 	vi.useFakeTimers();
-	api.mockResolvedValueOnce({ state: 'pending', nextPollAt: new Date(Date.now() + 2_000).toISOString() }).mockResolvedValueOnce({ state: 'pending', nextPollAt: 'invalid' }).mockResolvedValue(data());
+	// サーバーの時計が端末より skew だけ進んでいる (端末の時計が遅れている) 状況を、nextPollAt で作る。
+	const serverNextPoll = () => new Date(Date.now() + skew + 2_000).toISOString();
+	api.mockImplementationOnce(async () => ({ state: 'pending', nextPollAt: serverNextPoll() }))
+		.mockImplementationOnce(async () => ({ state: 'pending', nextPollAt: serverNextPoll() }))
+		.mockResolvedValue(data());
 	const pending = loadPreview(input, context, new AbortController().signal); await flushPreview();
-	await vi.advanceTimersByTimeAsync(1_999); expect(previewCalls()).toHaveLength(1);
+	await vi.advanceTimersByTimeAsync(499); expect(previewCalls()).toHaveLength(1);
 	await vi.advanceTimersByTimeAsync(1); expect(previewCalls()).toHaveLength(2);
-	await vi.advanceTimersByTimeAsync(749); expect(previewCalls()).toHaveLength(2);
+	await vi.advanceTimersByTimeAsync(999); expect(previewCalls()).toHaveLength(2);
 	await vi.advanceTimersByTimeAsync(1); await expect(pending).resolves.toMatchObject({ state: 'ready' });
 });
 
@@ -285,7 +289,7 @@ test('retry is single flight and a rejected batch stays retryable after cooldown
 test('a manually retried pending batch also stops at eight without background polling', async () => {
 	vi.useFakeTimers(); api.mockResolvedValue({ state: 'pending' });
 	const view = retryCard(); await fireEvent.click(retryButton(view)); await flushPreview();
-	await vi.advanceTimersByTimeAsync(7 * 750); await flushPreview();
+	await vi.advanceTimersByTimeAsync(10_500); await flushPreview();
 	expect(previewCalls()).toHaveLength(8); expect(retryButton(view).disabled).toBe(true);
 	await vi.advanceTimersByTimeAsync(60_000); expect(previewCalls()).toHaveLength(8); expect(retryButton(view).disabled).toBe(false);
 });
@@ -354,6 +358,13 @@ test.each(['success', 'failure'] as const)('main and quote photos coexist with t
 	expect(prepareCalls().map(call => call[1]?.kind)).toEqual(expect.arrayContaining(['image', 'quote-image']));
 	expect(prepareCalls('video')).toHaveLength(0);
 	expect(publicFetchCalls().every(([, options]) => options?.credentials === 'omit')).toBe(true);
+});
+
+test('a pending card whose server time is far ahead of the device clock waits at most two seconds', async () => {
+	vi.useFakeTimers(); const view = retryCard({ state: 'pending', nextPollAt: new Date(Date.now() + 20_000).toISOString() });
+	expect(retryButton(view).disabled).toBe(true);
+	await vi.advanceTimersByTimeAsync(1_999); expect(retryButton(view).disabled).toBe(true);
+	await vi.advanceTimersByTimeAsync(1); expect(retryButton(view).disabled).toBe(false); expect(previewCalls()).toHaveLength(0);
 });
 
 test('a newly mounted pending card respects the server retry time without issuing work', async () => {

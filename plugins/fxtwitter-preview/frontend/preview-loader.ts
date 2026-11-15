@@ -23,6 +23,17 @@ export function statusID(input: PreviewInput): string | null {
 	}
 }
 
+// 取得中の問い合わせの間隔 (ミリ秒)。n回目の応答が pending だったら、n番目の値だけ待つ。
+// サーバーの nextPollAt はサーバーの時計の時刻なので、端末の時計と引き算すると、時計のずれの分だけ
+// 待ちが延びる (#37)。取得は1秒以内に終わるので、最初は短く刻み、時刻は使わない。
+export const pollDelaysMs = [500, 1_000, 1_000, 2_000, 2_000, 2_000, 2_000] as const;
+
+// 再試行のボタンを押せない時間 (ミリ秒)。nextPollAt は端末の時計とずれうるので、この範囲に収める。
+export function retryCooldownMs(nextPollAt: string | undefined, now: number): number {
+	const untilNextPoll = (Date.parse(nextPollAt ?? '') || 0) - now;
+	return Math.min(2_000, Math.max(1_000, untilNextPoll));
+}
+
 function abortError(): DOMException {
 	return new DOMException('Aborted', 'AbortError');
 }
@@ -252,14 +263,14 @@ export async function loadPreview(input: PreviewInput, context: PreviewContext, 
 	if (postId == null || context.source?.kind !== 'note') throw new Error('A visible source note is required');
 	if (!context.revealed || !context.active || !context.inViewport) throw abortError();
 	const session = apiSession.value;
-	for (let attempt = 0; attempt < 8; attempt++) {
+	for (let attempt = 0; attempt <= pollDelaysMs.length; attempt++) {
 		if (signal.aborted || session !== apiSession.value) throw abortError();
 		const response = normalizedPreviewResponse(await api<unknown>('preview', { noteId: context.source.noteId, postId }, { signal }), postId);
 		// The host may ignore cancellation and settle after abort; the late-preview mutation proves this guard is needed.
 		// eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
 		if (signal.aborted || session !== apiSession.value) throw abortError();
 		if (response.state !== 'pending') return response;
-		if (attempt < 7) await delay(Math.max(750, (Date.parse(response.nextPollAt ?? '') || 0) - Date.now()), signal);
+		if (attempt < pollDelaysMs.length) await delay(pollDelaysMs[attempt], signal);
 		else return response;
 	}
 	throw new Error('unreachable');
