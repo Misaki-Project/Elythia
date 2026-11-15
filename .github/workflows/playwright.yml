@@ -44,6 +44,8 @@ on:
       - "tests/playwright/**"
       - "frontend/**"
       - "Makefile"
+      # バックアップの spec の job が、デーモンの image (target backup) をここから作る (#4102)
+      - "Dockerfile"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/playwright.yml"
@@ -93,11 +95,11 @@ jobs:
           # 「スタックごと分ける」= シャード数でしか稼げない。shard への
           # 割り振りは所要時間で均す (PLAYWRIGHT_SHARD、#4026)。
           #
-          # 7 にした理由と、見直す目安は docs/playwright.md の「shard の数」。
+          # 11 にした理由と、見直す目安は docs/playwright.md の「shard の数」。
           # job 1 つに固定で 130-150 秒かかり、PR 1 件で動く job はすでに GitHub の
           # 同時実行の上限 (Free で組織全体 20) を超えているので、増やすのは
           # spec の実行の時間が目安を超えたときだけにする。
-          SHARD_TOTAL: "7"
+          SHARD_TOTAL: "11"
         # backend 固有の make target / compose 引数 / prepull / timeout を
         # ここで一元定義する (= matrix.include の単一の情報源)。
         run: |
@@ -131,7 +133,7 @@ jobs:
             "test_target": "playwright-ts-test",
             "down_target": "playwright-ts-down",
             "compose_args": "-f tests/playwright/compose.yml -f tests/playwright/compose.ts.yml",
-            "prepull": "docker pull misskey/misskey:2026.10.1",
+            "prepull": "docker pull misskey/misskey:2026.11.0",
             "timeout_minutes": 45,
             "continue_on_error": true
           }'
@@ -151,6 +153,22 @@ jobs:
           # 直積にして渡すのが唯一の方法。
           matrix=$(jq -c -n --argjson bs "$backends" --argjson n "$SHARD_TOTAL" \
             '[$bs[] as $b | range(1; $n + 1) | $b + {shard: ., shard_total: $n}]')
+          # バックアップの取得・検証・復元の spec (specs/backup/) は、デーモンを付けた
+          # 専用のスタックで 1 回だけ流す (#4102)。復元の確定が DB を入れ替えるので、
+          # 上の shard のスタックには置けない。shard の番号の代わりに backup を入れる。
+          # artifact の名前 (アクセスログの mkgo-access-playwright-backup など) が
+          # shard と重ならないようにするため。Elythia の backend でだけ流す。時間の枠を
+          # 広げるのは、デーモンの image (Dockerfile の target backup) も作るため
+          backup=$(jq -c -n --argjson a "$mkgo" '$a + {
+            up_target: "playwright-backup-up",
+            test_target: "playwright-backup-test",
+            down_target: "playwright-backup-down",
+            compose_args: "-f tests/playwright/backup-stack/compose.yml",
+            shard: "backup",
+            shard_total: 1,
+            timeout_minutes: 35
+          }')
+          matrix=$(jq -c -n --argjson m "$matrix" --argjson b "$backup" '$m + [$b]')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "$matrix" | jq .
 
@@ -243,7 +261,7 @@ jobs:
 
       - name: Set up pnpm
         if: matrix.backend == 'mk-go' && steps.cache-misskey.outputs.cache-hit != 'true'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           # pnpm のバージョンは frontend/package.json の packageManager から
           # 取る。mk リポジトリ直下には package.json が無い。
@@ -294,10 +312,10 @@ jobs:
 
       - name: Run Playwright
         # spec は 1 スタックあたり直列でしか回せない。共有の root アカウント
-        # を 370 ファイル中 185 がブラウザでサインインした状態で使い (`uiSigninAsRoot` を
+        # を 388 ファイル中 185 がブラウザでサインインした状態で使い (`uiSigninAsRoot` を
         # 呼ぶ 184 と、フォームから入る signin.spec.ts。数え方は
         # `grep -rl 'uiSigninAsRoot' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す)、
-        # さらに 40 がサインインせず root の token で API を叩く (`root.json` を読み、
+        # さらに 45 が root ではサインインせずに root の token で API を叩く (`root.json` を読み、
         # root でサインインしないもの。数え方は
         # `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。このアカウントと instance meta を全 spec が
         # 共有しており、Playwright のファイル並列だと `profile_iscat_toggle`

@@ -93,8 +93,8 @@ func loadConfig(ctx plugin.Context) (config, error) {
 	if raw.GlobalColdFetchesPerHour < 1 || raw.GlobalColdFetchesPerHour > 100000 {
 		return config{}, fmt.Errorf("globalColdFetchesPerHour must be between 1 and 100000")
 	}
-	if raw.VideoPlaybackMode != "officialEmbed" && raw.VideoPlaybackMode != "linkOnly" {
-		return config{}, fmt.Errorf("videoPlaybackMode must be officialEmbed or linkOnly")
+	if raw.VideoPlaybackMode != "officialEmbed" && raw.VideoPlaybackMode != "linkOnly" && raw.VideoPlaybackMode != "nativeProxy" {
+		return config{}, fmt.Errorf("videoPlaybackMode must be officialEmbed, linkOnly, or nativeProxy")
 	}
 	roleBudgets := make(map[string]coldFetchBudget, len(raw.RoleColdFetchLimits))
 	for roleID, limits := range raw.RoleColdFetchLimits {

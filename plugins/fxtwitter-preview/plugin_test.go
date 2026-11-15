@@ -74,6 +74,10 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	if cfg.VideoPlaybackMode != "officialEmbed" {
 		t.Fatalf("video mode = %q", cfg.VideoPlaybackMode)
 	}
+	native, err := loadConfig(plugintest.New(t).WithConfig(map[string]any{"videoPlaybackMode": "nativeProxy"}).Context())
+	if err != nil || native.VideoPlaybackMode != "nativeProxy" {
+		t.Fatalf("nativeProxy video mode = %q, err=%v", native.VideoPlaybackMode, err)
+	}
 	if cfg.StaticImageMaxBytes != 10<<20 || cfg.AnonymousBudget != 60 {
 		t.Fatalf("reserved media/anonymous defaults = %d, %d", cfg.StaticImageMaxBytes, cfg.AnonymousBudget)
 	}

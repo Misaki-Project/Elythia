@@ -210,10 +210,6 @@ type Server struct {
 	// 数える照合のテストは名前解決を数えられない。テストがbeforeSetupで、数えて
 	// 拒否するresolverを入れる(#3369)。本番の組み立ては入れない。
 	outboundLookup func(ctx context.Context, host string) ([]net.IPAddr, error)
-	// paramEnforcedは、本家と同じ400で拒否するendpointの一覧。nilなら
-	// paramEnforcedEndpoints(宣言の全部)。本家の残りのendpoint(reset-db)では数えるだけの
-	// 検証を試せないので、影の検証のテストがbeforeSetupで差し替える(#3888)。
-	paramEnforced []string
 	// reactionCountWriter は世代のリアクションの書き込み先 (#3663)。テストが
 	// 取りこぼしたプロセスの状態を作るために読む。
 	reactionCountWriter *corereaction.SwitchableWriter
@@ -773,9 +769,11 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	e.Binder = &apiBinder{}
 
 	// trustProxyからIPExtractorを構成。詳細は buildIPExtractor のコメント。
-	// **常に設定する。** 未設定のまま残すと Echo の RealIP は XFF の最左を
-	// 無条件に信頼するので、trustProxy の解釈に失敗した / 空だったときに
-	// 誰でも IP を詐称できる状態へ倒れる (以前はそうなっていた)。
+	// **常に設定する。** echo v4.16.3 より前は、未設定だと RealIP が XFF の最左を
+	// 無条件に信頼し、trustProxy の解釈に失敗した / 空だったときに誰でも IP を
+	// 詐称できた (以前はそうなっていた)。v4.16.3 からは接続元だけを見るので、
+	// 未設定だと TCP では全員が前段 proxy のアドレスに、UDS では空文字になり、
+	// rate limit と IP の記録が壊れる。
 	trustedNets, err := config.ParseTrustProxy(cfg.TrustProxy)
 	if err != nil {
 		return nil, fmt.Errorf("server: %w", err)

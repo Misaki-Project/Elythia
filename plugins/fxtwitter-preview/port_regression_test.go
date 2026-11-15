@@ -176,7 +176,7 @@ func TestPortTombstoneReasonSurvivesClientStoreAndRoute(t *testing.T) {
 			}
 			a := &stubAPI{body: `{"id":"note1","text":"https://x.com/a/status/1234567890"}`}
 			routes := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(a).WithConfig(map[string]any{"externalFetchEnabled": true}).Routes(Plugin)
-			got, err := routes.Call(t, "POST /preview", plugintest.Request{UserID: "u1", Body: `{"noteId":"note1","postId":"1234567890"}`})
+			got, err := routes.Call(t, "POST /preview", plugintest.Request{UserID: "u1", Body: `{"noteId":"note1","postId":"1234567890"}`, CheckedRolePolicies: allowPreviewPolicies()})
 			if err != nil {
 				t.Fatal(err)
 			}

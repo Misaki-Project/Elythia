@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/elythia-network/elythia/internal/api/apierr"
+	"github.com/elythia-network/elythia/internal/misc/jsdate"
 	"github.com/elythia-network/elythia/internal/pgactivity"
 )
 
@@ -39,7 +40,7 @@ func assertUnavailable(t *testing.T, rec *httptest.ResponseRecorder, retryAfter 
 // maintenance (design §2.2).
 func TestHandler_Responses(t *testing.T) {
 	started := time.Date(2026, 10, 10, 3, 0, 0, 0, time.UTC)
-	st := &State{Phase: PhaseHeld, Kind: KindRestore, Reason: "<b>DB</b>", StartedAt: started, RequestedBy: "admin"}
+	st := &State{Phase: PhaseHeld, Kind: KindRestore, Reason: "<b>DB</b>", StartedAt: jsdate.NewTime(started), RequestedBy: "admin"}
 	h := NewHandler(HandlerOptions{State: func() *State { return st }, RetryAfter: 2 * time.Minute})
 
 	t.Run("api answers JSON the upstream client can read", func(t *testing.T) {
@@ -76,7 +77,7 @@ func TestHandler_Responses(t *testing.T) {
 	t.Run("status is public and hides the kind and the operator", func(t *testing.T) {
 		rec := serve(h, http.MethodGet, StatusPath, nil)
 		assert.Equal(t, http.StatusOK, rec.Code)
-		assert.JSONEq(t, `{"maintenance":true,"phase":"held","startedAt":"2026-10-10T03:00:00Z","reason":"<b>DB</b>"}`,
+		assert.JSONEq(t, `{"maintenance":true,"phase":"held","startedAt":"2026-10-10T03:00:00.000Z","reason":"<b>DB</b>"}`,
 			rec.Body.String())
 		assert.NotContains(t, rec.Body.String(), "restore")
 		assert.NotContains(t, rec.Body.String(), "admin")

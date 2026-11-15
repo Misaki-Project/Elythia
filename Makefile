@@ -1,4 +1,4 @@
-.PHONY: help check gates version plugin-test frontend-check diff-check playwright-check e2e-down-all \
+.PHONY: help check gates version plugin-test frontend-check diff-check playwright-check e2e-down-all schemathesis-test schemathesis-down upgrade-test upgrade-down \
 	update pull pull-plugins docker-update docker-rebuild docker-restart uds-update uds-deploy uds-backup-refresh \
 	image-up image-down image-down-v image-logs image-build \
 	build run dev clean tidy test fmt lint plugin-doc-check migrate-up migrate-down migrate-down-local migrate-create migrate-create-local \
@@ -16,7 +16,7 @@
 	uds-init uds-layout-check uds-frontend-build uds-build uds-rebuild uds-restart uds-up uds-down uds-down-v uds-logs uds-ps \
 	bench-up bench-run bench-down bench-logs bench-compare bench-compare-down bench-upstream \
 	apicompat apicompat-routes apicompat-render \
-	test-fast fuzz-imagedecode shapecheck shapecheck-gen shapecheck-report errorid-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check \
+	test-fast fuzz fuzz-imagedecode shapecheck shapecheck-gen shapecheck-report errorid-check perm-check wiring-check catalog-check rolelevel-catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check \
 	diff-up diff-test diff-down diff-logs \
 	upstream-e2e upstream-e2e-deps upstream-e2e-up upstream-e2e-down upstream-e2e-migrate upstream-e2e-test
 
@@ -76,11 +76,24 @@ frontend-check: | $(FRONTEND_PLUGINS_GENERATED) ## frontend/ を型チェック�
 	# Elythia が書いたファイルは misskey-js を直接 import しない (#4028)。frontend の
 	# eslint は src/ と public/loader/ しか見ないので、test/ も含めて別の script で検査する
 	cd frontend && node --test scripts/check-elythia-imports.test.mjs && node scripts/check-elythia-imports.mjs
+	# 本家の語に Elythia の語 (frontend/locales-elythia) を重ねる処理 (#4071)
+	cd frontend && node --test scripts/i18n-overlay.test.mjs
 	# ja-JP の語は en-US にもある (#4047)。無い語は英語の UI でも日本語のまま出る。
 	# 例外は scripts/locale-coverage-allowlist.tsv (本家の翻訳待ちの語だけ)
 	cd frontend && node --test scripts/check-locale-coverage.test.mjs && node scripts/check-locale-coverage.mjs
+	# Elythia の語が本家の語を書き換える・消すのは、locales-elythia/overrides.tsv に
+	# あるものだけ (#4071)。本家のファイルが本家と同じかは、本家が要るので upstream-check で見る
+	cd frontend && node --test scripts/check-locale-overrides.test.mjs && node scripts/check-locale-overrides.mjs
+	cd frontend && node --test scripts/check-locale-upstream.test.mjs
+	# 画面の文言を日本語で直書きしない (#4070)。英語の UI でも日本語のまま出る。
+	# 例外は scripts/hardcoded-japanese-allowlist.tsv (本家にもともとある直書きと、訳さないもの)
+	cd frontend && node --test scripts/check-hardcoded-japanese.test.mjs && node scripts/check-hardcoded-japanese.mjs
 	# 足したルートに spec の宣言があるか (#4035)。tests/playwright の node_modules が要る
 	$(MAKE) playwright-route-check
+	# 設定のページが prefer.model で扱う端末の設定のキーに、設定の表の行があるか (#4056)
+	$(MAKE) playwright-settings-check
+	# 管理画面の admin/update-meta のキーとロールのポリシーのキーに、表の行があるか (#4066)
+	$(MAKE) playwright-admin-settings-check
 	# **eslint も回す (#2906)。** CI は別 step で `pnpm eslint` を回しており、
 	# ここに無いと**手元で緑でも CI が落ちる**。#2903 で実際に踏んだ (デッドコードを
 	# 消したときの空行が @stylistic/no-multiple-empty-lines で落ちた)。個別ファイルに
@@ -138,6 +151,9 @@ E2E_COMPOSE_FILES = \
 	docker-compose.image.yml \
 	tests/diff/compose.yml \
 	tests/playwright/compose.yml \
+	tests/playwright/backup-stack/compose.yml \
+	tests/schemathesis/compose.yml \
+	tests/upgrade/compose.yml \
 	tests/dropin/compose.yml \
 	tests/dropin-frontend/compose.yml \
 	tests/federation/compose.misskey.yml \
@@ -149,7 +165,7 @@ E2E_COMPOSE_FILES = \
 # 使われている profile を全部渡す。**`down` は有効な profile の container しか
 # 消さない**ので、付けないと seed / runner 系が残る。存在しない profile 名を
 # 渡してもエラーにはならないので、ファイルごとに出し分けず全部並べる。
-E2E_PROFILES = --profile test --profile bench --profile outbound --profile inbound --profile report --profile tools
+E2E_PROFILES = --profile test --profile bench --profile outbound --profile inbound --profile report --profile tools --profile old
 
 e2e-down-all: ## 検証用スタックを一括撤去 (本番 project mk は対象外)
 	@for f in $(E2E_COMPOSE_FILES); do \
@@ -428,7 +444,7 @@ plugin-doc-check: ## authoring.md の Go スニペットがコンパイルでき
 # 2箇所に書くのは、CI step を `make plugin-vet` に置き換えると「列挙が git ではなく
 # ディレクトリを走査する pluginbuild に依存する」壊れ方を持ち込むため (#2701 の
 # コメントと同じ判断)。**片方だけ直すと CI と手元で結果が変わる**ので、必ず両方触る。
-BUNDLED_PLUGINS_ENABLED_BY_DEFAULT = rolelevel
+BUNDLED_PLUGINS_ENABLED_BY_DEFAULT = rolelevel tracking-parameter-cleaner
 
 plugin-vet: ## 同梱プラグインの既定無効を検査 + go vet (CI の build job の 2 step 相当)
 	@set -e; \
@@ -457,6 +473,23 @@ plugin-vet: ## 同梱プラグインの既定無効を検査 + go vet (CI の bu
 FUZZTIME ?= 2m
 FUZZPARALLEL ?= 2
 FUZZ ?= Fuzz
+
+# 画像デコーダ (internal/misc/imagedecode) は外す。種の組み立てとメモリの見込みが別なので
+# fuzz-imagedecode で回す。対象は git ls-files の *_test.go にある func Fuzz* で、FUZZ の
+# 正規表現に名前が合うものを 1 つずつ回す (#4116)。go test -fuzz は 1 回に 1 つの関数しか
+# 回せない。1 つも合わなければ落とす
+fuzz: ## fuzz を回す (画像デコーダは除く。FUZZTIME= 時間、FUZZ= 対象の正規表現、FUZZPARALLEL= worker 数)
+	@found=0; \
+	for f in $$(git ls-files '*_test.go' | xargs grep -l '^func Fuzz' | grep -v '^internal/misc/imagedecode/'); do \
+		for fz in $$(sed -n 's/^func \(Fuzz[A-Za-z0-9_]*\)(.*/\1/p' "$$f"); do \
+			echo "$$fz" | grep -qE '$(FUZZ)' || continue; \
+			found=$$((found + 1)); \
+			echo "==> ./$$(dirname $$f) $$fz ($(FUZZTIME), parallel $(FUZZPARALLEL))"; \
+			go test "./$$(dirname $$f)" -run '^$$' -fuzz="^$$fz$$" -fuzztime=$(FUZZTIME) -parallel=$(FUZZPARALLEL) || exit 1; \
+		done; \
+	done; \
+	[ $$found -gt 0 ] || { echo "no fuzz target matches FUZZ=$(FUZZ)"; exit 1; }; \
+	echo "fuzzed $$found targets"
 
 fuzz-imagedecode: ## 画像デコーダの fuzz を回す (FUZZTIME= 時間、FUZZ= 対象の正規表現、FUZZPARALLEL= worker 数)
 	# 種は module cache にある各ライブラリの testdata を IMAGEDECODE_FUZZ_SEEDS で
@@ -782,7 +815,7 @@ dropin-frontend-swap-test: ## TS-A → mk-A 切替まで含む frontend e2e
 # 以前は upstream の Dockerfile の `ARG NODE_VERSION` (`26.4.0-trixie` の形で、版と
 # distro の両方を持つ) から取っていた (#2921) が、#3379 で本家の Dockerfile は
 # 取り込まなくなった。版は CI (`node-version-file`) と同じ .node-version を見て、
-# distro は upstream 2026.10.0 の Dockerfile と同じ trixie を置く。本家の版を上げた
+# distro は upstream の Dockerfile と同じ trixie を置く (2026.11.0 で確かめた)。本家の版を上げた
 # ときは、本家の Dockerfile の distro が変わっていないかを確かめる。
 # recipe の中で読む — `$(shell ...)` は使わない (REVISION_LDFLAGS の理由)。
 #
@@ -872,11 +905,12 @@ UDS_CONFIG=deploy/uds/config/default.yml
 # (Dockerfile.bundled の後で 1.4GiB、Dockerfile.mkgo の後で 405MiB)。
 #
 # **専用のビルダーでビルドするのは mkgo だけ。** postgres (deploy/postgres-bigm) など
-# 他のサービスは既定のビルダーのまま。専用のビルダーは dockerd の image store を
-# 見ずに FROM をレジストリから引き直すので、base を digest で固定していない
-# postgres:18-alpine だと最初のビルドで新しい base を取りに行き、image が変わる。
-# 次の `up -d` で本番の PostgreSQL のコンテナが作り直される。既定のビルダーは
-# 手元の base とキャッシュを使うので、従来どおり image は変わらない。
+# 他のサービスは既定のビルダーのまま。専用のビルダーは dockerd の image store と
+# キャッシュを見ない。postgres-bigm の base は digest で固定しているが、最初の
+# ビルドで RUN の層 (apk add と pg_bigm のビルド) を作り直すので、image が変わり
+# うる。変われば、次の `up -d` で本番の PostgreSQL のコンテナが作り直される。
+# 既定のビルダーは手元のキャッシュを使うので、キャッシュを消していなければ、従来
+# どおり image は変わらない。
 #
 # - 初回だけ作る。最初のビルドはキャッシュが空なので時間がかかる
 # - 同じビルダーで別のビルドが走っているときに止めると、そちらも止まる
@@ -1255,12 +1289,16 @@ PLAYWRIGHT_ARGS ?=
 # `--shard` ではなくこちらを使う。`--shard` はファイルの並び順で切るので偏る。
 PLAYWRIGHT_SHARD ?=
 PLAYWRIGHT_SHARD_ENV = $(if $(PLAYWRIGHT_SHARD),-e PLAYWRIGHT_SHARD=$(PLAYWRIGHT_SHARD))
+# PW_SETTINGS_MUTATION=1 で、設定の表の各行を、設定を変えずに効き目だけ確かめる
+# (効き目の確かめが落ちることを期待する変異の確かめ。fixtures/settings_table.ts、#4056)
+PW_SETTINGS_MUTATION ?=
+PLAYWRIGHT_MUTATION_ENV = $(if $(PW_SETTINGS_MUTATION),-e PW_SETTINGS_MUTATION=$(PW_SETTINGS_MUTATION))
 
 playwright-test: ## Playwright spec を実行 (Elythia backend、PLAYWRIGHT_ARGS で引数追加)
 	# `--build` を付けて runner image を rebuild check させる。package.json
 	# 更新時に node_modules が古いままにならないよう、毎回 build context を
 	# 確認する (cache hit なら ms 単位で済むので overhead 無視可)。
-	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test run --rm --build $(PLAYWRIGHT_SHARD_ENV) playwright-runner test $(PLAYWRIGHT_ARGS)
+	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test run --rm --build $(PLAYWRIGHT_SHARD_ENV) $(PLAYWRIGHT_MUTATION_ENV) playwright-runner test $(PLAYWRIGHT_ARGS)
 
 playwright-update-snapshots: ## Playwright の見た目の差分の基準画像を作り直す (PLAYWRIGHT_ARGS で spec を絞る)
 	# toHaveScreenshot の基準画像は runner の container (Linux の chromium) で
@@ -1279,8 +1317,39 @@ playwright-route-check: ## frontend の全ルートが、どこかの Playwright
 	node --test tests/playwright/route-coverage.test.mjs
 	node tests/playwright/route-coverage.mjs
 
+.PHONY: playwright-settings-check
+playwright-settings-check: ## 設定のページが prefer.model で扱う端末の設定のキーが、どれも設定の表 (Playwright) の行で確かめられているか検査 (#4056)
+	# playwright-route-check と同じく、spec の一覧は playwright 自身に解かせる
+	@test -f tests/playwright/node_modules/@playwright/test/cli.js || { echo "tests/playwright の node_modules が無い: cd tests/playwright && npm ci" >&2; exit 1; }
+	node --test tests/playwright/settings-coverage.test.mjs
+	node tests/playwright/settings-coverage.mjs
+
+.PHONY: playwright-admin-settings-check
+playwright-admin-settings-check: ## 管理画面が admin/update-meta で書くキーとロールのポリシーのキーが、どれも管理画面の表 (Playwright) の行で確かめられているか検査 (#4066)
+	# spec の一覧は playwright 自身に解かせ、ポリシーの編集画面の template は frontend の
+	# vue/compiler-sfc に解かせるので、tests/playwright と frontend の node_modules が要る
+	@test -f tests/playwright/node_modules/@playwright/test/cli.js || { echo "tests/playwright の node_modules が無い: cd tests/playwright && npm ci" >&2; exit 1; }
+	node --test tests/playwright/admin-settings-coverage.test.mjs
+	node tests/playwright/admin-settings-coverage.mjs
+
 playwright-down: ## Playwright スタックを撤去
 	docker compose -f $(PLAYWRIGHT_COMPOSE) --profile test down -v
+
+# バックアップの取得・検証・復元の spec (specs/backup/) を流すスタック (#4102)。復元の
+# 確定が DB を入れ替えるので、上のスタックとは別の project (mk-playwright-backup) にする。
+# 流し終えたら playwright-backup-down で捨てる。もう一度流すときも作り直す。
+# 上のスタックと同時に流さない。runner は同じ tests/playwright を mount するので、
+# root の token (.auth/) と test-results/・results.json を互いに上書きする
+PLAYWRIGHT_BACKUP_COMPOSE=tests/playwright/backup-stack/compose.yml
+
+playwright-backup-up: ## バックアップの spec のスタック (デーモン付き) を起動
+	docker compose -f $(PLAYWRIGHT_BACKUP_COMPOSE) up -d --build
+
+playwright-backup-test: ## バックアップの spec (specs/backup/) を実行 (PLAYWRIGHT_ARGS で引数追加)
+	docker compose -f $(PLAYWRIGHT_BACKUP_COMPOSE) --profile test run --rm --build playwright-runner test $(PLAYWRIGHT_ARGS)
+
+playwright-backup-down: ## バックアップの spec のスタックを撤去
+	docker compose -f $(PLAYWRIGHT_BACKUP_COMPOSE) --profile test down -v
 
 playwright-logs: ## Playwright スタックのログを表示
 	docker compose -f $(PLAYWRIGHT_COMPOSE) logs -f
@@ -1306,6 +1375,31 @@ playwright-ts-test: ## Playwright spec を実行 (TS backend、upstream 追従�
 
 playwright-ts-down: ## Playwright TS スタックを撤去
 	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test down -v
+
+##@ e2e: 前のリリースからの更新
+# 前のリリースの image で作った DB に、今のコードで migrate up して起動し、作ったデータが
+# 読めて書き足せるかを確かめる (#4123)。前の版は UPGRADE_FROM で選べる (既定は HEAD から
+# 辿れる最新のリリースのタグ)。DB と Redis は毎回作り直す。結果は tests/upgrade/out/
+upgrade-test: build ## 前のリリースで作った DB を、今のコードが引き継げるかを確かめる (UPGRADE_FROM= で版を選ぶ)
+	tests/upgrade/run.sh
+
+upgrade-down: ## 前のリリースからの更新の検査のスタックを撤去 (volume ごと)
+	docker compose -f tests/upgrade/compose.yml --profile old down -v
+
+##@ e2e: /api.json から入力を作る検査
+# schemathesis で、/api.json の宣言から入力を作って全エンドポイントへ送る (#4118)。
+# Elythia はホストで go build したものを動かし、DB と Redis だけを compose で立てる。
+# 外すエンドポイントは tests/schemathesis/exclude.tsv。結果は tests/schemathesis/out/
+SCHEMATHESIS_COMPOSE=tests/schemathesis/compose.yml
+
+# DB と Redis は毎回作り直す (run.sh)。SCHEMATHESIS_MAX_EXAMPLES は 1 つの口に送る入力の
+# 数 (既定 20)、SCHEMATHESIS_ARGS は schemathesis に素通しする追加引数。まとめは
+# python3 tests/schemathesis/summarize.py
+schemathesis-test: build ## /api.json から入力を作って全エンドポイントへ送る (schemathesis。DB は毎回作り直す)
+	tests/schemathesis/run.sh
+
+schemathesis-down: ## /api.json の検査のスタックを撤去 (volume ごと)
+	docker compose -f $(SCHEMATHESIS_COMPOSE) --profile test down -v
 
 # Differential e2e diff harness (#2089) ― mk-go と Misskey TS を同一版で
 # 並列に立て、同一 endpoint のレスポンスを diff して entitycompat
@@ -1390,7 +1484,10 @@ upstream-fetch: ## UPSTREAM_MISSKEY_VERSION の本家を .cache/misskey/<版> �
 # 本家を読むテストが skip されずに通ることを見る。本家を取得する
 # apicompat.yml が回す (本家を読まない `make gates` には入れない)。
 # paramdef-genはnodeとfrontend/node_modules (TypeScriptとajv)も使う。
-upstream-check: ## golden と本家を読むテストが UPSTREAM_MISSKEY_VERSION の本家と一致するか検査
+upstream-check: ## golden と本家を読むテストと frontend/locales が UPSTREAM_MISSKEY_VERSION の本家と一致するか検査
+	# frontend/locales は本家のまま持つ。Elythia の語は frontend/locales-elythia に置く (#4071)。
+	# 安く済むので先に回す (後ろに置くと、前の段で落ちたときに見えなくなる)
+	node frontend/scripts/check-locale-upstream.mjs $(UPSTREAM_DIR)/locales
 	$(MAKE) shapecheck-gen
 	git diff --exit-code -- internal/entitycompat/testdata
 	$(MAKE) paramdef-gen
@@ -1503,17 +1600,17 @@ upstream-sync-lock: ## frontend/pnpm-lock.yaml を package.json から作り直�
 #  - misskey-js: exports が built/ を指すのでビルドしないと test/e2e が import できない。
 #    frontend まで含む `pnpm build` (5-10 分) は e2e には不要なので呼ばない。
 #  - .config/test.yml: 本家の utils.ts / setup が loadConfig() 経由で読む (port 等)。
-#  - compile-config: loadConfig() は YAML ではなく built/.config.json を読むので、
-#    NODE_ENV=test で .config/test.yml から生成しておく必要がある。
-#  - build-pre: loadConfig() は built/meta.json も readFileSync する (無いと ENOENT)。
+#    NODE_ENV=test なら loadConfig() はこの YAML をそのまま読む。本家 2026.10.x には
+#    YAML を built/.config.json に事前に変換する compile-config があったが、2026.11.0 で
+#    戻された (#4164) ので、生成は要らない。
+#  - build-pre: loadConfig() は built/meta.json を readFileSync する (無いと ENOENT)。
 #    frontend の manifest は existsSync 判定なので無くてよい。
 upstream-e2e-deps: upstream-fetch ## 本家 backend e2e に必要な本家側の依存を用意 (初回のみ)
 	cd $(UPSTREAM_E2E_MISSKEY) && \
 		pnpm install --frozen-lockfile && \
 		pnpm build-pre && \
 		pnpm --filter misskey-js build && \
-		cp .github/misskey/test.yml .config/ && \
-		NODE_ENV=test pnpm --filter backend compile-config
+		cp .github/misskey/test.yml .config/
 
 upstream-e2e-up: ## 本家 backend e2e 用の PostgreSQL / Redis を起動
 	docker compose -f $(UPSTREAM_E2E_COMPOSE) up -d --wait
@@ -1642,7 +1739,7 @@ perm-check: ## router middleware の権限が upstream より緩くないか検�
 
 .PHONY: wiring-check
 wiring-check: ## router で配線が必要なものが外れていないか検査
-	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestPluginNotificationDispatcherIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestAbuseReportNotifierIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestClipsNoteRepoIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestPasswordChecksAreFailureLimited|TestPasswordFailureGuardIsWired|TestRemoteStatsGateUsesFailClosedPredicate|TestStreamRevokeIsWired|TestAvatarDecorationRoleSetsAreWired|TestPushSubscriptionCacheIsShared|TestInstanceStatsGateIsWired|TestQueueProcessorSoftwareCheckersAreWired|TestFederationHostValuesAreWired|TestAccountCreatedAtIsWired|TestReversiAvatarURLIsWired|TestHideAppUserWithoutReadIsWired|TestRevokeTokenAdmitsAppUser|TestServerStatsGateIsWired|TestOutboundTransportIsShared|TestRelationSingleStatementReadersAreWired|TestEveryRouterRelationReposHasRelation|TestServerSourcesListsPackageFilesOnly|TestServerPkgReadersCoverEveryFile|TestRouteParsersReadEveryFile|TestCollectRoutesResolvesHandlerTypes|TestCountCriticalWiringEntriesReadsEveryFile|TestAPIRouteHandlersResolve|TestAPIRouteProblemsFlagsUncheckableHandlers|TestRouteRegistrationsAcrossFiles|TestCountCriticalWiringInRejectsTwoCalls|TestPushSubscriptionCacheProblemsRequireOneFile|TestHideAppUserOrderErrorRequiresOneFile|TestAPICacheControlMountedReadsEveryFile|TestCollectRoutesHandlesBlocksAndShapes|TestAllowlistDiffReportsBothWays|TestCollectRoutesScopeRules' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestPluginNotificationDispatcherIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestNotificationReceiveConfigCheckerIsWired|TestAbuseReportNotifierIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestClipsNoteRepoIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUploaderProfilesAreWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestPasswordChecksAreFailureLimited|TestPasswordFailureGuardIsWired|TestRemoteStatsGateUsesFailClosedPredicate|TestStreamRevokeIsWired|TestAvatarDecorationRoleSetsAreWired|TestPushSubscriptionCacheIsShared|TestInstanceStatsGateIsWired|TestQueueProcessorSoftwareCheckersAreWired|TestFederationHostValuesAreWired|TestAccountCreatedAtIsWired|TestReversiAvatarURLIsWired|TestHideAppUserWithoutReadIsWired|TestRevokeTokenAdmitsAppUser|TestServerStatsGateIsWired|TestOutboundTransportIsShared|TestRelationSingleStatementReadersAreWired|TestEveryRouterRelationReposHasRelation|TestServerSourcesListsPackageFilesOnly|TestServerPkgReadersCoverEveryFile|TestRouteParsersReadEveryFile|TestCollectRoutesResolvesHandlerTypes|TestCountCriticalWiringEntriesReadsEveryFile|TestAPIRouteHandlersResolve|TestAPIRouteProblemsFlagsUncheckableHandlers|TestRouteRegistrationsAcrossFiles|TestCountCriticalWiringInRejectsTwoCalls|TestPushSubscriptionCacheProblemsRequireOneFile|TestHideAppUserOrderErrorRequiresOneFile|TestAPICacheControlMountedReadsEveryFile|TestCollectRoutesHandlesBlocksAndShapes|TestAllowlistDiffReportsBothWays|TestCollectRoutesScopeRules' -count=1 -v
 
 .PHONY: notiftype-check
 notiftype-check: ## 通知タイプの一覧が 1 箇所から導出されているか検査

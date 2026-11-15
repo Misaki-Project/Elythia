@@ -37,10 +37,11 @@ func (s *store) ReadPublic(ctx context.Context, postID string) (*CacheEntry, err
 	var lastSuccessAt *time.Time
 	err := s.db.QueryRowContext(ctx, `
 		SELECT post_id, state, payload, fetched_at, next_fetch_at,
-		       COALESCE(last_error_class, ''), last_success_payload, last_success_at
+		       COALESCE(last_error_class, ''), last_success_payload, last_success_at,
+	       COALESCE(embed_token, '')
 		FROM public_post_cache WHERE post_id = $1
 	`, postID).Scan(&entry.PostID, &entry.State, &payload, &entry.FetchedAt,
-		&entry.NextFetchAt, &entry.ErrorClass, &lastSuccessPayload, &lastSuccessAt)
+		&entry.NextFetchAt, &entry.ErrorClass, &lastSuccessPayload, &lastSuccessAt, &entry.PlaybackToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -51,22 +52,38 @@ func (s *store) ReadPublic(ctx context.Context, postID string) (*CacheEntry, err
 		entry.UnavailableReason = unavailableReason(entry.ErrorClass)
 	}
 	if len(payload) > 0 {
-		var post PublicPost
-		if err := json.Unmarshal(payload, &post); err != nil {
+		post, err := decodeCachedPost(payload)
+		if err != nil {
 			return nil, fmt.Errorf("decode public cache: %w", err)
 		}
-		entry.Post = &post
+		entry.Post = post
 	} else if entry.State == "unavailable" && isTransientFailureClass(entry.ErrorClass) && len(lastSuccessPayload) > 0 {
-		var post PublicPost
-		if err := json.Unmarshal(lastSuccessPayload, &post); err != nil {
+		post, err := decodeCachedPost(lastSuccessPayload)
+		if err != nil {
 			return nil, fmt.Errorf("decode last successful public cache: %w", err)
 		}
 		entry.State = "stale"
 		entry.Stale = true
-		entry.Post = &post
+		entry.Post = post
 		entry.FetchedAt = lastSuccessAt
 	}
 	return &entry, nil
+}
+
+func decodeCachedPost(payload []byte) (*PublicPost, error) {
+	var cached cachedVideoPost
+	if err := json.Unmarshal(payload, &cached); err != nil {
+		return nil, err
+	}
+	post, err := decodePublicPostWithVideoIdentity(payload)
+	if err != nil {
+		return nil, err
+	}
+	post.privateVideoSources = cached.VideoSources
+	if cached.VideoSourcesVersion == 0 && cached.VideoSources.Version != 0 {
+		post.privateVideoSources.Version = cached.VideoSources.Version
+	}
+	return post, nil
 }
 
 func (s *store) AcquireFetch(ctx context.Context, postID, actorID string, now time.Time) (*lease, error) {
@@ -74,6 +91,17 @@ func (s *store) AcquireFetch(ctx context.Context, postID, actorID string, now ti
 }
 
 func (s *store) AcquireFetchForRoles(ctx context.Context, postID, actorID string, roleIDs []string, now time.Time) (*lease, error) {
+	return s.acquireFetchUsingBudget(ctx, postID, actorID, nil, roleIDs, now)
+}
+
+func (s *store) AcquireFetchWithBudget(ctx context.Context, postID, actorID string, limits coldFetchBudget, now time.Time) (*lease, error) {
+	if limits.PerHour < 1 || limits.PerHour > 10000 || limits.PerDay < 1 || limits.PerDay > 100000 {
+		return nil, errors.New("invalid checked cold fetch budget")
+	}
+	return s.acquireFetchUsingBudget(ctx, postID, actorID, &limits, nil, now)
+}
+
+func (s *store) acquireFetchUsingBudget(ctx context.Context, postID, actorID string, checkedLimits *coldFetchBudget, roleIDs []string, now time.Time) (*lease, error) {
 	if !statusIDPattern.MatchString(postID) || actorID == "" {
 		return nil, errors.New("invalid lease request")
 	}
@@ -90,6 +118,9 @@ func (s *store) AcquireFetchForRoles(ctx context.Context, postID, actorID string
 		return nil, err
 	}
 	limits := effectiveBudgetFromSettings(settings, roleIDs)
+	if checkedLimits != nil {
+		limits = *checkedLimits
+	}
 	token, err := randomToken()
 	if err != nil {
 		return nil, err
@@ -121,6 +152,81 @@ func (s *store) AcquireFetchForRoles(ctx context.Context, postID, actorID string
 	utcNow := now.UTC()
 	hourBucket := utcNow.Truncate(time.Hour)
 	dayBucket := time.Date(utcNow.Year(), utcNow.Month(), utcNow.Day(), 0, 0, 0, 0, time.UTC)
+	if ok, err := incrementBudget(ctx, tx, "user-hour:"+actorID, hourBucket, limits.PerHour); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errRateLimited
+	}
+	if ok, err := incrementBudget(ctx, tx, "user-day:"+actorID, dayBucket, limits.PerDay); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errRateLimited
+	}
+	if ok, err := incrementBudget(ctx, tx, "global", hourBucket, settings.GlobalPerHour); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errRateLimited
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &lease{PostID: postID, Token: won}, nil
+}
+
+func (s *store) AcquireNativeMetadataRefreshWithBudget(ctx context.Context, postID, actorID string, limits coldFetchBudget, now time.Time) (*lease, error) {
+	if !statusIDPattern.MatchString(postID) || actorID == "" || limits.PerHour < 1 || limits.PerHour > 10000 || limits.PerDay < 1 || limits.PerDay > 100000 {
+		return nil, errors.New("invalid native metadata refresh request")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := s.ensureRateLimitSettingsTx(ctx, tx); err != nil {
+		return nil, err
+	}
+	settings, _, _, err := readRateLimitSettingsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	token, err := randomToken()
+	if err != nil {
+		return nil, err
+	}
+	var won string
+	err = tx.QueryRowContext(ctx, `
+		UPDATE public_post_cache SET
+			state = 'pending', payload = NULL,
+			last_success_payload = CASE
+				WHEN state = 'ready' AND last_error_class IS NULL AND fetched_at IS NOT NULL AND jsonb_typeof(payload) = 'object'
+				THEN payload || '{"_fxTrustedSuccess":1}'::jsonb
+				WHEN last_success_at IS NOT NULL AND last_error_class IS NULL AND jsonb_typeof(last_success_payload) = 'object' AND last_success_payload->'_fxTrustedSuccess' = '1'::jsonb
+				THEN last_success_payload
+				WHEN last_success_at IS NOT NULL AND last_error_class IN ('network','read','timeout','upstream_429','upstream_5xx') AND jsonb_typeof(last_success_payload) = 'object' AND last_success_payload->'_fxTrustedSuccess' = '1'::jsonb
+				THEN last_success_payload
+				ELSE NULL END,
+			last_success_at = CASE
+				WHEN state = 'ready' AND last_error_class IS NULL AND fetched_at IS NOT NULL AND jsonb_typeof(payload) = 'object' THEN fetched_at
+				WHEN last_success_at IS NOT NULL AND (last_error_class IS NULL OR last_error_class IN ('network','read','timeout','upstream_429','upstream_5xx')) AND jsonb_typeof(last_success_payload) = 'object' AND last_success_payload->'_fxTrustedSuccess' = '1'::jsonb THEN last_success_at
+				ELSE NULL END,
+			next_fetch_at = $2, lease_token = $3, lease_expires_at = $4,
+			embed_token = NULL, embed_expires_at = NULL, updated_at = $5
+		WHERE post_id = $1 AND state = 'ready'
+		  AND (COALESCE(payload->>'hasVideo', 'false') = 'true' OR COALESCE(payload->'quote'->>'hasVideo', 'false') = 'true')
+		  AND (COALESCE(payload->'video'->>'provider' = 'x', false) OR COALESCE(payload->'videos'->0->>'provider' = 'x', false)
+		       OR COALESCE(payload->'quote'->'video'->>'provider' = 'x', false) OR COALESCE(payload->'quote'->'videos'->0->>'provider' = 'x', false))
+		  AND COALESCE(payload->>'_fxVideoSourcesVersion', '') <> '1'
+		  AND (lease_expires_at IS NULL OR lease_expires_at <= $5)
+		RETURNING lease_token
+	`, postID, now.Add(s.cfg.RefetchInterval), token, now.Add(fetchLeaseDuration), now).Scan(&won)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	hourBucket := now.UTC().Truncate(time.Hour)
+	dayBucket := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
 	if ok, err := incrementBudget(ctx, tx, "user-hour:"+actorID, hourBucket, limits.PerHour); err != nil {
 		return nil, err
 	} else if !ok {
@@ -202,33 +308,77 @@ func (s *store) CompleteReady(ctx context.Context, l lease, post PublicPost, now
 	if err != nil {
 		return false, err
 	}
+	nativeMain, nativeQuote := false, false
+	if s.cfg.VideoPlaybackMode == "nativeProxy" {
+		post.privateVideoSources.Version = 1
+		setPlaybackAvailability(post.Videos, post.privateVideoSources.Main)
+		nativeMain = hasVideoSource(post.privateVideoSources.Main)
+		if post.Video != nil {
+			post.Video.PlaybackAvailable = len(post.privateVideoSources.Main) > 0 && post.privateVideoSources.Main[0].URL != ""
+		}
+		if post.Quote != nil {
+			setPlaybackAvailability(post.Quote.Videos, post.privateVideoSources.Quote)
+			nativeQuote = hasVideoSource(post.privateVideoSources.Quote)
+			if post.Quote.Video != nil {
+				post.Quote.Video.PlaybackAvailable = len(post.privateVideoSources.Quote) > 0 && post.privateVideoSources.Quote[0].URL != ""
+			}
+		}
+	} else {
+		setPlaybackAvailability(post.Videos, nil)
+		if post.Video != nil {
+			post.Video.PlaybackAvailable = false
+		}
+		if post.Quote != nil {
+			setPlaybackAvailability(post.Quote.Videos, nil)
+			if post.Quote.Video != nil {
+				post.Quote.Video.PlaybackAvailable = false
+			}
+		}
+	}
+	applyVideoMediaIdentities(&post, post.privateVideoSources.Version, post.privateVideoSources)
 	if post.Video != nil && post.Video.PosterURL != "" {
 		expires := nextFetchAt
 		post.Video.PosterExpiresAt = &expires
+	}
+	for i := range post.Videos {
+		if post.Videos[i].PosterURL != "" {
+			expires := nextFetchAt
+			post.Videos[i].PosterExpiresAt = &expires
+		}
 	}
 	if post.Quote != nil && post.Quote.Video != nil && post.Quote.Video.PosterURL != "" {
 		expires := nextFetchAt
 		post.Quote.Video.PosterExpiresAt = &expires
 	}
+	if post.Quote != nil {
+		for i := range post.Quote.Videos {
+			if post.Quote.Videos[i].PosterURL != "" {
+				expires := nextFetchAt
+				post.Quote.Videos[i].PosterExpiresAt = &expires
+			}
+		}
+	}
 	var embedToken any
 	var embedExpires any
-	if s.cfg.VideoPlaybackMode == "officialEmbed" && (playableVideo(post.Video) || (post.Quote != nil && playableVideo(post.Quote.Video))) {
+	mainEmbed := s.cfg.VideoPlaybackMode == "officialEmbed" && playableVideo(post.Video)
+	quoteEmbed := s.cfg.VideoPlaybackMode == "officialEmbed" && post.Quote != nil && playableVideo(post.Quote.Video)
+	if mainEmbed || quoteEmbed || (s.cfg.VideoPlaybackMode == "nativeProxy" && (nativeMain || nativeQuote)) {
 		token, err := randomToken()
 		if err != nil {
 			return false, err
 		}
 		expires := nextFetchAt
-		if playableVideo(post.Video) {
+		if mainEmbed {
 			post.Video.EmbedToken = token
 			post.Video.EmbedExpiresAt = &expires
 		}
-		if post.Quote != nil && playableVideo(post.Quote.Video) {
+		if quoteEmbed {
 			post.Quote.Video.EmbedToken = token
 			post.Quote.Video.EmbedExpiresAt = &expires
 		}
 		embedToken, embedExpires = token, expires
 	}
-	payload, err := json.Marshal(post)
+	payload, err := marshalCachedPostPayload(post, s.cfg.VideoPlaybackMode == "nativeProxy")
 	if err != nil {
 		return false, err
 	}

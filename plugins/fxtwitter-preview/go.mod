@@ -1,9 +1,10 @@
 module github.com/Misaki-Project/Elythia/plugins/fxtwitter-preview
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/blezek/tga v0.0.0-20150626111426-80720cbc1017
+	github.com/elythia-network/mfm v0.1.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/kovidgoyal/imaging v1.8.21
 	github.com/elythia-network/elythia v0.0.0

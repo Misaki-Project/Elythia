@@ -128,7 +128,7 @@ func TestPortMediaRechecksACLAfterSuccessfulViewerRequest(t *testing.T) {
 	routes := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithAPI(a).WithHTTPClient(client).WithConfig(map[string]any{"externalFetchEnabled": true}).Routes(Plugin)
 	requestCtx, requestDone := context.WithCancel(context.Background())
 	defer requestDone()
-	req := plugintest.Request{Ctx: requestCtx, UserID: "u1", Params: map[string]string{"postId": "1234567890", "kind": "image", "index": "0"}, Query: map[string]string{"noteId": "note1"}}
+	req := plugintest.Request{Ctx: requestCtx, UserID: "u1", Params: map[string]string{"postId": "1234567890", "kind": "image", "index": "0"}, Query: map[string]string{"noteId": "note1"}, CheckedRolePolicies: allowPreviewPolicies()}
 	result, err := routes.Call(t, "GET /media/:postId/:kind/:index", req)
 	if err != nil {
 		t.Fatal(err)

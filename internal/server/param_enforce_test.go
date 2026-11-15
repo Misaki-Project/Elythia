@@ -407,7 +407,7 @@ func enforcedEndpoints(t *testing.T) []string {
 // TestEnforcedEndpointsAreDeclared checks paramEnforcedEndpoints: every
 // endpoint with a paramDef, upstream's or Elythia's own
 // (elythia_paramdefs.json, #3869), compiles and is enforced, but
-// paramCountedOnlyEndpoints, which must name upstream endpoints. Whether every
+// paramUnvalidatedEndpoints, which must name upstream endpoints. Whether every
 // route has a paramDef is TestAPIRoutesHaveParamDefs.
 func TestEnforcedEndpointsAreDeclared(t *testing.T) {
 	up, err := paramschema.Upstream()
@@ -435,19 +435,19 @@ func TestEnforcedEndpointsAreDeclared(t *testing.T) {
 	for _, name := range []string{"notes/create", "charts/notes", "admin/update-meta", "admin/queue/jobs", "admin/backup/list", "i/federation"} {
 		require.Contains(t, enforced, name)
 	}
-	// 数えるだけの一覧には、本家の宣言のある名前だけを、拒否の対象から外して置く。
+	// 検証しない一覧には、本家の宣言のある名前だけを、拒否の対象から外して置く。
 	// 使われなくなった名前を残さない。
-	var counted []string
+	var unvalidated []string
 	for name := range eff {
 		if !slices.Contains(enforced, name) {
-			counted = append(counted, name)
+			unvalidated = append(unvalidated, name)
 		}
 	}
-	slices.Sort(counted)
-	assert.Equal(t, slices.Sorted(slices.Values(paramCountedOnlyEndpoints)), counted, "the endpoints that are only counted")
-	for _, name := range paramCountedOnlyEndpoints {
+	slices.Sort(unvalidated)
+	assert.Equal(t, slices.Sorted(slices.Values(paramUnvalidatedEndpoints)), unvalidated, "the endpoints that are not validated")
+	for _, name := range paramUnvalidatedEndpoints {
 		_, ok := up[name]
-		assert.True(t, ok, "paramCountedOnlyEndpoints has %s, which is not an upstream endpoint", name)
+		assert.True(t, ok, "paramUnvalidatedEndpoints has %s, which is not an upstream endpoint", name)
 	}
 }
 
@@ -717,7 +717,7 @@ func TestEnforcedEndpointsMatchTheCorpus(t *testing.T) {
 		return nil, &net.DNSError{Err: "name resolution refused in the test", Name: host, IsNotFound: true}
 	}
 	redisClient, redisOptions := newRealRedis(t)
-	_, on, _ := newParamShadowServersOn(t, redisClient, redisOptions, []func(*Server){func(s *Server) {
+	on := newParamServerOn(t, redisClient, redisOptions, []func(*Server){func(s *Server) {
 		s.selfCheckRunner = diag
 		s.remoteChecker = diag
 		s.outboundLookup = countingLookup
@@ -1321,12 +1321,27 @@ func TestEnforcedEndpointsMatchTheCorpus(t *testing.T) {
 			assert.NotContains(t, seeded.stops, env.Error.Code, "%s (corpus line %d): body %s", name, tc.line, rec.Body.String())
 			elythiaReached[tc.ep]++
 		}
-		if eps[tc.ep].RequireFile {
+		if effective[tc.ep].RequireFile {
 			// 本家は requireFile の endpoint (drive/files/create) の引数を multipart の
 			// field から読み、JSON の body には ajv より先に本文の無い 400 を返す
 			// (handleMultipartRequest)。Elythia は RequireMultipartFile が同じ 400 を返す。
 			// 検証器は multipart を検証しないので、ajv の判定によらずこの応答になる (#3839)。
 			assert.Equal(t, http.StatusBadRequest, rec.Code, "%s (corpus line %d)", name, tc.line)
+			if effective[tc.ep].Elythia {
+				// Elythia の requireFile の endpoint (分割アップロードの append) は、
+				// RequireMultipartFile を通らず、handler が multipart の欄を読む。object の
+				// JSON の body は handler まで届き、欄が無いので位置の無い INVALID_PARAM に
+				// なる。object でない body は、その手前の requireObjectBody が #/type で
+				// 断る (#4090)。
+				assert.Equal(t, "INVALID_PARAM", env.Error.Code, "%s (corpus line %d): body %s", name, tc.line, rec.Body.String())
+				// object かどうかは先頭の文字で見る。decode すると 1e400 のような値で失敗する
+				if bytes.HasPrefix(bytes.TrimSpace(tc.in), []byte("{")) {
+					assert.Empty(t, env.Error.Info.Param, name)
+				} else {
+					assert.Equal(t, "#/type", env.Error.Info.Param, name)
+				}
+				continue
+			}
 			assert.Empty(t, rec.Body.String(), name)
 			continue
 		}
@@ -1561,7 +1576,7 @@ func TestEnforcedGETMatchesUpstream(t *testing.T) {
 	if serverIntegrationDB == nil {
 		t.Skip("PostgreSQL unavailable")
 	}
-	_, on, _ := newParamShadowServers(t)
+	on := newParamServer(t)
 
 	const castID = "0b5f1631-7c1a-41a6-b399-cce335f34d85"
 	const ajvID = "3d81ceae-475f-4600-b2a8-2bc116157532"

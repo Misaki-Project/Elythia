@@ -138,6 +138,8 @@ dumpから戻す方法は、DBの大きさに比例して止まる時間が延�
 
 **[pg_bigm](#pg_bigm-日本語の部分一致検索を高速化)などの拡張を入れたDBは、戻す先のサーバーにも同じ拡張が要る。** dumpは`CREATE EXTENSION`を含むので、拡張の無いサーバー(素の`postgres:18-alpine`)へは戻らない。戻す前に止まる。バックアップ用のimageにpg_bigmが入っているのは`backup verify`のためで、戻す先はDBのサーバー(UDS構成なら`deploy/postgres-bigm`のimage)になる。拡張を作るにはsuperuserが要ることがある。
 
+**戻す先のサーバーは、バックアップを取ったときのDBのサーバーと同じか、新しい版にする。** マイナー版が上がっただけでも、新しいサーバーのdumpは古いサーバーに戻せないことがある(18.7のサーバーは列に`pg_attver`を付け、18.6はそれを戻せない。#4152)。戻せる版のずれのほうが多いので、戻す前には比べない。`pg_restore`が落ちたときに、メタ情報の`postgresVersionNum`が戻す先のサーバーより新しければ、取ったときの版と戻す先のサーバーの版、戻す先のサーバーを取ったときの版以上に上げる手立てを、誤りの先頭に出す(#4155)。`pg_restore`は1つのトランザクションで動くので、ほかの失敗と同じく何も残らない。止まったら、戻す先のサーバーの版を上げてから流し直す。
+
 dumpは、戻す前に一時ファイルへ落とす(暗号化した世代は復号したもの。持ち主だけが読める0600で作る)。`backup`サービスではコンテナの`/tmp`に置くので、dumpの大きさの空きが要る。別の場所に置くときは`-tmp-dir <ディレクトリ>`を渡す。一時ファイルは終わったときと中断(`SIGINT` / `SIGTERM`)のときに消すが、`SIGKILL`やOOMで落ちたときは残る。**バイナリを直接実行すると、ホストの`/tmp`に平文のdumpが残りうる。** 利用者のtokenや秘密鍵が入るので、暗号化したディスクの上のディレクトリを`-tmp-dir`で渡すか、落ちたときに`elythia-restore-*.pgc`を消す。
 
 **戻すのはDBだけで、ドライブのファイル(ローカルの`drive-files`とオブジェクトストレージ)は戻らない。** [DBのバックアップ](backup.md)はファイルを含まないため。バックアップより後に消したファイルは、戻したDBに行があるのに中身が無く、画像が切れる。バックアップより後に上げたファイルは、DBに行が無いまま保存先に残り、どこからも指されない。ファイルも同じ時点へ揃えたいときは、保存先の側(オブジェクトストレージのversioningやスナップショットなど)で戻す。
@@ -206,7 +208,7 @@ docker compose start backup-daemon
 
 UDS構成は、`app`を`mkgo`に読み替え(`backup-daemon`はそのまま)、`docker compose`に`-f compose.uds.yaml`を付ける(`docker compose -f compose.uds.yaml run --rm --no-deps backup restore ...`)。`compose.uds.yaml.example`の`backup`サービスは、DBのソケット(`pg_sock`)と、Redisの後始末のためにvalkeyのソケット(`valkey_sock`)をmountしている。`compose.uds.yaml`に複製しているなら、`valkey_sock`の行も足す。`mkgo`は起動のたびに`elythia migrate`を流す(`deploy/uds/mkgo-entrypoint.sh`)が、戻すときに当て終えているので、何も起きない。
 
-バイナリ直接実行では、サーバーと、常駐させているなら`elythia backup daemon`を止めてから(daemonは確かめ終わってから再開する)、`pg_restore`があるホストで、本体と同じ設定ファイルを渡して流す。`pg_restore`の版は、バックアップを取った`pg_dump`以上で、DBのサーバー以下にする(バックアップを取った`pg_dump`も戻す先のサーバーも18なら、18の`pg_restore`)。`pg_restore`の場所は`backup.tools.pgRestore`で変えられる。
+バイナリ直接実行では、サーバーと、常駐させているなら`elythia backup daemon`を止めてから(daemonは確かめ終わってから再開する)、`pg_restore`があるホストで、本体と同じ設定ファイルを渡して流す。`pg_restore`の版は、バックアップを取った`pg_dump`以上で、DBのサーバー以下にする(バックアップを取った`pg_dump`も戻す先のサーバーも18なら、18の`pg_restore`)。戻す先のサーバーは、バックアップを取ったときのDBのサーバーと同じか新しい版にする(マイナー版も含む。[戻すときに行うこと](#戻すときに行うこと)の後の説明)。`pg_restore`の場所は`backup.tools.pgRestore`で変えられる。
 
 ```bash
 sudo systemctl stop elythia
@@ -416,7 +418,7 @@ make image-build       # ghcr.io/elythia-network/elythia:bundled をローカル
 `bundled` / `latest` は develop の最新を指す **可変タグ**。本番ではバージョンを固定する。**古い版に固定するときは、その版の compose を使う** (compose は同じ版の image の呼び方に合わせてある。2.0.0 で実行バイナリを `elythia` にまとめた、#3394)。
 
 ```bash
-MK_IMAGE=ghcr.io/elythia-network/elythia:2.1.0-bundled docker compose up -d
+MK_IMAGE=ghcr.io/elythia-network/elythia:2.2.0-bundled docker compose up -d
 ```
 
 **2.0.0 より前の版は、以前の置き場所 `ghcr.io/shiroha-a/mk` にある** ([タグの一覧](https://github.com/users/shiroha-a/packages/container/package/mk)。リポジトリを `Elythia-Network/elythia` へ移した 2.0.0 から、イメージの置き場所も変わった。#3394)。
@@ -451,7 +453,7 @@ gh workflow run docker.yml -f tag=1.1.0
 TS版Misskeyのイメージからアセットをコピーすることも可能:
 
 ```dockerfile
-FROM misskey/misskey:2026.10.1 AS misskey-assets
+FROM misskey/misskey:2026.11.0 AS misskey-assets
 FROM ghcr.io/elythia-network/elythia:latest
 COPY --from=misskey-assets /misskey/built /frontend
 COPY --from=misskey-assets /misskey/packages/frontend/assets /client-assets
@@ -702,14 +704,14 @@ worker 数は既定値がキューごとに違い、`stuck 検出` は**キュ�
 
 ```
   ok    config.url   https://example.com
-  ok    database     接続 ok / migration version 141
+  ok    database     接続 ok / migration version 143
   ok    database-health dead tuple と VACUUM に問題なし (122 テーブル)
   ok    pg-stat-statements 使っていない (shared_preload_libraries に無い)
   ok    root user    meta.rootUserId 設定済み
   ok    redis        接続 ok
   FAIL  webfinger    status 403 (連合が無効)
         インスタンス設定の `federation` が `none` になっている。連合するなら管理画面で有効にする
-  ok    nodeinfo     elythia 2.1.0
+  ok    nodeinfo     elythia 2.2.0
   warn  actor        assertionMethod (Ed25519) が無い
         RSA だけでも連合できる。Ed25519 を公開すると対応実装との署名検証が軽くなる
   ok    tls          証明書の残り 68 日
@@ -1427,7 +1429,7 @@ SELECT version, dirty FROM schema_migrations;
 
 ### 大きな表に index を足す migration
 
-`note` などの大きな表への index は、`CREATE INDEX CONCURRENTLY` で 1 ファイルに 1 本ずつ作る (例: `000054`、`000091`)。`000123`〜`000131` (#3590) も、`000126` を除いてこの形にしている。`000132` (#3612、`note_reaction` の `IDX_note_reaction_userId_id`) と `000140` (#3369、`note` のチャンネルの部分 index `IDX_note_channelId_userId_id`)、`000141` (#4021、`following` の配信の部分 index `IDX_following_followeeId_id_home`) も同じ形。`000126` (`user` の `avatarId` / `bannerId`) は、TS 版から移った DB では作らないための条件を `DO` ブロックで書いており、`DO` の中では `CONCURRENTLY` が使えないので、普通の `CREATE INDEX` で作る。
+`note` などの大きな表への index は、`CREATE INDEX CONCURRENTLY` で 1 ファイルに 1 本ずつ作る (例: `000054`、`000091`)。`000123`〜`000131` (#3590) も、`000126` を除いてこの形にしている。`000132` (#3612、`note_reaction` の `IDX_note_reaction_userId_id`) と `000140` (#3369、`note` のチャンネルの部分 index `IDX_note_channelId_userId_id`)、`000141` (#4021、`following` の配信の部分 index `IDX_following_followeeId_id_home`)、`000142` (#4164、`drive_file` の本家と同じ index `IDX_55720b33a61a7c806a8215b825`。TS 版から移った DB には元からある) も同じ形。`000126` (`user` の `avatarId` / `bannerId`) は、TS 版から移った DB では作らないための条件を `DO` ブロックで書いており、`DO` の中では `CONCURRENTLY` が使えないので、普通の `CREATE INDEX` で作る。
 
 `CONCURRENTLY` は書き込みを止めないが、次の点に注意する。
 
@@ -1451,7 +1453,7 @@ SELECT version, dirty FROM schema_migrations;
 - **途中で失敗すると、使えない (INVALID の) index が名前ごと残る。** 次に流すと `IF NOT EXISTS` が名前で何もしないので、**使えない index が残ったまま migration が成功扱いになる**。流し直す前に、INVALID の index が無いかを見る
 
   ```sql
-  -- 000123〜000132 (#3590 / #3612)、000140 (#3369)、000141 (#4021) の index に絞る。別の migration なら、その migration が作る名前に置き換える
+  -- 000123〜000132 (#3590 / #3612)、000140 (#3369)、000141 (#4021)、000142 (#4164) の index に絞る。別の migration なら、その migration が作る名前に置き換える
   SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
     JOIN pg_namespace n ON n.oid = i.relnamespace
    WHERE n.nspname = current_schema() AND NOT x.indisvalid
@@ -1460,7 +1462,7 @@ SELECT version, dirty FROM schema_migrations;
                        'IDX_antenna_note_unread_noteId', 'IDX_channel_note_unread_noteId',
                        'IDX_promo_read_noteId', 'IDX_following_followeeId_notify_normal',
                        'IDX_note_reaction_userId_id', 'IDX_note_channelId_userId_id',
-                       'IDX_following_followeeId_id_home');
+                       'IDX_following_followeeId_id_home', 'IDX_55720b33a61a7c806a8215b825');
   ```
 
   名前で絞るのは、別の作業の index を消さないため。例えば `REINDEX CONCURRENTLY` の途中には `<名前>_ccnew` という INVALID の index ができ、その `REINDEX` が失敗するとそのまま残る。失敗して残ったものは作っている最中ではないので、下の `pg_stat_progress_create_index` の確認をすり抜ける。migration の index と取り違えて消すと、その作業の後始末の手がかりを失う

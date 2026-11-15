@@ -169,6 +169,13 @@ type CreateInput struct {
 	// NoteSource, when set, supplies the note referenced by NoteID to the
 	// packers instead of each of them reading it again (#3611). Not persisted.
 	NoteSource *NoteSource
+	// receiveConfigChecked は、Hook が受け取りの設定 (notificationRecieveConfig) を
+	// 判定済みであることの印 (#4058)。非公開なので、Service を直接呼ぶ経路 (実績・
+	// 投票の終了・アプリ・予約投稿) は立てられず、Service で必ず判定を通る
+	receiveConfigChecked bool
+	// muteChecked は、Hook が受け手のミュートを判定済みであることの印 (#4065)。
+	// receiveConfigChecked と同じく、Service を直接呼ぶ経路は立てられない
+	muteChecked bool
 }
 
 // StreamingPublisher receives a freshly created notification so that
@@ -225,6 +232,8 @@ type Service struct {
 	noteUnreadRepo      repository.NoteUnreadRepository
 	unreadPublishDelay  time.Duration
 	policyResolver      PolicyResolver
+	receiveConfig       ReceiveConfigChecker
+	muteChecker         MuteChecker
 	// background は unreadNotification と Web Push を遅らせて送る timer を持つ
 	// 箱 (#3661)。nil なら time.AfterFunc で待つ (テスト)。
 	background *bgwork.Group
@@ -323,6 +332,60 @@ func (s *Service) SetPolicyResolver(r PolicyResolver) {
 	s.policyResolver = r
 }
 
+// ReceiveConfigChecker reports whether a user's notificationRecieveConfig
+// permits a notification (#4058). Hook implements it.
+type ReceiveConfigChecker interface {
+	PassesReceiveConfig(notifieeID string, in CreateInput) bool
+}
+
+// SetReceiveConfigChecker wires the per-user receive config gate (#4058), so
+// that the notifications created by calling Service directly (achievements,
+// poll ends, app notifications, scheduled notes) obey it too, as upstream
+// NotificationService.createNotification does for every type. The Hook path
+// checks it earlier and marks the input, so it is not checked twice.
+func (s *Service) SetReceiveConfigChecker(c ReceiveConfigChecker) {
+	s.receiveConfig = c
+}
+
+// passesReceiveConfig applies the receive config gate unless the input says
+// it has already been checked (by Hook). 未配線なら許可側に倒す (Hook と同じ fail-soft)。
+func (s *Service) passesReceiveConfig(in CreateInput) bool {
+	if in.receiveConfigChecked || s.receiveConfig == nil {
+		return true
+	}
+	return s.receiveConfig.PassesReceiveConfig(in.NotifieeID, in)
+}
+
+// SetMuteChecker wires the mute gate (#4065), so that the notifications created
+// by calling Service directly with a notifier (emoji application received)
+// are not delivered from a user the notifiee muted, as upstream
+// NotificationService.createNotification checks for every type. The Hook path
+// checks it earlier and marks the input, so it is not checked twice.
+func (s *Service) SetMuteChecker(c MuteChecker) {
+	s.muteChecker = c
+}
+
+// mutesApply reports whether muting the notifier suppresses a notification of
+// typ.
+//
+// **通報は抑制しない (#4065)。** 受け手はモデレーターで、通報者をミュートしていても、
+// その人からの嫌がらせの訴えなどを見落とさないため。通報は管理画面の一覧にも残るが、
+// 通知はモデレーターが気付くための入口なので、こちらは止めない。
+func mutesApply(typ Type) bool {
+	return typ != TypeAbuseReport
+}
+
+// passesMute applies the mute gate unless the input says it has already been
+// checked (by Hook). 送り主の居ない通知と未配線は許可側に倒す。判定の失敗も、Hook と同じく
+// 許可側に倒す (通知の取りこぼしのほうが害が大きい)。
+func (s *Service) passesMute(in CreateInput) bool {
+	if in.muteChecked || s.muteChecker == nil || in.NotifierID == "" || !mutesApply(in.Type) {
+		return true
+	}
+	muted, err := s.muteChecker.IsMuted(in.NotifieeID, in.NotifierID)
+	return err != nil || !muted
+}
+
 // passesRolePolicy reports whether the notifiee's roles permit receiving a
 // notification of the given type.
 //
@@ -411,6 +474,17 @@ func (s *Service) CreateCoalesced(ctx context.Context, in CreateInput, opt Coale
 	if !s.passesRolePolicy(in.NotifieeID, in.Type) {
 		return nil, nil
 	}
+	// 個人ごとの受け取りの設定も、ロックを取る前に判定する (#4058)。下の createWithPush で
+	// 二重に判定しないよう印を立てる
+	if !s.passesReceiveConfig(in) {
+		return nil, nil
+	}
+	in.receiveConfigChecked = true
+	// 受け手のミュートも同じくロックの前に判定する (#4065)
+	if !s.passesMute(in) {
+		return nil, nil
+	}
+	in.muteChecked = true
 
 	suffix := string(in.Type) + ":" + in.NotifieeID
 	lockKey := s.keyPrefix + "notificationCoalesceLock:" + suffix
@@ -508,7 +582,9 @@ func (s *Service) entriesOfType(ctx context.Context, userID string, typ Type) ([
 // Create persists a notification and publishes the stream events for it.
 //
 // **抑制されると (nil, nil) を返す。** ロール policy の opt-out
-// (SetPolicyResolver) に当たった場合で、エラーではない。戻り値の
+// (SetPolicyResolver) か、受け取る人の受信の設定 (SetReceiveConfigChecker、
+// #4058)、受け取る人による送り主のミュート (SetMuteChecker、#4065) に当たった
+// 場合で、エラーではない。戻り値の
 // Notification を使う呼び出し元は nil を確認すること。
 func (s *Service) Create(ctx context.Context, in CreateInput) (*Notification, error) {
 	return s.createWithPush(ctx, in, nil)
@@ -532,11 +608,19 @@ func (s *Service) createWithPush(ctx context.Context, in CreateInput, pushFn fun
 		return nil, ErrSelfNotification
 	}
 	// ロール単位の opt-out (#2898)。**Hook ではなく Service に置く** —
-	// 固有の通知は API から直接 Create を呼ぶ経路があり、Hook 側の
-	// passesReceiveConfig (個人ごと) だけではそこを通らない。
+	// 固有の通知は API から直接 Create を呼ぶ経路があり、Hook だけに置くと
+	// そこを通らない。個人ごとの受信の設定も、同じ理由でこの後に見る (#4058)。
 	//
 	// 抑制は (nil, nil)。エラーではないので呼び出し元のログに出さない。
 	if !s.passesRolePolicy(in.NotifieeID, in.Type) {
+		return nil, nil
+	}
+	// 個人ごとの受け取りの設定 (#4058)。Hook を通る経路は判定済み
+	if !s.passesReceiveConfig(in) {
+		return nil, nil
+	}
+	// 受け手のミュート (#4065)。Hook を通る経路は判定済み
+	if !s.passesMute(in) {
 		return nil, nil
 	}
 

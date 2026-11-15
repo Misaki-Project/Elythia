@@ -25,6 +25,9 @@ var defaults = map[string]any{
 	"inviteLimitCycle":              10080,
 	"inviteExpirationTime":          0,
 	"canManageCustomEmojis":         false,
+	"canUseFxTwitterPreview":        true,
+	"fxTwitterColdFetchesPerHour":   100,
+	"fxTwitterColdFetchesPerDay":    600,
 	// 絵文字の登録申請 (#2934)。**default true** — 登録は必ずモデレーターの
 	// 承認を通るので、申請そのものを既定で塞ぐ必要が無い。canCreateChannel と
 	// 同じく、絞りたい運営者が role で false にする。
@@ -282,6 +285,30 @@ func valueValid(key string, native, value any) bool {
 				return v >= 0 && v <= 100
 			case float64:
 				return v >= 0 && v <= 100 && math.Trunc(v) == v
+			default:
+				return false
+			}
+		}
+		if key == "fxTwitterColdFetchesPerHour" {
+			switch v := value.(type) {
+			case int:
+				return v >= 1 && v <= 10000
+			case int64:
+				return v >= 1 && v <= 10000
+			case float64:
+				return v >= 1 && v <= 10000 && math.Trunc(v) == v
+			default:
+				return false
+			}
+		}
+		if key == "fxTwitterColdFetchesPerDay" {
+			switch v := value.(type) {
+			case int:
+				return v >= 1 && v <= 100000
+			case int64:
+				return v >= 1 && v <= 100000
+			case float64:
+				return v >= 1 && v <= 100000 && math.Trunc(v) == v
 			default:
 				return false
 			}

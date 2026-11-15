@@ -34,6 +34,29 @@ func TestCatalogKeysAreSortedAndUnique(t *testing.T) {
 	}
 }
 
+func TestFxTwitterQuotaConstantsRequireBoundedIntegers(t *testing.T) {
+	for _, tt := range []struct {
+		key string
+		max int
+	}{
+		{"fxTwitterColdFetchesPerHour", 10000},
+		{"fxTwitterColdFetchesPerDay", 100000},
+	} {
+		t.Run(tt.key, func(t *testing.T) {
+			for _, value := range []any{1, tt.max, float64(tt.max)} {
+				if _, err := defaultCatalog.NormalizeConst(tt.key, value); err != nil {
+					t.Fatalf("valid quota %v rejected: %v", value, err)
+				}
+			}
+			for _, value := range []any{0, tt.max + 1, "1", 1.5} {
+				if _, err := defaultCatalog.NormalizeConst(tt.key, value); err == nil {
+					t.Fatalf("invalid quota %v accepted", value)
+				}
+			}
+		})
+	}
+}
+
 // multiplier は **numeric な key だけ**に許される。boolean や enum に「1段ごとに
 // 1.5倍」は意味が無いし、host 側の集約も乗算を受けない。
 func TestCatalogNumericKeys(t *testing.T) {

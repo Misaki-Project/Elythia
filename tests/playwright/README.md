@@ -33,7 +33,7 @@ specs/
 ├── upstream/       # upstream Misskey にも存在する機能の検証
 │   ├── ui/         # ブラウザを駆動する (243 spec)
 │   └── api/        # API の shape / 挙動 (96 spec)
-└── elythia/        # Elythia 独自機能の検証と、helper のガード、見た目の差分 (31 件)
+└── elythia/        # Elythia 独自機能の検証と、helper のガード、見た目の差分、設定の表 (49 件)
 ```
 
 ### ui と api の境界
@@ -142,32 +142,33 @@ tests/playwright/
 ├── specs/
 │   ├── upstream/ui/            # ブラウザを駆動する (243 spec)
 │   ├── upstream/api/           # API の shape / 挙動 (96 spec)
-│   └── elythia/                # Elythia 独自と helper のガード、見た目の差分 (ui/visual/) (31 件)
-└── fixtures/                   # 25 ファイル
+│   └── elythia/                # Elythia 独自と helper のガード、見た目の差分 (ui/visual/)、設定の表 (ui/settings/) (49 件)
+└── fixtures/                   # 26 ファイル
     ├── api.ts                  # POST /api/<endpoint> ラッパ
     ├── auth.ts                 # signup / signin helper
     ├── ui_auth.ts              # ブラウザのサインイン (root は保存した state を読み込む)
     ├── ui_route.ts             # gotoRoute / expectRoutedPage (not-found を落とす)
     ├── quota.ts                # role policy 上限の後始末
     ├── visual.ts               # 見た目の差分の種まきと撮り方 (docs/playwright.md の「見た目の差分」)
+    ├── settings_table.ts       # 設定の表の 1 行を回す (docs/playwright.md の「設定の表」)
     └── ...                     # abuse_report / backend / chat / files / notes / notifications / rate_limit / streaming / timeline / ui_click / ui_folder / ui_input
 ```
 
 ## 並列度
 
-**1 スタックに対しては直列で回すしかない** (`workers: 1`)。370 spec のうち 185 が
-共有の root (alice) で**ブラウザでサインインした状態**を使い (helper 経由が 184 で、
+**1 スタックに対しては直列で回すしかない** (`workers: 1`)。397 spec のうち 194 が
+共有の root (alice) で**ブラウザでサインインした状態**を使い (helper 経由が 193 で、
 `upstream/ui/signin.spec.ts` だけ signin フォームを直接駆動する。数え方は
-`grep -rl 'uiSigninAsRoot' specs --include='*.spec.ts' | wc -l` に 1 を足す)、
-さらに 40 がサインインせず root の token で API を叩く (`root.json` を読み、root で
+`grep -rlE 'uiSigninAsRoot|signinAdmin|runMetaRow|runPolicyRow' specs --include='*.spec.ts' | wc -l` に 1 を足す)、
+さらに 45 が root ではサインインせずに root の token で API を叩く (`root.json` を読み、root で
 サインインしないもの。数え方は
-`grep -rl 'root.json' specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。instance meta は全 spec が共有する。Playwright は
+`grep -rl 'root.json' specs --include='*.spec.ts' | xargs grep -LE 'uiSigninAsRoot|signinAdmin|runMetaRow|runPolicyRow' | grep -v '/signin.spec.ts$' | wc -l`)。instance meta は全 spec が共有する。Playwright は
 ファイル単位で並列化するので、`workers` を上げると `profile_iscat_toggle` と
 `profile_isbot_toggle` が同じアカウントを、`admin_branding_save` と
 `about_page_render` が同じ meta を取り合う。root の quota
 (antenna 5 / webhook 3 / clip 10) を消費する spec も 18 ある。
 
-**並列度はスタックごと分けることでしか稼げない。** CI は `PLAYWRIGHT_SHARD=i/7` で 7 job に
+**並列度はスタックごと分けることでしか稼げない。** CI は `PLAYWRIGHT_SHARD=i/11` で 11 job に
 分けて、それぞれ独立した stack を立てる (#2609)。割り振りは所要時間で均す
 (`shard-plan.mjs` と `shard-durations.json`、#4026。[docs/playwright.md](../../docs/playwright.md#shard-の割り振り))。
 

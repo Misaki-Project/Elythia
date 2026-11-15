@@ -17,7 +17,7 @@
 # ので、tag だけだと「どの builder で作ったか」を再現できない。digest があると
 # BuildKit は digest で pull する。tag は読む人向けと CI の版照合用に残す。
 # 更新は dependabot (`.github/dependabot.yml` の `docker`) が digest ごと上げる。
-FROM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
+FROM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
 
 # Step 2 (#618) で chai2010/webp → gen2brain/webp (libwebp on wazero/WASM) に
 # 切替えたので cgo 依存はゼロ。build-base (gcc + musl libc) は不要になった。
@@ -84,13 +84,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #
 # DB のバックアップを取る image。`docker build --target backup` で作る。本体の image
 # (下の runtime) は distroless で pg_dump を持たないので、postgres の公式 image に
-# elythia を足す。**pg_dump の版を DB のサーバーと揃えるため**で、DB と同じ
-# postgres:18-alpine を使う (古い pg_dump は新しいサーバーから取れない)。
+# elythia を足す。**pg_dump のメジャーバージョンを DB のサーバーと揃えるため**で、DB と
+# 同じタグ (postgres:18-alpine) を digest で固定して使う (古い pg_dump は新しいサーバー
+# から取れない)。
 #
 # builder とは別の stage でビルドする。builder は frontend/ の node_modules が無いと
 # 落ちるが、バックアップの image に frontend は要らない。命令は builder と同じ並びに
 # してあるので、BuildKit は go mod download までの layer を共有する。
-FROM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS backup-builder
+FROM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS backup-builder
 RUN apk add --no-cache git
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -107,8 +108,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w $REVISION_LDFLAGS" -o /out/bin/elythia ./cmd/elythia
 
 # digest で固定する (理由は builder と同じ)。DB のサーバーの版を上げたら、ここも
-# 同じメジャーバージョンへ上げる。
-FROM postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5 AS backup
+# 同じか新しい版へ上げる。マイナー版でも、DB のサーバーより古いと、確かめるときに
+# dump を使い捨ての PostgreSQL へ戻せないことがある (#4152、docs/backup.md)。
+FROM postgres:18-alpine@sha256:1018733457011bf88d81db98cf43aac6d5150afc18787dbe204771fedf80ff95 AS backup
 # pg_bigm を入れておく。UDS の構成の DB (deploy/postgres-bigm) は pg_bigm 入りで、
 # CREATE EXTENSION した DB の dump を戻すには、戻す側にも拡張が要る。verify (#3459) は
 # この image の中で使い捨ての PostgreSQL に戻すので、無いと CREATE EXTENSION pg_bigm で
@@ -145,7 +147,7 @@ CMD ["list", "-config", ".config/default.yml"]
 #
 # tag を省くと `latest` になり、いつ build したかで中身が変わる。builder と
 # 同じく digest で固定する (distroless の更新は dependabot が digest ごと上げる)。
-FROM gcr.io/distroless/static-debian13:latest@sha256:448810357cc8e67b7208988abdba0f5ec3d3aebee0a5b13eb624979792cffc0f
+FROM gcr.io/distroless/static-debian13:latest@sha256:1a64f46364620465ef9e9a8f5413757dfdf22695e050bbfd7303eeaf17a59383
 
 WORKDIR /app
 

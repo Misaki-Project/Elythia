@@ -183,10 +183,7 @@ type fxStatus struct {
 			Height  int    `json:"height"`
 			AltText string `json:"altText"`
 		} `json:"photos"`
-		Videos []struct {
-			ThumbnailURL string  `json:"thumbnail_url"`
-			Duration     float64 `json:"duration"`
-		} `json:"videos"`
+		Videos []fxVideo `json:"videos"`
 	} `json:"media"`
 	RawText struct {
 		Text   string `json:"text"`
@@ -206,7 +203,8 @@ const (
 	maxFxAuthorNameBytes      = 512
 	maxFxScreenNameBytes      = 64
 	maxFxAltTextBytes         = 4 << 10
-	maxFxMediaItems           = 4
+	maxFxPhotoItems           = 20
+	maxFxVideoItems           = 4
 	maxFxTextFacets           = 64
 	maxFxDimension            = 100_000
 	maxFxVideoDurationSeconds = float64(24 * 60 * 60)
@@ -239,7 +237,8 @@ func parseFxResponse(body []byte, wantedID string) (PublicPost, error) {
 		IsSensitive: status.PossiblySensitive,
 		Images:      []PublicImage{},
 	}
-	fillPublicMedia(&post.CreatedAt, &post.Images, &post.HasVideo, &post.Video, status)
+	post.privateVideoSources.Version = 1
+	fillPublicMedia(&post.CreatedAt, &post.Images, &post.HasVideo, &post.Video, &post.Videos, &post.privateVideoSources.Main, status)
 	if len(status.Quote) > 0 && string(status.Quote) != "null" {
 		var discriminator struct {
 			Type string `json:"type"`
@@ -267,7 +266,7 @@ func parseFxResponse(body []byte, wantedID string) (PublicPost, error) {
 				IsSensitive: quote.PossiblySensitive,
 				Images:      []PublicImage{},
 			}
-			fillPublicMedia(&publicQuote.CreatedAt, &publicQuote.Images, &publicQuote.HasVideo, &publicQuote.Video, quote)
+			fillPublicMedia(&publicQuote.CreatedAt, &publicQuote.Images, &publicQuote.HasVideo, &publicQuote.Video, &publicQuote.Videos, &post.privateVideoSources.Quote, quote)
 			post.Quote = publicQuote
 		}
 	}
@@ -384,7 +383,7 @@ func normalizedFxText(status fxStatus) (string, []PublicTextEntity) {
 	return string(utf16.Decode(output)), entities
 }
 
-func fillPublicMedia(createdAt *string, images *[]PublicImage, hasVideo *bool, publicVideo **PublicVideo, status fxStatus) {
+func fillPublicMedia(createdAt *string, images *[]PublicImage, hasVideo *bool, publicVideo **PublicVideo, publicVideos *[]PublicVideoMetadata, privateSources *[]privateVideoSource, status fxStatus) {
 	for _, photo := range status.Media.Photos {
 		if u := safeHTTPSURL(photo.URL); u != "" {
 			*images = append(*images, PublicImage{URL: u, Width: positive(photo.Width), Height: positive(photo.Height), Alt: photo.AltText})
@@ -392,12 +391,25 @@ func fillPublicMedia(createdAt *string, images *[]PublicImage, hasVideo *bool, p
 	}
 	if len(status.Media.Videos) > 0 {
 		*hasVideo = true
-		video := status.Media.Videos[0]
-		*publicVideo = &PublicVideo{Provider: "x", PosterURL: safeHTTPSURL(video.ThumbnailURL), DurationMS: int64(math.Round(video.Duration * 1000))}
+		*privateSources = selectVideoSources(status.Media.Videos)
+		for _, video := range status.Media.Videos {
+			*publicVideos = append(*publicVideos, PublicVideoMetadata{Provider: "x", PosterURL: safeHTTPSURL(video.ThumbnailURL), DurationMS: int64(math.Round(video.Duration * 1000))})
+		}
+		*publicVideo = legacyVideo((*publicVideos)[0])
 	} else if status.Media.External != nil && status.Media.External.Type == "video" {
 		*hasVideo = true
 		video := &PublicVideo{Provider: "external", PosterURL: safeHTTPSURL(status.Media.External.ThumbnailURL)}
 		*publicVideo = video
+		*publicVideos = append(*publicVideos, PublicVideoMetadata{Provider: video.Provider, ProviderVideoID: video.ProviderVideoID, PosterURL: video.PosterURL})
+	}
+}
+
+func legacyVideo(video PublicVideoMetadata) *PublicVideo {
+	return &PublicVideo{
+		Provider: video.Provider, ProviderVideoID: video.ProviderVideoID,
+		MediaIdentity: video.MediaIdentity, PosterURL: video.PosterURL,
+		PosterExpiresAt: video.PosterExpiresAt, DurationMS: video.DurationMS,
+		PlaybackAvailable: video.PlaybackAvailable,
 	}
 }
 
@@ -411,7 +423,7 @@ func validateFxStatus(status fxStatus) error {
 			return errors.New("Fx text facet exceeds limit")
 		}
 	}
-	if len(status.Media.Photos) > maxFxMediaItems || len(status.Media.Videos) > maxFxMediaItems {
+	if len(status.Media.Photos) > maxFxPhotoItems || len(status.Media.Videos) > maxFxVideoItems {
 		return errors.New("Fx media collection exceeds limit")
 	}
 	if status.Media.External != nil && (len(status.Media.External.Type) > 32 || len(status.Media.External.URL) > 4096 || len(status.Media.External.ThumbnailURL) > 4096) {
@@ -424,9 +436,14 @@ func validateFxStatus(status fxStatus) error {
 		}
 	}
 	for _, video := range status.Media.Videos {
-		if len(video.ThumbnailURL) > 4096 || math.IsNaN(video.Duration) || math.IsInf(video.Duration, 0) ||
+		if len(video.ThumbnailURL) > 4096 || len(video.URL) > 4096 || len(video.Type) > 32 || len(video.Format) > 32 || len(video.Formats) > 8 || math.IsNaN(video.Duration) || math.IsInf(video.Duration, 0) ||
 			video.Duration < 0 || video.Duration > maxFxVideoDurationSeconds {
 			return errors.New("Fx video field exceeds limit")
+		}
+		for _, format := range video.Formats {
+			if len(format.URL) > 4096 || len(format.Container) > 16 || len(format.Codec) > 32 || format.Bitrate < 0 || format.Bitrate > 100_000_000 {
+				return errors.New("Fx video format exceeds limit")
+			}
 		}
 	}
 	return nil

@@ -20,6 +20,7 @@ jobs:
         genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 9a50079ec9d198ab44e4b9ff24d0a408109c09da
         fedwatch https://github.com/Elythia-Network/elythia-plugin-fedwatch.git af105a020656aaba121998a0bd5a51bee232dec8
         hsr https://github.com/Misaki-Project/elythia-plugin-hsr.git 820068d720654650d5dc05d4136ad9f32f677fef
+      include_fxtwitter: true
       image: ghcr.io/misaki-project/mk-genshin
       # 再実行でも既存tagを上書きしない。
       tags: elythia-2-0-games-20261008-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

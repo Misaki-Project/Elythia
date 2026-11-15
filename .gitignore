@@ -101,6 +101,11 @@ plugins/*
 # roleLevel も同梱する (#12)。他の2つと異なり、**既定で有効** — Misaki の
 # bundled image で level 機能が設定なしで入るのはこれが意図だからです。
 !plugins/rolelevel/
+# Fx preview is bundled only when explicitly requested; cleaner is enabled by default.
+!plugins/fxtwitter-preview/
+!plugins/fxtwitter-preview/**
+!plugins/tracking-parameter-cleaner/
+!plugins/tracking-parameter-cleaner/**
 go.work
 go.work.sum
 cmd/elythia/plugins_generated.go

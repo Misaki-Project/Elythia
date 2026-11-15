@@ -79,55 +79,30 @@ func (r *countedMediaReader) Close() error {
 }
 
 func TestMediaFetchWaitsBeforeBodyAndHonorsCancellation(t *testing.T) {
-	body := tinyImage(t, "png")
-	release := make(chan struct{})
-	held := &heldMediaBody{Reader: bytes.NewReader(body), entered: make(chan struct{}), release: release}
-	firstClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/png"}}, Body: held}, nil
-	})}
-	firstDone := make(chan error, 1)
-	go func() {
-		blob, err := fetchTestMedia(context.Background(), firstClient, "https://pbs.twimg.com/media/first.png", 1<<20)
-		if err == nil && (!bytes.Equal(blob.Body, body) || blob.CacheControl != "private, no-store") {
-			err = errors.New("first image or privacy headers changed")
-		}
-		firstDone <- err
-	}()
-	defer func() {
-		close(release)
-		select {
-		case err := <-firstDone:
-			if err != nil {
-				t.Errorf("first media: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("first media did not finish after release")
-		}
-		if !held.closed.Load() {
-			t.Error("first response body was not closed")
-		}
-		assertMediaPipelineAvailable(t)
-	}()
-	select {
-	case <-held.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("first media did not reach its body")
+	// A request must reserve its maximum possible body size before making an
+	// outbound request. Saturate the weighted budget without allocating bytes.
+	admission := newMediaAdmission(1, 2, 256)
+	if !admission.buffered.TryAcquire(256) {
+		t.Fatal("could not reserve test byte budget")
 	}
-
 	var outbound atomic.Int32
-	otherBody := &countedMediaReader{}
-	otherClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		outbound.Add(1)
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/png"}}, Body: otherBody}, nil
+		return response(http.StatusOK, "image/png", string(tinyImage(t, "png"))), nil
 	})}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	_, err := fetchTestMedia(ctx, otherClient, "https://pbs.twimg.com/media/other.png", 2<<20)
-	if !errors.Is(err, context.DeadlineExceeded) || outbound.Load() != 1 || otherBody.reads.Load() != 0 {
-		t.Fatalf("waiting media: headers=%d body reads=%d err=%v", outbound.Load(), otherBody.reads.Load(), err)
+	_, _, err := fetchMediaWithAdmission(ctx, client, "https://pbs.twimg.com/media/other.png", 128, admission)
+	if !errors.Is(err, context.DeadlineExceeded) || outbound.Load() != 0 {
+		t.Fatalf("buffer waiter reached upstream: headers=%d err=%v", outbound.Load(), err)
 	}
-	if !otherBody.closed.Load() {
-		t.Error("waiting response body was not closed")
+	admission.buffered.Release(256)
+	blob, release, err := fetchMediaWithAdmission(context.Background(), client, "https://pbs.twimg.com/media/after.png", 128, admission)
+	if release != nil {
+		defer release()
+	}
+	if err != nil || outbound.Load() != 1 || len(blob.Body) == 0 {
+		t.Fatalf("buffer budget was not reusable after cancellation: headers=%d err=%v", outbound.Load(), err)
 	}
 }
 
@@ -193,7 +168,7 @@ func TestMediaFetchPreservesOrdinaryConcurrentImageBurst(t *testing.T) {
 
 func TestMediaFetchBoundsRequestsBeforeOutbound(t *testing.T) {
 	waitMediaRequests(t, 0)
-	const admitted = 33
+	const admitted = mediaRequestCapacity
 	releases := make([]func(), 0, admitted)
 	defer func() {
 		for _, release := range releases {
@@ -266,16 +241,36 @@ func TestMediaFetchHoldsProcessingUntilCanceledDecodeReturns(t *testing.T) {
 		t.Fatal("decoder did not start")
 	}
 	cancel()
-	otherBody := &countedMediaReader{}
+	otherBody := &observedMediaBody{Reader: bytes.NewReader(body)}
+	var otherDecode atomic.Int32
 	otherClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/png"}}, Body: otherBody}, nil
 	})}
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer waitCancel()
-	_, err := fetchTestMedia(waitCtx, otherClient, "https://pbs.twimg.com/media/next.png", 2<<20)
-	if !errors.Is(err, context.DeadlineExceeded) || otherBody.reads.Load() != 0 || !otherBody.closed.Load() {
-		t.Fatalf("cancellation released a running decoder: reads=%d closed=%v err=%v", otherBody.reads.Load(), otherBody.closed.Load(), err)
+	_, err := fetchTestMediaWithDecoder(waitCtx, otherClient, "https://pbs.twimg.com/media/next.png", 2<<20, func(data []byte) (image.Image, error) {
+		otherDecode.Add(1)
+		return imagedecode.DecodeImage(data)
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || otherBody.reads.Load() == 0 || !otherBody.closed.Load() || otherDecode.Load() != 0 {
+		t.Fatalf("canceled decoder waiter: reads=%d closed=%v decode=%d err=%v", otherBody.reads.Load(), otherBody.closed.Load(), otherDecode.Load(), err)
 	}
+}
+
+type observedMediaBody struct {
+	io.Reader
+	reads  atomic.Int32
+	closed atomic.Bool
+}
+
+func (b *observedMediaBody) Read(p []byte) (int, error) {
+	b.reads.Add(1)
+	return b.Reader.Read(p)
+}
+
+func (b *observedMediaBody) Close() error {
+	b.closed.Store(true)
+	return nil
 }
 
 type cancelAtMediaEOF struct {
@@ -329,7 +324,7 @@ func assertMediaPipelineAvailable(t *testing.T) {
 		t.Fatalf("pipeline did not recover: %v", err)
 	}
 	waitMediaRequests(t, 0)
-	releases := make([]func(), 0, 33)
+	releases := make([]func(), 0, mediaRequestCapacity)
 	if !processMediaAdmission.buffered.TryAcquire(mediaBufferCapacity) {
 		t.Fatal("pipeline lost encoded-buffer capacity")
 	}
@@ -339,7 +334,7 @@ func assertMediaPipelineAvailable(t *testing.T) {
 			release()
 		}
 	}()
-	for range 33 {
+	for range mediaRequestCapacity {
 		release, err := processMediaAdmission.admit(context.Background())
 		if err != nil {
 			t.Fatalf("pipeline lost admission capacity: %v", err)
@@ -438,7 +433,7 @@ func (w *heldMediaWriter) Write(body []byte) (int, error) {
 
 func TestMediaFetchAccountsForBlockedResponseWrites(t *testing.T) {
 	waitMediaRequests(t, 0)
-	const responses = 33
+	const responses = mediaRequestCapacity
 	body := tinyImage(t, "png")
 	var calls atomic.Int32
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -469,10 +464,11 @@ func TestMediaFetchAccountsForBlockedResponseWrites(t *testing.T) {
 		go func() {
 			defer requestDone()
 			fetchCtx, fetchDone := context.WithCancel(req.Context())
-			blob, err := fetchMedia(fetchCtx, req.Context(), client, "https://pbs.twimg.com/media/held.png", 1024)
+			blob, release, err := fetchMediaWithAdmission(fetchCtx, client, "https://pbs.twimg.com/media/held.png", 1024, processMediaAdmission)
 			fetchDone() // routes' fetch deadline ends before the host writes the Blob.
 			if err == nil {
 				_, err = writer.Write(blob.Body)
+				release()
 			}
 			done <- err
 		}()
@@ -497,39 +493,42 @@ func TestMediaFetchAccountsForBlockedResponseWrites(t *testing.T) {
 
 func TestMediaFetchBoundsBufferedResponsesBeforeRead(t *testing.T) {
 	waitMediaRequests(t, 0)
-	body := tinyImage(t, "png")
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return response(http.StatusOK, "image/png", string(body)), nil
-	})}
-	responseCtx, responseDone := context.WithCancel(context.Background())
-	defer responseDone()
-	fetchCtx, fetchDone := context.WithCancel(responseCtx)
-	blob, err := fetchMedia(fetchCtx, responseCtx, client, "https://pbs.twimg.com/media/large-limit.png", 50<<20)
-	fetchDone()
-	if err != nil || !bytes.Equal(blob.Body, body) {
-		t.Fatalf("largest supported byte limit rejected: %v", err)
+	// Two maximum-size leases fit under the 128 MiB cap; a third must wait
+	// before outbound headers while keeping ordinary small requests possible
+	// after one lease is released. The semaphore reserves weights, not memory.
+	const maxBytes = 50 << 20
+	admission := newMediaAdmission(1, 4, mediaBufferCapacity)
+	firstRelease, err := admission.admit(context.Background(), maxBytes)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Exercise the byte budget with a tiny image and the largest legal limit,
-	// without allocating a large image or stressing the test machine.
-	blockedBody := &countedMediaReader{}
+	secondRelease, err := admission.admit(context.Background(), maxBytes)
+	if err != nil {
+		firstRelease()
+		t.Fatal(err)
+	}
+	defer firstRelease()
+	defer secondRelease()
+	body := tinyImage(t, "png")
 	var headers atomic.Int32
-	blockedClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		headers.Add(1)
-		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/png"}}, Body: blockedBody}, nil
+		return response(http.StatusOK, "image/png", string(body)), nil
 	})}
 	waitCtx, waitDone := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer waitDone()
-	_, err = fetchTestMedia(waitCtx, blockedClient, "https://pbs.twimg.com/media/other-large-limit.png", 50<<20)
-	if !errors.Is(err, context.DeadlineExceeded) || headers.Load() != 1 || blockedBody.reads.Load() != 0 || !blockedBody.closed.Load() {
-		t.Fatalf("buffer budget bypassed: headers=%d reads=%d closed=%v err=%v", headers.Load(), blockedBody.reads.Load(), blockedBody.closed.Load(), err)
+	_, _, err = fetchMediaWithAdmission(waitCtx, client, "https://pbs.twimg.com/media/third-large-limit.png", maxBytes, admission)
+	if !errors.Is(err, context.DeadlineExceeded) || headers.Load() != 0 {
+		t.Fatalf("buffer budget bypassed before outbound: headers=%d err=%v", headers.Load(), err)
 	}
-	// A canceled large waiter must not hold credits or block a small image
-	// that still fits while the first response remains live.
-	if _, err := fetchTestMedia(context.Background(), client, "https://pbs.twimg.com/media/small.png", 1<<20); err != nil {
-		t.Fatalf("ordinary small image was blocked: %v", err)
+	firstRelease()
+	small, release, err := fetchMediaWithAdmission(context.Background(), client, "https://pbs.twimg.com/media/small.png", 1<<20, admission)
+	if release != nil {
+		defer release()
 	}
-	responseDone()
-	assertMediaPipelineAvailable(t)
+	if err != nil || !bytes.Equal(small.Body, body) || headers.Load() != 1 {
+		t.Fatalf("small request failed after capacity returned: headers=%d err=%v", headers.Load(), err)
+	}
 }
 
 func TestMediaFetchRejectsUnavailableResponseLifetime(t *testing.T) {
@@ -541,7 +540,7 @@ func TestMediaFetchRejectsUnavailableResponseLifetime(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	for _, responseCtx := range []context.Context{nil, context.Background(), canceled} {
-		if _, err := fetchMedia(context.Background(), responseCtx, client, "https://pbs.twimg.com/media/lifetime.png", 1<<20); err == nil {
+		if _, err := fetchMediaWithDecoder(context.Background(), responseCtx, client, "https://pbs.twimg.com/media/lifetime.png", 1<<20, imagedecode.DecodeImage); err == nil {
 			t.Error("missing or canceled response lifetime accepted")
 		}
 	}
@@ -562,8 +561,11 @@ func TestMediaFetchRetainsCreditsUntilHTTPHandlerReturns(t *testing.T) {
 	serverErrors := make(chan error, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		fetchCtx, fetchDone := context.WithCancel(req.Context())
-		blob, err := fetchMedia(fetchCtx, req.Context(), imageClient, "https://pbs.twimg.com/media/http.png", 1024)
+		blob, releaseMedia, err := fetchMediaWithAdmission(fetchCtx, imageClient, "https://pbs.twimg.com/media/http.png", 1024, processMediaAdmission)
 		fetchDone()
+		if releaseMedia != nil {
+			defer releaseMedia()
+		}
 		close(ready)
 		<-release
 		if err == nil {

@@ -20,7 +20,7 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 | `build` | CI | 全パッケージがコンパイルできるか + 同梱プラグインの `go vet` + 同梱サンプルが既定無効か（`rolelevel`だけはallowlistで既定有効） + 同梱サンプル入りの統合バイナリ | `go build ./...` / `make plugin-vet` / `make plugins-all && go build -o /dev/null ./cmd/elythia` |
 | `lint` | CI | `go vet` + **actionlint** + `gofmt -s -d` の差分 + 重複 fixture ID + **golangci-lint** | `make lint` / `make actionlint` / `make fmt` / `make golangci-lint` |
 | `test` | CI | 4-way shard、Python delivery artifact test、A/B harness helper test、ベンチのデータの生成器のテストの集約。どれか 1 つでも落ちれば赤 | `make test` / `python3 -m unittest discover -s tests/bench/queue/common -p 'test_*.py' -v` / `bash tests/bench/ab/test_run_helpers.sh` / `python3 -m unittest discover -s tests/bench/data -p 'test_*.py' -v` |
-| `frontend` | frontend | `frontend-lint` (10 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、Elythia のファイルの import、ルートと Playwright の spec の対応付け、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) の集約。frontend に関係しない差分では両方を skip して成功する | 下の「`frontend` が落ちたとき」 |
+| `frontend` | frontend | `frontend-lint` (10 workspace の eslint、typecheck、check-dts、SPDX ヘッダー、Elythia のファイルの import、en-US の語の抜け、Elythia の語が書き換える本家の語の一覧、日本語の直書き、ルートと Playwright の spec の対応付け、設定のページの `prefer.model` のキーと Playwright の設定の表の対応付け、管理画面の `admin/update-meta` のキーとロールのポリシーのキーと Playwright の管理画面の表の対応付け、locale、misskey-js の API レポート、`emoji-regex-check`) と `frontend-test` (本番設定のビルド、frontend の vitest、misskey-js のテスト) の集約。frontend に関係しない差分では両方を skip して成功する | 下の「`frontend` が落ちたとき」 |
 
 ### `test` が落ちたとき
 
@@ -103,15 +103,16 @@ PR を出すと十数個の check が走る。**どれが何を見ていて、�
 | `review` | Dependency review | PR が**新しく持ち込む**依存に既知の脆弱性が無いか (base と head の差分を比較、high 以上で失敗) | 未計測 | 手元では回せない (GitHub の advisory DB を引く) |
 | `analyze (go)` / `analyze (actions)` | CodeQL | **自分のコード**の静的解析 (Go の全 module と workflow の式) | 未計測 | 手元では回せない (CodeQL CLI が要る)。Code scanning alerts で見る |
 | `plugin-tests` | CI | 同梱プラグインのテスト (別 module なので `go list ./...` に入らない) | 1 min | `make plugin-test` |
-| `apicompat` | apicompat | **`docs/api-compat.md` が実態とずれていないか** (生成物なので再生成して diff を見る)。あわせて golden (本家の`paramDef`とajvの照合corpusを含む、#3673) が本家の版に追いついているか (`make upstream-check`、#3378) | 未計測 | `make apicompat` (**プラグイン抜き + testMode が要る**。手順は docs/development.md) |
+| `apicompat` | apicompat | **`docs/api-compat.md` が実態とずれていないか** (生成物なので再生成して diff を見る)。あわせて golden (本家の`paramDef`とajvの照合corpusを含む、#3673) が本家の版に追いついているか、`frontend/locales` が本家の版と同じか (`make upstream-check`、#3378 / #4071) | 未計測 | `make apicompat` (**プラグイン抜き + testMode が要る**。手順は docs/development.md) |
 | `e2e (1/4)` 〜 `4/4` | Upstream backend e2e | **本家の backend e2e 1256 テスト**が Elythia に対して通るか | 3-7 min | `make upstream-e2e` |
 | `diff` | Diff e2e | Elythia と TS の**レスポンスの値**が一致するか (endpoint 比較 35 件) | 4 min | `make diff-check` |
+| `upgrade` | Upgrade from the previous release | **前のリリースの image で作った DB を、今のコードで`migrate up`して引き継げるか** (#4123)。サーバーのコードか migration を変えた PR と、リリースの前の手動実行で回る | 未計測 | `make upgrade-test` |
 | `swap-test` | Drop-in e2e | TS→mk 切替で state が保たれるか | 5 min | `make dropin-swap-test` |
 | `elythia-born` | Drop-in e2e | **Elythia 生まれの DB を TS に引き渡せるか** (測る対象。保証はしない、#3191) | 5 min | `make dropin-elythia-born-test` |
 | `ed25519-verify` | Drop-in e2e | Fedibird-like mock との Ed25519 双方向 verify | 5 min | `make dropin-fedibird-test` |
 | `federation` | Drop-in e2e | 本物の Misskey TS との実連合 (follow/note/reaction/renote/reply/mention/delete) | 4 min | `make federation-misskey-e2e` |
 | `federation-mastodon` | Drop-in e2e | 本物の Mastodon との引用の承認 (FEP-044f): 双方向の引用が承認済みになるか、取り消しが双方向で効くか | 未計測 | `make federation-mastodon-e2e` |
-| `spec (Elythia 1/7)` 〜 `7/7` | Playwright | ブラウザからの統合互換 (370 spec ファイル) | 実測は [playwright.md の「shard の数」](playwright.md#shard-の数) | `make playwright-check` |
+| `spec (Elythia 1/11)` 〜 `11/11`、`spec (Elythia backup/1)` | Playwright | ブラウザからの統合互換 (434 spec ファイル。数え方は `git ls-files tests/playwright/specs \| grep -c '\.spec\.ts$'`)。`backup/1` はバックアップの spec だけを専用のスタックで流す (#4102) | 実測は [playwright.md の「shard の数」](playwright.md#shard-の数) | `make playwright-check` |
 | `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない)。`-bundled` は image の中で frontend もビルドする (#3379) | 4 min (`-bundled` はキャッシュが冷えていると frontend の分だけ延びる。手元の冷えたビルドで frontend stage だけ約 3 分) | `docker build -f Dockerfile .` / `docker build -f Dockerfile.bundled .` |
 | `compare` | Bench compare | **ベンチの仕組みを変えた PR でだけ**、PR の head 同士 (A/A) を同じスタックで流し、最後まで完了するか。「差なし」かどうかは check では見ず、Summary を人が見る。base と head を選んで比べるときは手動で起動する (`gh workflow run bench-compare.yml -f base=develop -f head=<ref>`、[bench-compare.md](bench-compare.md))。結果は対象の PR にコメントでも出る (下の「`bench-compare` / `bench-compare-comment` workflow」) | 35 min | `make bench-compare BASE=HEAD HEAD=HEAD SMOKE=1` (本番のホストでは smoke だけ) |
 | `compare` | Bench upstream | **本家の版 (`UPSTREAM_MISSKEY_VERSION`) かベンチの仕組み (bench-compare と同じ paths) を変えた PR でだけ**、本家の公式 image と PR の head を同じスタックで流し、最後まで完了するか。どちらが速いかは check では見ず、Summary を人が見る。毎週月曜日 (日本時間) の schedule と手動でも流れる (`gh workflow run bench-upstream.yml -f ref=develop`、[bench-compare.md](bench-compare.md#本家-misskey-との比較-bench-upstream)) | 未計測 (見込み 40 min) | `make bench-upstream SMOKE=1` (本番のホストでは smoke だけ) |
@@ -175,8 +176,8 @@ PKCS#1 のため TS 側の送信連合が全滅する不具合が見つかって
   「5xx が出た」に分けて数える。400 や 401 だけのものは handler の中身を通っていないので、
   通ったことにしない。`miauth/:session/check` のようなパラメータ付きのパスはルートの形に直す
 - **分母**: 本家の paramDef の golden (`upstream_paramdefs.json`。直接のルートを含む) と Elythia の
-  宣言 (`elythia_paramdefs.json`) に、宣言を持たない 2 つ (`signin`、`drive/files/create-chunked/append`)
-  を足したもの (`internal/routecoverage` の `Endpoints`)。組み立てたサーバーのルートと一致することを
+  宣言 (`elythia_paramdefs.json`) に、宣言を持たない 1 つ (`signin`) を足したもの
+  (`internal/routecoverage` の `Endpoints`)。組み立てたサーバーのルートと一致することを
   `internal/server` の `TestRouteCoverageEndpointsMatchRoutes` が確かめる。`reset-db` は testMode でだけ
   登録されるが、分母には入る。プラグインのパスと catch-all (`*`) は「エンドポイントでないパス」に出る
 - **集め方**: `upstream-backend-e2e` は shard ごとに集計した `route-hits-upstream-backend-e2e-<shard>`
@@ -205,8 +206,10 @@ PKCS#1 のため TS 側の送信連合が全滅する不具合が見つかって
 #### 通っていない API の一覧と週次のゲート (#4039)
 
 どの層でも 2xx・3xx で通っていないエンドポイントは、`internal/routecoverage/uncovered.tsv` に
-`<エンドポイント>\t<付ける予定の issue>` の形で載せる (4xx だけのものも載せる)。Elythia 独自のものは
-`#4024(18)`、本家互換のものは `#4024` (段階 C か (19) で見直す) にしてある。
+`<エンドポイント>\t<付ける予定の issue>` の形で載せる (4xx だけのものも載せる)。本家互換のものは
+`#4024` (段階 C か (19) で見直す) にしてある。Elythia 独自のものは、#4093 と #4102 で全部に
+テストが付き、一覧に残っていない。一覧を作り直すと、Elythia 独自の行には `#4024(18)` が付く
+(`tools/routecoverage`の既定)。戻ってきたら、付ける issue に書き換える。
 
 - **週次のゲート** (`api-coverage` workflow。毎週火曜日と手動実行、必須ではない): 3 つの層について、
   **develop にマージ済みの PR** の最新の run の `route-hits-<層>` を取ってきて合わせ、一覧と突き合わせる。
@@ -219,6 +222,9 @@ PKCS#1 のため TS 側の送信連合が全滅する不具合が見つかって
   - 一覧にあるのに通っている行がある。テストが付いたので、行を消す
   - 一覧の行が、実在しないエンドポイントを指している (改名か削除)
   - 3 層のどれかの集計が見つからない、または `notes/create` が通っていない (下限)
+  - バックアップの取得・検証・戻す操作の 7 件 (`admin/backup/take`・`verify`・`restore/*`) が通っていない。
+    この 7 件を叩くのは playwright の `spec (Elythia backup/1)` の job だけで (#4102)、その job が落ちた run が
+    使われると 7 件そろって未通過になる。一覧に足す前に、その run の job を見る
   - マージ済みの PR の最新の run から集計を取れなかった (古い run には戻らない)。その run が集計を出す前に
     落ちた (`notes/create` の下限など) か、集計の artifact が期限 (30 日) で消えたときに起きる。取り消された
     run は飛ばす。対処は、次に 3 つの workflow が走る PR のマージを待つ。develop で手動実行しても直らない
@@ -352,7 +358,11 @@ package load エラーで解析が空振りしうる。**ローカルの `go` �
 - `frontend-lint`: 10 workspace の eslint、typecheck (frontend は `vue-tsc --noEmit`、ほかに sw / misskey-js / elythia-js)、
   check-dts とその self test、SPDX ヘッダーとその検査ツールの self test、Elythia のファイルが misskey-js を直接 import していないかの検査とその self test (#4028)、
   ja-JP の語が en-US にもあるかの検査とその self test (#4047)、
+  Elythia の語 (`frontend/locales-elythia`) が書き換える・消す本家の語が一覧 (`overrides.tsv`) にあるかの検査とその self test、本家のファイルと比べる検査の self test (#4071)、
+  画面の文言を日本語で直書きしていないかの検査とその self test (#4070)、
   全ルートが Playwright の spec に対応付いているかの検査とその self test (`make playwright-route-check`、#4035。`tests/playwright` で `npm ci` してから回す)、
+  設定のページが `prefer.model` で扱う端末の設定のキーが、Playwright の設定の表で確かめられているかの検査とその self test (`make playwright-settings-check`、#4056)、
+  管理画面が `admin/update-meta` で書くキーとロールのポリシーのキーが、Playwright の管理画面の表で確かめられているかの検査とその self test (`make playwright-admin-settings-check`、#4066)、
   locale の検証、misskey-js の API レポート、`emoji-regex-check` (#3324) のいずれか
 - `frontend-test`: 本番設定のビルド、frontend の vitest、misskey-js のテストのいずれか
 
@@ -406,7 +416,7 @@ PR では回らない。失敗は Actions 上で確認して別 PR で対処す�
 
 | workflow | 内容 | 実行方法 |
 |---|---|---|
-| Playwright (`spec (ts 1/7)` 〜 `7/7`) | 同じ spec を **Misskey TS backend** に対して実行し、spec が Elythia の挙動に引きずられていないかを検証 | upstream 追従で本家の版を上げたとき |
+| Playwright (`spec (ts 1/11)` 〜 `11/11`) | 同じ spec を **Misskey TS backend** に対して実行し、spec が Elythia の挙動に引きずられていないかを検証 | upstream 追従で本家の版を上げたとき |
 | Docker (`workflow_dispatch`) | 過去のリリースタグから image を publish し直す | `gh workflow run docker.yml -f tag=1.1.1` |
 
 `spec (ts …)` を常時回さないのは、upstream が変わらない限り答えが変わらないため。詳細は
@@ -465,7 +475,7 @@ git ls-remote https://github.com/actions/checkout 'refs/tags/v7*'
 
 - `frontend/built/*` (#3379 より前の版では `third_party/misskey/built/*`) — 過去の docker build が root 所有で残っていることがある
 - `frontend/packages/*/built` — 同上。`i18n` / `misskey-bubble-game` が無いと frontend の型が通らない
-- `built/.config.json` / `built/meta.json` — 本家の `loadConfig()` が読む生成物
+- `built/meta.json` — 本家の `loadConfig()` が読む生成物 (本家 2026.10.x の `built/.config.json` は 2026.11.0 で要らなくなった)
 
 CI はまっさらな環境なので、手元にある生成物が要件を隠す。新しく CI に載せる workflow は
 **その PR 自身の paths に含めて、PR 上で発火させて確認する**こと。
@@ -665,13 +675,13 @@ checkout / setup-go を除くと step は実行順に 3 つ。**required job な
 - `.github/workflows/playwright.yml` で Playwright spec を実行する。
   `pull_request` (paths フィルタ) と `workflow_dispatch` で発火。nightly から
   PR トリガーへ移行済み (#2291)。
-- **7 シャード並列** (`PLAYWRIGHT_SHARD=i/7`。所要時間で割り振る、#4026。#4043 で 4 から 6 に、#4049 で 7 にした)。`fail-fast: false` で 1 つが落ちても
+- **11 シャード並列** (`PLAYWRIGHT_SHARD=i/11`。所要時間で割り振る、#4026。#4043 で 4 から 6 に、#4049 で 7 に、#4056 で 11 にした)。`fail-fast: false` で 1 つが落ちても
   他は完走する。
-- **1 スタックあたりは直列でしか回せない。** 370 spec ファイル中 185 が共有の
-  root (alice) で**ブラウザでサインインした状態**を使い (`uiSigninAsRoot` を呼ぶ 184 と、フォームから入る
-  `signin.spec.ts`。数え方は `grep -rl 'uiSigninAsRoot' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す)、さらに 40 が
-  サインインせず root の token で API を叩く (`root.json` を読み、root でサインインしないもの。数え方は
-  `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。
+- **1 スタックあたりは直列でしか回せない。** 397 spec ファイル中 194 が共有の
+  root (alice) で**ブラウザでサインインした状態**を使い (`uiSigninAsRoot` を呼ぶ 184、管理画面の表の helper を通る 9 と、フォームから入る
+  `signin.spec.ts`。数え方は `grep -rlE 'uiSigninAsRoot|signinAdmin|runMetaRow|runPolicyRow' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す)、さらに 45 が
+  root ではサインインせずに root の token で API を叩く (`root.json` を読み、root でサインインしないもの。数え方は
+  `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -LE 'uiSigninAsRoot|signinAdmin|runMetaRow|runPolicyRow' | grep -v '/signin.spec.ts$' | wc -l`)。
   instance meta も全 spec が共有する。Playwright は
   ファイル単位で並列化するので、`workers` を上げると `profile_iscat_toggle` と
   `profile_isbot_toggle` が同じアカウントを、`admin_branding_save` と
@@ -747,6 +757,10 @@ checkout / setup-go を除くと step は実行順に 3 つ。**required job な
   置かない。ajvやTypeScriptの版はlockで変わるので、pathsに`frontend/pnpm-lock.yaml`を入れている。
   検証器がcorpusの全件と一致するかは、nodeの要らない`go test`として`test-shards`で走る。
   手順は[本家への追従](upstream-catch-up.md#本家の版を上げた後に必須-引数のschemaparamdefのgoldenとajvの照合corpus)
+- **`frontend/locales`が本家の版と同じか(#4071)も`make upstream-check`で見る。** Elythiaの語は
+  `frontend/locales-elythia`に置き、本家のファイルは本家のまま持つ。比べる相手の本家が要るので
+  requiredの`frontend` workflowには置かず、pathsに`frontend/locales/**`を入れている。
+  検査ツールのself testは本家が要らないので、`frontend` workflowで走る
 - **config は `tests/upstream-e2e/mkgo.yml`。** `testMode: true` が要る — 無いと
   `/api/reset-db` が route に載らず、マトリクスが「TS 側に存在するが未実装 1 件」に化ける。
   接続先だけ `MK_*` で service container へ向ける。
@@ -776,7 +790,11 @@ checkout / setup-go を除くと step は実行順に 3 つ。**required job な
     10 workspace の eslint、typecheck (frontend / sw / misskey-js / elythia-js。frontend は `vue-tsc --noEmit`)、
     check-dts とその self test、SPDX ヘッダーとその検査ツールの self test、Elythia のファイルが misskey-js を直接 import していないかの検査とその self test (#4028)、
     ja-JP の語が en-US にもあるかの検査とその self test (#4047)、
+    Elythia の語が書き換える・消す本家の語の一覧の検査とその self test、本家のファイルと比べる検査の self test (#4071)、
+    画面の文言を日本語で直書きしていないかの検査とその self test (#4070)、
     `tests/playwright` の `npm ci` → 全ルートが Playwright の spec に対応付いているかの検査とその self test (`make playwright-route-check`、#4035)、
+    設定のページの `prefer.model` のキーが Playwright の設定の表で確かめられているかの検査とその self test (`make playwright-settings-check`、#4056)、
+    管理画面の `admin/update-meta` のキーとロールのポリシーのキーが Playwright の管理画面の表で確かめられているかの検査とその self test (`make playwright-admin-settings-check`、#4066)、
     locale の検証、misskey-js の API レポート、`make emoji-regex-check` (#3324)。同梱サンプル入りの統合バイナリの build (#2495) は、
     Node が要らないので毎回走る required の `build` job に置いた (Go だけの変更で
     `cmd/elythia` 側の配線が崩れても拾えるように)
@@ -866,6 +884,8 @@ PR では回らないので、失敗は Actions 上で確認して別 PR で対�
 |---|---|---|
 | `dropin-frontend-e2e.yml` | 3 TS インスタンス + cypress で frontend 視点の drop-in 互換 | 19:00 UTC |
 | `queue-bench-smoke.yml` | queue driver がジョブを落としていないか (`ok == sent`) | 17:30 UTC |
+| `schemathesis.yml` | `/api.json`の宣言から入力を作り、全エンドポイントの5xx・宣言に無いstatus・宣言の型に合わない応答を探す (#4118)。PRでも、このworkflowか`tests/schemathesis/`を変えたときは回る | 木曜日 03:30 UTC (木曜日 12:30 日本時間) |
+| `fuzz.yml` | Go の fuzz を対象ごとに 2 分ずつ回す (画像デコーダは除く、#4116)。PR でも、この workflow か fuzz のテストを変えたときは 15 秒ずつ回る | 21:30 UTC (06:30 日本時間) |
 | `bench-upstream.yml` | 本家 Misskey との性能比較 (develop と`UPSTREAM_MISSKEY_VERSION`の版) | 日曜日 20:40 UTC (月曜日 05:40 日本時間) |
 | `api-coverage.yml` | どの層でも通っていない API が一覧 (`internal/routecoverage/uncovered.tsv`) と一致しているか (#4039)。PR でも、集計の道具 (`internal/routecoverage/*.go`、`tools/routecoverage/`) か workflow を変えたときは回る | 火曜日 03:30 UTC (火曜日 12:30 日本時間) |
 

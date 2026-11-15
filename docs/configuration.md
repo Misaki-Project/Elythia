@@ -45,8 +45,6 @@ cp .config/docker.yml.example .config/docker.yml
 | `mediaProxyConcurrency` | int | `GOMAXPROCS / 2` (最低 1) | media proxy の画像処理 (decode/resize/encode) を同時に何本走らせてよいか (#3032)。**ピークメモリの上限**にあたる — 同時に走る本数がそのまま同時に確保される中間バッファの本数になり、内蔵プロキシは API サーバーと同じプロセスなのでそれがインスタンス全体の RSS になる。8 core で AVIF を c=8 流したときの peak RSS の実測は枠 1 → 131MB / 2 → 409MB / 4 → 636MB / 8 → 995MB / 無制限 → 959MB、同条件の jpg→avatar スループットは 30.7 / 45.5 / 63.9 / 71.2 / 71.6 rps。既定は peak RSS -34% をスループット -11% で買う点。枠が 5 秒空かなければ 503 (`?fallback` 指定時はダミー画像) で落とす。0 以下は既定値扱い |
 | `enableIpRateLimit` | bool | `true` | IPベースのレート制限を有効化 |
 | `disableEndpointRateLimits` | bool | `false` | per-endpoint rate limit table 全体を無効化。Misskey TS の `NODE_ENV=development` 相当で、ベンチマーク等で公正比較する用途専用。**本番で絶対に使わない** |
-| `disableParamShadow` | bool | `false` | 本家の`paramDef`での引数の検証を、応答を変えずに走らせ、handlerと判定が分かれた件数をログに出すのを止める (#3677)。本家に揃えたendpoint (`reset-db`を除く、本家かElythiaの宣言のあるendpointの全部。#3742〜#3888で広げ、#3890で宣言から決める形にした) の検証は止めない。数え方と見方は [docs/param-shadow.md](param-shadow.md) |
-| `paramShadowLogSeconds` | int | `600` | 上の件数の要約をログに出す間隔 (秒)。0 以下は既定に戻す |
 | `pidFile` | string | - | PIDファイルパス |
 | `testMode` | bool | `false` | テスト用エンドポイント(/api/reset-db)を有効化。**本番で絶対に使わない** |
 | `enablePprof` | bool | `false` | `/debug/pprof/*` ハンドラを公開。ローカルプロファイリング専用。**本番で絶対に使わない**。`MK_ENABLEPPROF`で上書き可。診断のためどうしても一時的に有効化する場合は、reverse proxy 側で`/debug`を落としてからにする (`deploy/uds/nginx/mkgo.conf`と[deployment.md](deployment.md)のnginx例はどちらも404にしてある)。取得はUDSへ直接 (`curl --unix-socket`)。 |
@@ -143,9 +141,9 @@ cp .config/docker.yml.example .config/docker.yml
 | `queueStuckWorkerSeconds` | int | キューごと | 1 件の job の handler が何秒戻ってこなければ、その worker を**キューの worker 数に数えない**扱いにするか。worker は 1 本が 1 dispatcher goroutine なので、handler から戻らなくなるとその分だけキューの処理能力が黙って減る (#2657 の本番障害では inbox の 4 本すべてが AP handler の中で 1 日以上戻らなかった)。該当 worker は**停止せず**脇に退ける + 代わりを立てるので、単に遅かっただけの job はそのまま完走し、完走後に pool へ戻る。**退けている間は実効の並列度が上がる** (上限は「到達した最大 worker 数 + max(設定値, 4)」。この枠は `queueHandlerDeadlineSeconds` で放棄した handler と共用で、達するとそのキューの worker を 0 まで縮めて止める。autoscale 無効なら設定値 + max(設定値, 4)、有効なら max(設定値, `maxWorkers`) + max(設定値, 4))。未設定はキューごとの既定 = deliver / inbox / relationship / push / webhook は 30 分、export / objectStorage / maintenance は**追跡しない** (分単位のページング処理が正常なため)。**既定が長いのは意図的**で、狙いは「恒久的に戻ってこない worker の回収」(#2657 は 1 日以上戻らなかった) であって遅い job の検出ではない。短くすると、正当に遅い job のたびに worker を差し替えて実効の並列度が設定値を超えた状態が定常化する。正値は全キューに適用、負値で機能ごと無効 |
 | `queueHandlerDeadlineSeconds` | int | `3600` | 1 件の job の handler を何秒待ってから諦めて worker を返すか。**超過しても handler は止まらない** — Go では goroutine を殺せないので、止まるのは待つ側だけ。放棄した handler は DB 接続などを掴んだまま走り続け、job は失敗して retry に回るので、放棄した実行と retry が重なりうる。それでも 1 回の詰まりで dispatcher を永久に失う (#2657 は inbox の 4 本すべてを失った) よりは軽い。**放棄した handler は `queueStuckWorkerSeconds` の隔離と同じ枠を食い**、枠に達するとそのキューの worker を 0 まで縮めて止める (goroutine と DB 接続を食い潰してプロセス全体を巻き込むより、キュー 1 本を止めるほうがましという判断)。この枠は隔離の有無に関わらず効くので、隔離対象外の maintenance / export / objectStorage でも同じ。`queueStuckWorkerSeconds` より後に発火するのは意図的で、あちらが先に capacity を戻し、こちらが後から worker 本体を回収する。1 job が分単位でページングするのが正常な task type (export / import / objectStorage:cleanRemoteFiles / maintenance:deleteAccount / maintenance:cleanRemoteNotes 等) は**対象外**でこの値を無視する (期限を切ると job が失敗して retry に回り永久に完了しない)。負値で機能ごと無効 |
 | `relationshipJobConcurrency` | int | `4` | follow / unfollow / block / unblock の worker 数。relationship queue 専用 worker (#2403)。既定を upstream の 16 でなく 4 にしているのは、relationship job が DB bound で `db.maxOpenConns` (既定 25) を HTTP 経路と共有するため |
-| `deliverJobPerSec` | int | - | AP配信レート上限 (tasks/sec)。設定すると `mkq.WithRateLimit` で worker dispatch が back-pressure される |
-| `inboxJobPerSec` | int | - | Inbox処理レート上限 (tasks/sec) (#534)。設定すると `mkq.WithRateLimit` で worker dispatch が back-pressure される |
-| `relationshipJobPerSec` | int | - | relationship 処理のレート上限 (tasks/sec)。設定すると `mkq.WithRateLimit` で worker dispatch が back-pressure される (#2403) |
+| `deliverJobPerSec` | int | - | AP配信レート上限 (tasks/sec)。**未設定なら上限なし** (本家は未設定でも 128。[本家との違い](divergence/config.md#4-3-job-queue-の構成差分))。設定すると `mkq.WithRateLimit` で worker dispatch が back-pressure される |
+| `inboxJobPerSec` | int | - | Inbox処理レート上限 (tasks/sec) (#534)。**未設定なら上限なし** (本家は未設定でも 32。[本家との違い](divergence/config.md#4-3-job-queue-の構成差分))。設定すると `mkq.WithRateLimit` で worker dispatch が back-pressure される |
+| `relationshipJobPerSec` | int | - | relationship 処理のレート上限 (tasks/sec)。**未設定なら上限なし** (本家は未設定でも 64。[本家との違い](divergence/config.md#4-3-job-queue-の構成差分))。設定すると `mkq.WithRateLimit` で worker dispatch が back-pressure される (#2403) |
 | `deliverJobMaxAttempts` | int | driver 既定 | AP配信の**総試行回数** (初回 + retry) のdefault。BullMQ `attempts` と同じ意味で、TS Misskey YAML 互換。EnqueueDeliver で `WithMaxRetry` 未指定時にだけ適用される (#495)。例: `deliverJobMaxAttempts: 8` で 1 回失敗するごとに retry されて最大 8 回試行 |
 | `inboxJobMaxAttempts` | int | driver 既定 | Inbox処理の**総試行回数** (#534)。BullMQ `attempts` と同じ意味で、TS Misskey YAML 互換。EnqueueInbox で `WithMaxRetry` 未指定時にだけ適用される |
 | `jobQueueAutoScale` | bool | `false` | AIMD auto-scale controller (#1120) を opt-in 有効化。`true` で個別 `<queue>JobConcurrency` 未設定の queue が `[minWorkers, maxWorkers]` 範囲で動的に伸縮する。詳細は `docs/design/auto-scale-job-workers.md`。 |
@@ -344,8 +342,6 @@ Elythia 側のマイグレーションには含めていない。pgroonga 拡張
 | `MK_PLUGINSECRETKEY` | `pluginSecretKey` |
 | `MK_TESTMODE` | `testMode` |
 | `MK_DISABLEENDPOINTRATELIMITS` | `disableEndpointRateLimits` |
-| `MK_DISABLEPARAMSHADOW` | `disableParamShadow` |
-| `MK_PARAMSHADOWLOGSECONDS` | `paramShadowLogSeconds` |
 | `MK_BCRYPTCOST` | `bcryptCost` |
 | `MK_CROSSORIGINOPENERPOLICY` | `crossOriginOpenerPolicy` |
 | `MK_NOTEHOOKCONCURRENCY` | `noteHookConcurrency` |

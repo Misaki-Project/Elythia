@@ -21,6 +21,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		return err
 	}
 	s := newStore(ctx.Storage().DB(), cfg)
+	registerPublishedMediaRoutes(ctx, r, s, cfg)
 
 	requireUser := func(req plugin.Request) error {
 		if req.UserID() == "" {
@@ -30,8 +31,10 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 	}
 
 	r.POST("/capabilities", func(req plugin.Request) (any, error) {
+		canUse := req.UserID() != "" && checkedPreviewAllowed(req)
 		return map[string]any{
 			"externalFetchEnabled":   cfg.ExternalFetchEnabled,
+			"canUseFxTwitterPreview": canUse,
 			"refetchIntervalSeconds": int(cfg.RefetchInterval.Seconds()),
 			"videoPlaybackMode":      cfg.VideoPlaybackMode,
 			"mediaMode":              "sameOriginProxy",
@@ -47,11 +50,18 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			NoteID    string `json:"noteId"`
 			PostID    string `json:"postId"`
 		}
-		if err := req.BindStrict(&body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) {
+		if err := plugin.BindStrict(req, &body); err != nil || body.NoteID == "" || !statusIDPattern.MatchString(body.PostID) {
 			return nil, plugin.NewCodedStatusError(http.StatusBadRequest, "invalid noteId or postId", "INVALID_REQUEST")
 		}
 		if !cfg.ExternalFetchEnabled {
 			return map[string]any{"state": "disabled"}, nil
+		}
+		allowed, budget, policyErr := checkedPreviewPolicy(req)
+		if policyErr != nil {
+			return nil, plugin.NewCodedStatusError(http.StatusInternalServerError, "preview policy resolution failed", "POLICY_UNAVAILABLE")
+		}
+		if !allowed {
+			return nil, plugin.NewCodedStatusError(http.StatusForbidden, "Fx preview is not permitted", "PREVIEW_FORBIDDEN")
 		}
 		if err := verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), body.NoteID, body.PostID); err != nil {
 			switch {
@@ -68,22 +78,48 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if err != nil {
 			return nil, err
 		}
-		if entry != nil && entry.NextFetchAt.After(now) {
-			if entry.State == "pending" {
+		if entry != nil && entry.State != "pending" && entry.NextFetchAt.After(now) {
+			if cfg.VideoPlaybackMode == "nativeProxy" && entry.State == "ready" && entry.Post != nil && (entry.Post.HasVideo || (entry.Post.Quote != nil && entry.Post.Quote.HasVideo)) {
+				needsMetadata, err := s.NeedsNativeVideoMetadata(req.Context(), body.PostID)
+				if err != nil {
+					return nil, err
+				}
+				if needsMetadata {
+					upgrade, err := s.AcquireNativeMetadataRefreshWithBudget(req.Context(), body.PostID, req.UserID(), budget, now)
+					if errors.Is(err, errRateLimited) {
+						return nil, plugin.NewCodedStatusError(http.StatusTooManyRequests, "cold fetch rate limit exceeded", "RATE_LIMITED")
+					}
+					if err != nil {
+						return nil, err
+					}
+					if upgrade != nil {
+						enqueueTimeout := min(cfg.RequestTimeout, 5*time.Second)
+						enqueueCtx, cancelEnqueue := context.WithTimeout(context.WithoutCancel(req.Context()), enqueueTimeout)
+						enqueueErr := ctx.Queue().Enqueue(enqueueCtx, "fetch-post", upgrade, plugin.WithMaxAttempts(1))
+						cancelEnqueue()
+						if enqueueErr != nil {
+							cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(req.Context()), enqueueTimeout)
+							defer cancelCleanup()
+							if _, cleanupErr := s.CompleteUnavailable(cleanupCtx, *upgrade, "network", time.Now().UTC()); cleanupErr != nil {
+								ctx.Logger().Warn("failed to release Fx fetch after native video metadata enqueue error", "postId", upgrade.PostID, "err", cleanupErr)
+							}
+							return nil, enqueueErr
+						}
+						return map[string]any{"state": "pending", "nextPollAt": now.Add(2 * time.Second)}, nil
+					}
+					entry, err = s.ReadPublic(req.Context(), body.PostID)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+			if entry != nil && entry.State == "pending" {
 				nextPoll := now.Add(2 * time.Second)
 				entry.NextPollAt = &nextPoll
 			}
-			return publicEntry(entry, body.NoteID), nil
+			return publicEntryForMode(entry, body.NoteID, cfg.VideoPlaybackMode), nil
 		}
-		roleReq, ok := req.(plugin.ActiveRoleRequest)
-		if !ok {
-			return nil, errors.New("active role lookup is unavailable")
-		}
-		roleIDs, roleErr := roleReq.ActiveRoleIDs()
-		if roleErr != nil {
-			return nil, roleErr
-		}
-		won, err := s.AcquireFetchForRoles(req.Context(), body.PostID, req.UserID(), roleIDs, now)
+		won, err := s.AcquireFetchWithBudget(req.Context(), body.PostID, req.UserID(), budget, now)
 		if errors.Is(err, errRateLimited) {
 			return nil, plugin.NewCodedStatusError(http.StatusTooManyRequests, "cold fetch rate limit exceeded", "RATE_LIMITED")
 		}
@@ -102,7 +138,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 				nextPoll := now.Add(2 * time.Second)
 				entry.NextPollAt = &nextPoll
 			}
-			return publicEntry(entry, body.NoteID), nil
+			return publicEntryForMode(entry, body.NoteID, cfg.VideoPlaybackMode), nil
 		}
 		if err := ctx.Queue().Enqueue(req.Context(), "fetch-post", won, plugin.WithMaxAttempts(1)); err != nil {
 			_, _ = s.CompleteUnavailable(req.Context(), *won, "enqueue", now)
@@ -115,6 +151,9 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if err := requireUser(req); err != nil {
 			return nil, err
 		}
+		if !checkedPreviewAllowed(req) {
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
 		if !cfg.ExternalFetchEnabled {
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
@@ -123,17 +162,118 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		if noteID == "" || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
-		rawURL, err := s.ResolveMedia(req.Context(), postID, req.Param("kind"), req.Param("index"), time.Now().UTC())
+		now := time.Now().UTC()
+		if !processMediaRequestLimiter.Allow(req.UserID(), now) {
+			return nil, plugin.NewCodedStatusError(http.StatusTooManyRequests, "media request rate limit exceeded; try again in a minute", "MEDIA_RATE_LIMITED")
+		}
+		waitBudget := mediaQueueWaitBudget(mediaRequestCapacity, mediaBufferCapacity, mediaUserActiveLimit, cfg.StaticImageMaxBytes, cfg.RequestTimeout, mediaQueueWaitTimeout)
+		waitCtx, cancelWait := context.WithTimeout(req.Context(), waitBudget)
+		defer cancelWait()
+		releaseUser, err := processMediaRequestGate.acquire(waitCtx, req.UserID(), cfg.StaticImageMaxBytes)
 		if err != nil {
+			return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "media request capacity is busy; retry shortly", "MEDIA_BUSY")
+		}
+		if waitCtx.Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(waitCtx, ctx.API(), req.UserID(), noteID, postID) != nil {
+			releaseUser()
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		rawURL, err := s.ResolveMedia(waitCtx, postID, req.Param("kind"), req.Param("index"), time.Now().UTC())
+		if err != nil || waitCtx.Err() != nil {
+			releaseUser()
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
 		fetchCtx, cancel := context.WithTimeout(req.Context(), cfg.RequestTimeout)
 		defer cancel()
-		blob, err := fetchMedia(fetchCtx, req.Context(), ctx.HTTP(), rawURL, cfg.StaticImageMaxBytes)
+		if req.Context().Done() == nil {
+			releaseUser()
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		fetchPoster := req.Param("kind") == "poster" || req.Param("kind") == "quote-poster"
+		var blob plugin.Blob
+		var releaseMedia func()
+		if fetchPoster {
+			blob, releaseMedia, err = fetchPosterWithAdmission(fetchCtx, ctx.HTTP(), rawURL, cfg.StaticImageMaxBytes, processMediaAdmission)
+		} else {
+			blob, releaseMedia, err = fetchMediaWithAdmission(fetchCtx, ctx.HTTP(), rawURL, cfg.StaticImageMaxBytes, processMediaAdmission)
+		}
 		if err != nil {
+			releaseUser()
 			ctx.Logger().Warn("Fx preview media unavailable", "postId", req.Param("postId"), "kind", req.Param("kind"), "err", err)
 			return nil, plugin.ErrNotFound("media unavailable")
 		}
+		if req.Context().Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+			releaseMedia()
+			releaseUser()
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		currentURL, resolveErr := s.ResolveMedia(req.Context(), postID, req.Param("kind"), req.Param("index"), time.Now().UTC())
+		if resolveErr != nil || currentURL != rawURL {
+			releaseMedia()
+			releaseUser()
+			return nil, plugin.ErrNotFound("media unavailable")
+		}
+		releaseMediaWhenRequestEnds(req.Context(), releaseMedia, releaseUser)
+		return blob, nil
+	})
+
+	r.GET("/media/video/:postId/:target/:index", func(req plugin.Request) (any, error) {
+		if err := requireUser(req); err != nil {
+			return nil, err
+		}
+		if !cfg.ExternalFetchEnabled || cfg.VideoPlaybackMode != "nativeProxy" {
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		if !checkedPreviewAllowed(req) {
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		postID, noteID, target, token := req.Param("postId"), req.Query("noteId"), req.Param("target"), req.Query("token")
+		index, parseErr := strconv.Atoi(req.Param("index"))
+		if noteID == "" || parseErr != nil || index < 0 || index >= maxFxVideoItems {
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		if verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		if !processNativeVideoLimiter.Allow(req.UserID(), time.Now().UTC()) {
+			return nil, plugin.NewCodedStatusError(http.StatusTooManyRequests, "video playback request limit exceeded; try again in a minute", "VIDEO_RATE_LIMITED")
+		}
+		waitCtx, cancelWait := context.WithTimeout(req.Context(), mediaQueueWaitBudget(mediaRequestCapacity, mediaBufferCapacity, mediaUserActiveLimit, nativeVideoMaxBytes, cfg.RequestTimeout, mediaQueueWaitTimeout))
+		defer cancelWait()
+		releaseUser, err := processNativeVideoRequestGate.acquire(waitCtx, req.UserID(), nativeVideoMaxBytes)
+		if err != nil {
+			return nil, plugin.NewCodedStatusError(http.StatusServiceUnavailable, "video playback capacity is busy; retry shortly", "VIDEO_BUSY")
+		}
+		if waitCtx.Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(waitCtx, ctx.API(), req.UserID(), noteID, postID) != nil {
+			releaseUser()
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		rawURL, err := s.ResolveNativeVideoSource(waitCtx, postID, token, target, index, time.Now().UTC())
+		if err != nil || waitCtx.Err() != nil {
+			releaseUser()
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		fetchCtx, cancelFetch := context.WithTimeout(req.Context(), cfg.RequestTimeout)
+		defer cancelFetch()
+		blob, releaseVideo, err := fetchVideoWithAdmission(fetchCtx, ctx.HTTP(), rawURL, nativeVideoMaxBytes, processNativeVideoAdmission)
+		if err != nil {
+			releaseUser()
+			if errors.Is(err, errNativeVideoTooLarge) {
+				return nil, plugin.NewCodedStatusError(http.StatusRequestEntityTooLarge, "video exceeds the in-app playback limit", "VIDEO_TOO_LARGE")
+			}
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		if req.Context().Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
+			releaseVideo()
+			releaseUser()
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		currentURL, resolveErr := s.ResolveNativeVideoSource(req.Context(), postID, token, target, index, time.Now().UTC())
+		if resolveErr != nil || currentURL != rawURL {
+			releaseVideo()
+			releaseUser()
+			return nil, plugin.ErrNotFound("video unavailable")
+		}
+		releaseMediaWhenRequestEnds(req.Context(), releaseVideo, releaseUser)
 		return blob, nil
 	})
 
@@ -142,6 +282,9 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			return nil, err
 		}
 		if !cfg.ExternalFetchEnabled || cfg.VideoPlaybackMode != "officialEmbed" {
+			return nil, plugin.ErrNotFound("embed unavailable")
+		}
+		if !checkedPreviewAllowed(req) {
 			return nil, plugin.ErrNotFound("embed unavailable")
 		}
 		var body struct {
@@ -154,7 +297,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			Lang      string `json:"lang"`
 			Nonce     string `json:"nonce"`
 		}
-		if err := req.BindStrict(&body); err != nil {
+		if err := plugin.BindStrict(req, &body); err != nil {
 			return nil, plugin.Errorf(http.StatusBadRequest, "invalid embed request")
 		}
 		if body.Target == "" {
@@ -191,7 +334,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			AuthToken string `json:"i,omitempty"`
 			PostID    string `json:"postId"`
 		}
-		if err := req.BindStrict(&body); err != nil || !statusIDPattern.MatchString(body.PostID) {
+		if err := plugin.BindStrict(req, &body); err != nil || !statusIDPattern.MatchString(body.PostID) {
 			return nil, plugin.Errorf(http.StatusBadRequest, "valid postId required")
 		}
 		items, err := s.ListAudit(req.Context(), body.PostID)
@@ -213,7 +356,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			Reason     string `json:"reason"`
 			Confirm    bool   `json:"confirm"`
 		}
-		if err := req.BindStrict(&body); err != nil {
+		if err := plugin.BindStrict(req, &body); err != nil {
 			return nil, plugin.Errorf(http.StatusBadRequest, "target, selection, reason, and confirmation are required")
 		}
 		validSelection := statusIDPattern.MatchString(body.PostID) || (body.Target == "audit" && body.PostID == "" && body.SnapshotID != nil)
@@ -249,7 +392,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		var body struct {
 			AuthToken string `json:"i,omitempty"`
 		}
-		if err := req.BindStrict(&body); err != nil {
+		if err := plugin.BindStrict(req, &body); err != nil {
 			return nil, plugin.Errorf(http.StatusBadRequest, "invalid request")
 		}
 		return s.ReadRateLimitSettingsResponse(req.Context())
@@ -260,26 +403,15 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 			return nil, plugin.Errorf(http.StatusForbidden, "administrator permission required")
 		}
 		var body struct {
-			AuthToken            string                  `json:"i,omitempty"`
-			Revision             int64                   `json:"revision"`
-			AuthenticatedPerHour int                     `json:"authenticatedPerHour"`
-			AuthenticatedPerDay  int                     `json:"authenticatedPerDay"`
-			GlobalPerHour        int                     `json:"globalPerHour"`
-			RoleLimits           []roleRateLimitResponse `json:"roleLimits"`
+			AuthToken     string `json:"i,omitempty"`
+			Revision      int64  `json:"revision"`
+			GlobalPerHour int    `json:"globalPerHour"`
 		}
-		if err := req.BindStrict(&body); err != nil || body.Revision < 1 {
+		if err := plugin.BindStrict(req, &body); err != nil || body.Revision < 1 {
 			return nil, plugin.Errorf(http.StatusBadRequest, "invalid rate limit settings")
 		}
 		settings := rateLimitSettings{
-			Revision: body.Revision, AuthenticatedPerHour: body.AuthenticatedPerHour,
-			AuthenticatedPerDay: body.AuthenticatedPerDay, GlobalPerHour: body.GlobalPerHour,
-			RoleLimits: make(map[string]coldFetchBudget, len(body.RoleLimits)),
-		}
-		for _, role := range body.RoleLimits {
-			if _, duplicate := settings.RoleLimits[role.RoleID]; duplicate {
-				return nil, plugin.Errorf(http.StatusBadRequest, "duplicate role rate limit")
-			}
-			settings.RoleLimits[role.RoleID] = coldFetchBudget{PerHour: role.PerHour, PerDay: role.PerDay}
+			Revision: body.Revision, GlobalPerHour: body.GlobalPerHour,
 		}
 		result, err := s.UpdateRateLimitSettings(req.Context(), req.UserID(), settings)
 		switch {
@@ -295,6 +427,10 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 }
 
 func publicEntry(entry *CacheEntry, noteID string) *CacheEntry {
+	return publicEntryForMode(entry, noteID, "officialEmbed")
+}
+
+func publicEntryForMode(entry *CacheEntry, noteID, videoPlaybackMode string) *CacheEntry {
 	if entry == nil || entry.Post == nil {
 		return entry
 	}
@@ -305,9 +441,21 @@ func publicEntry(entry *CacheEntry, noteID string) *CacheEntry {
 	for i := range post.Images {
 		post.Images[i].URL = mediaPath(post.ID, "image", i, noteID)
 	}
+	playbackToken := ""
+	if videoPlaybackMode == "nativeProxy" {
+		playbackToken = entry.PlaybackToken
+	}
+	post.Videos = rewriteVideoMetadata(post.Videos, post.ID, "main", noteID, playbackToken)
 	if post.Video != nil {
 		video := *post.Video
 		video.PosterURL = mediaPath(post.ID, "poster", 0, noteID)
+		if videoPlaybackMode == "nativeProxy" {
+			video.EmbedToken = ""
+			video.EmbedExpiresAt = nil
+		} else if videoPlaybackMode == "linkOnly" {
+			video.EmbedToken = ""
+			video.EmbedExpiresAt = nil
+		}
 		post.Video = &video
 	}
 	if post.Quote != nil {
@@ -317,9 +465,17 @@ func publicEntry(entry *CacheEntry, noteID string) *CacheEntry {
 		for i := range quote.Images {
 			quote.Images[i].URL = mediaPath(post.ID, "quote-image", i, noteID)
 		}
+		quote.Videos = rewriteVideoMetadata(quote.Videos, post.ID, "quote", noteID, playbackToken)
 		if post.Quote.Video != nil {
 			video := *post.Quote.Video
 			video.PosterURL = mediaPath(post.ID, "quote-poster", 0, noteID)
+			if videoPlaybackMode == "nativeProxy" {
+				video.EmbedToken = ""
+				video.EmbedExpiresAt = nil
+			} else if videoPlaybackMode == "linkOnly" {
+				video.EmbedToken = ""
+				video.EmbedExpiresAt = nil
+			}
 			quote.Video = &video
 		}
 		post.Quote = &quote
@@ -328,6 +484,52 @@ func publicEntry(entry *CacheEntry, noteID string) *CacheEntry {
 	return &copyEntry
 }
 
+func rewriteVideoMetadata(videos []PublicVideoMetadata, postID, target, noteID, token string) []PublicVideoMetadata {
+	result := append([]PublicVideoMetadata(nil), videos...)
+	for i := range result {
+		result[i].PosterURL = mediaPath(postID, videoPosterKind(target), i, noteID)
+		result[i].PlaybackURL = ""
+		if result[i].Provider == "x" && result[i].PlaybackAvailable && token != "" {
+			result[i].PlaybackURL = videoPlaybackPath(postID, target, i, noteID, token)
+		}
+	}
+	return result
+}
+
+func videoPosterKind(target string) string {
+	if target == "quote" {
+		return "quote-poster"
+	}
+	return "poster"
+}
+
+func videoPlaybackPath(postID, target string, index int, noteID, token string) string {
+	return "/api/plugin/fxtwitter-preview/media/video/" + url.PathEscape(postID) + "/" + target + "/" + strconv.Itoa(index) + "?noteId=" + url.QueryEscape(noteID) + "&token=" + url.QueryEscape(token)
+}
+
 func mediaPath(postID, kind string, index int, noteID string) string {
 	return "/api/plugin/fxtwitter-preview/media/" + postID + "/" + kind + "/" + strconv.Itoa(index) + "?noteId=" + url.QueryEscape(noteID)
+}
+
+func checkedPreviewAllowed(req plugin.Request) bool {
+	allowed, _, err := checkedPreviewPolicy(req)
+	return err == nil && allowed
+}
+
+func checkedPreviewPolicy(req plugin.Request) (bool, coldFetchBudget, error) {
+	policyReq, ok := req.(plugin.CheckedRolePolicyRequest)
+	if !ok || req.UserID() == "" {
+		return false, coldFetchBudget{}, errors.New("checked role policy lookup is unavailable")
+	}
+	policies, err := policyReq.CheckedRolePolicies("canUseFxTwitterPreview", "fxTwitterColdFetchesPerHour", "fxTwitterColdFetchesPerDay")
+	if err != nil {
+		return false, coldFetchBudget{}, err
+	}
+	allowed, ok := policies["canUseFxTwitterPreview"].(bool)
+	hour, hourOK := policies["fxTwitterColdFetchesPerHour"].(int)
+	day, dayOK := policies["fxTwitterColdFetchesPerDay"].(int)
+	if !ok || !hourOK || !dayOK || hour < 1 || hour > 10000 || day < 1 || day > 100000 {
+		return false, coldFetchBudget{}, errors.New("checked FxTwitter role policies are invalid")
+	}
+	return allowed, coldFetchBudget{PerHour: hour, PerDay: day}, nil
 }

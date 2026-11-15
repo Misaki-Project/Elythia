@@ -278,6 +278,9 @@ func (s *Server) buildCore(w *wiring, idGen id.Generator, roleService *corerole.
 	notificationService := corenotification.NewService(s.redis.Default, idGen, s.config.Redis.KeyPrefix(),
 		s.background) // #3661: 世代の停止で送り切る
 	notificationHook := corenotification.NewHook(notificationService, userRepo)
+	// 実績・投票の終了・アプリ・予約投稿の通知は Service を直接呼ぶので、受け取りの設定の
+	// 判定を Service にも渡す (#4058)
+	notificationService.SetReceiveConfigChecker(notificationHook)
 	webhookService := corewebhook.NewService(s.queueClient, webhookRepo, systemWebhookRepo, s.config.URL)
 	// payload の投稿を包む Packer (#3790)。follow / unfollow の Webhook は main stream と
 	// 同じ共有の userpack の Packer で包む (#3269、#3330)。
@@ -285,6 +288,8 @@ func (s *Server) buildCore(w *wiring, idGen id.Generator, roleService *corerole.
 	webhookReactionHook := corewebhook.NewReactionCreateHook(webhookService, idGen, entityPacker)
 	webhookFollowingHook := corewebhook.NewFollowingHook(webhookService, sharedUserPacker)
 	mutingService := coremuting.NewService(userRepo, mutingRepo, idGen)
+	// Service を直接呼ぶ通知 (絵文字の申請) にもミュートを効かせる (#4065)
+	notificationService.SetMuteChecker(mutingService)
 	renoteMutingService := coremuting.NewRenoteService(userRepo, renoteMutingRepo, idGen)
 	// note 著者にブロックされた user の投票を弾く (upstream youHaveBeenBlocked、#1538)。
 	pollService := corepoll.NewService(noteRepo, pollRepo, pollVoteRepo, followingRepo, idGen, blockingService)
@@ -305,6 +310,8 @@ func (s *Server) buildCore(w *wiring, idGen id.Generator, roleService *corerole.
 	// 監査ログ (#3678)。
 	driveService := coredrive.NewService(driveFileRepo, driveFolderRepo, driveStorage, idGen,
 		entityPacker, roleService, modLogService, userRepo)
+	// プロフィールの alwaysMarkNsfw / autoSensitive をアップロードに効かせる (#4057)。
+	driveService.SetUploaderProfiles(userRepo)
 	imgProcessor := coredrive.NewDefaultImageProcessor()
 	driveReader := coretransfer.NewRepoBackedDriveReader(driveFileRepo, driveStorage)
 	importer := coretransfer.NewImporter(coretransfer.ImporterDeps{

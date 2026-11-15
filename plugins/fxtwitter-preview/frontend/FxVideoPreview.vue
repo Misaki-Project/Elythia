@@ -4,118 +4,244 @@ SPDX-License-Identifier: AGPL-3.0-only
 -->
 <template>
 <MkSensitiveMediaGuard v-model:revealed="revealed" :isSensitive="isSensitive" kind="video">
-	<div :class="[$style.video, { [$style.videoIdle]: embedUrl == null, [$style.videoPlaying]: embedUrl != null }]" :data-fx-video-target="target">
-		<img v-if="embedUrl == null && posterSrc && !posterFailed" :class="$style.poster" :src="posterSrc" alt="動画のプレビュー" loading="lazy" @error="posterFailed = true">
-		<iframe v-if="embedUrl != null" ref="iframe" :class="$style.frame" :src="embedUrl" :style="{ height: frameHeight + 'px' }" scrolling="no" sandbox="allow-popups allow-popups-to-escape-sandbox allow-scripts allow-same-origin" allow="fullscreen; web-share" referrerpolicy="strict-origin-when-cross-origin" title="Xの投稿" @error="failEmbed(generation)"></iframe>
-		<button v-if="canPlay && embedUrl == null" type="button" :class="$style.play" data-fx-video-play :disabled="embedState === 'loading'" @click.stop="play">{{ embedState === 'loading' ? '接続中…' : 'Xの投稿を表示' }}</button>
-		<div v-if="embedState === 'failed'" :class="$style.videoError">埋め込みを表示できませんでした。</div>
-	</div>
-	<a :href="sourceHref" target="_blank" rel="nofollow noopener noreferrer" @click.stop>Xで投稿を開く</a>
+	<figure :class="$style.video" :data-fx-video-target="target" :data-video-index="index">
+		<button
+			type="button"
+			class="_button"
+			:class="$style.posterButton"
+			data-fx-video-play
+			:disabled="!canPlay || state === 'loading'"
+			:aria-label="state === 'loading' ? '動画を準備しています' : '動画を再生'"
+			@click.stop="play"
+		>
+			<img v-if="posterSrc" :class="$style.poster" :src="posterSrc" alt="" loading="lazy">
+			<span v-else :class="$style.posterPlaceholder" aria-hidden="true"><i class="ti ti-video"></i></span>
+			<span :class="$style.playIcon" aria-hidden="true"><i :class="state === 'loading' ? 'ti ti-loader-2' : 'ti ti-player-play-filled'"></i></span>
+		</button>
+		<figcaption :class="$style.details">
+			<span v-if="durationLabel" :class="$style.duration">{{ durationLabel }}</span>
+			<span v-else :class="$style.duration">動画 {{ index + 1 }}</span>
+			<span v-if="state === 'loading'" :class="$style.status">準備中…</span>
+			<span v-else-if="state === 'error'" :class="$style.status" role="status">{{ terminalError ? '動画へのアクセスが許可されていません。' : '動画を読み込めませんでした。' }}</span>
+			<a v-if="state === 'error' && postHref" :class="$style.sourceLink" :href="postHref" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ sourceLinkLabel }}</a>
+			<button v-if="state === 'error' && !terminalError" type="button" class="_button" :class="$style.retry" @click.stop="play">再試行</button>
+		</figcaption>
+	</figure>
 </MkSensitiveMediaGuard>
 </template>
 
 <script lang="ts" setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { api, apiSession } from './api.js';
-import type { PreviewContext } from '@/plugin-api.js';
+import { api, apiSession, fetchPluginResource, openPluginMedia } from './api.js';
+import type { PreviewContext, PluginMediaItem } from '@/plugin-api.js';
 import type { PublicVideo } from './api.js';
+import { loadPreview } from './preview-loader.js';
 import { MkSensitiveMediaGuard } from '@/plugin-api.js';
+import { fetchPreparedPublicBlob, isHttpForbidden, readBoundedMediaBlob } from './public-media.js';
+import type { PreparedPublicMedia } from './public-media.js';
 
-const props = defineProps<{ video: PublicVideo; posterSrc: string | null; cachePostId: string; contentPostId: string; target: 'main' | 'quote'; context: PreviewContext; isSensitive?: boolean }>();
-const iframe = ref<HTMLIFrameElement | null>(null);
+const props = defineProps<{
+	video: PublicVideo;
+	index: number;
+	cachePostId: string;
+	contentPostId: string;
+	target: 'main' | 'quote';
+	context: PreviewContext;
+	isSensitive?: boolean;
+}>();
+
+const MAX_VIDEO_BYTES = 64 * 1024 * 1024;
 const revealed = ref(false);
-const posterFailed = ref(false);
-const embedUrl = ref<string | null>(null);
-const embedState = ref<'idle' | 'loading' | 'failed'>('idle');
-const frameHeight = ref(360);
-const sourceHref = computed(() => 'https://x.com/i/status/' + props.contentPostId);
-const canPlay = computed(() => props.context.detail && props.context.revealed && props.context.active && props.context.inViewport && revealed.value && props.context.source?.kind === 'note' && props.video.embedToken != null && props.video.provider === 'x');
-let nonce = '';
+const posterSrc = ref<string | null>(null);
+const state = ref<'idle' | 'loading' | 'error'>('idle');
+const terminalError = ref(false);
+const activeVideo = ref(props.video);
+let posterController: AbortController | null = null;
+let playbackController: AbortController | null = null;
+let posterObjectUrl: string | null = null;
 let generation = 0;
-let controller: AbortController | null = null;
-let frameTimer: number | null = null;
 
-function stop(): void {
+const sourceNoteId = computed(() => props.context.source?.kind === 'note' ? props.context.source.noteId : null);
+const postHref = computed(() => /^[0-9]{2,20}$/.test(props.contentPostId) ? `https://x.com/i/status/${props.contentPostId}` : null);
+const sourceLinkLabel = computed(() => props.target === 'quote' ? 'Xで引用投稿を開く' : 'Xで投稿を開く');
+const canAccess = computed(() => props.context.detail && props.context.revealed && props.context.active && revealed.value && sourceNoteId.value != null);
+const canLoad = computed(() => canAccess.value && props.context.inViewport);
+const canPlay = computed(() => canLoad.value && activeVideo.value.provider === 'x' && activeVideo.value.playbackAvailable === true && activeVideo.value.playbackUrl != null);
+const durationLabel = computed(() => formatDuration(activeVideo.value.durationMs));
+
+function formatDuration(value?: number): string | null {
+	if (value == null || !Number.isFinite(value) || value < 0) return null;
+	const total = Math.floor(value / 1000);
+	return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+function validPublicUrl(value: unknown): void {
+	if (typeof value !== 'string') throw new Error('invalid URL');
+	const url = new URL(value, window.location.origin);
+	if (url.origin !== window.location.origin || url.hash !== '' || url.search !== '' || !/^\/api\/plugin\/fxtwitter-preview\/public-media\/[a-f0-9]{32}\.(?:jpg|jpeg|png|webp|avif|mp4)$/.test(url.pathname) || !url.pathname.endsWith('.mp4')) throw new Error('invalid public video URL');
+}
+
+function revokePoster(): void {
+	if (posterObjectUrl != null) URL.revokeObjectURL(posterObjectUrl);
+	posterObjectUrl = null;
+	posterSrc.value = null;
+}
+
+function stopPlayback(): void {
 	generation++;
-	controller?.abort(); controller = null;
-	if (frameTimer != null) window.clearTimeout(frameTimer);
-	frameTimer = null; embedUrl.value = null; nonce = ''; embedState.value = 'idle'; frameHeight.value = 360;
+	playbackController?.abort();
+	playbackController = null;
+	if (state.value === 'loading') state.value = 'idle';
 }
 
-function validatedEmbedURL(value: unknown): string | null {
-	if (typeof value !== 'string' || !value.startsWith('https://platform.twitter.com/embed/index.html?')) return null;
+async function loadPoster(): Promise<void> {
+	const noteId = sourceNoteId.value;
+	const path = props.video.posterUrl;
+	if (!canLoad.value || noteId == null || path == null || posterSrc.value != null || posterController != null) return;
+	const kind = props.target === 'main' ? 'poster' : 'quote-poster';
+	const expectedPath = `/api/plugin/fxtwitter-preview/media/${props.cachePostId}/${kind}/${props.index}`;
+	const source = new URL(path, window.location.origin);
+	if (source.origin !== window.location.origin || source.hash !== '' || source.pathname !== expectedPath || source.searchParams.size !== 1 || source.searchParams.get('noteId') !== noteId) return;
+	const controller = new AbortController();
+	posterController = controller;
 	try {
-		const parsed = new URL(value);
-		if (parsed.origin !== 'https://platform.twitter.com' || parsed.protocol !== 'https:' || parsed.username !== '' || parsed.password !== '' || parsed.port !== '' || parsed.pathname !== '/embed/index.html' || parsed.hash !== '') return null;
-		const expected: Record<string, string> = { id: props.contentPostId, embedId: nonce, theme: 'light', lang: 'ja', hideCard: 'false', hideThread: 'false', dnt: 'true' };
-		if (Array.from(parsed.searchParams).length !== Object.keys(expected).length || Object.entries(expected).some(([key, expectedValue]) => parsed.searchParams.getAll(key).length !== 1 || parsed.searchParams.get(key) !== expectedValue)) return null;
-		return parsed.href;
-	} catch { return null; }
+		const prepared = await api<PreparedPublicMedia>('media/prepare', { noteId, postId: props.cachePostId, kind, index: props.index }, { signal: controller.signal });
+		if (!canLoad.value || controller.signal.aborted) return;
+		const blob = await fetchPreparedPublicBlob(prepared, { expectedType: 'image', maxBytes: MAX_VIDEO_BYTES, signal: controller.signal });
+		if (!canLoad.value || controller.signal.aborted) return;
+		posterObjectUrl = URL.createObjectURL(blob);
+		posterSrc.value = posterObjectUrl;
+	} catch (error) {
+		// Only the backend's explicit private-YouTube response permits the old
+		// authenticated poster route. Arbitrary poster URLs stay rejected.
+		const code = (error as { code?: unknown } | null)?.code;
+		const status = (error as { status?: unknown } | null)?.status;
+		if (status === 409 && code === 'PRIVATE_MEDIA_ONLY' && props.video.provider === 'external' && canLoad.value && !controller.signal.aborted) {
+			try {
+				const response = await fetchPluginResource(`${source.pathname}${source.search}`, { method: 'GET', cache: 'no-store', signal: controller.signal });
+				const mime = response.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase();
+				const length = response.headers.get('Content-Length');
+				if (response.ok && (length == null || /^\d+$/.test(length) && Number(length) <= MAX_VIDEO_BYTES) && ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'].includes(mime ?? '') && !controller.signal.aborted && canLoad.value) {
+					const blob = await readBoundedMediaBlob(response, { maxBytes: MAX_VIDEO_BYTES, expectedType: mime!, signal: controller.signal });
+					if (!controller.signal.aborted && blob.type.toLowerCase() === mime) {
+						posterObjectUrl = URL.createObjectURL(blob);
+						posterSrc.value = posterObjectUrl;
+					}
+				}
+			} catch { /* optional poster */ }
+		}
+	} finally {
+		if (posterController === controller) posterController = null;
+	}
 }
 
-function failEmbed(current: number): void {
-	if (current !== generation) return;
-	if (frameTimer != null) window.clearTimeout(frameTimer);
-	frameTimer = null; controller?.abort(); controller = null; embedUrl.value = null; embedState.value = 'failed';
-}
-
-function playbackIsActive(): boolean {
-	return canPlay.value;
+function validatePlaybackUrl(value: unknown, noteId: string): string {
+	if (typeof value !== 'string' || !value.startsWith('/')) throw new Error('invalid playback capability');
+	const url = new URL(value, window.location.origin);
+	const expectedPath = `/api/plugin/fxtwitter-preview/media/video/${props.cachePostId}/${props.target}/${props.index}`;
+	if (url.origin !== window.location.origin || url.hash !== '' || url.pathname !== expectedPath || url.searchParams.size !== 2 || url.searchParams.get('noteId') !== noteId || !url.searchParams.has('token') || url.searchParams.get('token') === '') throw new Error('invalid playback capability');
+	return value;
 }
 
 async function play(): Promise<void> {
-	const source = props.context.source;
-	if (!canPlay.value || source?.kind !== 'note' || embedState.value === 'loading') return;
+	const noteId = sourceNoteId.value;
+	if (!canPlay.value || noteId == null || activeVideo.value.playbackUrl == null || state.value === 'loading' || terminalError.value) return;
+	const refreshDescriptor = state.value === 'error';
 	const current = ++generation;
-	const request = new AbortController(); controller = request;
-	const bytes = new Uint8Array(16); crypto.getRandomValues(bytes);
-	nonce = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
-	embedState.value = 'loading';
+	const controller = new AbortController();
+	playbackController = controller;
+	state.value = 'loading';
 	try {
-		const result = await api<{ url: string }>('embed/shell', { noteId: source.noteId, postId: props.cachePostId, token: props.video.embedToken, target: props.target, theme: 'light', lang: 'ja', nonce }, { signal: request.signal });
-		// Both the signal and reactive context may change while the host API is pending.
-		if (request.signal.aborted || current !== generation || !playbackIsActive()) return;
-		const url = validatedEmbedURL(result.url);
-		if (url == null) throw new Error('invalid official embed URL');
-		embedUrl.value = url;
-		// A load event cannot attest that the remote post rendered. Only a
-		// source- and nonce-checked resize message acknowledges the embed.
-		frameTimer = window.setTimeout(() => failEmbed(current), 15_000);
-	} catch { failEmbed(current); }
+		if (refreshDescriptor) {
+			const refreshed = await loadPreview({ kind: 'url', href: `https://x.com/i/status/${props.cachePostId}` }, props.context, controller.signal);
+			if (controller.signal.aborted || current !== generation || !canLoad.value) return;
+			const post = refreshed.state === 'ready' || refreshed.state === 'stale' ? refreshed.post : undefined;
+			if (post?.id !== props.cachePostId) throw new Error('refreshed post ownership mismatch');
+			const refreshedContent = props.target === 'quote' ? post?.quote : post;
+			if (refreshedContent?.id !== props.contentPostId || (refreshedContent.isSensitive === true) !== (props.isSensitive === true)) {
+				terminalError.value = true;
+				state.value = 'error';
+				return;
+			}
+			const videos = props.target === 'quote' ? refreshedContent.videos ?? (refreshedContent.video ? [refreshedContent.video] : []) : refreshedContent.videos ?? (refreshedContent.video ? [refreshedContent.video] : []);
+			const refreshedVideo = videos[props.index];
+			if (refreshedVideo == null || refreshedVideo.provider !== 'x' || refreshedVideo.playbackAvailable !== true || refreshedVideo.playbackUrl == null || (activeVideo.value.mediaIdentity != null && refreshedVideo.mediaIdentity !== activeVideo.value.mediaIdentity)) {
+				terminalError.value = true;
+				state.value = 'error';
+				return;
+			}
+			activeVideo.value = refreshedVideo;
+		}
+		const playbackUrl = validatePlaybackUrl(activeVideo.value.playbackUrl, noteId);
+		const prepared = await api<PreparedPublicMedia>('media/prepare', {
+			noteId,
+			postId: props.cachePostId,
+			kind: 'video',
+			target: props.target,
+			index: props.index,
+			playbackUrl,
+		}, { signal: controller.signal });
+		if (controller.signal.aborted || current !== generation || !canPlay.value) return;
+		validPublicUrl(prepared.url);
+		const blob = await fetchPreparedPublicBlob(prepared, { expectedType: 'video', maxBytes: MAX_VIDEO_BYTES, signal: controller.signal });
+		if (controller.signal.aborted || current !== generation || !canPlay.value) return;
+		const item: PluginMediaItem = { id: `${props.contentPostId}:video:${props.index}`, type: 'video', blob, filename: `x-${props.contentPostId}-${props.index + 1}.mp4`, isSensitive: props.isSensitive === true, initiallyRevealed: true };
+		await openPluginMedia([item], item.id);
+		if (current === generation) state.value = 'idle';
+	} catch (error) {
+		if (current === generation && !controller.signal.aborted) {
+			terminalError.value = isHttpForbidden(error);
+			state.value = 'error';
+		}
+	} finally {
+		if (playbackController === controller) playbackController = null;
+	}
 }
 
-function onMessage(event: MessageEvent): void {
-	if (embedUrl.value == null || event.origin !== 'https://platform.twitter.com' || event.source !== iframe.value?.contentWindow) return;
-	const embed = (event.data as Record<string, unknown> | null)?.['twttr.embed'] as { method?: unknown; id?: unknown; params?: Array<{ height?: unknown }> } | undefined;
-	if (embed?.method !== 'twttr.private.resize' || embed.id !== nonce) return;
-	const height = embed.params?.[0]?.height;
-	if (typeof height !== 'number' || !Number.isFinite(height)) return;
-	if (frameTimer != null) window.clearTimeout(frameTimer);
-	frameTimer = null; frameHeight.value = Math.max(180, Math.min(1000, height));
-}
-
-watch(canPlay, value => { if (!value) stop(); });
-watch(apiSession, stop);
-watch(() => [props.video, props.contentPostId, props.cachePostId, props.target, props.context.source?.noteId], () => { posterFailed.value = false; stop(); });
-onMounted(() => window.addEventListener('message', onMessage));
-onBeforeUnmount(() => { stop(); window.removeEventListener('message', onMessage); });
+watch(canAccess, value => {
+	if (!value) {
+		posterController?.abort();
+		posterController = null;
+		revokePoster();
+		stopPlayback();
+	}
+});
+watch(() => props.context.inViewport, value => {
+	if (value && canLoad.value) void loadPoster();
+	else if (!value) {
+		posterController?.abort();
+		posterController = null;
+		stopPlayback();
+	}
+});
+watch(apiSession, () => { revokePoster(); stopPlayback(); });
+watch(() => [props.video, props.index, props.cachePostId, props.contentPostId, props.target, sourceNoteId.value], () => {
+	activeVideo.value = props.video;
+	terminalError.value = false;
+	state.value = 'idle';
+	revokePoster();
+	stopPlayback();
+	if (canLoad.value) void loadPoster();
+});
+onMounted(() => { if (canLoad.value) void loadPoster(); });
+onBeforeUnmount(() => {
+	posterController?.abort();
+	stopPlayback();
+	revokePoster();
+});
 </script>
 
 <style lang="scss" module>
-.poster { display: block; width: 100%; max-height: 420px; object-fit: cover; background: var(--MI_THEME-bg); }
-.video { position: relative; background: var(--MI_THEME-bg); }
-.videoPlaying { display: flex; justify-content: center; width: 100%; }
-.videoIdle { min-height: 220px; aspect-ratio: 16 / 9; overflow: hidden; }
-.videoIdle::after { position: absolute; z-index: 1; inset: 0; content: ''; background: rgba(0, 0, 0, 0.22); pointer-events: none; }
-.videoIdle > .poster { position: absolute; inset: 0; width: 100%; height: 100%; max-height: none; object-fit: cover; }
-.frame { display: block; flex: 0 1 560px; width: 100%; max-width: 560px; margin-inline: auto; overflow: hidden; border: 0; background: var(--MI_THEME-panel); }
-.externalVideoLink { position: absolute; z-index: 2; top: 8px; right: 8px; padding: 6px 10px; border-radius: 999px; color: #fff; background: rgba(0, 0, 0, 0.78); font-size: 0.78em; text-decoration: none; }
-.externalVideoLink:focus-visible { outline: 3px solid var(--MI_THEME-accent); outline-offset: 2px; }
-.play { position: absolute; z-index: 2; top: 50%; left: 50%; transform: translate(-50%, -50%); width: max-content; max-width: calc(100% - 28px); padding: 10px 16px; border: 0; border-radius: 999px; color: white; background: rgba(0, 0, 0, 0.84); font: inherit; cursor: pointer; }
-.play:focus-visible { outline: 3px solid var(--MI_THEME-accent); outline-offset: 2px; }
-.videoError { position: absolute; z-index: 2; right: 12px; bottom: 10px; left: 12px; color: white; text-align: center; font-size: 0.85em; pointer-events: none; }
-@media (max-width: 480px) {
-	.videoIdle { min-height: 180px; }
-	.play { width: calc(100% - 28px); }
-}
+.video { min-width: 0; margin: 0; padding: 0 10px 10px; }
+.posterButton { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border-radius: var(--MI-radius); background: var(--MI_THEME-bg); cursor: pointer; }
+.posterButton:disabled { cursor: default; }
+.posterButton:focus-visible { outline: 3px solid var(--MI_THEME-accent); outline-offset: 2px; }
+.poster { display: block; width: 100%; height: 100%; object-fit: cover; object-position: center; }
+.posterPlaceholder { display: grid; width: 100%; height: 100%; place-items: center; color: var(--MI_THEME-fgTransparentWeak); font-size: 2em; }
+.playIcon { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font-size: 3em; text-shadow: 0 1px 8px rgb(0 0 0 / 65%); background: rgb(0 0 0 / 18%); }
+.details { display: flex; min-height: 2em; align-items: center; gap: 10px; padding-top: 5px; color: var(--MI_THEME-fgTransparentWeak); font-size: 0.82em; }
+.duration { flex: 0 0 auto; }
+.status { min-width: 0; overflow-wrap: anywhere; }
+.sourceLink { color: var(--MI_THEME-link); white-space: nowrap; }
+.retry { margin-inline-start: auto; color: var(--MI_THEME-accent); }
 </style>

@@ -15,7 +15,10 @@
 | 連合テスト (Mastodon) | Elythia ↔ 本物の Mastodon の引用の承認 (FEP-044f) | Docker Compose多段 | `make federation-mastodon-e2e` (起動から撤去まで通し) |
 | Drop-in e2e (pytest) | TS-A backend を mk-A に差し替えて state preservation 検証 | TS 2 instance + mk overlay | `make dropin-swap-test` (#365 / #367 / #372 / #374、詳細は[dropin-e2e.md](dropin-e2e.md)) |
 | Drop-in frontend e2e (cypress) | 3 TS instance + mk overlay swap で frontend 視点の互換 | cypress + 3 TS + mk-A | `make dropin-frontend-swap-test` (#380 / #381 / #387 / #394、詳細は[dropin-frontend-e2e.md](dropin-frontend-e2e.md)) |
-| Playwright e2e | Elythia と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、370 spec ファイル。PR ごとに Elythia、upstream 追従時に TS backend) |
+| Playwright e2e | Elythia と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、397 spec ファイル。PR ごとに Elythia、upstream 追従時に TS backend) |
+| fuzz | 連合の相手が中身を決める入力を読む関数(署名のヘッダ、公開鍵、JSON-LDの正規化、ActivityPubの型、リモートのHTML、ホスト、ソフトウェアの照合) | 不要(`internal/core/federation`と`mkqdriver`はRedisをtestcontainersで立てる) | `make fuzz` (詳細は[fuzz](#fuzz-4116)) |
+| 前のリリースからの更新 | 前のリリースの image で作った DB を、今のコードで`migrate up`して引き継げるか | PostgreSQL / Redis (compose) + 前の版の image + Elythia バイナリ | `make upgrade-test` (詳細は[前のリリースからの更新](#前のリリースからの更新-4123)) |
+| /api.json から入力を作る検査 | 全エンドポイント (外す一覧を除く) の 5xx・宣言に無い status・宣言の型に合わない応答 | PostgreSQL / Redis (compose) + Elythia バイナリ | `make schemathesis-test` (詳細は[/api.json から入力を作る検査](#apijson-から入力を作る検査-4118)) |
 | fuzz (画像デコーダ) | `internal/misc/imagedecode` のデコーダと判定関数 | 不要 | `make fuzz-imagedecode` (詳細は[画像デコーダの fuzz](#画像デコーダの-fuzz-3480)) |
 | 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体正本のまま Elythia に向けて実行 (UserLite の期待DTOにローカル連合状態を追加) | PostgreSQL / Redis + Elythia バイナリ | `make upstream-e2e` (#2347、25 ファイル 1256 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
 
@@ -276,9 +279,9 @@ make federation-misskey-down
 
 `tests/playwright/` 配下の spec を Elythia と Misskey TS の **両 backend** で並列実行し、drop-in 互換 regression を PR ごとに検出する基盤。
 
-- 範囲: 370 spec ファイル (upstream 339 = ui 243 / api 96、elythia 31) / 41 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
+- 範囲: 397 spec ファイル (upstream 339 = ui 243 / api 96、elythia 58) / 43 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
 - トリガー: `pull_request` (paths フィルタ) + `workflow_dispatch`。**nightly ではない** (#2291 で移行)。`.github/workflows/playwright.yml`
-- **7 シャード並列** (`PLAYWRIGHT_SHARD=i/7`、所要時間で割り振る。`fail-fast: false`)。1 スタックに対しては直列でしか回せない (共有の root と instance meta を spec が取り合う) ので、並列度はシャードごとに独立した stack を立てて稼ぐ (#2609)
+- **11 シャード並列** (`PLAYWRIGHT_SHARD=i/11`、所要時間で割り振る。`fail-fast: false`)。1 スタックに対しては直列でしか回せない (共有の root と instance meta を spec が取り合う) ので、並列度はシャードごとに独立した stack を立てて稼ぐ (#2609)
 - **TS backend は `workflow_dispatch` 専用**で PR では回らない。upstream が変わらない限り答えも変わらないため、追従する本家の版を上げたタイミングだけ回す
 - spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/elythia/` の 25 件 (16 件は Elythia 独自機能を見るので公式 image では通らない。7 件は全ルートの表 (#4041) で、Elythia 独自のルートを含む。残る 2 件は spec の helper のガードで、1 つの backend で見れば足りる)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している。`specs/upstream/ui/` にも、Elythia で足した `data-testid` で要素を取るために公式 image では落ちる spec がある ([docs/playwright.md](playwright.md#elythia-で足した-data-testid-を使う-spec-は公式-image-では落ちる))
 
@@ -420,6 +423,73 @@ make dropin-frontend-swap-test     # TS-A → mk-A 切替まで含む end-to-end
 ```
 
 nightly 19:00 UTC で `dropin-frontend-e2e` を実行 (`.github/workflows/dropin-frontend-e2e.yml`)。
+
+## fuzz (#4116)
+
+外から来る入力を読む関数のfuzz。対象は`git ls-files '*_test.go' | xargs grep -h '^func Fuzz'`で並ぶもので、2026-11-10の時点で14個(画像デコーダの4つを除く)。
+
+- **確かめること:** panicしないこと、5秒のうちに返ること(各ファイルの`within`。Goのfuzzは1入力の時間の上限を持たないため)、性質のはっきりしたものはその性質
+  - 冪等であること。`Normalize`と`NormalizeGateHost`は、もう一度かけても変わらない。`NormalizeActivity`は、正規化した本文(`act.raw`)から読み直しても同じactor・id・typeになる。正規化した本文は、Followへの`Accept`に入れて外へ送るため
+  - 範囲を読んだ直後とキャッシュから読んだ答えが同じこと(`semverrange.Satisfies`)
+  - 決定的であること(同じ入力で2回呼んで同じ結果)。`json.Unmarshal`で読む`Note`などの型、`FromHTML`、ソフトウェアの照合。`encoding/json`はほぼ常に決定的なので、これらは主にpanicと時間を見る対象
+  - `APLenient*`の型には`MarshalJSON`が無いので、書き戻して読み直す往復は確かめない
+- **普通の`go test`では種と`testdata/fuzz/`の入力だけが流れる。** 新しい入力を探すのは`make fuzz`と、毎日の`fuzz` workflow([ci.md](ci.md#schedule-で回る-workflow))
+- **`TestMain`がRedisを立てるパッケージ(`internal/core/federation`、`internal/queue/driver/mkqdriver`)は、fuzzのworkerの数だけRedisのコンテナを立てる。** workerは`TestMain`から起動し直されるため。Dockerが要る
+- **見つかった入力は`testdata/fuzz/<関数名>/`に書かれる。** 直したら、その入力をコミットする。以後は必須の`test`で毎回流れる。CIで見つかったものはartifact `fuzz-findings`に残る(公開のリポジトリでは、ログとartifactは誰でも読める。脆弱性に当たりそうなものは、artifactを消してから手元で直し、PRだけを出す)
+
+```bash
+make fuzz                                 # 全部を2分ずつ(FUZZTIMEの既定)
+make fuzz FUZZ='^FuzzNormalize$' FUZZTIME=10m
+```
+
+## 前のリリースからの更新 (#4123)
+
+前のリリースのimage(`ghcr.io/elythia-network/elythia:<版>`)で作ったDBに、今のコードで`migrate up`して起動し、作ったデータが読めて書き足せるかを確かめる。運営者がリリースのたびに踏む順と同じ。空のDBへの`migrate up`とmigrationの往復のテストでは、前の版が実際に書いた行の上で新しいmigrationとコードが動くかは分からない。
+
+- **`make upgrade-test`で回す。** `tests/upgrade/run.sh`が、DBとRedisを作り直し、前の版のimageで`migrate`して起動し、`scenario.py seed`でデータを作る。前の版を止めて、`go build`した今のコードで`migrate up`して起動し、`scenario.py verify`で確かめる。片付けは`make upgrade-down`
+- **前の版は、HEADから辿れる最新のリリースのタグ(x.y.z。HEADそのものに付いたタグは除く)。** `UPGRADE_FROM=2.0.0`のように渡すと選べる。タグを読むので、`git fetch --tags`が要る
+- **作るデータ:** 利用者3人(管理者を含む)、公開範囲ごとのノート、CW、返信、リノート、フォロー、リアクション、ドライブのファイル(行だけ。ファイルの中身は引き継がない)、クリップ、アンテナ、ロールの割り当て
+- **確かめること:** 前の版のmigrationの後と今のコードの`migrate up`の後の版(`schema_migrations`)を出し、後のほうが最新のmigrationの番号と一致すること(新しいmigrationが無ければ注意を出す)、seedとverifyの相手が前の版と今のビルドであること(`/api/meta`の`mkGoVersion`と`mkGoCommit`)、tokenがそのまま使えること、パスワードでサインインできること、ノートの本文・公開範囲・返信・リノート・数、宛先指定のノートが宛先でない人に伏せられたままであること、フォロー、リアクションの行と数、ドライブのファイルの行、クリップ、アンテナ、ロール、更新した後にノートとリアクションを書き足せてタイムラインに出ること
+- **リリースの前に、`upgrade` workflowを手動で回す**([ci.md](ci.md))。PRでは、サーバーのコードかmigrationを変えたときに回る
+
+## /api.json から入力を作る検査 (#4118)
+
+[schemathesis](https://schemathesis.readthedocs.io/)で、`/api.json`の宣言から入力を作り、全エンドポイントへ送る。見るのは、5xxを返さないこと、宣言に無いstatusを返さないこと、応答が宣言の型に合うこと。
+
+- **`make schemathesis-test`で回す。** `tests/schemathesis/run.sh`が、DBとRedis(`compose.yml`)を作り直し、`go build`したElythiaをホストで起動し、最初の利用者として管理者を作って、そのtokenで送る。frontendは要らない。片付けは`make schemathesis-down`
+- **外すエンドポイントは`tests/schemathesis/exclude.tsv`。** 検査に使う管理者やtokenを壊すもの、インスタンスの設定を変えるもの、渡したURLや相手を外へ取りに行くことが目的のもの。理由には叩くと何が起きるかを書く。どのpathにも当たらない行があると`run.sh`が落ちる
+  - IDやhostを引数に持つだけの口は外さない。webhookの作成やメールアドレスの確かめ(`email-address/available`はMXを引く)のように、作られた値で外への通信を試みる口は残っている。作られる値(`"0"`など)では、実際にインターネットへ出ることはまず無い
+- **宣言どおりの入力だけを送る(`--mode positive`)。** 壊れたJSONや型の違う入力も送ると、本家と同じFastifyの形の400(`FST_ERR_CTP_INVALID_JSON_BODY`など)が宣言のエラーの形と合わず、ほぼ全部の口で食い違いが出て、ほかの失敗が埋もれる。同じ理由で、文字列はUTF-8で表せるものだけにする(`--generation-codec utf-8`。対になっていないサロゲートはJSONの本文にならない)
+- **IDの書式(`misskey:id`)は`tests/schemathesis/hooks.py`で教える。** schemathesisはこの書式を知らず、教えないと半分以上の入力が引数の検証で弾かれる
+- **Elythia自身は全てのインターフェースで待ち受ける**(設定で待ち受けのアドレスを選べない)。rate limitを切っているので、手元では同じLANから見えないホストで回す。tokenは`docker compose run`の引数に載るので、共有のホストでは`ps`から見える(報告のファイルでは伏せられる)
+- **入力は乱数で作るので、見つかるものは実行ごとに変わる。** 2026-11-10の実行では、約500の口に約14,000件を送り、2xxまで届いた口が275、失敗のある口と検査の組が82だった(5xx 18、宣言に無いstatus 43、宣言の型に合わない応答 21)。IDの書式を教える前の試走では、流し直すたびに新しい失敗が14〜22件出た。schemathesisの既知の失敗の一覧(`--baseline`)は収束しないので使わない。見つかったものは原因ごとにissueへ切り出して直す
+- **2026-11-10の実行で出た5xxのうち、本家と同じなので残しているものが4つある(#4120)。** 毎週の結果に出続けるが、直すものではない。ほかの5xxが出たら、#4120と同じく原因を見て直す
+  - `chat/rooms/join`: 招待が無いとき。本家の`findOneByOrFail`と同じ500
+  - `admin/federation/refresh-remote-instance-metadata`: 登録の無いホストのとき。本家の`instance not found`と同じ500
+  - `users/show`: リモートの利用者を解決できないとき。本家の`FAILED_TO_RESOLVE_REMOTE_USER`は種類が`server`なので500
+  - `admin/announcements/create`: 存在しない`userId`のとき。本家と同じく外部キーの違反で500
+- **本家と同じ応答で、本家の宣言(`/api.json`)のほうが合っていない食い違いがある(#4121)。** 毎週の結果に出続けるが、Elythiaの応答は本家に揃えてあるので直さない
+  - `__proto__`のキーを含む本文に、本家のFastifyと同じ形の400(`FST_ERR_CTP_INVALID_JSON_BODY`。`statusCode`・`code`・`error`・`message`)を返す。宣言のエラーの形(`error`がobject)と合わない。schemathesisは宣言が許す余分なキーとして`__proto__`を作るので、多くの口で出る
+  - `meta`の`clientOptions`: 本家はDBの値(列の既定は`'{}'`)をそのまま返すので、新しいサーバーでは`{}`になり、宣言が必須とする`entrancePageStyle`などが無い
+  - ロールの`condFormula`: 本家の`paramDef`は`{type:'object'}`だけで、送られた値をそのまま保存して返すので、`{}`のような宣言の`oneOf`のどれにも当たらない値も返る
+  - ロールの`policies`: 宣言は値を数値か真偽値に限るが、`chatAvailability`は文字列(`available`など)
+  - `users`・`admin/show-users`などの`UserDetailed`: 宣言の`oneOf`の2つ以上に当たる(本家の宣言のあいまいさ)
+  - `pages/create`のブロックの中身: 利用者が送った形をそのまま返すので、宣言の`PageBlock`の`oneOf`に当たらないことがある
+  - `drive/files/create`の本文の無い400: 本家と同じく、fileの無い・読めないmultipartに返す。schemathesisはJSONでない応答として報告する。schemathesisが作るpartのheaderの制御文字は、本家は通しElythiaは読めないとして断る([approximations.md](divergence/approximations.md))
+- **`/api.json`に出ないstatusがある(#4122)。** 本家の`/api.json`の組み立て(`gen-spec.ts`)は、エラーを全部400の例として載せ、400以外の個別のstatus(404・409・413・422・503など)の応答を載せない。Elythiaの`/api.json`も同じ組み立て(`internal/api/openapi/spec.go`)なので、次のstatusはschemathesisが「宣言に無い」と報告し続けるが、直すものではない
+  - 本家も同じstatusを返すもの: `users/show`と通報の3つの口(`admin/forward-abuse-user-report`など)、`admin/system-webhook/show`、`admin/abuse-report/notification-recipient/show`の404、`drive/files/create`の413、`i/update`の422、`fetch-rss`の422・503
+  - 本家にある口で、Elythiaが一時的に応じられないときに返す503: `charts/*`の`CHART_UNAVAILABLE`、WebAuthnが設定されていないときの`i/2fa`とpasskeyのログイン、パスワードの照合の枠が取れないときの`i/change-password`とログインの口(#2849)など
+  - 本家は500か204で、Elythiaが4xxにしているもの([approximations.md](divergence/approximations.md)と[security.md](divergence/security.md)に記録): 存在しない行への404(`admin/show-user`、`admin/queue/show-job`、`users/achievements`など)、`admin/accounts/create`の使われているusernameと`admin/roles/assign`の付いているロールへの409
+  - Elythia独自の口の404・503(申請、バブルゲームの対戦、チャットの招待、分割アップロードの中止、承認制の登録が無効のときの503など)。宣言(`elythia_apidoc.json`)にエラーを足しても、組み立ては400の例にしか載せないので、宣言では直らない
+- **結果は`tests/schemathesis/out/`に残る。** `python3 tests/schemathesis/summarize.py`が、検査と口ごとの表を出す。叩いた口が400に届かなければ落とす(起動や読み込みが壊れたのを、失敗の無い実行と取り違えないため)
+- **毎週の`schemathesis` workflowで回す**([ci.md](ci.md#schedule-で回る-workflow))。必須ではなく、見つかったものが直るまでは赤のままになる
+
+```bash
+make schemathesis-test                                  # 1 つの口に 20 件ずつ
+make schemathesis-test SCHEMATHESIS_MAX_EXAMPLES=5 SCHEMATHESIS_ARGS='--include-path-regex ^/notes/'
+SCHEMATHESIS_MIN_OPERATIONS=1 python3 tests/schemathesis/summarize.py   # 口を絞ったときは下限を下げる
+make schemathesis-down
+```
 
 ## 画像デコーダの fuzz (#3480)
 

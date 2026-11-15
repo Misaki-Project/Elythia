@@ -14,6 +14,31 @@ func rangeCfg(ranges ...PolicyRange) Config {
 	}
 }
 
+func TestFxTwitterQuotaRangesKeepIntegerBoundaries(t *testing.T) {
+	tests := []struct {
+		name             string
+		key              string
+		base, additional float64
+		wantErr          bool
+	}{
+		{"hour valid endpoints", "fxTwitterColdFetchesPerHour", 100, 25, false},
+		{"day upper endpoint", "fxTwitterColdFetchesPerDay", 100000, 0, false},
+		{"below minimum", "fxTwitterColdFetchesPerHour", 0, 1, true},
+		{"above maximum", "fxTwitterColdFetchesPerDay", 100000, 1, true},
+		{"fractional middle stage", "fxTwitterColdFetchesPerHour", 1, .5, true},
+		{"fractional base", "fxTwitterColdFetchesPerDay", 1.5, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := PolicyRange{Type: RangeMultiplier, Key: tt.key, Start: 1, End: 4, Base: tt.base, Additional: tt.additional}
+			err := validateRanges([]PolicyRange{r}, 4, defaultCatalog)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateRanges error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // cfgWithLevelUps builds a config whose reachable stages are 1..levelUps+1, so an
 // exact tiling of the policy ranges has to end at levelUps+2. curveBase is 1 rather
 // than 100 so a 9e15 level-up count still fits the MaxExperience aggregate bound.

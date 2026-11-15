@@ -15,7 +15,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
+  BACKUP_SPEC_DIR,
   durationsFromReports,
+  listShardedSpecFiles,
   listSpecFiles,
   loadDurations,
   mergeDurations,
@@ -91,6 +93,9 @@ test('writesMeta detects the endpoints that write the meta', () => {
   assert.equal(writesMeta('await callApi(request, `admin/roles/update-default-policies`, {})'), true);
   assert.equal(writesMeta("await callApi(request, 'admin/meta', { i })"), false);
   assert.equal(writesMeta("await callApi(request, 'admin/update-meta-secrets', { i })"), false);
+  // meta を書く helper (fixtures/admin_table.ts) を呼ぶ spec も meta を書く
+  assert.equal(writesMeta('({ page }) => runMetaRow({ page }, row)'), true);
+  assert.equal(writesMeta('import { runMetaRowLike } from x; runMetaRowLike(a)'), false);
 });
 
 test('durationsFromReports sums every attempt per file', () => {
@@ -110,6 +115,15 @@ test('durationsFromReports sums every attempt per file', () => {
 });
 
 // ここから実際のリポジトリの状態を見る
+
+test('the shards leave out the specs of the backup stack', () => {
+  const all = listSpecFiles(here);
+  const sharded = listShardedSpecFiles(here);
+  const backup = 'specs/backup/backup_restore.spec.ts';
+  assert.ok(all.includes(backup), `${backup} not listed`);
+  assert.ok(!sharded.includes(backup), `${backup} is in the shards`);
+  assert.deepEqual(sharded, all.filter((f) => !f.startsWith(BACKUP_SPEC_DIR)));
+});
 
 test('spec listing finds the known specs', () => {
   const files = listSpecFiles(here);
@@ -151,8 +165,8 @@ test('the duration record has no entry for a removed spec', () => {
 
 test('the duration record covers most specs', () => {
   // 新しい spec は記録が無くても平均で割り振られるが、記録の無い spec が
-  // 増えるほど偏る。2 割を超えたら記録を作り直す
-  const files = listSpecFiles(here);
+  // 増えるほど偏る。2 割を超えたら記録を作り直す。shard に入らない specs/backup/ は数えない
+  const files = listShardedSpecFiles(here);
   const durations = loadDurations(here);
   const missing = files.filter((f) => typeof durations[f] !== 'number');
   assert.ok(missing.length <= files.length * 0.2, `${missing.length} specs have no record: run node shard-plan.mjs update`);

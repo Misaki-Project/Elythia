@@ -84,7 +84,7 @@ migration 連番は `migration/00NNNN_*.up.sql` の命名規則に従う (= 各 
 
 ### 2-2. triage doc を作成
 
-release ごとの差分 doc `docs/update/<yyyymm><nn>diff.md` (命名は 3 章。直近は [`20261001diff.md`](./update/20261001diff.md)) を新規作成する。古い前例には `docs/update/yyyymmdd-<tracker-issue>-triage.md` (`docs/update/20260512-947-triage.md`) の形もある。
+release ごとの差分 doc `docs/update/<yyyymm><nn>diff.md` (命名は 3 章。直近は [`20261100diff.md`](./update/20261100diff.md)) を新規作成する。古い前例には `docs/update/yyyymmdd-<tracker-issue>-triage.md` (`docs/update/20260512-947-triage.md`) の形もある。
 
 各 upstream commit について:
 - `git -C .cache/misskey/mirror.git show <sha>` で diff 精読
@@ -124,6 +124,8 @@ mirror (`.cache/misskey/mirror.git`、無ければ作る) に今の版 (`UPSTREA
 | 付け替える | `packages/backend/assets/` / 直下の `assets/` | `frontend/assets/` / `frontend/repo-assets/` へ当てる (D3) |
 | 作り直す | `pnpm-lock.yaml` | 当てない。手順 4 で作り直す |
 | 取り込まない | `packages/backend` (アセットを除く)、`.github/`、`.config/`、`Dockerfile`、文書類など。Elythia が `frontend/` から外したもの (Storybook の `packages/frontend/.storybook/`・`*.stories.impl.ts`・`*.stories.meta.ts`・`src/index.mdx` (#4027)、本家の frontend の e2e の `packages/frontend/test/e2e/` (`shared.ts` を除く)・`playwright.config.ts` (#4025)) | 当てない。外したものへの本家の変更を当てようとすると、当てる先が無くて止まるため。Storybook の依存の版上げなど `package.json` への変更は「取り込む」の側で衝突するので、足し戻さずに消す側で解く |
+
+**Elythia の語は `frontend/locales-elythia/` に置いている (#4071)。** 本家に無いディレクトリなので、取り込みでは触れない。`frontend/locales/` は本家のファイルをそのまま持つので、本家の `locales/` の変更は衝突せずに当たる。
 
 **どの区分にも当たらないパスがあると、何も当てずに止まる。** 本家が直下に新しく足したファイルや、submodule の gitlink の変更が該当する。「取り込む」で絞るだけだと新しいパスが黙って落ちるため。止まったら、そのパスの区分を決めて `tools/upstreamsync/main.go` の表 (`importFiles` / `importDirs` / `skipFiles` / `skipDirs`。Elythia が `frontend/` から外したパスなら `removedDirs` / `removedFiles` / `removedSuffixes`、外したディレクトリの中で残すものは `keptInRemovedDirs`) と設計 D1 の表の両方に足し、`go test ./tools/upstreamsync/` を通してからやり直す。
 
@@ -250,7 +252,7 @@ git add internal/api/paramschema/upstream_paramdefs.json internal/api/paramschem
   - `TestGoldenAJVConfigIsWhatThisPackageImplements`: 本家がajvの版・設定・formatを変えた。ajvの変更点を読み、検証器の挙動を合わせてからテストの期待値を更新する
   - `TestCorpusRejectsAtEveryReachableKeyword`: 本家のparamDefのkeywordの位置のうち、corpusにそのschemaPathで拒否されたcaseが無いものがある。新しい形のparamDefに生成器(`corpus.mjs`の`mutate`)が届いていない。生成器を直す。errors[0]にならない位置なら、`coverage_test.go`の規則か個別の項目に理由と一緒に足す(使われなくなった規則や項目があっても落ちる)
   - `TestConformsToAJVCorpus`の個々の不一致: 検証器とajvの判定が食い違った。不一致を例外にして通さず、検証器を直す
-- **goldenはバイナリに埋め込まれる。** 本番で検証だけを走らせて本家と判定が分かれる件数を数える仕組み(#3677、[param-shadow.md](param-shadow.md))が、このgoldenで判定する。作り直したgoldenは、次のビルドから数え方に効く
+- **goldenはバイナリに埋め込まれる。** 本番で引数を検証して本家と同じ400で拒否する仕組み(#3742、[param-shadow.md](param-shadow.md))が、このgoldenで判定する。作り直したgoldenは、次のビルドから本番の拒否の判定に効くので、`TestEnforcedEndpointsMatchTheCorpus`(DBとDockerが要る)を通してから出す
 - CIでは、`apicompat` workflowの`make upstream-check`が`paramdef-gen`を流して差分が無いことを見る。corpusとの一致は、nodeの要らない`go test`として`test`(`test-shards`)で走る
 - **goldenには`/api.json`の材料も入る**(#3810)。endpointごとの`doc`(metaの`description` / `tags` / `errors` / `res`と、`limit`の有無)、応答の型の定義の`refs`(本家の`misc/json-schema.ts`)、`endpoint-list.ts`の外で登録されるrouteの名前の`directRoutes`(本家の`ApiServerService.ts`)。chartの`res`は本家の`getJsonSchema`を`extract.mjs`の`chartJsonSchema`で同じように組み立てる。本家がこれらに新しい書き方を使い始めたときも、`unresolved values`で落ちる
 - **`paramdef-gen`の後に`make openapi-upstream-check`を流す**(Dockerが要る)。本家の公式image(`misskey/misskey:<版>`)の中で本家の`genOpenapiSpec`を呼んで`/api.json`を書き出し、`internal/api/openapi`が作る文書の本家互換の部分(全endpointのpathと`components`)と項目の順まで比べる。goldenの抜き出しかGoへの移植(`internal/api/openapi`)のどちらかがずれると、`TestSpecMatchesUpstreamAPIJSON`が落ちる。本家の`gen-spec.ts` / `schemas.ts` / `errors.ts`が変わっていたら、`internal/api/openapi`を合わせる。imageをpullするので`make gates`にもCIにも入れていない
@@ -312,7 +314,24 @@ make upstream-fetch   # .cache/misskey/<版> が無ければ
 cd frontend && node scripts/check-locale-coverage.mjs --write-allowlist ../.cache/misskey/$(cat ../UPSTREAM_MISSKEY_VERSION)/locales
 ```
 
-本家の ja-JP に無い語 (Elythia の語) と、本家の en-US にある語が抜けていると、許可リストを書かずに落ちる。前者は en-US に英訳を足し、後者は本家の en-US から写す。
+本家の ja-JP に無い語 (Elythia の語) と、本家の en-US にある語が抜けていると、許可リストを書かずに落ちる。前者は `frontend/locales-elythia/en-US.yml` に英訳を足し、後者は本家の en-US から写す。
+
+### 本家の版を上げた後に必須: Elythia の語が書き換える本家の語の一覧
+
+`frontend/scripts/check-locale-overrides.mjs` (CI では `frontend` workflow の `frontend-lint`、手元では `make frontend-check`) は、Elythia の語 (`frontend/locales-elythia/`) が本家の語を書き換える・消すのを、`frontend/locales-elythia/overrides.tsv` にあるキーだけに許す (#4071)。本家の `locales/` を取り込むと、次のどれかで落ちることがある。
+
+- **本家が、Elythia が足した語と同じキーを足した。** Elythia の語が本家の語を上書きする形になる。Elythia の語のキーを変えるか、上書きしてよいなら理由を付けて一覧に足す
+- **本家の文が、Elythia が書き換えた文と同じになった。** `locales-elythia/<言語>.yml` のその行を消す。どの言語でも書き換えなくなったら、一覧の行も消す
+- **本家が、Elythia が書き換えていた語を消した、またはキーを変えた。** 一覧の行が使われなくなって落ちる。Elythia の文の行は新しい語として残るので、要るかを見て、要らなければ消す。空文字の行は消すものが無くなったと落ちるので、消す。検査が目印にしている `introMisskey` がそうなったときは、終了コード 2 (検査を信用できない) で落ちるので、目印を別の書き換えている語に変える
+
+あわせて、`make upstream-check` (CI では `apicompat`) が `frontend/locales/` が本家の版と同じかを見る。取り込みの途中で本家のファイルに手を入れると落ちる。
+
+### 本家の版を上げた後に必須: 日本語の直書きの許可リスト
+
+`frontend/scripts/check-hardcoded-japanese.mjs` (CI では `frontend` workflow の `frontend-lint`、手元では `make frontend-check`) は、`frontend/packages` の画面の文言を日本語で直書きしていないかを見る (#4070)。例外の `frontend/scripts/hardcoded-japanese-allowlist.tsv` には、本家にもともとある直書きと、訳さないもの (支援者の名前、言語名、見本の文字) を入れている。本家を取り込むと、次のどちらかで落ちることがある。
+
+- **本家が日本語の直書きを足した。** 本家の直書きなら、ファイルと文の組を、どこで画面に出るかの理由と一緒に許可リストに足す。支援者の名前が増えたときも同じ
+- **本家が直書きを消したか、文を変えた。** 許可リストの行が使われなくなって落ちる。その行を消すか、新しい文に直す
 
 ### 本家の版を上げた後に必須: divergence doc の件数
 
@@ -433,7 +452,8 @@ Elythia 側の挙動に引きずられていた箇所が 19 件見つかり、�
 失敗した spec を見るときは以下に注意する。
 
 - Elythia には `docs/divergence.md` に記録した**意図的な差分**がある
-  (例: `NO_SUCH_*` を upstream は 400、Elythia は意味的に正確な 404 で返す)。
+  (例: 本家が 500 を返す口で、Elythia が 4xx を返すもの。`NO_SUCH_*` の 404 は
+  #2345 / #4122 で本家と同じ 400 に揃えた)。
   spec 側は `tests/playwright/fixtures/backend.ts` の `NOT_FOUND_STATUS` の
   ように backend ごとの期待値で吸収する。ただし**この逃げ道を足すたびに、その
   spec は parity を証明しなくなる**ので、安易に増やさない

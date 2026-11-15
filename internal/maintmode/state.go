@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/elythia-network/elythia/internal/misc/jsdate"
 )
 
 // Phases of a maintenance, as stored in the state hash.
@@ -105,22 +107,22 @@ var ErrNotActive = errors.New("maintmode: no maintenance is active")
 // State is the maintenance currently requested. A nil *State means the
 // processes should serve normally.
 type State struct {
-	Phase       string    `json:"phase"`
-	OpID        string    `json:"opId"`
-	Kind        string    `json:"kind"`
-	Reason      string    `json:"reason"`
-	StartedAt   time.Time `json:"startedAt"`
-	RequestedBy string    `json:"requestedBy"`
+	Phase       string      `json:"phase"`
+	OpID        string      `json:"opId"`
+	Kind        string      `json:"kind"`
+	Reason      string      `json:"reason"`
+	StartedAt   jsdate.Time `json:"startedAt"`
+	RequestedBy string      `json:"requestedBy"`
 	// LeaseUntil is refreshed by the backup service while it drives an
 	// operation (#3463 (6c)). Zero for a manual maintenance.
-	LeaseUntil time.Time `json:"leaseUntil"`
+	LeaseUntil jsdate.Time `json:"leaseUntil,omitzero"`
 
 	// The fields below are written by the judge.
 
 	// HeldAt is when the judge moved the maintenance to held.
-	HeldAt time.Time `json:"heldAt"`
+	HeldAt jsdate.Time `json:"heldAt,omitzero"`
 	// JudgedAt is when the judge last looked.
-	JudgedAt time.Time `json:"judgedAt"`
+	JudgedAt jsdate.Time `json:"judgedAt,omitzero"`
 	// WaitingFor lists the processes whose report is not drained yet.
 	WaitingFor []string `json:"waitingFor"`
 	// Blockers are the sessions on the database at JudgedAt. While held, a
@@ -148,15 +150,15 @@ func (s *State) Holding() bool {
 // OpenConns / InFlight / Error are shown by `elythia maintenance status` and
 // are never used to judge that the database has been let go.
 type ProcReport struct {
-	ID        string    `json:"id"`
-	Role      string    `json:"role"`
-	Version   string    `json:"version"`
-	Commit    string    `json:"commit"`
-	State     string    `json:"state"`
-	OpenConns int       `json:"openConns"`
-	InFlight  int64     `json:"inFlight"`
-	Error     string    `json:"error"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID        string      `json:"id"`
+	Role      string      `json:"role"`
+	Version   string      `json:"version"`
+	Commit    string      `json:"commit"`
+	State     string      `json:"state"`
+	OpenConns int         `json:"openConns"`
+	InFlight  int64       `json:"inFlight"`
+	Error     string      `json:"error"`
+	UpdatedAt jsdate.Time `json:"updatedAt"`
 }
 
 // Store reads and writes the maintenance state in Redis.
@@ -197,10 +199,10 @@ func (s *Store) Get(ctx context.Context) (*State, error) {
 		Kind:        m["kind"],
 		Reason:      m["reason"],
 		RequestedBy: m["requestedBy"],
-		StartedAt:   parseTime(m["startedAt"]),
-		LeaseUntil:  parseTime(m["leaseUntil"]),
-		HeldAt:      parseTime(m["heldAt"]),
-		JudgedAt:    parseTime(m["judgedAt"]),
+		StartedAt:   jsdate.NewTime(parseTime(m["startedAt"])),
+		LeaseUntil:  jsdate.NewTime(parseTime(m["leaseUntil"])),
+		HeldAt:      jsdate.NewTime(parseTime(m["heldAt"])),
+		JudgedAt:    jsdate.NewTime(parseTime(m["judgedAt"])),
 		JudgeError:  m["judgeError"],
 	}
 	// 判定役が書く欄は表示のためのもの。壊れていたら空として読む。
@@ -235,7 +237,7 @@ func (s *Store) Enter(ctx context.Context, st State) error {
 		st.Phase = PhaseEntering
 	}
 	if st.StartedAt.IsZero() {
-		st.StartedAt = time.Now()
+		st.StartedAt = jsdate.NewTime(time.Now())
 	}
 	if st.OpID == "" {
 		st.OpID = "op-" + randomHex()
@@ -246,10 +248,10 @@ func (s *Store) Enter(ctx context.Context, st State) error {
 		"kind", st.Kind,
 		"reason", st.Reason,
 		"requestedBy", st.RequestedBy,
-		"startedAt", formatTime(st.StartedAt),
+		"startedAt", formatTime(st.StartedAt.Time),
 	}
 	if !st.LeaseUntil.IsZero() {
-		args = append(args, "leaseUntil", formatTime(st.LeaseUntil))
+		args = append(args, "leaseUntil", formatTime(st.LeaseUntil.Time))
 	}
 	n, err := enterScript.Run(ctx, s.rdb, []string{s.StateKey()}, args...).Int()
 	if err != nil {
@@ -435,7 +437,7 @@ func (s *Store) notify(ctx context.Context) {
 // Report writes the report of one process with ProcTTL.
 func (s *Store) Report(ctx context.Context, r ProcReport) error {
 	if r.UpdatedAt.IsZero() {
-		r.UpdatedAt = time.Now()
+		r.UpdatedAt = jsdate.NewTime(time.Now())
 	}
 	key := s.ProcKey(r.ID)
 	// 全部の欄を毎回書くので、前の報告の欄は残らない。
@@ -448,7 +450,7 @@ func (s *Store) Report(ctx context.Context, r ProcReport) error {
 		"openConns": strconv.Itoa(r.OpenConns),
 		"inFlight":  strconv.FormatInt(r.InFlight, 10),
 		"error":     r.Error,
-		"updatedAt": formatTime(r.UpdatedAt),
+		"updatedAt": formatTime(r.UpdatedAt.Time),
 	})
 	pipe.Expire(ctx, key, ProcTTL)
 	if _, err := pipe.Exec(ctx); err != nil {
@@ -487,7 +489,7 @@ func (s *Store) Reports(ctx context.Context) ([]ProcReport, error) {
 			OpenConns: openConns,
 			InFlight:  inFlight,
 			Error:     m["error"],
-			UpdatedAt: parseTime(m["updatedAt"]),
+			UpdatedAt: jsdate.NewTime(parseTime(m["updatedAt"])),
 		})
 	}
 	if err := iter.Err(); err != nil {

@@ -46,7 +46,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 				<MkSwitch v-if="policyKind === 'boolean'" :modelValue="Boolean(range.value)" :disabled="readonly" @update:modelValue="value => range.value = value">
 					<template #label>{{ i18n.ts._roleLevel.constantValue }}</template>
 				</MkSwitch>
-				<MkInput v-else-if="policyKind === 'number'" :modelValue="Number(range.value)" type="number" :min="isGenshinRefresh ? 1 : undefined" :max="isGenshinRefresh ? 1440 : undefined" :step="isGenshinRefresh ? 1 : undefined" :readonly="readonly" @update:modelValue="value => updateConstant(range, value)">
+				<MkInput v-else-if="policyKind === 'number'" :modelValue="Number(range.value)" type="number" :min="fxQuotaBounds?.min ?? (isGenshinRefresh ? 1 : undefined)" :max="fxQuotaBounds?.max ?? (isGenshinRefresh ? 1440 : undefined)" :step="(fxQuotaBounds || isGenshinRefresh) ? 1 : undefined" :readonly="readonly" @update:modelValue="value => updateConstant(range, value)">
 					<template #label>{{ i18n.ts._roleLevel.constantValue }}</template>
 				</MkInput>
 				<MkSelect v-else-if="policyKind === 'enum'" :modelValue="String(range.value)" :items="enumItems" :readonly="readonly" @update:modelValue="value => range.value = value">
@@ -69,8 +69,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 			<template v-else-if="range.type === 'multiplier'">
 				<div :class="$style.valueColumns">
-					<MkInput :modelValue="range.base" type="number" :readonly="readonly" @update:modelValue="value => updateMultiplier(range, 'base', value)"><template #label>{{ i18n.ts._roleLevel.multiplierBase }}</template></MkInput>
-					<MkInput :modelValue="range.additional" type="number" :readonly="readonly" @update:modelValue="value => updateMultiplier(range, 'additional', value)"><template #label>{{ i18n.ts._roleLevel.multiplierAdditional }}</template></MkInput>
+					<MkInput :modelValue="range.base" type="number" :min="fxQuotaBounds?.min" :max="fxQuotaBounds?.max" :step="fxQuotaBounds ? 1 : undefined" :readonly="readonly" @update:modelValue="value => updateMultiplier(range, 'base', value)"><template #label>{{ i18n.ts._roleLevel.multiplierBase }}</template></MkInput>
+					<MkInput :modelValue="range.additional" type="number" :min="fxQuotaBounds ? -fxQuotaBounds.max : undefined" :max="fxQuotaBounds?.max" :step="fxQuotaBounds ? 1 : undefined" :readonly="readonly" @update:modelValue="value => updateMultiplier(range, 'additional', value)"><template #label>{{ i18n.ts._roleLevel.multiplierAdditional }}</template></MkInput>
 				</div>
 				<MkFolder defaultOpen>
 					<template #icon><i class="ti ti-calculator"></i></template>
@@ -122,6 +122,7 @@ const numericPolicyKeys = new Set([
 	'genshinRefreshIntervalMinutes',
 	'hsrRefreshIntervalMinutes', 'hsrUidLimit',
 	'genshinUidLimit',
+	'fxTwitterColdFetchesPerHour', 'fxTwitterColdFetchesPerDay',
 	'inviteExpirationTime', 'inviteLimit', 'inviteLimitCycle', 'maxFileSizeMb', 'mentionLimit',
 	'noteDraftLimit', 'noteEachClipsLimit', 'pinLimit', 'rateLimitFactor', 'scheduledNoteLimit',
 	'userEachUserListsLimit', 'userListLimit', 'webhookLimit', 'wordMuteLimit',
@@ -140,6 +141,11 @@ const policyKind = computed<'boolean' | 'number' | 'enum' | 'stringSet'>(() => {
 	return 'boolean';
 });
 const isGenshinRefresh = computed(() => props.policyKey === 'genshinRefreshIntervalMinutes' || props.policyKey === 'hsrRefreshIntervalMinutes');
+const fxQuotaBounds = computed(() => {
+	if (props.policyKey === 'fxTwitterColdFetchesPerHour') return { min: 1, max: 10000 };
+	if (props.policyKey === 'fxTwitterColdFetchesPerDay') return { min: 1, max: 100000 };
+	return undefined;
+});
 const rangeTypes = computed(() => [
 	{ label: i18n.ts._roleLevel.noPolicyChange, value: 'base' },
 	{ label: i18n.ts._roleLevel.constant, value: 'const' },
@@ -158,11 +164,16 @@ ensureTiling();
 watch(maxStage, ensureTiling);
 
 function defaultValue(): unknown {
-	return (instance.policies as unknown as Record<string, unknown>)[props.policyKey] ?? (isGenshinRefresh.value ? 10 : null);
+	const native = (instance.policies as unknown as Record<string, unknown>)[props.policyKey];
+	if (native != null) return native;
+	if (props.policyKey === 'fxTwitterColdFetchesPerHour') return 100;
+	if (props.policyKey === 'fxTwitterColdFetchesPerDay') return 600;
+	return isGenshinRefresh.value ? 10 : null;
 }
 
 function updateConstant(range: EditablePolicyRange, value: unknown): void {
 	if (isGenshinRefresh.value && !isGenshinRefreshInterval(value)) return;
+	if (fxQuotaBounds.value && (!Number.isInteger(Number(value)) || Number(value) < fxQuotaBounds.value.min || Number(value) > fxQuotaBounds.value.max)) return;
 	if ((props.policyKey === 'hsrUidLimit' || props.policyKey === 'genshinUidLimit') && (!Number.isInteger(Number(value)) || Number(value) < 0 || Number(value) > 100)) return;
 	range.value = Number(value);
 }
@@ -171,6 +182,7 @@ function updateMultiplier(range: EditablePolicyRange, key: 'base' | 'additional'
 	const base = key === 'base' ? value : range.base;
 	const additional = key === 'additional' ? value : range.additional;
 	if (isGenshinRefresh.value && !validGenshinRefreshMultiplier(base, additional, range.start, range.end)) return;
+	if (fxQuotaBounds.value && !validFxTwitterQuotaMultiplier(base, additional, range.start, range.end, fxQuotaBounds.value.min, fxQuotaBounds.value.max)) return;
 	range[key] = value;
 }
 
@@ -246,9 +258,14 @@ function removeRange(index: number): void {
 	if (!props.config) return;
 	const range = ranges.value[index];
 	if (!range) return;
+	const previous = ranges.value.map(item => ({ start: item.start, end: item.end }));
 	if (ranges.value.length > 1) {
 		if (index > 0) ranges.value[index - 1].end = range.end;
 		else ranges.value[1].start = range.start;
+	}
+	if (!validCurrentFxTwitterQuotaRanges()) {
+		ranges.value.forEach((item, i) => Object.assign(item, previous[i]));
+		return;
 	}
 	const configIndex = props.config.policyRanges.indexOf(range);
 	if (configIndex >= 0) props.config.policyRanges.splice(configIndex, 1);
@@ -256,12 +273,16 @@ function removeRange(index: number): void {
 }
 
 function updateStart(index: number, value: number): void {
+	const previous = ranges.value.map(range => ({ start: range.start, end: range.end }));
 	moveRangeStart(ranges.value, index, value);
+	if (!validCurrentFxTwitterQuotaRanges()) ranges.value.forEach((range, i) => Object.assign(range, previous[i]));
 	normalizeRefreshRanges();
 }
 
 function updateEnd(index: number, value: number): void {
+	const previous = ranges.value.map(range => ({ start: range.start, end: range.end }));
 	moveRangeEnd(ranges.value, index, value);
+	if (!validCurrentFxTwitterQuotaRanges()) ranges.value.forEach((range, i) => Object.assign(range, previous[i]));
 	normalizeRefreshRanges();
 }
 
@@ -274,8 +295,34 @@ function levelToStage(level: number): number {
 }
 
 function updateType(range: EditablePolicyRange, type: unknown): void {
+	const previousType = range.type;
+	const previousBase = range.base;
+	const previousAdditional = range.additional;
 	range.type = type as RoleLevelRangeType;
 	if (range.type === 'const' && range.value == null) range.value = defaultValue();
+	if (range.type === 'multiplier' && fxQuotaBounds.value) {
+		const fallback = Number(range.value ?? defaultValue());
+		range.base = Number.isFinite(fallback) ? fallback : fxQuotaBounds.value.min;
+		range.additional = Number.isInteger(range.additional) ? range.additional : 0;
+		if (!validFxTwitterQuotaMultiplier(range.base, range.additional, range.start, range.end, fxQuotaBounds.value.min, fxQuotaBounds.value.max)) range.additional = 0;
+	}
+	if (range.type !== 'multiplier' && previousType === 'multiplier') return;
+	if (!validCurrentFxTwitterQuotaRanges()) {
+		range.type = previousType;
+		range.base = previousBase;
+		range.additional = previousAdditional;
+	}
+}
+
+function validFxTwitterQuotaMultiplier(base: number, additional: number, start: number, end: number, min: number, max: number): boolean {
+	if (!Number.isInteger(base) || !Number.isInteger(additional)) return false;
+	const last = base + additional * Math.max(0, end - start - 1);
+	return base >= min && base <= max && last >= min && last <= max;
+}
+
+function validCurrentFxTwitterQuotaRanges(): boolean {
+	if (!fxQuotaBounds.value) return true;
+	return ranges.value.every(range => range.type !== 'multiplier' || validFxTwitterQuotaMultiplier(range.base, range.additional, range.start, range.end, fxQuotaBounds.value!.min, fxQuotaBounds.value!.max));
 }
 
 function stringSetValue(range: EditablePolicyRange): string {

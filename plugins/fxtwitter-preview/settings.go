@@ -7,16 +7,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"regexp"
-	"sort"
 	"time"
 )
 
-var (
-	errSettingsConflict = errors.New("rate limit settings were changed by another administrator")
-	roleIDPattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-)
+var errSettingsConflict = errors.New("rate limit settings were changed by another administrator")
 
 type rateLimitSettings struct {
 	Revision             int64
@@ -26,39 +20,19 @@ type rateLimitSettings struct {
 	RoleLimits           map[string]coldFetchBudget
 }
 
-type roleRateLimitResponse struct {
-	RoleID  string `json:"roleId"`
-	PerHour int    `json:"perHour"`
-	PerDay  int    `json:"perDay"`
-}
-
 type rateLimitSettingsResponse struct {
-	Revision             int64                   `json:"revision"`
-	AuthenticatedPerHour int                     `json:"authenticatedPerHour"`
-	AuthenticatedPerDay  int                     `json:"authenticatedPerDay"`
-	GlobalPerHour        int                     `json:"globalPerHour"`
-	RoleLimits           []roleRateLimitResponse `json:"roleLimits"`
-	UpdatedAt            time.Time               `json:"updatedAt"`
-	UpdatedBy            string                  `json:"updatedBy,omitempty"`
+	Revision      int64     `json:"revision"`
+	GlobalPerHour int       `json:"globalPerHour"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	UpdatedBy     string    `json:"updatedBy,omitempty"`
 }
 
 func validateRateLimitSettings(value rateLimitSettings) error {
-	if value.AuthenticatedPerHour < 1 || value.AuthenticatedPerHour > 10000 {
-		return errors.New("authenticatedPerHour must be between 1 and 10000")
-	}
-	if value.AuthenticatedPerDay < 1 || value.AuthenticatedPerDay > 100000 {
-		return errors.New("authenticatedPerDay must be between 1 and 100000")
-	}
 	if value.GlobalPerHour < 1 || value.GlobalPerHour > 100000 {
 		return errors.New("globalPerHour must be between 1 and 100000")
 	}
-	for roleID, limits := range value.RoleLimits {
-		if !roleIDPattern.MatchString(roleID) {
-			return fmt.Errorf("invalid role ID %q", roleID)
-		}
-		if limits.PerHour < 1 || limits.PerHour > 10000 || limits.PerDay < 1 || limits.PerDay > 100000 {
-			return fmt.Errorf("role %q limits are outside the allowed range", roleID)
-		}
+	if len(value.RoleLimits) != 0 {
+		return errors.New("role policies are managed through admin/roles")
 	}
 	return nil
 }
@@ -156,20 +130,9 @@ func (s *store) ReadRateLimitSettingsResponse(ctx context.Context) (rateLimitSet
 }
 
 func rateLimitResponse(value rateLimitSettings, updatedAt time.Time, updatedBy string) rateLimitSettingsResponse {
-	roleIDs := make([]string, 0, len(value.RoleLimits))
-	for roleID := range value.RoleLimits {
-		roleIDs = append(roleIDs, roleID)
-	}
-	sort.Strings(roleIDs)
-	roles := make([]roleRateLimitResponse, 0, len(roleIDs))
-	for _, roleID := range roleIDs {
-		limits := value.RoleLimits[roleID]
-		roles = append(roles, roleRateLimitResponse{RoleID: roleID, PerHour: limits.PerHour, PerDay: limits.PerDay})
-	}
 	return rateLimitSettingsResponse{
-		Revision: value.Revision, AuthenticatedPerHour: value.AuthenticatedPerHour,
-		AuthenticatedPerDay: value.AuthenticatedPerDay, GlobalPerHour: value.GlobalPerHour,
-		RoleLimits: roles, UpdatedAt: updatedAt, UpdatedBy: updatedBy,
+		Revision: value.Revision, GlobalPerHour: value.GlobalPerHour,
+		UpdatedAt: updatedAt, UpdatedBy: updatedBy,
 	}
 }
 
@@ -192,28 +155,16 @@ func (s *store) UpdateRateLimitSettings(ctx context.Context, actorID string, val
 	var updatedAt time.Time
 	err = tx.QueryRowContext(ctx, `
 		UPDATE rate_limit_settings SET
-			authenticated_per_hour = $1, authenticated_per_day = $2,
-			global_per_hour = $3, revision = revision + 1,
-			updated_at = now(), updated_by = $4
-		WHERE singleton = true AND revision = $5
+			global_per_hour = $1, revision = revision + 1,
+			updated_at = now(), updated_by = $2
+		WHERE singleton = true AND revision = $3
 		RETURNING revision, updated_at
-	`, value.AuthenticatedPerHour, value.AuthenticatedPerDay, value.GlobalPerHour, actorID, value.Revision).Scan(&revision, &updatedAt)
+	`, value.GlobalPerHour, actorID, value.Revision).Scan(&revision, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return rateLimitSettingsResponse{}, errSettingsConflict
 	}
 	if err != nil {
 		return rateLimitSettingsResponse{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM role_rate_limit`); err != nil {
-		return rateLimitSettingsResponse{}, err
-	}
-	for roleID, limits := range value.RoleLimits {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO role_rate_limit (role_id, per_hour, per_day, updated_at, updated_by)
-			VALUES ($1, $2, $3, $4, $5)
-		`, roleID, limits.PerHour, limits.PerDay, updatedAt, actorID); err != nil {
-			return rateLimitSettingsResponse{}, err
-		}
 	}
 	value.Revision = revision
 	if err := tx.Commit(); err != nil {
@@ -223,18 +174,9 @@ func (s *store) UpdateRateLimitSettings(ctx context.Context, actorID string, val
 }
 
 func effectiveBudgetFromSettings(value rateLimitSettings, roleIDs []string) coldFetchBudget {
-	result := coldFetchBudget{PerHour: value.AuthenticatedPerHour, PerDay: value.AuthenticatedPerDay}
-	for _, roleID := range roleIDs {
-		limits, ok := value.RoleLimits[roleID]
-		if !ok {
-			continue
-		}
-		if limits.PerHour > result.PerHour {
-			result.PerHour = limits.PerHour
-		}
-		if limits.PerDay > result.PerDay {
-			result.PerDay = limits.PerDay
-		}
-	}
-	return result
+	// Role policies are resolved by the host's checked admin/roles policy path.
+	// Stored role_rate_limit rows remain readable for migration compatibility but
+	// never override the host-resolved policy on an execution path.
+	_ = roleIDs
+	return coldFetchBudget{PerHour: value.AuthenticatedPerHour, PerDay: value.AuthenticatedPerDay}
 }

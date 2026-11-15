@@ -62,7 +62,7 @@ make dev
 | `make check` | `fmt` → `lint` → `actionlint` → `golangci-lint` → `test`。コミット前に必須 |
 | `make gates` | 静的 parity ゲートを一括実行 (内訳は下の「静的 parity ゲート」表) |
 | `make version` | Elythia / 互換 Misskey / 追従している本家 (`UPSTREAM_MISSKEY_VERSION`) のバージョンを表示 |
-| `make frontend-check` | `frontend/` の型チェック (`vue-tsc --noEmit`)、**`frontend/` のソースを読むゲート**、`emoji-regex-check` (#3324)、Elythia のファイルが `misskey-js` を直接 import していないかの検査 (#4028)、ja-JP の語が en-US にもあるかの検査 (#4047)、全ルートの Playwright の spec への対応付け (`playwright-route-check`、#4035)、**eslint** (#2906)。ビルド成果物を作らないので安全。ゲートは `frontend/` を本体で追跡するようになった (#3379) ので skip せず `make test` でも走るが、frontend を触ったときに手元でまとめて回せるよう、ここにも残している。**vitest は入っていない** (`make frontend-test`)。CI に同名の job はもう無く、CI では `frontend` workflow (`.github/workflows/frontend.yml`) が型・eslint・vitest・`emoji-regex-check` などを回す。同梱サンプル入りの統合バイナリの build は required の `build` job にある (#3379) |
+| `make frontend-check` | `frontend/` の型チェック (`vue-tsc --noEmit`)、**`frontend/` のソースを読むゲート**、`emoji-regex-check` (#3324)、Elythia のファイルが `misskey-js` を直接 import していないかの検査 (#4028)、ja-JP の語が en-US にもあるかの検査 (#4047)、全ルートの Playwright の spec への対応付け (`playwright-route-check`、#4035)、設定のページの `prefer.model` のキーの Playwright の設定の表への対応付け (`playwright-settings-check`、#4056)、管理画面の `admin/update-meta` のキーとロールのポリシーのキーの Playwright の管理画面の表への対応付け (`playwright-admin-settings-check`、#4066)、**eslint** (#2906)。ビルド成果物を作らないので安全。ゲートは `frontend/` を本体で追跡するようになった (#3379) ので skip せず `make test` でも走るが、frontend を触ったときに手元でまとめて回せるよう、ここにも残している。**vitest は入っていない** (`make frontend-test`)。CI に同名の job はもう無く、CI では `frontend` workflow (`.github/workflows/frontend.yml`) が型・eslint・vitest・`emoji-regex-check` などを回す。同梱サンプル入りの統合バイナリの build は required の `build` job にある (#3379) |
 | `make diff-check` | 差分比較ハーネスを作り直して実行 (クリーン DB 前提のため) |
 | `make playwright-check` | Playwright を作り直して実行 (同上) |
 | `make e2e-down-all` | 検証用スタックを一括撤去。**本番 project `mk` は対象外** |
@@ -137,6 +137,9 @@ cd mk && docker compose up -d
 | `make actionlint` | GitHub Actions の workflow を検査 (式の typo・存在しない `needs` 参照・`runs-on` の誤り・`run:` の中のシェルを shellcheck 経由で)。**CodeQL の `actions` とは別物** — あちらは script injection などのセキュリティを見るが、式が壊れているかは見ない。`lint` job から `make` 経由で呼ぶので、版の定義は Makefile に 1 つだけ置く |
 | `make test` | `go test ./... -v -race -count=1 -shuffle=3` (CI と同じテスト実行条件。PostgreSQL が要る → [testing.md](testing.md)) |
 | `make test-fast` | `-race` 抜き (反復用)。**コミット前の検査ではない** — CI で落ちるものが手元で緑になる |
+| `make upgrade-test` `upgrade-down` | 前のリリースで作ったDBを、今のコードが引き継げるかを確かめる(`UPGRADE_FROM`、[testing.md](testing.md#前のリリースからの更新-4123)) |
+| `make schemathesis-test` `schemathesis-down` | `/api.json`の宣言から入力を作り、全エンドポイントへ送る(`SCHEMATHESIS_MAX_EXAMPLES` / `SCHEMATHESIS_ARGS`、[testing.md](testing.md#apijson-から入力を作る検査-4118)) |
+| `make fuzz` | 画像デコーダ以外の fuzz (`FUZZTIME` / `FUZZ` / `FUZZPARALLEL`、[testing.md](testing.md#fuzz-4116)) |
 | `make fuzz-imagedecode` | 画像デコーダの fuzz (`FUZZTIME` / `FUZZ` / `FUZZPARALLEL`)。デコーダの依存を上げたら回す ([testing.md](testing.md#画像デコーダの-fuzz-3480)) |
 | `make frontend-test` | fork frontend の vitest (#2844) |
 | `make plugin-vet` | 同梱プラグインを`go vet` + 既定無効を検査（CIの`build` jobの2 step相当） |
@@ -145,6 +148,8 @@ cd mk && docker compose up -d
 | `make emoji-regex-check` | `make emoji-regex` の生成物と snapshot (正規表現と mfm-js / emoji-data の版) が、`frontend/` の `@elythia-network/mfm` から作り直したものと一致するか。node_modules が要るので `make gates` には入れず、手元では `make frontend-check` から、CI では `frontend` workflow の `frontend-lint` job から呼ばれる (#3324) |
 | `make route-coverage` | テストの層のアクセスログか `route-hits.json` を集計し、どの `/api` のエンドポイントが 2xx・3xx で通ったかを Markdown で出す (#4037)。`ROUTE_INPUTS` (必須、`.json` は集計済みとして足す)、`ROUTE_LAYER`、`ROUTE_OUT` (集計を JSON で書く)、`ROUTE_REQUIRE` (2xx で通っていなければ落とすエンドポイント、既定 `notes/create`)。`ROUTE_FLAGS` には `-gate -layers <層,...>` (`uncovered.tsv` との突き合わせ、#4039) か `-layers <層,...> -write-uncovered <パス>` (`uncovered.tsv` を作り直す。リダイレクトで書かない) を渡す。CI の `upstream-backend-e2e`・`playwright`・`diff-e2e` の `API coverage` job が使う。読み方は [ci.md](ci.md#api-の通過の集計-4037) |
 | `make playwright-route-check` | frontend の全ルート (`router.definition.ts` の `ROUTE_DEF`) が、Playwright の spec の宣言 (`coversRoutes`) か、許可リスト・保留のリストのどれかに載っているか。`tests/playwright` の node_modules が要るので `make gates` には入れず、手元では `make frontend-check` から、CI では `frontend` workflow の `frontend-lint` job から呼ばれる (#4035)。書き方は [playwright.md](playwright.md#ルートと-spec-の対応付け-4035) |
+| `make playwright-settings-check` | 設定のページ (`pages/settings/*.vue`) の `prefer.model` のキーが、Playwright の設定の表の宣言 (`coversPrefs`) か、許可リスト (`tests/playwright/settings-coverage-allowlist.tsv`) に載っているか (#4056)。`playwright-route-check` と同じく、`make frontend-check` と CI の `frontend` workflow から回す |
+| `make playwright-admin-settings-check` | 管理画面 (`pages/admin/*.vue` と `pages/instance-info.vue`) が `admin/update-meta` で書くキーと、ロールのポリシーの編集画面 (`roles.policy-editor.vue`) のキーが、Playwright の管理画面の表の宣言 (`coversMeta` / `coversPolicies`) か、許可リスト (`tests/playwright/admin-settings-coverage-allowlist.tsv`) に載っているか (#4066)。`playwright-settings-check` と同じく、`make frontend-check` と CI の `frontend` workflow から回す |
 | `make frontend-lint` | fork frontend の eslint。CI `frontend` workflow の `frontend-lint` job の eslint step のうち frontend と frontend-embed の分と同じで、範囲は `package.json` の script が持つ (`--quiet "src/**/*.{ts,vue}" "public/loader/*.js"`。起動画面のスクリプトを含める、#3954)。`make frontend-check` から呼ばれる (#2906)。実測 70 秒 (#3954 で frontend-embed を足す前は 55 秒) |
 | `make frontend-test` | fork frontend の vitest (`test/unit/**/*.test.ts`)。CI `frontend` workflow の `frontend-test` job の frontend unit tests step と同じ |
 | `make plugin-dev` | プラグインを編集しながら動かす (`PLUGIN=plugins/status`) |
@@ -223,6 +228,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 |---|---|---|
 | `make playwright-up` `playwright-test` `playwright-down` `playwright-logs` | Elythia backend に対する Playwright spec | — |
 | `make playwright-ts-up` `playwright-ts-test` `playwright-ts-down` | 同じ spec を Misskey TS backend に対して実行し、drop-in 互換を担保する | — |
+| `make playwright-backup-up` `playwright-backup-test` `playwright-backup-down` | バックアップの取得・検証・戻す操作の spec を、デーモン付きの専用のスタックで実行する (#4102) | [Playwright e2e](playwright.md#独自の-api-の応答の照合-4093) |
 | `make diff-up` `diff-test` `diff-down` `diff-logs` | Elythia と TS に同一リクエストを投げてレスポンスを値レベルで diff | [差分比較ハーネス](diff-e2e.md) |
 | `make dropin-up` `dropin-test` `dropin-down` `dropin-logs` | TS 2 インスタンスの federation smoke | [Drop-in e2e](dropin-e2e.md) |
 | `make dropin-mk-up` `dropin-mk-test` `dropin-mk-down` `dropin-mk-logs` | 上記の backend を Elythia に差し替えた overlay | 同上 |
@@ -347,7 +353,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "IDX_xxx" ON "yyy" ("zzz");
 | `vulncheck` | CI | 依存・Go stdlib の**到達可能な**既知脆弱性 + Go version の pin 整合 |
 | `plugin-tests` | CI | 同梱プラグインのテスト (別 module なので `go list ./...` に入らない) |
 | `build-and-push` / `-bundled` | Docker | image がビルドできるか (PR では push しない) |
-| `spec (Elythia 1/7)` 〜 `7/7` | Playwright | ブラウザからの統合互換。TS backend での実行は `workflow_dispatch` のみ |
+| `spec (Elythia 1/11)` 〜 `11/11`、`spec (Elythia backup/1)` | Playwright | ブラウザからの統合互換。`backup/1` はバックアップの spec を専用のスタックで流す (#4102)。TS backend での実行は `workflow_dispatch` のみ |
 | `e2e (1/4)` 〜 `4/4` | Upstream backend e2e | 本家の backend e2e が Elythia に対して通るか |
 | `diff` | Diff e2e | Elythia と TS の**レスポンスの値**が一致するか |
 | `swap-test` / `elythia-born` / `ed25519-verify` / `federation` / `federation-mastodon` | Drop-in e2e | 切替・TS へ戻す経路の測定・Ed25519・実連合 (Misskey TS / Mastodon) の 5 シナリオ |
@@ -478,7 +484,7 @@ make frontend-lint           # eslint だけ (CI と同じ範囲、実測 70 秒
 make e2e-down-all            # 検証用スタックを一括撤去 (**本番 project `mk` は対象外**)
 ```
 
-**上記は全体ではない。** `make help` が全 150 target を出す (`^名前:.*##` の行を数えた)。一覧と説明は
+**上記は全体ではない。** `make help` が全 165 target を出す (`^名前:.*##` の行を数えた)。一覧と説明は
 このファイルの上の節、CI 上の対応は [docs/ci.md](ci.md)。
 
 エントリポイント：

@@ -3,6 +3,7 @@ package role
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"math"
@@ -226,15 +227,12 @@ const (
 	PolicyLtlAvailable = "ltlAvailable"
 	PolicyGtlAvailable = "gtlAvailable"
 
-	// PolicyCanDeleteAccount gates a user's own i/delete-account request. Unlike
-	// HasRolePolicy consumers, this policy does not grant administrators a bypass.
+	// PolicyCanDeleteAccount gates a user's own i/delete-account request.
+	// Administrators do not bypass this policy.
 	PolicyCanDeleteAccount = "canDeleteAccount"
 
-	// PolicyCanPurgeAccount decides whether a deleted account's row is actually
-	// purged. It is a separate decision from PolicyCanDeleteAccount: true hard
-	// deletes the row (PreserveAccount false), false leaves the row behind
-	// (PreserveAccount true). Like canDeleteAccount, administrators get no
-	// bypass — HasRolePolicy is not the consumer here.
+	// PolicyCanPurgeAccount controls whether self-delete may physically remove
+	// the user and profile rows. Administrators do not bypass this policy.
 	PolicyCanPurgeAccount = "canPurgeAccount"
 )
 
@@ -243,6 +241,14 @@ const (
 // IsAdministrator / IsModerator / GetUserPolicies の DB 負荷を消す
 // (#300 3-5)。
 const roleCacheTTL = 5 * time.Minute
+
+// conditionalRoleErrorCacheTTL briefly caches conditional-role lookup errors
+// to bound repeated repository reads while allowing recovery checks promptly.
+const conditionalRoleErrorCacheTTL = time.Second
+
+// maxConditionalRoleErrorCacheEntries caps the existing role-cache map size
+// when admitting new conditional-error entries. Successful snapshots keep their policy.
+const maxConditionalRoleErrorCacheEntries = 1024
 
 // roleCacheEntry は per-user の roles snapshot + 失効時刻。
 type roleCacheEntry struct {
@@ -301,6 +307,7 @@ func cloneRoles(roles []*model.Role) []*model.Role {
 type userRoleSnapshot struct {
 	roles             []*model.Role
 	activeAssignments []activeRoleAssignment
+	conditionalErr    error
 }
 
 // clone は cache entry と呼び出し側のどちらかが他の変更を観測しないよう値を複製
@@ -309,6 +316,7 @@ func (s userRoleSnapshot) clone() userRoleSnapshot {
 	return userRoleSnapshot{
 		roles:             cloneRoles(s.roles),
 		activeAssignments: cloneActiveRoleAssignments(s.activeAssignments),
+		conditionalErr:    s.conditionalErr,
 	}
 }
 
@@ -575,10 +583,10 @@ func (s *Service) resolveUserRoleSnapshot(userID string) (userRoleSnapshot, erro
 	// formula 評価で絞り込む。assigned roles と matched conditional の和集合
 	// を返す。upstream TS の getUserRoles と同じ順 (assigned が先)。
 	//
-	// roleRepo / userRepo どちらかが未配線なら、conditional 評価は skip して
-	// assigned のみを返す (= 旧挙動)。test 経路で userRepo 未注入のケースに
-	// 配慮した soft-fail。
-	condRoles := s.evaluateConditionalRoles(userID, assignedRoles)
+	// 条件付きロールの入力を確認できないときも、既存の GetUserRoles 向けに
+	// 手動割当ロールの結果は返す。不完全な snapshot は短い TTL で保持し、
+	// checked consumer へ conditionalErr をそのまま伝える。
+	condRoles, conditionalErr := s.evaluateConditionalRoles(userID, assignedRoles)
 	roles := append(assignedRoles, condRoles...)
 
 	// #2106 S5: cache 失効を「TTL」と「最も早い assignment expiresAt」の min にする。
@@ -587,17 +595,39 @@ func (s *Service) resolveUserRoleSnapshot(userID string) (userRoleSnapshot, erro
 	// role/policy として効き続けてしまう (upstream は getUserAssigns で read 毎に
 	// expiresAt を再 filter)。entry を soonest expiry で drop すれば、次 read が
 	// 再 fetch して DB filter が期限切れ assignment を除外する。
-	cacheExpiry := time.Now().Add(roleCacheTTL)
+	now := time.Now()
+	cacheExpiry := now.Add(roleCacheTTL)
 	for _, a := range assignments {
 		if a.ExpiresAt != nil && a.ExpiresAt.Before(cacheExpiry) {
 			cacheExpiry = *a.ExpiresAt
 		}
 	}
+	if conditionalErr != nil {
+		errorExpiry := now.Add(conditionalRoleErrorCacheTTL)
+		if errorExpiry.Before(cacheExpiry) {
+			cacheExpiry = errorExpiry
+		}
+	}
 
-	snapshot := userRoleSnapshot{roles: roles, activeAssignments: activeAssignments}
+	snapshot := userRoleSnapshot{roles: roles, activeAssignments: activeAssignments, conditionalErr: conditionalErr}
 	s.userRoleCacheMu.Lock()
 	if s.allUserRoleEpoch == allEpoch && s.userRoleEpoch[userID] == userEpoch {
-		s.userRoleCache[userID] = &roleCacheEntry{snapshot: snapshot.clone(), expiresAt: cacheExpiry}
+		mayPublish := true
+		if conditionalErr != nil {
+			existing := s.userRoleCache[userID]
+			if existing != nil &&
+				time.Now().Before(existing.expiresAt) && existing.snapshot.conditionalErr == nil {
+				// 遅れて完了した失敗取得で、新しい成功スナップショットを上書きしない。
+				mayPublish = false
+			}
+			if existing == nil && len(s.userRoleCache) >= maxConditionalRoleErrorCacheEntries {
+				// 共通 cache の上限に達した場合、新しいキーの失敗結果は negative cache しない。
+				mayPublish = false
+			}
+		}
+		if mayPublish {
+			s.userRoleCache[userID] = &roleCacheEntry{snapshot: snapshot.clone(), expiresAt: cacheExpiry}
+		}
 	}
 	s.userRoleCacheMu.Unlock()
 	return snapshot.clone(), nil
@@ -624,33 +654,6 @@ func (s *Service) GetUserRoles(userID string) ([]*model.Role, error) {
 		return nil, err
 	}
 	return snapshot.roles, nil
-}
-
-// GetUserRolesStrict resolves complete active manual and conditional roles,
-// returning no roles when any required lookup fails. It never reads or writes
-// the lenient per-user cache, which may contain incomplete conditional results.
-func (s *Service) GetUserRolesStrict(userID string) ([]*model.Role, error) {
-	if userID == "" {
-		return nil, nil
-	}
-	if s.assignmentRepo == nil || s.roleRepo == nil {
-		return nil, errors.New("active role repositories are unavailable")
-	}
-	assignments, err := s.assignmentRepo.ListByUser(userID)
-	if err != nil {
-		return nil, err
-	}
-	assigned := make([]*model.Role, 0, len(assignments))
-	for _, assignment := range assignments {
-		if assignment.Role != nil {
-			assigned = append(assigned, assignment.Role)
-		}
-	}
-	conditional, err := s.evaluateConditionalRolesStrict(userID, assigned)
-	if err != nil {
-		return nil, err
-	}
-	return cloneRoles(append(assigned, conditional...)), nil
 }
 
 func (s *Service) finishUserRoleFlight(userID string) {
@@ -744,25 +747,13 @@ func (s *Service) GetUserAssign(userID, roleID string, at time.Time) (*model.Rol
 }
 
 // evaluateConditionalRoles returns the subset of `target=conditional`
-// roles whose `condFormula` evaluates to true for the user. Best-effort:
-// when prerequisites are missing (no userRepo wired, role list fetch
-// fails, user lookup fails, formula JSON malformed) we return nil so
-// callers fall back to assigned roles only. Matches upstream TS where
-// evalCond swallows all errors as false.
-func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role) []*model.Role {
-	matched, _ := s.evaluateConditionalRolesStrict(userID, assigned)
-	return matched
-}
-
-// evaluateConditionalRolesStrict preserves formula evaluation semantics while
-// making missing prerequisites and repository failures visible to strict callers.
-func (s *Service) evaluateConditionalRolesStrict(userID string, assigned []*model.Role) ([]*model.Role, error) {
-	if s.userRepo == nil {
-		return nil, errors.New("conditional role user repository is unavailable")
-	}
+// roles whose `condFormula` evaluates to true for the user. Repository lookup
+// failures are returned separately so checked policy consumers can fail closed;
+// legacy callers may keep using the assigned-role fallback.
+func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role) ([]*model.Role, error) {
 	allRoles, err := s.listRolesCached()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list roles for conditional evaluation: %w", err)
 	}
 	// 早期 short-circuit: conditional role が 1 つも無いなら user fetch を
 	// 省略する (= upstream TS と同 optimization)。これで大多数のインスタンス
@@ -777,12 +768,15 @@ func (s *Service) evaluateConditionalRolesStrict(userID string, assigned []*mode
 	if !hasCond {
 		return nil, nil
 	}
+	if s.userRepo == nil {
+		return nil, errors.New("conditional role user lookup is unavailable")
+	}
 	user, err := s.userRepo.FindByID(userID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("lookup user for conditional evaluation: %w", err)
 	}
 	if user == nil {
-		return nil, errors.New("conditional role user is unavailable")
+		return nil, errors.New("conditional role user lookup returned no user")
 	}
 	matched := make([]*model.Role, 0)
 	for _, r := range allRoles {
@@ -791,7 +785,8 @@ func (s *Service) evaluateConditionalRolesStrict(userID string, assigned []*mode
 		}
 		var formula CondFormula
 		// CondFormula は datatypes.JSON。未設定だと "{}" が入っていて
-		// type が空文字列のため EvalCond で false に倒れる。
+		// type が空文字列のため EvalCond で false に倒れる。既存挙動と同じく
+		// malformed JSON はこのロールだけ不一致として扱う。
 		if err := json.Unmarshal(r.CondFormula, &formula); err != nil {
 			continue
 		}
@@ -1299,32 +1294,20 @@ func policyUnlimitedOrAboveCap(v any, limit int) bool {
 func (s *Service) GetUserPolicies(userID string) map[string]any {
 	// 解決は resolvePolicies に委譲する (provider 失敗時は errorless で
 	// native-onlyの安全なmapを返す)。checked版はGetUserPoliciesCheckedがerrorを返す。
-	//
-	// **ここでは error を握り潰す** — 実効 map だけを必要とする consumer
-	// (`IsSilenced` / `HasRolePolicy` / `/api/i` の policy 応答) は meta の
-	// 一時障害で 500 にしては困るので、base を読めなかった窓でも
-	// native 既定の map を返す。認可の判断をする consumer は
-	// `GetUserPoliciesChecked` を使い、そちらの error で fail closed する。
-	out, _ := s.resolvePolicies(userID, nil)
+	out, _ := s.resolvePolicies(userID, nil, false)
 	return out
 }
 
 // applyMetaBasePolicies overlays `meta.policies` (admin UI 設定の base
-// override) onto the default policies map. `meta.policies` が空、または
-// metaRepo 未配線なら何も重ねない (= overlay する情報がない)。
+// override) onto the default policies map. Meta fetch and JSON errors are
+// returned so checked consumers can fail closed instead of silently using
+// permissive defaults. Unchecked consumers preserve the historical fail-soft
+// behavior: defaults/native roles and registered providers are still resolved.
 //
 // JSON unmarshal は数値を float64 に倒すため、key が DefaultPolicies で int
 // として宣言されている場合は明示的に int へ丸めて整合性を保つ (#1020 review:
 // consumer 側の `policies[key].(int)` type assert が float64 で panic する
 // regression を防ぐ)。base に無い未知 key は型情報が無いので素通し。
-//
-// **fetch / decode の失敗は握り潰さない (= fail-soft だった挙動の撤回)。**
-// base override を読めないのに黙って native default のまま返すと、
-// 「運営者が base で `canDeleteAccount=false` を指定している」instance が
-// **その窓だけ `true` を返す**。他の失敗 (role 入力 / provider) と違い
-// fallback 側がそのまま認可の許可側なので、握り潰すと認可が fail open する。
-// 解決 error として呼び出し側へ渡し、fail-soft を望む consumer
-// (`GetUserPolicies`) だけが `resolvePolicies` の error を捨てる。
 func (s *Service) applyMetaBasePolicies(base map[string]any) error {
 	if s.metaRepo == nil {
 		return nil
@@ -1346,18 +1329,25 @@ func (s *Service) applyMetaBasePolicies(base map[string]any) error {
 	return nil
 }
 
-// fractionalPolicyKeys are int-typed base policies whose consumers read them
-// through PolicyNumber, so a fractional value is kept as float64 instead of
-// being truncated by coerceToBaseType (#3489).
+// fractionalPolicyKeys are int-typed base policies whose consumers accept a
+// float64 (through PolicyNumber, or the rate limiter's own type switch), so a
+// fractional value is kept as float64 instead of being truncated by
+// coerceToBaseType (#3489).
 //
 // 切り捨てると 0.5 が 0 になり、drive の size policy では「保存できない」に
 // 変わる (本家は 0.5MB まで通す)。role に付けた値は maxNumber が小数のまま
 // 渡すので、consumer はもともと float64 を受けられる。他の int の key は
 // `.(int)` で読む consumer があるので、今の丸めを保つ。集約 (aggregatePolicyValues)
 // も同じ key だけ float64 の base を数値として扱う。
+//
+// rateLimitFactor も同じ (#4143)。本家の管理画面は 0.3 から 0.1 刻みで入れられ、
+// 初回のウィザードも基本ロールに 0.3 や 1.25 のような小数を書く。切り捨てると 0.3 が
+// 0 になり、0 は利用者ごとのレート制限を外す値なので、緩めたつもりの設定で制限
+// そのものが消える。
 var fractionalPolicyKeys = map[string]bool{
 	"maxFileSizeMb":   true,
 	"driveCapacityMb": true,
+	"rateLimitFactor": true,
 }
 
 // coerceBasePolicy is coerceToBaseType that keeps finite fractional values of

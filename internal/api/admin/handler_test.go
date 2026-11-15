@@ -987,6 +987,20 @@ func TestUnsuspendUser_RejectsDeletedAccount(t *testing.T) {
 	assert.True(t, userRepo.Users["u1"].IsSuspended, "a retained tombstone must not be revived")
 }
 
+// **リモートの削除済みは解除できる** (#4106)。本家と同じ。以前の削除で凍結も
+// 立っていた行を解除できるようにする。削除済みのままにする。
+func TestUnsuspendUser_RemoteDeletedAccount(t *testing.T) {
+	h, userRepo, _, _ := newTestHandler(t)
+	host := "remote.example"
+	userRepo.Users["u1"] = &model.User{ID: "u1", Host: &host, IsSuspended: true, IsDeleted: true}
+
+	rec := doPost(h.UnsuspendUser, `{"userId":"u1"}`, nil)
+
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	assert.False(t, userRepo.Users["u1"].IsSuspended)
+	assert.True(t, userRepo.Users["u1"].IsDeleted, "unsuspending must not undelete")
+}
+
 func TestUnsuspendUser_NotFound(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	rec := doPost(h.UnsuspendUser, `{"userId":"ghost"}`, nil)
@@ -1666,6 +1680,25 @@ func TestUpdateMeta_UpdateError(t *testing.T) {
 	h := apiadmin.NewHandler(signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil), nil, metaRepo, userRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	rec := doPost(h.UpdateMeta, `{"name":"test"}`, nil)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// rejectingUpdateMetaRepo fails Update with a value PostgreSQL refused.
+type rejectingUpdateMetaRepo struct {
+	*testutil.MockMetaRepository
+}
+
+func (f *rejectingUpdateMetaRepo) Update(_ map[string]any) error { return errRejectedValue }
+
+// 利用者の値を DB が断ったとき (長すぎる name など) は、500 ではなく 400 にする (#4120)。
+func TestUpdateMeta_RejectedValueIs400(t *testing.T) {
+	userRepo := testutil.NewMockUserRepository()
+	metaRepo := &rejectingUpdateMetaRepo{testutil.NewMockMetaRepository()}
+	metaRepo.Meta = &model.Meta{ID: "x"}
+	idGen, _ := id.NewGenerator("aidx")
+	h := apiadmin.NewHandler(signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil), nil, metaRepo, userRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := doPost(h.UpdateMeta, `{"name":"test"}`, nil)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"INVALID_PARAM"`)
 }
 
 func TestAccountsCreate_SignupInternalError(t *testing.T) {
@@ -2482,6 +2515,63 @@ type failingCreateRoleRepo struct {
 }
 
 func (f *failingCreateRoleRepo) Create(_ *model.Role) error { return assert.AnError }
+
+// rejectingCreateRoleRepo fails Create with a value PostgreSQL refused.
+type rejectingCreateRoleRepo struct {
+	*testutil.MockRoleRepository
+}
+
+func (f *rejectingCreateRoleRepo) Create(_ *model.Role) error { return errRejectedValue }
+
+// 利用者の値を DB が断ったとき (長すぎる名前など) は、500 ではなく 400 にする (#4120)。
+func TestRolesCreate_RejectedValueIs400(t *testing.T) {
+	rejectRepo := &rejectingCreateRoleRepo{testutil.NewMockRoleRepository()}
+	assignRepo := testutil.NewMockRoleAssignmentRepository(rejectRepo.MockRoleRepository)
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x"}
+	idGen, _ := id.NewGenerator("aidx")
+	roleSvc := role.NewService(rejectRepo, assignRepo, metaRepo, idGen)
+	userRepo := testutil.NewMockUserRepository()
+	h := apiadmin.NewHandler(signup.NewService(userRepo, metaRepo, idGen, nil, nil, nil), roleSvc, metaRepo, userRepo, idGen, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	rec := doPost(h.RolesCreate, fullRoleCreatePayload, nil)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"INVALID_PARAM"`)
+}
+
+// update も create と同じく 400 にする (#4120)。
+func TestRolesUpdate_RejectedValueIs400(t *testing.T) {
+	existing := &model.Role{ID: "r1", Name: "old"}
+	base := testutil.NewMockRoleRepository()
+	base.Roles[existing.ID] = existing
+	repo := &adminRoleRepository{RoleRepository: base, lookups: []adminRoleLookup{{role: existing}}, updateErr: errRejectedValue}
+	h, _, _ := adminHandlerWithRoleRepository(t, repo, base)
+	rec := doPost(h.RolesUpdate, `{"roleId":"r1","name":"new"}`, nil)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"INVALID_PARAM"`)
+}
+
+// displayOrder は int4 の列なので、範囲外は保存に進まず 400 にする (#4120)。
+// 以前は pgx が送る前に落とし、500 になっていた
+func TestRolesCreateAndUpdate_DisplayOrderOutsideInt4(t *testing.T) {
+	for _, order := range []string{"2147483648", "-2147483649"} {
+		h, _, _, roleRepo := newTestHandler(t)
+		body := strings.Replace(fullRoleCreatePayload, `"displayOrder": 0`, `"displayOrder": `+order, 1)
+		require.NotEqual(t, fullRoleCreatePayload, body)
+		rec := doPost(h.RolesCreate, body, nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, order)
+		assert.Empty(t, roleRepo.Roles, order)
+
+		roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "old"}
+		rec = doPost(h.RolesUpdate, `{"roleId":"r1","displayOrder":`+order+`}`, nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, order)
+		assert.Equal(t, 0, roleRepo.Roles["r1"].DisplayOrder, order)
+	}
+	h, _, _, roleRepo := newTestHandler(t)
+	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "old"}
+	rec := doPost(h.RolesUpdate, `{"roleId":"r1","displayOrder":2147483647}`, nil)
+	assert.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	assert.Equal(t, 2147483647, roleRepo.Roles["r1"].DisplayOrder)
+}
 
 func TestRolesAssign_InternalError(t *testing.T) {
 	// Exists がエラーになるケースをテスト
@@ -3449,7 +3539,8 @@ func TestEmojiUpdate_NotFound(t *testing.T) {
 	emojiRepo := testutil.NewMockEmojiRepository()
 	h.SetEmojiRepo(emojiRepo)
 	rec := doPost(h.EmojiUpdate, `{"id":"ghost","name":"x"}`, nil)
-	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"NO_SUCH_EMOJI"`)
 }
 
 func TestEmojiUpdate_InvalidParam(t *testing.T) {
@@ -4745,22 +4836,56 @@ func TestUnsuspendUser_OriginWriteFailureIs500(t *testing.T) {
 		"由来を記録できないのに解除を成功として返している")
 }
 
-// **アカウント削除も local として刻む。** `isSuspended` と `isDeleted` を同時に
-// 立てるので、remote 由来の記録が残っていると発信元が tombstone の凍結を外せる。
-// 読み取り側は `isSuspended` を見て隠すので、凍結が外れると削除したアカウントが
-// 見えるようになる。
-func TestAccountsDelete_RecordsLocalOrigin(t *testing.T) {
-	h, userRepo, _, _ := newTestHandler(t)
-	host := "remote.example"
-	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", Host: &host}
-	origins := newStubOriginRepo()
-	origins.origins["u1"] = model.SuspensionOriginRemote
-	h.SetSuspensionOriginRepoForTest(origins)
+// **ローカルの利用者の削除は凍結も立て、local として刻む。** 退会から資格情報の
+// 失効までの間、ログインを止めているのが `isSuspended` のため。
+func TestAccountsDelete_LocalUserIsSuspendedWithLocalOrigin(t *testing.T) {
+	for name, del := range map[string]func(*apiadmin.Handler) echo.HandlerFunc{
+		"accounts/delete": func(h *apiadmin.Handler) echo.HandlerFunc { return h.AccountsDelete },
+		"delete-account":  func(h *apiadmin.Handler) echo.HandlerFunc { return h.DeleteAccount },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, userRepo, _, _ := newTestHandler(t)
+			userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice"}
+			origins := newStubOriginRepo()
+			h.SetSuspensionOriginRepoForTest(origins)
 
-	rec := doPost(h.AccountsDelete, `{"userId":"u1"}`, nil)
-	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
-	assert.Equalf(t, model.SuspensionOriginLocal, origins.origins["u1"],
-		"削除で由来を刻んでいない。発信元が tombstone の凍結を外せる")
+			rec := doPost(del(h), `{"userId":"u1"}`, nil)
+			require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+			assert.True(t, userRepo.Users["u1"].IsDeleted)
+			assert.True(t, userRepo.Users["u1"].IsSuspended, "the login gate relies on isSuspended")
+			assert.Equal(t, model.SuspensionOriginLocal, origins.origins["u1"])
+		})
+	}
+}
+
+// **リモートの利用者の削除は isDeleted だけを立てる** (#4106)。本家と同じ。凍結も
+// 立てると、管理画面に凍結と出て、解除もできなかった。発信元由来の凍結が先に
+// あれば、それには触らない。
+func TestAccountsDelete_RemoteUserIsNotSuspended(t *testing.T) {
+	for name, del := range map[string]func(*apiadmin.Handler) echo.HandlerFunc{
+		"accounts/delete": func(h *apiadmin.Handler) echo.HandlerFunc { return h.AccountsDelete },
+		"delete-account":  func(h *apiadmin.Handler) echo.HandlerFunc { return h.DeleteAccount },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, userRepo, _, _ := newTestHandler(t)
+			host := "remote.example"
+			userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", Host: &host}
+			userRepo.Users["u2"] = &model.User{ID: "u2", Username: "bob", Host: &host, IsSuspended: true}
+			origins := newStubOriginRepo()
+			origins.origins["u2"] = model.SuspensionOriginRemote
+			h.SetSuspensionOriginRepoForTest(origins)
+
+			for _, id := range []string{"u1", "u2"} {
+				rec := doPost(del(h), fmt.Sprintf(`{"userId":%q}`, id), nil)
+				require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+				assert.True(t, userRepo.Users[id].IsDeleted, id)
+			}
+			assert.False(t, userRepo.Users["u1"].IsSuspended, "deleting a remote user must not suspend it")
+			assert.NotContains(t, origins.origins, "u1")
+			assert.True(t, userRepo.Users["u2"].IsSuspended, "an existing suspension stays")
+			assert.Equal(t, model.SuspensionOriginRemote, origins.origins["u2"])
+		})
+	}
 }
 
 // #3015: 最小文字数の範囲検証。上限は `localUsernamePattern` の 20 と揃える。

@@ -8,48 +8,52 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/elythia-network/mfm"
 )
 
 var statusIDPattern = regexp.MustCompile(`^[0-9]{2,20}$`)
 var xUserIDPattern = regexp.MustCompile(`^[0-9]{1,20}$`)
 var statusUserPattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,15}$`)
-var candidateURLPattern = regexp.MustCompile(`https://[^\s<>"']+`)
-
+var youtubeVideoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
 var statusHosts = map[string]bool{
 	"x.com": true, "www.x.com": true, "mobile.x.com": true,
 	"twitter.com": true, "www.twitter.com": true, "mobile.twitter.com": true,
 }
 
 type PublicPost struct {
-	QuoteUnavailableReason string             `json:"quoteUnavailableReason,omitempty"`
-	ID                     string             `json:"id"`
-	URL                    string             `json:"url"`
-	Text                   string             `json:"text"`
-	TextEntities           []PublicTextEntity `json:"textEntities,omitempty"`
-	CreatedAt              string             `json:"createdAt,omitempty"`
-	Author                 PublicAuthor       `json:"author"`
-	Likes                  int64              `json:"likes"`
-	Reposts                int64              `json:"reposts"`
-	Quotes                 int64              `json:"quotes"`
-	Replies                int64              `json:"replies"`
-	IsSensitive            *bool              `json:"isSensitive,omitempty"`
-	Images                 []PublicImage      `json:"images"`
-	HasVideo               bool               `json:"hasVideo"`
-	Video                  *PublicVideo       `json:"video,omitempty"`
-	Quote                  *PublicQuotedPost  `json:"quote,omitempty"`
+	QuoteUnavailableReason string                `json:"quoteUnavailableReason,omitempty"`
+	ID                     string                `json:"id"`
+	URL                    string                `json:"url"`
+	Text                   string                `json:"text"`
+	TextEntities           []PublicTextEntity    `json:"textEntities,omitempty"`
+	CreatedAt              string                `json:"createdAt,omitempty"`
+	Author                 PublicAuthor          `json:"author"`
+	Likes                  int64                 `json:"likes"`
+	Reposts                int64                 `json:"reposts"`
+	Quotes                 int64                 `json:"quotes"`
+	Replies                int64                 `json:"replies"`
+	IsSensitive            *bool                 `json:"isSensitive,omitempty"`
+	Images                 []PublicImage         `json:"images"`
+	HasVideo               bool                  `json:"hasVideo"`
+	Video                  *PublicVideo          `json:"video,omitempty"`
+	Videos                 []PublicVideoMetadata `json:"videos,omitempty"`
+	privateVideoSources    privateVideoSources   `json:"-"`
+	Quote                  *PublicQuotedPost     `json:"quote,omitempty"`
 }
 
 type PublicQuotedPost struct {
-	ID           string             `json:"id"`
-	URL          string             `json:"url"`
-	Text         string             `json:"text"`
-	TextEntities []PublicTextEntity `json:"textEntities,omitempty"`
-	CreatedAt    string             `json:"createdAt,omitempty"`
-	Author       PublicAuthor       `json:"author"`
-	IsSensitive  *bool              `json:"isSensitive,omitempty"`
-	Images       []PublicImage      `json:"images"`
-	HasVideo     bool               `json:"hasVideo"`
-	Video        *PublicVideo       `json:"video,omitempty"`
+	ID           string                `json:"id"`
+	URL          string                `json:"url"`
+	Text         string                `json:"text"`
+	TextEntities []PublicTextEntity    `json:"textEntities,omitempty"`
+	CreatedAt    string                `json:"createdAt,omitempty"`
+	Author       PublicAuthor          `json:"author"`
+	IsSensitive  *bool                 `json:"isSensitive,omitempty"`
+	Images       []PublicImage         `json:"images"`
+	HasVideo     bool                  `json:"hasVideo"`
+	Video        *PublicVideo          `json:"video,omitempty"`
+	Videos       []PublicVideoMetadata `json:"videos,omitempty"`
 }
 
 type PublicAuthor struct {
@@ -77,13 +81,27 @@ type PublicImage struct {
 }
 
 type PublicVideo struct {
-	Provider        string     `json:"provider,omitempty"`
-	ProviderVideoID string     `json:"providerVideoId,omitempty"`
-	PosterURL       string     `json:"posterUrl,omitempty"`
-	PosterExpiresAt *time.Time `json:"posterExpiresAt,omitempty"`
-	DurationMS      int64      `json:"durationMs,omitempty"`
-	EmbedToken      string     `json:"embedToken,omitempty"`
-	EmbedExpiresAt  *time.Time `json:"embedExpiresAt,omitempty"`
+	Provider          string     `json:"provider,omitempty"`
+	ProviderVideoID   string     `json:"providerVideoId,omitempty"`
+	MediaIdentity     string     `json:"mediaIdentity,omitempty"`
+	PosterURL         string     `json:"posterUrl,omitempty"`
+	PosterExpiresAt   *time.Time `json:"posterExpiresAt,omitempty"`
+	DurationMS        int64      `json:"durationMs,omitempty"`
+	PlaybackAvailable bool       `json:"playbackAvailable,omitempty"`
+	EmbedToken        string     `json:"embedToken,omitempty"`
+	EmbedExpiresAt    *time.Time `json:"embedExpiresAt,omitempty"`
+}
+
+// PublicVideoMetadata describes one X video while preserving the legacy single-video fields.
+type PublicVideoMetadata struct {
+	Provider          string     `json:"provider,omitempty"`
+	ProviderVideoID   string     `json:"providerVideoId,omitempty"`
+	MediaIdentity     string     `json:"mediaIdentity,omitempty"`
+	PosterURL         string     `json:"posterUrl,omitempty"`
+	PosterExpiresAt   *time.Time `json:"posterExpiresAt,omitempty"`
+	DurationMS        int64      `json:"durationMs,omitempty"`
+	PlaybackAvailable bool       `json:"playbackAvailable,omitempty"`
+	PlaybackURL       string     `json:"playbackUrl,omitempty"`
 }
 
 type CacheEntry struct {
@@ -95,7 +113,54 @@ type CacheEntry struct {
 	NextFetchAt       time.Time   `json:"-"`
 	NextPollAt        *time.Time  `json:"nextPollAt,omitempty"`
 	ErrorClass        string      `json:"-"`
+	PlaybackToken     string      `json:"-"`
 	Stale             bool        `json:"stale,omitempty"`
+}
+
+func youtubeVideoIDFromURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	var id string
+	switch host {
+	case "youtu.be":
+		parts := strings.Split(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
+		if len(parts) != 1 || parts[0] == "" {
+			return "", false
+		}
+		id, err = url.PathUnescape(parts[0])
+	case "youtube.com", "www.youtube.com", "m.youtube.com":
+		switch {
+		case u.EscapedPath() == "/watch":
+			values, parseErr := url.ParseQuery(u.RawQuery)
+			if parseErr != nil || len(values["v"]) != 1 {
+				return "", false
+			}
+			id = values["v"][0]
+		case strings.HasPrefix(u.EscapedPath(), "/shorts/"):
+			parts := strings.Split(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
+			if len(parts) != 2 || parts[0] != "shorts" {
+				return "", false
+			}
+			id, err = url.PathUnescape(parts[1])
+		case strings.HasPrefix(u.EscapedPath(), "/embed/"):
+			parts := strings.Split(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
+			if len(parts) != 2 || parts[0] != "embed" {
+				return "", false
+			}
+			id, err = url.PathUnescape(parts[1])
+		default:
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	if err != nil || !youtubeVideoIDPattern.MatchString(id) {
+		return "", false
+	}
+	return id, true
 }
 
 func statusIDFromURL(raw string) (string, bool) {
@@ -122,13 +187,23 @@ func noteContainsStatus(text, wantedID string) bool {
 	if !statusIDPattern.MatchString(wantedID) {
 		return false
 	}
-	for _, candidate := range candidateURLPattern.FindAllString(text, -1) {
-		candidate = strings.TrimRight(candidate, ".,;:!?)]}")
-		if id, ok := statusIDFromURL(candidate); ok && id == wantedID {
-			return true
+	var walk func(nodes []*mfm.Node) bool
+	walk = func(nodes []*mfm.Node) bool {
+		for _, node := range nodes {
+			if node.Type == mfm.NodeURL || node.Type == mfm.NodeLink {
+				if candidate, ok := node.Props["url"].(string); ok {
+					if id, ok := statusIDFromURL(candidate); ok && id == wantedID {
+						return true
+					}
+				}
+			}
+			if walk(node.Children) {
+				return true
+			}
 		}
+		return false
 	}
-	return false
+	return walk(mfm.Parse(text))
 }
 
 func safeHTTPSURL(raw string) string {

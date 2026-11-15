@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,8 +46,10 @@ func TestRateLimitSettingsSeedOnceAndRemainDatabaseCanonical(t *testing.T) {
 
 func TestRateLimitSettingsUpdateUsesRevisionAndAffectsAllStores(t *testing.T) {
 	db := migratedDB(t)
-	one := newStore(db, testConfig())
-	two := newStore(db, testConfig())
+	cfg := testConfig()
+	cfg.RoleBudgets = map[string]coldFetchBudget{"role-a": {PerHour: 9, PerDay: 90}}
+	one := newStore(db, cfg)
+	two := newStore(db, cfg)
 	current, err := one.ReadRateLimitSettings(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -56,9 +59,6 @@ func TestRateLimitSettingsUpdateUsesRevisionAndAffectsAllStores(t *testing.T) {
 		AuthenticatedPerHour: 1,
 		AuthenticatedPerDay:  10,
 		GlobalPerHour:        20,
-		RoleLimits: map[string]coldFetchBudget{
-			"role-a": {PerHour: 2, PerDay: 12},
-		},
 	}
 	updated, err := one.UpdateRateLimitSettings(context.Background(), "admin", next)
 	if err != nil {
@@ -71,20 +71,45 @@ func TestRateLimitSettingsUpdateUsesRevisionAndAffectsAllStores(t *testing.T) {
 		t.Fatalf("stale update error = %v", err)
 	}
 
-	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
-	if lease, err := two.AcquireFetchForRoles(context.Background(), "1234567890", "u1", []string{"role-a"}, now); err != nil || lease == nil {
-		t.Fatalf("first role lease = %#v, %v", lease, err)
+	stored, err := two.ReadRateLimitSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if lease, err := two.AcquireFetchForRoles(context.Background(), "2234567890", "u1", []string{"role-a"}, now); err != nil || lease == nil {
-		t.Fatalf("second role lease = %#v, %v", lease, err)
+	if limits, ok := stored.RoleLimits["role-a"]; !ok || limits.PerHour != 9 || limits.PerDay != 90 {
+		t.Fatalf("global settings update changed legacy role rows: %#v", stored.RoleLimits)
 	}
-	if lease, err := two.AcquireFetchForRoles(context.Background(), "3234567890", "u1", []string{"role-a"}, now); !errors.Is(err, errRateLimited) || lease != nil {
-		t.Fatalf("updated role limit was not enforced: %#v, %v", lease, err)
+	if stored.GlobalPerHour != 20 {
+		t.Fatalf("global safety cap = %d, want 20", stored.GlobalPerHour)
+	}
+	defaults := testConfig()
+	if stored.AuthenticatedPerHour != defaults.AuthenticatedBudget || stored.AuthenticatedPerDay != defaults.AuthenticatedDailyBudget {
+		t.Fatalf("global settings update changed legacy per-user values: %#v", stored)
+	}
+}
+
+func TestCheckedAdminRoleBudgetOverridesLegacyPluginRoleRows(t *testing.T) {
+	db := migratedDB(t)
+	if _, err := db.Exec(`INSERT INTO role_rate_limit (role_id, per_hour, per_day) VALUES ('legacy-role', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	s := newStore(db, testConfig())
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	limits := coldFetchBudget{PerHour: 2, PerDay: 2}
+	for _, postID := range []string{"1234567890", "2234567890"} {
+		if lease, err := s.AcquireFetchWithBudget(context.Background(), postID, "u1", limits, now); err != nil || lease == nil {
+			t.Fatalf("checked admin/roles budget did not override legacy row for %s: lease=%#v err=%v", postID, lease, err)
+		}
+	}
+	if lease, err := s.AcquireFetchWithBudget(context.Background(), "3234567890", "u1", limits, now); !errors.Is(err, errRateLimited) || lease != nil {
+		t.Fatalf("checked admin/roles budget was not enforced: lease=%#v err=%v", lease, err)
 	}
 }
 
 func TestAdminRateLimitSettingsRequireAdministrator(t *testing.T) {
 	db := migratedDB(t)
+	if _, err := db.Exec(`INSERT INTO role_rate_limit (role_id, per_hour, per_day) VALUES ('legacy-role', 7, 70)`); err != nil {
+		t.Fatal(err)
+	}
 	h := plugintest.New(t).WithName("fxtwitter-preview").WithDB(db).WithConfig(map[string]any{})
 	routes := h.Routes(Plugin)
 	if _, err := routes.Call(t, "POST /admin/rate-limit-settings", plugintest.Request{UserID: "mod", Moderator: true, Body: `{}`}); err == nil {
@@ -94,12 +119,40 @@ func TestAdminRateLimitSettingsRequireAdministrator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if strings.Contains(mustJSON(t, result), "roleLimits") {
+		t.Fatal("rate-limit settings response still exposes plugin-owned role policy editing data")
+	}
 	current := result.(rateLimitSettingsResponse)
-	body := `{"revision":` + strconv.FormatInt(current.Revision, 10) + `,"authenticatedPerHour":3,"authenticatedPerDay":30,"globalPerHour":40,"roleLimits":[{"roleId":"role-a","perHour":5,"perDay":50}]}`
+	initialSettings, err := newStore(db, testConfig()).ReadRateLimitSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"revision":` + strconv.FormatInt(current.Revision, 10) + `,"globalPerHour":40}`
 	if _, err := routes.Call(t, "POST /admin/rate-limit-settings/update", plugintest.Request{UserID: "mod", Moderator: true, Body: body}); err == nil {
 		t.Fatal("moderator changed administrator-only rate limit settings")
 	}
 	if _, err := routes.Call(t, "POST /admin/rate-limit-settings/update", plugintest.Request{UserID: "admin", Administrator: true, Body: body}); err != nil {
 		t.Fatal(err)
+	}
+	legacyRoleBody := `{"revision":` + strconv.FormatInt(current.Revision+1, 10) + `,"authenticatedPerHour":3,"authenticatedPerDay":30,"globalPerHour":40,"roleLimits":[{"roleId":"role-a","perHour":5,"perDay":50}]}`
+	if _, err := routes.Call(t, "POST /admin/rate-limit-settings/update", plugintest.Request{UserID: "admin", Administrator: true, Body: legacyRoleBody}); err == nil {
+		t.Fatal("legacy plugin endpoint still accepts per-user or role policy changes")
+	}
+	var perHour, perDay int
+	if err := db.QueryRow(`SELECT per_hour, per_day FROM role_rate_limit WHERE role_id = 'legacy-role'`).Scan(&perHour, &perDay); err != nil {
+		t.Fatal(err)
+	}
+	if perHour != 7 || perDay != 70 {
+		t.Fatalf("rejected plugin role update changed preserved legacy row: %d/%d", perHour, perDay)
+	}
+	stored, err := newStore(db, testConfig()).ReadRateLimitSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.RoleLimits["legacy-role"]; got.PerHour != 7 || got.PerDay != 70 {
+		t.Fatalf("legacy role data was not preserved: %#v", stored.RoleLimits)
+	}
+	if stored.AuthenticatedPerHour != initialSettings.AuthenticatedPerHour || stored.AuthenticatedPerDay != initialSettings.AuthenticatedPerDay {
+		t.Fatalf("rejected legacy per-user update changed stored values: %#v", stored)
 	}
 }

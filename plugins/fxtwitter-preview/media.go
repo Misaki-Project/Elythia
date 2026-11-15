@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,57 +24,100 @@ import (
 
 const (
 	mediaProcessingConcurrency = 1
-	mediaRequestCapacity       = 33
+	mediaRequestCapacity       = 16
 	mediaBufferCapacity        = 128 << 20
+	mediaResponseWriteTimeout  = 2 * time.Minute
 )
 
-var errMediaBusy = errors.New("media processing is busy")
+var errMediaBusy = errors.New("media processing capacity is unavailable")
+var errMediaBodyTooLarge = errors.New("media response exceeds configured limit")
 
-// 世代ごとに作り直さず、別の利用者・URL・メディア種別も同じ処理枠を使う。
-// ヘッダー取得は並行してよいが、画像の読み込み・デコード前には処理枠を取る。
-// 受付総数も制限し、待機側に画像バイト列や無制限の通信を積み上げない。
-var processMediaAdmission = &mediaAdmission{
-	requests: make(chan struct{}, mediaRequestCapacity),
-	running:  make(chan struct{}, mediaProcessingConcurrency),
-	buffered: semaphore.NewWeighted(mediaBufferCapacity),
-}
+var processMediaAdmission = newMediaAdmission(mediaProcessingConcurrency, mediaRequestCapacity, mediaBufferCapacity)
 
 type mediaAdmission struct {
 	requests chan struct{}
-	running  chan struct{}
+	decoders chan struct{}
 	buffered *semaphore.Weighted
+	capacity int64
 }
 
-func (a *mediaAdmission) admit(ctx context.Context) (func(), error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+func newMediaAdmission(concurrency, requestCapacity, bufferCapacity int) *mediaAdmission {
+	return &mediaAdmission{
+		requests: make(chan struct{}, requestCapacity),
+		decoders: make(chan struct{}, concurrency),
+		buffered: semaphore.NewWeighted(int64(bufferCapacity)),
+		capacity: int64(bufferCapacity),
 	}
-	select {
-	case a.requests <- struct{}{}:
-	default:
+}
+
+func (a *mediaAdmission) admit(ctx context.Context, maxBytes ...int) (func(), error) {
+	if len(maxBytes) == 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		select {
+		case a.requests <- struct{}{}:
+			return releaseMediaToken(a.requests), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if len(maxBytes) != 1 {
 		return nil, errMediaBusy
 	}
-	if err := ctx.Err(); err != nil {
+	return a.admitWithQueue(ctx, maxBytes[0], false)
+}
+
+func (a *mediaAdmission) admitWithQueue(ctx context.Context, maxBytes int, wait bool) (func(), error) {
+	reserveBytes := int64(maxBytes) + 1
+	if maxBytes < 1 || reserveBytes > a.capacity {
+		return nil, errMediaBusy
+	}
+	if wait {
+		select {
+		case a.requests <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	} else {
+		select {
+		case a.requests <- struct{}{}:
+		default:
+			return nil, errMediaBusy
+		}
+	}
+	if err := a.buffered.Acquire(ctx, reserveBytes); err != nil {
 		<-a.requests
 		return nil, err
 	}
-	return releaseMediaToken(a.requests), nil
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.buffered.Release(reserveBytes)
+			<-a.requests
+		})
+	}, nil
 }
 
-func (a *mediaAdmission) acquireProcessing(ctx context.Context) (func(), error) {
+func (a *mediaAdmission) acquireDecoder(ctx context.Context) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	select {
-	case a.running <- struct{}{}:
+	case a.decoders <- struct{}{}:
 		if err := ctx.Err(); err != nil {
-			<-a.running
+			<-a.decoders
 			return nil, err
 		}
-		return releaseMediaToken(a.running), nil
+		var once sync.Once
+		return func() { once.Do(func() { <-a.decoders }) }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func (a *mediaAdmission) acquireProcessing(ctx context.Context) (func(), error) {
+	return a.acquireDecoder(ctx)
 }
 
 func releaseMediaToken(tokens chan struct{}) func() {
@@ -82,164 +126,237 @@ func releaseMediaToken(tokens chan struct{}) func() {
 }
 
 func (s *store) ResolveMedia(ctx context.Context, postID, kind, rawIndex string, now time.Time) (string, error) {
+	url, _, err := s.ResolveMediaDescriptor(ctx, postID, kind, rawIndex, now)
+	return url, err
+}
+
+func (s *store) ResolveMediaDescriptor(ctx context.Context, postID, kind, rawIndex string, now time.Time) (string, *time.Time, error) {
 	if !statusIDPattern.MatchString(postID) {
-		return "", errors.New("invalid post id")
+		return "", nil, errors.New("invalid post id")
 	}
 	index, err := strconv.Atoi(rawIndex)
 	if err != nil || index < 0 {
-		return "", errors.New("invalid media index")
+		return "", nil, errors.New("invalid media index")
 	}
 	entry, err := s.ReadPublic(ctx, postID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if entry == nil || (entry.State != "ready" && entry.State != "stale") || entry.Post == nil || !entry.NextFetchAt.After(now) {
-		return "", errors.New("media descriptor unavailable")
+		return "", nil, errors.New("media descriptor unavailable")
 	}
+	var source string
 	switch kind {
 	case "avatar":
 		if index != 0 {
-			return "", errors.New("avatar index unavailable")
+			return "", nil, errors.New("avatar index unavailable")
 		}
-		return entry.Post.Author.AvatarURL, nil
+		source = entry.Post.Author.AvatarURL
 	case "image":
 		if index >= len(entry.Post.Images) {
-			return "", errors.New("image index unavailable")
+			return "", nil, errors.New("image index unavailable")
 		}
-		return entry.Post.Images[index].URL, nil
+		source = entry.Post.Images[index].URL
 	case "poster":
-		if index != 0 || entry.Post.Video == nil ||
-			(entry.State != "stale" && (entry.Post.Video.PosterExpiresAt == nil || !entry.Post.Video.PosterExpiresAt.After(now))) {
-			return "", errors.New("poster unavailable")
+		video := indexedVideo(entry.Post.Videos, entry.Post.Video, index)
+		if video == nil ||
+			(entry.State != "stale" && (video.PosterExpiresAt == nil || !video.PosterExpiresAt.After(now))) {
+			return "", nil, errors.New("poster unavailable")
 		}
-		return entry.Post.Video.PosterURL, nil
+		source = video.PosterURL
 	case "quote-avatar":
 		if index != 0 || entry.Post.Quote == nil {
-			return "", errors.New("quoted avatar unavailable")
+			return "", nil, errors.New("quoted avatar unavailable")
 		}
-		return entry.Post.Quote.Author.AvatarURL, nil
+		source = entry.Post.Quote.Author.AvatarURL
 	case "quote-image":
 		if entry.Post.Quote == nil || index >= len(entry.Post.Quote.Images) {
-			return "", errors.New("quoted image unavailable")
+			return "", nil, errors.New("quoted image unavailable")
 		}
-		return entry.Post.Quote.Images[index].URL, nil
+		source = entry.Post.Quote.Images[index].URL
 	case "quote-poster":
-		if index != 0 || entry.Post.Quote == nil || entry.Post.Quote.Video == nil ||
-			(entry.State != "stale" && (entry.Post.Quote.Video.PosterExpiresAt == nil || !entry.Post.Quote.Video.PosterExpiresAt.After(now))) {
-			return "", errors.New("quoted poster unavailable")
+		if entry.Post.Quote == nil {
+			return "", nil, errors.New("quoted poster unavailable")
 		}
-		return entry.Post.Quote.Video.PosterURL, nil
+		video := indexedVideo(entry.Post.Quote.Videos, entry.Post.Quote.Video, index)
+		if video == nil || (entry.State != "stale" && (video.PosterExpiresAt == nil || !video.PosterExpiresAt.After(now))) {
+			return "", nil, errors.New("quoted poster unavailable")
+		}
+		source = video.PosterURL
 	default:
-		return "", errors.New("unknown media kind")
+		return "", nil, errors.New("unknown media kind")
 	}
+	return source, entry.FetchedAt, nil
 }
 
-func fetchMedia(ctx, responseCtx context.Context, base *http.Client, rawURL string, maxBytes int) (plugin.Blob, error) {
-	return fetchMediaWithDecoder(ctx, responseCtx, base, rawURL, maxBytes, imagedecode.DecodeImage)
+func indexedVideo(videos []PublicVideoMetadata, legacy *PublicVideo, index int) *PublicVideoMetadata {
+	if index < 0 {
+		return nil
+	}
+	if len(videos) > 0 {
+		if index >= len(videos) {
+			return nil
+		}
+		return &videos[index]
+	}
+	if index != 0 || legacy == nil {
+		return nil
+	}
+	return &PublicVideoMetadata{Provider: legacy.Provider, ProviderVideoID: legacy.ProviderVideoID, PosterURL: legacy.PosterURL, PosterExpiresAt: legacy.PosterExpiresAt, DurationMS: legacy.DurationMS}
 }
 
+func fetchMedia(ctx context.Context, base *http.Client, rawURL string, maxBytes int) (plugin.Blob, error) {
+	blob, release, err := fetchMediaWithAdmission(ctx, base, rawURL, maxBytes, processMediaAdmission)
+	if release != nil {
+		release()
+	}
+	return blob, err
+}
+
+// fetchMediaWithDecoder keeps the request-lifetime guard for existing focused
+// decoder tests. Production routes use fetchMediaWithAdmission and retain the
+// returned reservation until the host finishes writing the response.
 func fetchMediaWithDecoder(ctx, responseCtx context.Context, base *http.Client, rawURL string, maxBytes int, decode func([]byte) (image.Image, error)) (plugin.Blob, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Scheme != "https" || !allowedMediaHost(u.Host) || u.User != nil {
-		return plugin.Blob{}, errors.New("media URL is not allowlisted")
-	}
-	// The host writes Blob.Body after the plugin handler returns. Only the incoming
-	// HTTP request context covers that write; the shorter fetch context does not.
-	// A host without a request-completion signal cannot safely serve this buffer.
 	if responseCtx == nil || responseCtx.Done() == nil {
 		return plugin.Blob{}, errors.New("media response lifetime is unavailable")
 	}
 	if err := responseCtx.Err(); err != nil {
 		return plugin.Blob{}, err
 	}
-	if maxBytes <= 0 || maxBytes > 50<<20 {
-		return plugin.Blob{}, errors.New("invalid media byte limit")
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || !allowedMediaHost(u.Host) || u.User != nil {
+		return plugin.Blob{}, errors.New("media URL is not allowlisted")
 	}
-	releaseRequest, err := processMediaAdmission.admit(ctx)
+	release, err := processMediaAdmission.admit(ctx, maxBytes)
 	if err != nil {
 		return plugin.Blob{}, err
 	}
-	var releaseBuffer func()
-	retained := false
-	releaseResponse := func() {
-		if releaseBuffer != nil {
-			releaseBuffer()
-		}
-		releaseRequest()
+	blob, release, err := fetchMediaWithReservationDecoder(ctx, base, u, maxBytes, processMediaAdmission, release, decode)
+	if err != nil {
+		return plugin.Blob{}, err
 	}
+	if err := responseCtx.Err(); err != nil {
+		release()
+		return plugin.Blob{}, err
+	}
+	context.AfterFunc(responseCtx, release)
+	return blob, nil
+}
+
+func fetchMediaWithAdmission(ctx context.Context, base *http.Client, rawURL string, maxBytes int, admission *mediaAdmission) (plugin.Blob, func(), error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || !allowedMediaHost(u.Host) || u.User != nil {
+		return plugin.Blob{}, nil, errors.New("media URL is not allowlisted")
+	}
+	return fetchAllowedMedia(ctx, base, u, maxBytes, admission)
+}
+
+func fetchPosterWithAdmission(ctx context.Context, base *http.Client, rawURL string, maxBytes int, admission *mediaAdmission) (plugin.Blob, func(), error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || u.User != nil || !(allowedMediaHost(u.Host) || allowedYouTubePosterURL(u)) {
+		return plugin.Blob{}, nil, errors.New("media URL is not allowlisted")
+	}
+	return fetchAllowedMedia(ctx, base, u, maxBytes, admission)
+}
+
+func fetchAllowedMedia(ctx context.Context, base *http.Client, u *url.URL, maxBytes int, admission *mediaAdmission) (plugin.Blob, func(), error) {
+	release, err := admission.admit(ctx, maxBytes)
+	if err != nil {
+		return plugin.Blob{}, nil, err
+	}
+	return fetchMediaWithReservation(ctx, base, u, maxBytes, admission, release)
+}
+
+func fetchMediaWithReservation(ctx context.Context, base *http.Client, u *url.URL, maxBytes int, admission *mediaAdmission, release func()) (plugin.Blob, func(), error) {
+	return fetchMediaWithReservationDecoder(ctx, base, u, maxBytes, admission, release, imagedecode.DecodeImage)
+}
+
+func fetchMediaWithReservationDecoder(ctx context.Context, base *http.Client, u *url.URL, maxBytes int, admission *mediaAdmission, release func(), decode func([]byte) (image.Image, error)) (plugin.Blob, func(), error) {
+	keepReservation := false
 	defer func() {
-		if !retained {
-			releaseResponse()
+		if !keepReservation {
+			release()
 		}
 	}()
 	client := *base
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return plugin.Blob{}, err
+		return plugin.Blob{}, nil, err
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return plugin.Blob{}, err
+		return plugin.Blob{}, nil, err
 	}
-	var releaseProcessing func()
-	defer func() {
-		_ = res.Body.Close()
-		if releaseProcessing != nil {
-			releaseProcessing()
-		}
-	}()
+	defer res.Body.Close() //nolint:errcheck
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return plugin.Blob{}, fmt.Errorf("media status %d", res.StatusCode)
+		return plugin.Blob{}, nil, fmt.Errorf("media status %d", res.StatusCode)
 	}
 	declared, _, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
 	if err != nil || !allowedImageMIME(declared) {
-		return plugin.Blob{}, errors.New("media content type is not allowed")
+		return plugin.Blob{}, nil, errors.New("media content type is not allowed")
 	}
-	// Reserve before reading, including spare capacity from io.ReadAll growth.
-	// Retain both credits while the host may still reference the response bytes.
-	bufferCost := 2*int64(maxBytes) + 1024
-	if err := processMediaAdmission.buffered.Acquire(ctx, bufferCost); err != nil {
-		return plugin.Blob{}, err
+	if res.ContentLength > int64(maxBytes) {
+		return plugin.Blob{}, nil, errors.New("media response exceeds configured limit")
 	}
-	var bufferOnce sync.Once
-	releaseBuffer = func() { bufferOnce.Do(func() { processMediaAdmission.buffered.Release(bufferCost) }) }
-	// デコーダーはcontextで中断できない。キャンセル後も完了までは枠を保持する。
-	releaseProcessing, err = processMediaAdmission.acquireProcessing(ctx)
+	body, err := readBoundedMediaBody(res.Body, maxBytes)
 	if err != nil {
-		return plugin.Blob{}, err
+		return plugin.Blob{}, nil, err
 	}
-	body, err := io.ReadAll(io.LimitReader(res.Body, int64(maxBytes)+1))
-	if err != nil {
-		return plugin.Blob{}, err
-	}
-	if len(body) > maxBytes {
-		return plugin.Blob{}, errors.New("media response exceeds configured limit")
+	if err := ctx.Err(); err != nil {
+		return plugin.Blob{}, nil, err
 	}
 	detected, _, _ := mime.ParseMediaType(http.DetectContentType(body))
 	if !allowedImageMIME(detected) || detected != declared {
-		return plugin.Blob{}, errors.New("media content does not match type")
+		return plugin.Blob{}, nil, errors.New("media content does not match type")
 	}
-	if err := ctx.Err(); err != nil {
-		return plugin.Blob{}, err
+	releaseDecoder, err := admission.acquireDecoder(ctx)
+	if err != nil {
+		return plugin.Blob{}, nil, err
 	}
 	if _, err := decode(body); err != nil {
-		return plugin.Blob{}, fmt.Errorf("decode media: %w", err)
+		releaseDecoder()
+		return plugin.Blob{}, nil, fmt.Errorf("decode media: %w", err)
 	}
+	releaseDecoder()
 	if err := ctx.Err(); err != nil {
-		return plugin.Blob{}, err
+		return plugin.Blob{}, nil, err
 	}
-	if err := responseCtx.Err(); err != nil {
-		return plugin.Blob{}, err
+	keepReservation = true
+	return plugin.Blob{ContentType: detected, Body: body, CacheControl: "private, no-store", WriteTimeout: mediaResponseWriteTimeout}, release, nil
+}
+
+func readBoundedMediaBody(reader io.Reader, maxBytes int) ([]byte, error) {
+	buffer := make([]byte, maxBytes+1)
+	n, err := io.ReadFull(reader, buffer)
+	if n > maxBytes {
+		return nil, errMediaBodyTooLarge
 	}
-	context.AfterFunc(responseCtx, releaseResponse)
-	retained = true
-	return plugin.Blob{ContentType: detected, Body: body, CacheControl: "private, no-store"}, nil
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	return buffer[:n], nil
 }
 
 func allowedMediaHost(value string) bool {
 	switch value {
 	case "pbs.twimg.com":
+		return true
+	default:
+		return false
+	}
+}
+
+func allowedYouTubePosterURL(u *url.URL) bool {
+	if u == nil || u.Scheme != "https" || u.Host != "img.youtube.com" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || u.EscapedPath() != u.Path {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "vi" || !youtubeVideoIDPattern.MatchString(parts[1]) {
+		return false
+	}
+	switch parts[2] {
+	case "default.jpg", "mqdefault.jpg", "hqdefault.jpg", "sddefault.jpg", "maxresdefault.jpg", "0.jpg", "1.jpg", "2.jpg", "3.jpg":
 		return true
 	default:
 		return false

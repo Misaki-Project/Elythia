@@ -93,16 +93,16 @@ func TestMediaFetchAcceptsBoundedRasterFormats(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(blob.Body) != len(body) || blob.CacheControl != "private, no-store" {
+			if len(blob.Body) != len(body) || blob.CacheControl != "private, no-store" || blob.WriteTimeout != mediaResponseWriteTimeout {
 				t.Fatalf("blob = %#v", blob)
 			}
 		})
 	}
 }
 
-func TestMediaFetchRejectsLegacyYouTubePosterHostBeforeOutbound(t *testing.T) {
+func TestMediaFetchAllowsCanonicalYouTubePosterOnlyThroughPosterPath(t *testing.T) {
 	body := tinyImage(t, "jpeg")
-	rawURL := "https://img.youtube.com/vi/abc123/hqdefault.jpg"
+	rawURL := "https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
 	called := false
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		called = true
@@ -111,9 +111,27 @@ func TestMediaFetchRejectsLegacyYouTubePosterHostBeforeOutbound(t *testing.T) {
 		}
 		return response(200, "image/jpeg", string(body)), nil
 	})}
-	_, err := fetchTestMedia(context.Background(), client, rawURL, 1<<20)
-	if err == nil || called {
-		t.Fatalf("legacy host allowed: called = %v, err = %v", called, err)
+	if _, err := fetchTestMedia(context.Background(), client, rawURL, 1<<20); err == nil || called {
+		t.Fatal("YouTube poster host was allowed for a general media URL")
+	}
+	blob, release, err := fetchPosterWithAdmission(context.Background(), client, rawURL, 1<<20, processMediaAdmission)
+	if release != nil {
+		defer release()
+	}
+	if err != nil || !called || !bytes.Equal(blob.Body, body) || blob.CacheControl != "private, no-store" {
+		t.Fatalf("canonical YouTube poster was not served privately: called=%v blob=%#v err=%v", called, blob, err)
+	}
+	for _, unsafeURL := range []string{
+		"https://img.youtube.com.evil.example/vi/dQw4w9WgXcQ/hqdefault.jpg",
+		"https://img.youtube.com:443/vi/dQw4w9WgXcQ/hqdefault.jpg",
+		"https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg?x=1",
+		"https://img.youtube.com/vi/short/hqdefault.jpg",
+		"https://img.youtube.com/vi/dQw4w9WgXcQ/../../../secret.jpg",
+	} {
+		called = false
+		if _, _, err := fetchPosterWithAdmission(context.Background(), client, unsafeURL, 1<<20, processMediaAdmission); err == nil || called {
+			t.Fatalf("unsafe YouTube poster URL accepted: %q, called=%v", unsafeURL, called)
+		}
 	}
 }
 

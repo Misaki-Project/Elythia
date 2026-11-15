@@ -5,7 +5,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <template>
 	<div class="_gaps_s">
-		<XFolder v-if="matchQuery([i18n.ts._role._options.rateLimitFactor, 'rateLimitFactor'])" v-model:policyMeta="policyMetaModel.rateLimitFactor" :levelConfig="levelConfig" policyKey="rateLimitFactor" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.rateLimitFactor, 'rateLimitFactor'])" v-model:policyMeta="policyMetaModel.rateLimitFactor" :levelConfig="levelConfig" policyKey="rateLimitFactor" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="rateLimitFactor">
 			<template #label>{{ i18n.ts._role._options.rateLimitFactor }}</template>
 			<template #valueText>{{ Math.floor(valuesModel.rateLimitFactor * 100) }}%</template>
 			<template #default="{ disabled }">
@@ -15,7 +15,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.gtlAvailable, 'gtlAvailable'])" v-model:policyMeta="policyMetaModel.gtlAvailable" :levelConfig="levelConfig" policyKey="gtlAvailable" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.gtlAvailable, 'gtlAvailable'])" v-model:policyMeta="policyMetaModel.gtlAvailable" :levelConfig="levelConfig" policyKey="gtlAvailable" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="gtlAvailable">
 			<template #label>{{ i18n.ts._role._options.gtlAvailable }}</template>
 			<template #valueText>{{ valuesModel.gtlAvailable ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -25,7 +25,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.ltlAvailable, 'ltlAvailable'])" v-model:policyMeta="policyMetaModel.ltlAvailable" :levelConfig="levelConfig" policyKey="ltlAvailable" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.ltlAvailable, 'ltlAvailable'])" v-model:policyMeta="policyMetaModel.ltlAvailable" :levelConfig="levelConfig" policyKey="ltlAvailable" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="ltlAvailable">
 			<template #label>{{ i18n.ts._role._options.ltlAvailable }}</template>
 			<template #valueText>{{ valuesModel.ltlAvailable ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -35,7 +35,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canPublicNote, 'canPublicNote'])" v-model:policyMeta="policyMetaModel.canPublicNote" :levelConfig="levelConfig" policyKey="canPublicNote" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canPublicNote, 'canPublicNote'])" v-model:policyMeta="policyMetaModel.canPublicNote" :levelConfig="levelConfig" policyKey="canPublicNote" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canPublicNote">
 			<template #label>{{ i18n.ts._role._options.canPublicNote }}</template>
 			<template #valueText>{{ valuesModel.canPublicNote ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -45,7 +45,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.chatAvailability, 'chatAvailability'])" v-model:policyMeta="policyMetaModel.chatAvailability" :levelConfig="levelConfig" policyKey="chatAvailability" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.chatAvailability, 'chatAvailability'])" v-model:policyMeta="policyMetaModel.chatAvailability" :levelConfig="levelConfig" policyKey="chatAvailability" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="chatAvailability">
 			<template #label>{{ i18n.ts._role._options.chatAvailability }}</template>
 			<template #valueText>{{ valuesModel.chatAvailability === 'available' ? i18n.ts.yes : valuesModel.chatAvailability === 'readonly' ? i18n.ts.readonly : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -63,7 +63,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.mentionMax, 'mentionLimit'])" v-model:policyMeta="policyMetaModel.mentionLimit" :levelConfig="levelConfig" policyKey="mentionLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.mentionMax, 'mentionLimit'])" v-model:policyMeta="policyMetaModel.mentionLimit" :levelConfig="levelConfig" policyKey="mentionLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="mentionLimit">
 			<template #label>{{ i18n.ts._role._options.mentionMax }}</template>
 			<template #valueText>{{ valuesModel.mentionLimit }}</template>
 			<template #default="{ disabled }">
@@ -72,7 +72,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canInvite, 'canInvite'])" v-model:policyMeta="policyMetaModel.canInvite" :levelConfig="levelConfig" policyKey="canInvite" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canInvite, 'canInvite'])" v-model:policyMeta="policyMetaModel.canInvite" :levelConfig="levelConfig" policyKey="canInvite" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canInvite">
 			<template #label>{{ i18n.ts._role._options.canInvite }}</template>
 			<template #valueText>{{ valuesModel.canInvite ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -82,7 +82,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.inviteLimit, 'inviteLimit'])" v-model:policyMeta="policyMetaModel.inviteLimit" :levelConfig="levelConfig" policyKey="inviteLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.inviteLimit, 'inviteLimit'])" v-model:policyMeta="policyMetaModel.inviteLimit" :levelConfig="levelConfig" policyKey="inviteLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="inviteLimit">
 			<template #label>{{ i18n.ts._role._options.inviteLimit }}</template>
 			<template #valueText>{{ valuesModel.inviteLimit }}</template>
 			<template #default="{ disabled }">
@@ -91,7 +91,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.inviteLimitCycle, 'inviteLimitCycle'])" v-model:policyMeta="policyMetaModel.inviteLimitCycle" :levelConfig="levelConfig" policyKey="inviteLimitCycle" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.inviteLimitCycle, 'inviteLimitCycle'])" v-model:policyMeta="policyMetaModel.inviteLimitCycle" :levelConfig="levelConfig" policyKey="inviteLimitCycle" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="inviteLimitCycle">
 			<template #label>{{ i18n.ts._role._options.inviteLimitCycle }}</template>
 			<template #valueText>{{ valuesModel.inviteLimitCycle + i18n.ts._time.minute }}</template>
 			<template #default="{ disabled }">
@@ -101,7 +101,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.inviteExpirationTime, 'inviteExpirationTime'])" v-model:policyMeta="policyMetaModel.inviteExpirationTime" :levelConfig="levelConfig" policyKey="inviteExpirationTime" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.inviteExpirationTime, 'inviteExpirationTime'])" v-model:policyMeta="policyMetaModel.inviteExpirationTime" :levelConfig="levelConfig" policyKey="inviteExpirationTime" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="inviteExpirationTime">
 			<template #label>{{ i18n.ts._role._options.inviteExpirationTime }}</template>
 			<template #valueText>{{ valuesModel.inviteExpirationTime + i18n.ts._time.minute }}</template>
 			<template #default="{ disabled }">
@@ -111,7 +111,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canManageAvatarDecorations, 'canManageAvatarDecorations'])" v-model:policyMeta="policyMetaModel.canManageAvatarDecorations" :levelConfig="levelConfig" policyKey="canManageAvatarDecorations" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canManageAvatarDecorations, 'canManageAvatarDecorations'])" v-model:policyMeta="policyMetaModel.canManageAvatarDecorations" :levelConfig="levelConfig" policyKey="canManageAvatarDecorations" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canManageAvatarDecorations">
 			<template #label>{{ i18n.ts._role._options.canManageAvatarDecorations }}</template>
 			<template #valueText>{{ valuesModel.canManageAvatarDecorations ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -121,7 +121,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canManageCustomEmojis, 'canManageCustomEmojis'])" v-model:policyMeta="policyMetaModel.canManageCustomEmojis" :levelConfig="levelConfig" policyKey="canManageCustomEmojis" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canManageCustomEmojis, 'canManageCustomEmojis'])" v-model:policyMeta="policyMetaModel.canManageCustomEmojis" :levelConfig="levelConfig" policyKey="canManageCustomEmojis" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canManageCustomEmojis">
 			<template #label>{{ i18n.ts._role._options.canManageCustomEmojis }}</template>
 			<template #valueText>{{ valuesModel.canManageCustomEmojis ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -131,7 +131,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canSearchNotes, 'canSearchNotes'])" v-model:policyMeta="policyMetaModel.canSearchNotes" :levelConfig="levelConfig" policyKey="canSearchNotes" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canSearchNotes, 'canSearchNotes'])" v-model:policyMeta="policyMetaModel.canSearchNotes" :levelConfig="levelConfig" policyKey="canSearchNotes" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canSearchNotes">
 			<template #label>{{ i18n.ts._role._options.canSearchNotes }}</template>
 			<template #valueText>{{ valuesModel.canSearchNotes ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -141,7 +141,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canSearchUsers, 'canSearchUsers'])" v-model:policyMeta="policyMetaModel.canSearchUsers" :levelConfig="levelConfig" policyKey="canSearchUsers" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canSearchUsers, 'canSearchUsers'])" v-model:policyMeta="policyMetaModel.canSearchUsers" :levelConfig="levelConfig" policyKey="canSearchUsers" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canSearchUsers">
 			<template #label>{{ i18n.ts._role._options.canSearchUsers }}</template>
 			<template #valueText>{{ valuesModel.canSearchUsers ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -151,7 +151,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canUseTranslator, 'canUseTranslator'])" v-model:policyMeta="policyMetaModel.canUseTranslator" :levelConfig="levelConfig" policyKey="canUseTranslator" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canUseTranslator, 'canUseTranslator'])" v-model:policyMeta="policyMetaModel.canUseTranslator" :levelConfig="levelConfig" policyKey="canUseTranslator" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canUseTranslator">
 			<template #label>{{ i18n.ts._role._options.canUseTranslator }}</template>
 			<template #valueText>{{ valuesModel.canUseTranslator ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -161,7 +161,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canCreateChannel, 'canCreateChannel'])" v-model:policyMeta="policyMetaModel.canCreateChannel" :levelConfig="levelConfig" policyKey="canCreateChannel" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canCreateChannel, 'canCreateChannel'])" v-model:policyMeta="policyMetaModel.canCreateChannel" :levelConfig="levelConfig" policyKey="canCreateChannel" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canCreateChannel">
 			<template #label>{{ i18n.ts._role._options.canCreateChannel }}</template>
 			<template #valueText>{{ valuesModel.canCreateChannel ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -171,7 +171,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.driveCapacity, 'driveCapacityMb'])" v-model:policyMeta="policyMetaModel.driveCapacityMb" :levelConfig="levelConfig" policyKey="driveCapacityMb" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.driveCapacity, 'driveCapacityMb'])" v-model:policyMeta="policyMetaModel.driveCapacityMb" :levelConfig="levelConfig" policyKey="driveCapacityMb" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="driveCapacityMb">
 			<template #label>{{ i18n.ts._role._options.driveCapacity }}</template>
 			<template #valueText>{{ valuesModel.driveCapacityMb }}MB</template>
 			<template #default="{ disabled }">
@@ -181,7 +181,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.maxFileSize, 'maxFileSizeMb'])" v-model:policyMeta="policyMetaModel.maxFileSizeMb" :levelConfig="levelConfig" policyKey="maxFileSizeMb" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.maxFileSize, 'maxFileSizeMb'])" v-model:policyMeta="policyMetaModel.maxFileSizeMb" :levelConfig="levelConfig" policyKey="maxFileSizeMb" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="maxFileSizeMb">
 			<template #label>{{ i18n.ts._role._options.maxFileSize }}</template>
 			<template #valueText>{{ valuesModel.maxFileSizeMb }}MB</template>
 			<template #default="{ disabled }">
@@ -195,7 +195,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.uploadableFileTypes, 'uploadableFileTypes'])" v-model:policyMeta="policyMetaModel.uploadableFileTypes" :levelConfig="levelConfig" policyKey="uploadableFileTypes" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.uploadableFileTypes, 'uploadableFileTypes'])" v-model:policyMeta="policyMetaModel.uploadableFileTypes" :levelConfig="levelConfig" policyKey="uploadableFileTypes" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="uploadableFileTypes">
 			<template #label>{{ i18n.ts._role._options.uploadableFileTypes }}</template>
 			<template #valueText>...</template>
 			<template #default="{ disabled }">
@@ -213,7 +213,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			**集約は他の bool / 数値 policy と同じ** (bool は OR、数値は max)。
 			intersection なのは下の optOutNotificationTypes だけ。
 		-->
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canRequestCustomEmojis, 'canRequestCustomEmojis'])" v-model:policyMeta="canRequestCustomEmojisMeta" :levelConfig="levelConfig" policyKey="canRequestCustomEmojis" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canRequestCustomEmojis, 'canRequestCustomEmojis'])" v-model:policyMeta="canRequestCustomEmojisMeta" :levelConfig="levelConfig" policyKey="canRequestCustomEmojis" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canRequestCustomEmojis">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.canRequestCustomEmojis }}</template>
 			<template #valueText>{{ canRequestCustomEmojis ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -228,7 +228,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			カスタム絵文字をアバターデコレーションとして重ねられるか (#2975)。mk-go 独自。
 			**個数の policy は無い** — 既存の avatarDecorationLimit に合算する。
 		-->
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canUseEmojiAsAvatarDecoration, 'canUseEmojiAsAvatarDecoration'])" v-model:policyMeta="canUseEmojiAsAvatarDecorationMeta" :levelConfig="levelConfig" policyKey="canUseEmojiAsAvatarDecoration" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canUseEmojiAsAvatarDecoration, 'canUseEmojiAsAvatarDecoration'])" v-model:policyMeta="canUseEmojiAsAvatarDecorationMeta" :levelConfig="levelConfig" policyKey="canUseEmojiAsAvatarDecoration" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canUseEmojiAsAvatarDecoration">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.canUseEmojiAsAvatarDecoration }}</template>
 			<template #valueText>{{ canUseEmojiAsAvatarDecoration ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -245,7 +245,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			requireAdmin なので、既定でモデレーターへ開くと同じ機密情報に
 			既存より緩い経路を新設することになる。開くかどうかは運営者が決める。
 		-->
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canSearchIpHistory, 'canSearchIpHistory'])" v-model:policyMeta="canSearchIpHistoryMeta" :levelConfig="levelConfig" policyKey="canSearchIpHistory" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canSearchIpHistory, 'canSearchIpHistory'])" v-model:policyMeta="canSearchIpHistoryMeta" :levelConfig="levelConfig" policyKey="canSearchIpHistory" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canSearchIpHistory">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.canSearchIpHistory }}</template>
 			<template #valueText>{{ canSearchIpHistory ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -256,7 +256,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canDeleteAccount, 'canDeleteAccount'])" v-model:policyMeta="canDeleteAccountMeta" :levelConfig="levelConfig" policyKey="canDeleteAccount" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canDeleteAccount, 'canDeleteAccount'])" v-model:policyMeta="canDeleteAccountMeta" :levelConfig="levelConfig" policyKey="canDeleteAccount" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canDeleteAccount">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.canDeleteAccount }}</template>
 			<template #valueText>{{ canDeleteAccount ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -267,7 +267,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canPurgeAccount, 'canPurgeAccount'])" v-model:policyMeta="canPurgeAccountMeta" :levelConfig="levelConfig" policyKey="canPurgeAccount" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canPurgeAccount, 'canPurgeAccount'])" v-model:policyMeta="canPurgeAccountMeta" :levelConfig="levelConfig" policyKey="canPurgeAccount" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canPurgeAccount">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.canPurgeAccount }}</template>
 			<template #valueText>{{ canPurgeAccount ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -278,7 +278,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canUseChunkedUpload, 'canUseChunkedUpload'])" v-model:policyMeta="canUseChunkedUploadMeta" :levelConfig="levelConfig" policyKey="canUseChunkedUpload" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canUseChunkedUpload, 'canUseChunkedUpload'])" v-model:policyMeta="canUseChunkedUploadMeta" :levelConfig="levelConfig" policyKey="canUseChunkedUpload" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canUseChunkedUpload">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.canUseChunkedUpload }}</template>
 			<template #valueText>{{ canUseChunkedUpload ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -289,7 +289,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.chunkedUploadMaxConcurrentSessions, 'chunkedUploadMaxConcurrentSessions'])" v-model:policyMeta="chunkedUploadMaxConcurrentSessionsMeta" :levelConfig="levelConfig" policyKey="chunkedUploadMaxConcurrentSessions" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.chunkedUploadMaxConcurrentSessions, 'chunkedUploadMaxConcurrentSessions'])" v-model:policyMeta="chunkedUploadMaxConcurrentSessionsMeta" :levelConfig="levelConfig" policyKey="chunkedUploadMaxConcurrentSessions" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="chunkedUploadMaxConcurrentSessions">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.chunkedUploadMaxConcurrentSessions }}</template>
 			<template #valueText>{{ chunkedUploadMaxConcurrentSessions }}</template>
 			<template #default="{ disabled }">
@@ -299,7 +299,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.chunkedUploadMaxPendingMb, 'chunkedUploadMaxPendingMb'])" v-model:policyMeta="chunkedUploadMaxPendingMbMeta" :levelConfig="levelConfig" policyKey="chunkedUploadMaxPendingMb" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.chunkedUploadMaxPendingMb, 'chunkedUploadMaxPendingMb'])" v-model:policyMeta="chunkedUploadMaxPendingMbMeta" :levelConfig="levelConfig" policyKey="chunkedUploadMaxPendingMb" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="chunkedUploadMaxPendingMb">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.chunkedUploadMaxPendingMb }}</template>
 			<template #valueText>{{ chunkedUploadMaxPendingMb }}MB</template>
 			<template #default="{ disabled }">
@@ -315,7 +315,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			**固定の暦ではなく直前 N 時間で数える** — 暦だと切り替わりの直前と
 			直後に連続で出せてしまう。0 はその期間の上限なし。
 		-->
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerDay, 'emojiApplicationMaxPerDay'])" v-model:policyMeta="emojiApplicationMaxPerDayMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPerDay" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerDay, 'emojiApplicationMaxPerDay'])" v-model:policyMeta="emojiApplicationMaxPerDayMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPerDay" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="emojiApplicationMaxPerDay">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerDay }}</template>
 			<template #valueText>{{ emojiApplicationMaxPerDay === 0 ? i18n.ts._mkgoRolePolicy.emojiApplicationQuotaUnlimited : emojiApplicationMaxPerDay }}</template>
 			<template #default="{ disabled }">
@@ -325,7 +325,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerWeek, 'emojiApplicationMaxPerWeek'])" v-model:policyMeta="emojiApplicationMaxPerWeekMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPerWeek" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerWeek, 'emojiApplicationMaxPerWeek'])" v-model:policyMeta="emojiApplicationMaxPerWeekMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPerWeek" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="emojiApplicationMaxPerWeek">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerWeek }}</template>
 			<template #valueText>{{ emojiApplicationMaxPerWeek === 0 ? i18n.ts._mkgoRolePolicy.emojiApplicationQuotaUnlimited : emojiApplicationMaxPerWeek }}</template>
 			<template #default="{ disabled }">
@@ -335,7 +335,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerMonth, 'emojiApplicationMaxPerMonth'])" v-model:policyMeta="emojiApplicationMaxPerMonthMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPerMonth" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerMonth, 'emojiApplicationMaxPerMonth'])" v-model:policyMeta="emojiApplicationMaxPerMonthMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPerMonth" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="emojiApplicationMaxPerMonth">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.emojiApplicationMaxPerMonth }}</template>
 			<template #valueText>{{ emojiApplicationMaxPerMonth === 0 ? i18n.ts._mkgoRolePolicy.emojiApplicationQuotaUnlimited : emojiApplicationMaxPerMonth }}</template>
 			<template #default="{ disabled }">
@@ -350,7 +350,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			数え方が逆**で、却下・取り下げ・承認で枠が戻る。絞っているものも違い、
 			あちらは「出せる総量」、こちらは「モデレーターが見る一覧の長さ」。
 		-->
-		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPending, 'emojiApplicationMaxPending'])" v-model:policyMeta="emojiApplicationMaxPendingMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPending" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.emojiApplicationMaxPending, 'emojiApplicationMaxPending'])" v-model:policyMeta="emojiApplicationMaxPendingMeta" :levelConfig="levelConfig" policyKey="emojiApplicationMaxPending" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="emojiApplicationMaxPending">
 			<template #label>{{ i18n.ts._mkgoRolePolicy.emojiApplicationMaxPending }}</template>
 			<template #valueText>{{ emojiApplicationMaxPending === 0 ? i18n.ts._mkgoRolePolicy.emojiApplicationQuotaUnlimited : emojiApplicationMaxPending }}</template>
 			<template #default="{ disabled }">
@@ -398,7 +398,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			複数のロールに属している利用者は全ロールで切られている種類だけが届かなくなる
 			(他の policy と同じく緩い方に倒す)。
 		-->
-		<XFolder v-if="matchQuery([i18n.ts._mkgoNotification.optOutNotificationTypes, 'optOutNotificationTypes'])" v-model:policyMeta="optOutPolicyMeta" :levelConfig="levelConfig" policyKey="optOutNotificationTypes" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._mkgoNotification.optOutNotificationTypes, 'optOutNotificationTypes'])" v-model:policyMeta="optOutPolicyMeta" :levelConfig="levelConfig" policyKey="optOutNotificationTypes" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="optOutNotificationTypes">
 			<template #label>{{ i18n.ts._mkgoNotification.optOutNotificationTypes }}</template>
 			<template #valueText>{{ optOutTypes.length === 0 ? i18n.ts.none : optOutTypes.length }}</template>
 			<template #default="{ disabled }">
@@ -429,7 +429,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.alwaysMarkNsfw, 'alwaysMarkNsfw'])" v-model:policyMeta="policyMetaModel.alwaysMarkNsfw" :levelConfig="levelConfig" policyKey="alwaysMarkNsfw" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.alwaysMarkNsfw, 'alwaysMarkNsfw'])" v-model:policyMeta="policyMetaModel.alwaysMarkNsfw" :levelConfig="levelConfig" policyKey="alwaysMarkNsfw" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="alwaysMarkNsfw">
 			<template #label>{{ i18n.ts._role._options.alwaysMarkNsfw }}</template>
 			<template #valueText>{{ valuesModel.alwaysMarkNsfw ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -439,7 +439,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canUpdateBioMedia, 'canUpdateBioMedia'])" v-model:policyMeta="policyMetaModel.canUpdateBioMedia" :levelConfig="levelConfig" policyKey="canUpdateBioMedia" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canUpdateBioMedia, 'canUpdateBioMedia'])" v-model:policyMeta="policyMetaModel.canUpdateBioMedia" :levelConfig="levelConfig" policyKey="canUpdateBioMedia" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canUpdateBioMedia">
 			<template #label>{{ i18n.ts._role._options.canUpdateBioMedia }}</template>
 			<template #valueText>{{ valuesModel.canUpdateBioMedia ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -449,7 +449,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.pinMax, 'pinLimit'])" v-model:policyMeta="policyMetaModel.pinLimit" :levelConfig="levelConfig" policyKey="pinLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.pinMax, 'pinLimit'])" v-model:policyMeta="policyMetaModel.pinLimit" :levelConfig="levelConfig" policyKey="pinLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="pinLimit">
 			<template #label>{{ i18n.ts._role._options.pinMax }}</template>
 			<template #valueText>{{ valuesModel.pinLimit }}</template>
 			<template #default="{ disabled }">
@@ -458,7 +458,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.antennaMax, 'antennaLimit'])" v-model:policyMeta="policyMetaModel.antennaLimit" :levelConfig="levelConfig" policyKey="antennaLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.antennaMax, 'antennaLimit'])" v-model:policyMeta="policyMetaModel.antennaLimit" :levelConfig="levelConfig" policyKey="antennaLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="antennaLimit">
 			<template #label>{{ i18n.ts._role._options.antennaMax }}</template>
 			<template #valueText>{{ valuesModel.antennaLimit }}</template>
 			<template #default="{ disabled }">
@@ -467,7 +467,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.wordMuteMax, 'wordMuteLimit'])" v-model:policyMeta="policyMetaModel.wordMuteLimit" :levelConfig="levelConfig" policyKey="wordMuteLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.wordMuteMax, 'wordMuteLimit'])" v-model:policyMeta="policyMetaModel.wordMuteLimit" :levelConfig="levelConfig" policyKey="wordMuteLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="wordMuteLimit">
 			<template #label>{{ i18n.ts._role._options.wordMuteMax }}</template>
 			<template #valueText>{{ valuesModel.wordMuteLimit }}</template>
 			<template #default="{ disabled }">
@@ -477,7 +477,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.webhookMax, 'webhookLimit'])" v-model:policyMeta="policyMetaModel.webhookLimit" :levelConfig="levelConfig" policyKey="webhookLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.webhookMax, 'webhookLimit'])" v-model:policyMeta="policyMetaModel.webhookLimit" :levelConfig="levelConfig" policyKey="webhookLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="webhookLimit">
 			<template #label>{{ i18n.ts._role._options.webhookMax }}</template>
 			<template #valueText>{{ valuesModel.webhookLimit }}</template>
 			<template #default="{ disabled }">
@@ -486,7 +486,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.clipMax, 'clipLimit'])" v-model:policyMeta="policyMetaModel.clipLimit" :levelConfig="levelConfig" policyKey="clipLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.clipMax, 'clipLimit'])" v-model:policyMeta="policyMetaModel.clipLimit" :levelConfig="levelConfig" policyKey="clipLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="clipLimit">
 			<template #label>{{ i18n.ts._role._options.clipMax }}</template>
 			<template #valueText>{{ valuesModel.clipLimit }}</template>
 			<template #default="{ disabled }">
@@ -495,7 +495,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.noteEachClipsMax, 'noteEachClipsLimit'])" v-model:policyMeta="policyMetaModel.noteEachClipsLimit" :levelConfig="levelConfig" policyKey="noteEachClipsLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.noteEachClipsMax, 'noteEachClipsLimit'])" v-model:policyMeta="policyMetaModel.noteEachClipsLimit" :levelConfig="levelConfig" policyKey="noteEachClipsLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="noteEachClipsLimit">
 			<template #label>{{ i18n.ts._role._options.noteEachClipsMax }}</template>
 			<template #valueText>{{ valuesModel.noteEachClipsLimit }}</template>
 			<template #default="{ disabled }">
@@ -504,7 +504,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.userListMax, 'userListLimit'])" v-model:policyMeta="policyMetaModel.userListLimit" :levelConfig="levelConfig" policyKey="userListLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.userListMax, 'userListLimit'])" v-model:policyMeta="policyMetaModel.userListLimit" :levelConfig="levelConfig" policyKey="userListLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="userListLimit">
 			<template #label>{{ i18n.ts._role._options.userListMax }}</template>
 			<template #valueText>{{ valuesModel.userListLimit }}</template>
 			<template #default="{ disabled }">
@@ -513,7 +513,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.userEachUserListsMax, 'userEachUserListsLimit'])" v-model:policyMeta="policyMetaModel.userEachUserListsLimit" :levelConfig="levelConfig" policyKey="userEachUserListsLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.userEachUserListsMax, 'userEachUserListsLimit'])" v-model:policyMeta="policyMetaModel.userEachUserListsLimit" :levelConfig="levelConfig" policyKey="userEachUserListsLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="userEachUserListsLimit">
 			<template #label>{{ i18n.ts._role._options.userEachUserListsMax }}</template>
 			<template #valueText>{{ valuesModel.userEachUserListsLimit }}</template>
 			<template #default="{ disabled }">
@@ -522,7 +522,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canHideAds, 'canHideAds'])" v-model:policyMeta="policyMetaModel.canHideAds" :levelConfig="levelConfig" policyKey="canHideAds" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canHideAds, 'canHideAds'])" v-model:policyMeta="policyMetaModel.canHideAds" :levelConfig="levelConfig" policyKey="canHideAds" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canHideAds">
 			<template #label>{{ i18n.ts._role._options.canHideAds }}</template>
 			<template #valueText>{{ valuesModel.canHideAds ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -532,7 +532,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.avatarDecorationLimit, 'avatarDecorationLimit'])" v-model:policyMeta="policyMetaModel.avatarDecorationLimit" :levelConfig="levelConfig" policyKey="avatarDecorationLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.avatarDecorationLimit, 'avatarDecorationLimit'])" v-model:policyMeta="policyMetaModel.avatarDecorationLimit" :levelConfig="levelConfig" policyKey="avatarDecorationLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="avatarDecorationLimit">
 			<template #label>{{ i18n.ts._role._options.avatarDecorationLimit }}</template>
 			<template #valueText>{{ valuesModel.avatarDecorationLimit }}</template>
 			<template #default="{ disabled }">
@@ -541,7 +541,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportAntennas, 'canImportAntennas'])" v-model:policyMeta="policyMetaModel.canImportAntennas" :levelConfig="levelConfig" policyKey="canImportAntennas" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportAntennas, 'canImportAntennas'])" v-model:policyMeta="policyMetaModel.canImportAntennas" :levelConfig="levelConfig" policyKey="canImportAntennas" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canImportAntennas">
 			<template #label>{{ i18n.ts._role._options.canImportAntennas }}</template>
 			<template #valueText>{{ valuesModel.canImportAntennas ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -551,7 +551,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportBlocking, 'canImportBlocking'])" v-model:policyMeta="policyMetaModel.canImportBlocking" :levelConfig="levelConfig" policyKey="canImportBlocking" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportBlocking, 'canImportBlocking'])" v-model:policyMeta="policyMetaModel.canImportBlocking" :levelConfig="levelConfig" policyKey="canImportBlocking" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canImportBlocking">
 			<template #label>{{ i18n.ts._role._options.canImportBlocking }}</template>
 			<template #valueText>{{ valuesModel.canImportBlocking ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -561,7 +561,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportFollowing, 'canImportFollowing'])" v-model:policyMeta="policyMetaModel.canImportFollowing" :levelConfig="levelConfig" policyKey="canImportFollowing" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportFollowing, 'canImportFollowing'])" v-model:policyMeta="policyMetaModel.canImportFollowing" :levelConfig="levelConfig" policyKey="canImportFollowing" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canImportFollowing">
 			<template #label>{{ i18n.ts._role._options.canImportFollowing }}</template>
 			<template #valueText>{{ valuesModel.canImportFollowing ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -571,7 +571,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportMuting, 'canImportMuting'])" v-model:policyMeta="policyMetaModel.canImportMuting" :levelConfig="levelConfig" policyKey="canImportMuting" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportMuting, 'canImportMuting'])" v-model:policyMeta="policyMetaModel.canImportMuting" :levelConfig="levelConfig" policyKey="canImportMuting" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canImportMuting">
 			<template #label>{{ i18n.ts._role._options.canImportMuting }}</template>
 			<template #valueText>{{ valuesModel.canImportMuting ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -581,7 +581,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportUserLists, 'canImportUserList'])" v-model:policyMeta="policyMetaModel.canImportUserLists" :levelConfig="levelConfig" policyKey="canImportUserLists" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.canImportUserLists, 'canImportUserList'])" v-model:policyMeta="policyMetaModel.canImportUserLists" :levelConfig="levelConfig" policyKey="canImportUserLists" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="canImportUserLists">
 			<template #label>{{ i18n.ts._role._options.canImportUserLists }}</template>
 			<template #valueText>{{ valuesModel.canImportUserLists ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -591,7 +591,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.noteDraftLimit, 'noteDraftLimit'])" v-model:policyMeta="policyMetaModel.noteDraftLimit" :levelConfig="levelConfig" policyKey="noteDraftLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.noteDraftLimit, 'noteDraftLimit'])" v-model:policyMeta="policyMetaModel.noteDraftLimit" :levelConfig="levelConfig" policyKey="noteDraftLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="noteDraftLimit">
 			<template #label>{{ i18n.ts._role._options.noteDraftLimit }}</template>
 			<template #valueText>{{ valuesModel.noteDraftLimit }}</template>
 			<template #default="{ disabled }">
@@ -600,7 +600,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.scheduledNoteLimit, 'scheduledNoteLimit'])" v-model:policyMeta="policyMetaModel.scheduledNoteLimit" :levelConfig="levelConfig" policyKey="scheduledNoteLimit" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.scheduledNoteLimit, 'scheduledNoteLimit'])" v-model:policyMeta="policyMetaModel.scheduledNoteLimit" :levelConfig="levelConfig" policyKey="scheduledNoteLimit" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="scheduledNoteLimit">
 			<template #label>{{ i18n.ts._role._options.scheduledNoteLimit }}</template>
 			<template #valueText>{{ valuesModel.scheduledNoteLimit }}</template>
 			<template #default="{ disabled }">
@@ -609,7 +609,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</template>
 		</XFolder>
 
-		<XFolder v-if="matchQuery([i18n.ts._role._options.watermarkAvailable, 'watermarkAvailable'])" v-model:policyMeta="policyMetaModel.watermarkAvailable" :levelConfig="levelConfig" policyKey="watermarkAvailable" :isBaseRole="isBaseRole" :readonly="readonly">
+		<XFolder v-if="matchQuery([i18n.ts._role._options.watermarkAvailable, 'watermarkAvailable'])" v-model:policyMeta="policyMetaModel.watermarkAvailable" :levelConfig="levelConfig" policyKey="watermarkAvailable" :isBaseRole="isBaseRole" :readonly="readonly" data-policy-key="watermarkAvailable">
 			<template #label>{{ i18n.ts._role._options.watermarkAvailable }}</template>
 			<template #valueText>{{ valuesModel.watermarkAvailable ? i18n.ts.yes : i18n.ts.no }}</template>
 			<template #default="{ disabled }">
@@ -617,6 +617,42 @@ SPDX-License-Identifier: AGPL-3.0-only
 					<template #label>{{ i18n.ts.enable }}</template>
 				</MkSwitch>
 			</template>
+		</XFolder>
+
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes, 'genshinRefreshIntervalMinutes'])" v-model:policyMeta="genshinRefreshIntervalMinutesMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="genshinRefreshIntervalMinutes" data-policy-key="genshinRefreshIntervalMinutes">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes }}</template>
+			<template #valueText>{{ genshinRefreshIntervalMinutes }}</template>
+			<template #default="{ disabled }"><MkInput v-model="genshinRefreshIntervalMinutes" type="number" :min="1" :max="1440" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.genshinRefreshIntervalMinutes_caption }}</template></MkInput></template>
+		</XFolder>
+		<XFolder v-if="matchQuery(['Genshin', i18n.ts.genshinGameName, 'genshinUidLimit'])" v-model:policyMeta="genshinUidLimitMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="genshinUidLimit" data-policy-key="genshinUidLimit">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.genshinUidLimit }}</template>
+			<template #valueText>{{ genshinUidLimit }}</template>
+			<template #default="{ disabled }"><MkInput v-model="genshinUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.genshinUidLimit_caption }}</template></MkInput></template>
+		</XFolder>
+		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrUidLimit'])" v-model:policyMeta="hsrUidLimitMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="hsrUidLimit" data-policy-key="hsrUidLimit">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.hsrUidLimit }}</template>
+			<template #valueText>{{ hsrUidLimit }}</template>
+			<template #default="{ disabled }"><MkInput v-model="hsrUidLimit" type="number" :min="0" :max="100" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.hsrUidLimit_caption }}</template></MkInput></template>
+		</XFolder>
+		<XFolder v-if="matchQuery(['HSR', i18n.ts.hsrGameName, 'hsrRefreshIntervalMinutes'])" v-model:policyMeta="hsrRefreshIntervalMinutesMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="hsrRefreshIntervalMinutes" data-policy-key="hsrRefreshIntervalMinutes">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.hsrRefreshIntervalMinutes }}</template>
+			<template #valueText>{{ hsrRefreshIntervalMinutes }}</template>
+			<template #default="{ disabled }"><MkInput v-model="hsrRefreshIntervalMinutes" type="number" :min="1" :max="1440" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.hsrRefreshIntervalMinutes_caption }}</template></MkInput></template>
+		</XFolder>
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.canUseFxTwitterPreview, 'canUseFxTwitterPreview'])" v-model:policyMeta="canUseFxTwitterPreviewMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="canUseFxTwitterPreview" data-policy-key="canUseFxTwitterPreview">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.canUseFxTwitterPreview }}</template>
+			<template #valueText>{{ canUseFxTwitterPreview ? i18n.ts.yes : i18n.ts.no }}</template>
+			<template #default="{ disabled }"><MkSwitch v-model="canUseFxTwitterPreview" :disabled="disabled"><template #label>{{ i18n.ts.enable }}</template><template #caption>{{ i18n.ts._mkgoRolePolicy.canUseFxTwitterPreview_caption }}</template></MkSwitch></template>
+		</XFolder>
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerHour, 'fxTwitterColdFetchesPerHour'])" v-model:policyMeta="fxTwitterColdFetchesPerHourMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="fxTwitterColdFetchesPerHour" data-policy-key="fxTwitterColdFetchesPerHour">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerHour }}</template>
+			<template #valueText>{{ fxTwitterColdFetchesPerHour }}</template>
+			<template #default="{ disabled }"><MkInput v-model="fxTwitterColdFetchesPerHour" type="number" :min="1" :max="10000" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerHour_caption }}</template></MkInput></template>
+		</XFolder>
+		<XFolder v-if="matchQuery([i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerDay, 'fxTwitterColdFetchesPerDay'])" v-model:policyMeta="fxTwitterColdFetchesPerDayMeta" :isBaseRole="isBaseRole" :readonly="readonly" :levelConfig="levelConfig" policyKey="fxTwitterColdFetchesPerDay" data-policy-key="fxTwitterColdFetchesPerDay">
+			<template #label>{{ i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerDay }}</template>
+			<template #valueText>{{ fxTwitterColdFetchesPerDay }}</template>
+			<template #default="{ disabled }"><MkInput v-model="fxTwitterColdFetchesPerDay" type="number" :min="1" :max="100000" :step="1" :disabled="disabled"><template #caption>{{ i18n.ts._mkgoRolePolicy.fxTwitterColdFetchesPerDay_caption }}</template></MkInput></template>
 		</XFolder>
 	</div>
 </template>
@@ -712,6 +748,9 @@ const mkGoPolicyMetaKeys: string[] = [
 	'hsrRefreshIntervalMinutes',
 	'hsrUidLimit',
 	'genshinUidLimit',
+	'canUseFxTwitterPreview',
+	'fxTwitterColdFetchesPerHour',
+	'fxTwitterColdFetchesPerDay',
 ];
 
 function setPolicyMeta(incoming: Partial<PolicyMetaRecord> | undefined): PolicyMetaRecord {
@@ -808,6 +847,26 @@ const emojiApplicationMaxPerMonthMeta = mkGoPolicyMeta('emojiApplicationMaxPerMo
 // 審査待ちの上限 (#2977)。既定 0 = 無制限。
 const emojiApplicationMaxPending = mkGoPolicyValue('emojiApplicationMaxPending', 0);
 const emojiApplicationMaxPendingMeta = mkGoPolicyMeta('emojiApplicationMaxPending');
+const genshinRefreshIntervalMinutesModel = mkGoPolicyValue('genshinRefreshIntervalMinutes', 10);
+const genshinRefreshIntervalMinutes = computed({ get: () => genshinRefreshIntervalMinutesModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 1 && value <= 1440) genshinRefreshIntervalMinutesModel.value = value; } });
+const genshinRefreshIntervalMinutesMeta = mkGoPolicyMeta('genshinRefreshIntervalMinutes');
+const genshinUidLimitModel = mkGoPolicyValue('genshinUidLimit', 1);
+const genshinUidLimit = computed({ get: () => genshinUidLimitModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 0 && value <= 100) genshinUidLimitModel.value = value; } });
+const genshinUidLimitMeta = mkGoPolicyMeta('genshinUidLimit');
+const hsrUidLimitModel = mkGoPolicyValue('hsrUidLimit', 1);
+const hsrUidLimit = computed({ get: () => hsrUidLimitModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 0 && value <= 100) hsrUidLimitModel.value = value; } });
+const hsrUidLimitMeta = mkGoPolicyMeta('hsrUidLimit');
+const hsrRefreshIntervalMinutesModel = mkGoPolicyValue('hsrRefreshIntervalMinutes', 10);
+const hsrRefreshIntervalMinutes = computed({ get: () => hsrRefreshIntervalMinutesModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 1 && value <= 1440) hsrRefreshIntervalMinutesModel.value = value; } });
+const hsrRefreshIntervalMinutesMeta = mkGoPolicyMeta('hsrRefreshIntervalMinutes');
+const canUseFxTwitterPreview = mkGoPolicyValue('canUseFxTwitterPreview', true);
+const canUseFxTwitterPreviewMeta = mkGoPolicyMeta('canUseFxTwitterPreview');
+const fxTwitterColdFetchesPerHourModel = mkGoPolicyValue('fxTwitterColdFetchesPerHour', 100);
+const fxTwitterColdFetchesPerHour = computed({ get: () => fxTwitterColdFetchesPerHourModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 1 && value <= 10000) fxTwitterColdFetchesPerHourModel.value = value; } });
+const fxTwitterColdFetchesPerHourMeta = mkGoPolicyMeta('fxTwitterColdFetchesPerHour');
+const fxTwitterColdFetchesPerDayModel = mkGoPolicyValue('fxTwitterColdFetchesPerDay', 600);
+const fxTwitterColdFetchesPerDay = computed({ get: () => fxTwitterColdFetchesPerDayModel.value, set: (value: number) => { if (Number.isInteger(value) && value >= 1 && value <= 100000) fxTwitterColdFetchesPerDayModel.value = value; } });
+const fxTwitterColdFetchesPerDayMeta = mkGoPolicyMeta('fxTwitterColdFetchesPerDay');
 
 const genshinRefreshIntervalModel = mkGoPolicyValue('genshinRefreshIntervalMinutes', 10);
 const genshinRefreshIntervalMinutes = computed({

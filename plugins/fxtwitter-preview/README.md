@@ -11,7 +11,7 @@
 
 ## 公開経路と認可
 
-ログインした viewer ごとに `notes/show` を呼び、note の可視性と、その note に含まれる正確な X/Twitter post ID を検証してから、公開 cache の参照・lease・画像・embed を許可します。role の照会は optional `ActiveRoleRequest` を使い、照会不能時は cold fetch を許可しません。cache hit と lease 敗者は cold-fetch quota を消費しません。
+ログインした viewer ごとに `notes/show` を呼び、note の可視性と、その note に含まれる正確な X/Twitter post ID を検証してから、公開 cache の参照・lease・画像・embed・video を許可します。権限と利用者別取得上限はホストの `admin/roles` checked policy (`canUseFxTwitterPreview`, `fxTwitterColdFetchesPerHour`, `fxTwitterColdFetchesPerDay`) だけで解決し、照会不能時は拒否します。Fx 管理画面/APIからロール・利用者ごとの権限値は変更できません。cache hit と lease 敗者は cold-fetch quota を消費しません。
 
 Fx への送信は固定 `https://api.fxtwitter.com/2/status/{numeric-id}` のみです。host の SSRF 対策済み HTTP client を使い、redirect を拒否し、response bytes、text、media 件数と画像 decode の上限を維持します。note 本文、viewer ID、cookie、認証情報を Fx に送りません。
 
@@ -21,7 +21,7 @@ Fx への送信は固定 `https://api.fxtwitter.com/2/status/{numeric-id}` の�
 
 ## cache と理由 DTO
 
-post ごとの再取得間隔は既定 60 分です。これは lease/refetch の間隔で、保存行が 60 分で消えるという意味ではありません。user hourly/daily、global hourly、server-derived role 上限と PostgreSQL lease を維持します。
+post ごとの再取得間隔は既定 60 分です。これは lease/refetch の間隔で、保存行が 60 分で消えるという意味ではありません。利用者別 hourly/daily 上限は `admin/roles` の checked policy、全利用者・プロセス共通の hourly abuse cap は Fx 管理画面の global 設定、lease は PostgreSQL で管理します。旧 `role_rate_limit` 行と per-user 設定列は互換性のため保持しますが、現行 route の権限や取得上限には使いません。旧role-limit fieldsを含む更新payloadは拒否します。
 
 成功した公開 payload は、一時的な network/read/timeout/429/5xx 失敗後にだけ `state: stale` として再利用できます。非一時的な unavailable/schema/disabled 等の完了は `last_success_payload` と時刻を破棄し、その後の network 失敗でも復活させません。新しい authoritative success は公開 cache を再設定できます。media/embed capability も失敗時に無効化します。
 
@@ -39,7 +39,9 @@ migration 1–5 は既存 schema/data を保持します。追加 migration 6 �
 
 ## クリック発行の完全投稿 embed
 
-native X video は `officialEmbed` の場合だけ、クリックに対応する認証済み `POST /embed/shell` で完全投稿の `https://platform.twitter.com/embed/index.html` URL を発行します。post ID、cache-bound token、有効期限、引用 target、theme/lang、per-click nonce を検証し、note ACL を再確認します。元の `Tweet.html` 動画専用 presentation、直接 video CDN bytes、YouTube player は使いません。既存 cache の YouTube descriptor も capability として拒否します。
+`nativeProxy` では main/quote の各 X video に poster と個別の再生操作を表示し、選んだ1件だけを認証済み same-origin `GET /media/video/:postId/:target/:index` から Blob として読み込みます。各要求で login、checked role policy、note ACL と正確な status link、cache token/expiry、現在の target/index descriptor を取得前後に再検証します。upstream は固定 `video.twimg.com` HTTPS host、redirectなし、MP4 MIME/FTYP検証、32 MiB上限です。応答は `private, no-store` で、write deadline は2分です。raw video CDN URL は public DTO に含めません。
+
+`officialEmbed` はクリック後の認証済み `POST /embed/shell` で完全投稿の `https://platform.twitter.com/embed/index.html` URL を発行します。post ID、cache-bound token、有効期限、引用 target、theme/lang、per-click nonce を検証し、note ACL を再確認します。`linkOnly` は embed と native playback capability を公開しません。元の `Tweet.html` 動画専用 presentation と YouTube player は使わず、既存 cache の YouTube descriptor も capability として拒否します。
 
 外部 video provider は poster と元の X 投稿リンクへの fallback に留めます。`linkOnly` は embed 発行を止めます。frontend は detail/CW reveal/active/viewport gate、mount/abort の cleanup、source-link UI を持ちます。動画モード省略時は `officialEmbed` ですが、外部取得の既定は OFF です。初回手順では `linkOnly` を明示し、公式 iframe は運営者が後で許可してもクリック後だけ読み込みます。
 

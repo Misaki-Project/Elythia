@@ -65,6 +65,11 @@ on:
         required: false
         type: boolean
         default: true
+      include_fxtwitter:
+        description: "disabled manifest の FxTwitter preview を明示的に bundle に含める"
+        required: false
+        type: boolean
+        default: false
     secrets:
       plugin_token:
         description: "private なプラグインを clone するための token"
@@ -147,7 +152,11 @@ jobs:
           MK_PLUGINS: ${{ inputs.plugins }}
         run: |
           set -eu
-          out=$(GOWORK=off go run ./tools/pluginbuild)
+          if [ "${{ inputs.include_fxtwitter }}" = "true" ]; then
+            out=$(GOWORK=off go run ./tools/pluginbuild -include-disabled-dir plugins/fxtwitter-preview)
+          else
+            out=$(GOWORK=off go run ./tools/pluginbuild)
+          fi
           printf '%s\n' "$out"
 
           # **要求したプラグインが実際に組み込まれたかを突き合わせる。**
@@ -191,7 +200,7 @@ jobs:
 
       - name: Log in to GHCR
         if: inputs.push
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -238,6 +247,8 @@ jobs:
           context: .
           file: ./Dockerfile.bundled
           platforms: linux/amd64
+          build-args: |
+            PLUGIN_INCLUDE_DISABLED_DIR=${{ inputs.include_fxtwitter && 'plugins/fxtwitter-preview' || '' }}
           push: ${{ inputs.push }}
           tags: ${{ steps.target.outputs.tags }}
           labels: |

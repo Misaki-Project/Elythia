@@ -170,9 +170,12 @@ const mkGoRolePolicyKeys: string[] = [
 	'hsrRefreshIntervalMinutes',
 	'hsrUidLimit',
 	'genshinUidLimit',
+	'canUseFxTwitterPreview',
+	'fxTwitterColdFetchesPerHour',
+	'fxTwitterColdFetchesPerDay',
 ];
 
-const role = ref((() => {
+const role = ref<PreparedRoleLike>((() => {
 	const base = deepClone(props.modelValue);
 	base.levelConfig ??= defaultRoleLevelConfig(base.id ?? '');
 	ensureAccountDeletionRolePolicies(base.policies, instance.policies);

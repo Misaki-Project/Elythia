@@ -60,16 +60,19 @@ export function fetchPluginResource(path: string, options?: RequestInit): Promis
 export type Capabilities = {
 	externalFetchEnabled: boolean;
 	refetchIntervalSeconds: number;
-	videoPlaybackMode: 'officialEmbed' | 'linkOnly';
+	videoPlaybackMode: 'officialEmbed' | 'linkOnly' | 'nativeProxy';
 	mediaMode: 'sameOriginProxy';
 };
 
 export type PublicVideo = {
 	provider: 'x' | 'external';
 	providerVideoId?: string;
+	mediaIdentity?: string;
 	posterUrl?: string;
 	posterExpiresAt?: string;
 	durationMs?: number;
+	playbackAvailable?: boolean;
+	playbackUrl?: string;
 	embedToken?: string;
 	embedExpiresAt?: string;
 };
@@ -89,6 +92,7 @@ export type PublicPost = {
 	images: Array<{ url: string; width?: number; height?: number; alt?: string }>;
 	hasVideo: boolean;
 	isSensitive?: boolean;
+	videos?: PublicVideo[];
 	video?: PublicVideo;
 	quote?: PublicQuotedPost;
 };
@@ -103,6 +107,7 @@ export type PublicQuotedPost = {
 	images: Array<{ url: string; width?: number; height?: number; alt?: string }>;
 	hasVideo: boolean;
 	isSensitive?: boolean;
+	videos?: PublicVideo[];
 	video?: PublicVideo;
 };
 
@@ -149,18 +154,9 @@ export function unavailableMessage(reason?: UnavailableReason): string {
 	}
 }
 
-export type RoleRateLimit = {
-	roleId: string;
-	perHour: number;
-	perDay: number;
-};
-
 export type RateLimitSettings = {
 	revision: number;
-	authenticatedPerHour: number;
-	authenticatedPerDay: number;
 	globalPerHour: number;
-	roleLimits: RoleRateLimit[];
 	updatedAt: string;
 	updatedBy?: string;
 };

@@ -6,20 +6,34 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { defineConfig } from '@playwright/test';
-import { listSpecFiles, loadDurations, parseShard, planShards, writesMeta } from './shard-plan.mjs';
+import { BACKUP_SPEC_DIR, listShardedSpecFiles, listSpecFiles, loadDurations, parseShard, planShards, writesMeta } from './shard-plan.mjs';
 
 // mk-go backend に対する Playwright e2e の設定 (#744)。spec は
-// `specs/upstream/` に 339 ファイル、`specs/elythia/` に 31 ファイル。CI では
+// `specs/upstream/` に 339 ファイル、`specs/elythia/` に 49 ファイル。CI では
 // `PLAYWRIGHT_SHARD=i/N` で N 個の job に分けて回す (docs/playwright.md)。
 //
 // **shard は `PLAYWRIGHT_SHARD=i/N` で切る (#4026)。** `--shard` はファイルの
 // 並び順で切るだけで、軽い api の spec と重い ui の spec が別の shard に偏る。
 // 所要時間の記録 (shard-durations.json) から割り振る (shard-plan.mjs)。
 // 指定が無ければ全部を流す。
-const allSpecs = listSpecFiles(__dirname);
+//
+// specs/backup/ は、バックアップのデーモンを付けた専用のスタック (backup-stack/compose.yml、
+// #4102) でだけ流す。復元の確定が DB を入れ替えるので、ほかの spec と同じスタックには
+// 置けない。そのスタックの runner は PLAYWRIGHT_STACK=backup を渡し、shard は切らない。
+// PLAYWRIGHT_STACK=all は、spec を読むゲート (route-coverage.mjs の listTests) が全部を
+// 一覧にするためのもので、流すためのものではない
+const stack = process.env.PLAYWRIGHT_STACK;
+// 綴りを間違えると、黙って通常の spec を全部流してしまう (バックアップのスタックに向けたなら、そこで
+// ほかの spec が走る)
+if (stack !== undefined && !['', 'all', 'backup'].includes(stack)) throw new Error(`PLAYWRIGHT_STACK must be empty, all or backup: ${stack}`);
+const allSpecs = (() => {
+  if (stack === 'all') return listSpecFiles(__dirname);
+  if (stack === 'backup') return listSpecFiles(__dirname).filter((f) => f.startsWith(BACKUP_SPEC_DIR));
+  return listShardedSpecFiles(__dirname);
+})();
 const shardEnv = process.env.PLAYWRIGHT_SHARD;
 const selected = (() => {
-  if (shardEnv === undefined || shardEnv === '') return allSpecs;
+  if (stack === 'backup' || stack === 'all' || shardEnv === undefined || shardEnv === '') return allSpecs;
   const { current, total } = parseShard(shardEnv);
   return planShards(allSpecs, loadDurations(__dirname), total)[current - 1];
 })();
@@ -91,10 +105,10 @@ export default defineConfig({
     // i18n key 解決に使うので、これで全 spec の text 前提が安定する。
     locale: 'en-US',
   },
-  // **1 スタックに対しては直列で回すしかない。** 370 spec のうち 185 が共有の
+  // **1 スタックに対しては直列で回すしかない。** 388 spec のうち 185 が共有の
   // root (alice) でブラウザでサインインした状態を使い (`uiSigninAsRoot` を呼ぶ 184 と
   // signin.spec.ts。数え方は `grep -rl 'uiSigninAsRoot' tests/playwright/specs --include='*.spec.ts' | wc -l` に 1 を足す)、
-  // さらに 40 がサインインせず root の token で API を叩く (`root.json` を読み、
+  // さらに 45 が root ではサインインせずに root の token で API を叩く (`root.json` を読み、
   // root でサインインしないもの。数え方は
   // `grep -rl 'root.json' tests/playwright/specs --include='*.spec.ts' | xargs grep -L 'uiSigninAsRoot' | grep -v '/signin.spec.ts$' | wc -l`)。
   // instance meta は全 spec が共有する。Playwright は
@@ -102,7 +116,7 @@ export default defineConfig({
   // `profile_isbot_toggle` が同じアカウントを、`admin_branding_save` と
   // `about_page_render` が同じ meta を取り合う。root の quota
   // (antenna 5 / webhook 3 / clip 10) を消費する spec も 18 ある。
-  // 並列度は CI 側で `PLAYWRIGHT_SHARD=i/7` の 7 job に分けて稼ぐ (#2609、#4043 で 6 に、#4049 で 7 に)。
+  // 並列度は CI 側で `PLAYWRIGHT_SHARD=i/11` の 11 job に分けて稼ぐ (#2609、#4043 で 6 に、#4049 で 7 に、#4056 で 11 に)。
   workers: 1,
   // 1 度だけ retry を許可する。Chromium headless が稀に SIGSEGV (= signal 11
   // / GPF) で即死する infrastructure flake (= profile_iscat_toggle 1ms 即死

@@ -139,8 +139,11 @@ function normalizedVideo(value: unknown): PublicPost['video'] | null | undefined
 	const posterExpiresAt = optionalString(video.posterExpiresAt);
 	const embedToken = optionalString(video.embedToken);
 	const embedExpiresAt = optionalString(video.embedExpiresAt);
+	const mediaIdentity = optionalString(video.mediaIdentity);
+	const playbackUrl = optionalString(video.playbackUrl);
+	const playbackAvailable = optionalBoolean(video.playbackAvailable);
 	const durationMs = video.durationMs == null ? undefined : typeof video.durationMs === 'number' && Number.isFinite(video.durationMs) ? video.durationMs : null;
-	if (providerVideoId === null || posterUrl === null || posterExpiresAt === null || embedToken === null || embedExpiresAt === null || durationMs === null) return null;
+	if (providerVideoId === null || posterUrl === null || posterExpiresAt === null || embedToken === null || embedExpiresAt === null || mediaIdentity === null || playbackUrl === null || playbackAvailable === null || durationMs === null) return null;
 	// v0.3 ready caches can contain YouTube descriptors. Keep their safe public
 	// content, but never carry the retired provider/player capability forward.
 	if (provider === 'youtube' && providerVideoId != null && providerVideoId.trim() !== '') {
@@ -149,6 +152,9 @@ function normalizedVideo(value: unknown): PublicPost['video'] | null | undefined
 			...(posterUrl == null ? {} : { posterUrl }),
 			...(posterExpiresAt == null ? {} : { posterExpiresAt }),
 			...(durationMs == null ? {} : { durationMs }),
+			...(mediaIdentity == null ? {} : { mediaIdentity }),
+			...(playbackAvailable == null ? {} : { playbackAvailable }),
+			...(playbackUrl == null ? {} : { playbackUrl }),
 		};
 	}
 	if (provider !== 'x' && provider !== 'external') return null;
@@ -159,9 +165,24 @@ function normalizedVideo(value: unknown): PublicPost['video'] | null | undefined
 		...(posterUrl == null ? {} : { posterUrl }),
 		...(posterExpiresAt == null ? {} : { posterExpiresAt }),
 		...(durationMs == null ? {} : { durationMs }),
+		...(mediaIdentity == null ? {} : { mediaIdentity }),
+		...(playbackAvailable == null ? {} : { playbackAvailable }),
+		...(playbackUrl == null ? {} : { playbackUrl }),
 		...(embedToken == null ? {} : { embedToken }),
 		...(embedExpiresAt == null ? {} : { embedExpiresAt }),
 	};
+}
+
+function normalizedVideos(value: unknown): PublicPost['videos'] | null | undefined {
+	if (value == null) return undefined;
+	if (!Array.isArray(value) || value.length > 4) return null;
+	const result: NonNullable<PublicPost['videos']> = [];
+	for (const item of value) {
+		const video = normalizedVideo(item);
+		if (video == null) return null;
+		result.push(video);
+	}
+	return result;
 }
 
 function normalizedQuote(value: unknown): PublicQuotedPost | null | undefined {
@@ -171,13 +192,14 @@ function normalizedQuote(value: unknown): PublicQuotedPost | null | undefined {
 	const author = normalizedAuthor(quote.author);
 	const images = normalizedImages(quote.images);
 	const video = normalizedVideo(quote.video);
+	const videos = normalizedVideos(quote.videos);
 	const createdAt = optionalString(quote.createdAt);
 	const textEntities = normalizedTextEntities(quote.textEntities, quote.text);
 	const isSensitive = optionalBoolean(quote.isSensitive);
-	if (author == null || images == null || video === null || createdAt === null || textEntities == null || isSensitive === null) return null;
+	if (author == null || images == null || video === null || videos === null || createdAt === null || textEntities == null || isSensitive === null) return null;
 	return {
 		id: quote.id, url: quote.url, text: quote.text, author, images, hasVideo: quote.hasVideo, textEntities,
-		...(createdAt == null ? {} : { createdAt }), ...(video == null ? {} : { video }), ...(isSensitive == null ? {} : { isSensitive }),
+		...(createdAt == null ? {} : { createdAt }), ...(video == null ? {} : { video }), ...(videos == null ? {} : { videos }), ...(isSensitive == null ? {} : { isSensitive }),
 	};
 }
 
@@ -187,17 +209,18 @@ function normalizedPost(value: unknown, expectedID: string): PublicPost | null {
 	const author = normalizedAuthor(post.author);
 	const images = normalizedImages(post.images);
 	const video = normalizedVideo(post.video);
+	const videos = normalizedVideos(post.videos);
 	const quote = normalizedQuote(post.quote);
 	const createdAt = optionalString(post.createdAt);
 	const textEntities = normalizedTextEntities(post.textEntities, post.text);
 	const isSensitive = optionalBoolean(post.isSensitive);
 	const counts = [post.likes, post.reposts, post.quotes, post.replies];
-	if (author == null || images == null || video === null || quote === null || createdAt === null || textEntities == null || isSensitive === null || counts.some(count => typeof count !== 'number' || !Number.isFinite(count))) return null;
+	if (author == null || images == null || video === null || videos === null || quote === null || createdAt === null || textEntities == null || isSensitive === null || counts.some(count => typeof count !== 'number' || !Number.isFinite(count))) return null;
 	return {
 		id: post.id, url: post.url, text: post.text, author, images, hasVideo: post.hasVideo, textEntities,
 		...(post.quoteUnavailableReason == null ? {} : { quoteUnavailableReason: unavailableReason(post.quoteUnavailableReason) ?? 'unknown' }),
 		likes: post.likes as number, reposts: post.reposts as number, quotes: post.quotes as number, replies: post.replies as number,
-		...(createdAt == null ? {} : { createdAt }), ...(video == null ? {} : { video }), ...(quote == null ? {} : { quote }), ...(isSensitive == null ? {} : { isSensitive }),
+		...(createdAt == null ? {} : { createdAt }), ...(video == null ? {} : { video }), ...(videos == null ? {} : { videos }), ...(quote == null ? {} : { quote }), ...(isSensitive == null ? {} : { isSensitive }),
 	};
 }
 

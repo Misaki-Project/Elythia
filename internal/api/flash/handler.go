@@ -96,6 +96,9 @@ func (h *Handler) Create(c echo.Context) error {
 		Visibility:  req.Visibility,
 	})
 	if err != nil {
+		if repository.IsRejectedValue(err) {
+			return apierr.JSONInvalidParam(c)
+		}
 		return apierr.JSONInternalError(c)
 	}
 	return c.JSON(http.StatusOK, h.flashWithKnownUser(f, user))
@@ -155,7 +158,7 @@ func (h *Handler) Update(c echo.Context) error {
 	if req.Visibility != nil && *req.Visibility != "public" && *req.Visibility != "private" {
 		return apierr.JSONInvalidParam(c)
 	}
-	f, err := h.svc.Update(user.ID, req.FlashID, coreflash.UpdateInput{
+	_, err := h.svc.Update(user.ID, req.FlashID, coreflash.UpdateInput{
 		Title:       req.Title,
 		Summary:     req.Summary,
 		Script:      req.Script,
@@ -169,9 +172,13 @@ func (h *Handler) Update(c echo.Context) error {
 		case errors.Is(err, coreflash.ErrAccessDenied):
 			return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Access denied.", "08e60c88-5948-478e-a132-02ec701d67b2"))
 		}
+		if repository.IsRejectedValue(err) {
+			return apierr.JSONInvalidParam(c)
+		}
 		return apierr.JSONInternalError(c)
 	}
-	return c.JSON(http.StatusOK, h.flashWithKnownUser(f, user))
+	// upstream flash/update.ts は res を持たず何も返さないので、204で本文を返さない (#4122)。
+	return c.NoContent(http.StatusNoContent)
 }
 
 // DeleteRequest is the request body for flash/delete.

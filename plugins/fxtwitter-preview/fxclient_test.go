@@ -132,7 +132,7 @@ func TestFxClientRejectsInvalidInputAndResponse(t *testing.T) {
 		{"mismatched-id", response(200, "application/json", `{"code":200,"status":{"id":"9999999999","text":"x","author":{"name":"a","screen_name":"b"}}}`)},
 		{"tombstone", response(200, "application/json", `{"code":200,"status":{"tombstone":{"text":"gone"}}}`)},
 		{"long-text", response(200, "application/json", `{"code":200,"status":{"id":"1234567890","text":"`+strings.Repeat("x", maxFxTextBytes+1)+`","author":{"name":"a","screen_name":"b"}}}`)},
-		{"too-many-media", response(200, "application/json", `{"code":200,"status":{"id":"1234567890","text":"x","author":{"name":"a","screen_name":"b"},"media":{"photos":[{},{},{},{},{}]}}}`)},
+		{"too-many-media", response(200, "application/json", `{"code":200,"status":{"id":"1234567890","text":"x","author":{"name":"a","screen_name":"b"},"media":{"photos":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{ }]}}}`)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,6 +143,55 @@ func TestFxClientRejectsInvalidInputAndResponse(t *testing.T) {
 			client := newFxClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return tc.res, nil })}, cfg)
 			if _, err := client.Fetch(context.Background(), "1234567890"); err == nil {
 				t.Fatal("invalid response accepted")
+			}
+		})
+	}
+}
+
+func TestFxClientPhotoLimitIsTwentyAndVideoLimitRemainsFour(t *testing.T) {
+	makeStatus := func(photos, videos int) []byte {
+		return []byte(fmt.Sprintf(`{"code":200,"status":{"id":"1234567890","text":"x","author":{"name":"a","screen_name":"b"},"media":{"photos":[%s],"videos":[%s]}}}`,
+			strings.TrimSuffix(strings.Repeat("{},", photos), ","),
+			strings.TrimSuffix(strings.Repeat("{},", videos), ",")))
+	}
+	for _, tc := range []struct {
+		name         string
+		photos       int
+		videos       int
+		wantAccepted bool
+	}{
+		{name: "twenty photos", photos: 20, wantAccepted: true},
+		{name: "twenty one photos", photos: 21},
+		{name: "four videos", videos: 4, wantAccepted: true},
+		{name: "five videos", videos: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseFxResponse(makeStatus(tc.photos, tc.videos), "1234567890")
+			if tc.wantAccepted && err != nil {
+				t.Fatalf("expected accepted media collection, got %v", err)
+			}
+			if !tc.wantAccepted && err == nil {
+				t.Fatal("expected media collection to exceed its limit")
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name         string
+		quotePhotos  int
+		wantAccepted bool
+	}{
+		{name: "twenty quoted photos", quotePhotos: 20, wantAccepted: true},
+		{name: "twenty one quoted photos", quotePhotos: 21},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"code":200,"status":{"id":"1234567890","text":"x","author":{"name":"a","screen_name":"b"},"quote":{"id":"2234567890","text":"q","author":{"name":"c","screen_name":"d"},"media":{"photos":[%s]}}}}`,
+				strings.TrimSuffix(strings.Repeat("{},", tc.quotePhotos), ","))
+			_, err := parseFxResponse([]byte(body), "1234567890")
+			if tc.wantAccepted && err != nil {
+				t.Fatalf("expected accepted quoted media collection, got %v", err)
+			}
+			if !tc.wantAccepted && err == nil {
+				t.Fatal("expected quoted media collection to exceed its limit")
 			}
 		})
 	}
@@ -194,7 +243,10 @@ func TestFxClientKeepsYouTubeExternalURLsAsPosterFallbackForMainAndQuote(t *test
 				t.Fatal(err)
 			}
 			encoded := mustJSON(t, post)
-			if strings.Count(encoded, `"provider":"external"`) != 2 || strings.Contains(encoded, `"providerVideoId"`) {
+			if post.Video == nil || post.Video.Provider != "external" || post.Video.ProviderVideoID != "" || post.Video.PosterURL != "https://pbs.twimg.com/main.jpg" ||
+				len(post.Videos) != 1 || post.Videos[0].Provider != "external" || post.Videos[0].ProviderVideoID != "" || post.Videos[0].PosterURL != post.Video.PosterURL ||
+				post.Quote == nil || post.Quote.Video == nil || post.Quote.Video.Provider != "external" || post.Quote.Video.ProviderVideoID != "" || post.Quote.Video.PosterURL != "https://pbs.twimg.com/quote.jpg" ||
+				len(post.Quote.Videos) != 1 || post.Quote.Videos[0].Provider != "external" || post.Quote.Videos[0].ProviderVideoID != "" || post.Quote.Videos[0].PosterURL != post.Quote.Video.PosterURL || strings.Contains(encoded, `"providerVideoId"`) {
 				t.Fatalf("external main/quote fallback = %s", encoded)
 			}
 			for _, forbidden := range []string{"list=", "t=43", "si=", "feature=", rawURL} {
