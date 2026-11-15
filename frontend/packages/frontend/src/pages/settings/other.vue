@@ -55,7 +55,18 @@ SPDX-License-Identifier: AGPL-3.0-only
 					<template #label><SearchLabel>{{ i18n.ts.rolesAssignedToMe }}</SearchLabel></template>
 
 					<div class="_gaps_s">
-						<MkRolePreview v-for="role in $i.roles" :key="role.id" :role="role" :forModeration="false"/>
+						<div v-for="role in $i.roles" :key="role.id" :class="$style.roleItem">
+							<MkRolePreview :class="$style.rolePreview" :role="role" :forModeration="false"/>
+							<MkButton
+								v-if="levelProfileRoles.has(role.id)"
+								v-tooltip="levelProfileRoles.get(role.id)?.hidden ? i18n.ts._roleLevel.showOnProfile : i18n.ts._roleLevel.hideOnProfile"
+								iconOnly
+								:aria-label="levelProfileRoles.get(role.id)?.hidden ? i18n.ts._roleLevel.showOnProfile : i18n.ts._roleLevel.hideOnProfile"
+								@click="toggleLevelRoleVisibility(role.id)"
+							>
+								<i :class="levelProfileRoles.get(role.id)?.hidden ? 'ti ti-eye-off' : 'ti ti-eye'"></i>
+							</MkButton>
+						</div>
 					</div>
 				</MkFolder>
 			</SearchMarker>
@@ -166,7 +177,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 </template>
 
 <script lang="ts" setup>
-import { computed, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import XMigration from './migration.vue';
 import XFederation from './federation.vue';
 import MkSwitch from '@/components/MkSwitch.vue';
@@ -185,6 +196,8 @@ import { definePage } from '@/page.js';
 import FormSection from '@/components/form/section.vue';
 import { prefer } from '@/preferences.js';
 import MkRolePreview from '@/components/MkRolePreview.vue';
+import { roleLevelApi } from '@/utility/role-level-api.js';
+import type { RoleLevelUserRole } from '@/utility/role-level-api.js';
 import { signout } from '@/signout.js';
 import { hideAllTips as _hideAllTips, resetAllTips as _resetAllTips } from '@/tips.js';
 import { suggestReload } from '@/utility/reload-suggest.js';
@@ -192,6 +205,25 @@ import { cloudBackup } from '@/preferences/utility.js';
 import { shouldShowAccountDeletionSection } from '@/utility/account-delete-policy.js';
 
 const $i = ensureSignin();
+const levelProfileRoles = ref(new Map<string, RoleLevelUserRole & { hidden: boolean }>());
+
+async function refreshLevelProfileRoles() {
+	try {
+		const result = await roleLevelApi<{ roles: Array<RoleLevelUserRole & { hidden: boolean }> }>('plugin/role-level/users/profile-settings', {});
+		levelProfileRoles.value = new Map(result.roles.map(role => [role.roleId, role]));
+	} catch {
+		levelProfileRoles.value = new Map();
+	}
+}
+
+async function toggleLevelRoleVisibility(roleId: string) {
+	const current = levelProfileRoles.value.get(roleId);
+	if (!current) return;
+	await roleLevelApi('plugin/role-level/users/profile-hide', { roleId, hidden: !current.hidden });
+	await refreshLevelProfileRoles();
+}
+
+await refreshLevelProfileRoles();
 
 // 導線の判定は共通ヘルパー (#2989)。**3 箇所で式を書き分けない** — 条件を
 // 変えたときに一部の画面だけ違う状態が残る。
@@ -263,3 +295,16 @@ definePage(() => ({
 	icon: 'ti ti-dots',
 }));
 </script>
+
+<style lang="scss" module>
+.roleItem {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.rolePreview {
+	flex: 1;
+	min-width: 0;
+}
+</style>

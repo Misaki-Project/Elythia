@@ -11,15 +11,22 @@ import (
 )
 
 var defaults = map[string]any{
-	"gtlAvailable":          true,
-	"ltlAvailable":          true,
-	"canPublicNote":         true,
-	"mentionLimit":          20,
-	"canInvite":             false,
-	"inviteLimit":           0,
-	"inviteLimitCycle":      10080,
-	"inviteExpirationTime":  0,
-	"canManageCustomEmojis": false,
+	"gtlAvailable":                  true,
+	"ltlAvailable":                  true,
+	"canPublicNote":                 true,
+	"mentionLimit":                  20,
+	"canInvite":                     false,
+	"inviteLimit":                   0,
+	"inviteLimitCycle":              10080,
+	"inviteExpirationTime":          0,
+	"canManageCustomEmojis":         false,
+	"canUseFxTwitterPreview":        true,
+	"fxTwitterColdFetchesPerHour":   100,
+	"fxTwitterColdFetchesPerDay":    600,
+	"genshinRefreshIntervalMinutes": 10,
+	"genshinUidLimit":               1,
+	"hsrRefreshIntervalMinutes":     10,
+	"hsrUidLimit":                   1,
 	// 絵文字の登録申請 (#2934)。**default true** — 登録は必ずモデレーターの
 	// 承認を通るので、申請そのものを既定で塞ぐ必要が無い。canCreateChannel と
 	// 同じく、絞りたい運営者が role で false にする。
@@ -249,6 +256,18 @@ func valueValid(key string, native, value any) bool {
 		_, ok := value.(bool)
 		return ok
 	case int:
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" {
+			return integerPolicyInRange(value, 1, 1440)
+		}
+		if key == "genshinUidLimit" || key == "hsrUidLimit" {
+			return integerPolicyInRange(value, 0, 100)
+		}
+		if key == "fxTwitterColdFetchesPerHour" {
+			return integerPolicyInRange(value, 1, 10000)
+		}
+		if key == "fxTwitterColdFetchesPerDay" {
+			return integerPolicyInRange(value, 1, 100000)
+		}
 		return numberValid(value)
 	case string:
 		v, ok := value.(string)
@@ -278,6 +297,19 @@ func valueValid(key string, native, value any) bool {
 			return true
 		}
 		return false
+	default:
+		return false
+	}
+}
+
+func integerPolicyInRange(value any, min, max int) bool {
+	switch v := value.(type) {
+	case int:
+		return v >= min && v <= max
+	case int64:
+		return v >= int64(min) && v <= int64(max)
+	case float64:
+		return v >= float64(min) && v <= float64(max) && math.Trunc(v) == v
 	default:
 		return false
 	}

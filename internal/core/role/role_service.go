@@ -1625,6 +1625,9 @@ func aggregatePolicyValues(key string, baseVal any, values []any) any {
 		}
 		return false
 	case int:
+		if key == "genshinRefreshIntervalMinutes" || key == "hsrRefreshIntervalMinutes" {
+			return minNumber(values, baseVal)
+		}
 		return maxNumber(values, baseVal)
 	case float64:
 		// 基本ポリシーの小数を残す key (coerceBasePolicy) は、base が float64 に
@@ -1796,6 +1799,27 @@ func maxNumber(values []any, base any) any {
 	return best.normalized
 }
 
+// minNumber picks the minimum host-int-compatible value. The game refresh
+// interval policies intentionally become more restrictive as roles combine.
+func minNumber(values []any, base any) any {
+	var best intBaseNumeric
+	found := false
+	for _, v := range values {
+		candidate, ok := intBaseNumber(v)
+		if !ok || !candidate.integer || candidate.intValue < 1 || candidate.intValue > 1440 {
+			continue
+		}
+		if !found || candidate.lessThan(best) {
+			best = candidate
+			found = true
+		}
+	}
+	if !found {
+		return base
+	}
+	return best.normalized
+}
+
 type intBaseNumeric struct {
 	integer    bool
 	intValue   int64
@@ -1838,6 +1862,19 @@ func (n intBaseNumeric) greaterThan(other intBaseNumeric) bool {
 		return compareIntToFraction(n.intValue, other.floatValue) > 0
 	}
 	return compareIntToFraction(other.intValue, n.floatValue) < 0
+}
+
+func (n intBaseNumeric) lessThan(other intBaseNumeric) bool {
+	if n.integer && other.integer {
+		return n.intValue < other.intValue
+	}
+	if !n.integer && !other.integer {
+		return n.floatValue < other.floatValue
+	}
+	if n.integer {
+		return compareIntToFraction(n.intValue, other.floatValue) < 0
+	}
+	return compareIntToFraction(other.intValue, n.floatValue) > 0
 }
 
 // compareIntToFraction compares exact i with finite, in-range, non-integral f.

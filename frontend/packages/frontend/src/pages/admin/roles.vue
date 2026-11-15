@@ -29,8 +29,12 @@ SPDX-License-Identifier: AGPL-3.0-only
 				<MkFoldableSection>
 					<template #header>{{ i18n.ts._role.manualRoles }}</template>
 					<div class="_gaps_s">
-						<MkRolePreview v-for="role in roles.filter(x => x.target === 'manual')" :key="role.id" :role="role" :forModeration="true"/>
+						<MkRolePreview v-for="role in roles.filter(x => x.target === 'manual' && !levelRoleIds.has(x.id))" :key="role.id" :role="role" :forModeration="true"/>
 					</div>
+				</MkFoldableSection>
+				<MkFoldableSection>
+					<template #header>{{ i18n.ts._roleLevel.title }}</template>
+					<div class="_gaps_s"><MkRolePreview v-for="role in roles.filter(isLevelRole)" :key="role.id" :role="role" :forModeration="true"/></div>
 				</MkFoldableSection>
 				<MkFoldableSection>
 					<template #header>{{ i18n.ts._role.conditionalRoles }}</template>
@@ -59,11 +63,21 @@ import { instance, fetchInstance } from '@/instance.js';
 import MkFoldableSection from '@/components/MkFoldableSection.vue';
 import { useRouter } from '@/router.js';
 import { deepClone } from '@/utility/clone.js';
+import { isLegacyLevelRole, roleLevelApi } from '@/utility/role-level-api.js';
+import type { RoleLevelConfig } from '@/utility/role-level-api.js';
 
 const router = useRouter();
 const baseRoleQ = ref('');
 
 const roles = await misskeyApi('admin/roles/list');
+const levelRoleResponse = await roleLevelApi<{ roles: RoleLevelConfig[] }>('plugin/role-level/admin/roles/list', {}).catch(() => ({ roles: [] }));
+const levelRoleConfigs = Array.isArray(levelRoleResponse?.roles) ? levelRoleResponse.roles : [];
+const levelRoleIds = new Set(levelRoleConfigs.map(role => role.roleId));
+for (const role of roles) if (isLegacyLevelRole(role as { target: string })) levelRoleIds.add(role.id);
+
+function isLevelRole(role: { id: string; target: string }) {
+	return levelRoleIds.has(role.id) || isLegacyLevelRole(role);
+}
 
 const policies = reactive(deepClone(instance.policies));
 

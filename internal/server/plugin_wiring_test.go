@@ -25,6 +25,7 @@ import (
 	"github.com/elythia-network/elythia/internal/config"
 	corerole "github.com/elythia-network/elythia/internal/core/role"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/permissions"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/queue/driver"
@@ -1954,6 +1955,56 @@ func TestSetupPlugins_RoutesRejectAppTokens(t *testing.T) {
 	scope = nil
 	assert.Equal(t, http.StatusOK, get().Code)
 	assert.True(t, reached)
+}
+
+func TestSetupPlugins_RoleLevelAllowsOnlyScopedXPAppRoute(t *testing.T) {
+	var reached string
+	def := pluginDef("role-level", func(_ plugin.Context, r plugin.Router) error {
+		r.POST("/admin/change-exp", func(plugin.Request) (any, error) {
+			reached = "xp"
+			return map[string]string{"ok": "yes"}, nil
+		})
+		r.POST("/admin/other", func(plugin.Request) (any, error) {
+			reached = "other"
+			return map[string]string{"ok": "yes"}, nil
+		})
+		return nil
+	}, nil)
+	s, api := newPluginTestServer(config.RoleServer)
+	var scope *middleware.AuthScope
+	s.echo.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if scope != nil {
+				c.Set(string(middleware.AuthScopeContextKey), scope)
+			}
+			return next(c)
+		}
+	})
+	require.NoError(t, s.setupPlugins(api, []plugin.Definition{def}, noopStorage))
+	post := func(path string) *httptest.ResponseRecorder {
+		reached = ""
+		rec := httptest.NewRecorder()
+		s.echo.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+		return rec
+	}
+
+	scope = &middleware.AuthScope{IsApp: true, Scopes: []string{permissions.WriteRoleLevelExperience}}
+	assert.Equal(t, http.StatusOK, post("/api/plugin/role-level/admin/change-exp").Code)
+	assert.Equal(t, "xp", reached)
+	assert.Equal(t, http.StatusForbidden, post("/api/plugin/role-level/admin/other").Code)
+	assert.Empty(t, reached)
+
+	scope = &middleware.AuthScope{IsApp: true, Scopes: []string{"read:account"}}
+	assert.Equal(t, http.StatusForbidden, post("/api/plugin/role-level/admin/change-exp").Code)
+	assert.Empty(t, reached)
+
+	// Native and anonymous behavior remains delegated to the plugin handler.
+	scope = &middleware.AuthScope{IsApp: false}
+	assert.Equal(t, http.StatusOK, post("/api/plugin/role-level/admin/change-exp").Code)
+	assert.Equal(t, "xp", reached)
+	scope = nil
+	assert.Equal(t, http.StatusOK, post("/api/plugin/role-level/admin/change-exp").Code)
+	assert.Equal(t, "xp", reached)
 }
 
 // **プラグインに渡す HTTP client が outbound の共通設定を通ること (#3037)。**

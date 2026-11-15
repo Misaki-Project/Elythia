@@ -311,6 +311,17 @@ func TestMaxNumber_ExactMixedNumericOrdering(t *testing.T) {
 	assert.Equal(t, 2.5, maxNumber([]any{1.5, 2.5}, 0))
 }
 
+func TestGameRefreshIntervalPoliciesUseBoundedMinimum(t *testing.T) {
+	for _, key := range []string{"genshinRefreshIntervalMinutes", "hsrRefreshIntervalMinutes"} {
+		t.Run(key, func(t *testing.T) {
+			assert.Equal(t, 5, aggregatePolicyValues(key, 10, []any{30, 5, 10}))
+			assert.Equal(t, 5, aggregatePolicyValues(key, 10, []any{0, 1441, 5}))
+			assert.Equal(t, 10, aggregatePolicyValues(key, 10, []any{0, 1441, 1.5, "5"}))
+			assert.Equal(t, 1440, aggregatePolicyValues(key, 10, []any{1440, 1441}))
+		})
+	}
+}
+
 func TestPolicyUnlimitedOrAboveCap(t *testing.T) {
 	assert.True(t, policyUnlimitedOrAboveCap(-1, 10))
 	assert.True(t, policyUnlimitedOrAboveCap(11, 10))

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	"github.com/elythia-network/elythia/internal/bgwork"
 	coredrive "github.com/elythia-network/elythia/internal/core/drive"
 	corerole "github.com/elythia-network/elythia/internal/core/role"
+	"github.com/elythia-network/elythia/internal/misc/permissions"
 	"github.com/elythia-network/elythia/internal/pluginstore"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/queue/driver"
@@ -36,6 +38,25 @@ import (
 // エンドポイントを追加したときに衝突すると、API 互換 (本プロジェクトの最優先
 // 方針) が壊れるため。
 const pluginRoutePrefix = "/plugin/"
+
+func roleLevelAppTokenGate() echo.MiddlewareFunc {
+	requireScope := middleware.RequireScope(permissions.WriteRoleLevelExperience)
+	reject := middleware.RejectAppToken()
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		scoped := requireScope(next)
+		denied := reject(next)
+		return func(c echo.Context) error {
+			scope := middleware.GetAuthScope(c)
+			if scope == nil || !scope.IsApp {
+				return next(c)
+			}
+			if c.Request().Method == http.MethodPost && c.Path() == "/api/plugin/role-level/admin/change-exp" {
+				return scoped(c)
+			}
+			return denied(c)
+		}
+	}
+}
 
 var errPluginEffectivePolicySetup = errors.New("plugin effective policy provider setup failed")
 
@@ -207,7 +228,11 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			// 任意の endpoint へ抜けられる)。upstream が
 			// 「`kind` 無し + 資格情報要」で app token を一律拒否するのと
 			// 同じ側に倒す。
-			group := api.Group(pluginRoutePrefix+def.Name, middleware.RejectAppToken())
+			var groupMiddleware echo.MiddlewareFunc = middleware.RejectAppToken()
+			if def.Name == "role-level" {
+				groupMiddleware = roleLevelAppTokenGate()
+			}
+			group := api.Group(pluginRoutePrefix+def.Name, groupMiddleware)
 			if needsRoutes {
 				r := &pluginRouter{group: group, roles: s.pluginRoles}
 				if s.roleService != nil {
@@ -914,6 +939,21 @@ type pluginRequest struct {
 
 func (r *pluginRequest) Context() context.Context { return r.c.Request().Context() }
 func (r *pluginRequest) Bind(v any) error         { return json.NewDecoder(r.c.Request().Body).Decode(v) }
+func (r *pluginRequest) BindStrict(v any) error {
+	dec := json.NewDecoder(r.c.Request().Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
 func (r *pluginRequest) Param(name string) string { return r.c.Param(name) }
 func (r *pluginRequest) Query(name string) string { return r.c.QueryParam(name) }
 

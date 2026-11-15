@@ -159,12 +159,19 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 		<div v-else-if="tab === 'roles'" class="_gaps">
 			<MkButton v-if="user.host == null" primary rounded @click="assignRole"><i class="ti ti-plus"></i> {{ i18n.ts.assign }}</MkButton>
+			<MkInfo v-if="roleLevelUnavailable" warn>{{ i18n.ts._roleLevel.unavailable }}</MkInfo>
 
 			<div v-for="role in info.roles" :key="role.id">
 				<div :class="$style.roleItemMain">
 					<MkRolePreview :class="$style.role" :role="role" :forModeration="true"/>
+					<div v-if="roleLevelByRoleId.get(role.id)" :class="$style.roleLevelControls">
+						<XRoleLevelValue :level="roleLevelByRoleId.get(role.id)!"/>
+						<button v-tooltip="i18n.ts._roleLevel.setExperience" class="_button" :class="$style.roleLevelAction" :aria-label="i18n.ts._roleLevel.setExperience" @click="changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'set')"><i class="ti ti-equal"></i></button>
+						<button v-tooltip="i18n.ts._roleLevel.adjustExperience" class="_button" :class="$style.roleLevelAction" :aria-label="i18n.ts._roleLevel.adjustExperience" @click="changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'add')">±</button>
+						<button v-tooltip="i18n.ts._roleLevel.multiplyExperience" class="_button" :class="$style.roleLevelAction" :aria-label="i18n.ts._roleLevel.multiplyExperience" @click="changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'multiplier')">*</button>
+					</div>
 					<button class="_button" @click="toggleRoleItem(role)"><i class="ti ti-chevron-down"></i></button>
-					<button v-if="role.target === 'manual'" class="_button" :class="$style.roleUnassign" @click="unassignRole(role, $event)"><i class="ti ti-x"></i></button>
+					<button v-if="role.target === 'manual' || (role.target as string) === 'manualLevel'" class="_button" :class="$style.roleUnassign" @click="unassignRole(role, $event)"><i class="ti ti-x"></i></button>
 					<button v-else class="_button" :class="$style.roleUnassign" disabled><i class="ti ti-ban"></i></button>
 				</div>
 				<div v-if="expandedRoleIds.includes(role.id)" :class="$style.roleItemSub">
@@ -277,6 +284,9 @@ import { instance } from '@/instance.js';
 import XEmojiApplications from '@/pages/admin-user.emoji-applications.vue';
 import XRelatedAccounts from '@/pages/admin-user.related-accounts.vue';
 import MkRolePreview from '@/components/MkRolePreview.vue';
+import XRoleLevelValue from '@/pages/admin-user.role-level-value.vue';
+import { roleLevelApi } from '@/utility/role-level-api.js';
+import type { RoleLevelAdminUserResponse, RoleLevelUserRole } from '@/utility/role-level-api.js';
 import MkPagination from '@/components/MkPagination.vue';
 import { Paginator } from '@/utility/paginator.js';
 import { adminShowUserParams, createLazyUserIpLookup } from '@/utility/user-ip-lookup.js';
@@ -307,6 +317,38 @@ const {
 });
 const user = ref(result.user);
 const info = ref(result.info);
+const roleLevelData = ref<RoleLevelAdminUserResponse | null>(null);
+const roleLevelUnavailable = ref(false);
+const roleLevelByRoleId = computed(() => new Map((roleLevelData.value?.roles ?? []).map(role => [role.roleId, role])));
+
+async function refreshRoleLevels() {
+	try {
+		roleLevelData.value = await roleLevelApi<RoleLevelAdminUserResponse>('plugin/role-level/admin/users/show', { userId: props.userId });
+		roleLevelUnavailable.value = false;
+	} catch {
+		roleLevelData.value = null;
+		roleLevelUnavailable.value = true;
+	}
+}
+
+await refreshRoleLevels();
+
+async function changeRoleExperience(current: RoleLevelUserRole, mode: 'set' | 'add' | 'multiplier') {
+	const input = await os.inputNumber({
+		title: i18n.ts._roleLevel.editExperience,
+		default: mode === 'set' ? current.experience : mode === 'multiplier' ? 1 : 0,
+	});
+	if (input.canceled) return;
+	await roleLevelApi('plugin/role-level/admin/change-exp', {
+		idempotencyKey: crypto.randomUUID(),
+		userId: props.userId,
+		roleId: current.roleId,
+		mode,
+		operand: input.result,
+	});
+	await refreshRoleLevels();
+}
+
 const ips = ipLookup.value;
 const ap = ref<Misskey.entities.ApGetResponse | null>(null);
 const moderator = ref(info.value.isModerator);
@@ -773,6 +815,17 @@ definePage(() => ({
 	padding: 6px 12px;
 	font-size: 85%;
 	color: color(from var(--MI_THEME-fg) srgb r g b / 0.75);
+}
+
+.roleLevelControls {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.roleLevelAction {
+	width: 32px;
+	height: 32px;
 }
 
 .roleUnassign {

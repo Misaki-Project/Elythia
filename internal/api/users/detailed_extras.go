@@ -26,6 +26,7 @@ func (h *Handler) FillDetailedExtrasMany(ctx context.Context, viewer *model.User
 	users := make([]*model.User, len(targets))
 	lites := make([]*entity.UserLite, len(targets))
 	for i, t := range targets {
+		h.applyProfileRoleVisibility(ctx, t.User.ID, t.Detailed)
 		users[i], lites[i] = t.User, &t.Detailed.UserLite
 	}
 	h.fillUserLites(users, lites)
