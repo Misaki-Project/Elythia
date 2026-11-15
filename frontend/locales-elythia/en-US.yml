@@ -1068,3 +1068,4 @@ _objectStorageMigration:
   verifyConfirm: "This reads every moved file from object storage and checks its size and hash. Reading transfers as much data as the total size of the files, which some providers charge for. Continue?"
   purgeConfirm: "This deletes the local copies of the verified files. Deleted local copies cannot be recovered, and object storage becomes the only copy. If you disable object storage or change its settings afterwards, the moved files can no longer be shown. After deleting, do not restore the database backup taken before moving until \"Move back to local\" has finished. Continue?"
   restoreConfirm: "This moves the migrated files back from object storage to the local storage. The local storage needs room for them. The copies in object storage are kept. Continue?"
+pluginNoteOptionsCannotBeScheduled: "This post's plugin options cannot be used with a scheduled post. Unschedule it or clear the options."
