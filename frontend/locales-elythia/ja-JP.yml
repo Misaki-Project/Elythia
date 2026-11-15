@@ -1095,3 +1095,5 @@ _settings:
   fxTwitterPreviewModeOgp: "標準のリンクカード（OGP）"
   fxTwitterPreviewModeText: "テキスト"
   fxTwitterPreviewModeMedia: "メディア（既定）"
+  fxTwitterPreviewTimelineAutoOpen: "タイムラインで自動で開く"
+  fxTwitterPreviewTimelineAutoOpenDescription: "オフにすると、タイムラインではボタンを押したときだけ開きます。ノートの詳細には影響しません。"

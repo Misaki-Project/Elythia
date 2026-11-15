@@ -250,7 +250,7 @@ function normalizedPreviewResponse(value: unknown, expectedID: string): PreviewR
 export async function loadPreview(input: PreviewInput, context: PreviewContext, signal: AbortSignal): Promise<PreviewResponse> {
 	const postId = statusID(input);
 	if (postId == null || context.source?.kind !== 'note') throw new Error('A visible source note is required');
-	if (!context.detail || !context.revealed || !context.active || !context.inViewport) throw abortError();
+	if (!context.revealed || !context.active || !context.inViewport) throw abortError();
 	const session = apiSession.value;
 	for (let attempt = 0; attempt < 8; attempt++) {
 		if (signal.aborted || session !== apiSession.value) throw abortError();

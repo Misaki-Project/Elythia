@@ -348,6 +348,9 @@ export const PREF_DEF = definePreferences({
 	fxTwitterPreviewMode: {
 		default: 'media' as 'ogp' | 'text' | 'media',
 	},
+	fxTwitterPreviewTimelineAutoOpen: {
+		default: true,
+	},
 	trackingParameterCleanerEnabled: {
 		accountDependent: true,
 		default: true,

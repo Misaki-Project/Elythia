@@ -6320,6 +6320,14 @@ export interface Locale extends ILocale {
          * メディア（既定）
          */
         "fxTwitterPreviewModeMedia": string;
+        /**
+         * タイムラインで自動で開く
+         */
+        "fxTwitterPreviewTimelineAutoOpen": string;
+        /**
+         * オフにすると、タイムラインではボタンを押したときだけ開きます。ノートの詳細には影響しません。
+         */
+        "fxTwitterPreviewTimelineAutoOpenDescription": string;
     };
     "_preferencesProfile": {
         /**

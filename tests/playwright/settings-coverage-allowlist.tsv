@@ -2,4 +2,5 @@
 # 書き方は docs/playwright.md の「設定の表」。
 reportError	other.vue の部品 (MkSwitch) がコメントアウトされていて画面に無く、frontend のどこからも値を読まない。prefer.model の宣言だけが残っている
 fxTwitterPreviewMode	Misakiの同梱プラグインfxtwitter-previewのfrontend (plugins/fxtwitter-preview/frontend/index.ts の preferenceKey) だけが読む。このプラグインは elythia-plugin.yml が disabled: true で、Playwright のスタックには組み込まれないので効き目を確かめられない
+fxTwitterPreviewTimelineAutoOpen	Misakiの同梱プラグインfxtwitter-previewのfrontend (plugins/fxtwitter-preview/frontend/index.ts の presentation) だけが読む。このプラグインは elythia-plugin.yml が disabled: true で、Playwright のスタックには組み込まれないので効き目を確かめられない
 trackingParameterCleanerEnabled	Misakiの同梱プラグインtracking-parameter-cleanerの貼り付け変換 (plugins/tracking-parameter-cleaner/frontend/index.ts の enabledPreferenceKey) だけが、plugin-api.ts の transformPastedText を通して読む。本体のコードは値を読まない

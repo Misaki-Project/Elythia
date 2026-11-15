@@ -12,16 +12,22 @@ import AdminPage from './AdminPage.vue';
 import type { Capabilities, PreviewResponse } from './api.js';
 import type { PreviewProvider } from '@/plugin-api.js';
 import { definePlugin } from '@/plugin-api.js';
+import { prefer } from '@/preferences.js';
 
 export { FxPreview, initApi, truncatePostText, loadPreview, statusID };
 export type { PreviewResponse } from './api.js';
 
+// タイムラインで自動で開くかの設定。ホストが渡す設定は1つ (表示方法) だけなので、こちらは直接読む。
+// prefer.r の値を読むので、ホストの presentation の computed が変更を追える。値が無ければ既定のオンとして扱う。
+function timelineAutoOpen(): boolean {
+	return (prefer.r as Partial<typeof prefer.r>).fxTwitterPreviewTimelineAutoOpen?.value !== false;
+}
+
 export const provider: PreviewProvider<PreviewResponse> = {
 	id: 'x-status',
 	priority: 100,
-	requiresDetail: true,
 	preferenceKey: 'fxTwitterPreviewMode',
-	presentation: (_input, context) => context.preferenceValue === 'ogp' ? 'manual' : 'automatic',
+	presentation: (_input, context) => context.preferenceValue === 'ogp' || (!context.detail && !timelineAutoOpen()) ? 'manual' : 'automatic',
 	manualLabel: 'FxTwitter',
 	loadingComponent: FxPreviewSkeleton,
 	match: input => statusID(input) != null,
