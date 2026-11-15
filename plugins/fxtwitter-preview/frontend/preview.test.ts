@@ -134,6 +134,7 @@ beforeEach(() => {
 	preferState.nsfw = 'respect';
 	preferState.confirmWhenRevealingSensitiveMedia = false;
 	preferState.fxTwitterPreviewMode = 'media';
+	setTimelineAutoOpen(true);
 	const fxModePreference = preferReactive.fxTwitterPreviewMode ??= ref('media');
 	fxModePreference.value = 'media';
 	// The host test helper's Record type is wider than its lazily created runtime entries.
@@ -142,17 +143,46 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); _resetPreviewsForTest(); vi.restoreAllMocks(); vi.unstubAllGlobals(); fetchMock.resetMocks(); });
 
-test('no-CW timeline through the current coordinator never requests Fx', async () => {
+function setTimelineAutoOpen(value: boolean): void {
+	preferState.fxTwitterPreviewTimelineAutoOpen = value;
+	if (!('fxTwitterPreviewTimelineAutoOpen' in preferReactive)) preferReactive.fxTwitterPreviewTimelineAutoOpen = ref(value);
+	preferReactive.fxTwitterPreviewTimelineAutoOpen.value = value;
+}
+
+test('timeline opens the Fx text card automatically by default without loading media', async () => {
 	await register();
-	coordinate({ detail: false });
-	await nextTick(); await nextTick();
-	expect(api.mock.calls.filter(call => call[0].endsWith('/preview'))).toHaveLength(0);
+	const view = coordinate({ detail: false });
+	await waitFor(() => expect(view.getByText('public body')).toBeTruthy());
+	expect(previewCalls()).toHaveLength(1);
+	expect(previewCalls()[0][1]).toEqual({ noteId: 'note-1', postId: '1234567890' });
+	expect(prepareCalls()).toHaveLength(0);
 	expect(media).not.toHaveBeenCalled();
 });
 
+test('timeline waits for the Fx action when automatic opening is off, and details still open automatically', async () => {
+	setTimelineAutoOpen(false);
+	await register();
+	const timeline = coordinate({ detail: false });
+	const manual = await timeline.findByRole('button', { name: 'FxTwitter' });
+	await flushPreview();
+	expect(previewCalls()).toHaveLength(0);
+	await fireEvent.click(manual);
+	await waitFor(() => expect(timeline.getByText('public body')).toBeTruthy());
+	expect(previewCalls()).toHaveLength(1);
+	timeline.unmount();
+	const detail = coordinate();
+	await waitFor(() => expect(detail.getByText('public body')).toBeTruthy());
+	expect(previewCalls()).toHaveLength(2);
+});
+
 test('provider uses the saved three-mode preference and leaves guest cards to the native fallback', () => {
-	expect(provider.requiresDetail).toBe(true);
+	expect(provider.requiresDetail).toBeUndefined();
 	expect(provider.preferenceKey).toBe('fxTwitterPreviewMode');
+	expect(provider.presentation?.(input, { ...context, detail: false, preferenceValue: 'media' })).toBe('automatic');
+	expect(provider.presentation?.(input, { ...context, detail: false, preferenceValue: 'ogp' })).toBe('manual');
+	setTimelineAutoOpen(false);
+	expect(provider.presentation?.(input, { ...context, detail: false, preferenceValue: 'media' })).toBe('manual');
+	expect(provider.presentation?.(input, { ...context, preferenceValue: 'media' })).toBe('automatic');
 	expect(provider.presentation?.(input, { ...context, preferenceValue: 'ogp' })).toBe('manual');
 	expect(provider.presentation?.(input, { ...context, preferenceValue: 'text' })).toBe('automatic');
 	expect(provider.presentation?.(input, { ...context, preferenceValue: 'media' })).toBe('automatic');
@@ -191,7 +221,7 @@ test('provider authorization failure returns to the host standard URL preview', 
 	expect(nativeTweet).not.toBeNull();
 	expect(prepareCalls('video')).toHaveLength(0);
 });
-test.each([{ detail: false }, { revealed: false }, { active: false }, { inViewport: false }, { source: null }])('direct loader refuses gated context %j', async patch => {
+test.each([{ revealed: false }, { active: false }, { inViewport: false }, { source: null }])('direct loader refuses gated context %j', async patch => {
 	await expect(loadPreview(input, { ...context, ...patch }, new AbortController().signal)).rejects.toThrow();
 	expect(api).not.toHaveBeenCalled();
 });
@@ -260,7 +290,7 @@ test('a manually retried pending batch also stops at eight without background po
 	await vi.advanceTimersByTimeAsync(60_000); expect(previewCalls()).toHaveLength(8); expect(retryButton(view).disabled).toBe(false);
 });
 
-test.each(['unmount', 'cw', 'inactive', 'viewport', 'detail', 'source', 'input', 'session', 'parent'] as const)('retry aborts and rejects late publication on %s change', async change => {
+test.each(['unmount', 'cw', 'inactive', 'viewport', 'source', 'input', 'session', 'parent'] as const)('retry aborts and rejects late publication on %s change', async change => {
 	let finish!: (value: PreviewResponse) => void;
 	api.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
 	const view = retryCard(); await fireEvent.click(retryButton(view)); await flushPreview();
@@ -268,17 +298,26 @@ test.each(['unmount', 'cw', 'inactive', 'viewport', 'detail', 'source', 'input',
 	if (change === 'unmount') view.unmount();
 	else if (change === 'session') { initApi(api as PluginHost['api'], media as PluginHost['fetch'], viewer); await nextTick(); } else if (change === 'input') await view.rerender({ input: { kind: 'url', href: 'https://x.com/bob/status/9876543210' } });
 	else if (change === 'parent') await view.rerender({ data: { state: 'disabled' } });
-	else await view.rerender({ context: { ...context, ...(change === 'cw' ? { revealed: false } : change === 'inactive' ? { active: false } : change === 'viewport' ? { inViewport: false } : change === 'detail' ? { detail: false } : { source: { kind: 'note', noteId: 'note-2' } }) } });
+	else await view.rerender({ context: { ...context, ...(change === 'cw' ? { revealed: false } : change === 'inactive' ? { active: false } : change === 'viewport' ? { inViewport: false } : { source: { kind: 'note', noteId: 'note-2' } }) } });
 	expect(signal.aborted).toBe(true);
 	finish(data()); await flushPreview();
 	expect(view.queryByText('public body')).toBeNull(); expect(media).not.toHaveBeenCalled();
-	if (change === 'cw' || change === 'inactive' || change === 'viewport' || change === 'detail') {
+	if (change === 'cw' || change === 'inactive' || change === 'viewport') {
 		expect(retryButton(view).disabled).toBe(true);
 		await view.rerender({ context }); expect(retryButton(view).disabled).toBe(false);
 		expect(previewCalls()).toHaveLength(1);
 		api.mockResolvedValue(data()); await fireEvent.click(retryButton(view)); await flushPreview();
 		expect(view.getByText('public body')).toBeTruthy(); expect(previewCalls()).toHaveLength(2);
 	}
+});
+
+test('a pending timeline card can be retried without the note detail', async () => {
+	api.mockResolvedValue(data());
+	const view = render(provider.component as typeof FxPreview, { props: { input, data: { state: 'pending' }, context: { ...context, detail: false } }, global: globals });
+	expect(retryButton(view).disabled).toBe(false);
+	await fireEvent.click(retryButton(view)); await flushPreview();
+	expect(previewCalls()).toHaveLength(1);
+	expect(view.getByText('public body')).toBeTruthy();
 });
 
 test('retry overrides are discarded on note ownership change and use only the new source', async () => {

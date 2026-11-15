@@ -66,6 +66,12 @@ SPDX-License-Identifier: AGPL-3.0-only
 											<template #caption><SearchText>{{ i18n.ts._settings.fxTwitterPreviewModeDescription }}</SearchText></template>
 										</MkSelect>
 									</MkPreferenceContainer>
+									<MkPreferenceContainer k="fxTwitterPreviewTimelineAutoOpen">
+										<MkSwitch v-model="fxTwitterPreviewTimelineAutoOpen">
+											<template #label>{{ i18n.ts._settings.fxTwitterPreviewTimelineAutoOpen }}</template>
+											<template #caption>{{ i18n.ts._settings.fxTwitterPreviewTimelineAutoOpenDescription }}</template>
+										</MkSwitch>
+									</MkPreferenceContainer>
 								</div>
 							</MkFolder>
 						</SearchMarker>
@@ -950,6 +956,7 @@ const $i = ensureSignin();
 const lang = ref(miLocalStorage.getItem('lang'));
 const dataSaver = ref(prefer.s.dataSaver);
 const fxTwitterPreviewMode = prefer.model('fxTwitterPreviewMode');
+const fxTwitterPreviewTimelineAutoOpen = prefer.model('fxTwitterPreviewTimelineAutoOpen');
 const trackingParameterCleanerEnabled = prefer.model('trackingParameterCleanerEnabled');
 const realtimeMode = store.model('realtimeMode');
 

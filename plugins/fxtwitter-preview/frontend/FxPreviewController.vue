@@ -28,7 +28,7 @@ const failed = ref(false);
 const cooling = ref(false);
 const sourceHref = computed(() => props.input.kind === 'url' ? props.input.href : '#');
 const ownershipKey = computed(() => [apiSession.value, sourceHref.value, props.context.source?.noteId ?? ''].join('\u0000'));
-const eligible = computed(() => statusID(props.input) != null && props.context.source?.kind === 'note' && props.context.detail && props.context.revealed && props.context.active && props.context.inViewport);
+const eligible = computed(() => statusID(props.input) != null && props.context.source?.kind === 'note' && props.context.revealed && props.context.active && props.context.inViewport);
 let controller: AbortController | null = null;
 let generation = 0;
 let cooldownTimer: number | null = null;
