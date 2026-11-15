@@ -193,7 +193,7 @@ describe('role-level UI integration points', () => {
 		expect(source).toContain("changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'add')");
 		expect(source).not.toContain("'subtract'");
 		expect(source).toContain('>±</button>');
-		expect(source).toContain('>＊</button>');
+		expect(source).toContain('>*</button>');
 		expect(source).toContain("changeRoleExperience(roleLevelByRoleId.get(role.id)!, 'multiplier')");
 	});
 

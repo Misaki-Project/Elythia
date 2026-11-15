@@ -9,6 +9,13 @@ import GameRankings from '@/pages/game-rankings.vue';
 const mocks = vi.hoisted(() => ({ definePage: vi.fn(), names: ['hsr', 'genshin'] }));
 vi.mock('@/page.js', () => ({ definePage: mocks.definePage }));
 vi.mock('@/server-plugins.generated.js', () => ({ serverPlugins: [] }));
+vi.mock('@/i18n.js', () => ({ i18n: { ts: {
+	gameRankings: 'ゲームランキング',
+	gameRankingTabLabel: 'ゲーム',
+	gameRankingEmpty: '利用できるゲームランキングはありません。',
+	genshinGameName: '原神',
+	hsrGameName: 'スターレイル',
+} } }));
 vi.mock('@/components/global/PageWithHeader.vue', async () => {
 	const { defineComponent, h } = await import('vue');
 	return { default: defineComponent({ setup(_props, { slots }) { return () => h('main', slots.default?.()); } }) };

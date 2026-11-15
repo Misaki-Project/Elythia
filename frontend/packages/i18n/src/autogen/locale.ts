@@ -13705,6 +13705,26 @@ export interface Locale extends ILocale {
      * 貼り付け時に追跡パラメータを除去する
      */
     "trackingParameterCleanerEnabled": string;
+    /**
+     * ゲームランキング
+     */
+    "gameRankings": string;
+    /**
+     * ゲーム
+     */
+    "gameRankingTabLabel": string;
+    /**
+     * 利用できるゲームランキングはありません。
+     */
+    "gameRankingEmpty": string;
+    /**
+     * 原神
+     */
+    "genshinGameName": string;
+    /**
+     * スターレイル
+     */
+    "hsrGameName": string;
     "_abuseReportForm": {
         /**
          * 違反カテゴリ
@@ -15223,6 +15243,30 @@ export interface Locale extends ILocale {
          * キャッシュにない投稿を1日に新規取得する上限です（既定600、1〜100000）。
          */
         "fxTwitterColdFetchesPerDay_caption": string;
+        /**
+         * 原神のUID連携上限
+         */
+        "genshinUidLimit": string;
+        /**
+         * 本人確認済みのローカルUID数の上限です（既定1件、0で新規連携禁止）。上限を下げても既存の連携は自動解除しません。
+         */
+        "genshinUidLimit_caption": string;
+        /**
+         * スターレイルのUID連携上限
+         */
+        "hsrUidLimit": string;
+        /**
+         * 本人確認済みのローカルUID数の上限です（既定1件、0で新規連携禁止）。上限を下げても既存の連携は自動解除しません。
+         */
+        "hsrUidLimit_caption": string;
+        /**
+         * スターレイルの自動取得間隔（分）
+         */
+        "hsrRefreshIntervalMinutes": string;
+        /**
+         * 1〜1440分の整数（既定10分）。EnkaのTTLを優先し、同じ優先度のロールでは短い間隔を採用します。
+         */
+        "hsrRefreshIntervalMinutes_caption": string;
     };
     "_mkgoAvatarDecoration": {
         /**

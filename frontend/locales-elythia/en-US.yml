@@ -35,6 +35,11 @@ failedToLoadMedia: "Failed to load the file, or this browser cannot display or p
 nFilesSelected: "{n} selected"
 unselectAll: "Clear selection"
 trackingParameterCleanerEnabled: "Remove tracking parameters when pasting"
+gameRankings: "Game rankings"
+gameRankingTabLabel: "Game"
+gameRankingEmpty: "No game rankings are available."
+genshinGameName: "Genshin Impact"
+hsrGameName: "Honkai: Star Rail"
 _followApproval:
   groupTitle: "Follow approval"
   inactiveDescription: "All follows require approval, so the period-based settings do not apply. They apply again once you stop requiring approval for follows."
@@ -655,6 +660,12 @@ _mkgoRolePolicy:
   fxTwitterColdFetchesPerHour_caption: "Maximum new fetches for uncached posts per hour (default 100; range 1–10000)."
   fxTwitterColdFetchesPerDay: "FxTwitter cold fetches per day"
   fxTwitterColdFetchesPerDay_caption: "Maximum new fetches for uncached posts per day (default 600; range 1–100000)."
+  genshinUidLimit: "Genshin Impact UID link limit"
+  genshinUidLimit_caption: "Maximum number of verified local UIDs (default 1; 0 blocks new links). Lowering the limit does not unlink existing UIDs."
+  hsrUidLimit: "Honkai: Star Rail UID link limit"
+  hsrUidLimit_caption: "Maximum number of verified local UIDs (default 1; 0 blocks new links). Lowering the limit does not unlink existing UIDs."
+  hsrRefreshIntervalMinutes: "Honkai: Star Rail automatic refresh interval (minutes)"
+  hsrRefreshIntervalMinutes_caption: "An integer from 1 to 1440 minutes (default 10). The Enka TTL takes precedence, and among roles with the same priority the shorter interval is used."
 _mkgoEmoji:
   importAndReact: "Import and react"
 _mkgoBubbleGame:

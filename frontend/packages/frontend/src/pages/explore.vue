@@ -57,7 +57,7 @@ const headerTabs = computed(() => [{
 	key: 'roles',
 	icon: 'ti ti-badges',
 	title: i18n.ts.roles,
-}, ...(games.length ? [{ key: gameRankingsPath, icon: 'ti ti-trophy', title: 'ゲームランキング' }] : []), ...pluginPages.map(page => ({
+}, ...(games.length ? [{ key: gameRankingsPath, icon: 'ti ti-trophy', title: i18n.ts.gameRankings }] : []), ...pluginPages.map(page => ({
 	key: page.fullPath,
 	icon: page.navIcon ?? 'ti ti-puzzle',
 	title: page.navTitle!,
