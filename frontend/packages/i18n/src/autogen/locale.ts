@@ -6300,6 +6300,26 @@ export interface Locale extends ILocale {
              */
             "sendOnEnter": string;
         };
+        /**
+         * FxTwitter プレビュー
+         */
+        "fxTwitterPreviewMode": string;
+        /**
+         * 許可された投稿で使う表示方法です。OGPは標準のリンクカード、テキストは本文、メディアは本文と画像・動画を表示します。
+         */
+        "fxTwitterPreviewModeDescription": string;
+        /**
+         * 標準のリンクカード（OGP）
+         */
+        "fxTwitterPreviewModeOgp": string;
+        /**
+         * テキスト
+         */
+        "fxTwitterPreviewModeText": string;
+        /**
+         * メディア（既定）
+         */
+        "fxTwitterPreviewModeMedia": string;
     };
     "_preferencesProfile": {
         /**
@@ -9897,6 +9917,10 @@ export interface Locale extends ILocale {
          * ダイレクトメッセージを閲覧する
          */
         "read:chat": string;
+        /**
+         * ロール経験値を変更する
+         */
+        "write:admin:role-level-experience": string;
     };
     "_auth": {
         /**
@@ -13574,6 +13598,10 @@ export interface Locale extends ILocale {
         "mfm": string;
     };
     /**
+     * 貼り付け時に追跡パラメータを除去する
+     */
+    "trackingParameterCleanerEnabled": string;
+    /**
      * Elythiaについて
      */
     "aboutMkGo": string;
@@ -15071,6 +15099,66 @@ export interface Locale extends ILocale {
         "ldSignatureSeenAt": string;
     };
     "_mkgoRolePolicy": {
+        /**
+         * 原神UID連携上限
+         */
+        "genshinUidLimit": string;
+        /**
+         * このロールで連携できる原神UID数の上限です（0〜100、既定1）。
+         */
+        "genshinUidLimit_caption": string;
+        /**
+         * 原神の自動取得間隔（分）
+         */
+        "genshinRefreshIntervalMinutes": string;
+        /**
+         * 所有確認済みの原神UIDを自動更新する最短間隔です。1〜1440分の整数で指定します（既定10分）。EnkaのTTLが長い場合はTTLを優先し、更新確認は1分ごとに行います。同じ優先度のロールでは短い間隔を採用するため、個別ロールで長い間隔を指定する場合は優先度を上げてください。UID所有確認の有効期限や再確認待機は変更しません。
+         */
+        "genshinRefreshIntervalMinutes_caption": string;
+        /**
+         * スターレイルUID連携上限
+         */
+        "hsrUidLimit": string;
+        /**
+         * このロールで連携できるスターレイルUID数の上限です（0〜100、既定1）。
+         */
+        "hsrUidLimit_caption": string;
+        /**
+         * スターレイル自動取得間隔（分）
+         */
+        "hsrRefreshIntervalMinutes": string;
+        /**
+         * 所有確認済みUIDの自動更新間隔です。1〜1440分の整数で指定します（既定10分）。同じ優先度のロールでは短い間隔を採用します。
+         */
+        "hsrRefreshIntervalMinutes_caption": string;
+        /**
+         * 範囲やレベル数の変更で取得間隔が1〜1440分を超える場合、範囲先頭の値を1〜1440分の整数に補正し、倍率の加算値を0に戻します。保存前にプレビューを確認してください。
+         */
+        "genshinRefreshRange_caption": string;
+        /**
+         * FxTwitter プレビューを使える
+         */
+        "canUseFxTwitterPreview": string;
+        /**
+         * このロールでX投稿のFxTwitterプレビューを許可します。サーバー全体の外部取得設定が無効なら、新しい取得は行われません。
+         */
+        "canUseFxTwitterPreview_caption": string;
+        /**
+         * FxTwitter 新規取得数（1時間）
+         */
+        "fxTwitterColdFetchesPerHour": string;
+        /**
+         * キャッシュにない投稿を1時間に新規取得する上限です（既定100、1〜10000）。
+         */
+        "fxTwitterColdFetchesPerHour_caption": string;
+        /**
+         * FxTwitter 新規取得数（1日）
+         */
+        "fxTwitterColdFetchesPerDay": string;
+        /**
+         * キャッシュにない投稿を1日に新規取得する上限です（既定600、1〜100000）。
+         */
+        "fxTwitterColdFetchesPerDay_caption": string;
         /**
          * カスタム絵文字の登録を申請できる
          */
@@ -17243,5 +17331,215 @@ export interface Locale extends ILocale {
          * 稼働時間
          */
         "uptime": string;
+    };
+    "_roleLevel": {
+        /**
+         * レベルロール
+         */
+        "title": string;
+        /**
+         * ここではレベルロールの経験値曲線を設定します。レベル別ポリシーは、下にある各ポリシーの編集欄で設定できます。
+         */
+        "editorDescription": string;
+        /**
+         * 開始レベル
+         */
+        "baseLevel": string;
+        /**
+         * 経験値曲線
+         */
+        "experienceCurve": string;
+        /**
+         * 区間 {n}
+         */
+        "segment": ParameterizedString<"n">;
+        /**
+         * 計算方法
+         */
+        "calculation": string;
+        /**
+         * 上昇レベル数
+         */
+        "levelUps": string;
+        /**
+         * 基本必要経験値
+         */
+        "baseExperience": string;
+        /**
+         * 段階ごとの加算値
+         */
+        "additionalExperience": string;
+        /**
+         * 指数
+         */
+        "exponential": string;
+        /**
+         * 経験値区間を追加
+         */
+        "addSegment": string;
+        /**
+         * レベル別ポリシー
+         */
+        "policyRanges": string;
+        /**
+         * レベルごとに適用するポリシーを設定します。
+         */
+        "policyRangesDescription": string;
+        /**
+         * このポリシーに適用するレベル範囲を設定します。範囲は連続し、開始レベルと最大レベルまでを常に覆います。
+         */
+        "perPolicyRangesDescription": string;
+        /**
+         * {count} 件のレベルポリシー
+         */
+        "policyRangeCount": ParameterizedString<"count">;
+        /**
+         * ポリシー範囲 {n}
+         */
+        "range": ParameterizedString<"n">;
+        /**
+         * 適用方法
+         */
+        "rangeType": string;
+        /**
+         * 開始段階
+         */
+        "startStage": string;
+        /**
+         * 終了段階
+         */
+        "endStage": string;
+        /**
+         * 開始レベル
+         */
+        "startPolicyLevel": string;
+        /**
+         * 終了レベル
+         */
+        "endPolicyLevel": string;
+        /**
+         * ポリシーキー
+         */
+        "policyKey": string;
+        /**
+         * 固定値
+         */
+        "constantValue": string;
+        /**
+         * 基準値
+         */
+        "multiplierBase": string;
+        /**
+         * 段階ごとの加算値
+         */
+        "multiplierAdditional": string;
+        /**
+         * ポリシー範囲を追加
+         */
+        "addRange": string;
+        /**
+         * このポリシーに範囲を追加
+         */
+        "addPolicyRange": string;
+        /**
+         * 固定
+         */
+        "constant": string;
+        /**
+         * 線形
+         */
+        "linear": string;
+        /**
+         * 段階加算
+         */
+        "multiplier": string;
+        /**
+         * 変更なし
+         */
+        "noPolicyChange": string;
+        /**
+         * 他のポリシーに影響されません
+         */
+        "noPolicyChangeDescription": string;
+        /**
+         * 影響情報
+         */
+        "impactInformation": string;
+        /**
+         * 計算式:
+         */
+        "formula": string;
+        /**
+         * Lv.{level}: {value}
+         */
+        "policySimulation": ParameterizedString<"level" | "value">;
+        /**
+         * Lv.{level}: {cost} XP ({from} ～ {to} XP)
+         */
+        "experienceSimulation": ParameterizedString<"level" | "cost" | "from" | "to">;
+        /**
+         * Lv.{level}: MAX ({from} ～ XP)
+         */
+        "experienceSimulationMax": ParameterizedString<"level" | "from">;
+        /**
+         * 通常値を使用
+         */
+        "useBasePolicy": string;
+        /**
+         * レベル {level}
+         */
+        "level": ParameterizedString<"level">;
+        /**
+         * 経験値 {current} / {next}
+         */
+        "experience": ParameterizedString<"current" | "next">;
+        /**
+         * 最大レベル
+         */
+        "maxLevel": string;
+        /**
+         * 経験値を編集
+         */
+        "editExperience": string;
+        /**
+         * 経験値を設定
+         */
+        "setExperience": string;
+        /**
+         * 経験値を加算
+         */
+        "addExperience": string;
+        /**
+         * 経験値を加減算
+         */
+        "adjustExperience": string;
+        /**
+         * 経験値を減算
+         */
+        "subtractExperience": string;
+        /**
+         * 経験値を乗算
+         */
+        "multiplyExperience": string;
+        /**
+         * 表示する
+         */
+        "showOnProfile": string;
+        /**
+         * 非表示にする
+         */
+        "hideOnProfile": string;
+        /**
+         * レベル設定を削除
+         */
+        "removeConfiguration": string;
+        /**
+         * 旧形式のレベルロールです。保存するとプラグイン形式へ移行します。
+         */
+        "legacyRoleNotice": string;
+        /**
+         * レベル情報を取得できませんでした。サーバーのrole-level設定を確認してください。
+         */
+        "unavailable": string;
     };
 }
