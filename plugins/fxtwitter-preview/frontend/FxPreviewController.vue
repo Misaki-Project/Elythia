@@ -4,10 +4,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 -->
 
 <template>
-<div v-if="currentData.state === 'pending'" :class="$style.pending">
-	<p role="status">{{ loading ? 'Xの投稿を再取得しています…' : '投稿の取得がまだ完了していません。時間をおいて再試行できます。' }}</p>
+<FxPreviewSkeleton v-if="currentData.state === 'pending' && loading"/>
+<div v-else-if="currentData.state === 'pending'" :class="$style.pending">
+	<p role="status">投稿の取得がまだ完了していません。時間をおいて再試行できます。</p>
 	<p v-if="failed" data-fx-preview-error role="status">取得に失敗しました。時間をおいて再試行してください。</p>
-	<button type="button" data-fx-preview-retry :disabled="!eligible || loading || cooling" @click.stop="retry">{{ loading ? '取得中…' : '再試行' }}</button>
+	<button type="button" data-fx-preview-retry :disabled="!eligible || loading || cooling" @click.stop="retry">再試行</button>
 	<a :href="sourceHref" target="_blank" rel="nofollow noopener noreferrer">Xで投稿を開く</a>
 </div>
 <FxPreview v-else :data="currentData" :input="input" :context="context"/>
@@ -15,6 +16,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <script lang="ts" setup>
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue';
+import FxPreviewSkeleton from './FxPreviewSkeleton.vue';
 import FxPreview from './FxPreview.vue';
 import { apiSession } from './api.js';
 import { loadPreview, statusID } from './preview-loader.js';
