@@ -17,7 +17,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue';
 import FxPreview from './FxPreview.vue';
 import { apiSession } from './api.js';
-import { loadPreview, statusID } from './preview-loader.js';
+import { loadPreview, retryCooldownMs, statusID } from './preview-loader.js';
 import type { PreviewResponse } from './api.js';
 import type { PreviewContext, PreviewInput } from '@/plugin-api.js';
 
@@ -46,7 +46,7 @@ function clearCooldown(): void {
 
 function cooldown(nextPollAt?: string): void {
 	clearCooldown(); cooling.value = true;
-	cooldownTimer = window.setTimeout(() => { cooldownTimer = null; cooling.value = false; }, Math.max(1_000, (Date.parse(nextPollAt ?? '') || 0) - Date.now()));
+	cooldownTimer = window.setTimeout(() => { cooldownTimer = null; cooling.value = false; }, retryCooldownMs(nextPollAt, Date.now()));
 }
 
 function ownsRequest(current: number, key: string, request: AbortController): boolean {
