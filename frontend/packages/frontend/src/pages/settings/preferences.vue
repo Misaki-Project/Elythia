@@ -51,7 +51,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 							</MkSwitch>
 						</SearchMarker>
 
-						<SearchMarker :keywords="['X', 'Twitter', 'FxTwitter', 'preview', 'プレビュー', 'tracking', 'parameter', 'cleaner']">
+						<SearchMarker :keywords="['X', 'Twitter', 'FxTwitter', 'preview', 'プレビュー']">
 							<MkFolder>
 								<template #label><SearchLabel>{{ i18n.ts._settings.fxTwitterPreviewMode }}</SearchLabel></template>
 								<template #icon><SearchIcon><i class="ti ti-brand-x"></i></SearchIcon></template>
@@ -66,13 +66,16 @@ SPDX-License-Identifier: AGPL-3.0-only
 											<template #caption><SearchText>{{ i18n.ts._settings.fxTwitterPreviewModeDescription }}</SearchText></template>
 										</MkSelect>
 									</MkPreferenceContainer>
-									<MkPreferenceContainer k="trackingParameterCleanerEnabled">
-										<MkSwitch v-model="trackingParameterCleanerEnabled">
-										<template #label>{{ i18n.ts.trackingParameterCleanerEnabled }}</template>
-										</MkSwitch>
-									</MkPreferenceContainer>
 								</div>
 							</MkFolder>
+						</SearchMarker>
+
+						<SearchMarker :keywords="['tracking', 'parameter', 'cleaner', 'paste', 'URL', '追跡', 'パラメータ', '貼り付け']">
+							<MkPreferenceContainer k="trackingParameterCleanerEnabled">
+								<MkSwitch v-model="trackingParameterCleanerEnabled">
+									<template #label><i class="ti ti-link"></i> <SearchLabel>{{ i18n.ts.trackingParameterCleanerEnabled }}</SearchLabel></template>
+								</MkSwitch>
+							</MkPreferenceContainer>
 						</SearchMarker>
 
 						<MkDisableSection :disabled="realtimeMode">
