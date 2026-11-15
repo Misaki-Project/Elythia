@@ -8,7 +8,7 @@ Each user can turn cleaning off in the host's personal settings; it starts on by
 
 The cleaner recognizes only exact HTTP(S) hosts listed in `frontend/cleaner.ts`:
 
-- X and Twitter: `x.com`, `twitter.com`, and their listed `www`/`mobile` hosts; removes `s`, `t`, `ref_src`, and `ref_url` on shared status paths only.
+- X and Twitter: `x.com`, `twitter.com`, and their listed `www`/`mobile` hosts; removes `s`, `t`, `a`, `ref_src`, and `ref_url` on shared status paths only.
 - YouTube: `youtube.com` and `youtu.be` hosts listed in the source; removes `si`.
 - Instagram: listed `instagram.com` hosts; removes `igsh` and `igshid`.
 - Facebook: listed Facebook hosts; removes `fbclid`.
