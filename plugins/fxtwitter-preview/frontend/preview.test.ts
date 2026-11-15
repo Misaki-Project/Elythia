@@ -268,6 +268,18 @@ test.each([-60_000, 0, 18_000, 3_600_000])('poll timing does not depend on the d
 	await vi.advanceTimersByTimeAsync(1); await expect(pending).resolves.toMatchObject({ state: 'ready' });
 });
 
+test('the dots animation is shown while the host loads the first preview and is replaced by the post', async () => {
+	let finish!: (value: PreviewResponse) => void;
+	api.mockImplementation(async path => path.endsWith('/capabilities') ? { externalFetchEnabled: true } : await new Promise(resolve => { finish = resolve; }));
+	await register(); const view = coordinate(); await flushPreview();
+	const loading = view.container.querySelector('[data-fx-preview-loading]');
+	expect(loading?.getAttribute('role')).toBe('status');
+	expect(loading?.querySelectorAll('span[aria-hidden="true"] > span')).toHaveLength(3);
+	finish(data()); await flushPreview();
+	await waitFor(() => expect(view.getByText('public body')).toBeTruthy());
+	expect(view.container.querySelector('[data-fx-preview-loading]')).toBeNull();
+});
+
 test('retry is single flight and a rejected batch stays retryable after cooldown', async () => {
 	vi.useFakeTimers();
 	let reject!: (reason: Error) => void;
@@ -275,7 +287,9 @@ test('retry is single flight and a rejected batch stays retryable after cooldown
 	const view = retryCard();
 	const button = retryButton(view);
 	button.click(); button.click(); button.click(); await flushPreview();
-	expect(previewCalls()).toHaveLength(1); expect(retryButton(view).disabled).toBe(true);
+	expect(previewCalls()).toHaveLength(1);
+	expect(view.container.querySelector('[data-fx-preview-loading]')).toBeTruthy();
+	expect(view.container.querySelector('[data-fx-preview-retry]')).toBeNull();
 	reject(new Error('temporary failure')); await flushPreview();
 	expect(view.container.querySelector('[data-fx-preview-error]')).toBeTruthy();
 	expect(retryButton(view).disabled).toBe(true);
