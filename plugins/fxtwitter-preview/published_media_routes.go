@@ -259,7 +259,7 @@ func preparePublishedVideo(req plugin.Request, ctx plugin.Context, s *store, cfg
 	defer cancelFetch()
 	blob, releaseVideo, err := fetchVideoWithAdmission(fetchCtx, ctx.HTTP(), rawURL, nativeVideoMaxBytes, processNativeVideoAdmission)
 	if err != nil {
-		return nil, plugin.ErrNotFound("video unavailable")
+		return nil, nativeVideoUnavailable(ctx.Logger(), body.PostID, err)
 	}
 	defer releaseVideo()
 	if req.Context().Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), body.NoteID, body.PostID) != nil {
