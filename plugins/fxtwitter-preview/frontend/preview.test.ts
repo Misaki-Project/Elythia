@@ -38,7 +38,7 @@ function data(): PreviewResponse & { post: PublicPost } {
 function fixtureHost(me: PluginHost['me'] = { id: 'u1', username: 'u1', host: null }): PluginHost {
 	// The public PluginHost contract names this authenticated resource method fetch.
 	// eslint-disable-next-line id-denylist
-	return { name: 'fxtwitter-preview', me, api: api as PluginHost['api'], fetch: media as PluginHost['fetch'], openMedia: viewer, slot() {}, preview: { register() {} }, postForm: { registerPasteTransform() {} } };
+	return { name: 'fxtwitter-preview', me, api: api as PluginHost['api'], fetch: media as PluginHost['fetch'], openMedia: viewer, slot() {}, preview: { register() {} }, postForm: { registerPasteTransform() {}, registerNoteOption() {} } };
 }
 
 async function register() {
