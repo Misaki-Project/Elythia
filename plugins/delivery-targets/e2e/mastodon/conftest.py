@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import sys
 
 import httpx
@@ -20,6 +22,9 @@ MASTODON_URL = os.environ.get("MASTODON_URL", "https://mastodon")
 MKGO_DOMAIN = os.environ.get("MKGO_DOMAIN", "mkgo")
 MASTODON_DOMAIN = os.environ.get("MASTODON_DOMAIN", "mastodon")
 MASTODON_TOKEN_FILE = os.environ.get("MASTODON_TOKEN_FILE", "/shared/mastodon_token")
+# Mastodon の Sidekiq が使う Redis (tests/federation/compose.mastodon.yml の redis-masto)。
+SIDEKIQ_REDIS_HOST = os.environ.get("SIDEKIQ_REDIS_HOST", "redis-masto")
+SIDEKIQ_REDIS_PORT = int(os.environ.get("SIDEKIQ_REDIS_PORT", "6379"))
 
 
 class MastodonClient:
@@ -50,6 +55,90 @@ class MastodonClient:
 
     def home_uris(self) -> set[str]:
         return {s.get("uri") for s in self.get("/api/v1/timelines/home", limit=40)}
+
+
+# 再試行待ち / 予約に入っても、届いたかどうかの判定に関わらないジョブ。
+# 理由の欄には、どの経路で実際に入るかを書く。
+SIDEKIQ_IGNORED_CLASSES = {
+    # 受信したステータスを作った後、リンクのプレビューを取りに行くのを
+    # perform_in で遅らせて schedule に積む (Mastodon の
+    # FetchLinkCardService の呼び出し元)。ステータスは既に作られている。
+    "LinkCrawlWorker": "scheduled after a status is created, to fetch its link preview",
+}
+
+
+class SidekiqQueue:
+    """Mastodon's Sidekiq, read straight from its Redis.
+
+    Mastodon には Sidekiq のキューを読む API が無いので、Sidekiq が Redis に置く
+    鍵を読む (queues / queue:<名前> / processes と各プロセスの busy / retry /
+    schedule)。テスト用の image に Redis のクライアントを足さないよう、RESP を
+    ここで直接話す。
+    """
+
+    label = "Mastodon sidekiq"
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.descriptions: dict[str, str] = {}
+        # 除外した class のうち、実際に現れたもの。除外の一覧が古くなって
+        # いないかを、セッションの終わりに確かめる。
+        self.ignored_seen: set[str] = set()
+
+    def _call(self, *args: str):
+        with socket.create_connection((self.host, self.port), timeout=10) as sock:
+            out = f"*{len(args)}\r\n" + "".join(f"${len(a.encode())}\r\n{a}\r\n" for a in args)
+            sock.sendall(out.encode())
+            return self._read(sock.makefile("rb"))
+
+    def _read(self, f):
+        line = f.readline().rstrip(b"\r\n")
+        kind, rest = line[:1], line[1:]
+        if kind == b"+":
+            return rest.decode()
+        if kind == b"-":
+            raise RuntimeError(f"redis: {rest.decode()}")
+        if kind == b":":
+            return int(rest)
+        if kind == b"$":
+            n = int(rest)
+            if n < 0:
+                return None
+            data = f.read(n + 2)[:n]
+            return data.decode()
+        if kind == b"*":
+            n = int(rest)
+            return [] if n < 0 else [self._read(f) for _ in range(n)]
+        raise RuntimeError(f"redis: unexpected reply {line!r}")
+
+    def pending(self) -> int:
+        processes = self._call("SMEMBERS", "processes")
+        # 1 つも無ければ、鍵の名前が変わって何も読めていない。0 件を「空」と
+        # 取り違えないよう落とす。
+        if not processes:
+            raise AssertionError("Mastodon sidekiq: no process registered under 'processes'")
+        busy = sum(int(self._call("HGET", p, "busy") or 0) for p in processes)
+        queued = sum(int(self._call("LLEN", f"queue:{q}")) for q in self._call("SMEMBERS", "queues"))
+        return busy + queued
+
+    def retrying(self) -> frozenset[str]:
+        jids = set()
+        for key in ("retry", "schedule"):
+            for member in self._call("ZRANGE", key, "0", "-1"):
+                job = json.loads(member)
+                if job.get("class") in SIDEKIQ_IGNORED_CLASSES:
+                    self.ignored_seen.add(job["class"])
+                    continue
+                jid = str(job.get("jid"))
+                jids.add(jid)
+                self.descriptions[jid] = (
+                    f"{key}:{job.get('class')}({job.get('args')}) {job.get('error_class') or ''} {job.get('error_message') or ''}"
+                )
+        return frozenset(jids)
+
+    def describe(self, jid: str) -> str:
+        return self.descriptions.get(jid, jid)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -103,3 +192,12 @@ def mastodon_follows_alice(mkgo: MisskeyLikeClient, mastodon: MastodonClient) ->
         return bool(rels and rels[0].get("following"))
 
     poll_until(following, timeout=90, interval=3, desc="Elythia accepts alice's follow")
+
+
+@pytest.fixture(scope="session")
+def sidekiq(mastodon: MastodonClient):
+    q = SidekiqQueue(SIDEKIQ_REDIS_HOST, SIDEKIQ_REDIS_PORT)
+    poll_until(lambda: q._call("SCARD", "processes") > 0, timeout=120, interval=3, desc="sidekiq registers")
+    yield q
+    unused = set(SIDEKIQ_IGNORED_CLASSES) - q.ignored_seen
+    assert not unused, f"SIDEKIQ_IGNORED_CLASSES has entries never seen: {sorted(unused)}"
