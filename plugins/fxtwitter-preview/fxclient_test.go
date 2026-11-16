@@ -375,6 +375,44 @@ func TestFxClientReadsFacetIndicesAsCodePoints(t *testing.T) {
 	}
 }
 
+// original の無い応答では、文字単位とUTF-16の単位のうち、種類に合う形の範囲を採る。
+func TestFxClientResolvesFacetsWithoutOriginal(t *testing.T) {
+	cases := []struct {
+		name, facets, want, text string
+	}{
+		{name: "utf16 url", facets: `{"type":"url","indices":[3,17],"replacement":"https://example.com/a"}`, want: "😀 https://example.com/a more #tag"},
+		{name: "code point url", facets: `{"type":"url","indices":[2,16],"replacement":"https://example.com/a"}`, want: "😀 https://example.com/a more #tag"},
+		{name: "utf16 media", facets: `{"type":"media","indices":[3,17]}`, want: "😀 more #tag"},
+		{name: "code point media", facets: `{"type":"media","indices":[2,16]}`, want: "😀 more #tag"},
+		{name: "utf16 hashtag", facets: `{"type":"hashtag","indices":[23,27]}`, want: "😀 https://t.co/a more #tag"},
+		{name: "code point hashtag", facets: `{"type":"hashtag","indices":[22,26]}`, want: "😀 https://t.co/a more #tag"},
+		// どちらの候補も種類に合う形でないときは、これまでどおり UTF-16 の位置を使う。
+		{name: "unshaped media", text: "😀 pic more #tag", facets: `{"type":"media","indices":[3,6]}`, want: "😀 more #tag"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			text := "😀 https://t.co/a more #tag"
+			if tc.text != "" {
+				text = tc.text
+			}
+			body := []byte(`{"code":200,"status":{"id":"1234567890","text":"fallback","author":{"name":"Alice","screen_name":"alice"},"raw_text":{"text":"` + text + `","facets":[` + tc.facets + `]}}}`)
+			post, err := parseFxResponse(body, "1234567890")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if post.Text != tc.want {
+				t.Fatalf("visible text = %q, want %q", post.Text, tc.want)
+			}
+			if strings.HasPrefix(tc.name, "utf16 hashtag") || strings.HasPrefix(tc.name, "code point hashtag") {
+				encoded := utf16.Encode([]rune(post.Text))
+				if len(post.TextEntities) != 1 || string(utf16.Decode(encoded[post.TextEntities[0].Start:post.TextEntities[0].End])) != "#tag" {
+					t.Fatalf("entities = %#v", post.TextEntities)
+				}
+			}
+		})
+	}
+}
+
 func TestFxClientDecodesFacetOutputAfterRawUTF16Matching(t *testing.T) {
 	body := []byte(`{"code":200,"status":{"id":"1234567890","text":"fallback","author":{"name":"Alice","screen_name":"alice"},"raw_text":{"text":"😀 https://t.co/a &lt;ok&gt; #tag @bob","facets":[{"type":"url","indices":[3,17],"original":"https://t.co/a","replacement":"https://example.com/a?x=1&amp;y=2&amp;literal=&amp;lt;x&amp;gt;","display":"example.com/a"},{"type":"hashtag","indices":[29,33],"original":"#tag","replacement":"#tag","display":"#tag"},{"type":"mention","indices":[34,38],"original":"@bob","replacement":"@bob","display":"@bob"}]}}}`)
 	post, err := parseFxResponse(body, "1234567890")

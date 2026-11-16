@@ -330,20 +330,30 @@ func normalizedFxText(status fxStatus) (string, []PublicTextEntity) {
 	}
 	runeOffsets = append(runeOffsets, offset)
 	cursor := 0
-	resolve := func(start, end int, want string) (int, int, string, bool) {
+	resolve := func(start, end int, kind, want string) (int, int, string, bool) {
 		candidates := make([][2]int, 0, 2)
 		if start >= 0 && start <= end && end < len(runeOffsets) {
 			candidates = append(candidates, [2]int{runeOffsets[start], runeOffsets[end]})
 		}
 		candidates = append(candidates, [2]int{start, end})
+		valid := make([][2]int, 0, len(candidates))
 		for _, c := range candidates {
 			if c[0] < cursor || c[0] < 0 || c[1] <= c[0] || c[1] > len(encoded) {
 				continue
 			}
+			valid = append(valid, c)
+		}
+		for _, c := range valid {
 			original := string(utf16.Decode(encoded[c[0]:c[1]]))
-			if want == "" || want == original {
+			// original が無い応答では一致を確かめられないので、種類に合う形 (URL なら http で
+			// 始まる、など) の候補を採る。どちらも合わなければ、これまでどおり UTF-16 の位置を使う。
+			if want == original || (want == "" && facetLooksLike(kind, original)) {
 				return c[0], c[1], original, true
 			}
+		}
+		if want == "" && len(valid) > 0 {
+			c := valid[len(valid)-1]
+			return c[0], c[1], string(utf16.Decode(encoded[c[0]:c[1]])), true
 		}
 		return 0, 0, "", false
 	}
@@ -351,7 +361,7 @@ func normalizedFxText(status fxStatus) (string, []PublicTextEntity) {
 		if len(facet.Indices) != 2 {
 			continue
 		}
-		start, end, original, ok := resolve(facet.Indices[0], facet.Indices[1], facet.Original)
+		start, end, original, ok := resolve(facet.Indices[0], facet.Indices[1], facet.Type, facet.Original)
 		if !ok {
 			continue
 		}
@@ -404,6 +414,20 @@ func normalizedFxText(status fxStatus) (string, []PublicTextEntity) {
 	}
 	appendVisibleUnits(encoded[cursor:])
 	return string(utf16.Decode(output)), entities
+}
+
+// facetLooksLike は、original の無い範囲が、その種類の範囲として自然な形かを見る。
+func facetLooksLike(kind, value string) bool {
+	switch kind {
+	case "url", "media":
+		return strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://")
+	case "hashtag":
+		return strings.HasPrefix(value, "#") || strings.HasPrefix(value, "＃")
+	case "mention":
+		return strings.HasPrefix(value, "@") || strings.HasPrefix(value, "＠")
+	default:
+		return false
+	}
 }
 
 func fillPublicMedia(createdAt *string, images *[]PublicImage, hasVideo *bool, publicVideo **PublicVideo, publicVideos *[]PublicVideoMetadata, privateSources *[]privateVideoSource, status fxStatus) {
