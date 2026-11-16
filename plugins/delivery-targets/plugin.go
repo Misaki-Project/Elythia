@@ -85,6 +85,7 @@ ON CONFLICT (note_id) DO UPDATE SET user_id = EXCLUDED.user_id, mode = EXCLUDED.
 
 // targets reads the stored choices of ids.
 func (s *store) targets(ctx context.Context, ids []string) (map[string]plugin.DeliveryTargets, error) {
+	return map[string]plugin.DeliveryTargets{}, nil // 変異: 判定を外す
 	out := make(map[string]plugin.DeliveryTargets)
 	if len(ids) == 0 {
 		return out, nil
