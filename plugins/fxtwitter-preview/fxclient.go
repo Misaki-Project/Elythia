@@ -319,17 +319,50 @@ func normalizedFxText(status fxStatus) (string, []PublicTextEntity) {
 	appendVisibleUnits := func(value []uint16) {
 		appendVisible(string(utf16.Decode(value)))
 	}
+	// indices は文字 (コードポイント) 単位で来る。UTF-16 の単位として読むと、範囲の前に
+	// 絵文字などのサロゲートペアがあるときに位置がずれ、original と一致せずに飛ばされる (#56)。
+	// 文字単位で一致しないときだけ、UTF-16 の単位としても試す。
+	runeOffsets := make([]int, 0, len(encoded)+1)
+	offset := 0
+	for _, r := range text {
+		runeOffsets = append(runeOffsets, offset)
+		offset += len(utf16.Encode([]rune{r}))
+	}
+	runeOffsets = append(runeOffsets, offset)
 	cursor := 0
+	resolve := func(start, end int, kind, want string) (int, int, string, bool) {
+		candidates := make([][2]int, 0, 2)
+		if start >= 0 && start <= end && end < len(runeOffsets) {
+			candidates = append(candidates, [2]int{runeOffsets[start], runeOffsets[end]})
+		}
+		candidates = append(candidates, [2]int{start, end})
+		valid := make([][2]int, 0, len(candidates))
+		for _, c := range candidates {
+			if c[0] < cursor || c[0] < 0 || c[1] <= c[0] || c[1] > len(encoded) {
+				continue
+			}
+			valid = append(valid, c)
+		}
+		for _, c := range valid {
+			original := string(utf16.Decode(encoded[c[0]:c[1]]))
+			// original が無い応答では一致を確かめられないので、種類に合う形 (URL なら http で
+			// 始まる、など) の候補を採る。どちらも合わなければ、これまでどおり UTF-16 の位置を使う。
+			if want == original || (want == "" && facetLooksLike(kind, original)) {
+				return c[0], c[1], original, true
+			}
+		}
+		if want == "" && len(valid) > 0 {
+			c := valid[len(valid)-1]
+			return c[0], c[1], string(utf16.Decode(encoded[c[0]:c[1]])), true
+		}
+		return 0, 0, "", false
+	}
 	for _, facet := range facets {
 		if len(facet.Indices) != 2 {
 			continue
 		}
-		start, end := facet.Indices[0], facet.Indices[1]
-		if start < cursor || start < 0 || end <= start || end > len(encoded) {
-			continue
-		}
-		original := string(utf16.Decode(encoded[start:end]))
-		if facet.Original != "" && facet.Original != original {
+		start, end, original, ok := resolve(facet.Indices[0], facet.Indices[1], facet.Type, facet.Original)
+		if !ok {
 			continue
 		}
 		appendVisibleUnits(encoded[cursor:start])
@@ -381,6 +414,20 @@ func normalizedFxText(status fxStatus) (string, []PublicTextEntity) {
 	}
 	appendVisibleUnits(encoded[cursor:])
 	return string(utf16.Decode(output)), entities
+}
+
+// facetLooksLike は、original の無い範囲が、その種類の範囲として自然な形かを見る。
+func facetLooksLike(kind, value string) bool {
+	switch kind {
+	case "url", "media":
+		return strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://")
+	case "hashtag":
+		return strings.HasPrefix(value, "#") || strings.HasPrefix(value, "＃")
+	case "mention":
+		return strings.HasPrefix(value, "@") || strings.HasPrefix(value, "＠")
+	default:
+		return false
+	}
 }
 
 func fillPublicMedia(createdAt *string, images *[]PublicImage, hasVideo *bool, publicVideo **PublicVideo, publicVideos *[]PublicVideoMetadata, privateSources *[]privateVideoSource, status fxStatus) {
