@@ -187,3 +187,14 @@ func TestNormalizeHost(t *testing.T) {
 	_, err := NormalizeHost(long)
 	assert.Error(t, err)
 }
+
+func TestAvailableRoute(t *testing.T) {
+	handlers := plugintest.New(t).WithName(Name).Routes(Plugin)
+	got, err := handlers.Call(t, "POST /available", plugintest.Request{UserID: "u1"})
+	if err != nil {
+		t.Fatalf("POST /available: %v", err)
+	}
+	if m, ok := got.(map[string]bool); !ok || !m["available"] {
+		t.Fatalf("POST /available = %#v, want available: true", got)
+	}
+}

@@ -12,6 +12,26 @@ export function initApi(fn: Api): void {
 	call = fn;
 }
 
+/** How long to wait for the backend before leaving the button out. */
+export const AVAILABLE_TIMEOUT_MS = 5000;
+
+/**
+ * Reports whether this plugin's backend is running on the server.
+ *
+ * 運営者が設定でバックエンドを止めても、frontend はビルドに含まれたまま読み込ま
+ * れる。止まっていればルートも無いので、答えが返らなければボタンを出さない。
+ * 起動を待たせ続けないよう、時間を区切る。未ログインでも失敗するが、投稿できない
+ * のでボタンは要らない。
+ */
+export async function isAvailable(api: Api, timeoutMs = AVAILABLE_TIMEOUT_MS): Promise<boolean> {
+	try {
+		const res = await api<{ available?: unknown }>('plugin/delivery-targets/available', {}, { signal: AbortSignal.timeout(timeoutMs) });
+		return res?.available === true;
+	} catch {
+		return false;
+	}
+}
+
 type Instance = { host: string };
 
 /**

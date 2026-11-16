@@ -42,12 +42,27 @@ var Plugin = plugin.Definition{
 )`,
 	}},
 	NoteDelivery: noteDelivery,
+	Routes:       routes,
 }
 
 // Option is what the post form sends as pluginOptions["delivery-targets"].
 type Option struct {
 	Mode  string   `json:"mode"`
 	Hosts []string `json:"hosts"`
+}
+
+// routes registers POST /available, which the frontend asks before showing
+// its button.
+//
+// 設定の enabled: false でバックエンドを止めても、frontend はビルドに含まれた
+// まま読み込まれる。そのままボタンを出すと、選んで投稿したときに notes/create
+// が pluginOptions を受け取る相手がおらず INVALID_PARAM になる。プラグインが
+// 止まっていればこのルートも登録されないので、答えたときだけボタンを出す。
+func routes(_ plugin.Context, r plugin.Router) error {
+	r.POST("/available", func(plugin.Request) (any, error) {
+		return map[string]bool{"available": true}, nil
+	})
+	return nil
 }
 
 func noteDelivery(ctx plugin.Context) (plugin.NoteDeliveryRegistration, error) {
