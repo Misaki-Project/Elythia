@@ -7,6 +7,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/vue';
 import { defineComponent, nextTick, ref } from 'vue';
 import { preferReactive, preferState } from '../../../frontend/packages/frontend/test/setup.unit.js';
 import AdminPage from './AdminPage.vue';
+import FxVideoPreview from './FxVideoPreview.vue';
 import plugin, { FxPreview, initApi, loadPreview, provider, statusID } from './index.js';
 import type { PreviewResponse, PublicPost } from './api.js';
 import type { PluginHost, PreviewContext, PreviewInput, PreviewProvider } from '@/plugin-api.js';
@@ -639,6 +640,51 @@ test.each([
 	expect(viewer).not.toHaveBeenCalled();
 	expect(view.getByText('Xで投稿を開く').getAttribute('href')).toBe('https://x.com/i/status/1234567890');
 });
+const posterPath = '/api/plugin/fxtwitter-preview/media/1234567890/poster/0?noteId=note-1';
+const imagePath = (index: number) => `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1`;
+
+test.each([
+	{ images: 2, videos: 1, layout: '3' },
+	{ images: 3, videos: 1, layout: '4' },
+	{ images: 1, videos: 2, layout: '3' },
+])('images and videos share one grid ($images images, $videos videos)', async ({ images, videos, layout }) => {
+	const response = data();
+	response.post.images = Array.from({ length: images }, (_, index) => ({ url: imagePath(index) }));
+	response.post.videos = Array.from({ length: videos }, () => videoDescriptor());
+	response.post.isSensitive = true;
+	const view = card(response);
+	await waitFor(() => expect(view.container.querySelectorAll('[data-fx-media-grid]')).toHaveLength(1));
+	const grid = must(view.container.querySelector('[data-fx-media-grid]'));
+	expect(grid.getAttribute('data-media-count')).toBe(layout);
+	expect(grid.querySelectorAll('[data-fx-video-tile] [data-fx-video-target="main"]')).toHaveLength(videos);
+	expect(view.container.querySelectorAll('[data-sensitive-media-reveal]')).toHaveLength(1);
+	await fireEvent.click(must(view.container.querySelector('[data-sensitive-media-reveal]')));
+	await waitFor(() => expect(view.container.querySelectorAll<HTMLButtonElement>('[data-fx-video-play]:not([disabled])')).toHaveLength(videos));
+});
+
+test('a single video uses the 16:9 grid and shows the play icon with its duration', async () => {
+	const response = data();
+	response.post.images = [];
+	response.post.videos = [videoDescriptor()];
+	const view = card(response);
+	const grid = must(await waitFor(() => view.container.querySelector<HTMLElement>('[data-fx-media-grid]')));
+	expect(grid.getAttribute('data-media-count')).toBe('1');
+	expect(grid.style.getPropertyValue('--fx-single-aspect')).toBe('');
+	const pill = must(view.container.querySelector('[data-fx-video-play] [data-fx-video-play-pill]'));
+	expect(pill.firstElementChild?.className).toBe('ti ti-player-play');
+	expect(pill.lastElementChild?.textContent).toBe('1:05');
+});
+
+test('the poster starts loading as soon as the grid reveals the video', async () => {
+	const props = { video: { ...videoDescriptor(), posterUrl: posterPath }, index: 0, cachePostId: '1234567890', contentPostId: '1234567890', target: 'main' as const, context, revealed: false };
+	const view = render(FxVideoPreview, { props, global: globals });
+	await flushPreview();
+	expect(prepareCalls('poster')).toHaveLength(0);
+	await view.rerender({ ...props, revealed: true });
+	await waitFor(() => expect(prepareCalls('poster')).toHaveLength(1));
+	await waitFor(() => expect(view.container.querySelector('[data-fx-video-play] img')?.getAttribute('src')).toMatch(/^blob:/));
+});
+
 test('unsupported external video has no playback or source link', async () => {
 	const response = data(); response.post.videos = []; response.post.video = { provider: 'external' };
 	const view = card(response); await nextTick(); await nextTick();
