@@ -42,3 +42,23 @@
 - **shared inboxを共有するサーバーには、外しても届くことがあります。** 許すサーバーと外したサーバーの利用者が同じshared inboxを使っていると、そのinboxへは送ります (送らなければ許したサーバーにも届かないため)
 - CherryPickから移行したDBの`note."deliveryTargets"`列は読みません。移行前のノートの指定は引き継がれません
 - 削除 (`Delete`) は絞りません。中身を持たず、届いていないサーバーでは何も起きないためです
+
+## 実連合のe2e
+
+`e2e/`に、本物のMisskeyとMastodonを相手に、指定どおりに配送と照会が止まるかを確かめるテストがあります(#52)。`tests/federation/`のスタックに重ね、プラグイン入りのElythiaで回します。Actionsでは`misaki-delivery-targets-e2e`が、プラグインや本体の配送・照会のコードを変えたPRと手動のときに回します。
+
+```bash
+# 前提: frontend/built がある (pnpm build 済み)。Dockerが要る
+plugins/delivery-targets/e2e/run.sh misskey
+plugins/delivery-targets/e2e/run.sh mastodon
+```
+
+| 指定 | 相手のフォロワーへの配送 | 相手のサーバーからの照会 | 署名の無い照会 |
+|---|---|---|---|
+| 指定なし | 届く | 見える | 見える |
+| includeに相手を入れる | 届く | 見える | 見えない |
+| includeに別のサーバーだけを入れる | 届かない | 見えない | 見えない |
+| excludeに相手を入れる | 届かない | 見えない | 見える |
+| excludeに別のサーバーだけを入れる | 届く | 見える | 見える |
+
+「届かない」は、後から投稿した絞っていないノートが相手に着き、Elythiaの配送のキューが空になった後も、相手のタイムラインに出ないことで判定します。
