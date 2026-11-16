@@ -685,6 +685,27 @@ test('the poster starts loading as soon as the grid reveals the video', async ()
 	await waitFor(() => expect(view.container.querySelector('[data-fx-video-play] img')?.getAttribute('src')).toMatch(/^blob:/));
 });
 
+test.each([
+	{ code: 'VIDEO_REMOVED_DMCA', text: '著作権の申し立てにより、Xで削除された動画です。', retry: false },
+	{ code: 'VIDEO_SOURCE_FORBIDDEN', text: 'Xが動画の配信を拒否しました。', retry: false },
+	{ code: 'VIDEO_SOURCE_GONE', text: 'Xで削除された動画です。', retry: false },
+	{ code: 'VIDEO_TOO_LARGE', text: 'アプリ内で再生できる大きさを超えています。', retry: false },
+	{ code: 'VIDEO_SOURCE_TIMEOUT', text: 'Xからの応答が時間内にありませんでした。時間をおいて再試行してください。', retry: true },
+	{ code: 'VIDEO_SOURCE_FAILED', text: 'Xから動画を取得できませんでした。時間をおいて再試行してください。', retry: true },
+	{ code: 'SOMETHING_ELSE', text: '動画を読み込めませんでした。', retry: true },
+])('video playback failure $code explains the cause', async ({ code, text, retry }) => {
+	api.mockImplementation(async (path: string) => {
+		if (path.endsWith('/media/prepare')) throw Object.assign(new Error('video unavailable'), { status: 404, code });
+		return data();
+	});
+	const view = card(data());
+	await fireEvent.click(must(await view.findByRole('button', { name: '動画を再生' })));
+	const status = must(await waitFor(() => must(view.container.querySelector('[data-fx-video-target="main"] [role="status"]'))));
+	expect(status.textContent).toBe(text);
+	expect(status.getAttribute('data-fx-video-error')).toBe(code);
+	expect(view.queryByRole('button', { name: '再試行' }) != null).toBe(retry);
+});
+
 test('unsupported external video has no playback or source link', async () => {
 	const response = data(); response.post.videos = []; response.post.video = { provider: 'external' };
 	const view = card(response); await nextTick(); await nextTick();

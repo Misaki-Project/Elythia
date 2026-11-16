@@ -23,7 +23,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</span>
 	</button>
 	<figcaption v-if="state === 'error'" :class="$style.details">
-		<span :class="$style.status" role="status">{{ terminalError ? '動画へのアクセスが許可されていません。' : '動画を読み込めませんでした。' }}</span>
+		<span :class="$style.status" role="status" :data-fx-video-error="errorCode ?? undefined">{{ errorMessage }}</span>
 		<a v-if="state === 'error' && postHref" :class="$style.sourceLink" :href="postHref" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ sourceLinkLabel }}</a>
 		<button v-if="state === 'error' && !terminalError" type="button" class="_button" :class="$style.retry" @click.stop="play">再試行</button>
 	</figcaption>
@@ -55,6 +55,23 @@ const MAX_VIDEO_BYTES = 64 * 1024 * 1024;
 const posterSrc = ref<string | null>(null);
 const state = ref<'idle' | 'loading' | 'error'>('idle');
 const terminalError = ref(false);
+const errorCode = ref<string | null>(null);
+
+// サーバーが video.twimg.com から動画を取れなかった原因 (#57)。terminal は、再試行しても直らないもの。
+const sourceErrors: Record<string, { message: string; terminal: boolean }> = {
+	VIDEO_REMOVED_DMCA: { message: '著作権の申し立てにより、Xで削除された動画です。', terminal: true },
+	VIDEO_SOURCE_FORBIDDEN: { message: 'Xが動画の配信を拒否しました。', terminal: true },
+	VIDEO_SOURCE_GONE: { message: 'Xで削除された動画です。', terminal: true },
+	VIDEO_SOURCE_TIMEOUT: { message: 'Xからの応答が時間内にありませんでした。時間をおいて再試行してください。', terminal: false },
+	VIDEO_SOURCE_FAILED: { message: 'Xから動画を取得できませんでした。時間をおいて再試行してください。', terminal: false },
+	VIDEO_TOO_LARGE: { message: 'アプリ内で再生できる大きさを超えています。', terminal: true },
+};
+
+const errorMessage = computed(() => {
+	const known = errorCode.value != null ? sourceErrors[errorCode.value] as { message: string } | undefined : undefined;
+	if (known) return known.message;
+	return terminalError.value ? '動画へのアクセスが許可されていません。' : '動画を読み込めませんでした。';
+});
 const activeVideo = ref(props.video);
 let posterController: AbortController | null = null;
 let playbackController: AbortController | null = null;
@@ -147,6 +164,7 @@ async function play(): Promise<void> {
 	const noteId = sourceNoteId.value;
 	if (!canPlay.value || noteId == null || activeVideo.value.playbackUrl == null || state.value === 'loading' || terminalError.value) return;
 	const refreshDescriptor = state.value === 'error';
+	errorCode.value = null;
 	const current = ++generation;
 	const controller = new AbortController();
 	playbackController = controller;
@@ -190,7 +208,10 @@ async function play(): Promise<void> {
 		if (current === generation) state.value = 'idle';
 	} catch (error) {
 		if (current === generation && !controller.signal.aborted) {
-			terminalError.value = isHttpForbidden(error);
+			const code = (error as { code?: unknown } | null)?.code;
+			errorCode.value = typeof code === 'string' ? code : null;
+			const known = errorCode.value != null ? sourceErrors[errorCode.value] as { terminal: boolean } | undefined : undefined;
+			terminalError.value = isHttpForbidden(error) || known?.terminal === true;
 			state.value = 'error';
 		}
 	} finally {
@@ -220,6 +241,7 @@ watch(apiSession, () => { revokePoster(); stopPlayback(); });
 watch(() => [props.video, props.index, props.cachePostId, props.contentPostId, props.target, sourceNoteId.value], () => {
 	activeVideo.value = props.video;
 	terminalError.value = false;
+	errorCode.value = null;
 	state.value = 'idle';
 	revokePoster();
 	stopPlayback();

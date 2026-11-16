@@ -11,7 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -250,11 +253,11 @@ func fetchVideoWithAdmission(ctx context.Context, base *http.Client, rawURL stri
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return plugin.Blob{}, nil, err
+		return plugin.Blob{}, nil, classifyNativeVideoTransportError(err)
 	}
 	defer res.Body.Close() //nolint:errcheck
 	if res.StatusCode != http.StatusOK {
-		return plugin.Blob{}, nil, fmt.Errorf("video status %d", res.StatusCode)
+		return plugin.Blob{}, nil, classifyNativeVideoStatus(res)
 	}
 	contentType, _, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
 	if err != nil || contentType != "video/mp4" {
@@ -336,3 +339,70 @@ var processNativeVideoAdmission = newMediaAdmission(2, 8, (64<<20)+2)
 var processNativeVideoRequestGate = newMediaRequestGate(8, 0, 0, (64<<20)+2)
 var processNativeVideoLimiter = newVideoProxyLimiter(nativeVideoUserPerMinute, nativeVideoGlobalPerMinute)
 var errNativeVideoTooLarge = errors.New("video response exceeds the 32 MiB playback limit")
+
+// nativeVideoSourceError は、video.twimg.com から動画を取れなかった原因を表す (#57)。
+// 利用者に見せる文言と、再試行しても直らないかどうかを、原因ごとに分けるために使う。
+type nativeVideoSourceError struct {
+	Reason string // dmca / forbidden / gone / timeout / failed
+	Status int    // video.twimg.com の状態コード。応答が無かったときは 0
+}
+
+func (e *nativeVideoSourceError) Error() string {
+	return fmt.Sprintf("video source %s (status %d)", e.Reason, e.Status)
+}
+
+const nativeVideoErrorBodyLimit = 4 << 10
+
+func classifyNativeVideoStatus(res *http.Response) error {
+	switch res.StatusCode {
+	case http.StatusForbidden:
+		// 著作権の申し立てで削除された動画は 403 {"error_code":2,"error_response":"Dmcaed"} を返す。
+		var body struct {
+			ErrorResponse string `json:"error_response"`
+		}
+		raw, _ := io.ReadAll(io.LimitReader(res.Body, nativeVideoErrorBodyLimit))
+		if json.Unmarshal(raw, &body) == nil && strings.EqualFold(body.ErrorResponse, "Dmcaed") {
+			return &nativeVideoSourceError{Reason: "dmca", Status: res.StatusCode}
+		}
+		return &nativeVideoSourceError{Reason: "forbidden", Status: res.StatusCode}
+	case http.StatusNotFound, http.StatusGone:
+		return &nativeVideoSourceError{Reason: "gone", Status: res.StatusCode}
+	default:
+		return &nativeVideoSourceError{Reason: "failed", Status: res.StatusCode}
+	}
+}
+
+func classifyNativeVideoTransportError(err error) error {
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return &nativeVideoSourceError{Reason: "timeout"}
+	}
+	return &nativeVideoSourceError{Reason: "failed"}
+}
+
+// nativeVideoUnavailable は、動画を取れなかった原因を、利用者に返すエラーに変えて記録する。
+// 状態コードはどの原因でも、これまでどおり 404 にし、原因はエラーコードで分ける。
+func nativeVideoUnavailable(logger *slog.Logger, postID string, err error) error {
+	// 大きさの上限超えは、どの経路でも同じコードで返す。画面はこれを見て再試行のボタンを出さない。
+	if errors.Is(err, errNativeVideoTooLarge) {
+		return plugin.NewCodedStatusError(http.StatusRequestEntityTooLarge, "video exceeds the in-app playback limit", "VIDEO_TOO_LARGE")
+	}
+	var source *nativeVideoSourceError
+	if !errors.As(err, &source) {
+		logger.Warn("Fx video unavailable", "postId", postID, "reason", "invalid", "err", err)
+		return plugin.ErrNotFound("video unavailable")
+	}
+	logger.Warn("Fx video unavailable", "postId", postID, "reason", source.Reason, "status", source.Status)
+	switch source.Reason {
+	case "dmca":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "video was removed on X in response to a copyright claim", "VIDEO_REMOVED_DMCA")
+	case "forbidden":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "X refused to serve the video", "VIDEO_SOURCE_FORBIDDEN")
+	case "gone":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "video was deleted on X", "VIDEO_SOURCE_GONE")
+	case "timeout":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "X did not answer in time", "VIDEO_SOURCE_TIMEOUT")
+	default:
+		return plugin.NewCodedStatusError(http.StatusNotFound, "video could not be fetched from X", "VIDEO_SOURCE_FAILED")
+	}
+}
