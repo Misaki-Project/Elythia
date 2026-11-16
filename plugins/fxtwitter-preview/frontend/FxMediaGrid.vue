@@ -4,12 +4,13 @@ SPDX-License-Identifier: AGPL-3.0-only
 -->
 
 <template>
-<MkSensitiveMediaGuard v-model:revealed="revealed" :isSensitive="isSensitive" kind="image">
+<MkSensitiveMediaGuard v-model:revealed="revealed" :isSensitive="isSensitive" :kind="images.length === 0 ? 'video' : 'image'">
 	<div
 		data-fx-media-grid
 		:data-layout="isManyImages ? 'many' : undefined"
 		:data-image-count="images.length"
-		:class="[$style.mediaGrid, { [$style.singleImage]: images.length === 1, [$style.threeImages]: images.length === 3, [$style.fourImages]: images.length === 4, [$style.manyImages]: isManyImages }]"
+		:data-media-count="mediaCount"
+		:class="[$style.mediaGrid, { [$style.singleImage]: mediaCount === 1, [$style.threeImages]: mediaCount === 3, [$style.fourImages]: mediaCount === 4, [$style.manyImages]: isManyImages }]"
 		:style="singleImageStyle"
 	>
 		<button
@@ -29,6 +30,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 			</span>
 			<span v-if="visibleIndex === 5 && overflowCount > 0" :class="$style.overflowOverlay" data-photo-overflow aria-hidden="true">+{{ overflowCount }}</span>
 		</button>
+		<div v-for="videoIndex in visibleVideoIndexes" :key="`video:${videoIndex}`" :class="$style.mediaTile" data-fx-video-tile>
+			<slot name="video" :index="videoIndex" :revealed="revealed"></slot>
+		</div>
 	</div>
 </MkSensitiveMediaGuard>
 </template>
@@ -48,12 +52,18 @@ export type FxRenderedImage = {
 
 const props = defineProps<{
 	images: FxRenderedImage[];
+	// 画像の後ろに並べる動画の数。動画のタイルは video のスロットで描く。
+	videoCount?: number;
 	isSensitive?: boolean;
 }>();
 
-const isManyImages = computed(() => props.images.length > 4);
-const visibleImages = computed(() => isManyImages.value ? props.images.slice(0, 6) : props.images);
-const overflowCount = computed(() => Math.max(0, props.images.length - 6));
+// 画像と動画を合わせた数で配置を決める。6枚目までを並べ、残りは6枚目に「+n」を出す。
+const MAX_VISIBLE = 6;
+const mediaCount = computed(() => props.images.length + (props.videoCount ?? 0));
+const isManyImages = computed(() => mediaCount.value > 4);
+const visibleImages = computed(() => props.images.slice(0, MAX_VISIBLE));
+const visibleVideoIndexes = computed(() => Array.from({ length: Math.max(0, Math.min(props.videoCount ?? 0, MAX_VISIBLE - visibleImages.value.length)) }, (_, index) => index));
+const overflowCount = computed(() => Math.max(0, mediaCount.value - MAX_VISIBLE));
 
 defineEmits<{
 	(ev: 'open', index: number): void;
@@ -61,7 +71,7 @@ defineEmits<{
 
 const revealed = defineModel<boolean>('revealed', { default: false });
 const singleImageStyle = computed<Record<string, string> | undefined>(() => {
-	const image = props.images.length === 1 ? props.images[0] : null;
+	const image = mediaCount.value === 1 && props.images.length === 1 ? props.images[0] : null;
 	if (image == null) return undefined;
 	const natural = image.width != null && image.height != null && image.width > 0 && image.height > 0 ? image.width / image.height : 16 / 9;
 	// 縦長の画像は1:1までにする。横長は元の比で、極端なものだけ16:9に戻す。
@@ -152,15 +162,15 @@ const singleImageStyle = computed<Record<string, string> | undefined>(() => {
 	aspect-ratio: auto;
 }
 
-.manyImages[data-image-count='5'] {
+.manyImages[data-media-count='5'] {
 	grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
-.manyImages[data-image-count='5'] .mediaTile:nth-child(-n + 2) {
+.manyImages[data-media-count='5'] .mediaTile:nth-child(-n + 2) {
 	grid-column: span 3;
 }
 
-.manyImages[data-image-count='5'] .mediaTile:nth-child(n + 3) {
+.manyImages[data-media-count='5'] .mediaTile:nth-child(n + 3) {
 	grid-column: span 2;
 }
 

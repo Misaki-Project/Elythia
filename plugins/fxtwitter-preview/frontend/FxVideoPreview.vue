@@ -3,31 +3,31 @@ SPDX-FileCopyrightText: syuilo and misskey-project
 SPDX-License-Identifier: AGPL-3.0-only
 -->
 <template>
-<MkSensitiveMediaGuard v-model:revealed="revealed" :isSensitive="isSensitive" kind="video">
-	<figure :class="$style.video" :data-fx-video-target="target" :data-video-index="index">
-		<button
-			type="button"
-			class="_button"
-			:class="$style.posterButton"
-			data-fx-video-play
-			:disabled="!canPlay || state === 'loading'"
-			:aria-label="state === 'loading' ? '動画を準備しています' : '動画を再生'"
-			@click.stop="play"
-		>
-			<img v-if="posterSrc" :class="$style.poster" :src="posterSrc" alt="" loading="lazy">
-			<span v-else :class="$style.posterPlaceholder" aria-hidden="true"><i class="ti ti-video"></i></span>
-			<span :class="$style.playIcon" aria-hidden="true"><i :class="state === 'loading' ? 'ti ti-loader-2' : 'ti ti-player-play-filled'"></i></span>
-		</button>
-		<figcaption :class="$style.details">
-			<span v-if="durationLabel" :class="$style.duration">{{ durationLabel }}</span>
-			<span v-else :class="$style.duration">動画 {{ index + 1 }}</span>
-			<span v-if="state === 'loading'" :class="$style.status">準備中…</span>
-			<span v-else-if="state === 'error'" :class="$style.status" role="status">{{ terminalError ? '動画へのアクセスが許可されていません。' : '動画を読み込めませんでした。' }}</span>
-			<a v-if="state === 'error' && postHref" :class="$style.sourceLink" :href="postHref" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ sourceLinkLabel }}</a>
-			<button v-if="state === 'error' && !terminalError" type="button" class="_button" :class="$style.retry" @click.stop="play">再試行</button>
-		</figcaption>
-	</figure>
-</MkSensitiveMediaGuard>
+<figure :class="$style.video" :data-fx-video-target="target" :data-video-index="index">
+	<button
+		type="button"
+		class="_button"
+		:class="$style.posterButton"
+		data-fx-video-play
+		:disabled="!canPlay || state === 'loading'"
+		:aria-label="state === 'loading' ? '動画を準備しています' : '動画を再生'"
+		@click.stop="play"
+	>
+		<img v-if="posterSrc" :class="$style.poster" :src="posterSrc" alt="" loading="lazy">
+		<span v-else :class="$style.posterPlaceholder" aria-hidden="true"><i class="ti ti-video"></i></span>
+		<span :class="$style.playOverlay" aria-hidden="true">
+			<span :class="$style.playPill" data-fx-video-play-pill>
+				<i :class="state === 'loading' ? 'ti ti-loader-2' : 'ti ti-player-play'"></i>
+				<span v-if="durationLabel" data-fx-video-duration>{{ durationLabel }}</span>
+			</span>
+		</span>
+	</button>
+	<figcaption v-if="state === 'error'" :class="$style.details">
+		<span :class="$style.status" role="status">{{ terminalError ? '動画へのアクセスが許可されていません。' : '動画を読み込めませんでした。' }}</span>
+		<a v-if="state === 'error' && postHref" :class="$style.sourceLink" :href="postHref" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ sourceLinkLabel }}</a>
+		<button v-if="state === 'error' && !terminalError" type="button" class="_button" :class="$style.retry" @click.stop="play">再試行</button>
+	</figcaption>
+</figure>
 </template>
 
 <script lang="ts" setup>
@@ -36,7 +36,6 @@ import { api, apiSession, fetchPluginResource, openPluginMedia } from './api.js'
 import type { PreviewContext, PluginMediaItem } from '@/plugin-api.js';
 import type { PublicVideo } from './api.js';
 import { loadPreview } from './preview-loader.js';
-import { MkSensitiveMediaGuard } from '@/plugin-api.js';
 import { fetchPreparedPublicBlob, isHttpForbidden, readBoundedMediaBlob } from './public-media.js';
 import type { PreparedPublicMedia } from './public-media.js';
 
@@ -48,10 +47,11 @@ const props = defineProps<{
 	target: 'main' | 'quote';
 	context: PreviewContext;
 	isSensitive?: boolean;
+	// センシティブの確認は、この動画を並べる格子 (FxMediaGrid) がまとめて行う。
+	revealed: boolean;
 }>();
 
 const MAX_VIDEO_BYTES = 64 * 1024 * 1024;
-const revealed = ref(false);
 const posterSrc = ref<string | null>(null);
 const state = ref<'idle' | 'loading' | 'error'>('idle');
 const terminalError = ref(false);
@@ -64,7 +64,7 @@ let generation = 0;
 const sourceNoteId = computed(() => props.context.source?.kind === 'note' ? props.context.source.noteId : null);
 const postHref = computed(() => /^[0-9]{2,20}$/.test(props.contentPostId) ? `https://x.com/i/status/${props.contentPostId}` : null);
 const sourceLinkLabel = computed(() => props.target === 'quote' ? 'Xで引用投稿を開く' : 'Xで投稿を開く');
-const canAccess = computed(() => props.context.revealed && props.context.active && revealed.value && sourceNoteId.value != null);
+const canAccess = computed(() => props.context.revealed && props.context.active && props.revealed && sourceNoteId.value != null);
 const canLoad = computed(() => canAccess.value && props.context.inViewport);
 const canPlay = computed(() => canLoad.value && activeVideo.value.provider === 'x' && activeVideo.value.playbackAvailable === true && activeVideo.value.playbackUrl != null);
 const durationLabel = computed(() => formatDuration(activeVideo.value.durationMs));
@@ -206,9 +206,11 @@ watch(canAccess, value => {
 		stopPlayback();
 	}
 });
+// 表示の可否は、格子のセンシティブの部品 (非同期で読み込まれる) が決めた後に確定する。
+// 確定した時点でサムネイルの取得を始めないと、最初の表示でサムネイルが出ない。
+watch(canLoad, value => { if (value) void loadPoster(); });
 watch(() => props.context.inViewport, value => {
-	if (value && canLoad.value) void loadPoster();
-	else if (!value) {
+	if (!value) {
 		posterController?.abort();
 		posterController = null;
 		stopPlayback();
@@ -232,16 +234,17 @@ onBeforeUnmount(() => {
 </script>
 
 <style lang="scss" module>
-.video { min-width: 0; margin: 0; padding: 0 10px 10px; }
-.posterButton { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border-radius: var(--MI-radius); background: var(--MI_THEME-bg); cursor: pointer; }
+.video { position: relative; width: 100%; height: 100%; min-width: 0; margin: 0; padding: 0; }
+.posterButton { position: relative; display: block; width: 100%; height: 100%; overflow: hidden; background: var(--MI_THEME-bg); cursor: pointer; }
 .posterButton:disabled { cursor: default; }
 .posterButton:focus-visible { outline: 3px solid var(--MI_THEME-accent); outline-offset: 2px; }
 .poster { display: block; width: 100%; height: 100%; object-fit: cover; object-position: center; }
 .posterPlaceholder { display: grid; width: 100%; height: 100%; place-items: center; color: var(--MI_THEME-fgTransparentWeak); font-size: 2em; }
-.playIcon { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font-size: 3em; text-shadow: 0 1px 8px rgb(0 0 0 / 65%); background: rgb(0 0 0 / 18%); }
-.details { display: flex; min-height: 2em; align-items: center; gap: 10px; padding-top: 5px; color: var(--MI_THEME-fgTransparentWeak); font-size: 0.82em; }
-.duration { flex: 0 0 auto; }
+.playOverlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgb(0 0 0 / 18%); }
+.playPill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; color: #fff; background: rgb(0 0 0 / 60%); font-size: 1.1em; font-variant-numeric: tabular-nums; }
+.playPill > i { font-size: 1.4em; }
+.details { position: absolute; right: 0; bottom: 0; left: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 6px 10px; color: #fff; background: rgb(0 0 0 / 65%); font-size: 0.82em; }
 .status { min-width: 0; overflow-wrap: anywhere; }
-.sourceLink { color: var(--MI_THEME-link); white-space: nowrap; }
-.retry { margin-inline-start: auto; color: var(--MI_THEME-accent); }
+.sourceLink { color: #fff; text-decoration: underline; white-space: nowrap; }
+.retry { margin-inline-start: auto; color: #fff; text-decoration: underline; }
 </style>

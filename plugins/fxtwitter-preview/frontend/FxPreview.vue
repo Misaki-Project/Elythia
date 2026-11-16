@@ -22,18 +22,21 @@ SPDX-License-Identifier: AGPL-3.0-only
 	<a v-if="textSummary.truncated && !context.detail" :class="$style.more" :href="noteHref ?? undefined">もっと見る</a>
 	<p v-if="data.stale" :class="$style.stale">一時的に取得できないため、前回取得した内容を表示しています。</p>
 	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
-	<FxMediaGrid v-if="showAttachmentMedia && renderedImages.length" :key="`images:${data.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :isSensitive="data.post.isSensitive" @open="openImage"/>
-	<FxVideoPreview
-		v-for="(video, index) in mainVideos"
-		:key="`video:${data.post.id}:${index}`"
-		:video="video"
-		:index="index"
-		:cachePostId="data.post.id"
-		:contentPostId="data.post.id"
-		target="main"
-		:context="context"
-		:isSensitive="data.post.isSensitive"
-	/>
+	<FxMediaGrid v-if="showAttachmentMedia && (renderedImages.length || mainVideos.length)" :key="`images:${data.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :videoCount="mainVideos.length" :isSensitive="data.post.isSensitive" @open="openImage">
+		<template #video="{ index, revealed }">
+			<FxVideoPreview
+				:key="`video:${data.post.id}:${index}`"
+				:video="mainVideos[index]"
+				:index="index"
+				:cachePostId="data.post.id"
+				:contentPostId="data.post.id"
+				target="main"
+				:context="context"
+				:isSensitive="data.post.isSensitive"
+				:revealed="revealed"
+			/>
+		</template>
+	</FxMediaGrid>
 	<MkTime v-if="postCreatedAt" data-fx-post-time="main" :class="$style.postTime" :time="postCreatedAt" mode="detail"/>
 	<p v-if="data.post.quoteUnavailableReason" :data-fx-quote-unavailable="data.post.quoteUnavailableReason">引用: {{ unavailableMessage(data.post.quoteUnavailableReason) }}</p>
 	<section
@@ -50,18 +53,21 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</header>
 		<p :class="$style.quoteText"><template v-for="segment in quoteTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template></p>
 		<p v-if="!showAttachmentMedia && quoteMediaSummary" :class="$style.quoteMediaSummary">引用: {{ quoteMediaSummary }}</p>
-		<FxMediaGrid v-if="showAttachmentMedia && renderedQuoteImages.length" :key="`quote-images:${data.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :isSensitive="data.post.quote.isSensitive" @open="openQuoteImage"/>
-		<FxVideoPreview
-			v-for="(video, index) in quoteVideos"
-			:key="`quote-video:${data.post.quote.id}:${index}`"
-			:video="video"
-			:index="index"
-			:cachePostId="data.post.id"
-			:contentPostId="data.post.quote.id"
-			target="quote"
-			:context="context"
-			:isSensitive="data.post.quote.isSensitive"
-		/>
+		<FxMediaGrid v-if="showAttachmentMedia && (renderedQuoteImages.length || quoteVideos.length)" :key="`quote-images:${data.post.quote.id}`" v-model:revealed="quoteImagesRevealed" :images="renderedQuoteImages" :videoCount="quoteVideos.length" :isSensitive="data.post.quote.isSensitive" @open="openQuoteImage">
+			<template #video="{ index, revealed }">
+				<FxVideoPreview
+					:key="`quote-video:${data.post.quote.id}:${index}`"
+					:video="quoteVideos[index]"
+					:index="index"
+					:cachePostId="data.post.id"
+					:contentPostId="data.post.quote.id"
+					target="quote"
+					:context="context"
+					:isSensitive="data.post.quote.isSensitive"
+					:revealed="revealed"
+				/>
+			</template>
+		</FxMediaGrid>
 		<MkTime v-if="quoteCreatedAt" data-fx-post-time="quote" :class="$style.postTime" :time="quoteCreatedAt" mode="detail"/>
 	</section>
 	<div v-if="mediaLoadFailed" :class="$style.mediaError" role="status">
