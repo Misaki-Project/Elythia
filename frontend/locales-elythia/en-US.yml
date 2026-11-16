@@ -1115,3 +1115,4 @@ _settings:
   fxTwitterPreviewTimelineAutoOpen: "Open automatically in timelines"
   fxTwitterPreviewTimelineAutoOpenDescription: "When off, previews in timelines open only after you press the button. Note details are not affected."
 pluginNoteOptionsCannotBeDrafted: "Plugin options cannot be saved to drafts or scheduled posts. Clear the options before saving, or post without scheduling."
+pluginNoteOptionsDroppedFromDraft: "Some plugin options in the unfinished post are no longer available and were removed. Check the options before posting."
