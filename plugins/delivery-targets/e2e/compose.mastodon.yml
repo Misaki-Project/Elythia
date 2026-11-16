@@ -8,3 +8,6 @@ services:
     volumes:
       - ../../plugins/delivery-targets/e2e:/dt:ro
     working_dir: /dt/mastodon
+    # tests/federation の image は pytest -x で最初の失敗で止まる。ここでは
+    # 指定ごとに独立した判定なので、壊れた指定を一度に全部出すため -x を外す
+    command: ["pytest", "-vs", "--tb=short"]
