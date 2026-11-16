@@ -1114,4 +1114,4 @@ _settings:
   fxTwitterPreviewModeMedia: "Media (default)"
   fxTwitterPreviewTimelineAutoOpen: "Open automatically in timelines"
   fxTwitterPreviewTimelineAutoOpenDescription: "When off, previews in timelines open only after you press the button. Note details are not affected."
-pluginNoteOptionsCannotBeScheduled: "This post's plugin options cannot be used with a scheduled post. Unschedule it or clear the options."
+pluginNoteOptionsCannotBeDrafted: "Plugin options cannot be saved to drafts or scheduled posts. Clear the options before saving, or post without scheduling."
