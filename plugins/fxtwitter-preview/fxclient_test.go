@@ -345,6 +345,36 @@ func TestFxClientDecodesFallbackTextExactlyOnce(t *testing.T) {
 	}
 }
 
+// FxTwitter の indices は文字 (コードポイント) 単位。絵文字より後ろの範囲も、
+// 実際の応答と同じ形で除いたりリンクにしたりできること (#56)。
+func TestFxClientReadsFacetIndicesAsCodePoints(t *testing.T) {
+	body := []byte(`{"code":200,"status":{"id":"1234567890","text":"fallback","author":{"name":"Alice","screen_name":"alice"},"raw_text":{"text":"成功😺 https://t.co/a #タグ @bob 😺 https://t.co/mmmmmmmmmm","display_text_range":[0,28],"facets":[` +
+		`{"type":"url","indices":[4,18],"original":"https://t.co/a","replacement":"https://example.com/a","display":"example.com/a"},` +
+		`{"type":"hashtag","indices":[19,22],"original":"#タグ","replacement":"#タグ","display":"#タグ"},` +
+		`{"type":"mention","indices":[23,27],"original":"@bob","replacement":"@bob","display":"@bob"},` +
+		`{"type":"media","indices":[30,53],"original":"https://t.co/mmmmmmmmmm","replacement":"https://x.com/alice/status/1234567890/video/1","display":"pic.x.com/mmmmmmmmmm"}]}}}`)
+	post, err := parseFxResponse(body, "1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantText := "成功😺 https://example.com/a #タグ @bob 😺"
+	if post.Text != wantText {
+		t.Fatalf("visible text = %q, want %q", post.Text, wantText)
+	}
+	wantKinds := []string{"url", "hashtag", "mention"}
+	if len(post.TextEntities) != len(wantKinds) {
+		t.Fatalf("entities = %#v", post.TextEntities)
+	}
+	encoded := utf16.Encode([]rune(post.Text))
+	for i, kind := range wantKinds {
+		entity := post.TextEntities[i]
+		visible := string(utf16.Decode(encoded[entity.Start:entity.End]))
+		if entity.Kind != kind || visible != entity.Display {
+			t.Fatalf("entity %d = %#v covers %q", i, entity, visible)
+		}
+	}
+}
+
 func TestFxClientDecodesFacetOutputAfterRawUTF16Matching(t *testing.T) {
 	body := []byte(`{"code":200,"status":{"id":"1234567890","text":"fallback","author":{"name":"Alice","screen_name":"alice"},"raw_text":{"text":"😀 https://t.co/a &lt;ok&gt; #tag @bob","facets":[{"type":"url","indices":[3,17],"original":"https://t.co/a","replacement":"https://example.com/a?x=1&amp;y=2&amp;literal=&amp;lt;x&amp;gt;","display":"example.com/a"},{"type":"hashtag","indices":[29,33],"original":"#tag","replacement":"#tag","display":"#tag"},{"type":"mention","indices":[34,38],"original":"@bob","replacement":"@bob","display":"@bob"}]}}}`)
 	post, err := parseFxResponse(body, "1234567890")
