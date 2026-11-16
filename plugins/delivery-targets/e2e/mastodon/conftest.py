@@ -71,6 +71,7 @@ class SidekiqQueue:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
+        self.descriptions: dict[str, str] = {}
 
     def _call(self, *args: str):
         with socket.create_connection((self.host, self.port), timeout=10) as sock:
@@ -112,8 +113,16 @@ class SidekiqQueue:
         jids = set()
         for key in ("retry", "schedule"):
             for member in self._call("ZRANGE", key, "0", "-1"):
-                jids.add(str(json.loads(member).get("jid")))
+                job = json.loads(member)
+                jid = str(job.get("jid"))
+                jids.add(jid)
+                self.descriptions[jid] = (
+                    f"{key}:{job.get('class')}({job.get('args')}) {job.get('error_class') or ''} {job.get('error_message') or ''}"
+                )
         return frozenset(jids)
+
+    def describe(self, jid: str) -> str:
+        return self.descriptions.get(jid, jid)
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -156,6 +156,6 @@ def settle(watches: list[QueueWatch], sentinel_arrived, before: dict[str, frozen
     for w in watches:
         new = w.retrying() - before[w.label]
         assert not new, (
-            f"{w.label}: jobs {sorted(new)} moved to delayed or failed while checking; "
+            f"{w.label}: jobs {[getattr(w, 'describe', str)(j) for j in sorted(new)]} moved to delayed or failed while checking; "
             "a restricted note may still arrive on retry"
         )
