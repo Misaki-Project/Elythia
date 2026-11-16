@@ -10,7 +10,7 @@ import pytest
 
 from conftest import MISSKEY_DOMAIN  # type: ignore[import-not-found]
 from conftest_base import MisskeyLikeClient  # type: ignore[import-not-found]
-from dt_common import Case, cases, marker, note_url, post, settle, unsigned_fetch_status  # type: ignore[import-not-found]
+from dt_common import Case, cases, deliver_retrying, marker, note_url, post, settle, unsigned_fetch_status  # type: ignore[import-not-found]
 
 CASES = cases(MISSKEY_DOMAIN)
 
@@ -22,12 +22,13 @@ def _on_bob_timeline(misskey: MisskeyLikeClient, url: str) -> bool:
 @pytest.mark.parametrize("case", CASES, ids=[c.name for c in CASES])
 def test_delivery(case: Case, mkgo: MisskeyLikeClient, misskey: MisskeyLikeClient, bob_follows_alice) -> None:
     m = marker()
+    retrying_before = deliver_retrying(mkgo)
     note = post(mkgo, f"delivery-targets {case.name} {m}", case)
     url = note_url(mkgo, note["id"])
     sentinel = mkgo.create_note(f"sentinel {m}")["createdNote"]
     sentinel_url = note_url(mkgo, sentinel["id"])
 
-    settle(mkgo, lambda: _on_bob_timeline(misskey, sentinel_url))
+    settle(mkgo, lambda: _on_bob_timeline(misskey, sentinel_url), retrying_before)
     assert _on_bob_timeline(misskey, url) is case.delivered, (
         f"{case.name}: expected delivered={case.delivered} to {MISSKEY_DOMAIN}"
     )

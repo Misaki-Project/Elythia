@@ -74,30 +74,51 @@ def unsigned_fetch_status(url: str) -> int:
     return resp.status_code
 
 
+def _deliver_stats(admin: MisskeyLikeClient) -> dict:
+    return admin._api("admin/queue/stats", {}).get("deliver", {})
+
+
+def deliver_retrying(admin: MisskeyLikeClient) -> int:
+    """Count deliveries that are waiting for a retry (delayed) or gave up (failed)."""
+    deliver = _deliver_stats(admin)
+    return sum(int(deliver.get(k, 0) or 0) for k in ("delayed", "failed"))
+
+
 def wait_deliver_queue_empty(admin: MisskeyLikeClient, timeout: int = 120) -> None:
     """Wait until Elythia has no delivery waiting or running.
 
-    再試行待ち (delayed) は数えない。起動直後に相手がまだ受け付けずに失敗した
-    配送などが、分単位で残るため。届くべきでないノートが送られていれば、
-    先に投稿したものなので、後の目印のノートより前に相手へ着いている。
+    再試行待ち (delayed) はここでは待たない。起動直後に相手がまだ受け付けずに
+    失敗した配送などが、分単位で残るため。代わりに settle が、投稿の前より
+    delayed + failed が増えていないことを確かめる。
     """
 
     def empty() -> bool:
-        stats = admin._api("admin/queue/stats", {})
-        deliver = stats.get("deliver", {})
+        deliver = _deliver_stats(admin)
         return sum(int(deliver.get(k, 0) or 0) for k in ("waiting", "active")) == 0
 
     poll_until(empty, timeout=timeout, interval=2, desc="Elythia's deliver queue drains")
 
 
-def settle(admin: MisskeyLikeClient, sentinel_arrived) -> None:
+def settle(admin: MisskeyLikeClient, sentinel_arrived, retrying_before: int) -> None:
     """Wait until a later, unrestricted note reached the peer and nothing is left to deliver.
 
     「届かない」を待ち時間だけで決めると、遅れて届いたときに見落とす。後から
     投稿した絞っていないノートが相手に着き、さらに配送のキューが空になった時点で、
     先に投稿したノートが届くならもう届いている。
+
+    ただし、送ってはいけないノートの配送が一時的に失敗すると、再試行待ち
+    (delayed) に移ってキューが空に見え、後の再試行で届くことがある (#53 の
+    レビュー)。そこで、投稿の前に数えた delayed + failed (retrying_before) より
+    増えていたら、「届かない」の証明にならないので落とす。既にあった delayed が
+    failed に移っても和は変わらず、成功して消えれば減るだけなので、増えるのは
+    この間に新しく失敗した配送があったときだけ。
     """
     poll_until(sentinel_arrived, timeout=120, interval=3, desc="the sentinel note reaches the peer")
     wait_deliver_queue_empty(admin)
     # 相手の受信のキューで処理中のものを待つ。
     time.sleep(5)
+    after = deliver_retrying(admin)
+    assert after <= retrying_before, (
+        f"deliveries waiting for a retry or failed grew from {retrying_before} to {after} "
+        "while checking; a restricted note may still be delivered on retry"
+    )
