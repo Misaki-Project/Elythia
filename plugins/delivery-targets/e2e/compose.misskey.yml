@@ -1,0 +1,16 @@
+# tests/federation/compose.misskey.yml に重ねる (#52)。
+#
+#   docker compose -f tests/federation/compose.misskey.yml \
+#     -f plugins/delivery-targets/e2e/compose.misskey.yml ...
+#
+# 相対パスは最初の -f のディレクトリ (tests/federation) から解かれる。
+# project name を分け、tests/federation の連合テストと同時に回してもぶつからないようにする。
+name: mk-delivery-targets-misskey
+
+services:
+  test-runner:
+    environment:
+      FEDERATION_COMMON_DIR: /tests/common
+    volumes:
+      - ../../plugins/delivery-targets/e2e:/dt:ro
+    working_dir: /dt/misskey

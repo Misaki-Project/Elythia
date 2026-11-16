@@ -1,0 +1,10 @@
+# tests/federation/compose.mastodon.yml に重ねる (#52)。compose.misskey.yml と同じ形。
+name: mk-delivery-targets-mastodon
+
+services:
+  test-runner:
+    environment:
+      FEDERATION_COMMON_DIR: /tests/common
+    volumes:
+      - ../../plugins/delivery-targets/e2e:/dt:ro
+    working_dir: /dt/mastodon
