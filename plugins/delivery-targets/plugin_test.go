@@ -168,6 +168,10 @@ func TestNormalizeHost(t *testing.T) {
 		"https://remote.example/@u":     "remote.example",
 		"https://remote.example:8443/x": "remote.example:8443",
 		"remote.example:443":            "remote.example:443",
+		"http://remote.example:80/@a":   "remote.example",
+		"https://remote.example:443/@a": "remote.example",
+		"http://remote.example:8080/":   "remote.example:8080",
+		"http://remote.example:443/":    "remote.example:443",
 		"例え.テスト":                        "xn--r8jz45g.xn--zckzah",
 		"https://例え.テスト/@user?x=1#frag": "xn--r8jz45g.xn--zckzah",
 	}

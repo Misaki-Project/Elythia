@@ -27,6 +27,12 @@ func NormalizeHost(s string) (string, error) {
 			return "", fmt.Errorf("host %q is not a host name", s)
 		}
 		s = u.Host
+		// 既定のポートは落とす。本体は綴りをそろえるときに https を仮定するので、
+		// `http://remote.example:80/` の`:80`を残すと、相手の URI から取った
+		// `remote.example`と一致しなくなる。frontend の`new URL().host`と同じ扱い。
+		if (u.Scheme == "http" && u.Port() == "80") || (u.Scheme == "https" && u.Port() == "443") {
+			s = u.Hostname()
+		}
 	}
 	s = strings.TrimPrefix(s, "@")
 	if s == "" || len(s) > maxHostLength {

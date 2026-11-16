@@ -27,6 +27,10 @@ describe('delivery-targets option', () => {
 		expect(normalizeHost(' Remote.Example. ')).toBe('remote.example');
 		expect(normalizeHost('@remote.example')).toBe('remote.example');
 		expect(normalizeHost('https://remote.example:8443/@user')).toBe('remote.example:8443');
+		// 既定のポートは落とす (バックエンドの NormalizeHost と同じ形にする)。
+		expect(normalizeHost('http://remote.example:80/@user')).toBe('remote.example');
+		expect(normalizeHost('https://remote.example:443/@user')).toBe('remote.example');
+		expect(normalizeHost('http://remote.example:443/')).toBe('remote.example:443');
 		expect(normalizeHost('')).toBeNull();
 		expect(normalizeHost('a b')).toBeNull();
 		expect(normalizeHost('a/b')).toBeNull();
