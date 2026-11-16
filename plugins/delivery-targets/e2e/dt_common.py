@@ -78,18 +78,22 @@ def _deliver_stats(admin: MisskeyLikeClient) -> dict:
     return admin._api("admin/queue/stats", {}).get("deliver", {})
 
 
-def deliver_retrying(admin: MisskeyLikeClient) -> int:
-    """Count deliveries that are waiting for a retry (delayed) or gave up (failed)."""
-    deliver = _deliver_stats(admin)
-    return sum(int(deliver.get(k, 0) or 0) for k in ("delayed", "failed"))
+def deliver_retrying(admin: MisskeyLikeClient) -> frozenset[str]:
+    """Return the IDs of deliveries waiting for a retry (delayed) or given up (failed).
+
+    admin/queue/jobs は state ごとに新しい順で返すので、件数の上限に当たっても
+    新しく入ったジョブは必ず含まれる。
+    """
+    jobs = admin._api("admin/queue/jobs", {"queue": "deliver", "state": ["delayed", "failed"]})
+    return frozenset(str(j["id"]) for j in jobs)
 
 
 def wait_deliver_queue_empty(admin: MisskeyLikeClient, timeout: int = 120) -> None:
     """Wait until Elythia has no delivery waiting or running.
 
     再試行待ち (delayed) はここでは待たない。起動直後に相手がまだ受け付けずに
-    失敗した配送などが、分単位で残るため。代わりに settle が、投稿の前より
-    delayed + failed が増えていないことを確かめる。
+    失敗した配送などが、分単位で残るため。代わりに settle が、投稿の前に無かった
+    ジョブが delayed / failed に入っていないことを確かめる。
     """
 
     def empty() -> bool:
@@ -99,7 +103,7 @@ def wait_deliver_queue_empty(admin: MisskeyLikeClient, timeout: int = 120) -> No
     poll_until(empty, timeout=timeout, interval=2, desc="Elythia's deliver queue drains")
 
 
-def settle(admin: MisskeyLikeClient, sentinel_arrived, retrying_before: int) -> None:
+def settle(admin: MisskeyLikeClient, sentinel_arrived, retrying_before: frozenset[str]) -> None:
     """Wait until a later, unrestricted note reached the peer and nothing is left to deliver.
 
     「届かない」を待ち時間だけで決めると、遅れて届いたときに見落とす。後から
@@ -108,17 +112,17 @@ def settle(admin: MisskeyLikeClient, sentinel_arrived, retrying_before: int) -> 
 
     ただし、送ってはいけないノートの配送が一時的に失敗すると、再試行待ち
     (delayed) に移ってキューが空に見え、後の再試行で届くことがある (#53 の
-    レビュー)。そこで、投稿の前に数えた delayed + failed (retrying_before) より
-    増えていたら、「届かない」の証明にならないので落とす。既にあった delayed が
-    failed に移っても和は変わらず、成功して消えれば減るだけなので、増えるのは
-    この間に新しく失敗した配送があったときだけ。
+    レビュー)。件数の和で比べると、前からあった再試行待ちが同時に成功して
+    消えたときに見落とすので、ジョブの ID で比べる。投稿の前 (retrying_before)
+    に無かった ID が delayed か failed にあれば、「届かない」の証明にならないので
+    落とす (どのノートの配送かは見ず、安全側に倒す)。
     """
     poll_until(sentinel_arrived, timeout=120, interval=3, desc="the sentinel note reaches the peer")
     wait_deliver_queue_empty(admin)
     # 相手の受信のキューで処理中のものを待つ。
     time.sleep(5)
-    after = deliver_retrying(admin)
-    assert after <= retrying_before, (
-        f"deliveries waiting for a retry or failed grew from {retrying_before} to {after} "
-        "while checking; a restricted note may still be delivered on retry"
+    new = deliver_retrying(admin) - retrying_before
+    assert not new, (
+        f"deliveries {sorted(new)} moved to delayed or failed while checking; "
+        "a restricted note may still be delivered on retry"
     )
