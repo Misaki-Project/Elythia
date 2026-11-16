@@ -257,9 +257,6 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		blob, releaseVideo, err := fetchVideoWithAdmission(fetchCtx, ctx.HTTP(), rawURL, nativeVideoMaxBytes, processNativeVideoAdmission)
 		if err != nil {
 			releaseUser()
-			if errors.Is(err, errNativeVideoTooLarge) {
-				return nil, plugin.NewCodedStatusError(http.StatusRequestEntityTooLarge, "video exceeds the in-app playback limit", "VIDEO_TOO_LARGE")
-			}
 			return nil, nativeVideoUnavailable(ctx.Logger(), postID, err)
 		}
 		if req.Context().Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {

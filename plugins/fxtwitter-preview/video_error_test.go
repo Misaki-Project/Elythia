@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -85,5 +86,15 @@ func TestNativeVideoUnavailableKeepsGenericErrorForOtherFailures(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "reason=invalid") {
 		t.Fatalf("log = %q", logs.String())
+	}
+}
+
+// /media/prepare の経路でも、大きさの上限超えは VIDEO_TOO_LARGE になること。
+func TestNativeVideoUnavailableKeepsSizeLimitCode(t *testing.T) {
+	var logs bytes.Buffer
+	mapped := nativeVideoUnavailable(slog.New(slog.NewTextHandler(&logs, nil)), "1234567890", fmt.Errorf("fetch: %w", errNativeVideoTooLarge))
+	status, code := plugin.ExtractStatusError(mapped)
+	if status == nil || status.Status != http.StatusRequestEntityTooLarge || code != "VIDEO_TOO_LARGE" {
+		t.Fatalf("mapped = %v (%v, %q)", mapped, status, code)
 	}
 }

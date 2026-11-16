@@ -383,6 +383,10 @@ func classifyNativeVideoTransportError(err error) error {
 // nativeVideoUnavailable は、動画を取れなかった原因を、利用者に返すエラーに変えて記録する。
 // 状態コードはどの原因でも、これまでどおり 404 にし、原因はエラーコードで分ける。
 func nativeVideoUnavailable(logger *slog.Logger, postID string, err error) error {
+	// 大きさの上限超えは、どの経路でも同じコードで返す。画面はこれを見て再試行のボタンを出さない。
+	if errors.Is(err, errNativeVideoTooLarge) {
+		return plugin.NewCodedStatusError(http.StatusRequestEntityTooLarge, "video exceeds the in-app playback limit", "VIDEO_TOO_LARGE")
+	}
 	var source *nativeVideoSourceError
 	if !errors.As(err, &source) {
 		logger.Warn("Fx video unavailable", "postId", postID, "reason", "invalid", "err", err)
