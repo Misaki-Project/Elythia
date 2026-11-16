@@ -57,6 +57,16 @@ class MastodonClient:
         return {s.get("uri") for s in self.get("/api/v1/timelines/home", limit=40)}
 
 
+# 再試行待ち / 予約に入っても、届いたかどうかの判定に関わらないジョブ。
+# 理由の欄には、どの経路で実際に入るかを書く。
+SIDEKIQ_IGNORED_CLASSES = {
+    # 受信したステータスを作った後、リンクのプレビューを取りに行くのを
+    # perform_in で遅らせて schedule に積む (Mastodon の
+    # FetchLinkCardService の呼び出し元)。ステータスは既に作られている。
+    "LinkCrawlWorker": "scheduled after a status is created, to fetch its link preview",
+}
+
+
 class SidekiqQueue:
     """Mastodon's Sidekiq, read straight from its Redis.
 
@@ -72,6 +82,9 @@ class SidekiqQueue:
         self.host = host
         self.port = port
         self.descriptions: dict[str, str] = {}
+        # 除外した class のうち、実際に現れたもの。除外の一覧が古くなって
+        # いないかを、セッションの終わりに確かめる。
+        self.ignored_seen: set[str] = set()
 
     def _call(self, *args: str):
         with socket.create_connection((self.host, self.port), timeout=10) as sock:
@@ -114,6 +127,9 @@ class SidekiqQueue:
         for key in ("retry", "schedule"):
             for member in self._call("ZRANGE", key, "0", "-1"):
                 job = json.loads(member)
+                if job.get("class") in SIDEKIQ_IGNORED_CLASSES:
+                    self.ignored_seen.add(job["class"])
+                    continue
                 jid = str(job.get("jid"))
                 jids.add(jid)
                 self.descriptions[jid] = (
@@ -179,7 +195,9 @@ def mastodon_follows_alice(mkgo: MisskeyLikeClient, mastodon: MastodonClient) ->
 
 
 @pytest.fixture(scope="session")
-def sidekiq(mastodon: MastodonClient) -> SidekiqQueue:
+def sidekiq(mastodon: MastodonClient):
     q = SidekiqQueue(SIDEKIQ_REDIS_HOST, SIDEKIQ_REDIS_PORT)
     poll_until(lambda: q._call("SCARD", "processes") > 0, timeout=120, interval=3, desc="sidekiq registers")
-    return q
+    yield q
+    unused = set(SIDEKIQ_IGNORED_CLASSES) - q.ignored_seen
+    assert not unused, f"SIDEKIQ_IGNORED_CLASSES has entries never seen: {sorted(unused)}"
