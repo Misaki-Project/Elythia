@@ -604,6 +604,61 @@ instance/server capはplugin集約の後に適用する。`chunkedUploadMaxConcu
 
 plugin独自の書き込みでpolicy入力が変わった場合は、永続化のcommit成功後にだけ`inv.InvalidateUser`または`inv.InvalidateRole`を呼ぶ。provider失敗の結果はcacheしない。in-flightの古いnative role/provider結果はinvalidation後のrequestへ返さず、cacheにも戻さない。conditional roleの対象userはassignment rowから列挙できないため、role invalidationは全userのrole/policy cacheを保守的に破棄する。匿名（空`UserID`）にはper-user invalidationが無いため、匿名結果に影響する状態変更では`InvalidateRole`を使う。
 
+## ノートの配送先を絞る
+
+`Definition.NoteDelivery`で、ローカルのノートを連合する先のホストを、ノートごとに絞れる(#4199)。CherryPickの「連合配送の対象」を移すために足した口で、指定の受け付けと保存はプラグインが持ち、配送と照会への適用は本体が行う。
+
+**絞ることしかできない。** 本体は、今までどおりに配送先と照会の可否を決めたうえで、プラグインが返した条件に合わないホストを外すことにだけ使う。プラグインが配送先を増やしたり、本体が見せない投稿を見せたりする口は無い。
+
+```go
+func noteDelivery(ctx plugin.Context) (plugin.NoteDeliveryRegistration, error) {
+	db := ctx.Storage().DB()
+	return plugin.NoteDeliveryRegistration{
+		Prepare: func(c context.Context, req plugin.NoteDeliveryPrepareRequest) error {
+			var opt struct {
+				Mode  string   `json:"mode"`
+				Hosts []string `json:"hosts"`
+			}
+			if err := json.Unmarshal(req.Option, &opt); err != nil {
+				return fmt.Errorf("%w: %w", plugin.ErrBadNoteOption, err)
+			}
+			_, err := db.ExecContext(c, `INSERT INTO targets (note_id, mode, hosts) VALUES ($1, $2, $3)`,
+				req.NoteID, opt.Mode, strings.Join(opt.Hosts, ","))
+			return err
+		},
+		Targets: func(c context.Context, noteIDs []string) (map[string]plugin.DeliveryTargets, error) {
+			out := map[string]plugin.DeliveryTargets{}
+			// noteIDs の行を読み、条件のあるノートだけを out に入れる。
+			return out, nil
+		},
+	}, nil
+}
+```
+
+- **指定は`notes/create`の`pluginOptions.<プラグイン名>`で受け取る。** 本体は中身を読まずに`Prepare`へ渡す。`Prepare`は**ノートを保存する前**に、保存するIDで呼ばれる。保存の後だと、条件を書く前に配送が走りうるため。ノートの保存に失敗すると書いた行が残るが、IDは使い回されないので他のノートには効かない
+- **`Prepare`のエラーはノートを作らない。** `plugin.ErrBadNoteOption`を包んだエラーは400 `INVALID_PARAM`、それ以外は500になる。どちらも、プラグインのメッセージは利用者に返さない。`pluginOptions`に、登録されていないプラグインの名前があっても400になる (絞ったつもりの指定を黙って捨てない)。値が`null`の項目は送られなかったものとして扱い、名前も確かめない。400以外の失敗 (エラー・panic・期限切れ) は、プラグインの名前とノートのIDを付けて本体のログに残す。panicは値とスタックも残す
+- **`Targets`は配送と照会のたびに呼ばれる。** 1回に渡すIDは20件まで。条件の無いノートは返す map に入れない。**エラー・panic・5秒の期限切れは「どこにも配らない・誰にも見せない」になる**。どのノートを絞っていたかも読めないので、そのとき渡したノートは、条件を付けていないものも含めて全部が対象になる。プラグインの障害のあいだは、そのサーバーのローカルのノートが1つも連合しない。配送の再試行は無いので、障害のあいだに作られたノートは連合しないまま残る
+- **期限は`Prepare` / `Targets`に渡す`context`でしか伝わらない。** 本体はプラグインの処理を途中で止められないので、`context`を見ない処理は期限を過ぎても戻るまで配送や照会を待たせる。期限を過ぎてから返った結果は、成功でも失敗として扱う
+- **ホストは利用者の`host`と比べる。** 配送ではフォロワー・宛先の利用者の`host`を見る。inboxのURLのホストではない (inboxを別のホストに置くサーバーで、判定がずれるため)。比べる前に、本体が両方を利用者の`host`と同じ形 (小文字・punycode・末尾の`.`と既定のポートを外したもの) にそろえる。`Bad.Example`・`bad.example.`・`bad.example:443`・`パイ.example`は、それぞれ`bad.example`・`xn--eckve.example`と同じに扱う。既定でないポート (`bad.example:8443`) は別のサーバーのまま扱う
+- **フォロワーへの配送は、shared inboxの単位でしか分けられない。** 許すホストと許さないホストの利用者が同じshared inboxを使っていれば (1つのサーバーが複数のドメインの利用者を持つとき)、そのinboxへは送る。送らなければ許したホストにも届かないため。excludeにそのうち片方のドメインだけを入れても、外したドメインのサーバーには届く
+- **絞ったノートはrelayへ流さない。** relayは受け取ったものを加盟する全サーバーへ配り直すので、ホストで絞れない
+- **照会 (`/notes/:id`・`/notes/:id/activity`・outbox・featured) は、照会してきたサーバーのホストで判定する。** 署名を本体が持っている鍵で確かめられれば署名した利用者の`host`、確かめられなければUser-Agentに書かれたホスト (MisskeyとMastodonは自分のURLを入れる。CherryPickと同じ判定) を使う。どちらでも分からない相手は空文字になり、includeでは見せず、excludeでは見せる。署名は確かめられたが、署名した利用者が凍結・削除されているか、こちらが配送しない相手のときは、絞ったノートを1つも見せない (空文字として扱うと、外したホストが署名を付けるだけでexcludeのノートを照会できるため)。見せないときは`/notes/:id`・`/notes/:id/activity`は404、outboxとfeaturedの一覧からは外す
+- **`/notes/:id`をWebページ (HTML) として取られたときは、絞ったノートのOGP (要約・添付・作者) を出さない。** 外したサーバーがリンクカードを作るために取ると、署名もUser-Agentも無しに中身を読めるため。条件を読めないときも出さない。**埋め込み (`/embed/notes/:id`)・フィード (`/@user.rss`など)・公開のAPI (`notes/show`など) は絞らない。** 公開のノートはWebから誰でも読めるので、この機能で隠しきることはできない。絞るのは、ActivityPubで届く先と照会できる相手、OGPの3つ
+- **User-Agentは相手が自由に書ける。** 外したホストはUser-Agentを書き換えれば照会でき、許したホストを名乗ればincludeのノートも照会できる。照会の判定は、信頼しないサーバーへ配送しないための補助と考えること
+- 適用するのは、Create・Announce (リノート)・引用の承認に伴うUpdate・投票のUpdate(Question)・QuoteRequestの配送と、上の照会。Deleteは絞らない (中身を持たず、届いていない相手には何も起きない)
+- **登録はロールに関係なく行われる。** 条件の保存はAPIのプロセス、投票のUpdateの配送はキューのプロセスで走るため。登録 (`NoteDelivery`の呼び出し) に失敗すると起動を止める
+- **プラグインを無効にすると絞り込みも止まる。** 本体は条件を持っていないので、無効にした後は、絞ったノートも今までどおりに配送・照会される。止める前に運営者へ知らせること
+- 下書きと予約投稿 (`notes/drafts/create`・`notes/drafts/update`) は`pluginOptions`を受け取れない。`null`以外の値があれば400 `INVALID_PARAM`にする (黙って捨てると、予約の時刻に絞られないまま連合するため)
+
+テストでは`plugintest`の`NoteDelivery`で登録を取り出し、`Prepare` / `Targets`を直接呼ぶ。migrationは本体と同じ実装で適用される。
+
+```go
+reg := plugintest.New(t).WithName("targets").WithDB(db).NoteDelivery(Plugin)
+if err := reg.Prepare(context.Background(), plugin.NoteDeliveryPrepareRequest{NoteID: "n1", UserID: "u1", Option: json.RawMessage(`{"mode":"include","hosts":["a.example"]}`)}); err != nil {
+	t.Fatal(err)
+}
+```
+
 ## 設定
 
 ```go
@@ -952,6 +1007,34 @@ host.postForm.registerPasteTransform('normalize-example', text => text.trim());
 現在providerを接続しているのは`MkNote` / `MkNoteDetailed`のURLだけで、チャット、
 URLプレビューポップアップ、ページ本文などは対象外。`PreviewInput`の`file`は将来の
 接続用に型だけを定義しており、現時点でfile入力を渡す画面は無い。
+
+### 投稿フォームの指定
+
+投稿フォームのフッターにボタンを足し、ノートごとの指定を入力させられる(#4199)。
+値は`notes/create`の`pluginOptions.<プラグイン名>`としてそのまま送られ、バックエンドの
+[`NoteDelivery`](#ノートの配送先を絞る)の`Prepare`が受け取る。登録はプラグインごとに1つで、
+キーはプラグインの名前になる。
+
+```ts
+host.postForm.registerNoteOption({
+	icon: 'ti ti-world-share',
+	label: () => 'Delivery targets',
+	component: TargetsEditor,
+	isSet: value => value != null,
+});
+```
+
+`component`はホストのダイアログの中に置かれ、`modelValue`を受け取って`update:modelValue`を
+出す。未設定のときの`modelValue`は`null`。`isSet`が偽を返す値は送らず、ボタンも強調しない
+(省略すると`null` / `undefined`以外を設定済みとみなし、`isSet`が例外を投げたときも設定済みに倒す)。
+下書きと予約投稿は`pluginOptions`を受け取れないので、指定があるままメニューから下書きに
+保存しようとしたときと、予約しようとしたときは、フォームが止めて知らせる。指定は投稿の後も
+フォームに残り、メニューの「リセット」では消える。端末に残る書きかけの投稿には指定も残り、
+開き直すと戻る。そのときに入っていないプラグインの指定は外し、外したことを知らせる。
+
+`registerNoteOption`は`PluginHost`の必須のメソッドとして足したので、テストなどで`PluginHost`を
+手で組み立てているプラグインは、`postForm`に`registerNoteOption() {}`を足さないと`vue-tsc`が
+落ちる。
 
 ### checked role policy
 
@@ -1302,8 +1385,31 @@ type Definition struct
   Notifications func(Context, Notifications) error
   EffectivePolicies func(Context, EffectivePolicyInvalidator) (EffectivePolicyRegistration, error)
   Secrets    []SecretSpec
+  NoteDelivery func(Context) (NoteDeliveryRegistration, error)
 
 func (Definition) Validate() error
+
+type NoteDeliveryRegistration struct
+  Prepare func(ctx context.Context, req NoteDeliveryPrepareRequest) error
+  Targets func(ctx context.Context, ids []string) (map[string]DeliveryTargets, error)
+
+type NoteDeliveryPrepareRequest struct
+  NoteID string
+  UserID string
+  Option json.RawMessage
+
+type DeliveryTargetsMode string
+
+const DeliveryTargetsInclude
+const DeliveryTargetsExclude
+
+type DeliveryTargets struct
+  Mode  DeliveryTargetsMode
+  Hosts []string
+
+func (DeliveryTargets) Allows(string) bool
+
+var ErrBadNoteOption error
 
 type SecretSpec struct
   Name        string
@@ -1512,6 +1618,7 @@ host.api<T>(endpoint, params, { signal? })
 host.fetch(path, options?)
 host.openMedia(items, initialId?)
 host.postForm.registerPasteTransform(id, transform, options?)
+host.postForm.registerNoteOption(option)
 
 PluginPage: { path, component, navTitle?, navIcon?, admin? }
 
@@ -1519,6 +1626,7 @@ PluginPage: { path, component, navTitle?, navIcon?, admin? }
     PluginPage / PageRegistration / PluginUser / PreviewInput / PreviewContext
     PreviewPresentation / PreviewProvider / PreviewRegistration
     PasteTextTransform / PasteTextTransformOptions / PluginMediaItem
+    NoteOptionDefinition
 関数: getUsers(ids)
 再公開: MkInput / MkButton / MkFolder / MkLoading
         MkSelect / MkSwitch / MkAvatar / MkUserName / MkTime / PageWithHeader

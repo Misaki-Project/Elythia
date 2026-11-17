@@ -236,13 +236,14 @@ GETで登録したルートは、本家(Fastifyの`exposeHeadRoutes`。既定で
 
 upstream の endpoint は `endpoints/` 配下 438 件 + `ApiServerService.ts` の fastify 直登録 8 件 (POST 6 / GET 2) = **446 件**。うち **446 件すべてを実装済み (coverage 100.0%)**。直登録の `fastify.all` (`/clear-browser-cache`) は GET と POST の 2 件と数える (#3926)。
 
-### 1-1. Elythia にしかない (126)
+### 1-1. Elythia にしかない (127)
 
-本体の113件に、Misakiで既定有効の`role-level`プラグイン13件を含める。`make apicompat`は登録済みプラグインルートも集計する。統合後の内訳はGET variant 25件、chat拡張15件、その他86件 (role-level 13件、upstream追加のreversi操作3件)。
+本体の113件に、Misakiで既定有効の`role-level`プラグイン13件と`delivery-targets`プラグイン1件を含める。`make apicompat`は登録済みプラグインルートも集計する。統合後の内訳はGET variant 25件、chat拡張15件、その他87件 (role-level 13件、delivery-targets 1件、upstream追加のreversi操作3件)。
 
 | 分類 | 件数 | 内容 |
 |---|---|---|
 | role-levelプラグイン | 13 | `/api/plugin/role-level/*`配下のPOSTルート。level設定・XP操作・assignment参照・監査・孤立データの検査と整理・プロフィール表示設定を提供する。Misakiの通常ビルドでは既定有効で、生成API一覧の「その他」に含まれる。詳細は[Misaki固有の記録](misaki.md#role-level)を参照 |
+| delivery-targetsプラグイン | 1 | `POST /api/plugin/delivery-targets/available`。バックエンドが動いているかを投稿フォームのボタンが確かめるためのルートで、`available: true`だけを返す。設定でバックエンドを止めるとルートも無くなり、ボタンは出ない (#48)。Misakiの通常ビルドでは既定有効で、生成API一覧の「その他」に含まれる |
 | GET variant 追加 | 25 | `charts/*` 12 件、`emoji` / `emojis` / `federation/instances` / `federation/stats` / `fetch-rss` / `get-online-users-count` / `hashtags/trend` / `notes/featured` / `notes/reactions` / `server-info` / `bubble-game/ranking` / `users/featured-notes` / `retention`。**対応する POST は両側にある**。`notes/reactions` 以外の 24 件は本家も `allowGet: true` で GET を受ける (`tools/apicompat` は本家を POST だけで数えるので、ここに分類される)。GET の route と `cacheSec` の `Cache-Control` は `TestCacheSecDrift` が本家と突き合わせる (#3593)。`notes/reactions` は本家が 2026.9.0 で `allowGet` を外した後も GET を残している |
 | cherrypick chat 拡張 | 15 | `chat/messages` / `chat/messages/create` / `read` / `update` / `reactions/create` / `reactions/delete`、`chat/rooms/joined` / `unmute` / `transfer-ownership` / `members/ban` / `members/update-membership` / `invitations/accept` / `delete` / `reject`、`chat/unread-count` |
 | 分割アップロード | 4 | `drive/files/create-chunked/start` / `append` / `finish` / `abort` (#2313 / #2314)。upstream に分割アップロードが無いため対応物なし。S3 の multipart upload を包むもので、`UploadId` は `chunked_upload_session` に閉じてクライアントへ出さない。能力は `/api/meta` の `chunkedUpload` で告知し、**未対応構成では field ごと出さない**ので純正クライアントは単発アップロードに倒れる |
@@ -403,6 +404,7 @@ upstream 由来のクライアントはそのまま通る (省略時は upstream
 | `admin/show-user` | `withSignins` | `false`でサインインの履歴を返さない (同梱のfrontendのIPの照会が送る)。省略と`null`は履歴を含める。#3867までこの表に載せていなかった ([deployment.md](../deployment.md) に説明がある) |
 | `admin/drive/files` | `host` | ファイルのホストで絞り込む。`hostname` (本家の引数) より優先する。同梱のfrontendは`hostname`を送る。#3867まで記録していなかった |
 | `notes` | `noteIds` | 公開のノートの一覧の代わりに、指定した id のノートを返す (100 件まで。`notes/show-partial-bulk`と同じ上限)。同梱のfrontendは`notes/show-partial-bulk`を使う。#3867までこの表に載せていなかった ([operations.md](operations.md)・[security.md](security.md) に記録がある)。100 件を超えると先頭の 100 件に切っていた (#3867から400) |
+| `notes/create` | `pluginOptions` | ノートの配送先を絞るプラグイン (`plugin.Definition.NoteDelivery`) への指定 (#4199)。プラグインの名前をキーにしたobjectで、値は本体が読まずにそのプラグインへ渡す。そのプラグインが入っていない名前は`INVALID_PARAM` (400) にする (絞ったつもりの指定を黙って捨てない)。プラグインが値を拒んだときも`INVALID_PARAM`で、どちらの場合もノートは作らない。値の`null`は省略と同じで、そのプラグインが入っていない名前でも断らない。下書きと予約投稿 (`notes/drafts/create`・`notes/drafts/update`) は受け取れないので、`null`以外の値があれば`INVALID_PARAM` (400) にする (下書きには指定を残す場所が無く、黙って捨てると予約の時刻に絞られないまま連合するため)。絞ったノートは、`/notes/:id`をWebページとして取られたときのOGPも出さない。プラグインの入っていないサーバーでは、本家と同じく何も絞らない。詳細は[プラグインの作者向けの文書](../plugins/authoring.md#ノートの配送先を絞る) |
 | `notes/global-timeline` | `allowPartial` | `limit`に満たなくても読み進めずに返す。本家は他のtimeline (`notes/timeline`・`notes/local-timeline`など) にだけ持ち、同梱のfrontendはどのtimelineにも送る。#3867までこの表に載せていなかった ([approximations.md](approximations.md)・[operations.md](operations.md) に記述がある) |
 | `federation/instances` | `sinceId` / `untilId` / `sinceDate` / `untilDate` | 一覧のカーソル (#493、#1173)。本家は`offset`だけを持つ。#3867まで記録していなかった |
 | `i/move` | `password` | 渡したときだけアカウントのパスワードを照合する (#1546)。同梱のfrontendは送らない。#3867まで記録していなかった |

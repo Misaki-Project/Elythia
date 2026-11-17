@@ -1,10 +1,12 @@
 package federation
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
+	"github.com/elythia-network/elythia/internal/core/notedelivery"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
@@ -26,16 +28,28 @@ type PollDeliveryHook struct {
 	userRepo repository.UserRepository
 	urls     *activitypub.URLBuilder
 	idGen    id.Generator
+	// rules はプラグインが絞った配送先 (#4199)。nil なら絞らない。
+	rules *notedelivery.Registry
 }
 
-// NewPollDeliveryHook constructs a PollDeliveryHook.
-func NewPollDeliveryHook(renderer *activitypub.Renderer, deliver *DeliverService, userRepo repository.UserRepository, urls *activitypub.URLBuilder, idGen id.Generator) *PollDeliveryHook {
+// SetNoteDeliveryRules wires the plugins that narrow where local notes
+// federate (#4199). Update(Question) はノートの本文を丸ごと
+// 持つので、Create と同じ相手にだけ配る。
+func (h *PollDeliveryHook) SetNoteDeliveryRules(r *notedelivery.Registry) {
+	h.rules = r
+}
+
+// NewPollDeliveryHook constructs a PollDeliveryHook. rules is the plugins that
+// narrow where local notes federate (#4199); nil means none. 渡し忘れを
+// ビルドで止めるため、構築子の引数で受ける (NewNoteDeliveryHook と同じ)。
+func NewPollDeliveryHook(renderer *activitypub.Renderer, deliver *DeliverService, userRepo repository.UserRepository, urls *activitypub.URLBuilder, idGen id.Generator, rules *notedelivery.Registry) *PollDeliveryHook {
 	return &PollDeliveryHook{
 		renderer: renderer,
 		deliver:  deliver,
 		userRepo: userRepo,
 		urls:     urls,
 		idGen:    idGen,
+		rules:    rules,
 	}
 }
 
@@ -97,6 +111,8 @@ func (h *PollDeliveryHook) OnLocalPollUpdated(target *model.Note) {
 		return
 	}
 
+	rule := h.rules.Rule(context.Background(), target.ID)
+
 	activity, err := h.renderer.RenderQuestionUpdate(target, h.idGen)
 	if err != nil {
 		// 引用の承認を引けなかった (#3234)。承認の抜けた Update を送ると、相手側で
@@ -130,7 +146,7 @@ func (h *PollDeliveryHook) OnLocalPollUpdated(target *model.Note) {
 		ids = append(ids, target.Mentions...)
 		// specified なアンケートの Update はフォロワー配信と併用しないので、
 		// 個別 inbox でよい。
-		inboxes := remoteInboxesForUserIDs(h.userRepo, ids, target.UserID, preferredInbox)
+		inboxes := remoteInboxesForUserIDsAllowed(h.userRepo, ids, target.UserID, preferredInbox, rule.Allows)
 		if len(inboxes) == 0 {
 			return
 		}
@@ -140,7 +156,7 @@ func (h *PollDeliveryHook) OnLocalPollUpdated(target *model.Note) {
 		}
 		return
 	}
-	if err := h.deliver.DeliverToFollowers(target.UserID, body); err != nil {
+	if err := deliverToFollowersByRule(h.deliver, target.UserID, body, rule); err != nil {
 		slog.Warn("poll delivery: enqueue question update failed",
 			"noteId", target.ID, "err", err)
 	}
@@ -161,6 +177,12 @@ func (h *PollDeliveryHook) OnLocalPollUpdated(target *model.Note) {
 // `note_delivery_hook.go` の `findNoteAuthor`)。error を返しても行き先が無いので、
 // **DB 障害のあいだは宛先が組めず配送が落ちたまま戻らない** (warn log にだけ残る)。
 func remoteInboxesForUserIDs(userRepo repository.UserRepository, ids []string, skipID string, inboxOf func(*model.User) string) []string {
+	return remoteInboxesForUserIDsAllowed(userRepo, ids, skipID, inboxOf, nil)
+}
+
+// remoteInboxesForUserIDsAllowed is remoteInboxesForUserIDs that also skips
+// users whose host allow rejects. allow が nil なら絞らない (#4199)。
+func remoteInboxesForUserIDsAllowed(userRepo repository.UserRepository, ids []string, skipID string, inboxOf func(*model.User) string, allow func(host string) bool) []string {
 	if userRepo == nil || len(ids) == 0 {
 		return nil
 	}
@@ -191,6 +213,9 @@ func remoteInboxesForUserIDs(userRepo repository.UserRepository, ids []string, s
 	seenInbox := make(map[string]struct{}, len(users))
 	for _, u := range users {
 		if u == nil || u.IsLocal() {
+			continue
+		}
+		if allow != nil && !allow(hostOf(u)) {
 			continue
 		}
 		inbox := inboxOf(u)

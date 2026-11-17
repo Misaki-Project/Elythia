@@ -1,0 +1,106 @@
+name: Misaki delivery-targets e2e
+
+# delivery-targets (#48) が、本物の Misskey / Mastodon への配送と照会を、投稿ごとの
+# 指定どおりに止められるかを確かめる (#52)。tests/federation のスタックに
+# plugins/delivery-targets/e2e の上書きを重ね、プラグイン入りの Elythia で回す。
+#
+# 上流と共有する tests/federation と dropin-e2e.yml には手を入れない。上流を取り込む
+# ときにぶつからないよう、このフォークだけの workflow にしてある。
+#
+# required checks には入れない。実連合は相手の起動や配送の遅れで揺れるので、
+# merge を止める検査には向かない (dropin-e2e と同じ判断)。非ブロッキングを
+# continue-on-error で表さないこと。job は正しく失敗させる。
+
+on:
+  pull_request:
+    paths:
+      - "plugins/delivery-targets/**"
+      - "internal/core/notedelivery/**"
+      - "internal/core/federation/**"
+      - "internal/api/ap/**"
+      - "internal/api/notes/**"
+      - "plugin/**"
+      - "tests/federation/**"
+      - ".github/workflows/misaki-delivery-targets-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: misskey
+            image: misskey/misskey:2026.11.0
+          - target: mastodon
+            image: ghcr.io/mastodon/mastodon:v4.7.2
+    name: ${{ matrix.target }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Dockerfile.mkgo は frontend/built を COPY するので、docker build より前に
+      # host で作っておく。キーは frontend/ と同梱プラグインの木の SHA (dropin-e2e と
+      # 同じ理由で、lock の hash では古い built/ が使われる)。
+      - name: Resolve frontend tree SHA
+        id: tree
+        run: echo "sha=$(git rev-parse HEAD:frontend)-$(git rev-parse HEAD:plugins)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache frontend workspace (built + node_modules)
+        id: cache-frontend
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            frontend/node_modules
+            frontend/packages/*/node_modules
+            frontend/built
+          key: misaki-dt-e2e-frontend-${{ runner.os }}-${{ steps.tree.outputs.sha }}
+
+      # pluginbuild は frontend のビルドの前と、run.sh の中 (Elythia の image に
+      # プラグインを組み込むため) で使うので、Go はキャッシュの有無に関係なく入れる。
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up pnpm
+        if: steps.cache-frontend.outputs.cache-hit != 'true'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Set up Node.js
+        if: steps.cache-frontend.outputs.cache-hit != 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: frontend/.node-version
+
+      - name: Build frontend bundle
+        if: steps.cache-frontend.outputs.cache-hit != 'true'
+        working-directory: frontend
+        run: |
+          (cd .. && GOWORK=off go run ./tools/pluginbuild)
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Pre-pull the peer image
+        run: docker pull ${{ matrix.image }}
+
+      - name: Run delivery-targets e2e against ${{ matrix.target }}
+        env:
+          DT_E2E_LOG_DIR: /tmp/delivery-targets-e2e-logs
+        run: plugins/delivery-targets/e2e/run.sh ${{ matrix.target }}
+
+      - name: Upload logs artifact on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: delivery-targets-e2e-logs-${{ matrix.target }}
+          path: /tmp/delivery-targets-e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 14
