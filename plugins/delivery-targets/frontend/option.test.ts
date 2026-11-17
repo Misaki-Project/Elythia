@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, test } from 'vitest';
-import { addHosts, emptyOption, isSet, MAX_HOSTS, normalizeHost, removeHost, toOption } from './option.js';
+import { addHosts, emptyOption, isSet, MAX_HOSTS, normalizeHost, removeHost, setHost, toOption } from './option.js';
 
 describe('delivery-targets option', () => {
 	test('isSet sends only lists with servers, in either mode', () => {
@@ -43,5 +43,13 @@ describe('delivery-targets option', () => {
 		const many = Array.from({ length: MAX_HOSTS + 5 }, (_, i) => `h${i}.example`).join(' ');
 		expect(addHosts(emptyOption(), many).hosts).toHaveLength(MAX_HOSTS);
 		expect(removeHost(added, 'b.example').hosts).toEqual(['a.example', 'c.example']);
+	});
+
+	test('setHost toggles one host in the same form as typing it', () => {
+		const on = setHost(emptyOption(), 'A.Example', true);
+		expect(on.hosts).toEqual(addHosts(emptyOption(), 'A.Example').hosts);
+		expect(setHost(on, 'a.example', true).hosts).toEqual(['a.example']);
+		expect(setHost(on, 'A.Example', false).hosts).toEqual([]);
+		expect(setHost(on, 'a b', false)).toBe(on);
 	});
 });
