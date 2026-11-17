@@ -41,9 +41,39 @@ type Instance = { host: string };
 export async function suggestHosts(query: string, signal?: AbortSignal): Promise<string[]> {
 	if (call == null || query.trim() === '') return [];
 	try {
-		const res = await call<Instance[]>('federation/instances', { host: query.trim(), limit: 8, sort: '+pubSub' }, { signal });
+		// 応答しない・配信を止めた・ブロック中のサーバーは、選んでも届かないので出さない。
+		const res = await call<Instance[]>('federation/instances', {
+			host: query.trim(),
+			limit: 8,
+			sort: '+pubSub',
+			notResponding: false,
+			suspended: false,
+			blocked: false,
+		}, { signal });
 		return res.map(i => i.host);
 	} catch {
 		return [];
+	}
+}
+
+export type FollowerHost = { host: string; count: number };
+export type FollowerHosts = { hosts: FollowerHost[]; truncated: boolean };
+
+/**
+ * Lists the remote servers where the signed-in user has followers, most
+ * followers first. 応答しないサーバーなどはバックエンドが外している。
+ * 読めなければ null (一覧を出さず、入力で選べば足りる)。
+ */
+export async function followerHosts(signal?: AbortSignal): Promise<FollowerHosts | null> {
+	if (call == null) return null;
+	try {
+		const res = await call<Partial<FollowerHosts> | null>('plugin/delivery-targets/follower-hosts', {}, { signal });
+		if (res == null || !Array.isArray(res.hosts)) return null;
+		return {
+			hosts: res.hosts.filter(h => typeof h?.host === 'string' && typeof h.count === 'number'),
+			truncated: res.truncated === true,
+		};
+	} catch {
+		return null;
 	}
 }

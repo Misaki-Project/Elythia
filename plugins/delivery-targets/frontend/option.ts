@@ -68,3 +68,10 @@ export function addHosts(option: DeliveryTargetsOption, input: string): Delivery
 export function removeHost(option: DeliveryTargetsOption, host: string): DeliveryTargetsOption {
 	return { ...option, hosts: option.hosts.filter(h => h !== host) };
 }
+
+/** Adds or removes one host, as the followers' server list toggles it. */
+export function setHost(option: DeliveryTargetsOption, host: string, selected: boolean): DeliveryTargetsOption {
+	if (selected) return addHosts(option, host);
+	const normalized = normalizeHost(host);
+	return normalized == null ? option : removeHost(option, normalized);
+}
