@@ -251,25 +251,6 @@ test('the timeline loads photos in media mode like the note detail', async () =>
 	expect(openMedia.mock.calls[0][1]).toBe('1234567890:1');
 });
 
-test('a failed timeline photo can be retried like in the note detail', async () => {
-	const post = makePost({ images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }] });
-	hostApi.mockImplementation(async (path: string, params: Record<string, unknown>) => {
-		if (path.endsWith('/preview')) return { state: 'ready', post };
-		return { url: mediaURL(Number(params.index ?? 0)), contentType: 'image/png', size: 3, expiresAt: '2026-11-15T00:00:00Z' };
-	});
-	let publicAttempt = 0;
-	vi.stubGlobal('fetch', async () => {
-		publicAttempt++;
-		if (publicAttempt === 1) return new Response(null, { status: 503 });
-		return new Response(new Blob(['abc'], { type: 'image/png' }), { status: 200, headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } });
-	});
-	const view = card(post, { ...context, detail: false });
-	await waitFor(() => expect(view.container.querySelector('[data-photo-state="error"]')).not.toBeNull());
-	await fireEvent.click(view.getByRole('button', { name: '写真を再試行' }));
-	await waitFor(() => expect(view.container.querySelector('[data-photo-state="error"]')).toBeNull());
-	expect(publicAttempt).toBe(2);
-});
-
 test.each([
 	{ code: 'MEDIA_REMOVED_DMCA', state: 'dmca', text: '著作権の申し立てにより、Xで削除された画像があります。', retry: false },
 	{ code: 'MEDIA_SOURCE_GONE', state: 'gone', text: 'Xで削除された画像があります。', retry: false },
@@ -305,6 +286,25 @@ test('a deleted photo wins over a retryable one in the message, and only the ret
 	prepared.length = 0;
 	await fireEvent.click(view.getByRole('button', { name: '写真を再試行' }));
 	await waitFor(() => expect(prepared).toEqual([1]));
+});
+
+test('a failed timeline photo can be retried like in the note detail', async () => {
+	const post = makePost({ images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }] });
+	hostApi.mockImplementation(async (path: string, params: Record<string, unknown>) => {
+		if (path.endsWith('/preview')) return { state: 'ready', post };
+		return { url: mediaURL(Number(params.index ?? 0)), contentType: 'image/png', size: 3, expiresAt: '2026-11-15T00:00:00Z' };
+	});
+	let publicAttempt = 0;
+	vi.stubGlobal('fetch', async () => {
+		publicAttempt++;
+		if (publicAttempt === 1) return new Response(null, { status: 503 });
+		return new Response(new Blob(['abc'], { type: 'image/png' }), { status: 200, headers: { 'Content-Type': 'image/png', 'Content-Length': '3' } });
+	});
+	const view = card(post, { ...context, detail: false });
+	await waitFor(() => expect(view.container.querySelector('[data-photo-state="error"]')).not.toBeNull());
+	await fireEvent.click(view.getByRole('button', { name: '写真を再試行' }));
+	await waitFor(() => expect(view.container.querySelector('[data-photo-state="error"]')).toBeNull());
+	expect(publicAttempt).toBe(2);
 });
 
 test('the note detail shows the whole text, and the timeline truncates it with a link to the note', () => {
