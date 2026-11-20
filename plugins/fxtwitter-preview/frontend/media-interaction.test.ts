@@ -289,7 +289,7 @@ test('a deleted photo wins over a retryable one in the message, and only the ret
 	await fireEvent.click(view.getByRole('button', { name: '写真を再試行' }));
 	await waitFor(() => expect(prepared).toContain(1));
 	// 再試行は順に取り直すので、続けて別の写真を取りに行かないことを、少し待ってから確かめる。
-	await new Promise(resolve => setTimeout(resolve, 50));
+	await new Promise(resolve => window.setTimeout(resolve, 50));
 	expect(prepared).toEqual([1]);
 });
 
