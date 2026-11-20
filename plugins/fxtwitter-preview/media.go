@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -286,29 +287,32 @@ func fetchMediaWithReservationDecoder(ctx context.Context, base *http.Client, u 
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return plugin.Blob{}, nil, err
+		return plugin.Blob{}, nil, classifySourceTransportError(err)
 	}
 	defer res.Body.Close() //nolint:errcheck
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return plugin.Blob{}, nil, fmt.Errorf("media status %d", res.StatusCode)
+		return plugin.Blob{}, nil, classifySourceStatus(res)
 	}
 	declared, _, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
 	if err != nil || !allowedImageMIME(declared) {
-		return plugin.Blob{}, nil, errors.New("media content type is not allowed")
+		return plugin.Blob{}, nil, &mediaProcessingError{errors.New("media content type is not allowed")}
 	}
 	if res.ContentLength > int64(maxBytes) {
-		return plugin.Blob{}, nil, errors.New("media response exceeds configured limit")
+		return plugin.Blob{}, nil, &mediaProcessingError{errors.New("media response exceeds configured limit")}
 	}
 	body, err := readBoundedMediaBody(res.Body, maxBytes)
+	if errors.Is(err, errMediaBodyTooLarge) {
+		return plugin.Blob{}, nil, &mediaProcessingError{err}
+	}
 	if err != nil {
-		return plugin.Blob{}, nil, err
+		return plugin.Blob{}, nil, classifySourceTransportError(err)
 	}
 	if err := ctx.Err(); err != nil {
-		return plugin.Blob{}, nil, err
+		return plugin.Blob{}, nil, classifySourceTransportError(err)
 	}
 	detected, _, _ := mime.ParseMediaType(http.DetectContentType(body))
 	if !allowedImageMIME(detected) || detected != declared {
-		return plugin.Blob{}, nil, errors.New("media content does not match type")
+		return plugin.Blob{}, nil, &mediaProcessingError{errors.New("media content does not match type")}
 	}
 	releaseDecoder, err := admission.acquireDecoder(ctx)
 	if err != nil {
@@ -316,7 +320,7 @@ func fetchMediaWithReservationDecoder(ctx context.Context, base *http.Client, u 
 	}
 	if _, err := decode(body); err != nil {
 		releaseDecoder()
-		return plugin.Blob{}, nil, fmt.Errorf("decode media: %w", err)
+		return plugin.Blob{}, nil, &mediaProcessingError{fmt.Errorf("decode media: %w", err)}
 	}
 	releaseDecoder()
 	if err := ctx.Err(); err != nil {
@@ -324,6 +328,41 @@ func fetchMediaWithReservationDecoder(ctx context.Context, base *http.Client, u 
 	}
 	keepReservation = true
 	return plugin.Blob{ContentType: detected, Body: body, CacheControl: "private, no-store", WriteTimeout: mediaResponseWriteTimeout}, release, nil
+}
+
+// mediaProcessingError は、取得はできたが、こちらのサーバーで画像として扱えなかったことを表す
+// (形式が画像でない、大きさの上限を超える、読めない画像)。取得先の削除や通信の失敗とは分ける (#62)。
+type mediaProcessingError struct{ err error }
+
+func (e *mediaProcessingError) Error() string { return e.err.Error() }
+func (e *mediaProcessingError) Unwrap() error { return e.err }
+
+// mediaUnavailable は、画像を取れなかった原因を、利用者に返すエラーに変えて記録する (#62)。
+// 状態コードはどの原因でも、これまでどおり 404 にし、原因はエラーコードで分ける。
+func mediaUnavailable(logger *slog.Logger, postID, kind string, err error) error {
+	var processing *mediaProcessingError
+	if errors.As(err, &processing) {
+		logger.Warn("Fx preview media unavailable", "postId", postID, "kind", kind, "reason", "processing", "err", processing.err)
+		return plugin.NewCodedStatusError(http.StatusNotFound, "the server could not process the image", "MEDIA_PROCESSING_FAILED")
+	}
+	var source *mediaSourceError
+	if !errors.As(err, &source) {
+		logger.Warn("Fx preview media unavailable", "postId", postID, "kind", kind, "reason", "invalid", "err", err)
+		return plugin.ErrNotFound("media unavailable")
+	}
+	logger.Warn("Fx preview media unavailable", "postId", postID, "kind", kind, "reason", source.Reason, "status", source.Status)
+	switch source.Reason {
+	case "dmca":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "image was removed on X in response to a copyright claim", "MEDIA_REMOVED_DMCA")
+	case "forbidden":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "X refused to serve the image", "MEDIA_SOURCE_FORBIDDEN")
+	case "gone":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "image was deleted on X", "MEDIA_SOURCE_GONE")
+	case "timeout":
+		return plugin.NewCodedStatusError(http.StatusNotFound, "X did not answer in time", "MEDIA_SOURCE_TIMEOUT")
+	default:
+		return plugin.NewCodedStatusError(http.StatusNotFound, "image could not be fetched from X", "MEDIA_SOURCE_FAILED")
+	}
 }
 
 func readBoundedMediaBody(reader io.Reader, maxBytes int) ([]byte, error) {

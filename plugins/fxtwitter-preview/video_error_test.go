@@ -56,9 +56,9 @@ func TestNativeVideoFetchClassifiesSourceFailures(t *testing.T) {
 			if release != nil {
 				release()
 			}
-			var sourceErr *nativeVideoSourceError
+			var sourceErr *mediaSourceError
 			if !errors.As(err, &sourceErr) {
-				t.Fatalf("err = %v, want nativeVideoSourceError", err)
+				t.Fatalf("err = %v, want mediaSourceError", err)
 			}
 			if sourceErr.Reason != tc.wantReason || sourceErr.Status != tc.wantStatus {
 				t.Fatalf("reason/status = %s/%d, want %s/%d", sourceErr.Reason, sourceErr.Status, tc.wantReason, tc.wantStatus)

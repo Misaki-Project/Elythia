@@ -198,8 +198,7 @@ func routes(ctx plugin.Context, r plugin.Router) error {
 		}
 		if err != nil {
 			releaseUser()
-			ctx.Logger().Warn("Fx preview media unavailable", "postId", req.Param("postId"), "kind", req.Param("kind"), "err", err)
-			return nil, plugin.ErrNotFound("media unavailable")
+			return nil, mediaUnavailable(ctx.Logger(), req.Param("postId"), req.Param("kind"), err)
 		}
 		if req.Context().Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), noteID, postID) != nil {
 			releaseMedia()
