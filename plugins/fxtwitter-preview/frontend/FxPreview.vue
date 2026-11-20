@@ -19,7 +19,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</div>
 	</header>
 	<p :class="$style.text"><template v-for="segment in displayedTextSegments" :key="segment.key"><MkUrl v-if="segment.kind === 'url' && segment.href" :url="segment.href" :aria-label="segment.text" @click.stop/><MkA v-else-if="segment.kind === 'hashtag' && segment.href" class="_link" :to="segment.href" @click.stop>{{ segment.text }}</MkA><a v-else-if="segment.kind === 'mention' && segment.href" class="_link" :href="segment.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ segment.text }}</a><span v-else>{{ segment.text }}</span></template><span v-if="textSummary.truncated && !context.detail">…</span></p>
-	<a v-if="textSummary.truncated && !context.detail" :class="$style.more" :href="noteHref ?? undefined">もっと見る</a>
+	<MkA v-if="textSummary.truncated && !context.detail && noteHref" :class="$style.more" :to="noteHref" data-fx-more @click.stop>もっと見る</MkA>
 	<p v-if="data.stale" :class="$style.stale">一時的に取得できないため、前回取得した内容を表示しています。</p>
 	<p v-if="!showAttachmentMedia && mediaSummary" :class="$style.mediaSummary">{{ mediaSummary }}</p>
 	<FxMediaGrid v-if="showAttachmentMedia && (renderedImages.length || mainVideos.length)" :key="`images:${data.post.id}`" v-model:revealed="imagesRevealed" :images="renderedImages" :videoCount="mainVideos.length" :isSensitive="data.post.isSensitive" @open="openImage">

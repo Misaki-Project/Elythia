@@ -270,7 +270,7 @@ test('a failed timeline photo can be retried like in the note detail', async () 
 	expect(publicAttempt).toBe(2);
 });
 
-test('the note detail shows the whole text, and the timeline truncates it with a link to the note', () => {
+test('the note detail shows the whole text, and the timeline truncates it with a link to the note', async () => {
 	const long = Array.from({ length: 8 }, (_, line) => `line ${line + 1}`).join('\n');
 	const detail = card(makePost({ text: long }));
 	expect(detail.container.querySelector('p')?.textContent).toBe(long);
@@ -278,7 +278,13 @@ test('the note detail shows the whole text, and the timeline truncates it with a
 	detail.unmount();
 	const timeline = card(makePost({ text: long }), { ...context, detail: false });
 	expect(timeline.container.querySelector('p')?.textContent).not.toContain('line 6');
-	expect(timeline.getByText('もっと見る').getAttribute('href')).toBe('/notes/note-1');
+	const more = await timeline.findByText('もっと見る');
+	expect(more.getAttribute('href')).toBe('/notes/note-1');
+	// 本体のノートのリンクと同じく MkA がルーターで開く (デッキではウィンドウ)。ブラウザの移動は止める (#63)。
+	const cardClick = vi.fn();
+	timeline.container.addEventListener('click', cardClick);
+	expect(more.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))).toBe(false);
+	expect(cardClick).not.toHaveBeenCalled();
 });
 
 test.each([
