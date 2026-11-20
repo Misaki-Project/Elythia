@@ -5,7 +5,47 @@
 
 import { isHttpForbidden } from './public-media.js';
 
-export type PhotoLoadFailure = { index: number; reason: 'fetch' | 'forbidden' | 'budget' };
+export type PhotoFailureReason = 'fetch' | 'forbidden' | 'budget' | 'gone' | 'dmca' | 'processing' | 'unreachable';
+export type PhotoLoadFailure = { index: number; reason: PhotoFailureReason };
+
+// 写真の枠の状態。error と unreachable は再試行でき、ほかの失敗は再試行しても直らない。
+export type PhotoState = 'loading' | 'error' | 'forbidden' | 'limit' | 'gone' | 'dmca' | 'processing' | 'unreachable';
+
+// サーバーが画像を取れなかった原因 (#62)。取得先での削除、こちらでの処理の失敗、通信の失敗を分ける。
+const reasonByCode: Record<string, PhotoFailureReason> = {
+	MEDIA_REMOVED_DMCA: 'dmca',
+	MEDIA_SOURCE_GONE: 'gone',
+	MEDIA_SOURCE_FORBIDDEN: 'forbidden',
+	MEDIA_PROCESSING_FAILED: 'processing',
+	MEDIA_SOURCE_TIMEOUT: 'unreachable',
+	MEDIA_SOURCE_FAILED: 'unreachable',
+};
+
+export function photoFailureReason(error: unknown): PhotoFailureReason {
+	const code = (error as { code?: unknown } | null)?.code;
+	if (typeof code === 'string' && Object.hasOwn(reasonByCode, code)) return reasonByCode[code];
+	return isHttpForbidden(error) ? 'forbidden' : 'fetch';
+}
+
+export function photoStateForFailure(reason: PhotoFailureReason | undefined): PhotoState | undefined {
+	if (reason == null) return undefined;
+	if (reason === 'fetch') return 'error';
+	if (reason === 'budget') return 'limit';
+	return reason;
+}
+
+export function isRetryablePhotoState(state: PhotoState | undefined): boolean {
+	return state === 'error' || state === 'unreachable';
+}
+
+/** 写真の失敗をまとめて伝える文言。再試行しても直らない原因を先に出す。 */
+export function photoErrorMessage(states: readonly (PhotoState | undefined)[]): string {
+	if (states.includes('dmca')) return '著作権の申し立てにより、Xで削除された画像があります。';
+	if (states.includes('gone')) return 'Xで削除された画像があります。';
+	if (states.includes('processing')) return 'サーバーで画像を処理できませんでした。';
+	if (states.includes('unreachable')) return 'Xから画像を取得できませんでした。時間をおいて再試行してください。';
+	return 'メディアを読み込めませんでした。通信または容量上限を確認して再試行してください。';
+}
 
 export type PhotoLoadResult<T> = {
 	items: Array<T | null>;
@@ -54,7 +94,7 @@ export async function loadPhotoIndexesSequentially<T extends { blob: Pick<Blob, 
 		} catch (error) {
 			const isBudgetError = error instanceof PhotoBudgetExceededError ||
 				(typeof error === 'object' && error != null && 'name' in error && error.name === 'PhotoBudgetExceededError');
-			const reason = isBudgetError ? 'budget' : isHttpForbidden(error) ? 'forbidden' : 'fetch';
+			const reason = isBudgetError ? 'budget' : photoFailureReason(error);
 			failures.push({ index, reason });
 			if (reason === 'budget' || stopOnFetchFailure) break;
 			continue;

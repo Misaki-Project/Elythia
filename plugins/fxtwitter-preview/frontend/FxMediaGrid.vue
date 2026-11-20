@@ -25,7 +25,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		>
 			<img v-if="image.src != null" :src="image.src" :alt="image.alt" loading="lazy">
 			<span v-else :class="$style.missingImage" :data-photo-state="image.state ?? 'loading'" aria-hidden="true">
-				<i v-if="image.state === 'error' || image.state === 'forbidden'" class="ti ti-photo-x"></i>
+				<i v-if="image.state != null && image.state !== 'loading' && image.state !== 'limit'" class="ti ti-photo-x"></i>
 				<i v-else class="ti ti-photo"></i>
 			</span>
 			<span v-if="visibleIndex === 5 && overflowCount > 0" :class="$style.overflowOverlay" data-photo-overflow aria-hidden="true">+{{ overflowCount }}</span>
@@ -39,13 +39,14 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 <script lang="ts" setup>
 import { computed } from 'vue';
+import type { PhotoState } from './photo-gallery.js';
 import { MkSensitiveMediaGuard } from '@/plugin-api.js';
 
 export type FxRenderedImage = {
 	index: number;
 	src: string | null;
 	alt: string;
-	state?: 'loading' | 'error' | 'forbidden' | 'limit';
+	state?: PhotoState;
 	width?: number;
 	height?: number;
 };

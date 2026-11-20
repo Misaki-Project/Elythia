@@ -71,7 +71,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<MkTime v-if="quoteCreatedAt" data-fx-post-time="quote" :class="$style.postTime" :time="quoteCreatedAt" mode="detail"/>
 	</section>
 	<div v-if="mediaLoadFailed" :class="$style.mediaError" role="status">
-		<span>メディアを読み込めませんでした。通信または容量上限を確認して再試行してください。</span>
+		<span data-fx-media-error>{{ mediaErrorMessage }}</span>
 		<button v-if="attachmentLoadFailed && photoRetryable" type="button" class="_button" @click="retryVisiblePhotos">写真を再試行</button>
 		<a v-for="link in mediaErrorLinks" :key="link.href" :href="link.href" target="_blank" rel="nofollow noopener noreferrer" @click.stop>{{ link.label }}</a>
 	</div>
@@ -97,10 +97,11 @@ import { api, apiSession, fetchPluginResource, openPluginMedia, truncatePostText
 import { retainResource } from './media-cache.js';
 import { loadPreview } from './preview-loader.js';
 import type { PreviewResponse, PublicPost, PublicTextEntity, PublicVideo } from './api.js';
+import type { PhotoState } from './photo-gallery.js';
 import type { PluginMediaItem, PreviewContext, PreviewInput } from '@/plugin-api.js';
 import type { ResourceLease } from './media-cache.js';
 import { MkA, MkTime, MkUrl } from '@/plugin-api.js';
-import { loadPhotoIndexesSequentially, orderPhotoPreviews } from './photo-gallery.js';
+import { isRetryablePhotoState, loadPhotoIndexesSequentially, orderPhotoPreviews, photoErrorMessage, photoStateForFailure } from './photo-gallery.js';
 import { fetchPreparedPublicBlob } from './public-media.js';
 import type { PreparedPublicMedia } from './public-media.js';
 
@@ -116,9 +117,9 @@ type IdentityBundle = {
 };
 type AttachmentBundle = {
 	images: Array<LoadedMedia | null>;
-	imageStates: Array<'loading' | 'error' | 'forbidden' | 'limit' | undefined>;
+	imageStates: Array<PhotoState | undefined>;
 	quoteImages: Array<LoadedMedia | null>;
-	quoteImageStates: Array<'loading' | 'error' | 'forbidden' | 'limit' | undefined>;
+	quoteImageStates: Array<PhotoState | undefined>;
 	objectUrls: string[];
 	failed: boolean;
 	bytes: number;
@@ -134,20 +135,23 @@ let attachmentKey = '';
 const avatarSrc = ref<string | null>(null);
 const imageSources = ref<Array<string | null>>([]);
 const imageBlobs = ref<Array<Blob | null>>([]);
-const imageStates = ref<Array<'loading' | 'error' | 'forbidden' | 'limit' | undefined>>([]);
+const imageStates = ref<Array<PhotoState | undefined>>([]);
 const imagesRevealed = ref(false);
 const quoteAvatarSrc = ref<string | null>(null);
 const quoteImageSources = ref<Array<string | null>>([]);
 const quoteImageBlobs = ref<Array<Blob | null>>([]);
-const quoteImageStates = ref<Array<'loading' | 'error' | 'forbidden' | 'limit' | undefined>>([]);
+const quoteImageStates = ref<Array<PhotoState | undefined>>([]);
 const quoteImagesRevealed = ref(false);
 const identityLoadFailed = ref(false);
 const identityMainFailed = ref(false);
 const identityQuoteFailed = ref(false);
 const attachmentLoadFailed = ref(false);
 const photoRetryBlocked = ref(false);
+// 再試行しても直らない写真 (取得中のもの、許可されないもの、Xで削除されたもの、サーバーで扱えないもの)。
+const permanentPhotoStates = new Set<PhotoState>(['loading', 'forbidden', 'gone', 'dmca', 'processing']);
 const mediaLoadFailed = computed(() => [identityLoadFailed.value, attachmentLoadFailed.value].includes(true));
-const photoRetryable = computed(() => !photoRetryBlocked.value && [...imageStates.value, ...quoteImageStates.value].includes('error'));
+const photoRetryable = computed(() => !photoRetryBlocked.value && [...imageStates.value, ...quoteImageStates.value].some(isRetryablePhotoState));
+const mediaErrorMessage = computed(() => photoErrorMessage([...imageStates.value, ...quoteImageStates.value]));
 const renderedImages = computed(() => (props.data.post?.images ?? []).map((image, index) => ({ index, src: imageSources.value[index] ?? null, alt: image.alt ?? '', width: image.width, height: image.height, state: imageStates.value[index] ?? 'loading' as const })));
 const renderedQuoteImages = computed(() => (props.data.post?.quote?.images ?? []).map((image, index) => ({ index, src: quoteImageSources.value[index] ?? null, alt: image.alt ?? '', width: image.width, height: image.height, state: quoteImageStates.value[index] ?? 'loading' as const })));
 const previewMode = computed(() => {
@@ -178,8 +182,8 @@ function xStatusUrl(id?: string): string | null {
 const mediaErrorLinks = computed(() => {
 	const post = props.data.post;
 	if (post == null) return [];
-	const mainFailed = identityMainFailed.value || imageStates.value.some(state => state === 'error' || state === 'forbidden' || state === 'limit');
-	const quoteFailed = identityQuoteFailed.value || quoteImageStates.value.some(state => state === 'error' || state === 'forbidden' || state === 'limit');
+	const mainFailed = identityMainFailed.value || imageStates.value.some(state => state != null && state !== 'loading');
+	const quoteFailed = identityQuoteFailed.value || quoteImageStates.value.some(state => state != null && state !== 'loading');
 	const links = [
 		mainFailed ? { href: xStatusUrl(post.id), label: 'Xで投稿を開く' } : null,
 		quoteFailed ? { href: xStatusUrl(post.quote?.id), label: 'Xで引用投稿を開く' } : null,
@@ -386,7 +390,7 @@ async function loadAttachments(): Promise<void> {
 			bytes = loaded.bytes;
 			failed ||= loaded.failures.length > 0;
 			const failureByIndex = new Map(loaded.failures.map(failure => [failure.index, failure.reason]));
-			const states = loaded.items.map((item, index) => item != null ? undefined : failureByIndex.get(index) === 'budget' ? 'limit' as const : failureByIndex.get(index) === 'forbidden' ? 'forbidden' as const : failureByIndex.has(index) ? 'error' as const : 'loading' as const);
+			const states = loaded.items.map((item, index): PhotoState | undefined => item != null ? undefined : photoStateForFailure(failureByIndex.get(index)) ?? 'loading');
 			if (target === 'main') {
 				images = loaded.items;
 				mainStates = states;
@@ -461,7 +465,7 @@ async function retryVisiblePhotos(): Promise<void> {
 		const descriptors = target === 'main' ? post.images : quote?.images ?? [];
 		const states = target === 'main' ? imageStates.value : quoteImageStates.value;
 		const existing = target === 'main' ? bundle.images : bundle.quoteImages;
-		const indexes = descriptors.map((_, index) => index).slice(0, descriptors.length > 4 ? 6 : descriptors.length).filter(index => existing[index] == null && states[index] !== 'loading' && states[index] !== 'forbidden');
+		const indexes = descriptors.map((_, index) => index).slice(0, descriptors.length > 4 ? 6 : descriptors.length).filter(index => existing[index] == null && !permanentPhotoStates.has(states[index] ?? 'error'));
 		const result = await loadPhotoIndexesSequentially(descriptors, indexes, existing, bytes, 64 * 1024 * 1024, (path, index, remaining) => fetchPreparedImage(path, target === 'main' ? 'image' : 'quote-image', index, controller.signal, remaining), false, controller.signal);
 		if (controller.signal.aborted || generation !== attachmentGeneration || attachmentBundle !== bundle) break;
 		bytes = result.bytes;
@@ -473,14 +477,14 @@ async function retryVisiblePhotos(): Promise<void> {
 			imageSources.value = result.items.map(item => item?.src ?? null);
 			imageBlobs.value = result.items.map(item => item?.blob ?? null);
 			const failures = new Map(result.failures.map(failure => [failure.index, failure.reason]));
-			imageStates.value = result.items.map((item, index) => item != null ? undefined : failures.get(index) === 'budget' ? 'limit' : failures.get(index) === 'forbidden' ? 'forbidden' : failures.has(index) ? 'error' : imageStates.value[index] ?? 'loading');
+			imageStates.value = result.items.map((item, index) => item != null ? undefined : photoStateForFailure(failures.get(index)) ?? imageStates.value[index] ?? 'loading');
 			bundle.imageStates = imageStates.value;
 		} else {
 			bundle.quoteImages = result.items;
 			quoteImageSources.value = result.items.map(item => item?.src ?? null);
 			quoteImageBlobs.value = result.items.map(item => item?.blob ?? null);
 			const failures = new Map(result.failures.map(failure => [failure.index, failure.reason]));
-			quoteImageStates.value = result.items.map((item, index) => item != null ? undefined : failures.get(index) === 'budget' ? 'limit' : failures.get(index) === 'forbidden' ? 'forbidden' : failures.has(index) ? 'error' : quoteImageStates.value[index] ?? 'loading');
+			quoteImageStates.value = result.items.map((item, index) => item != null ? undefined : photoStateForFailure(failures.get(index)) ?? quoteImageStates.value[index] ?? 'loading');
 			bundle.quoteImageStates = quoteImageStates.value;
 		}
 	}
@@ -524,7 +528,7 @@ async function openGallery(target: 'main' | 'quote', selectedIndex: number): Pro
 		}
 		return;
 	}
-	const states = result.items.map((item, index) => item != null ? undefined : result.failures.some(failure => failure.index === index && failure.reason === 'budget') ? 'limit' as const : result.failures.some(failure => failure.index === index && failure.reason === 'forbidden') ? 'forbidden' as const : 'error' as const);
+	const states = result.items.map((item, index): PhotoState | undefined => item != null ? undefined : photoStateForFailure(result.failures.find(failure => failure.index === index)?.reason) ?? 'error');
 	if (result.failures.length > 0 || result.items.some(item => item == null)) {
 		const retained = new Set([...imageSources.value, ...quoteImageSources.value].filter((value): value is string => value != null));
 		for (const item of result.items) if (item != null && !retained.has(item.src)) URL.revokeObjectURL(item.src);

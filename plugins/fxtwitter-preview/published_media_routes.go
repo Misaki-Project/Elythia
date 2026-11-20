@@ -97,7 +97,7 @@ func registerPublishedMediaRoutes(ctx plugin.Context, r plugin.Router, s *store,
 		defer cancelFetch()
 		blob, releaseMedia, err := fetchMediaWithAdmission(fetchCtx, ctx.HTTP(), rawURL, cfg.StaticImageMaxBytes, processMediaAdmission)
 		if err != nil {
-			return nil, plugin.ErrNotFound("media unavailable")
+			return nil, mediaUnavailable(ctx.Logger(), body.PostID, body.Kind, err)
 		}
 		defer releaseMedia()
 		if req.Context().Err() != nil || !checkedPreviewAllowed(req) || verifyVisibleNote(req.Context(), ctx.API(), req.UserID(), body.NoteID, body.PostID) != nil {
