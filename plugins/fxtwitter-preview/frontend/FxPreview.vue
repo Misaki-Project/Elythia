@@ -147,8 +147,8 @@ const identityMainFailed = ref(false);
 const identityQuoteFailed = ref(false);
 const attachmentLoadFailed = ref(false);
 const photoRetryBlocked = ref(false);
-// 再試行しても直らない写真 (取得中のもの、許可されないもの、Xで削除されたもの、サーバーで扱えないもの)。
-const permanentPhotoStates = new Set<PhotoState>(['loading', 'forbidden', 'gone', 'dmca', 'processing']);
+// 再試行しても直らない写真 (取得中のもの、許可されないもの、Xで削除されたもの、Xが配信を拒否したもの、サーバーで扱えないもの)。
+const permanentPhotoStates = new Set<PhotoState>(['loading', 'forbidden', 'gone', 'dmca', 'refused', 'processing']);
 const mediaLoadFailed = computed(() => [identityLoadFailed.value, attachmentLoadFailed.value].includes(true));
 const photoRetryable = computed(() => !photoRetryBlocked.value && [...imageStates.value, ...quoteImageStates.value].some(isRetryablePhotoState));
 const mediaErrorMessage = computed(() => photoErrorMessage([...imageStates.value, ...quoteImageStates.value]));

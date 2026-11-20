@@ -254,16 +254,17 @@ test('the timeline loads photos in media mode like the note detail', async () =>
 test.each([
 	{ code: 'MEDIA_REMOVED_DMCA', state: 'dmca', text: '著作権の申し立てにより、Xで削除された画像があります。', retry: false },
 	{ code: 'MEDIA_SOURCE_GONE', state: 'gone', text: 'Xで削除された画像があります。', retry: false },
-	{ code: 'MEDIA_SOURCE_FORBIDDEN', state: 'forbidden', text: 'メディアを読み込めませんでした。通信または容量上限を確認して再試行してください。', retry: false },
+	{ code: 'MEDIA_SOURCE_FORBIDDEN', state: 'refused', text: 'Xが画像の配信を拒否しました。', retry: false },
+	{ code: 'PREVIEW_FORBIDDEN', status: 403, state: 'forbidden', text: '画像へのアクセスが許可されていません。', retry: false },
 	{ code: 'MEDIA_PROCESSING_FAILED', state: 'processing', text: 'サーバーで画像を処理できませんでした。', retry: false },
 	{ code: 'MEDIA_SOURCE_TIMEOUT', state: 'unreachable', text: 'Xから画像を取得できませんでした。時間をおいて再試行してください。', retry: true },
 	{ code: 'MEDIA_SOURCE_FAILED', state: 'unreachable', text: 'Xから画像を取得できませんでした。時間をおいて再試行してください。', retry: true },
 	{ code: undefined, state: 'error', text: 'メディアを読み込めませんでした。通信または容量上限を確認して再試行してください。', retry: true },
-])('a photo that failed with $code tells whether it was deleted on X or failed on the server', async ({ code, state, text, retry }) => {
+])('a photo that failed with $code tells whether it was deleted on X or failed on the server', async ({ code, status, state, text, retry }: { code?: string; status?: number; state: string; text: string; retry: boolean }) => {
 	const post = makePost({ images: [{ url: '/api/plugin/fxtwitter-preview/media/1234567890/image/0?noteId=note-1' }] });
 	hostApi.mockImplementation(async (path: string) => {
 		if (path.endsWith('/preview')) return { state: 'ready', post };
-		throw Object.assign(new Error('media unavailable'), { status: 404, code });
+		throw Object.assign(new Error('media unavailable'), { status: status ?? 404, code });
 	});
 	const view = card(post);
 	await waitFor(() => expect(view.container.querySelector(`[data-photo-state="${state}"]`)).not.toBeNull());
@@ -272,20 +273,24 @@ test.each([
 });
 
 test('a deleted photo wins over a retryable one in the message, and only the retryable one is retried', async () => {
-	const post = makePost({ images: [0, 1].map(index => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1` })) });
+	const post = makePost({ images: [0, 1, 2].map(index => ({ url: `/api/plugin/fxtwitter-preview/media/1234567890/image/${index}?noteId=note-1` })) });
 	const prepared: number[] = [];
 	hostApi.mockImplementation(async (path: string, params: Record<string, unknown>) => {
 		if (path.endsWith('/preview')) return { state: 'ready', post };
 		const index = Number(params.index ?? 0);
 		prepared.push(index);
-		throw Object.assign(new Error('media unavailable'), { status: 404, code: index === 0 ? 'MEDIA_SOURCE_GONE' : 'MEDIA_SOURCE_TIMEOUT' });
+		throw Object.assign(new Error('media unavailable'), { status: 404, code: ['MEDIA_SOURCE_GONE', 'MEDIA_SOURCE_TIMEOUT', 'MEDIA_SOURCE_FORBIDDEN'][index] });
 	});
 	const view = card(post);
-	await waitFor(() => expect(view.container.querySelector('[data-photo-state="unreachable"]')).not.toBeNull());
+	await waitFor(() => expect(view.container.querySelector('[data-photo-state="refused"]')).not.toBeNull());
+	expect(view.container.querySelector('[data-photo-state="unreachable"]')).not.toBeNull();
 	expect(view.container.querySelector('[data-fx-media-error]')?.textContent).toBe('Xで削除された画像があります。');
 	prepared.length = 0;
 	await fireEvent.click(view.getByRole('button', { name: '写真を再試行' }));
-	await waitFor(() => expect(prepared).toEqual([1]));
+	await waitFor(() => expect(prepared).toContain(1));
+	// 再試行は順に取り直すので、続けて別の写真を取りに行かないことを、少し待ってから確かめる。
+	await new Promise(resolve => setTimeout(resolve, 50));
+	expect(prepared).toEqual([1]);
 });
 
 test('a failed timeline photo can be retried like in the note detail', async () => {

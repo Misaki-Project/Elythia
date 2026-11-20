@@ -5,17 +5,17 @@
 
 import { isHttpForbidden } from './public-media.js';
 
-export type PhotoFailureReason = 'fetch' | 'forbidden' | 'budget' | 'gone' | 'dmca' | 'processing' | 'unreachable';
+export type PhotoFailureReason = 'fetch' | 'forbidden' | 'budget' | 'gone' | 'dmca' | 'refused' | 'processing' | 'unreachable';
 export type PhotoLoadFailure = { index: number; reason: PhotoFailureReason };
 
 // 写真の枠の状態。error と unreachable は再試行でき、ほかの失敗は再試行しても直らない。
-export type PhotoState = 'loading' | 'error' | 'forbidden' | 'limit' | 'gone' | 'dmca' | 'processing' | 'unreachable';
+export type PhotoState = 'loading' | 'error' | 'forbidden' | 'limit' | 'gone' | 'dmca' | 'refused' | 'processing' | 'unreachable';
 
 // サーバーが画像を取れなかった原因 (#62)。取得先での削除、こちらでの処理の失敗、通信の失敗を分ける。
 const reasonByCode: Record<string, PhotoFailureReason> = {
 	MEDIA_REMOVED_DMCA: 'dmca',
 	MEDIA_SOURCE_GONE: 'gone',
-	MEDIA_SOURCE_FORBIDDEN: 'forbidden',
+	MEDIA_SOURCE_FORBIDDEN: 'refused',
 	MEDIA_PROCESSING_FAILED: 'processing',
 	MEDIA_SOURCE_TIMEOUT: 'unreachable',
 	MEDIA_SOURCE_FAILED: 'unreachable',
@@ -42,6 +42,8 @@ export function isRetryablePhotoState(state: PhotoState | undefined): boolean {
 export function photoErrorMessage(states: readonly (PhotoState | undefined)[]): string {
 	if (states.includes('dmca')) return '著作権の申し立てにより、Xで削除された画像があります。';
 	if (states.includes('gone')) return 'Xで削除された画像があります。';
+	if (states.includes('refused')) return 'Xが画像の配信を拒否しました。';
+	if (states.includes('forbidden')) return '画像へのアクセスが許可されていません。';
 	if (states.includes('processing')) return 'サーバーで画像を処理できませんでした。';
 	if (states.includes('unreachable')) return 'Xから画像を取得できませんでした。時間をおいて再試行してください。';
 	return 'メディアを読み込めませんでした。通信または容量上限を確認して再試行してください。';
