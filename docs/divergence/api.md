@@ -236,14 +236,14 @@ GETで登録したルートは、本家(Fastifyの`exposeHeadRoutes`。既定で
 
 upstream の endpoint は `endpoints/` 配下 438 件 + `ApiServerService.ts` の fastify 直登録 8 件 (POST 6 / GET 2) = **446 件**。うち **446 件すべてを実装済み (coverage 100.0%)**。直登録の `fastify.all` (`/clear-browser-cache`) は GET と POST の 2 件と数える (#3926)。
 
-### 1-1. Elythia にしかない (127)
+### 1-1. Elythia にしかない (128)
 
-本体の113件に、Misakiで既定有効の`role-level`プラグイン13件と`delivery-targets`プラグイン1件を含める。`make apicompat`は登録済みプラグインルートも集計する。統合後の内訳はGET variant 25件、chat拡張15件、その他87件 (role-level 13件、delivery-targets 1件、upstream追加のreversi操作3件)。
+本体の113件に、Misakiで既定有効の`role-level`プラグイン13件と`delivery-targets`プラグイン2件を含める。`make apicompat`は登録済みプラグインルートも集計する。統合後の内訳はGET variant 25件、chat拡張15件、その他88件 (role-level 13件、delivery-targets 2件、upstream追加のreversi操作3件)。
 
 | 分類 | 件数 | 内容 |
 |---|---|---|
 | role-levelプラグイン | 13 | `/api/plugin/role-level/*`配下のPOSTルート。level設定・XP操作・assignment参照・監査・孤立データの検査と整理・プロフィール表示設定を提供する。Misakiの通常ビルドでは既定有効で、生成API一覧の「その他」に含まれる。詳細は[Misaki固有の記録](misaki.md#role-level)を参照 |
-| delivery-targetsプラグイン | 1 | `POST /api/plugin/delivery-targets/available`。バックエンドが動いているかを投稿フォームのボタンが確かめるためのルートで、`available: true`だけを返す。設定でバックエンドを止めるとルートも無くなり、ボタンは出ない (#48)。Misakiの通常ビルドでは既定有効で、生成API一覧の「その他」に含まれる |
+| delivery-targetsプラグイン | 2 | `POST /api/plugin/delivery-targets/available`は、バックエンドが動いているかを投稿フォームのボタンが確かめるためのルートで、`available: true`だけを返す。設定でバックエンドを止めるとルートも無くなり、ボタンは出ない (#48)。`POST /api/plugin/delivery-targets/follower-hosts`は、ログイン中の利用者のフォロワーがいるサーバーと人数を返す。本体の`users/followers`をその利用者として呼んで数え、応答しない・配信を止めた・ブロック中のサーバーは外す (#60)。Misakiの通常ビルドでは既定有効で、生成API一覧の「その他」に含まれる |
 | GET variant 追加 | 25 | `charts/*` 12 件、`emoji` / `emojis` / `federation/instances` / `federation/stats` / `fetch-rss` / `get-online-users-count` / `hashtags/trend` / `notes/featured` / `notes/reactions` / `server-info` / `bubble-game/ranking` / `users/featured-notes` / `retention`。**対応する POST は両側にある**。`notes/reactions` 以外の 24 件は本家も `allowGet: true` で GET を受ける (`tools/apicompat` は本家を POST だけで数えるので、ここに分類される)。GET の route と `cacheSec` の `Cache-Control` は `TestCacheSecDrift` が本家と突き合わせる (#3593)。`notes/reactions` は本家が 2026.9.0 で `allowGet` を外した後も GET を残している |
 | cherrypick chat 拡張 | 15 | `chat/messages` / `chat/messages/create` / `read` / `update` / `reactions/create` / `reactions/delete`、`chat/rooms/joined` / `unmute` / `transfer-ownership` / `members/ban` / `members/update-membership` / `invitations/accept` / `delete` / `reject`、`chat/unread-count` |
 | 分割アップロード | 4 | `drive/files/create-chunked/start` / `append` / `finish` / `abort` (#2313 / #2314)。upstream に分割アップロードが無いため対応物なし。S3 の multipart upload を包むもので、`UploadId` は `chunked_upload_session` に閉じてクライアントへ出さない。能力は `/api/meta` の `chunkedUpload` で告知し、**未対応構成では field ごと出さない**ので純正クライアントは単発アップロードに倒れる |

@@ -24,16 +24,34 @@ SPDX-License-Identifier: AGPL-3.0-only
 		<MkButton v-for="h in option.hosts" :key="h" small rounded data-testid="delivery-targets-host" @click="remove(h)">{{ h }} <i class="ti ti-x"></i></MkButton>
 	</div>
 	<div :class="$style.caption">{{ messages.noteCaption }}</div>
+
+	<MkFolder :defaultOpen="true" data-testid="delivery-targets-follower-hosts">
+		<template #label>{{ messages.followerHosts }}</template>
+		<div class="_gaps_s">
+			<div :class="$style.caption">{{ messages.followerHostsCaption }}</div>
+			<MkLoading v-if="followers === undefined"/>
+			<div v-else-if="followers === null" :class="$style.caption">{{ messages.followerHostsFailed }}</div>
+			<div v-else-if="followers.hosts.length === 0" :class="$style.caption">{{ messages.followerHostsEmpty }}</div>
+			<template v-else>
+				<MkSwitch v-for="f in followers.hosts" :key="f.host" :modelValue="option.hosts.includes(f.host)" data-testid="delivery-targets-follower-host" @update:modelValue="v => toggle(f.host, v)">
+					{{ f.host }}
+					<template #caption>{{ messages.followerCount(f.count) }}</template>
+				</MkSwitch>
+				<div v-if="followers.truncated" :class="$style.caption">{{ messages.followerHostsTruncated }}</div>
+			</template>
+		</div>
+	</MkFolder>
 </div>
 </template>
 
 <script lang="ts" setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
-import { MkButton, MkInput } from '@/plugin-api.js';
+import { MkButton, MkFolder, MkInput, MkLoading, MkSwitch } from '@/plugin-api.js';
 import { messages } from './messages.js';
-import { addHosts, removeHost, toOption } from './option.js';
+import { addHosts, removeHost, setHost, toOption } from './option.js';
 import type { DeliveryTargetsOption } from './option.js';
-import { suggestHosts } from './host.js';
+import { followerHosts, suggestHosts } from './host.js';
+import type { FollowerHosts } from './host.js';
 
 const props = defineProps<{
 	modelValue: unknown;
@@ -71,6 +89,17 @@ function remove(host: string) {
 	update(removeHost(option.value, host));
 }
 
+function toggle(host: string, selected: boolean) {
+	update(setHost(option.value, host, selected));
+}
+
+// フォロワーのいるサーバーの一覧。undefined は読み込み中、null は読めなかった。
+const followers = ref<FollowerHosts | null | undefined>(undefined);
+const followersController = new AbortController();
+followerHosts(followersController.signal).then(v => {
+	followers.value = v;
+});
+
 // 補完は入力が止まってから引く。打つたびに API を呼ばない。
 let timer: number | null = null;
 let controller: AbortController | null = null;
@@ -91,6 +120,7 @@ watch(draft, (value) => {
 onBeforeUnmount(() => {
 	if (timer != null) window.clearTimeout(timer);
 	controller?.abort();
+	followersController.abort();
 });
 </script>
 
