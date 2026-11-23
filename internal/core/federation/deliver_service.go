@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
@@ -60,6 +62,12 @@ type ed25519SignerEntry struct {
 	fetchedAt time.Time
 }
 
+// rsaSignerEntry is a local signer's RSA keypair, cached only once found.
+type rsaSignerEntry struct {
+	privPEM   string
+	fetchedAt time.Time
+}
+
 // DeliverService computes recipient inboxes and enqueues HTTP-signed delivery
 // jobs onto the deliver queue.
 //
@@ -99,8 +107,16 @@ type DeliverService struct {
 	// に対する DB lookup を 1 回に集約。resolver の resolveActorGroup と同 pattern。
 	capGroup    singleflight.Group
 	signerGroup singleflight.Group
+	// rsaSignerCache は署名者の RSA 鍵 (#4221)。activity ごとに鍵の有無を DB へ
+	// 聞いていた。見つかったものだけを持つ。queue の経路は値を使わず (worker が
+	// SignerUserID から引き直す)、有無の確認にだけ使う。連合を Off から On に戻すと
+	// 鍵は作り直されるが、Off の間の配送は preflightSigner が先に止める。
+	// rsaSignerGroup は signerGroup と分ける。同じ group で鍵を取り違えると、
+	// 戻り値の型が合わずに panic する。
+	rsaSignerCache sync.Map // string (userID) -> rsaSignerEntry
+	rsaSignerGroup singleflight.Group
 	// cacheMu / cacheGen は DropLocal (#3732) のための世代。DropLocal は番号を進めてから
-	// 2 つの cache を消し、読み込みの結果は読む前に控えた番号と一致するときだけ積む。
+	// cache を消し、読み込みの結果は読む前に控えた番号と一致するときだけ積む。
 	// singleflight の鍵にも番号を含め、捨てた後の呼び出しが捨てる前に始まった
 	// 読み込みに相乗りしないようにする。
 	cacheMu  sync.Mutex
@@ -215,8 +231,15 @@ func (s *DeliverService) DeliverToUserOnce(signerUserID string, recipient *model
 // goneSuspend the instance on a 410 (#1811)。recipient の sharedInbox に一致する
 // inbox も shared 扱いにする。
 func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inboxes []string, recipient *model.User, sharedInboxes map[string]bool, notAfter time.Time, opts ...driver.EnqueueOption) error {
+	_, err := s.deliverUsable(signerUserID, body, inboxes, recipient, sharedInboxes, notAfter, opts...)
+	return err
+}
+
+// deliverUsable is deliverInternal that also returns the inboxes it enqueued
+// to: inboxes without the empty, blocked and duplicate ones (nil on error).
+func (s *DeliverService) deliverUsable(signerUserID string, body []byte, inboxes []string, recipient *model.User, sharedInboxes map[string]bool, notAfter time.Time, opts ...driver.EnqueueOption) ([]string, error) {
 	if len(inboxes) == 0 {
-		return nil
+		return nil, nil
 	}
 	usableInboxes := make([]string, 0, len(inboxes))
 	usableSeen := make(map[string]struct{}, len(inboxes))
@@ -231,7 +254,7 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 		usableInboxes = append(usableInboxes, inbox)
 	}
 	if len(usableInboxes) == 0 {
-		return nil
+		return nil, nil
 	}
 	inboxes = usableInboxes
 	var signer *model.User
@@ -241,7 +264,7 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 		var err error
 		signer, signerNeedsObservation, err = s.preflightSigner(signerUserID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		knownUsers := make(map[string]*model.User, 1)
 		if signer != nil {
@@ -249,7 +272,7 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 		}
 		bodyReferences, err = s.preflightBodyReferences(body, knownUsers)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		// Both signer and every local actor/note reference have passed lookup and
 		// availability checks. Only now can an outbound attempt record a first
@@ -257,13 +280,13 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 		host := firstDeliveryHost(inboxes, s)
 		if signerNeedsObservation {
 			if err := s.observeExternalReference(signer.ID, host); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		for _, candidate := range bodyReferences {
 			if candidate.observe {
 				if err := s.observeExternalReference(candidate.id, host); err != nil {
-					return err
+					return nil, err
 				}
 			}
 			s.localReferenceCache.rememberUser(candidate.id, s.clock())
@@ -274,13 +297,13 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 		}
 		if needsNoteRecheck {
 			if err := s.confirmOutboundLocalNotes(body); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 	keyID, keyPEM, err := s.signerCredentials(signerUserID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Ed25519 sign 経路を試行できるのは recipient が Ed25519 capable
 	// (assertionMethod を持つ) + sender が Ed25519 keypair を持つ両方が
@@ -290,18 +313,12 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 	if recipient != nil && s.recipientIsEd25519Capable(recipient) {
 		edKeyID, edPrivPEM = s.signerEd25519Credentials(signerUserID)
 	}
-	seen := make(map[string]struct{}, len(inboxes))
+	// inboxes は冒頭で空・重複・ブロックを除いてある (#4221。以前はここでもう
+	// 一度ブロックを照合していた)。
+	// 本文の Digest は activity ごとに 1 回だけ計算し、job に持たせる (#4221)。
+	digest := activitypub.SHA256Digest(body)
+	payloads := make([]queue.DeliverPayload, 0, len(inboxes))
 	for _, inbox := range inboxes {
-		if inbox == "" {
-			continue
-		}
-		if _, dup := seen[inbox]; dup {
-			continue
-		}
-		if s.isBlockedInbox(inbox) {
-			continue
-		}
-		seen[inbox] = struct{}{}
 		isShared := sharedInboxes[inbox] ||
 			(recipient != nil && recipient.SharedInbox != nil && *recipient.SharedInbox != "" && inbox == *recipient.SharedInbox)
 		// **署名鍵は payload に詰めない。** queue の job は
@@ -318,6 +335,7 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 			Ed25519KeyID:  edKeyID,
 			IsSharedInbox: isShared,
 			SignerUserID:  signerUserID,
+			Digest:        digest,
 		}
 		if !notAfter.IsZero() {
 			payload.NotAfter = notAfter.UnixMilli()
@@ -330,15 +348,90 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 			inline.KeyPEM = keyPEM
 			inline.Ed25519PrivPEM = edPrivPEM
 			if err := s.syncDeliverHook(inline); err != nil {
-				return fmt.Errorf("sync deliver to %s: %w", inbox, err)
+				return nil, fmt.Errorf("sync deliver to %s: %w", inbox, err)
 			}
 			continue
 		}
-		if err := s.enqueuer.EnqueueDeliver(payload, opts...); err != nil {
-			return fmt.Errorf("enqueue deliver to %s: %w", inbox, err)
-		}
+		payloads = append(payloads, payload)
 	}
-	return nil
+	if err := s.enqueueDelivers(payloads, opts); err != nil {
+		return nil, err
+	}
+	return inboxes, nil
+}
+
+const (
+	// deliverEnqueueParallelMin is the number of delivery jobs from which
+	// enqueueDelivers enqueues them in parallel (#4219). 1件ずつの配送
+	// (DeliverToUser など) では、並べても速くならず、goroutineの分だけ損をする。
+	deliverEnqueueParallelMin = 8
+	// deliverEnqueueParallelism is the maximum number of jobs enqueued at once
+	// (#4219). 積む間、この本数だけRedisの接続を使う。16本で1件あたり152µsから
+	// 73µsになり、それ以上はほとんど縮まなかった。
+	deliverEnqueueParallelism = 16
+)
+
+// enqueueDelivers enqueues payloads onto the deliver queue and returns the
+// first error. 件数が多ければ並べて積む (#4219)。失敗したら、まだ積んでいない
+// ものは積まない (直列のときに、失敗したところで止めていたのと同じ)。積む処理の
+// panic は、直列のときと同じく呼び出し元へ伝える。
+func (s *DeliverService) enqueueDelivers(payloads []queue.DeliverPayload, opts []driver.EnqueueOption) error {
+	if len(payloads) < deliverEnqueueParallelMin {
+		for _, payload := range payloads {
+			if err := s.enqueuer.EnqueueDeliver(payload, opts...); err != nil {
+				return fmt.Errorf("enqueue deliver to %s: %w", payload.Inbox, err)
+			}
+		}
+		return nil
+	}
+	var (
+		next     atomic.Int64
+		failed   atomic.Bool
+		errOnce  sync.Once
+		firstErr error
+		wg       sync.WaitGroup
+		// panicked は、worker の中で起きた最初の panic。
+		panicked  any
+		panicOnce sync.Once
+	)
+	fail := func(err error) {
+		failed.Store(true)
+		errOnce.Do(func() { firstErr = err })
+	}
+	for range min(deliverEnqueueParallelism, len(payloads)) {
+		wg.Go(func() {
+			var inbox string
+			// 直列のときは、積む処理の panic を呼び出し元の recover (hook の
+			// goroutine や echo の Recover) がスタック付きで記録していた。worker の
+			// goroutine には受け手がいないので、ここで受け止めて、全部の worker が
+			// 止まった後に呼び出し元の goroutine で投げ直す。元のスタックは、投げ直す
+			// 値に含める。
+			defer func() {
+				if r := recover(); r != nil {
+					failed.Store(true)
+					panicOnce.Do(func() {
+						panicked = fmt.Sprintf("enqueue deliver to %s: %v\n\n%s", inbox, r, debug.Stack())
+					})
+				}
+			}()
+			for !failed.Load() {
+				i := int(next.Add(1)) - 1
+				if i >= len(payloads) {
+					return
+				}
+				inbox = payloads[i].Inbox
+				if err := s.enqueuer.EnqueueDeliver(payloads[i], opts...); err != nil {
+					fail(fmt.Errorf("enqueue deliver to %s: %w", inbox, err))
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if panicked != nil {
+		panic(panicked)
+	}
+	return firstErr
 }
 
 func (s *DeliverService) confirmOutboundLocalNotes(body []byte) error {
@@ -609,7 +702,7 @@ func (s *DeliverService) signerEd25519Credentials(userID string) (string, string
 }
 
 // DropLocal drops the cached Ed25519 capabilities of recipients and the
-// cached Ed25519 keys of local signers in this process (#3732). It is what the
+// cached Ed25519 and RSA keys of local signers in this process (#3732). It is what the
 // cache list of internal/server calls (docs/architecture.md 4.4). It tells no
 // other process.
 func (s *DeliverService) DropLocal() {
@@ -618,6 +711,7 @@ func (s *DeliverService) DropLocal() {
 	s.cacheGen++
 	s.capCache.Clear()
 	s.signerCache.Clear()
+	s.rsaSignerCache.Clear()
 }
 
 func (s *DeliverService) cacheGeneration() uint64 {
@@ -677,60 +771,93 @@ func (s *DeliverService) DeliverToFollowers(signerUserID string, body []byte) er
 // (#2567)。同一アクティビティを同一 inbox に重複 POST しないため、先に
 // 別バッチ (DirectRecipe 等) で送った inbox をここで省く用途で使う。
 func (s *DeliverService) DeliverToFollowersExcluding(signerUserID string, body []byte, exclude map[string]bool) error {
-	rows, err := s.followingRepo.ListRemoteFollowerInboxes(signerUserID)
-	if err != nil {
-		return err
-	}
-	inboxes := make([]string, 0, len(rows))
-	var sharedInboxes map[string]bool
-	for _, row := range rows {
-		if exclude[row.Inbox] {
-			continue
-		}
-		inboxes = append(inboxes, row.Inbox)
-		if row.Shared {
-			if sharedInboxes == nil {
-				sharedInboxes = make(map[string]bool)
-			}
-			sharedInboxes[row.Inbox] = true
-		}
-	}
-	return s.deliverInternal(signerUserID, body, inboxes, nil, sharedInboxes, time.Time{})
+	_, err := s.deliverToFollowers(signerUserID, body, exclude, nil)
+	return err
 }
 
 // DeliverToFollowersAllowed is DeliverToFollowersExcluding limited to the
 // followers whose host allow reports true (#4199).
 //
 // **判定に使うのはフォロワーの利用者の host。** inbox の URL のホストで
-// 判定すると、利用者のドメインと配送先のドメインを分けたサーバー (利用者は
-// `acct.example`、inbox は `web.acct.example`) で、外したはずのホストに
+// 判定すると、inbox を actor とは別のホストに置くサーバー (利用者の host は
+// `remote.example`、inbox は `inbox.remote.example`) で、外したはずのホストに
 // 届くか、許したはずのホストに届かない。照会の判定 (署名した利用者の host)
-// とも揃わなくなる。
+// とも揃わなくなる。利用者の host は actor の URL のホストで、WebFinger の
+// acct のドメインではない (#4202)。
 //
 // shared inbox を許すホストと許さないホストの利用者が共有しているときは送る
 // (同じサーバーなので、送らなければ許したホストにも届かない)。
 func (s *DeliverService) DeliverToFollowersAllowed(signerUserID string, body []byte, exclude map[string]bool, allow func(host string) bool) error {
-	rows, err := s.followingRepo.ListRemoteFollowerInboxHosts(signerUserID)
-	if err != nil {
-		return err
+	_, err := s.deliverToFollowers(signerUserID, body, exclude, allow)
+	return err
+}
+
+// DeliverToFollowersCollect is DeliverToFollowersAllowed (allow == nil means
+// every follower) that also returns the inboxes it enqueued to, so a caller
+// can skip 1:1 deliveries those inboxes already cover (#4223). On error the
+// set is nil.
+func (s *DeliverService) DeliverToFollowersCollect(signerUserID string, body []byte, allow func(host string) bool) (map[string]bool, error) {
+	return s.deliverToFollowers(signerUserID, body, nil, allow)
+}
+
+// deliverToFollowers enqueues delivery to signerUserID's remote followers,
+// skipping inboxes in exclude and, when allow is non-nil, followers whose
+// host allow rejects. Returns the inboxes enqueued to (blocked ones left out).
+func (s *DeliverService) deliverToFollowers(signerUserID string, body []byte, exclude map[string]bool, allow func(host string) bool) (map[string]bool, error) {
+	var rows []model.RemoteInbox
+	if allow == nil {
+		var err error
+		rows, err = s.followingRepo.ListRemoteFollowerInboxes(signerUserID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		hostRows, err := s.followingRepo.ListRemoteFollowerInboxHosts(signerUserID)
+		if err != nil {
+			return nil, err
+		}
+		rows = make([]model.RemoteInbox, 0, len(hostRows))
+		for _, row := range hostRows {
+			if allow(row.Host) {
+				rows = append(rows, row.RemoteInbox)
+			}
+		}
 	}
 	inboxes := make([]string, 0, len(rows))
 	seen := make(map[string]bool, len(rows))
 	var sharedInboxes map[string]bool
 	for _, row := range rows {
-		if exclude[row.Inbox] || seen[row.Inbox] || !allow(row.Host) {
+		if exclude[row.Inbox] {
 			continue
 		}
-		seen[row.Inbox] = true
-		inboxes = append(inboxes, row.Inbox)
+		// shared の印は、同じ URL の行のどれか 1 つが shared なら付ける。行の順で
+		// 決めると、ある利用者の sharedInbox と別の利用者の個別 inbox が同じ URL の
+		// とき、410 をホスト単位の判定 (#1811) へ回せないことがある。
 		if row.Shared {
 			if sharedInboxes == nil {
 				sharedInboxes = make(map[string]bool)
 			}
 			sharedInboxes[row.Inbox] = true
 		}
+		if seen[row.Inbox] {
+			continue
+		}
+		seen[row.Inbox] = true
+		inboxes = append(inboxes, row.Inbox)
 	}
-	return s.deliverInternal(signerUserID, body, inboxes, nil, sharedInboxes, time.Time{})
+	// 返すのは実際に積んだ inbox だけ。除いた inbox (空、ブロックや許可リストの
+	// 外) まで返すと、1:1 の配送を省いた相手がどこからも受け取らないことがある。
+	// 判定は積むときの 1 回だけにする (もう一度判定すると、間に設定が変わったとき
+	// 積まなかった inbox が入る)。
+	usable, err := s.deliverUsable(signerUserID, body, inboxes, nil, sharedInboxes, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+	enqueued := make(map[string]bool, len(usable))
+	for _, inbox := range usable {
+		enqueued[inbox] = true
+	}
+	return enqueued, nil
 }
 
 // DeliverToInboxes enqueues delivery to an explicit set of remote inboxes,
@@ -779,7 +906,25 @@ func (s *DeliverService) signerCredentials(userID string) (string, string, error
 	if !user.IsLocal() {
 		return "", "", ErrNoLocalSigner
 	}
-	kp, err := s.keypairRepo.FindByUserID(userID)
+	keyID := s.urls.UserKeyURI(userID)
+	if cached, ok := s.rsaSignerCache.Load(userID); ok {
+		entry := cached.(rsaSignerEntry)
+		if s.clock().Sub(entry.fetchedAt) <= ed25519CacheTTL {
+			return keyID, entry.privPEM, nil
+		}
+	}
+	gen := s.cacheGeneration()
+	val, err, _ := s.rsaSignerGroup.Do(flightKey(userID, gen), func() (any, error) {
+		kp, err := s.keypairRepo.FindByUserID(userID)
+		if err != nil {
+			return nil, err
+		}
+		// 無いときと読めなかったときは持たない。鍵を作った直後や DB が戻った
+		// 直後に、TTL の間だけ配送が止まらないようにする。
+		entry := rsaSignerEntry{privPEM: kp.PrivateKey, fetchedAt: s.clock()}
+		s.storeIfCurrent(gen, func() { s.rsaSignerCache.Store(userID, entry) })
+		return entry, nil
+	})
 	if err != nil {
 		// **DB 障害を「鍵が無い」にしない** (#2799)。この経路は enqueue の
 		// 前 (producer 側) なので job のリトライ判定は変わらないが、呼び出し元は
@@ -790,8 +935,7 @@ func (s *DeliverService) signerCredentials(userID string) (string, string, error
 		}
 		return "", "", ErrSignerKeyMissing
 	}
-	keyID := s.urls.UserKeyURI(userID)
-	return keyID, kp.PrivateKey, nil
+	return keyID, val.(rsaSignerEntry).privPEM, nil
 }
 
 // fanoutInbox returns the inbox URL that the FOLLOWER fan-out would use for u.
@@ -834,6 +978,13 @@ func fanoutInbox(u *model.User) string {
 //
 // 個別 inbox を持たない行だけ sharedInbox へ倒す。upstream はその場合
 // 配送を skip するが、送れるなら送る方が利用者の意図に近い。
+//
+// ただし、ノートの作成と SendNoteUpdate の Update (引用の承認を付けたものと
+// 外したもの) では、相手の sharedInbox へフォロワーとして既に積んでいれば、
+// 1:1 では送らない (#4223、本家と同じ)。上の
+// 「shared inbox で非公開 activity を扱わない実装」の相手には、フォロワー限定や
+// ホームのノートが、フォローしていないメンション先へ届かないことがある。本家と
+// 同じ振る舞いなので受け入れる。
 func preferredInbox(u *model.User) string {
 	if u.Inbox != nil && *u.Inbox != "" {
 		return *u.Inbox

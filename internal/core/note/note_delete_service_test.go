@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/testutil"
@@ -368,4 +369,35 @@ func TestDeleteService_NotificationHookNotFiredOnFailure(t *testing.T) {
 
 	require.Error(t, svc.Delete(&model.User{ID: "intruder"}, "n1"))
 	assert.Empty(t, hook.notes)
+}
+
+// recordingNoteForgetter records the IDs and the group it is handed.
+type recordingNoteForgetter struct {
+	got    []string
+	groups []*bgwork.Group
+}
+
+func (r *recordingNoteForgetter) ForgetNotesInBackground(g *bgwork.Group, ids []string) {
+	r.got = append(r.got, ids...)
+	r.groups = append(r.groups, g)
+}
+
+// Deleting a local note tells the NoteDelivery plugins to drop what they
+// stored for it, in the group of the server generation; a remote note never
+// had any (#4202).
+func TestDeleteService_ForgetsNoteDelivery(t *testing.T) {
+	noteRepo := testutil.NewMockNoteRepository()
+	host := "remote.example"
+	noteRepo.Notes["local"] = &model.Note{ID: "local", UserID: "user1"}
+	noteRepo.Notes["remote"] = &model.Note{ID: "remote", UserID: "user2", UserHost: &host}
+	svc := note.NewDeleteService(noteRepo)
+	forgetter := &recordingNoteForgetter{}
+	g := bgwork.New()
+	svc.SetNoteDeliveryForgetter(forgetter, g)
+
+	require.NoError(t, svc.Delete(&model.User{ID: "user1"}, "local"))
+	require.NoError(t, svc.Delete(&model.User{ID: "user2", Host: &host}, "remote"))
+	require.ErrorIs(t, svc.Delete(&model.User{ID: "user1"}, "missing"), note.ErrNoteNotFound)
+	assert.Equal(t, []string{"local"}, forgetter.got, "a remote note and a note that was not deleted are not forgotten")
+	assert.Equal(t, []*bgwork.Group{g}, forgetter.groups)
 }

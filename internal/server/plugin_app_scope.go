@@ -5,7 +5,7 @@ import (
 
 	"github.com/elythia-network/elythia/internal/misc/permissions"
 	"github.com/elythia-network/elythia/internal/server/middleware"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 )
 
 // pluginAppTokenPolicy keeps app tokens out of plugin routes by default.
@@ -15,7 +15,7 @@ func pluginAppTokenPolicy() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		scoped := middleware.RequireScope(permissions.WriteRoleLevelExperience)(next)
 		denied := middleware.RejectAppToken()(next)
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			if c.Request().Method == http.MethodPost && c.Path() == "/api/plugin/role-level/admin/change-exp" {
 				return scoped(c)
 			}

@@ -39,6 +39,41 @@ const TaskTypeObjectStorageDeleteFile = "objectStorage:deleteFile"
 // `cleanRemoteFiles` job: 1 本の job が内部でバッチ削除を回す (#2325)。
 const TaskTypeCleanRemoteFiles = "objectStorage:cleanRemoteFiles"
 
+// TaskTypeMigrateLocalDriveFiles is the task type of one batch of copying
+// locally stored drive files to object storage (#4180). Elythia-only: each
+// job copies a batch and enqueues the next one with the cursor.
+const TaskTypeMigrateLocalDriveFiles = "objectStorage:migrateLocalDriveFiles"
+
+// TaskTypeVerifyMigratedDriveFiles is the task type of one batch of verifying
+// the drive files the migration copied to object storage (#4181).
+// Elythia-only; it takes MigrateLocalDriveFilesPayload like the migration.
+const TaskTypeVerifyMigratedDriveFiles = "objectStorage:verifyMigratedDriveFiles"
+
+// TaskTypePurgeLocalDriveFiles is the task type of one batch of deleting the
+// local copies of the verified drive files (#4182). Elythia-only; it takes
+// MigrateLocalDriveFilesPayload like the migration.
+const TaskTypePurgeLocalDriveFiles = "objectStorage:purgeLocalDriveFiles"
+
+// TaskTypeRestoreMigratedDriveFiles is the task type of one batch of moving
+// the migrated drive files back to the local storage (#4183). Elythia-only;
+// it takes MigrateLocalDriveFilesPayload like the migration.
+const TaskTypeRestoreMigratedDriveFiles = "objectStorage:restoreMigratedDriveFiles"
+
+// TaskTypeCleanupRestoredDriveFileCopies is the task type of one batch of
+// deleting the copies the drive files moved back to the local storage left
+// in object storage (#4197). Elythia-only; it takes
+// MigrateLocalDriveFilesPayload like the migration, with the key of the last
+// copy handled as AfterID.
+const TaskTypeCleanupRestoredDriveFileCopies = "objectStorage:cleanupRestoredDriveFileCopies"
+
+// MigrateLocalDriveFilesPayload names the migration, verification, purge or
+// restore run (Token) and the cursor (the files after AfterID are handled
+// next).
+type MigrateLocalDriveFilesPayload struct {
+	Token   string `json:"token"`
+	AfterID string `json:"afterId"`
+}
+
 // ObjectStorageDeleteFilePayload identifies the object to remove.
 //
 // upstream の job data も `{ key }` の 1 field だけで、どの backend から消すかは
@@ -239,6 +274,11 @@ type DeliverPayload struct {
 	// 変わった後に届いてしまうもの (引用の承認の QuoteRequest) に付ける。期限付きの
 	// job は、ブレーカーや流量の制限で後へ回す代わりに捨てる。
 	NotAfter int64 `json:"notAfter,omitempty"`
+	// Digest is the HTTP Digest header value of Body ("SHA-256=<base64>"),
+	// computed once per activity when it is enqueued (#4221). 配送先が何千あっても
+	// 本文のハッシュは 1 回で済む。空 (それより前に積まれた job) なら worker が
+	// 計算する。
+	Digest string `json:"digest,omitempty"`
 }
 
 // NewDeliverTask serializes the payload into a driver.Task ready to

@@ -54,7 +54,19 @@ const (
 	// 入るので、ホスト単位で起こす手段が無い。試行が通ったり管理者が手で閉じたり
 	// しても、最大 1 時間待ったままになる。5 分で起きて判定し直せば、再開後は
 	// 5 分以内に流れる (起きるたびに Redis を 1 回読むだけ)。
+	//
+	// 間隔が breakerLongHoldInterval に達したら区切らない (下を参照)。
 	breakerHoldCap = 5 * time.Minute
+	// breakerLongHoldInterval is the probe interval from which a held job
+	// waits for the next probe instead of breakerHoldCap (#4222).
+	//
+	// 間隔が上限に達した相手は、少なくとも 1 時間ほど落ちたままでいる。そこからも
+	// 5 分で区切ると、7 日の自動停止までの間に 1 件が約 2,000 回起きて、payload の
+	// decode と Redis の出し入れをしては遅延に戻る。次に試す時刻まで待たせれば、
+	// 1 時間に 1 回で済む。その代わり、手で閉じても溜まったジョブは次に試す時刻
+	// (ずらしを含めて最大 66 分) まで流れない。試行は次に試す時刻の後に最初に
+	// 起きたジョブが行うので、自動で閉じるときの遅れは以前と同じく数分以内。
+	breakerLongHoldInterval = BreakerMaxInterval
 	// breakerProbeWait is how long jobs wait while the single probe is in
 	// flight. 試行はすぐ終わることが多いので短くする。長いと、試行が通った後も
 	// 溜まったジョブがその分待たされる。
@@ -113,6 +125,8 @@ type CheckResult struct {
 	// ProbeToken は半開の試行の札。試行の結果はこの札と一緒に返す。札が一致する
 	// ときだけ「試行の失敗」として間隔を倍にし、枠を外す。
 	ProbeToken string
+	// FlagSet は CheckWithFlag に渡したキーが Redis にあったか。
+	FlagSet bool
 }
 
 // BreakerState is one host's breaker as shown to admins.
@@ -177,7 +191,9 @@ const (
 	checkThrottle = 4 // 429 で止めている。値は予約した送信時刻までの ms
 )
 
-// checkScript returns {kind, ms, hasState}.
+// checkScript returns {kind, ms, hasState, flag, interval}. flag is whether
+// KEYS[6] exists (0 when it is not passed). interval is the probe interval in
+// ms while the breaker is open (checkOpen), 0 otherwise.
 //
 // 判定と probe ロックの取得を不可分にする。別々に叩くと、半開の瞬間に
 // 複数のノードが同時に「試してよい」と判断する。
@@ -188,12 +204,16 @@ local token = ARGV[3]
 local spacing = tonumber(ARGV[4])
 local job = ARGV[5]
 local hasState = redis.call("EXISTS", KEYS[1])
+local flag = 0
+if #KEYS >= 6 then
+  flag = redis.call("EXISTS", KEYS[6])
+end
 -- 予約済みのジョブは自分の時刻まで待つ。時刻が来たら予約を消して先へ進む
 -- (まだ止めていれば列の最後尾に並び直す = 429 が再発した)。
 if job ~= "" then
   local mine = tonumber(redis.call("HGET", KEYS[5], job) or "0")
   if mine > now then
-    return {4, mine - now, hasState}
+    return {4, mine - now, hasState, flag, 0}
   end
   if mine > 0 then
     redis.call("HDEL", KEYS[5], job)
@@ -213,48 +233,64 @@ if ttl and ttl > 0 then
     redis.call("HSET", KEYS[5], job, slot)
     redis.call("PEXPIRE", KEYS[5], slot - now + 60000)
   end
-  return {4, slot - now, hasState}
+  return {4, slot - now, hasState, flag, 0}
 end
 local o = tonumber(redis.call("HGET", KEYS[1], "o") or "0")
 if o > 0 then
   local p = tonumber(redis.call("HGET", KEYS[1], "p") or "0")
   if now < p then
-    return {2, p - now, 1}
+    return {2, p - now, 1, flag, tonumber(redis.call("HGET", KEYS[1], "i") or "0")}
   end
   if redis.call("SET", KEYS[2], token, "NX", "PX", lockTTL) then
-    return {1, 0, 1}
+    return {1, 0, 1, flag, 0}
   end
-  return {3, redis.call("PTTL", KEYS[2]), 1}
+  return {3, redis.call("PTTL", KEYS[2]), 1, flag, 0}
 end
-return {0, 0, hasState}
+return {0, 0, hasState, flag, 0}
 `)
 
 // Check decides whether a delivery to host may go now. job identifies the
-// delivery across wake-ups (the processor passes a hash of the payload), so
+// delivery across wake-ups (the processor passes a hash of the payload fields), so
 // a job held by a 429 keeps its reserved send time; "" reserves anew each time.
 //
 // **Redis が読めなければ通す。** 観測のための仕組みが配送を止める側に倒れると、
 // Redis の瞬断が全配送の停止になる。
 func (b *Breaker) Check(ctx context.Context, host, job string) CheckResult {
+	return b.CheckWithFlag(ctx, host, job, "")
+}
+
+// CheckWithFlag is Check that also reports in FlagSet whether flagKey exists
+// on the breaker's Redis ("" reads nothing). 配送が同じ Redis に置く別の印
+// (Ed25519 の degrade) を、判定と同じ 1 往復で読むために使う (#4221)。
+//
+// Redis が読めなければ FlagSet は false になる。
+func (b *Breaker) CheckWithFlag(ctx context.Context, host, job, flagKey string) CheckResult {
 	if b == nil || host == "" {
 		return CheckResult{}
 	}
 	token := b.token()
-	res, err := checkScript.Run(ctx, b.rdb,
-		[]string{breakerKey(host), probeKey(host), throttleKey(host), slotKey(host), reservationKey(host)},
+	keys := []string{breakerKey(host), probeKey(host), throttleKey(host), slotKey(host), reservationKey(host)}
+	if flagKey != "" {
+		keys = append(keys, flagKey)
+	}
+	res, err := checkScript.Run(ctx, b.rdb, keys,
 		b.clock().UnixMilli(), breakerProbeLockTTL.Milliseconds(), token, throttleSpacing.Milliseconds(), job).Int64Slice()
-	if err != nil || len(res) != 3 {
+	if err != nil || len(res) != 5 {
 		return CheckResult{}
 	}
-	r := CheckResult{HasState: res[2] == 1}
+	r := CheckResult{HasState: res[2] == 1, FlagSet: res[3] == 1}
 	ms := time.Duration(res[1]) * time.Millisecond
 	switch res[0] {
 	case checkProbe:
 		r.Decision, r.ProbeToken = BreakerProbe, token
 	case checkOpen:
-		// 次に試す時刻まで丸ごとは待たせない (breakerHoldCap)。一斉に起きないよう、
-		// 待ち時間の 1 割までずらす (待ちは最大 5 分なので、ずれは最大 30 秒)。
-		wait := min(ms, breakerHoldCap)
+		// 次に試す時刻まで丸ごとは待たせない (breakerHoldCap)。ただし間隔が長く
+		// なった相手は、次に試す時刻まで待たせる (breakerLongHoldInterval)。
+		// 一斉に起きないよう、待ち時間の 1 割までずらす。
+		wait := ms
+		if time.Duration(res[4])*time.Millisecond < breakerLongHoldInterval {
+			wait = min(ms, breakerHoldCap)
+		}
 		r.Decision, r.Delay = BreakerDelay, wait+b.jitter(wait/10)
 	case checkProbing:
 		wait := min(max(ms, time.Second), breakerProbeWait)
@@ -355,7 +391,11 @@ func (b *Breaker) ReleaseProbe(ctx context.Context, host, probeToken string) {
 }
 
 // HoldFor returns how long a job that failed while the breaker is open
-// should wait, capped like Check's holds.
+// should wait, capped at breakerHoldCap.
+//
+// 間隔が長くても breakerHoldCap で区切る。ここに来るのは試行と、開いた瞬間に
+// 飛んでいた配送だけで件数が少ない。起きた後の Check が、次に試す時刻まで
+// 待たせる (#4222)。
 func (b *Breaker) HoldFor(untilProbe time.Duration) time.Duration {
 	if b == nil {
 		return untilProbe
@@ -392,7 +432,8 @@ return 0
 
 // Close lets deliveries to host go again (an admin closing it by hand): it
 // forgets the breaker state, the 429 hold and the reserved send times. Held
-// jobs wake within breakerHoldCap and find nothing to wait for.
+// jobs wake within breakerHoldCap and find nothing to wait for, except those
+// held until the next probe (breakerLongHoldInterval), which wake then.
 //
 // **429 の予約も消す。** 予約の列は溜まった件数 x 間隔まで伸びる (1 万件で
 // 1.4 時間) ので、残すと手で閉じても解けない。

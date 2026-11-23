@@ -47,6 +47,8 @@ export type ElythiaMetaFields = {
 	approvalRequiredForSignup?: boolean;
 	registrationClosed?: boolean;
 	signupApplicationForm?: SignupApplicationFormField[];
+	/** The server plugins whose post form options `notes/create` accepts in `pluginOptions`. */
+	noteDeliveryPlugins?: string[];
 	/** Present only when chunked upload is available. */
 	chunkedUpload?: {
 		chunkSize: number;
@@ -904,6 +906,61 @@ export type DriveUsageBucket = {
 export type DriveUsageKind = 'attachment' | 'avatar' | 'banner' | 'emoji' | 'other';
 
 export type DriveUsageOrigin = 'local' | 'remote';
+
+/** The result of `admin/drive/object-storage-migration/status` (#4180 - #4183, #4197). */
+export type DriveObjectStorageMigrationStatus = {
+	/** Whether object storage is configured, so files have somewhere to go. */
+	objectStorageEnabled: boolean;
+	/** The operation running now, or null when none is. */
+	running: 'migrate' | 'verify' | 'purge' | 'restore' | 'cleanup' | null;
+	/** Files still stored locally. */
+	localFiles: number;
+	/** Files the migration copied to object storage (the files `restore` moves back). */
+	migratedFiles: number;
+	/** Files whose last migration attempt failed. */
+	failedFiles: number;
+	/** The most recent failures, newest first (at most 100). */
+	failures: DriveObjectStorageMigrationFailure[];
+	/** Migrated files whose copy was verified to match the recorded size and md5. */
+	verifiedFiles: number;
+	/** Files whose last verification failed. */
+	verifyFailedFiles: number;
+	/** The most recent verification failures, newest first (at most 100). */
+	verifyFailures: DriveObjectStorageMigrationFailure[];
+	/** Verified files whose local copy has not been deleted. */
+	purgeableFiles: number;
+	/** Migrated files whose local copy was deleted. */
+	localDeletedFiles: number;
+	/** Files whose last purge attempt failed. A mismatch keeps the local copy; a failed deletion may leave part of it. */
+	purgeFailedFiles: number;
+	/** The most recent purge failures, newest first (at most 100). */
+	purgeFailures: DriveObjectStorageMigrationFailure[];
+	/** Files whose last attempt to move back failed (they stay migrated). */
+	restoreFailedFiles: number;
+	/** The most recent failures to move back, newest first (at most 100). */
+	restoreFailures: DriveObjectStorageMigrationFailure[];
+	/** Copies the files moved back left in object storage (the copies `cleanup-copies` deletes). */
+	restoredCopies: number;
+	/** Copies whose last deletion failed. */
+	cleanupFailedCopies: number;
+	/** The most recent copies that could not be deleted, newest first (at most 100). */
+	cleanupFailures: DriveObjectStorageMigrationCopyFailure[];
+};
+
+/** A copy left by moving a file back that could not be deleted (#4197). The file may have been deleted. */
+export type DriveObjectStorageMigrationCopyFailure = {
+	key: string;
+	fileId: string;
+	error: string;
+	failedAt: string;
+};
+
+/** A file the migration could not copy, verify, purge or move back. */
+export type DriveObjectStorageMigrationFailure = {
+	fileId: string;
+	error: string;
+	failedAt: string;
+};
 
 /** The result of `admin/drive/usage`. */
 export type DriveUsage = {

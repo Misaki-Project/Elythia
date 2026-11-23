@@ -40,7 +40,8 @@ const (
 // HTTPSigner abstracts the signed POST capability of activitypub.Client so
 // that DeliverProcessor can be unit-tested without an actual HTTP client.
 type HTTPSigner interface {
-	PostSigned(url string, body []byte, key *activitypub.PrivateKey) (*http.Response, error)
+	// PostSignedDigest sends body with digest as its Digest header value.
+	PostSignedDigest(url string, body []byte, digest string, key *activitypub.PrivateKey) (*http.Response, error)
 }
 
 // ResponseHook is invoked after each HTTP attempt so the instance metadata
@@ -75,7 +76,9 @@ type DeliveryTelemetry interface {
 // DeliveryBreaker holds deliveries to hosts that are down or asked us to
 // slow down (#3048). 実装は core/deliveryhealth.Breaker。
 type DeliveryBreaker interface {
-	Check(ctx context.Context, host, job string) deliveryhealth.CheckResult
+	// CheckWithFlag also reports whether flagKey exists, in the same round
+	// trip (#4221)。Ed25519 の degrade の印を読むのに使う。
+	CheckWithFlag(ctx context.Context, host, job, flagKey string) deliveryhealth.CheckResult
 	RecordFailure(ctx context.Context, host, probeToken string) (open bool, untilProbe time.Duration)
 	ReleaseProbe(ctx context.Context, host, probeToken string)
 	HoldFor(untilProbe time.Duration) time.Duration
@@ -320,6 +323,9 @@ func isPermanentSigningKeyError(err error) bool {
 // に EX=300 で記録され、以後 5 分間は同 host への配送が即 RSA fallback される
 // (= "assertionMethod を expose しているが Ed25519 verify が壊れている" 実装
 // に対する safety net #1067 / #1071)。
+//
+// ブレーカーを配線したときは、印をブレーカーの Redis で読む (#4221)。
+// SetDeliveryBreaker には同じ Redis のブレーカーを渡すこと。
 func (p *DeliverProcessor) SetRedis(c *redis.Client) {
 	p.redis = c
 }
@@ -623,7 +629,8 @@ func (p *DeliverProcessor) Handle(ctx context.Context, t driver.Task) error {
 	// (admin/queue/jobs から読めてしまうため)、PrivPEM の有無では判定できない。
 	// KeyID は DeliverService が「相手が FEP-521a で Ed25519 を expose して
 	// いる」と判断したときだけ詰める、という契約は変わっていない。
-	useEd25519 := (payload.Ed25519KeyID != "" || payload.Ed25519PrivPEM != "") && !p.isEd25519Degraded(host)
+	wantEd25519 := payload.Ed25519KeyID != "" || payload.Ed25519PrivPEM != ""
+	useEd25519 := wantEd25519
 
 	// 落ちている相手 / 間隔を空けるよう言われた相手へは送らず、試行回数を消費せずに
 	// 後へ回す (#3048)。**生成側 (fanout) では止めない** — ブレーカーの開閉は可変な
@@ -632,13 +639,25 @@ func (p *DeliverProcessor) Handle(ctx context.Context, t driver.Task) error {
 	// 迂回させても届かない)。
 	a := attempt{ctx: ctx, host: host}
 	if p.breaker != nil && host != "" {
-		r := p.breaker.Check(ctx, host, deliveryJobKey(t.Payload()))
+		// Ed25519 の degrade の印は、ブレーカーの判定と同じ 1 往復で読む (#4221。
+		// 以前は別々に Redis へ聞いていた)。印を書くのは SetRedis の client なので、
+		// **ブレーカーと SetRedis には同じ Redis を渡す** (どちらも Default)。
+		// 分けると、書いた印をここで読めなくなる。
+		// 読めなければ印は無い扱いになり、isEd25519Degraded と同じく Ed25519 を試す。
+		var flagKey string
+		if wantEd25519 {
+			flagKey = ed25519DegradeKey(host)
+		}
+		r := p.breaker.CheckWithFlag(ctx, host, deliveryJobKey(payload, t.Payload()), flagKey)
 		if r.Decision == deliveryhealth.BreakerDelay {
 			slog.Debug("ap deliver: held back (breaker open or rate limited)", "host", host, "wait", r.Delay)
 			return holdOrDrop(payload, fmt.Errorf("ap deliver: %s held back", host), r.Delay)
 		}
 		a.probeToken = r.ProbeToken
 		a.breakerState = r.HasState || r.Decision == deliveryhealth.BreakerProbe
+		useEd25519 = useEd25519 && !r.FlagSet
+	} else if useEd25519 {
+		useEd25519 = !p.isEd25519Degraded(host)
 	}
 
 	// 配送レイテンシの起点 (#2461)。sendOnce の中で Ed25519->RSA の再送が起きた
@@ -770,7 +789,7 @@ func (p *DeliverProcessor) sendOnce(payload queue.DeliverPayload, useEd25519 boo
 	if useEd25519 {
 		key, err := p.resolveSigningKey(keyKindEd25519, payload)
 		if err == nil {
-			resp, perr := p.signer.PostSigned(payload.Inbox, payload.Body, key)
+			resp, perr := p.signer.PostSignedDigest(payload.Inbox, payload.Body, bodyDigest(payload), key)
 			if perr != nil {
 				slog.Warn("ap deliver: ed25519 post failed",
 					"inbox", payload.Inbox, "err", perr)
@@ -796,7 +815,7 @@ func (p *DeliverProcessor) sendOnce(payload queue.DeliverPayload, useEd25519 boo
 		}
 		return nil, false, fmt.Errorf("load private key: %w: %w", err, errLocalSend)
 	}
-	resp, perr := p.signer.PostSigned(payload.Inbox, payload.Body, key)
+	resp, perr := p.signer.PostSignedDigest(payload.Inbox, payload.Body, bodyDigest(payload), key)
 	if perr != nil {
 		slog.Warn("ap deliver: post failed",
 			"inbox", payload.Inbox, "err", perr)
@@ -831,15 +850,43 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 	return 0
 }
 
+// bodyDigest returns the Digest header value of the payload's body: the one
+// computed when it was enqueued, or computed here for a job enqueued before
+// #4221.
+func bodyDigest(p queue.DeliverPayload) string {
+	if p.Digest != "" {
+		return p.Digest
+	}
+	return activitypub.SHA256Digest(p.Body)
+}
+
 // deliveryJobKey identifies a delivery across wake-ups so that a job held by
 // a 429 keeps its reserved send time.
 //
 // ジョブの ID は driver.Task に載っていないので payload から作る。同じ payload の
 // ジョブが 2 つあると予約を共有するが、先に起きた方が予約を消し、後の方は
 // 止めていなければそのまま送る (止めていれば並び直す) だけで、取りこぼしは無い。
-func deliveryJobKey(payload []byte) string {
-	sum := sha256.Sum256(payload)
-	return hex.EncodeToString(sum[:16])
+//
+// **本文はハッシュし直さない** (#4221)。Digest があれば、本文の代わりにそれと
+// 本文以外の項目から作る。本文ごとハッシュすると、本文の SHA-256 を Digest と
+// 合わせて 2 回計算することになる。Digest の無い job (それより前に積まれたもの)
+// は、今までどおり payload 全体から作る。新旧の worker が混ざっている間は、
+// 同じ job でも版によって鍵が変わる。予約が見つからなかった側は列の最後尾に
+// 並び直すだけで、送り損ねはしない。
+//
+// payload に項目を足したら、ここに入れるか、入れない理由を
+// TestDeliverProcessor_JobKeyCoversEveryField の除外に書く。
+func deliveryJobKey(p queue.DeliverPayload, raw []byte) string {
+	if p.Digest == "" {
+		sum := sha256.Sum256(raw)
+		return hex.EncodeToString(sum[:16])
+	}
+	h := sha256.New()
+	for _, f := range []string{p.Inbox, p.Digest, p.SignerUserID, p.KeyID, p.Ed25519KeyID, strconv.FormatInt(p.NotAfter, 10), strconv.FormatBool(p.IsSharedInbox)} {
+		_, _ = h.Write([]byte(f))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // expired reports whether a delivery with a deadline is past it (#3238).

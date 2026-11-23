@@ -23,6 +23,7 @@ import type {
 	BubbleVersusReportReason,
 	DatabaseHealthReport,
 	DeliveryOutcomeClass,
+	DriveObjectStorageMigrationStatus,
 	DriveUsage,
 	EmojiApplication,
 	EmojiApplicationPendingLimit,
@@ -142,6 +143,38 @@ export type ElythiaEndpoints = {
 	'admin/database-health': {
 		req: Misskey.entities.EmptyRequest;
 		res: DatabaseHealthReport;
+	};
+	'admin/drive/object-storage-migration/cleanup-copies': {
+		/** Deletes the copies the drive files moved back left in object storage, in the background (#4197). */
+		req: Misskey.entities.EmptyRequest;
+		res: undefined;
+	};
+	'admin/drive/object-storage-migration/purge-local': {
+		/**
+		 * Deletes the local copies of the verified drive files in the background, verifying each once more first (#4182).
+		 * It requires the re-authentication of `admin/backup/*` (#4184).
+		 */
+		req: BackupReauth;
+		res: undefined;
+	};
+	'admin/drive/object-storage-migration/restore': {
+		/** Moves the migrated drive files back to the local storage in the background (#4183). */
+		req: Misskey.entities.EmptyRequest;
+		res: undefined;
+	};
+	'admin/drive/object-storage-migration/start': {
+		/** Copies the locally stored drive files to object storage in the background (#4180). */
+		req: Misskey.entities.EmptyRequest;
+		res: undefined;
+	};
+	'admin/drive/object-storage-migration/status': {
+		req: Misskey.entities.EmptyRequest;
+		res: DriveObjectStorageMigrationStatus;
+	};
+	'admin/drive/object-storage-migration/verify': {
+		/** Verifies the migrated drive files against the recorded size and md5 in the background (#4181). */
+		req: Misskey.entities.EmptyRequest;
+		res: undefined;
 	};
 	'admin/drive/usage': {
 		req: {

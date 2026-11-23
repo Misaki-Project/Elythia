@@ -9,10 +9,11 @@ import (
 
 	"github.com/elythia-network/elythia/internal/api/meta"
 	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/notedelivery"
 	"github.com/elythia-network/elythia/internal/frontendutil"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 )
 
 // embedCacheControl mirrors upstream's `public, max-age=3600` on embed pages.
@@ -37,9 +38,13 @@ type EmbedDeps struct {
 	UserRepo repository.UserRepository
 	ClipRepo repository.ClipRepository
 
-	PackNote func(c echo.Context, note *model.Note) (any, error)
-	PackUser func(c echo.Context, user *model.User) (any, error)
-	PackClip func(c echo.Context, clip *model.Clip) (any, error)
+	PackNote func(c *echo.Context, note *model.Note) (any, error)
+	PackUser func(c *echo.Context, user *model.User) (any, error)
+	PackClip func(c *echo.Context, clip *model.Clip) (any, error)
+
+	// NoteDelivery は配送先を絞るプラグイン (#4203)。条件で自分のホストに
+	// 見せないノートは埋め込まない。nil なら絞らない。
+	NoteDelivery *notedelivery.Registry
 }
 
 // embedHandlers renders the embed shell for the four upstream embed routes.
@@ -50,6 +55,7 @@ type embedHandlers struct {
 	chunkedUpload        meta.ChunkedUploadCapability
 	setup                *meta.SetupDetector
 	adRepo               repository.AdRepository
+	noteDeliveryPlugins  meta.NoteDeliveryPlugins
 	entry                frontendutil.ClientEntryInfo
 	loader               frontendutil.LoaderAssets
 	deps                 EmbedDeps
@@ -65,6 +71,7 @@ func newEmbedHandlers(
 	chunkedUpload meta.ChunkedUploadCapability,
 	setup *meta.SetupDetector,
 	adRepo repository.AdRepository,
+	noteDeliveryPlugins meta.NoteDeliveryPlugins,
 	deps EmbedDeps,
 ) *embedHandlers {
 	return &embedHandlers{
@@ -74,6 +81,7 @@ func newEmbedHandlers(
 		chunkedUpload:        chunkedUpload,
 		setup:                setup,
 		adRepo:               adRepo,
+		noteDeliveryPlugins:  noteDeliveryPlugins,
 		entry:                embedEntryFor(cfg),
 		loader:               embedLoaderAssetsFor(cfg),
 		deps:                 deps,
@@ -89,14 +97,19 @@ func newEmbedHandlers(
 //   - visibility が specified   -> 文脈なしのシェル (宛先限定)
 //   - visibility が followers   -> 文脈なしのシェル (フォロワー限定)
 //   - userHost != nil (リモート) -> 文脈なしのシェル
+//   - プラグインの条件で、自分のホストに見せないノート -> 文脈なしのシェル (#4203)
 //
 // upstream は該当時に何も返さず fastify の既定 (空応答) に落ちるが、mk-go は
 // 常にシェルを返す。「ノートが無い」と「非公開」を応答の形で区別させないため。
-func (h *embedHandlers) Note(c echo.Context) error {
+func (h *embedHandlers) Note(c *echo.Context) error {
 	// upstream は `relations: { user: true, reply: true, renote: true }` で引く。
 	// FindByID だと author が空のまま pack され、埋め込みに投稿者名が出ない。
 	note, err := h.deps.NoteRepo.FindByIDWithRelations(c.Param("note"))
 	if err != nil || note == nil || !embedNoteIsPublic(note) {
+		return h.render(c, nil)
+	}
+	// 埋め込みは認証を伴わないので、ログインしていない閲覧者として判定する。
+	if h.deps.NoteDelivery.HiddenFromVisitors(c.Request().Context(), []string{note.ID})[note.ID] {
 		return h.render(c, nil)
 	}
 	packed, err := h.deps.PackNote(c, note)
@@ -120,7 +133,7 @@ func embedNoteIsPublic(note *model.Note) bool {
 // User renders /embed/user-timeline/:user.
 //
 // リモートユーザーは埋め込まない (upstream と同じ)。
-func (h *embedHandlers) User(c echo.Context) error {
+func (h *embedHandlers) User(c *echo.Context) error {
 	user, err := h.deps.UserRepo.FindByID(c.Param("user"))
 	if err != nil || user == nil || (user.Host != nil && *user.Host != "") {
 		return h.render(c, nil)
@@ -133,7 +146,7 @@ func (h *embedHandlers) User(c echo.Context) error {
 }
 
 // Clip renders /embed/clips/:clip.
-func (h *embedHandlers) Clip(c echo.Context) error {
+func (h *embedHandlers) Clip(c *echo.Context) error {
 	clip, err := h.deps.ClipRepo.FindByID(c.Param("clip"))
 	if err != nil || clip == nil {
 		return h.render(c, nil)
@@ -152,12 +165,12 @@ func (h *embedHandlers) Clip(c echo.Context) error {
 }
 
 // Fallback renders /embed/* for paths without a dedicated handler.
-func (h *embedHandlers) Fallback(c echo.Context) error {
+func (h *embedHandlers) Fallback(c *echo.Context) error {
 	return h.render(c, nil)
 }
 
 // render writes the embed HTML shell with the optional context payload.
-func (h *embedHandlers) render(c echo.Context, ctx *embedContext) error {
+func (h *embedHandlers) render(c *echo.Context, ctx *embedContext) error {
 	instanceName := config.DisplayName
 	// upstream base-embed.tsx:46-47 と同じ fallback (SPA shell と共通)。
 	iconURL := "/favicon.ico"
@@ -183,7 +196,7 @@ func (h *embedHandlers) render(c echo.Context, ctx *embedContext) error {
 		if m.ThemeColor != nil && *m.ThemeColor != "" {
 			themeColor = *m.ThemeColor
 		}
-		metaJSON = buildMetaJSON(h.cfg, m, h.proxyAccountResolver, h.chunkedUpload, h.setup, h.adRepo)
+		metaJSON = buildMetaJSON(h.cfg, m, h.proxyAccountResolver, h.chunkedUpload, h.setup, h.adRepo, h.noteDeliveryPlugins)
 	}
 
 	embedCtxJSON := ""

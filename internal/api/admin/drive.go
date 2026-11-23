@@ -8,12 +8,13 @@ import (
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/pagination"
+	coredrive "github.com/elythia-network/elythia/internal/core/drive"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"gorm.io/datatypes"
 
 	"github.com/elythia-network/elythia/internal/core/role"
@@ -35,7 +36,7 @@ const driveCleanupMaxBatches = 10000
 //
 // queue 未配線時のみ、従来どおり handler 内で同期削除する。storage backend も
 // 未配線なら DB 行のみ削除 (条件は修正済 = isLink=false)。
-func (h *Handler) DriveCleanRemoteFiles(c echo.Context) error {
+func (h *Handler) DriveCleanRemoteFiles(c *echo.Context) error {
 	if h.driveFileRepo == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -69,7 +70,7 @@ func (h *Handler) DriveCleanRemoteFiles(c echo.Context) error {
 // 同じ行を re-list し続けてしまう。失敗は slog で観測可能にし orphan を検知できる
 // ようにする。list / DeleteByIDs (= DB) の失敗は hard error として返し、handler が
 // 500 を返す (DB-only 経路の 500 と整合)。
-func (h *Handler) deleteFilesBatched(c echo.Context, list func(limit int) ([]*model.DriveFile, error)) error {
+func (h *Handler) deleteFilesBatched(c *echo.Context, list func(limit int) ([]*model.DriveFile, error)) error {
 	return h.cleanupFilesBatched(c, list, h.driveFileRepo.DeleteByIDs)
 }
 
@@ -83,7 +84,7 @@ func (h *Handler) deleteFilesBatched(c echo.Context, list func(limit int) ([]*mo
 // **`finish` が行を消さない場合、list が同じ行を返し続けない形であること。**
 // link に倒すと `isLink = false` の条件から外れるので `ListRemoteCache` は
 // 次のバッチを返す (消す場合と同じ)。
-func (h *Handler) cleanupFilesBatched(c echo.Context, list func(limit int) ([]*model.DriveFile, error), finish func(ids []string) (int64, error)) error {
+func (h *Handler) cleanupFilesBatched(c *echo.Context, list func(limit int) ([]*model.DriveFile, error), finish func(ids []string) (int64, error)) error {
 	for i := 0; i < driveCleanupMaxBatches; i++ {
 		files, err := list(driveCleanupBatchSize)
 		if err != nil {
@@ -101,6 +102,16 @@ func (h *Handler) cleanupFilesBatched(c echo.Context, list func(limit int) ([]*m
 		if _, err := finish(ids); err != nil {
 			slog.ErrorContext(c.Request().Context(), "drive cleanup: finish failed", "err", err)
 			return err
+		}
+		// ローカルへ戻したファイル (#4183) の写しはバケットに残っている。ドライブの画面からの
+		// 削除と同じく、記録した写しを消す (#4197)。行を消せた後で消す。先に消すと、行を
+		// 消せなかったときに、ローカルを消した行の最後の実体まで無くなる。
+		if h.restoredCopies != nil {
+			for _, f := range files {
+				if f.StoredInternal && !f.IsLink {
+					h.restoredCopies.ReleaseRestoredCopies(c.Request().Context(), f.ID)
+				}
+			}
 		}
 		if len(files) < driveCleanupBatchSize {
 			return nil
@@ -120,7 +131,7 @@ func (h *Handler) cleanupFilesBatched(c echo.Context, list func(limit int) ([]*m
 // 実体があるので、primary (= object storage) に消しに行っても空振りしてローカルに
 // 孤児が残る。行の storedInternal を見て backend を選ぶ (#1414 の二系統 storage /
 // #2315)。localStorageDeleter 未配線なら従来どおり primary に倒す。
-func (h *Handler) deleteFileStorageObjects(c echo.Context, f *model.DriveFile) {
+func (h *Handler) deleteFileStorageObjects(c *echo.Context, f *model.DriveFile) {
 	if h.storageDeleter == nil || f == nil {
 		return
 	}
@@ -150,6 +161,18 @@ func (h *Handler) deleteFileStorageObjects(c echo.Context, f *model.DriveFile) {
 				"fileId", f.ID, "err", err)
 		}
 	}
+	// オブジェクトストレージへ写したファイル (#4180) は、ローカルにも写しが残っている。
+	// 行を消すと誰も指さなくなるので、ローカルからも消す。
+	if coredrive.HasMigratedLocalCopy(f) && h.localStorageDeleter != nil {
+		for _, key := range []*string{f.AccessKey, f.ThumbnailAccessKey, f.WebpublicAccessKey} {
+			if key != nil && *key != "" {
+				if err := h.localStorageDeleter.Delete(*key); err != nil {
+					slog.WarnContext(c.Request().Context(), "drive cleanup: delete the local copy of a migrated file",
+						"fileId", f.ID, "err", err)
+				}
+			}
+		}
+	}
 }
 
 // DriveCleanup handles POST /api/admin/drive/cleanup.
@@ -163,7 +186,7 @@ func (h *Handler) deleteFileStorageObjects(c echo.Context, f *model.DriveFile) {
 // **対象行の選び方は両経路で同じ。** どちらも DriveFileRepository の
 // DeleteOrphans / ListOrphans が返す集合で、選択条件は同 interface の doc を
 // 参照。
-func (h *Handler) DriveCleanup(c echo.Context) error {
+func (h *Handler) DriveCleanup(c *echo.Context) error {
 	if h.driveFileRepo == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -188,7 +211,7 @@ func (h *Handler) DriveCleanup(c echo.Context) error {
 const SystemUserIDToken = "@system"
 
 // DriveFiles handles POST /api/admin/drive/files.
-func (h *Handler) DriveFiles(c echo.Context) error {
+func (h *Handler) DriveFiles(c *echo.Context) error {
 	if h.driveFileRepo == nil {
 		return c.JSON(http.StatusOK, []any{})
 	}
@@ -281,7 +304,7 @@ func (h *Handler) packDriveFileAdmin(f *model.DriveFile) entity.DriveFileEntity 
 // レスポンス shape は upstream admin/drive/show-file.ts の custom 28-field
 // 形に揃え、`requestIp` / `requestHeaders` を含む (frontend admin-file の
 // IP タブで参照、それ以外は PackDriveFile + admin only field の合成、#1148)。
-func (h *Handler) DriveShowFile(c echo.Context) error {
+func (h *Handler) DriveShowFile(c *echo.Context) error {
 	// 本家のparamDefはanyOfで、{fileId: misskey:id}か{url: string}の片方を満たせば、
 	// もう片方の値の型は問わない。実行部は'fileId' in psで分岐するので、fileIdの
 	// キーがあればurlは見ない(#3857)。以前はstringで受けていたので、型の違うもう

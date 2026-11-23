@@ -1,4 +1,4 @@
-name: Misaki image with Genshin, Fedwatch and HSR
+name: Misaki image
 
 # 手動実行のみ。公開後も本番のcomposeや稼働containerは変更しない。
 on:

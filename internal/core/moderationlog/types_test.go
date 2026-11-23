@@ -76,6 +76,11 @@ func TestLogTypeValues(t *testing.T) {
 		{LogCloseDeliveryBreaker, "closeDeliveryBreaker"},
 		{LogApproveSignupApplication, "approveSignupApplication"},
 		{LogRejectSignupApplication, "rejectSignupApplication"},
+		{LogMigrateDriveFilesToObjectStorage, "migrateDriveFilesToObjectStorage"},
+		{LogVerifyMigratedDriveFiles, "verifyMigratedDriveFiles"},
+		{LogPurgeLocalDriveFiles, "purgeLocalDriveFiles"},
+		{LogRestoreMigratedDriveFiles, "restoreMigratedDriveFiles"},
+		{LogCleanupRestoredDriveFileCopies, "cleanupRestoredDriveFileCopies"},
 	}
 	for _, tc := range cases {
 		if string(tc.got) != tc.want {

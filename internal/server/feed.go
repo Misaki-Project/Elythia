@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"net/http"
@@ -11,10 +12,11 @@ import (
 	apmfm "github.com/elythia-network/elythia/internal/activitypub/mfm"
 	"github.com/elythia-network/elythia/internal/config"
 	corenote "github.com/elythia-network/elythia/internal/core/note"
+	"github.com/elythia-network/elythia/internal/core/notedelivery"
 	"github.com/elythia-network/elythia/internal/core/ugcvisibility"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/elythia-network/mfm"
 )
@@ -255,6 +257,9 @@ type feedHandler struct {
 	toHTML func(text, mentionedRemoteUsers string) string
 	// now は時間窓の判定に使う現在時刻。nil なら time.Now (テストで固定する)。
 	now func() time.Time
+	// noteDelivery は配送先を絞るプラグイン (#4203)。条件で自分のホストに見せない
+	// ノートはフィードに載せない。nil なら絞らない。
+	noteDelivery *notedelivery.Registry
 }
 
 // newFeedHandler builds the feed handler setupRoutes registers on /@:acct.
@@ -274,8 +279,10 @@ func newFeedHandler(
 	profiles func(userID string) *model.UserProfile,
 	avatarURL func(u *model.User) string,
 	toHTML func(text, mentionedRemoteUsers string) string,
+	noteDelivery *notedelivery.Registry,
 ) *feedHandler {
 	return &feedHandler{
+		noteDelivery:  noteDelivery,
 		baseURL:       baseURL,
 		host:          host,
 		users:         users,
@@ -292,19 +299,19 @@ func newFeedHandler(
 //
 // upstream は存在しないユーザーに 404 を返す。SPA catchall より前に登録して
 // あるので、ここで 404 を返せばそのままクライアントに届く。
-func (h *feedHandler) serve(c echo.Context, username string, render func(*feedData) ([]byte, error), contentType string) error {
+func (h *feedHandler) serve(c *echo.Context, username string, render func(*feedData) ([]byte, error), contentType string) error {
 	username = strings.TrimSpace(username)
 	if username == "" {
-		return echo.NewHTTPError(http.StatusNotFound)
+		return echo.NewHTTPError(http.StatusNotFound, http.StatusText(http.StatusNotFound))
 	}
 	u, err := h.users.FindLocalByUsername(username)
 	if err != nil && !repository.IsNotFound(err) {
 		// **DB 障害を not-found に丸めない** (#2792)。このファイルは
 		// apierr を使わないので echo の HTTPError で返す。
-		return echo.NewHTTPError(http.StatusInternalServerError)
+		return echo.NewHTTPError(http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 	}
 	if err != nil || u == nil {
-		return echo.NewHTTPError(http.StatusNotFound)
+		return echo.NewHTTPError(http.StatusNotFound, http.StatusText(http.StatusNotFound))
 	}
 	// 凍結中 / 「ログインしていないユーザーにコンテンツを見せない」設定の
 	// 利用者はフィードを配らない。upstream ClientServerService.getFeed は
@@ -318,19 +325,19 @@ func (h *feedHandler) serve(c echo.Context, username string, render func(*feedDa
 	// channels/note_filter.go`) と同じく「requireSigninToViewContents な著者の
 	// コンテンツは匿名に出さない」を、この経路でも成立させる。
 	if u.IsSuspended || u.RequireSigninToViewContents {
-		return echo.NewHTTPError(http.StatusNotFound)
+		return echo.NewHTTPError(http.StatusNotFound, http.StatusText(http.StatusNotFound))
 	}
 	// upstream getFeed は ugcVisibilityForVisitor が 'none' なら feed を返さない
 	// (404)。'local' で remote 利用者を外す条件は、この feed がローカル利用者
 	// だけを引く (feedUserResolver) ので常に満たされない。
 	if ugcvisibility.HidesAll(h.ugcVisibilityNow()) {
-		return echo.NewHTTPError(http.StatusNotFound)
+		return echo.NewHTTPError(http.StatusNotFound, http.StatusText(http.StatusNotFound))
 	}
 
-	data := h.build(u)
+	data := h.build(c.Request().Context(), u)
 	out, err := render(data)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError)
+		return echo.NewHTTPError(http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 	}
 	return c.Blob(http.StatusOK, contentType, out)
 }
@@ -343,7 +350,7 @@ func (h *feedHandler) ugcVisibilityNow() string {
 	return h.ugcVisibility()
 }
 
-func (h *feedHandler) build(u *model.User) *feedData {
+func (h *feedHandler) build(ctx context.Context, u *model.User) *feedData {
 	name := u.Username
 	if u.Name != nil && *u.Name != "" {
 		name = *u.Name
@@ -366,11 +373,18 @@ func (h *feedHandler) build(u *model.User) *feedData {
 	if err != nil {
 		notes = nil
 	}
+	// フィードは常に匿名で読まれるので、ログインしていない閲覧者として判定する
+	// (#4203)。外した分だけ件数が減るが、フィードは件数を出さないので、どれを
+	// 絞ったかは件数からは分からない。
+	hidden := h.hiddenFromVisitors(ctx, notes)
 	nowMs := time.Now().UnixMilli()
 	if h.now != nil {
 		nowMs = h.now().UnixMilli()
 	}
 	for _, n := range notes {
+		if hidden[n.ID] {
+			continue
+		}
 		e := feedEntry{
 			Title: "New note by " + name,
 			Link:  h.baseURL + "/notes/" + n.ID,
@@ -410,6 +424,19 @@ func (h *feedHandler) build(u *model.User) *feedData {
 	return data
 }
 
+// hiddenFromVisitors returns the IDs of the notes a plugin keeps from viewers
+// who are not signed in (#4203). フィードはローカルの利用者のノートだけを載せる。
+func (h *feedHandler) hiddenFromVisitors(ctx context.Context, notes []*model.Note) map[string]bool {
+	if h.noteDelivery.Empty() || len(notes) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(notes))
+	for _, n := range notes {
+		ids = append(ids, n.ID)
+	}
+	return h.noteDelivery.HiddenFromVisitors(ctx, ids)
+}
+
 // describe mirrors upstream の description 組み立て。
 // followingVisibility / followersVisibility が public でなければ数を伏せる。
 func (h *feedHandler) describe(u *model.User) string {
@@ -437,15 +464,15 @@ func (h *feedHandler) describe(u *model.User) string {
 	return desc
 }
 
-func (h *feedHandler) RSS(c echo.Context, username string) error {
+func (h *feedHandler) RSS(c *echo.Context, username string) error {
 	return h.serve(c, username, (*feedData).rss2, "application/rss+xml; charset=utf-8")
 }
 
-func (h *feedHandler) Atom(c echo.Context, username string) error {
+func (h *feedHandler) Atom(c *echo.Context, username string) error {
 	return h.serve(c, username, (*feedData).atom1, "application/atom+xml; charset=utf-8")
 }
 
-func (h *feedHandler) JSON(c echo.Context, username string) error {
+func (h *feedHandler) JSON(c *echo.Context, username string) error {
 	return h.serve(c, username, (*feedData).jsonFeed, "application/json; charset=utf-8")
 }
 
@@ -455,7 +482,7 @@ func (h *feedHandler) JSON(c echo.Context, username string) error {
 // Echo のルータは Fastify と違い `/@:user.rss` のような「セグメント内に
 // リテラルを含むパターン」を解釈できず、パラメータ名が `user.rss` になって
 // しまう。そのため既存の /@:acct ハンドラで受けて、ここで拡張子を見て振り分ける。
-func (h *feedHandler) TryServe(c echo.Context, acct string) (bool, error) {
+func (h *feedHandler) TryServe(c *echo.Context, acct string) (bool, error) {
 	switch {
 	case strings.HasSuffix(acct, ".rss"):
 		return true, h.RSS(c, strings.TrimSuffix(acct, ".rss"))

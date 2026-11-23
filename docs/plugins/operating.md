@@ -92,11 +92,11 @@ jobs:
 
 ## Misaki版の原神入り更新イメージ
 
-Misaki forkでは `.github/workflows/misaki-genshin-image.yml` を手動実行すると、実行対象の本体コミットの`frontend/`と、原神・fedwatch・hsrの固定コミットからfrontendとbackendを同時にビルドします。外部プラグインは別リポジトリから取得し、本体へ直接コミットしません。role-levelは本体に同梱します。
+Misaki forkでは `.github/workflows/misaki-image.yml` を手動実行すると、実行対象の本体コミットの`frontend/`と、原神・fedwatch・hsrの固定コミットからfrontendとbackendを同時にビルドします。外部プラグインは別リポジトリから取得し、本体へ直接コミットしません。role-levelは本体に同梱します。
 
 ```bash
 # <mkの不変コミット> は検証・マージ済みの版を指定する。
-gh workflow run misaki-genshin-image.yml --repo Misaki-Project/mk --ref <mkの不変コミット>
+gh workflow run misaki-image.yml --repo Misaki-Project/mk --ref <mkの不変コミット>
 ```
 
 公開先は `ghcr.io/misaki-project/mk-genshin` です。タグにはコミット・実行ID・再実行回数を含め、既存タグを上書きしません。実行結果のimageとdigestを確認し、更新時はdigestで固定してください。既存の認証情報だけを使い、新しいsecretの登録は不要です。

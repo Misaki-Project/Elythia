@@ -8,10 +8,11 @@ import (
 	"time"
 
 	"github.com/elythia-network/elythia/internal/config"
+	"github.com/elythia-network/elythia/internal/core/notedelivery"
 	"github.com/elythia-network/elythia/internal/core/ugcvisibility"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -57,7 +58,7 @@ func newFeedTestHandler(notes []*model.Note) *feedHandler {
 	}
 }
 
-func doFeedReq(t *testing.T, h func(echo.Context, string) error, user string) *httptest.ResponseRecorder {
+func doFeedReq(t *testing.T, h func(*echo.Context, string) error, user string) *httptest.ResponseRecorder {
 	t.Helper()
 	e := echo.New()
 	rec := httptest.NewRecorder()
@@ -162,7 +163,7 @@ func TestFeedNoteHTML(t *testing.T) {
 // 存在しないユーザーは 404。upstream も同じ。
 func TestFeed_UnknownUserIs404(t *testing.T) {
 	h := newFeedTestHandler(nil)
-	for _, fn := range []func(echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
+	for _, fn := range []func(*echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
 		rec := doFeedReq(t, fn, "nobody")
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 	}
@@ -228,7 +229,7 @@ func TestFeed_TryServe(t *testing.T) {
 func TestFeed_SuspendedUserIs404(t *testing.T) {
 	h := newFeedTestHandler(sampleFeedNotes())
 	h.users.(stubFeedUsers).users["alice"].IsSuspended = true
-	for _, fn := range []func(echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
+	for _, fn := range []func(*echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
 		rec := doFeedReq(t, fn, "alice")
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 		assert.NotContains(t, rec.Body.String(), "hello")
@@ -240,7 +241,7 @@ func TestFeed_SuspendedUserIs404(t *testing.T) {
 func TestFeed_RequireSigninToViewContentsIs404(t *testing.T) {
 	h := newFeedTestHandler(sampleFeedNotes())
 	h.users.(stubFeedUsers).users["alice"].RequireSigninToViewContents = true
-	for _, fn := range []func(echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
+	for _, fn := range []func(*echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
 		rec := doFeedReq(t, fn, "alice")
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 		// 本文 (MFM→HTML 変換済み) も著者名も 1 文字も出さない。
@@ -279,7 +280,7 @@ func TestFeed_TryServeAppliesVisibilityGate(t *testing.T) {
 // ゲートを足しても通常の利用者は 200 のまま (= ゲートが広すぎないこと)。
 func TestFeed_NormalUserStillServed(t *testing.T) {
 	h := newFeedTestHandler(sampleFeedNotes())
-	for _, fn := range []func(echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
+	for _, fn := range []func(*echo.Context, string) error{h.RSS, h.Atom, h.JSON} {
 		rec := doFeedReq(t, fn, "alice")
 		assert.Equal(t, http.StatusOK, rec.Code)
 		assert.Contains(t, rec.Body.String(), "hello")
@@ -331,13 +332,16 @@ func TestFeed_UGCVisibilityForVisitor(t *testing.T) {
 func TestNewFeedHandlerKeepsDependencies(t *testing.T) {
 	users := &stubFeedUsers{}
 	notes := &stubFeedNotes{}
+	rules := notedelivery.NewForServer("https://local.example")
 	var called []string
 	h := newFeedHandler("https://local.example", "local.example", users, notes,
 		func(string) (time.Time, error) { called = append(called, "parseTime"); return time.Time{}, nil },
 		func() string { called = append(called, "ugcVisibility"); return "none" },
 		func(string) *model.UserProfile { called = append(called, "profiles"); return nil },
 		func(*model.User) string { called = append(called, "avatarURL"); return "" },
-		func(string, string) string { called = append(called, "toHTML"); return "" })
+		func(string, string) string { called = append(called, "toHTML"); return "" },
+		rules)
+	assert.Same(t, rules, h.noteDelivery)
 	assert.Equal(t, "https://local.example", h.baseURL)
 	assert.Equal(t, "local.example", h.host)
 	assert.Same(t, users, h.users)

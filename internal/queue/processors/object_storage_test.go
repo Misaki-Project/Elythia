@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	coredrive "github.com/elythia-network/elythia/internal/core/drive"
 	"github.com/elythia-network/elythia/internal/model"
@@ -242,4 +243,54 @@ func TestObjectStorageProcessor_HandleDeleteFile_LocalBackend(t *testing.T) {
 	err := p.HandleDeleteFile(context.Background(), deleteFileTask(t, "abc.webp"))
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "not configured"))
+}
+
+// TestObjectStorageProcessor_HandleCleanRemoteFiles_DeletesTheLocalCopyOfAMigratedFile
+// covers a cached remote file the local-to-object-storage migration copied
+// (#4180): turning it into a link row must remove the local copy too.
+func TestObjectStorageProcessor_HandleCleanRemoteFiles_DeletesTheLocalCopyOfAMigratedFile(t *testing.T) {
+	at := time.Now()
+	repo := &fakeRemoteFileCleaner{batches: [][]*model.DriveFile{{
+		{ID: "f1", AccessKey: strptr("migrated"), ThumbnailAccessKey: strptr("migrated-thumb"), ObjectStorageMigratedAt: &at},
+		{ID: "f2", AccessKey: strptr("direct")},
+	}}}
+	object := &fakeObjectStorage{}
+	local := &fakeObjectStorage{}
+	p := processors.NewObjectStorageProcessor(object, local, repo)
+
+	require.NoError(t, p.HandleCleanRemoteFiles(context.Background(), driver.RawTask{}))
+	assert.Equal(t, []string{"migrated", "migrated-thumb", "direct"}, object.keys())
+	assert.Equal(t, []string{"migrated", "migrated-thumb"}, local.keys())
+}
+
+type recordingCopyReleaser struct{ ids []string }
+
+func (r *recordingCopyReleaser) ReleaseRestoredCopies(_ context.Context, fileID string) {
+	r.ids = append(r.ids, fileID)
+}
+
+// ローカルへ戻したキャッシュのファイル (#4183) を link 行へ倒すときは、記録した写しも消す
+// (#4197)。オブジェクトストレージの行には当てない。
+func TestObjectStorageProcessor_HandleCleanRemoteFiles_ReleasesTheRestoredCopies(t *testing.T) {
+	repo := &fakeRemoteFileCleaner{batches: [][]*model.DriveFile{{
+		{ID: "f1", StoredInternal: true, AccessKey: strptr("restored")},
+		{ID: "f2", AccessKey: strptr("direct")},
+	}}}
+	p := processors.NewObjectStorageProcessor(&fakeObjectStorage{}, &fakeObjectStorage{}, repo)
+	r := &recordingCopyReleaser{}
+	p.SetRestoredCopyReleaser(r)
+	require.NoError(t, p.HandleCleanRemoteFiles(context.Background(), driver.RawTask{}))
+	assert.Equal(t, []string{"f1"}, r.ids)
+}
+
+// 行を link 行へ倒せなかったときは写しを消さない。
+func TestObjectStorageProcessor_HandleCleanRemoteFiles_KeepsTheRestoredCopiesWhenTheRowsStay(t *testing.T) {
+	repo := &fakeRemoteFileCleaner{batches: [][]*model.DriveFile{{
+		{ID: "f1", StoredInternal: true, AccessKey: strptr("restored")},
+	}}, deleteErr: errors.New("db down")}
+	p := processors.NewObjectStorageProcessor(&fakeObjectStorage{}, &fakeObjectStorage{}, repo)
+	r := &recordingCopyReleaser{}
+	p.SetRestoredCopyReleaser(r)
+	require.Error(t, p.HandleCleanRemoteFiles(context.Background(), driver.RawTask{}))
+	assert.Empty(t, r.ids)
 }

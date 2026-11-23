@@ -10,8 +10,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -209,7 +210,7 @@ func TestClaimTimeIsUp_EndsOnlyAfterTheTimer(t *testing.T) {
 func TestActions_RejectMissingParams(t *testing.T) {
 	h, _ := newActionsHandler(t)
 	cases := map[string]struct {
-		fn   func(echo.Context) error
+		fn   func(*echo.Context) error
 		body string
 	}{
 		"ready の gameId が無い":            {h.Ready, `{"ready":true}`},
@@ -238,14 +239,14 @@ func (failingFindRepo) FindByID(string) (*model.ReversiGame, error) {
 // DB の障害は対局が無いことに丸めず、内部の文面も返さない。サービスが無いときも 500。
 func TestActions_InternalErrors(t *testing.T) {
 	h, _ := newTestHandler()
-	for name, fn := range map[string]func(echo.Context) error{"ready": h.Ready, "put-stone": h.PutStone, "claim-time-is-up": h.ClaimTimeIsUp} {
+	for name, fn := range map[string]func(*echo.Context) error{"ready": h.Ready, "put-stone": h.PutStone, "claim-time-is-up": h.ClaimTimeIsUp} {
 		rec := post(fn, `{"gameId":"g1","ready":true,"pos":19}`, u1)
 		assert.Equal(t, http.StatusInternalServerError, rec.Code, "%s: サービスが無い", name)
 	}
 
 	h2, _ := newTestHandler()
 	h2.SetService(corereversi.NewService(failingFindRepo{newMock()}, nil, apiReversiRedis.Client))
-	for name, fn := range map[string]func(echo.Context) error{"ready": h2.Ready, "put-stone": h2.PutStone, "claim-time-is-up": h2.ClaimTimeIsUp} {
+	for name, fn := range map[string]func(*echo.Context) error{"ready": h2.Ready, "put-stone": h2.PutStone, "claim-time-is-up": h2.ClaimTimeIsUp} {
 		rec := post(fn, `{"gameId":"g1","ready":true,"pos":19}`, u1)
 		assert.Equal(t, http.StatusInternalServerError, rec.Code, name)
 		assert.NotContains(t, rec.Body.String(), "db down", name)
@@ -254,7 +255,7 @@ func TestActions_InternalErrors(t *testing.T) {
 
 // postCanceled calls handler with a request whose context is already canceled
 // (the client hung up right after sending it).
-func postCanceled(handler func(echo.Context) error, body string, user *model.User) *httptest.ResponseRecorder {
+func postCanceled(handler func(*echo.Context) error, body string, user *model.User) *httptest.ResponseRecorder {
 	e := echo.New()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -324,4 +325,18 @@ func TestPutStone_EchoesTheOperationIDInTheLog(t *testing.T) {
 	}
 	require.NotNil(t, log)
 	assert.Equal(t, "op-42", log["id"])
+}
+
+// Changing the ready state more often than the service allows answers 429,
+// like the other rate limits of the API.
+func TestReady_TooManyChangesIs429(t *testing.T) {
+	h, repo := newActionsHandler(t)
+	seedPendingGame(t, repo, "g-many")
+	body := `{"gameId":"g-many","ready":false}`
+	require.Equal(t, http.StatusNoContent, post(h.Ready, body, u1).Code)
+	// u1 は上限 (1 分に 300 回) まで変えた後。
+	require.NoError(t, apiReversiRedis.Client.Set(context.Background(), "reversi:game:preStartChanges:g-many:u1", 300, time.Minute).Err())
+	rec := post(h.Ready, body, u1)
+	require.Equal(t, http.StatusTooManyRequests, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "RATE_LIMIT_EXCEEDED")
 }

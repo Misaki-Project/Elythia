@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 )
@@ -62,6 +63,13 @@ type ModeratorDeleteHook interface {
 	OnModeratorNoteDeleted(moderatorID string, note *model.Note, author *model.User)
 }
 
+// NoteDeliveryForgetter drops what the plugins that narrow where local notes
+// federate stored for deleted notes (#4202). 実装は core/notedelivery.Registry。
+// 失敗はベストエフォート (実装がログに残す)。
+type NoteDeliveryForgetter interface {
+	ForgetNotesInBackground(g *bgwork.Group, noteIDs []string)
+}
+
 // DeleteService provides note deletion logic.
 type DeleteService struct {
 	noteRepo            repository.NoteRepository
@@ -73,6 +81,9 @@ type DeleteService struct {
 	noteStreamHook      DeleteNoteStreamHook
 	moderatorDeleteHook ModeratorDeleteHook
 	notificationHook    DeleteNotificationHook
+	noteDelivery        NoteDeliveryForgetter
+	// background は片付けを走らせる世代のグループ (#3661)。nil なら素の goroutine。
+	background *bgwork.Group
 }
 
 // NewDeleteService creates a new DeleteService.
@@ -122,6 +133,15 @@ func (s *DeleteService) SetModeratorDeleteHook(h ModeratorDeleteHook) {
 // so the renote / quote notification the note left is removed (#3201)。
 func (s *DeleteService) SetNotificationHook(h DeleteNotificationHook) {
 	s.notificationHook = h
+}
+
+// SetNoteDeliveryForgetter attaches the plugins that narrow where local notes
+// federate, so they can drop what they stored for a deleted local note
+// (#4202). nil で何もしない (初期状態)。片付けは g (サーバーの世代のグループ)
+// で走らせ、世代の停止で待たせる。
+func (s *DeleteService) SetNoteDeliveryForgetter(f NoteDeliveryForgetter, g *bgwork.Group) {
+	s.noteDelivery = f
+	s.background = g
 }
 
 // SetNoteStreamHook attaches a DeleteNoteStreamHook invoked after Delete so
@@ -209,6 +229,14 @@ func (s *DeleteService) DeleteAs(actor *model.User, isModerator bool, noteID str
 	// ベストエフォート。
 	if s.notificationHook != nil {
 		s.notificationHook.OnNoteDeleted(note)
+	}
+	// 配送先を絞るプラグインが書いた条件を片付ける (#4202)。条件を書くのは
+	// ローカルのノートだけ。ベストエフォート。止まっているプラグインを待つと、
+	// notes/delete (unrenote はリノートの数だけ) の応答が遅れるので、世代の
+	// グループの goroutine で呼ぶ (同時に走る数には上限がある)。IDは使い回さない
+	// ので、片付けは急がなくてよい。
+	if s.noteDelivery != nil && note.UserHost == nil {
+		s.noteDelivery.ForgetNotesInBackground(s.background, []string{note.ID})
 	}
 	// moderator が他人の note を削除したときは moderation log に deleteNote を
 	// 残す (upstream NoteDeleteService の deleter && note.userId !== deleter.id、

@@ -2,9 +2,11 @@ package federation
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
+	"github.com/elythia-network/elythia/internal/core/notedelivery"
 	"github.com/elythia-network/elythia/internal/misc/id"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
@@ -18,10 +20,14 @@ import (
 // hook tests can assert what was scheduled without a real queue server. The
 // non-deliver methods are no-ops to satisfy queue.Enqueuer.
 type recordingEnqueuer struct {
+	// mu は、件数の多い配送が並べて積むとき (#4219) の delivers を守る。
+	mu       sync.Mutex
 	delivers []queue.DeliverPayload
 }
 
 func (r *recordingEnqueuer) EnqueueDeliver(p queue.DeliverPayload, _ ...driver.EnqueueOption) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.delivers = append(r.delivers, p)
 	return nil
 }
@@ -53,6 +59,14 @@ func newHookSetup(t *testing.T) (*PollDeliveryHook, *recordingEnqueuer, *testuti
 // seed remote followers and assert that they are NOT used as the recipient set.
 func newHookSetupWithFollowing(t *testing.T) (*PollDeliveryHook, *recordingEnqueuer, *testutil.MockUserRepository, *testutil.MockUserKeypairRepository, *testutil.MockFollowingRepository, id.Generator) {
 	t.Helper()
+	return newHookSetupWithRules(t, nil, testutil.NewMockNoteRepository())
+}
+
+// newHookSetupWithRules is newHookSetupWithFollowing with the plugins that
+// narrow where local notes federate (#4199) and the notes that exist (#4202)
+// handed to the constructor.
+func newHookSetupWithRules(t *testing.T, rules *notedelivery.Registry, notes *testutil.MockNoteRepository) (*PollDeliveryHook, *recordingEnqueuer, *testutil.MockUserRepository, *testutil.MockUserKeypairRepository, *testutil.MockFollowingRepository, id.Generator) {
+	t.Helper()
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
 	urls := activitypub.NewURLBuilder("https://local.example")
@@ -62,7 +76,7 @@ func newHookSetupWithFollowing(t *testing.T) (*PollDeliveryHook, *recordingEnque
 	keypairRepo := testutil.NewMockUserKeypairRepository()
 	followingRepo := testutil.NewMockFollowingRepository()
 	deliver := NewDeliverService(enq, userRepo, followingRepo, keypairRepo, urls, nil)
-	hook := NewPollDeliveryHook(renderer, deliver, userRepo, urls, idGen, nil)
+	hook := NewPollDeliveryHook(renderer, deliver, userRepo, urls, idGen, rules, notes)
 	return hook, enq, userRepo, keypairRepo, followingRepo, idGen
 }
 

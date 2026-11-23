@@ -2,7 +2,7 @@
 
 Elythia が持つ「純正 Misskey (misskey-dev/misskey) には無い、または挙動が異なる」ものをまとめたリファレンスの目次。差分そのものは、領域ごとに [`docs/divergence/`](#領域ごとの差分) のファイルへ分けてある (#3414)。
 
-- 基準: **Elythia 2.2.0 (Misaki)** ⇔ Misskey TS `2026.11.0`
+- 基準: **Elythia 2.3.0 (Misaki)** ⇔ Misskey TS `2026.11.0`
 - 最終更新: 2026-10-07 (領域ごとのファイルへの分割、#3414)
 
 > ベースラインを固定したのは 1.0.0 (= Misskey TS `2026.7.0` 追従完了時点)。1.1.x は
@@ -32,10 +32,10 @@ Elythia は Misskey TS からの drop-in 移行 (Misskey TS の DB / Redis を�
 
 | 軸 | Elythia 独自 | cherrypick 由来 | 未実装 |
 |---|---|---|---|
-| API endpoint | GET variant 25 + alias 4 + 分割アップロード 4 + 承認制 7 + 絵文字の申請 10 + exact assignment lookup 2 + admin 観測 8 + 配送のブレーカー 1 + 消えたインスタンスの片付け 2 + 連合のルール 5 + IP 検索 3 + バブルゲームの対戦 10 + フォローの止め方 1 + DB のバックアップ 11 + アカウント単位の連合制御 2 + role-levelプラグイン 13 + delivery-targetsプラグイン 1 + リバーシの対局操作 3 | chat 15 | **0** |
-| API レスポンスの additive field | 11 (`runtime` / `mkGoVersion` / `chunkedUpload` / `approvalRequiredForSignup` / `registrationClosed` / `signupApplicationForm` / `canRequestCustomEmojis` / `minimumUsernameLength` / `managedByPlugin` / `federationStatus` / `has<秘密の欄>` (`admin/meta` の 11 欄と `admin/captcha/current` の `hasSecretKey` を 1 つと数える。[security.md §7](divergence/security.md#7-意図的な安全側-divergence))) | reversi packed game の `crc32` 等 | — |
-| DB テーブル | 21 (+ bookkeeping 2) | 0 | 0 |
-| DB カラム | 33 (+ 未使用の残存列 3) | 3 | 0 |
+| API endpoint | GET variant 25 + alias 4 + 分割アップロード 4 + 承認制 7 + 絵文字の申請 10 + exact assignment lookup 2 + admin 観測 8 + 配送のブレーカー 1 + 消えたインスタンスの片付け 2 + 連合のルール 5 + IP 検索 3 + バブルゲームの対戦 10 + フォローの止め方 1 + DB のバックアップ 11 + アカウント単位の連合制御 2 + role-levelプラグイン 13 + delivery-targetsプラグイン 1 + リバーシの対局の操作 3 + ドライブのオブジェクトストレージへの移行 6 | chat 15 | **0** |
+| API レスポンスの additive field | 12 (`runtime` / `mkGoVersion` / `chunkedUpload` / `approvalRequiredForSignup` / `registrationClosed` / `signupApplicationForm` / `canRequestCustomEmojis` / `minimumUsernameLength` / `noteDeliveryPlugins` / `managedByPlugin` / `federationStatus` / `has<秘密の欄>` (`admin/meta` の 11 欄と `admin/captcha/current` の `hasSecretKey` を 1 つと数える。[security.md §7](divergence/security.md#7-意図的な安全側-divergence))) | reversi packed game の `crc32` 等 | — |
+| DB テーブル | 23 (+ bookkeeping 2) | 0 | 0 |
+| DB カラム | 36 (+ 未使用の残存列 3) | 3 | 0 |
 | ActivityPub | Ed25519 / RemoteStatsFetcher ほか | reversi 連合 / chat 連合 | — |
 | config キー | 20 前後 | 0 | — |
 | fork frontend の独自変更 | 143 tag (`2026.7.0-mk.0` ～ `2026.10.0-mk.5`) | — | — |

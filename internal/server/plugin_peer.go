@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
 	"github.com/elythia-network/elythia/internal/api/apierr"
@@ -542,7 +542,7 @@ func (p *pluginPeer) dispatchReply(host, sendID string, reply json.RawMessage) {
 // **wrapPluginHandler には載せない。** 署名検証に生の *http.Request が要る
 // うえ、これは本体の責務であってプラグインのハンドラではない。
 func (p *pluginPeer) echoHandler() echo.HandlerFunc {
-	return func(c echo.Context) error {
+	return func(c *echo.Context) error {
 		req := c.Request()
 
 		// **署名検証の前に IP で見る。** 検証は actor 解決 (未知の keyId なら
@@ -565,8 +565,7 @@ func (p *pluginPeer) echoHandler() echo.HandlerFunc {
 		// 止まらない)。ここは middleware を通らない経路への保険。
 		body, err := io.ReadAll(io.LimitReader(req.Body, p.maxBody+1))
 		if err != nil {
-			var he *echo.HTTPError
-			if errors.As(err, &he) {
+			if he := apierr.HTTPStatusError(err); he != nil {
 				// BodyLimitByPath が wrap した limitedReader の 413 を潰さない。
 				return he
 			}
@@ -636,12 +635,12 @@ func (p *pluginPeer) echoHandler() echo.HandlerFunc {
 //
 // **Retry-After を付ける。** 送信側は失敗を 15 秒 / 30 秒 / 60 秒で再送するので、
 // 目安が無いと同じ勢いで戻ってくる。
-func peerTooManyRequests(c echo.Context) error {
+func peerTooManyRequests(c *echo.Context) error {
 	c.Response().Header().Set("Retry-After", "60")
 	return peerError(c, http.StatusTooManyRequests, "リクエストが多すぎます")
 }
 
-func peerError(c echo.Context, status int, msg string) error {
+func peerError(c *echo.Context, status int, msg string) error {
 	return c.JSON(status, map[string]any{"error": map[string]any{"message": msg}})
 }
 
@@ -744,7 +743,7 @@ func normalizePeerHost(host string) string {
 // **無名関数のままにしない。** router を組み立てるには DB / Redis が要るので、
 // ここに置いて直接呼べる形にしておかないと挙動をテストで固定できない
 // (実際 #2822 まで catchall のテストは 1 つも無かった)。
-func apiCatchall(c echo.Context) error {
+func apiCatchall(c *echo.Context) error {
 	path := c.Request().URL.Path
 	slog.Warn("unimplemented API endpoint", "method", c.Request().Method, "path", path)
 	// GET は upstream ApiServerService の `fastify.get('/*')` と同じく 404
@@ -763,7 +762,7 @@ func apiCatchall(c echo.Context) error {
 	//
 	// **HEAD も GET と同じく 404 (#3925)。** 本家の `fastify.get('/*')` は
 	// Fastify の exposeHeadRoutes で HEAD にも応える。この catch-all は
-	// api.Any で HEAD も持つので、GET のルートへの振り分け (headRoutes) を
+	// 全メソッドの Match (anyMethods) で HEAD も持つので、GET のルートへの振り分け (headRoutes) を
 	// 通らず HEAD のまま届く。
 	method := c.Request().Method
 	if method == http.MethodGet || method == http.MethodHead || isPluginPeerPath(path) {

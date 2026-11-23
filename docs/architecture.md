@@ -17,7 +17,7 @@ Elythia は Misskey (TypeScript/NestJS) から生まれ、バックエンドを 
 
 ```
 ┌─────────────────────────────────────────────┐
-│  api (HTTP ハンドラ)            Echo v4       │  ← server/api/endpoints/* + server/*Service
+│  api (HTTP ハンドラ)            Echo v5       │  ← server/api/endpoints/* + server/*Service
 ├─────────────────────────────────────────────┤
 │  core (ビジネスロジック)        ドメインサービス │  ← core/*Service.ts
 ├─────────────────────────────────────────────┤
@@ -75,9 +75,10 @@ Elythia は Misskey (TypeScript/NestJS) から生まれ、バックエンドを 
 upstream `server/api/endpoints/` の endpoint 群を、ディレクトリ単位で実装。**upstream の 446 endpoint をすべて実装済み** (coverage 100.0%)。一次情報は `make apicompat` が生成する [api-compat.md](api-compat.md)。
 
 ルート数は `internal/server` が `/api/*` に静的登録する数 (`api.POST` 516 + `api.GET` 14 +
-`api.Match(chartMethods, …)` 12 × 2 methods = 554 と、`api.Any` 2。test mode でだけ登録する
-`/api/reset-db` を含む)。`api.Any` は catchall と、全メソッドで受ける `/api/clear-browser-cache`
-(#3926)。登録は、この 2 つと `/api/reset-db` が `router.go` の `setupRoutes()`、ほかは領域ごとの
+`api.Match(chartMethods, …)` 12 × 2 methods = 554 と、全メソッドで受ける
+`api.Group.Match(anyMethods, …)` 2。test mode でだけ登録する `/api/reset-db` を含む)。後者は
+catchall と `/api/clear-browser-cache` (#3926) で、echo の v5 の `Any` の代わりに v4 の `Any` と
+同じメソッドを `Match` で登録する (#4239)。登録は、この 2 つと `/api/reset-db` が `router.go` の `setupRoutes()`、ほかは領域ごとの
 `routes_<領域>.go` にある (#3697、4.2)。実行時はこれに同梱プラグインのルートが乗る。
 `docs/api-compat.md` の 446 + 110 = 556 は、554 に `/api/clear-browser-cache` の GET と POST を
 足した数と一致する (api-compat.md は GET と POST だけを数え、catchall を数えない)。パッケージ数は、`git ls-files internal/api` のうちテストでない `.go` を持つ
@@ -91,11 +92,12 @@ api-compat.md の 444 + 58) は、ルート数の段落を最後に直した 202
 #3926 でも同じ数え方で数え直した (`api.POST` は #3926 より前から 516 で、514 のままだった)。
 
 `/api` の外は `s.echo` へ直接登録していて、`setupRoutes()` とその節 (4.2 の「setupRoutes の節」、
-#3901) の本文の登録の式文は 65 (`GET` 51 / `POST` 5 / `OPTIONS` 2 / `Any` 1 / `File` 4 / `Static` 2。
+#3901) の本文の登録の式文は 65 (`GET` 51 / `POST` 5 / `OPTIONS` 2 / `Match` 1 / `FileFS` 4 / `Static` 2。
+#4239 で `Any` を全メソッドの `Match` に、`File` を `FileFS` に置き換えた。数は変わらない。
 4.2 の「/api のルートの登録」の前後の数の表と同じ数え方で、`if` の中も数える)。内訳は
 `wireFederationRoutes` 41・`wireFrontendRoutes` 17・`setupRoutes()` 5・`wireAdmin` 1・
 `wireStreaming` 1。前に書いていた 64 (`GET` 50) は、#3901 で節へ移す前の `develop`
-(`e083dfe4b7`) を同じ数え方で数えると 65 (`GET` 51) で、1 つ足りなかった。`Any` は 1 呼び出しで全メソッドを登録するので、
+(`e083dfe4b7`) を同じ数え方で数えると 65 (`GET` 51) で、1 つ足りなかった。全メソッドの `Match` (`anyMethods`) は 1 呼び出しで v4 の `Any` と同じ 11 のメソッドを登録するので、
 ルート単位に展開すると増える。ほかに `/debug/pprof` 配下が 8 (`pprofGroup` への登録)。
 `setupRoutes()` から呼ぶ関数の中の登録 (`registerFrontendAssets` の `/vite/*` と `/embed_vite/*`、
 `wireMetricsEndpoint` の `/metrics`、`serveStaticAssetDir` の `/twemoji/*` と `/fluent-emoji/*`) は、
@@ -1943,7 +1945,7 @@ setupRoutes()
   …                                              // routes_<領域>.go の 24 個を 1 回ずつ
   registerFetchRoutes(api, fetchExternalHandler, fetchRSSHandler)
   …                                              // プラグインの準備 (失敗したら return)
-  api.Any("/*", apiCatchall)                     // catchall は元の位置
+  api.Group.Match(anyMethods, "/*", apiCatchall) // catchall は元の位置 (#4239 の前は api.Any)
 ```
 
 - **領域ごとのファイル `routes_<領域>.go` に、`func register<領域>Routes(api apiRoutes, …)` を
@@ -2028,19 +2030,22 @@ setupRoutes()
   `backupGuard` を受け取らない)
 - /api の行には、handler を関数リテラルで書いたものが無い
 
-**echo の登録の順は変わる。** `Echo.Routes()` は map から作るので順を持たない。
+**echo の登録の順は変わる。** (#3901 の当時の echo v4 での計測。v5 の `Router().Routes()` は
+登録の順を持つ、#4239) `Echo.Routes()` は map から作るので順を持たない。
 `Echo.OnAddRouteHandler` で登録の順に並べると、前後で同じ位置にある登録は、test mode でない
-構成で 667 のうち 61、test mode と pprof を有効にした構成で 676 のうち 69 だった。順が効くのは
-同じ method と path を 2 回登録したとき (後の登録が勝つ) だけで、2 回登録しているのは
+構成で 667 のうち 61、test mode と pprof を有効にした構成で 676 のうち 69 だった。当時の v4 で順が
+効くのは同じ method と path を 2 回登録したとき (後の登録が勝つ。v5 は既定の `echo.New` でも
+上書きを許すが、`AllowOverwritingRoute` を立てないルーターを渡すと重複の登録は panic になる。下の
+group の 404 のルートは、上書きを許す形で登録されるので当たらない) だけで、2 回登録しているのは
 `api.Use` が足す `echo_route_not_found` の `/api` と `/api/*` だけ (順は前後で同じ)。catchall
-(`/api/*` の `Any`) とプラグインのルートは、前と同じく /api のほかのルートより後に登録する。
+(`/api/*` の、当時の `Any`) とプラグインのルートは、前と同じく /api のほかのルートより後に登録する。
 
 **残したもの**
 
 | 登録 | 理由 |
 |---|---|
 | test mode の `/api/reset-db` | handler を test mode の `if` の中で作る。`if` ごと元の位置に残した (`apiRoutesOutsideRegistrars` に、どの経路で登録するかを書いた) |
-| catchall の `api.Any("/*", apiCatchall)` | プラグインのルートより後に置く (読み手のため。echo は静的な path を wildcard より優先するので、順には依存しない)。`apiRoutes` を通らない登録なので、`apiRegistrationAllowed` でファイル (`router.go`) まで決めてある |
+| catchall の `api.Group.Match(anyMethods, "/*", apiCatchall)` (#4239 の前は `api.Any`) | プラグインのルートより後に置く (読み手のため。echo は静的な path を wildcard より優先するので、順には依存しない)。`apiRoutes` を通らない登録なので、`apiRegistrationAllowed` でファイル (`router.go`) まで決めてある |
 | /api の外の `s.echo` の 64 文 (ActivityPub・SSR・well-known・oauth・nodeinfo・inbox・streaming・`/files`・`/proxy`・`/url`・`/backup-download`・静的配信・SPA) | `apiRoutes` を通らない別の層で、この段の関数の形 (`api apiRoutes` を受ける) に当てはまらない。`/notes/:id` や `/@:acct` のように `s` と `ssrMeta` などを捕まえる closure、構築の呼び出しを行の中に持つもの (`filesHandler(…)`、`newTwemojiBadgeHandler(…)`。後者は #3776 で変数に取り出した) があり、評価の時刻の確認がこの段より重い。静的配信と SPA の catchall はプラグインの準備の `return` より後にある |
 | `/debug/pprof` の 8 文 | `s.config.EnablePprof` の `if` の中で、/api の外 |
 
@@ -2540,7 +2545,9 @@ roleの判定もすでに真になっている)。
    もう一度保存する。止まっていれば何もしない
 7. `queueDriver`: queueのdriverを閉じる
 8. `pubsub`: この世代のRedisの購読(`internalPubSub` / `streamPubSub`)を閉じる
-9. `echo`: echoをShutdownする
+
+echoを止める段は無い。listenerは`Supervisor`が持ち、echoのv5は自分のserverも`Shutdown`も持たない
+(#4239で段を消した。それまでは9番目の`echo`の段がechoの`Shutdown`を呼んでいたが、本番では何も止めていなかった)。
 
 queueが止まったかどうか(2の結果)は、表を作る関数の中の変数に置き、3と6がそれを読む。
 
@@ -2613,7 +2620,7 @@ Supervisorの側は変えていない。停止のエラーの使われ方は次�
   このエラーで変わらない
 - `startGenerationLocked`(`StartBackground`に失敗した世代)は、今までどおり停止のエラーを捨てる
 
-**一覧の外の段(上の1〜3・5〜9)は、一覧に入れていない。** 動きを変えずには入れられないため。
+**一覧の外の段(上の1〜3・5〜8)は、一覧に入れていない。** 動きを変えずには入れられないため。
 #3711で段の表にした後も、一覧とは別の表に置いている。
 
 | 段 | 入れない理由 |
@@ -2624,7 +2631,6 @@ Supervisorの側は変えていない。停止のエラーの使われ方は次�
 | `chart` (`chartMgmt.Stop`) | 起動するのは `StartBackground` で、構築の途中ではない。後始末では止めない (起動していない) |
 | `queueDriver` (`queueDriver.Close`) | エラーを返し、6 で止まらなかった worker を待った後に閉じる。後始末では nil に戻す |
 | `pubsub` (pubsub の `Close`) | 購読は stream の節で始めるが、閉じるのは driver の後。一覧に入れると、一覧より後に止める 5〜7 より先に閉じることになる |
-| `echo` (echo の `Shutdown`) | 戻り値が `StopBackground` の戻り値になる(ほかの段が失敗していれば、そのエラーと`errors.Join`でまとめる。#3707、#3711) |
 
 **テストが見ている範囲は次のとおり** (`internal/server/lifecycle_parts_test.go`・
 `lifecycle_parts_value_test.go`・`lifecycle_start_test.go`・`lifecycle_startonce_test.go`・`lifecycle_stop_test.go`・`lifecycle_steps_test.go`。多くは実際に`newServer`で作ったサーバーで見る)。部品を足す・動かすときは、テストの表とこの節の表を一緒に直す。
@@ -2959,8 +2965,8 @@ setupRoutes()
 | ロール | `roles` (`role.Service`。利用者のロール・ロールの一覧と、プラグインの policy の結果) | #3725 |
 | 絵文字とデコレーション | `emojis` (`CachedEmojiRepository`。ローカルの一覧と (name, host) の entry)・`emojiDecorations` (`avatardecoration.EmojiResolver`)・`avatarDecorations` (`avatardecoration.Resolver`。catalog) | #3727 |
 | 連合 (その 1) | `instances` (`instance.Service`。ホストの停止の判定と応答の健全)・`relays` (`relay.Service`。承認済みの relay の一覧)・`fedRules` (`fedrule.Service`。連合のルールのスナップショット) | #3729 |
-| 連合 (その 2) | `deliverEd25519` (`DeliverService`。相手の Ed25519 の対応と送る側の Ed25519 の鍵)・`federationPublicKeys` (`Resolver`。相手の公開鍵と、Ed25519 の鍵が無いことの記憶)・`deliverSigningKeys` (`DeliverProcessor` の解析済みの署名鍵)・`instanceActorSigner` (instance actor の秘密鍵) | #3732 |
-| 投稿・タイムライン・通知 | `antennas` (`CachedAntennaRepository`。有効なアンテナの全件)・`pushSubscriptions` (`webpush.SubscriptionCache` のメモリの層)・`featuredNotes` (`notes.FeaturedRankingCache`。注目ノートの全体の順位)・`notePublisher` (`stream.NotePublisher`。直前に pack したノート)・`timelineJSON` (`notes.TimelineJSONCache`。opt-in のタイムラインの最初の頁) | #3736 |
+| 連合 (その 2) | `deliverEd25519` (`DeliverService`。相手の Ed25519 の対応と、送る側の Ed25519 と RSA の鍵。RSA は #4221 から)・`federationPublicKeys` (`Resolver`。相手の公開鍵と、Ed25519 の鍵が無いことの記憶)・`deliverSigningKeys` (`DeliverProcessor` の解析済みの署名鍵)・`instanceActorSigner` (instance actor の秘密鍵) | #3732 |
+| 投稿・タイムライン・通知 | `antennas` (`CachedAntennaRepository`。有効なアンテナの全件)・`userWebhooks` (`CachedWebhookRepository`。有効な利用者の webhook の全件、#4218)・`pushSubscriptions` (`webpush.SubscriptionCache` のメモリの層)・`featuredNotes` (`notes.FeaturedRankingCache`。注目ノートの全体の順位)・`notePublisher` (`stream.NotePublisher`。直前に pack したノート)・`timelineJSON` (`notes.TimelineJSONCache`。opt-in のタイムラインの最初の頁) | #3736 |
 | 管理画面と統計 | `driveUsage` (`driveusage.Service`。ドライブの使用量の集計)・`dbHealth` (`dbhealth.Service`。DB の統計)・`statsCounts` (`stats.Handler`。`/api/stats` の instance と note_reaction の総数)・`ipLogWindow` (`iplog.Service`。書いた (利用者, IP) の印) | #3738 |
 | 外部とファイル | `urlPreview` (`urlpreview.Fetcher`。URL ごとのプレビュー)・`remoteStats` (`federation.RemoteStatsFetcher`。リモート利用者の統計の件数と作成日時)・`fetchRSS` (`fetchrss.Handler`。URL ごとの pack 済みの本文)・`pluginPeers` (`nodeInfoPeerLister`。相手の nodeinfo にあるプラグインの名前)・`twemojiBadge` (`twemojiBadgeHandler`。名前ごとの焼いた PNG) | #3776 |
 | 起動時の写し(段階4の最後) | `captcha`(captchaのproviderの組)・`reactionBuffering`(リアクションのバッファの切り替え)。どちらも捨てずにmetaから読み直す項目(`reloadOnDrop`) | #3777 |
@@ -3363,13 +3369,13 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 `MK_` プレフィックスの環境変数でオーバーライド可（例 `MK_DB_HOST`）。詳細は [configuration.md](configuration.md)。
 
-マイグレーション（`migration/`、golang-migrate、現在 143 本）:
+マイグレーション（`migration/`、golang-migrate、現在 147 本）:
 
 Misakiの独自処理は別系列の`migration/local/000001_misaki_drop_remote_avatar_decorations`へ置く。本体140本とforkの1本は別の台帳で管理する。旧Misaki版では上流と異なる番号を割り当てていたため、既存DBの更新は[移行履歴の照合](misaki-migration-reconciliation.md)に従う。
 
 - TS Misskey の既存テーブルへは原則**追加のみ**。例外が 23 件あり、うち 17 件は Elythia が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
 - drop-in テストで発見した補完列は専用マイグレーションで追加。
-- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただしこれは今後の規約で、既存の down は守れていない** — 宣言があるのは 31 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down が 51 本ある（[migration-from-ts.md](migration-from-ts.md#elythia-内での切り戻し)）。
+- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただしこれは今後の規約で、既存の down は守れていない** — 宣言があるのは 35 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down が 52 本ある (数え方は migration-from-ts.md と同じ)（[migration-from-ts.md](migration-from-ts.md#elythia-内での切り戻し)）。
 
 ```bash
 make migrate-up      # 最新まで
@@ -3393,7 +3399,7 @@ CLAUDE.md の Section 1 / 2 にあった表とツリーを、#3248 でここへ�
 | Component | Library | 用途 |
 |-----------|---------|------|
 | 言語 | **Go 1.27** | `go.mod`でバージョン管理 |
-| Webフレームワーク | **Echo v4** (`labstack/echo/v4`) | HTTPルーティング、ミドルウェア、WebSocket |
+| Webフレームワーク | **Echo v5** (`labstack/echo/v5`。#4239 で v4 から上げた) | HTTPルーティング、ミドルウェア、WebSocket |
 | ORM | **GORM** (`gorm.io/gorm`) | PostgreSQLアクセス |
 | Migration | **golang-migrate** (`golang-migrate/migrate/v4`) | SQLベースのマイグレーション |
 | Config | **Viper** (`spf13/viper`) | YAML + 環境変数オーバーライド |

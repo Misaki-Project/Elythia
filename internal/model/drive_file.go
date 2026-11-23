@@ -1,6 +1,10 @@
 package model
 
-import "gorm.io/datatypes"
+import (
+	"time"
+
+	"gorm.io/datatypes"
+)
 
 // DriveFile represents the `drive_file` table.
 type DriveFile struct {
@@ -31,6 +35,20 @@ type DriveFile struct {
 	IsLink             bool           `gorm:"column:isLink;default:false" json:"isLink"`
 	RequestHeaders     datatypes.JSON `gorm:"column:requestHeaders;type:jsonb;default:'{}'" json:"requestHeaders"`
 	RequestIP          *string        `gorm:"column:requestIp;type:varchar(128)" json:"requestIp"`
+	// ObjectStorageMigratedAt is when the local-to-object-storage migration
+	// copied the file (#4180). Nil for files that were never migrated,
+	// including those uploaded to object storage directly. Elythia-only.
+	ObjectStorageMigratedAt *time.Time `gorm:"column:objectStorageMigratedAt" json:"-"`
+	// ObjectStorageVerifiedAt is when the verification found the migrated
+	// file readable in object storage with the recorded size and md5 (#4181).
+	// Nil until verified, and again after a failed verification or a new
+	// migration. Elythia-only.
+	ObjectStorageVerifiedAt *time.Time `gorm:"column:objectStorageVerifiedAt" json:"-"`
+	// ObjectStorageLocalDeletedAt is when the purge deleted the local copy of
+	// the migrated file after verifying it once more (#4182). It is set
+	// before the deletion, so a set value means the local copy is gone or was
+	// left behind; nil does not mean the local copy is there. Elythia-only.
+	ObjectStorageLocalDeletedAt *time.Time `gorm:"column:objectStorageLocalDeletedAt" json:"-"`
 
 	// Relations
 	User   *User        `gorm:"foreignKey:UserID" json:"user,omitempty"`

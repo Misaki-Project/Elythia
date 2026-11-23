@@ -14,6 +14,7 @@ import (
 	"github.com/elythia-network/elythia/internal/core/procstats"
 	"github.com/elythia-network/elythia/internal/core/role"
 	"github.com/elythia-network/elythia/internal/core/signup"
+	"github.com/elythia-network/elythia/internal/core/strongauth"
 	"github.com/elythia-network/elythia/internal/core/userpack"
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/id"
@@ -167,6 +168,9 @@ type Handler struct {
 	// objectStorageEnqueuer は bulk drive cleanup の実体削除を queue へ
 	// 逃がす (#2325)。nil なら従来どおり handler 内で同期削除する。
 	objectStorageEnqueuer ObjectStorageEnqueuer
+	// restoredCopies deletes the copies a file moved back to the local storage
+	// left in object storage, when the bulk cleanups delete the file (#4197).
+	restoredCopies RestoredCopyReleaser
 	// captchaVerifierFactory builds a one-off captcha.Verifier for
 	// admin/captcha/save verification. nil uses the real providers; tests
 	// inject a stub to avoid external HTTP calls.
@@ -199,6 +203,12 @@ type Handler struct {
 	// driveUsage は admin/drive/usage の集計元 (#3053)。**未配線なら 500 を
 	// 返す** — 0 バイトを返すと「使っていない」という誤った事実を出すため。
 	driveUsage DriveUsageProvider
+	// driveStorageMigration は、ローカルのファイルをオブジェクトストレージへ写す
+	// 処理 (#4180)。未配線なら admin/drive/object-storage-migration/* は 500 を返す。
+	driveStorageMigration DriveStorageMigrator
+	// driveStorageMigrationReauth は、ローカルを消す処理 (purge-local) の再認証
+	// (#4184)。admin/backup/* と同じ strongauth。
+	driveStorageMigrationReauth *strongauth.Verifier
 	// signupApplications は承認制の登録の審査面 (#2555)。未配線なら該当
 	// endpoint は 503 を返す。
 	signupApplications SignupApplicationReviewer
@@ -720,6 +730,19 @@ func (h *Handler) SetLocalStorageDeleter(s StorageDeleter) {
 // synchronous in-request deletion.
 func (h *Handler) SetObjectStorageEnqueuer(e ObjectStorageEnqueuer) {
 	h.objectStorageEnqueuer = e
+}
+
+// RestoredCopyReleaser deletes the copies a drive file moved back to the
+// local storage left in object storage (coredrive.StorageMigrator, #4197).
+type RestoredCopyReleaser interface {
+	ReleaseRestoredCopies(ctx context.Context, fileID string)
+}
+
+// SetRestoredCopyReleaser wires what deletes the copies a deleted file left
+// in object storage when it was moved back (#4197). Optional — nil leaves
+// the copies to the cleanup of the migration.
+func (h *Handler) SetRestoredCopyReleaser(r RestoredCopyReleaser) {
+	h.restoredCopies = r
 }
 
 // SetStorageDeleter wires the object-storage backend so bulk drive cleanups can
