@@ -15,6 +15,9 @@ import (
 	"gorm.io/gorm"
 )
 
+// misakiCoreLatest は本体の系列の最新の版。上流のmigrationを取り込んだら上げる。
+const misakiCoreLatest = 147
+
 func misakiMigrationPaths() (string, string) {
 	root := filepath.Join("..", "..", "..")
 	return filepath.ToSlash(filepath.Join(root, "migration")), filepath.Join(root, "docs", "sql", "misaki-117-to-tracks.sql")
@@ -28,7 +31,7 @@ func TestMisakiHistory_MigrationTracksAreUnique(t *testing.T) {
 		name, dir string
 		latest    uint
 	}{
-		{"core", core, 143},
+		{"core", core, misakiCoreLatest},
 		{"local", filepath.Join(core, "local"), 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,7 +136,7 @@ func TestMisakiHistory_Legacy117ReachesSameSchemaAsFresh(t *testing.T) {
 	assert.Equal(t, []int64{1}, legacy.versions(t, "schema_migrations_local"))
 	code, out := legacy.migrate(t, "-direction", "up")
 	require.Equal(t, 0, code, out)
-	assert.Equal(t, []int64{143}, legacy.versions(t, "schema_migrations"))
+	assert.Equal(t, []int64{misakiCoreLatest}, legacy.versions(t, "schema_migrations"))
 	assert.Equal(t, []int64{1}, legacy.versions(t, "schema_migrations_local"))
 	assert.True(t, legacy.columnExists(t, "user", "accountCreatedAt"), "core117 must not be skipped")
 
@@ -162,7 +165,7 @@ func TestMisakiHistory_UpAcceptsCanonical117(t *testing.T) {
 	require.True(t, f.columnExists(t, "user", "accountCreatedAt"))
 	code, out = f.migrate(t, "-direction", "up")
 	require.Equal(t, 0, code, out)
-	assert.Equal(t, []int64{143}, f.versions(t, "schema_migrations"))
+	assert.Equal(t, []int64{misakiCoreLatest}, f.versions(t, "schema_migrations"))
 	assert.Equal(t, []int64{1}, f.versions(t, "schema_migrations_local"))
 }
 
