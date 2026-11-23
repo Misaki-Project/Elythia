@@ -28,7 +28,7 @@ on:
       - "go.mod"
       - "frontend/**"
       - "plugins/rolelevel/**"
-      - ".github/workflows/misaki-genshin-image.yml"
+      - ".github/workflows/misaki-image.yml"
   workflow_dispatch:
 
 jobs:

@@ -59,7 +59,7 @@ docker build -f Dockerfile.bundled \
 
 `elythia-plugin.yml` の `disabled: true` はそのままです。これはビルドの既定選択で、runtime 設定とは別です。通常の generator では Fx を除外し、上の `-include-disabled-dir`／Docker build argument は Fx だけを追加選択します。`rolelevel` と配置した3つは含まれ、他の disabled sample は選びません。生成された `cmd/elythia/plugins_generated.go`、`frontend/packages/frontend/src/server-plugins.generated.ts` と `mk-plugins.generated.json` でこの集合を確認してください。
 
-`<LOCAL_IMAGE_TAG>` は運営者が選ぶローカルタグです。registry、公開先、image digest は未確定で、この手順は push しません。既存の `misaki-genshin-image` workflow が変更なしで Fx を含むとは限りません。ここでは選択 argument を渡すローカルビルドを明示しています。ビルド成功後の `docker image inspect '<LOCAL_IMAGE_TAG>' --format '{{.Id}}'` とソース SHA を記録し、`org.opencontainers.image.revision` が checkout した `<REVIEWED_PLUGIN_SHA>` と一致することも確認します。この手順の作成時点では、この image のビルド・公開は実施していません。本番への配布・実際の image digest 固定・サービス切替は、運用環境を確認した別の手順で実施します。
+`<LOCAL_IMAGE_TAG>` は運営者が選ぶローカルタグです。registry、公開先、image digest は未確定で、この手順は push しません。既存の `misaki-image` workflow が変更なしで Fx を含むとは限りません。ここでは選択 argument を渡すローカルビルドを明示しています。ビルド成功後の `docker image inspect '<LOCAL_IMAGE_TAG>' --format '{{.Id}}'` とソース SHA を記録し、`org.opencontainers.image.revision` が checkout した `<REVIEWED_PLUGIN_SHA>` と一致することも確認します。この手順の作成時点では、この image のビルド・公開は実施していません。本番への配布・実際の image digest 固定・サービス切替は、運用環境を確認した別の手順で実施します。
 
 旧 plugin commit `68ff75dc0fe6c2f2854315ca5fa31c3efc92a17a` を固定した updater-v2 のプロファイルは、新しい SHA の適用前に別途レビューして更新する必要があります。この手順では updater 自体を書き換えず、revision の偽装や強制適用で確認を迂回しません。
 

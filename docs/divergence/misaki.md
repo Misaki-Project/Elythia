@@ -24,7 +24,7 @@ APIキーで呼べるのは`POST /api/plugin/role-level/admin/change-exp`だけ�
 
 ## 外部プラグインの固定コミット
 
-`.github/workflows/misaki-genshin-image.yml`は、本体を実行対象の不変commitから、外部プラグインを次のSHAからビルドする。プラグインのソースを本体へ直接取り込まず、`role-level`だけは本体に同梱する。この表はworkflowの`plugins`入力の記録であり、上流追従だけを理由にpinを動かさない。
+`.github/workflows/misaki-image.yml`は、本体を実行対象の不変commitから、外部プラグインを次のSHAからビルドする。プラグインのソースを本体へ直接取り込まず、`role-level`だけは本体に同梱する。この表はworkflowの`plugins`入力の記録であり、上流追従だけを理由にpinを動かさない。
 
 | プラグイン | リポジトリ | 固定SHA |
 |---|---|---|
