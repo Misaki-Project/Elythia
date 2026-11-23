@@ -3,6 +3,8 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +14,7 @@ import (
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/testutil"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,7 +29,7 @@ func TestAuthenticate_NoToken(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		user := GetUser(c)
 		assert.Nil(t, user)
 		return c.String(http.StatusOK, "ok")
@@ -54,7 +56,7 @@ func TestAuthenticate_BearerToken(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		u := GetUser(c)
 		assert.NotNil(t, u)
 		assert.Equal(t, "user1", u.ID)
@@ -84,7 +86,7 @@ func TestAuthenticate_PutsTokenInContext(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		assert.Equal(t, nativeToken, GetToken(c),
 			"middleware は raw auth token を context にそのまま積むべき")
 		return c.String(http.StatusOK, "ok")
@@ -159,7 +161,7 @@ func TestAuthenticate_SuspendedUserTreatedAsAnonymous(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		assert.Nil(t, GetUser(c), "凍結 user は context に attach されない")
 		assert.Equal(t, "", GetToken(c), "凍結 user は token も context に attach されない")
 		// raw token は存在する (解決できなくても)。cacheSec gate がこれで cache を抑える (#2049)。
@@ -181,17 +183,17 @@ func TestAuthenticate_HasRawToken(t *testing.T) {
 	// token 無し → HasRawToken=false。
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	c := e.NewContext(req, httptest.NewRecorder())
-	require.NoError(t, auth.Authenticate()(func(c echo.Context) error {
+	require.NoError(t, auth.Authenticate()(func(c *echo.Context) error {
 		assert.False(t, HasRawToken(c), "token 無しは HasRawToken=false")
 		return nil
 	})(c))
 
-	// query param i= の token (解決不能でも transient error 経路で anonymous) → HasRawToken=true。
+	// query param i= の削除済み token (匿名に落ちる) → HasRawToken=true。
 	deleted := &model.User{ID: "ud", Username: "del", IsDeleted: true}
 	userRepo.Tokens["dtok"] = deleted
 	req2 := httptest.NewRequest(http.MethodGet, "/?i=dtok", nil)
 	c2 := e.NewContext(req2, httptest.NewRecorder())
-	require.NoError(t, auth.Authenticate()(func(c echo.Context) error {
+	require.NoError(t, auth.Authenticate()(func(c *echo.Context) error {
 		assert.True(t, HasRawToken(c), "deleted token でも raw token はあるので HasRawToken=true")
 		return nil
 	})(c2))
@@ -213,7 +215,7 @@ func TestAuthenticate_DeletedUserTreatedAsAnonymous(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		assert.Nil(t, GetUser(c), "削除済 user は context に attach されない")
 		assert.True(t, IsInactiveAccountRequest(c), "/streaming が拒否できるよう印を積む")
 		assert.False(t, IsSuspendedRequest(c), "凍結の 403 YOUR_ACCOUNT_SUSPENDED とは区別する")
@@ -243,7 +245,7 @@ func TestRequireAuth_SuspendedRejected(t *testing.T) {
 
 	// Authenticate → RequireAuth の chain は production の認証要 endpoint
 	// と同じ pipeline。
-	chained := auth.Authenticate()(RequireAuth()(func(c echo.Context) error {
+	chained := auth.Authenticate()(RequireAuth()(func(c *echo.Context) error {
 		t.Fatal("RequireAuth は通過するべきでない")
 		return nil
 	}))
@@ -274,7 +276,7 @@ func TestAuthenticate_QueryParam(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		u := GetUser(c)
 		assert.NotNil(t, u)
 		assert.Equal(t, "user2", u.ID)
@@ -312,7 +314,7 @@ func TestAuthenticate_TokenCacheAvoidsDBOnRepeatedHit(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer "+tok)
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
-		_ = auth.Authenticate()(func(c echo.Context) error {
+		_ = auth.Authenticate()(func(c *echo.Context) error {
 			u := GetUser(c)
 			assert.NotNil(t, u)
 			assert.Equal(t, "u_cache_1", u.ID)
@@ -349,7 +351,7 @@ func TestAuthenticate_OrphanedAccessTokenFallsBackToAnonymous(t *testing.T) {
 	// 旧実装ではここで panic していた。Authenticate が anonymous で next に
 	// 渡すこと、ハンドラ内 GetUser が nil を返すことを確認する。
 	require.NotPanics(t, func() {
-		err := auth.Authenticate()(func(c echo.Context) error {
+		err := auth.Authenticate()(func(c *echo.Context) error {
 			assert.Nil(t, GetUser(c), "orphaned access_token must not produce a user")
 			return c.String(http.StatusOK, "ok")
 		})(c)
@@ -369,7 +371,7 @@ func TestAuthenticate_TokenCacheNotFoundIsNotPoisoned(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer ghost-tok")
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
-		_ = auth.Authenticate()(func(c echo.Context) error {
+		_ = auth.Authenticate()(func(c *echo.Context) error {
 			assert.Nil(t, GetUser(c))
 			return c.String(http.StatusOK, "ok")
 		})(c)
@@ -393,7 +395,7 @@ func TestAuthenticate_InvalidToken(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		t.Fatal("無効 token では handler に到達しない")
 		return nil
 	})
@@ -419,7 +421,7 @@ func TestRequireAuth_Authenticated(t *testing.T) {
 	user := &model.User{ID: "user1", Username: "test"}
 	c.Set(string(UserContextKey), user)
 
-	handler := RequireAuth()(func(c echo.Context) error {
+	handler := RequireAuth()(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 
@@ -434,7 +436,7 @@ func TestRequireAuth_Unauthenticated(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := RequireAuth()(func(c echo.Context) error {
+	handler := RequireAuth()(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 
@@ -467,7 +469,7 @@ func TestAuthenticate_AccessToken(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		u := GetUser(c)
 		assert.NotNil(t, u)
 		assert.Equal(t, "user3", u.ID)
@@ -497,7 +499,7 @@ func TestAuthenticate_UpstreamAppTokenForm(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
 		var got *model.User
-		require.NoError(t, auth.Authenticate()(func(c echo.Context) error {
+		require.NoError(t, auth.Authenticate()(func(c *echo.Context) error {
 			got = GetUser(c)
 			return c.NoContent(http.StatusOK)
 		})(c))
@@ -536,7 +538,7 @@ func TestAuthenticate_AppIssuedAccessToken(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		u := GetUser(c)
 		assert.NotNil(t, u)
 		assert.Equal(t, "user_app_1", u.ID)
@@ -564,7 +566,7 @@ func TestAuthenticate_JSONBodyToken(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		u := GetUser(c)
 		assert.NotNil(t, u)
 		assert.Equal(t, "user4", u.ID)
@@ -595,7 +597,7 @@ func TestAuthenticate_JSONBodyToken_BOMPrefix(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		u := GetUser(c)
 		assert.NotNil(t, u, "BOM-prefixed body token must authenticate")
 		assert.Equal(t, "user5", u.ID)
@@ -646,7 +648,7 @@ func TestAuthenticate_JSONBodyToken_ExactKey(t *testing.T) {
 			c := e.NewContext(req, httptest.NewRecorder())
 			called := false
 			gotID := ""
-			handler := auth.Authenticate()(func(c echo.Context) error {
+			handler := auth.Authenticate()(func(c *echo.Context) error {
 				called = true
 				if u := GetUser(c); u != nil {
 					gotID = u.ID
@@ -684,7 +686,7 @@ func TestAuthenticate_QueryTokenOnlyOnGet(t *testing.T) {
 			c := e.NewContext(req, httptest.NewRecorder())
 			called := false
 			gotID := ""
-			require.NoError(t, auth.Authenticate()(func(c echo.Context) error {
+			require.NoError(t, auth.Authenticate()(func(c *echo.Context) error {
 				called = true
 				if u := GetUser(c); u != nil {
 					gotID = u.ID
@@ -736,7 +738,7 @@ func TestAuthenticate_MultipartTokenFromBodyOnly(t *testing.T) {
 			c := e.NewContext(req, httptest.NewRecorder())
 			called := false
 			gotID := ""
-			require.NoError(t, auth.Authenticate()(func(c echo.Context) error {
+			require.NoError(t, auth.Authenticate()(func(c *echo.Context) error {
 				called = true
 				if u := GetUser(c); u != nil {
 					gotID = u.ID
@@ -760,7 +762,7 @@ func TestAuthenticate_JSONBodyToken_EmptyI(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		assert.Nil(t, GetUser(c))
 		return c.String(http.StatusOK, "ok")
 	})
@@ -780,7 +782,7 @@ func TestAuthenticate_JSONBodyToken_NoIField(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		assert.Nil(t, GetUser(c))
 		return c.String(http.StatusOK, "ok")
 	})
@@ -800,7 +802,7 @@ func TestAuthenticate_JSONBodyToken_InvalidJSON(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		assert.Nil(t, GetUser(c))
 		return c.String(http.StatusOK, "ok")
 	})
@@ -829,7 +831,7 @@ func TestAuthenticate_BearerTakesPrecedenceOverBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		u := GetUser(c)
 		assert.NotNil(t, u)
 		// Bearer header が body より優先
@@ -858,7 +860,7 @@ func TestRequireAdmin_Success(t *testing.T) {
 	c := e.NewContext(req, rec)
 	c.Set(string(UserContextKey), &model.User{ID: "u1"})
 
-	handler := RequireAdmin(&stubRoleChecker{admin: true})(func(c echo.Context) error {
+	handler := RequireAdmin(&stubRoleChecker{admin: true})(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 	err := handler(c)
@@ -873,7 +875,7 @@ func TestRequireAdmin_NotAdmin(t *testing.T) {
 	c := e.NewContext(req, rec)
 	c.Set(string(UserContextKey), &model.User{ID: "u1"})
 
-	handler := RequireAdmin(&stubRoleChecker{admin: false})(func(c echo.Context) error {
+	handler := RequireAdmin(&stubRoleChecker{admin: false})(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 	err := handler(c)
@@ -890,7 +892,7 @@ func TestRequireAdmin_NoUser(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := RequireAdmin(&stubRoleChecker{})(func(c echo.Context) error {
+	handler := RequireAdmin(&stubRoleChecker{})(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 	err := handler(c)
@@ -905,7 +907,7 @@ func TestRequireModerator_Success(t *testing.T) {
 	c := e.NewContext(req, rec)
 	c.Set(string(UserContextKey), &model.User{ID: "u1"})
 
-	handler := RequireModerator(&stubRoleChecker{moderator: true})(func(c echo.Context) error {
+	handler := RequireModerator(&stubRoleChecker{moderator: true})(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 	err := handler(c)
@@ -920,7 +922,7 @@ func TestRequireModerator_NotModerator(t *testing.T) {
 	c := e.NewContext(req, rec)
 	c.Set(string(UserContextKey), &model.User{ID: "u1"})
 
-	handler := RequireModerator(&stubRoleChecker{moderator: false})(func(c echo.Context) error {
+	handler := RequireModerator(&stubRoleChecker{moderator: false})(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 	err := handler(c)
@@ -937,7 +939,7 @@ func TestRequireModerator_NoUser(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	handler := RequireModerator(&stubRoleChecker{})(func(c echo.Context) error {
+	handler := RequireModerator(&stubRoleChecker{})(func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
 	err := handler(c)
@@ -961,9 +963,9 @@ func TestRequireSecure_NativeTokenAllowed(t *testing.T) {
 	nat := "nativetoken1234"
 	c.Set(string(UserContextKey), &model.User{ID: "u1", Token: &nat})
 	c.Set(string(TokenContextKey), nat)
-	err := RequireSecure()(func(c echo.Context) error { return c.String(http.StatusOK, "ok") })(c)
+	err := RequireSecure()(func(c *echo.Context) error { return c.String(http.StatusOK, "ok") })(c)
 	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, c.Response().Status)
+	assert.Equal(t, http.StatusOK, c.Response().(*echo.Response).Status)
 }
 
 func TestRequireSecure_AppTokenDenied(t *testing.T) {
@@ -974,7 +976,7 @@ func TestRequireSecure_AppTokenDenied(t *testing.T) {
 	// access token (app/MiAuth): user.Token (native) と request token が異なる
 	c.Set(string(UserContextKey), &model.User{ID: "u1", Token: &nat})
 	c.Set(string(TokenContextKey), "apptoken_different")
-	err := RequireSecure()(func(c echo.Context) error { return c.String(http.StatusOK, "ok") })(c)
+	err := RequireSecure()(func(c *echo.Context) error { return c.String(http.StatusOK, "ok") })(c)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusForbidden, rec.Code)
 	assert.Contains(t, rec.Body.String(), "ACCESS_DENIED")
@@ -984,7 +986,7 @@ func TestRequireSecure_Anonymous(t *testing.T) {
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodPost, "/", nil), rec)
-	err := RequireSecure()(func(c echo.Context) error { return c.String(http.StatusOK, "ok") })(c)
+	err := RequireSecure()(func(c *echo.Context) error { return c.String(http.StatusOK, "ok") })(c)
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
@@ -993,7 +995,7 @@ func TestRequireSecure_Anonymous(t *testing.T) {
 
 // newScopeCtx builds an echo context with the given AuthScope pre-set (nil
 // leaves it unset = unauthenticated/anonymous).
-func newScopeCtx(scope *AuthScope) (echo.Context, *httptest.ResponseRecorder) {
+func newScopeCtx(scope *AuthScope) (*echo.Context, *httptest.ResponseRecorder) {
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodPost, "/", nil), rec)
@@ -1007,7 +1009,7 @@ func TestRequireScope_NativeTokenPasses(t *testing.T) {
 	// native login token (IsApp=false) は scope 無検査で full access。
 	c, rec := newScopeCtx(&AuthScope{IsApp: false})
 	called := false
-	h := RequireScope("write:admin:queue")(func(c echo.Context) error {
+	h := RequireScope("write:admin:queue")(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1021,7 +1023,7 @@ func TestRequireScope_AnonymousPasses(t *testing.T) {
 	// 拒否は companion の RequireModerator/RequireAuth に委ねる。
 	c, rec := newScopeCtx(nil)
 	called := false
-	h := RequireScope("read:admin:queue")(func(c echo.Context) error {
+	h := RequireScope("read:admin:queue")(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1033,7 +1035,7 @@ func TestRequireScope_AnonymousPasses(t *testing.T) {
 func TestRequireScope_AppTokenWithKindPasses(t *testing.T) {
 	c, rec := newScopeCtx(&AuthScope{IsApp: true, Scopes: []string{"read:account", "write:admin:queue"}})
 	called := false
-	h := RequireScope("write:admin:queue")(func(c echo.Context) error {
+	h := RequireScope("write:admin:queue")(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1046,7 +1048,7 @@ func TestRequireScope_AppTokenWithoutKindDenied(t *testing.T) {
 	// app token が endpoint の kind を持たない → 403 PERMISSION_DENIED。
 	c, rec := newScopeCtx(&AuthScope{IsApp: true, Scopes: []string{"read:account"}})
 	called := false
-	h := RequireScope("write:admin:queue")(func(c echo.Context) error {
+	h := RequireScope("write:admin:queue")(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1064,7 +1066,7 @@ func TestRequireScope_AppTokenWithoutKindDenied(t *testing.T) {
 func TestRequireScope_AppTokenEmptyScopesDenied(t *testing.T) {
 	// permission 空の app token も拒否 (isApp=true なので full access ではない)。
 	c, rec := newScopeCtx(&AuthScope{IsApp: true, Scopes: nil})
-	h := RequireScope("read:admin:queue")(func(c echo.Context) error {
+	h := RequireScope("read:admin:queue")(func(c *echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	})
 	require.NoError(t, h(c))
@@ -1090,7 +1092,7 @@ func TestAuthenticate_AppTokenScopesPropagated(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+rawToken)
 	c := e.NewContext(req, httptest.NewRecorder())
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		sc := GetAuthScope(c)
 		require.NotNil(t, sc)
 		assert.True(t, sc.IsApp, "app token は IsApp=true")
@@ -1115,7 +1117,7 @@ func TestAuthenticate_NativeTokenIsNotApp(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+rawToken)
 	c := e.NewContext(req, httptest.NewRecorder())
 
-	handler := auth.Authenticate()(func(c echo.Context) error {
+	handler := auth.Authenticate()(func(c *echo.Context) error {
 		sc := GetAuthScope(c)
 		require.NotNil(t, sc)
 		assert.False(t, sc.IsApp, "native token は IsApp=false")
@@ -1127,7 +1129,7 @@ func TestAuthenticate_NativeTokenIsNotApp(t *testing.T) {
 
 // --- RequireNotMoved (#1562 prohibitMoved) ---
 
-func newMovedCtx(user *model.User) (echo.Context, *httptest.ResponseRecorder) {
+func newMovedCtx(user *model.User) (*echo.Context, *httptest.ResponseRecorder) {
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodPost, "/", nil), rec)
@@ -1140,7 +1142,7 @@ func newMovedCtx(user *model.User) (echo.Context, *httptest.ResponseRecorder) {
 func TestRequireNotMoved_NormalUserPasses(t *testing.T) {
 	c, rec := newMovedCtx(&model.User{ID: "u1"})
 	called := false
-	h := RequireNotMoved()(func(c echo.Context) error {
+	h := RequireNotMoved()(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1153,7 +1155,7 @@ func TestRequireNotMoved_MovedUserRejected(t *testing.T) {
 	moved := "https://other.example/users/xyz"
 	c, rec := newMovedCtx(&model.User{ID: "u1", MovedToURI: &moved})
 	called := false
-	h := RequireNotMoved()(func(c echo.Context) error {
+	h := RequireNotMoved()(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1171,7 +1173,7 @@ func TestRequireNotMoved_EmptyMovedURIPasses(t *testing.T) {
 	empty := ""
 	c, rec := newMovedCtx(&model.User{ID: "u1", MovedToURI: &empty})
 	called := false
-	h := RequireNotMoved()(func(c echo.Context) error {
+	h := RequireNotMoved()(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1184,7 +1186,7 @@ func TestRequireNotMoved_AnonymousPasses(t *testing.T) {
 	// user 未設定 (anonymous) は素通しし、認可は RequireAuth に任せる。
 	c, rec := newMovedCtx(nil)
 	called := false
-	h := RequireNotMoved()(func(c echo.Context) error {
+	h := RequireNotMoved()(func(c *echo.Context) error {
 		called = true
 		return c.NoContent(http.StatusOK)
 	})
@@ -1207,7 +1209,7 @@ func TestAuthenticate_InvalidToken_WWWAuthenticateHeader(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
-	chained := WWWAuthenticate()(auth.Authenticate()(func(c echo.Context) error {
+	chained := WWWAuthenticate()(auth.Authenticate()(func(c *echo.Context) error {
 		t.Fatal("無効 token では handler に到達しない")
 		return nil
 	}))
@@ -1239,7 +1241,7 @@ func TestSuspendedUser_403OnAllCredentialGates(t *testing.T) {
 			rec := httptest.NewRecorder()
 			c := e.NewContext(req, rec)
 
-			chained := auth.Authenticate()(gate(func(c echo.Context) error {
+			chained := auth.Authenticate()(gate(func(c *echo.Context) error {
 				t.Fatal("凍結 user は gate を通過しない")
 				return nil
 			}))
@@ -1252,13 +1254,102 @@ func TestSuspendedUser_403OnAllCredentialGates(t *testing.T) {
 	}
 }
 
+// 削除したアカウントのトークンは、どのcredential必須gateでも401
+// AUTHENTICATION_FAILEDになる (#4208)。CREDENTIAL_REQUIREDのままだと、frontendが
+// 確かめられない失敗として扱い、端末からこのアカウントを外せない。自分で削除すると
+// isSuspendedも立つので、その形でも同じ応答になることを確かめる。
+func TestDeletedUser_AuthenticationFailedOnAllCredentialGates(t *testing.T) {
+	gates := map[string]echo.MiddlewareFunc{
+		"RequireAuth":      RequireAuth(),
+		"RequireSecure":    RequireSecure(),
+		"RequireAdmin":     RequireAdmin(&stubRoleChecker{admin: true}),
+		"RequireModerator": RequireModerator(&stubRoleChecker{moderator: true}),
+	}
+	for name, gate := range gates {
+		for _, suspended := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/suspended=%v", name, suspended), func(t *testing.T) {
+				userRepo := testutil.NewMockUserRepository()
+				tokenRepo := testutil.NewMockAccessTokenRepository()
+				token := "deleted-token-" + name
+				userRepo.Tokens[token] = &model.User{ID: "u_d", Username: "gone", IsDeleted: true, IsSuspended: suspended}
+				auth := NewAuthMiddleware(userRepo, tokenRepo)
+
+				e := echo.New()
+				req := httptest.NewRequest(http.MethodPost, "/", nil)
+				req.Header.Set("Authorization", "Bearer "+token)
+				rec := httptest.NewRecorder()
+				c := e.NewContext(req, rec)
+
+				chained := auth.Authenticate()(gate(func(c *echo.Context) error {
+					t.Fatal("deleted user must not pass the gate")
+					return nil
+				}))
+				require.NoError(t, chained(c))
+				assert.Equal(t, http.StatusUnauthorized, rec.Code)
+				var resp map[string]any
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+				errObj := resp["error"].(map[string]any)
+				assert.Equal(t, "AUTHENTICATION_FAILED", errObj["code"])
+				assert.Equal(t, "b0a7f5f8-dc2f-4171-b91f-de88ad238e14", errObj["id"])
+			})
+		}
+	}
+}
+
+// failingTokenUserRepo fails the native token lookup with a transient error.
+type failingTokenUserRepo struct {
+	*testutil.MockUserRepository
+}
+
+func (failingTokenUserRepo) FindByToken(string) (*model.User, error) {
+	return nil, errors.New("connection reset")
+}
+
+// failingAccessTokenRepo fails the access token lookup with a transient error.
+type failingAccessTokenRepo struct {
+	*testutil.MockAccessTokenRepository
+}
+
+func (failingAccessTokenRepo) FindByHashOrToken(string, string) (*model.AccessToken, error) {
+	return nil, errors.New("connection reset")
+}
+
+// トークンの検索がDBの一時的な失敗で落ちたら、本家と同じく500を返し、匿名として
+// 先へ進めない (#4212)。native tokenの検索で落ちたときは、access_tokenの検索へ
+// 進むとnot foundで終わって401 AUTHENTICATION_FAILEDになり、frontendが有効な
+// アカウントを端末から外す (#4208)。匿名で進むと、認証が要るendpointは401
+// CREDENTIAL_REQUIREDになり、/streamingは匿名の接続として張られる。
+func TestAuthenticate_TransientTokenLookupFailureIsInternalError(t *testing.T) {
+	for name, auth := range map[string]*AuthMiddleware{
+		"native token": NewAuthMiddleware(failingTokenUserRepo{testutil.NewMockUserRepository()}, testutil.NewMockAccessTokenRepository()),
+		"access token": NewAuthMiddleware(testutil.NewMockUserRepository(), failingAccessTokenRepo{testutil.NewMockAccessTokenRepository()}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := echo.New()
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.Header.Set("Authorization", "Bearer abcdefghijklmnop")
+			rec := httptest.NewRecorder()
+			c := e.NewContext(req, rec)
+
+			require.NoError(t, auth.Authenticate()(func(c *echo.Context) error {
+				t.Fatal("must not continue as an anonymous request")
+				return nil
+			})(c))
+			assert.Equal(t, http.StatusInternalServerError, rec.Code)
+			var resp map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			assert.Equal(t, "INTERNAL_ERROR", resp["error"].(map[string]any)["code"])
+		})
+	}
+}
+
 // 未認証 (token 無し) は従来どおり 401 CREDENTIAL_REQUIRED (凍結 flag 無し)。
 func TestCredentialRequired_NoToken(t *testing.T) {
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
-	handler := RequireAuth()(func(c echo.Context) error { return nil })
+	handler := RequireAuth()(func(c *echo.Context) error { return nil })
 	require.NoError(t, handler(c))
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	var resp map[string]any
@@ -1293,7 +1384,7 @@ func TestRejectAppToken(t *testing.T) {
 			}
 
 			called := false
-			h := RejectAppToken()(func(echo.Context) error {
+			h := RejectAppToken()(func(*echo.Context) error {
 				called = true
 				return c.String(http.StatusOK, "ok")
 			})
@@ -1313,7 +1404,7 @@ func TestRejectAppToken_ResponseShapeMatchesRequireScope(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c := e.NewContext(httptest.NewRequest(http.MethodPost, "/api/x", nil), rec)
 		c.Set(string(AuthScopeContextKey), &AuthScope{IsApp: true, Scopes: []string{"read:account"}})
-		require.NoError(t, mw(func(echo.Context) error { return nil })(c))
+		require.NoError(t, mw(func(*echo.Context) error { return nil })(c))
 		return rec.Body.String()
 	}
 
@@ -1334,7 +1425,7 @@ func TestNativeTokenMatches(t *testing.T) {
 
 func TestIsInactiveAccountRequest(t *testing.T) {
 	e := echo.New()
-	newCtx := func() echo.Context {
+	newCtx := func() *echo.Context {
 		return e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), httptest.NewRecorder())
 	}
 	assert.False(t, IsInactiveAccountRequest(newCtx()))

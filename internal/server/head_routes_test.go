@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/labstack/echo/v4"
-	echomw "github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/echo/v5"
+	echomw "github.com/labstack/echo/v5/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -115,10 +115,13 @@ func newHeadRoutesFixture(t *testing.T) (*headRoutesFixture, string) {
 	e := f.e
 	e.GET("/page", f.handler("page", http.StatusOK, "<html>page</html>"))
 	e.GET("/users/:id", f.handler("user", http.StatusOK, `{"id":"u"}`))
+	// 先頭に "/" の無いパス。echo のルーターは "/relative" として持つが、
+	// OnAddRoute には正規化する前の "relative" が届く (#4241)。
+	e.GET("relative", f.handler("relative", http.StatusOK, "relative"))
 	// net/http の書き込みの buffer (4KiB) を超える本文。handler の途中で
 	// 書き出されるので、元のリクエストが HEAD に戻っていないと本文が漏れる。
 	e.GET("/large", f.handler("large", http.StatusOK, strings.Repeat("large body ", 10000)))
-	e.GET("/missing", func(c echo.Context) error {
+	e.GET("/missing", func(c *echo.Context) error {
 		f.record("missing", c)
 		return echo.NewHTTPError(http.StatusNotFound, "no such thing")
 	})
@@ -129,12 +132,12 @@ func newHeadRoutesFixture(t *testing.T) (*headRoutesFixture, string) {
 	// /api と同じ形。HEAD も持つ catch-all と、それより具体的な GET のルート。
 	api := e.Group("/api", func(next echo.HandlerFunc) echo.HandlerFunc { return next })
 	api.GET("/emojis", f.handler("api-emojis", http.StatusOK, `{"emojis":[]}`))
-	api.Any("/*", f.handler("api-catchall", http.StatusOK, "{}"))
+	api.Match(anyMethods, "/*", f.handler("api-catchall", http.StatusOK, "{}"))
 	// HEAD を明示したルートは、そのまま HEAD として handler に届く。
-	e.Any("/any/*", f.handler("any", http.StatusOK, "any"))
+	e.Match(anyMethods, "/any/*", f.handler("any", http.StatusOK, "any"))
 	e.GET("/*", f.handler("spa", http.StatusOK, "<html>spa</html>"))
 	e.HEAD("/probe", f.handler("probe-head", http.StatusNoContent, ""))
-	e.GET("/blob", func(c echo.Context) error {
+	e.GET("/blob", func(c *echo.Context) error {
 		f.record("blob", c)
 		c.Response().Header().Set(echo.HeaderContentType, "application/octet-stream")
 		http.ServeContent(c.Response(), headreq.Request(c), "blob", time.Time{}, newCountingSeeker(blobPayload))
@@ -146,7 +149,7 @@ func newHeadRoutesFixture(t *testing.T) (*headRoutesFixture, string) {
 	return f, srv.URL
 }
 
-func (f *headRoutesFixture) record(name string, c echo.Context) {
+func (f *headRoutesFixture) record(name string, c *echo.Context) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seen[name] = seenRequest{method: c.Request().Method, head: headreq.Is(c)}
@@ -166,7 +169,7 @@ func (f *headRoutesFixture) reset() {
 }
 
 func (f *headRoutesFixture) handler(name string, status int, body string) echo.HandlerFunc {
-	return func(c echo.Context) error {
+	return func(c *echo.Context) error {
 		f.record(name, c)
 		c.Response().Header().Set("X-Route", name)
 		if body == "" {
@@ -217,7 +220,7 @@ func resetBlobBytesRead() {
 func TestHeadRoutes_GETRouteAnswersHEADLikeGET(t *testing.T) {
 	f, base := newHeadRoutesFixture(t)
 
-	for _, path := range []string{"/page", "/users/abc", "/large", "/grp/item", "/api/emojis", "/somewhere/else", "/"} {
+	for _, path := range []string{"/page", "/users/abc", "/relative", "/large", "/grp/item", "/api/emojis", "/somewhere/else", "/"} {
 		t.Run(path, func(t *testing.T) {
 			assertHEADLikeGET(t, base, path, nil, echo.HeaderContentType, "X-Route", echo.HeaderContentLength)
 		})
@@ -285,7 +288,7 @@ func TestHeadRoutes_RoutesWithoutGETAreUnchanged(t *testing.T) {
 	e := echo.New()
 	h := installHeadRoutes(e)
 	e.Use(h.presentAsGET)
-	ok := func(c echo.Context) error { return c.String(http.StatusOK, "x") }
+	ok := func(c *echo.Context) error { return c.String(http.StatusOK, "x") }
 	e.POST("/post-only", ok)
 	g := e.Group("/grp", func(next echo.HandlerFunc) echo.HandlerFunc { return next })
 	g.POST("/post-only", ok)
@@ -359,7 +362,7 @@ func TestHeadRoutes_FilesHEADUsesTheSniffOnlyBranch(t *testing.T) {
 // なったら、この仕組みは要らなくなるので、気づけるようにする。
 func TestHeadRoutes_EchoAloneAnswersHEADWith405(t *testing.T) {
 	e := echo.New()
-	e.GET("/page", func(c echo.Context) error { return c.String(http.StatusOK, "page") })
+	e.GET("/page", func(c *echo.Context) error { return c.String(http.StatusOK, "page") })
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "/page", nil))
 	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
@@ -420,4 +423,18 @@ func TestHeadRoutes_FilesLocalHEADSkipsTheBodyCopy(t *testing.T) {
 	assert.Equal(t, "image/png", res.Header.Get(echo.HeaderContentType))
 	assert.Empty(t, res.trailing)
 	assert.LessOrEqual(t, blobBytesRead(), int64(coredrive.MIMESniffLen))
+}
+
+// TestNormalizeRoutePath pins that a recorded route path takes the form echo's
+// router stores and Context.Path reports (#4241).
+func TestNormalizeRoutePath(t *testing.T) {
+	for in, want := range map[string]string{
+		"":           "/",
+		"relative":   "/relative",
+		"/":          "/",
+		"/api/*":     "/api/*",
+		"/users/:id": "/users/:id",
+	} {
+		assert.Equal(t, want, normalizeRoutePath(in), "%q", in)
+	}
 }

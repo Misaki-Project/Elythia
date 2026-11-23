@@ -48,6 +48,15 @@ type ObjectStorageProcessor struct {
 	storage  coredrive.Storage
 	local    coredrive.Storage
 	fileRepo RemoteFileCleaner
+	// restoredCopies deletes the copies a file moved back to the local storage
+	// left in object storage (#4197). nil means never.
+	restoredCopies coredrive.RestoredCopyReleaser
+}
+
+// SetRestoredCopyReleaser wires what deletes the copies a cleaned file left
+// in object storage when it was moved back (#4197).
+func (p *ObjectStorageProcessor) SetRestoredCopyReleaser(r coredrive.RestoredCopyReleaser) {
+	p.restoredCopies = r
 }
 
 // NewObjectStorageProcessor constructs the processor. storage is the primary
@@ -130,6 +139,16 @@ func (p *ObjectStorageProcessor) HandleCleanRemoteFiles(ctx context.Context, _ d
 			slog.Error("cleanRemoteFiles: ExpireByIDs failed", "err", err)
 			return err
 		}
+		// ローカルへ戻したファイル (#4183) の写しはバケットに残っている。行を link 行へ倒すと
+		// 写しを指すものが無くなるので、記録した写しを消す (#4197)。倒せた後で消す。先に消すと、
+		// 倒せなかったときに、ローカルを消した行の最後の実体まで無くなる。
+		if p.restoredCopies != nil {
+			for _, f := range files {
+				if f.StoredInternal && !f.IsLink {
+					p.restoredCopies.ReleaseRestoredCopies(ctx, f.ID)
+				}
+			}
+		}
 		totalDeleted += deleted
 		if len(files) < cleanRemoteFilesBatchSize {
 			break
@@ -162,6 +181,17 @@ func (p *ObjectStorageProcessor) deleteObjects(f *model.DriveFile) {
 		if err := backend.Delete(*key); err != nil {
 			slog.Warn("cleanRemoteFiles: storage delete failed (object may be orphaned)",
 				"fileId", f.ID, "err", err)
+		}
+	}
+	// オブジェクトストレージへ写したファイル (#4180) は、ローカルにも写しが残っている。
+	// 行を link 行へ倒すと誰も指さなくなるので、ローカルからも消す。
+	if coredrive.HasMigratedLocalCopy(f) && p.local != nil {
+		for _, key := range []*string{f.AccessKey, f.ThumbnailAccessKey, f.WebpublicAccessKey} {
+			if key != nil && *key != "" {
+				if err := p.local.Delete(*key); err != nil {
+					slog.Warn("cleanRemoteFiles: delete the local copy of a migrated file", "fileId", f.ID, "err", err)
+				}
+			}
 		}
 	}
 }

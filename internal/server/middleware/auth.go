@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -14,7 +15,7 @@ import (
 	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"gorm.io/gorm"
 )
 
@@ -46,7 +47,8 @@ const (
 	rawTokenPresentContextKey contextKey = "misskeyRawTokenPresent"
 	// deletedContextKey flags that the request carried a valid token whose
 	// account is (logically) deleted. HTTP では匿名として扱うが、/streaming は
-	// 凍結と同じくこの接続を拒否する (IsInactiveAccountRequest)。
+	// 凍結と同じくこの接続を拒否する (IsInactiveAccountRequest)。認証が要る
+	// gateでは401 AUTHENTICATION_FAILEDを返す (credentialRequiredResponse、#4208)。
 	deletedContextKey contextKey = "misskeyDeleted"
 	// heldAppUserContextKey holds the user of an app token that lacks
 	// AppReadKind, moved out of UserContextKey by HideAppUserWithoutRead until
@@ -182,10 +184,15 @@ func (a *AuthMiddleware) notifyInvalidated(userID string) {
 }
 
 // Authenticate is an Echo middleware that extracts and validates the user token.
-// It does NOT reject unauthenticated requests - it just sets the user if valid.
+// Requests without a usable credential pass through as anonymous (no token,
+// a deleted or suspended account, an access token whose user is gone), leaving
+// authorization to the gates. It rejects only a token that does not exist (or
+// a plugin-managed account's token from outside) with 401
+// AUTHENTICATION_FAILED, and a token it could not check because of a database
+// failure with 500 INTERNAL_ERROR (#4212).
 func (a *AuthMiddleware) Authenticate() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			token := extractToken(c)
 			if token == "" {
 				return next(c)
@@ -201,12 +208,20 @@ func (a *AuthMiddleware) Authenticate() echo.MiddlewareFunc {
 				// AUTHENTICATION_FAILED を返す経路なのでそれに揃える (#1559)。
 				// WWW-Authenticate: error=invalid_token は WWWAuthenticate
 				// middleware が body から判定して付ける。orphaned access_token
-				// (#514) や transient な DB error は誤って全 request を 401 に
-				// しないよう従来どおり anonymous に落とし、後続の認可に委ねる。
+				// (#514) は anonymous に落とし、後続の認可に委ねる。
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return c.JSON(http.StatusUnauthorized, apierr.AuthenticationFailed())
 				}
-				return next(c)
+				if errors.Is(err, errOrphanedAccessToken) {
+					return next(c)
+				}
+				// DBの一時的な失敗などで確かめられなかったときは、本家と同じく500を返す
+				// (#4212)。本家は認証の途中の失敗をAuthenticationError以外として500にし、
+				// /streamingのupgradeも500で拒否する。匿名に落とすと、認証が要る
+				// endpointは401 CREDENTIAL_REQUIREDになってクライアントがログインの切れと
+				// 受け取り、/streamingは匿名の接続として張られて通知が届かなくなる。
+				slog.Error("auth: cannot resolve token", "path", c.Request().URL.Path, "err", err)
+				return apierr.JSONInternalError(c)
 			}
 
 			// **プラグインが管理するアカウントの token は、プロセス内の呼び出しで
@@ -271,7 +286,7 @@ func (a *AuthMiddleware) Authenticate() echo.MiddlewareFunc {
 // 呼んだときに失敗させないため (公開の内容はそのまま読める)。
 func HideAppUserWithoutRead() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			sc := GetAuthScope(c)
 			if sc == nil || !sc.IsApp || slices.Contains(sc.Scopes, AppReadKind) {
 				return next(c)
@@ -290,7 +305,7 @@ func HideAppUserWithoutRead() echo.MiddlewareFunc {
 // is calling (i/revoke-token, which lets any app token revoke itself).
 func AdmitAppUser() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			admitHeldAppUser(c)
 			return next(c)
 		}
@@ -301,7 +316,7 @@ func AdmitAppUser() echo.MiddlewareFunc {
 // UserContextKey. Endpoint gates call it first: past the gate, the app token's
 // permission has been checked against the endpoint (or the gate rejects app
 // tokens outright), so the handler may see the user.
-func admitHeldAppUser(c echo.Context) {
+func admitHeldAppUser(c *echo.Context) {
 	u, ok := c.Get(string(heldAppUserContextKey)).(*model.User)
 	if !ok || u == nil {
 		return
@@ -317,7 +332,7 @@ func admitHeldAppUser(c echo.Context) {
 //
 // upstream ApiCallService も suspended は 403 にするので、endpoint 固有の
 // CREDENTIAL_REQUIRED を返す handler でも suspended だけは 403 に分ける必要がある。
-func IsSuspendedRequest(c echo.Context) bool {
+func IsSuspendedRequest(c *echo.Context) bool {
 	v, _ := c.Get(string(suspendedContextKey)).(bool)
 	return v
 }
@@ -326,7 +341,7 @@ func IsSuspendedRequest(c echo.Context) bool {
 // whose account is suspended or deleted. Both are treated as anonymous by
 // Authenticate; /streaming uses this to refuse the upgrade instead
 // (upstream StreamingApiServerService rejects suspended users with 403).
-func IsInactiveAccountRequest(c echo.Context) bool {
+func IsInactiveAccountRequest(c *echo.Context) bool {
 	if IsSuspendedRequest(c) {
 		return true
 	}
@@ -335,11 +350,20 @@ func IsInactiveAccountRequest(c echo.Context) bool {
 }
 
 // credentialRequiredResponse writes the error for a credential-required gate
-// when GetUser is nil: 403 YOUR_ACCOUNT_SUSPENDED when the request carried a
-// valid token for a suspended account (upstream ApiCallService.ts、#1559)、else
-// 401 CREDENTIAL_REQUIRED. Shared by RequireAuth / RequireSecure /
-// RequireAdmin / RequireModerator so the suspended branch stays consistent.
-func credentialRequiredResponse(c echo.Context) error {
+// when GetUser is nil: 401 AUTHENTICATION_FAILED when the request carried a
+// token for a deleted account (#4208), 403 YOUR_ACCOUNT_SUSPENDED when it
+// carried a valid token for a suspended account (upstream ApiCallService.ts、
+// #1559)、else 401 CREDENTIAL_REQUIRED. Shared by RequireAuth / RequireSecure /
+// RequireAdmin / RequireModerator so these branches stay consistent.
+func credentialRequiredResponse(c *echo.Context) error {
+	// 削除したアカウントのトークンには、削除のジョブがトークンを消した後と同じ応答を
+	// 返す (#4208)。トークンは、管理者の削除などではジョブがノートなどを全部消し終える
+	// まで残り、ジョブが失敗すると残り続ける。その間をCREDENTIAL_REQUIREDにすると、
+	// frontendはトークンが無効と確かめられなかった失敗として扱い、端末から
+	// このアカウントを外せない。
+	if v, _ := c.Get(string(deletedContextKey)).(bool); v {
+		return c.JSON(http.StatusUnauthorized, apierr.AuthenticationFailed())
+	}
 	if v, _ := c.Get(string(suspendedContextKey)).(bool); v {
 		return c.JSON(http.StatusForbidden, apierr.YourAccountSuspended())
 	}
@@ -349,7 +373,7 @@ func credentialRequiredResponse(c echo.Context) error {
 // RequireAuth is a middleware that requires authentication.
 func RequireAuth() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			admitHeldAppUser(c)
 			user := GetUser(c)
 			if user == nil {
@@ -372,7 +396,7 @@ func RequireAuth() echo.MiddlewareFunc {
 // their raw token never matches user.Token.
 func RequireSecure() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			admitHeldAppUser(c)
 			user := GetUser(c)
 			if user == nil {
@@ -392,7 +416,7 @@ func RequireSecure() echo.MiddlewareFunc {
 }
 
 // GetUser returns the authenticated user from the context.
-func GetUser(c echo.Context) *model.User {
+func GetUser(c *echo.Context) *model.User {
 	u, ok := c.Get(string(UserContextKey)).(*model.User)
 	if !ok {
 		return nil
@@ -406,7 +430,7 @@ func GetUser(c echo.Context) *model.User {
 // tokenCache entry so subsequent requests read fresh user state from DB
 // instead of returning stale cached values within the 30s TTL window
 // (#960).
-func GetToken(c echo.Context) string {
+func GetToken(c *echo.Context) string {
 	t, ok := c.Get(string(TokenContextKey)).(string)
 	if !ok {
 		return ""
@@ -418,7 +442,7 @@ func GetToken(c echo.Context) string {
 // body `i`), regardless of whether it resolved to a valid user. cacheSec
 // endpoints use this so an invalid/suspended/deleted token still suppresses the
 // public Cache-Control, matching upstream ApiCallService's `!token` check (#2049).
-func HasRawToken(c echo.Context) bool {
+func HasRawToken(c *echo.Context) bool {
 	v, _ := c.Get(string(rawTokenPresentContextKey)).(bool)
 	return v
 }
@@ -426,7 +450,7 @@ func HasRawToken(c echo.Context) bool {
 // GetAuthScope returns the OAuth scope view for the current request, or nil
 // when the request was unauthenticated (no token). A non-nil result with
 // IsApp=false denotes a native login token (full access).
-func GetAuthScope(c echo.Context) *AuthScope {
+func GetAuthScope(c *echo.Context) *AuthScope {
 	s, ok := c.Get(string(AuthScopeContextKey)).(*AuthScope)
 	if !ok {
 		return nil
@@ -443,7 +467,7 @@ func GetAuthScope(c echo.Context) *AuthScope {
 // scope are both enforced (#1552).
 func RequireScope(kind string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			sc := GetAuthScope(c)
 			// native login token / anonymous → no scope restriction.
 			if sc == nil || !sc.IsApp {
@@ -475,7 +499,7 @@ func RequireScope(kind string) echo.MiddlewareFunc {
 // `i/change-password` のような endpoint へ抜けられる。
 func RejectAppToken() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			if sc := GetAuthScope(c); sc != nil && sc.IsApp {
 				return c.JSON(http.StatusForbidden, apierr.PermissionDenied())
 			}
@@ -490,7 +514,7 @@ func RejectAppToken() echo.MiddlewareFunc {
 // こと (GetUser が nil の場合は素通しし、認可は RequireAuth 側に任せる)。
 func RequireNotMoved() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			user := GetUser(c)
 			if user != nil && user.MovedToURI != nil && *user.MovedToURI != "" {
 				return c.JSON(http.StatusForbidden, apierr.ErrorWithKind(
@@ -514,7 +538,7 @@ type RoleChecker interface {
 // RequireAdmin is a middleware that requires the user to have an administrator role.
 func RequireAdmin(checker RoleChecker) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			admitHeldAppUser(c)
 			user := GetUser(c)
 			if user == nil {
@@ -539,7 +563,7 @@ func RequireAdmin(checker RoleChecker) echo.MiddlewareFunc {
 // RequireModerator is a middleware that requires the user to have a moderator or admin role.
 func RequireModerator(checker RoleChecker) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			admitHeldAppUser(c)
 			user := GetUser(c)
 			if user == nil {
@@ -562,7 +586,7 @@ func RequireModerator(checker RoleChecker) echo.MiddlewareFunc {
 	}
 }
 
-func extractToken(c echo.Context) string {
+func extractToken(c *echo.Context) string {
 	// Bearer token from Authorization header
 	auth := c.Request().Header.Get("Authorization")
 	if strings.HasPrefix(auth, "Bearer ") {
@@ -651,6 +675,14 @@ func (a *AuthMiddleware) resolveUser(token string) (user *model.User, scopes []s
 	if err == nil {
 		a.tokenCache.putIfFresh(readStart, token, user, nil, "", false)
 		return user, nil, "", false, nil
+	}
+	// 見つからなかった以外の失敗(DBの一時的な失敗など)は、ここで打ち切る (#4208)。
+	// 下のaccess_tokenの検索へ進むと、native tokenはそちらに無いのでnot foundで
+	// 終わり、有効なtokenなのに401 AUTHENTICATION_FAILEDを返す。frontendは
+	// これを「トークンが無効」と受け取り、端末からアカウントを外す。打ち切れば
+	// Authenticateが500を返す (#4212)。
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil, "", false, err
 	}
 
 	// hash 列 (miauth: sha256(token) / 本家の app 認証の形: 提示された値の小文字)

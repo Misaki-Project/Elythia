@@ -148,7 +148,8 @@ const defaultStuckAfter = 30 * time.Minute
 //
 // **追跡対象にも長い job は残る。** deleteAccount は maintenance ではなく
 // deliver に載っており (queue.go の EnqueueDeleteAccount)、100 件ごとに 250ms
-// 空けるので 70 万ノート規模で 30 分を超える。inbox も resolver の再帰で
+// 空けるので 70 万ノート規模で 30 分を超える (オブジェクトストレージのドライブの
+// ファイルも 100 件ごとに 250ms 空けるので、その分も足される)。inbox も resolver の再帰で
 // 理論上 40 分を超えうる。どちらも隔離されるだけで job は cancel されないため
 // 実害は「一時的に Worker が 1 本増える」に留まるが、閾値を短くすると
 // その状態が定常化する。
@@ -427,20 +428,21 @@ func (s *Server) Start() error {
 			optsBase = append(optsBase, mkq.WithJobMetrics(s.maxMetricsPoints))
 		}
 		if s.idlePollInterval > 0 {
-			// アイドル時の空振りポーリングを間引きたい運用者向けの opt-in。
+			// アイドル時の空振りの間隔。既定は config の
+			// defaultQueueIdlePollSeconds (#4215)。
 			//
 			// **ジョブ取得は遅くならない。** worker は BZPOPMIN で marker key を
 			// 待っており、ジョブが積まれた時点で Lua 側が marker を push するので
-			// ミリ秒で起きる (interval 30 秒でも取得 18.9ms を実測)。この値は
-			// 「marker を取り逃した場合に気づくまで」の上限でしかない。
+			// ミリ秒で起きる (interval 30 秒でも取得 18.9ms を実測)。この値で
+			// 延びるものは config の defaultQueueIdlePollSeconds に書いた。
 			//
-			// **既定を延ばさないのは shutdown が延びるため。** 発行済みの
-			// BZPOPMIN は ctx キャンセルで中断できないので、停止には最大
-			// interval だけかかる (実測: 1 秒で 0.6 秒、5 秒で 4.6 秒)。
-			// mkq 既定の 100ms は go-redis が 1 秒へ切り上げるため実効 1 秒で、
-			// worker 44 個の構成ではアイドル時に Redis へ毎秒 774 コマンド撃つ
-			// (本番実測。Misskey TS は毎秒 21.5)。Redis の CPU は 1 コアの
-			// 1.2% なので、再起動の速さと引き換えにする価値は薄いと判断した。
+			// **停止も遅くならない。** mkq v1.0.4 から、Stop が worker 専用の
+			// wake key を突いて待機中の dispatcher を起こす
+			// (TestShutdown_DoesNotScaleWithWorkerCount)。
+			//
+			// **Redis の瞬断の後の再開は延びるが、最大約 5 秒。** mkq v1.5.2 から、
+			// 取り出しが失敗した後の眠りはこの値に従わず、1 秒から倍にして 5 秒で
+			// 頭打ちになる (mkq#154)。それより前の mkq では、延ばした分だけ止まった。
 			optsBase = append(optsBase, mkq.WithIdlePollInterval(s.idlePollInterval))
 		}
 		// custom backoff (`{type:"custom"}`) で enqueue された job の retry delay
@@ -1399,6 +1401,9 @@ func newDispatchHandler(handlers map[string]driver.HandlerFunc, qname string, ob
 			c = driver.WithJobLogger(c, func(lc context.Context, line string) error {
 				return job.Log(lc, line)
 			})
+			// 処理中の印を、同じジョブの再試行と別のジョブとで見分けるのに使う (受信の
+			// 再投函ガード)。
+			c = driver.WithJobID(c, job.ID)
 			d := handlerDeadlineFor(taskType, deadline)
 			return runBounded(c, h, mkqTask{taskType: taskType, payload: job.Data.payload()},
 				d, graceFor(d),

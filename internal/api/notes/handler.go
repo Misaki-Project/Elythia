@@ -13,6 +13,7 @@ import (
 	"github.com/elythia-network/elythia/internal/api/jsnum"
 	"github.com/elythia-network/elythia/internal/api/notehide"
 	"github.com/elythia-network/elythia/internal/api/pagination"
+	"github.com/elythia-network/elythia/internal/bgwork"
 	"github.com/elythia-network/elythia/internal/core/note"
 	"github.com/elythia-network/elythia/internal/core/notedelivery"
 	"github.com/elythia-network/elythia/internal/core/notesfilter"
@@ -32,14 +33,16 @@ import (
 	"github.com/elythia-network/elythia/internal/queue/driver"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 )
 
 // Handler handles note-related API endpoints.
 type Handler struct {
 	// noteDelivery は notes/create の pluginOptions を受け取るプラグイン
 	// (#4199)。nil なら pluginOptions の項目は全部 400 になる。
-	noteDelivery    *notedelivery.Registry
+	noteDelivery *notedelivery.Registry
+	// background は片付けを走らせる世代のグループ (#3661、#4202)。
+	background      *bgwork.Group
 	noteRepo        repository.NoteRepository
 	piningRepo      repository.UserNotePiningRepository
 	createService   *note.CreateService
@@ -186,7 +189,7 @@ func (h *Handler) SetLocalFederationObserver(observer activitypub.LocalFederatio
 	h.localFederationObserver = observer
 }
 
-func (h *Handler) gateRemoteNoteAction(c echo.Context, user *model.User, noteID string) bool {
+func (h *Handler) gateRemoteNoteAction(c *echo.Context, user *model.User, noteID string) bool {
 	if h.localFederationObserver == nil || user == nil || !user.IsLocal() || h.noteRepo == nil {
 		return true
 	}
@@ -212,6 +215,40 @@ func (h *Handler) gateRemoteNoteAction(c echo.Context, user *model.User, noteID 
 // pluginOptions (#4199).
 func (h *Handler) SetNoteDeliveryRules(r *notedelivery.Registry) {
 	h.noteDelivery = r
+}
+
+// forgetUnfederatedNote tells the NoteDelivery plugins to drop the conditions
+// they stored for noteID when the note was not stored (#4202).
+//
+// **保存に失敗したかは、エラーではなくDBの primary で確かめる。** 作成はノートの行を書いた
+// 後 (投票の保存など) でも失敗を返しうる。その行はAPで照会されうるので、条件を
+// 消すと、絞ったつもりのノートが誰にでも見えるようになる。行があるか確かめられ
+// ないとき (DBの障害) も消さない。
+//
+// **保存したノートは、localOnly でも条件を残す。** 連合はしないが、`/notes/:id`を
+// Webページとして取られたときのOGPを隠すのに条件を使う (ssr_meta.go)。
+//
+// プラグインは世代のグループの goroutine で呼ぶ (同時に走る数には上限がある)。
+// Prepareが期限切れで失敗したときに、止まっているプラグインをもう一度待つと、
+// エラーの応答がさらに遅れる。IDは使い回さないので、片付けは急がなくてよい。
+func (h *Handler) forgetUnfederatedNote(noteID string, createErr error) {
+	if createErr == nil || h.noteRepo == nil {
+		return
+	}
+	// primary を読む。レプリカは複製前の行を取りこぼすので、保存の後で失敗した
+	// ノートを「無い」と取り違え、条件を消してしまう (repository の規約、#4202)。
+	ids, err := h.noteRepo.ExistingNoteIDsOnPrimary([]string{noteID})
+	if err != nil || len(ids) > 0 {
+		return
+	}
+	h.noteDelivery.ForgetNotesInBackground(h.background, []string{noteID})
+}
+
+// SetBackground wires the group of the server generation (#3661) that runs
+// the cleanup of forgetUnfederatedNote, so stopping the generation waits for
+// it. nil runs plain goroutines.
+func (h *Handler) SetBackground(g *bgwork.Group) {
+	h.background = g
 }
 
 // SetPiningRepo wires the repository used to verify that a notes/show target
@@ -528,7 +565,7 @@ type PollRequest struct {
 }
 
 // Create handles POST /api/notes/create.
-func (h *Handler) Create(c echo.Context) error {
+func (h *Handler) Create(c *echo.Context) error {
 	user := middleware.GetUser(c)
 
 	var req CreateRequest
@@ -564,10 +601,14 @@ func (h *Handler) Create(c echo.Context) error {
 		NoExtractHashtags:  req.NoExtractHashtags,
 		NoExtractEmojis:    req.NoExtractEmojis,
 	}
+	// preparedID はプラグインに条件を書かせたノートの ID。書かせた後にノートを
+	// 保存しなかったら、プラグインに片付けさせる (#4202)。
+	var preparedID string
 	if len(req.PluginOptions) > 0 {
 		options := req.PluginOptions
 		reqCtx := c.Request().Context()
 		in.BeforeInsert = func(noteID string) error {
+			preparedID = noteID
 			return h.noteDelivery.Prepare(reqCtx, noteID, user.ID, options)
 		}
 	}
@@ -611,6 +652,9 @@ func (h *Handler) Create(c echo.Context) error {
 	}
 
 	created, err := h.createService.Create(in)
+	if preparedID != "" {
+		h.forgetUnfederatedNote(preparedID, err)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, note.ErrNoteContentRequired):
@@ -746,7 +790,7 @@ type ShowRequest struct {
 }
 
 // Show handles POST /api/notes/show.
-func (h *Handler) Show(c echo.Context) error {
+func (h *Handler) Show(c *echo.Context) error {
 	var req ShowRequest
 	if err := c.Bind(&req); err != nil || req.NoteID == "" {
 		return apierr.JSONInvalidParam(c)
@@ -788,6 +832,12 @@ func (h *Handler) Show(c echo.Context) error {
 	if h.queryService != nil && !h.queryService.CanSee(viewer, n) {
 		entity.HideNoteEntity(&s[0])
 	}
+	// プラグインの条件で自分のホストに見せないノートは、ログインしていない閲覧者には
+	// 本文を伏せる (#4203)。見られない公開範囲のノートと同じ形 (200 + isHidden) に
+	// するので、本家のクライアントはそのまま表示できる。
+	if viewer == nil && n.UserHost == nil && h.noteDelivery.HiddenFromVisitors(c.Request().Context(), []string{n.ID})[n.ID] {
+		entity.HideNoteEntity(&s[0])
+	}
 	return c.JSON(http.StatusOK, s[0])
 }
 
@@ -823,7 +873,7 @@ type DeleteRequest struct {
 }
 
 // Delete handles POST /api/notes/delete.
-func (h *Handler) Delete(c echo.Context) error {
+func (h *Handler) Delete(c *echo.Context) error {
 	user := middleware.GetUser(c)
 
 	var req DeleteRequest
@@ -880,27 +930,27 @@ func (r *listRequest) resolve() bool {
 }
 
 // Renotes handles POST /api/notes/renotes.
-func (h *Handler) Renotes(c echo.Context) error {
+func (h *Handler) Renotes(c *echo.Context) error {
 	return h.serveList(c, "12908022-2e21-46cd-ba6a-3edaf6093f46", func(viewer *model.User, req listRequest) ([]*model.Note, error) {
 		return h.queryService.ListRenotes(viewer, req.NoteID, req.UntilID, req.SinceID, int(*req.Limit))
 	})
 }
 
 // Replies handles POST /api/notes/replies.
-func (h *Handler) Replies(c echo.Context) error {
+func (h *Handler) Replies(c *echo.Context) error {
 	return h.serveList(c, apierr.UUIDNoSuchNote, func(viewer *model.User, req listRequest) ([]*model.Note, error) {
 		return h.queryService.ListReplies(viewer, req.NoteID, req.UntilID, req.SinceID, int(*req.Limit))
 	})
 }
 
 // Children handles POST /api/notes/children.
-func (h *Handler) Children(c echo.Context) error {
+func (h *Handler) Children(c *echo.Context) error {
 	return h.serveList(c, apierr.UUIDNoSuchNote, func(viewer *model.User, req listRequest) ([]*model.Note, error) {
 		return h.queryService.ListChildren(viewer, req.NoteID, req.UntilID, req.SinceID, int(*req.Limit))
 	})
 }
 
-func (h *Handler) serveList(c echo.Context, noSuchNoteID string, fn func(*model.User, listRequest) ([]*model.Note, error)) error {
+func (h *Handler) serveList(c *echo.Context, noSuchNoteID string, fn func(*model.User, listRequest) ([]*model.Note, error)) error {
 	var req listRequest
 	if err := c.Bind(&req); err != nil || req.NoteID == "" {
 		return apierr.JSONInvalidParam(c)
@@ -1092,7 +1142,7 @@ type SearchRequest struct {
 }
 
 // Search handles POST /api/notes/search.
-func (h *Handler) Search(c echo.Context) error {
+func (h *Handler) Search(c *echo.Context) error {
 	var req SearchRequest
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
@@ -1267,7 +1317,7 @@ func nextSearchPage(page searchPage, raw []*model.Note) searchPage {
 }
 
 // State handles POST /api/notes/state.
-func (h *Handler) State(c echo.Context) error {
+func (h *Handler) State(c *echo.Context) error {
 	var req ShowRequest
 	if err := c.Bind(&req); err != nil || req.NoteID == "" {
 		return apierr.JSONInvalidParam(c)
@@ -1293,7 +1343,7 @@ type ConversationRequest struct {
 }
 
 // Conversation handles POST /api/notes/conversation.
-func (h *Handler) Conversation(c echo.Context) error {
+func (h *Handler) Conversation(c *echo.Context) error {
 	var req ConversationRequest
 	if err := c.Bind(&req); err != nil || req.NoteID == "" {
 		return apierr.JSONInvalidParam(c)
@@ -1350,7 +1400,7 @@ func (h *Handler) Conversation(c echo.Context) error {
 // (visibility filter 付き)、不在時は upstream 互換の public note 一覧を返す。これで
 // misskey-js SDK の {local:true,limit:30} 呼び出しも、既存の {noteIds:[...]} 呼び出しも
 // 両立する。
-func (h *Handler) BulkShow(c echo.Context) error {
+func (h *Handler) BulkShow(c *echo.Context) error {
 	var req struct {
 		NoteIDs []string `json:"noteIds"`
 		// upstream notes.ts public-note timeline params (noteIds 不在時に使用)。

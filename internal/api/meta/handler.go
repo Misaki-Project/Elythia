@@ -12,7 +12,7 @@ import (
 	"github.com/elythia-network/elythia/internal/core/signup"
 	"github.com/elythia-network/elythia/internal/misc/json5"
 	"github.com/elythia-network/elythia/internal/repository"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"gorm.io/datatypes"
 )
 
@@ -33,6 +33,9 @@ type Handler struct {
 	chunkedUpload ChunkedUploadCapability
 	// setup は `requireSetup` の判定 (#3037)。nil なら `rootUserId` だけで判定する。
 	setup *SetupDetector
+	// noteDeliveryPlugins は notes/create の pluginOptions を受け取るプラグインの
+	// 名前 (#4202)。nil なら空の一覧を出す。
+	noteDeliveryPlugins NoteDeliveryPlugins
 	// respCache は serialize 済みレスポンスのキャッシュ (#2649)。
 	// 上の依存を差し替える SetXxx は、レスポンスの中身が変わるので
 	// いずれも respCache を落とす。
@@ -81,6 +84,34 @@ func (h *Handler) SetSetupDetector(d *SetupDetector) {
 	h.respCache.invalidate()
 }
 
+// NoteDeliveryPlugins lists the names of the server plugins whose options
+// notes/create accepts in pluginOptions (#4202). 起動の後は変わらない。
+type NoteDeliveryPlugins func() []string
+
+// SetNoteDeliveryPlugins wires the additive `noteDeliveryPlugins` field.
+// Unset reports an empty list.
+func (h *Handler) SetNoteDeliveryPlugins(f NoteDeliveryPlugins) {
+	h.noteDeliveryPlugins = f
+	h.respCache.invalidate()
+}
+
+// NoteDeliveryPluginNames returns the value of the additive
+// `noteDeliveryPlugins` field: never nil, so it is written as `[]`.
+//
+// **投稿フォームが、ボタンを出すかの判定に使う** (#4202)。frontend に同梱した
+// プラグインでも、サーバーで無効にしたもの (`enabled: false`) は pluginOptions を
+// 受け取らない。ボタンを出すと、指定した投稿が毎回 `INVALID_PARAM` になる。
+func NoteDeliveryPluginNames(f NoteDeliveryPlugins) []string {
+	if f == nil {
+		return []string{}
+	}
+	names := f()
+	if names == nil {
+		return []string{}
+	}
+	return names
+}
+
 // chunkedUploadInfo returns the value of the additive `chunkedUpload` field,
 // or nil when the capability is unavailable.
 func (h *Handler) chunkedUploadInfo() map[string]any {
@@ -98,7 +129,7 @@ func (h *Handler) chunkedUploadInfo() map[string]any {
 // POST /api/meta
 // Meta handles POST /api/meta.
 // TS互換: detail (boolean, default true)。falseの場合は簡易レスポンスを返す。
-func (h *Handler) Meta(c echo.Context) error {
+func (h *Handler) Meta(c *echo.Context) error {
 	var params struct {
 		Detail *bool `json:"detail"`
 	}
@@ -127,11 +158,12 @@ func (h *Handler) Meta(c echo.Context) error {
 		h.respCache.putIfCurrent(detail, body, gen)
 	}
 
-	// echo は ?pretty / Debug のとき indent 付きで書く (context.JSON)。cache は
+	// ?pretty のとき、サーバーの JSONSerializer は indent 付きで書く (echo の v4 の
+	// context.JSON と同じ字下げ、#4239)。cache は
 	// compact な bytes しか持たないので、ここで同じ形に整える。**cache を
 	// 素通しにはしない**: /api/meta は未認証で叩けて per-endpoint の rate limit も
 	// 無いので、素通しにすると ?pretty を付けるだけで誰でもキャッシュを外せる。
-	if _, pretty := c.QueryParams()["pretty"]; c.Echo().Debug || pretty {
+	if _, pretty := c.QueryParams()["pretty"]; pretty {
 		var buf bytes.Buffer
 		if err := json.Indent(&buf, body, "", metaPrettyIndent); err != nil {
 			return c.JSONBlob(http.StatusOK, body)
@@ -177,6 +209,8 @@ func (h *Handler) buildMeta(detail bool) (map[string]any, error) {
 		// upstream の `localUsernameSchema` は `^\w{1,20}$` 固定なので
 		// 対応する field が無い。
 		"minimumUsernameLength": signup.EffectiveMinimumUsernameLength(m),
+		// notes/create の pluginOptions を受け取るプラグインの名前 (#4202)。
+		"noteDeliveryPlugins": NoteDeliveryPluginNames(h.noteDeliveryPlugins),
 		// ビルドした revision (#2700)。/about-elythia が「Elythia 1.3.0 (abc1234)」として
 		// 出す。以前は同梱 frontend の版 (mkGoFrontendVersion) も出していたが、
 		// frontend を本体へ取り込んで版が本体と同じになったので廃止した (#3379)。
@@ -320,7 +354,7 @@ func (h *Handler) buildMeta(detail bool) (map[string]any, error) {
 
 // Ping returns a simple pong response.
 // POST /api/ping
-func (h *Handler) Ping(c echo.Context) error {
+func (h *Handler) Ping(c *echo.Context) error {
 	// upstream ping.ts は `{ pong: Date.now() }` (epoch-ms number) を返す。
 	// misskey-js PingResponse.pong も number 型 (boolean ではない、#2027)。
 	return c.JSON(http.StatusOK, map[string]any{

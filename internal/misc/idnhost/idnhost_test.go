@@ -105,6 +105,8 @@ func TestMatchesBlockList_MappedSpellings(t *testing.T) {
 	for _, in := range []string{"ｅｖｉｌ.example", "evil\u3002example", "evil.ex\u00adample", "sub.ｅｖｉｌ.example:8443"} {
 		assert.True(t, MatchesBlockList([]string{"evil.example"}, in), "%q", in)
 		assert.True(t, MatchesBlockList([]string{"ｅｖｉｌ.example"}, Puny(in)), "%q", in)
+		assert.True(t, CompileBlockList([]string{"evil.example"}).Matches(in), "compiled %q", in)
+		assert.True(t, CompileBlockList([]string{"ｅｖｉｌ.example"}).Matches(Puny(in)), "compiled %q", in)
 	}
 }
 
@@ -126,6 +128,8 @@ func TestHostPort(t *testing.T) {
 		{"punycode へ畳む", "https://パイ.example/x", "xn--eckve.example"},
 		{"IPv6 は bracket を戻す", "https://[::1]:8443/x", "[::1]:8443"},
 		{"IPv6 の既定ポート", "https://[::1]:443/x", "[::1]"},
+		{"IPv6 の zone は落とす", "https://[2001:db8::1%25z]/x", "[2001:db8::1]"},
+		{"zone を落としてもポートは残す", "https://[fe80::1%25en0]:8443/x", "[fe80::1]:8443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			u, err := url.Parse(tc.raw)

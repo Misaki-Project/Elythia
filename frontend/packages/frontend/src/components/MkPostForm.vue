@@ -104,7 +104,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 			<button v-tooltip="i18n.ts.mention" class="_button" :class="$style.footerButton" @click="insertMention"><i class="ti ti-at"></i></button>
 			<button v-if="showAddMfmFunction" v-tooltip="i18n.ts.addMfmFunction" :class="['_button', $style.footerButton]" @click="insertMfmFunction"><i class="ti ti-palette"></i></button>
 			<button v-if="postFormActions.length > 0" v-tooltip="i18n.ts.plugins" class="_button" :class="$style.footerButton" @click="showActions"><i class="ti ti-plug"></i></button>
-			<button v-for="option in noteOptionEntries" :key="option.plugin" v-tooltip="option.label()" class="_button" :class="[$style.footerButton, { [$style.footerButtonActive]: pluginOptions[option.plugin] !== undefined }]" :data-testid="`post-form-plugin-option-${option.plugin}`" @click="editNoteOption(option)"><i :class="option.icon"></i></button>
+			<button v-for="option in noteOptionEntries" :key="option.plugin" v-tooltip="noteOptionLabel(option)" class="_button" :class="[$style.footerButton, { [$style.footerButtonActive]: pluginOptions[option.plugin] !== undefined }]" :data-testid="`post-form-plugin-option-${option.plugin}`" @click="editNoteOption(option)"><i :class="option.icon"></i></button>
 		</div>
 		<div :class="$style.footerRight">
 			<button v-tooltip="i18n.ts.emoji" :class="['_button', $style.footerButton]" data-testid="post-form-emoji" @click="insertEmoji"><i class="ti ti-mood-happy"></i></button>
@@ -155,7 +155,7 @@ import { emojiPicker } from '@/utility/emoji-picker.js';
 import { mfmFunctionPicker } from '@/utility/mfm-function-picker.js';
 import { prefer } from '@/preferences.js';
 import { getPluginHandlers } from '@/plugin.js';
-import { transformPastedText, noteOptions, isNoteOptionSet } from '@/plugin-api.js';
+import { transformPastedText, noteOptions, noteOptionLabel, isNoteOptionSet } from '@/plugin-api.js';
 import type { NoteOptionRegistration } from '@/plugin-api.js';
 import { DI } from '@/di.js';
 import { globalEvents } from '@/events.js';
@@ -222,8 +222,16 @@ const scheduledAt = ref<number | null>(null);
 // サーバープラグインのノートごとの指定 (#4199)。設定済みのものだけを
 // 持ち、notes/create の pluginOptions にそのまま送る。投稿した後も残す (公開範囲と同じく、
 // 続けて投稿するときに指定し直さなくてよい。ボタンの強調で今の状態が分かる)。
+// rememberNoteVisibility がオンなら、公開範囲と同じく前のフォームで送った指定から始める
+// (#4205)。呼び出し元が公開範囲を渡したフォームでは、公開範囲と同じく覚えた値を使わない。
 const noteOptionEntries = noteOptions();
-const pluginOptions = ref<Record<string, unknown>>({});
+const rememberedPluginOptions = prefer.s.rememberNoteVisibility && props.initialVisibility == null
+	? keepRegisteredPluginOptions(store.s.pluginNoteOptions)
+	: { kept: {}, dropped: false };
+const pluginOptions = ref<Record<string, unknown>>(rememberedPluginOptions.kept);
+// 書きかけの投稿や、削除して編集する元のノートが、覚えた指定を置き換えたか。置き換えた
+// ときは、覚えた指定から外したものを知らせない (フォームに出ている指定とは関係がない)。
+let rememberedPluginOptionsReplaced = false;
 const draghover = ref(false);
 const quoteId = ref<string | null>(null);
 const hasNotSpecifiedMentions = ref(false);
@@ -703,7 +711,9 @@ function showOtherSettings() {
 			if (canceled) return;
 			clear();
 			// 投稿の後は残すが (pluginOptions の宣言を参照)、明示的なリセットでは消す。
+			// 次のフォームに引き継ぐために覚えた指定も消す (#4205)。
 			pluginOptions.value = {};
+			store.set('pluginNoteOptions', {});
 		},
 	}] satisfies MenuItem[];
 
@@ -976,24 +986,35 @@ function saveDraft() {
 // notes/create が400で断る) ので外す。黙って外すと絞られないまま投稿されうるので、
 // 外したことを知らせる (#4199)。
 function restorePluginOptions(stored: Record<string, unknown> | undefined) {
-	if (stored == null) return;
-	const next: Record<string, unknown> = {};
-	let dropped = false;
-	for (const [plugin, value] of Object.entries(stored)) {
-		const option = noteOptionEntries.find(x => x.plugin === plugin);
-		if (option != null && isNoteOptionSet(option, value)) {
-			next[plugin] = value;
-		} else {
-			dropped = true;
-		}
-	}
-	pluginOptions.value = next;
+	// 書きかけの投稿の値で公開範囲を置き換えるのと同じく、指定も置き換える。書きかけに
+	// 指定が無ければ空にし、覚えていた指定を持ち越さない (#4205)。
+	const { kept, dropped } = keepRegisteredPluginOptions(stored);
+	pluginOptions.value = kept;
+	rememberedPluginOptionsReplaced = true;
 	if (dropped) {
 		os.alert({
 			type: 'warning',
 			text: i18n.ts.pluginNoteOptionsDroppedFromDraft,
 		});
 	}
+}
+
+// keepRegisteredPluginOptions keeps the options of plugins registered now
+// whose values they count as set. The values are copied.
+//
+// プラグインを外したり無効にしたりした後に、知らない指定を送らないため (#4205)。
+function keepRegisteredPluginOptions(stored: Record<string, unknown> | undefined): { kept: Record<string, unknown>; dropped: boolean } {
+	const kept: Record<string, unknown> = {};
+	let dropped = false;
+	for (const [plugin, value] of Object.entries(stored ?? {})) {
+		const option = noteOptionEntries.find(x => x.plugin === plugin);
+		if (option != null && isNoteOptionSet(option, value)) {
+			kept[plugin] = JSON.parse(JSON.stringify(value)) as unknown;
+		} else {
+			dropped = true;
+		}
+	}
+	return { kept, dropped };
 }
 
 function deleteDraft() {
@@ -1188,8 +1209,18 @@ async function post(ev?: PointerEvent) {
 		}
 	}
 
+	// 別のアカウントとして投稿したかは、送る前に控える (送った後で postAccount を空にする)。
+	const postedAsAnotherAccount = token != null;
 	posting.value = true;
 	misskeyApi('notes/create', postData, token).then((res) => {
+		// 公開範囲と同じく、送った指定を次のフォームの初期値に覚える。送信に成功したもの
+		// だけを覚え、指定が無ければ空を覚える (#4205)。
+		// **別のアカウントとして投稿したときは覚えない。** 覚える先はログイン中の
+		// アカウントの記憶なので、別のアカウントで付けた指定が、次のフォームで今の
+		// アカウントの初期値に入る。指定は配送先を絞るもので、アカウントごとに違いうる。
+		if (prefer.s.rememberNoteVisibility && !postedAsAnotherAccount) {
+			store.set('pluginNoteOptions', JSON.parse(JSON.stringify(postData.pluginOptions ?? {})) as Record<string, unknown>);
+		}
 		if (props.freezeAfterPosted) {
 			posted.value = true;
 		} else {
@@ -1278,7 +1309,7 @@ function cancel() {
 
 async function editNoteOption(option: NoteOptionRegistration) {
 	const { dispose } = await os.popupAsyncWithDialog(import('@/components/MkPluginNoteOptionDialog.vue').then(x => x.default), {
-		title: option.label(),
+		title: noteOptionLabel(option),
 		component: markRaw(option.component),
 		initialValue: pluginOptions.value[option.plugin] ?? null,
 	}, {
@@ -1396,6 +1427,8 @@ async function openAccountMenu(ev: PointerEvent) {
 				cw.value = draft.cw ?? null;
 				visibility.value = draft.visibility;
 				localOnly.value = resolveLocalOnlyPreference($i.federationStatus, draft.localOnly);
+				// 下書きは指定を持てないので、公開範囲と同じく下書きの値 (空) で置き換える (#4205)。
+				pluginOptions.value = {};
 				files.value = draft.files ?? [];
 				hashtags.value = draft.hashtag ?? '';
 				if (draft.hashtag) withHashtags.value = true;
@@ -1575,6 +1608,9 @@ onMounted(() => {
 			cw.value = init.cw ?? null;
 			visibility.value = init.visibility;
 			localOnly.value = resolveLocalOnlyPreference($i.federationStatus, init.localOnly);
+			// 元のノートの指定はクライアントから分からないので、覚えた指定を付けずに空から始める (#4205)。
+			pluginOptions.value = {};
+			rememberedPluginOptionsReplaced = true;
 			files.value = init.files ?? [];
 			if (init.poll) {
 				poll.value = {
@@ -1593,9 +1629,28 @@ onMounted(() => {
 			reactionAcceptance.value = init.reactionAcceptance;
 		}
 
+		notifyDroppedRememberedPluginOptions();
+
 		nextTick(() => watchForDraft());
 	});
 });
+
+// notifyDroppedRememberedPluginOptions tells that some remembered plugin
+// options were dropped, and forgets them so that the next form does not tell
+// it again.
+//
+// サーバーで無効にしたり外したりしたプラグインの覚えた指定は送れないので外す。
+// 黙って外すと、絞ったつもりのノートが絞られないまま投稿されうるので、書きかけの
+// 投稿と同じく知らせる (#4202)。
+function notifyDroppedRememberedPluginOptions() {
+	if (!rememberedPluginOptions.dropped) return;
+	store.set('pluginNoteOptions', JSON.parse(JSON.stringify(rememberedPluginOptions.kept)) as Record<string, unknown>);
+	if (rememberedPluginOptionsReplaced) return;
+	os.alert({
+		type: 'warning',
+		text: i18n.ts.pluginNoteOptionsDroppedFromRemembered,
+	});
+}
 
 onBeforeUnmount(() => {
 	uploader.abortAll();

@@ -1,6 +1,6 @@
 # API互換性状況
 
-対象バージョン: **Misskey 2026.11.0** (Elythia 2.2.0)
+対象バージョン: **Misskey 2026.11.0** (Elythia 2.3.0)
 最終更新: 2026-09-23
 
 本ドキュメントは互換性調査 (#107, #124) と、Playwright Phase 1-4 で発見・修正した drift backlog の**履歴**を集約したもの。
@@ -286,9 +286,9 @@ Go側のマイグレーション (000001〜) はTS版テーブルに対して原
 
 この22件は本体の系列だけを数える。Misakiのリモートアバターデコレーション削除は`migration/local/`の独立した1本で、CherryPick由来のリモート行を削除し、downで復元できない。旧Misaki版から更新する場合は[移行履歴の照合](misaki-migration-reconciliation.md)も先に確認する。
 
-**Elythia 固有のテーブル (upstream に対応するものが無い) は 20 件:**
+**Elythia 固有のテーブル (upstream に対応するものが無い) は 22 件:**
 
-> [divergence/db.md](divergence/db.md) §2-1 は同じものを **23** と数えている。差は 3 件で、
+> [divergence/db.md](divergence/db.md) §2-1 は同じものを **25** と数えている。差は 3 件で、
 > あちらは `note_unread` (upstream DB には legacy として残るが 2026.7.0 の `models/` に
 > entity が無く参照 0 件。Elythia はこれを実用している) と bookkeeping 2 件
 > (`migrations` / `schema_migrations`) を加える。CI の
@@ -315,8 +315,10 @@ Go側のマイグレーション (000001〜) はTS版テーブルに対して原
 | `bubble_game_versus_record` | バブルゲームの対戦の記録 (#3232) | `000105` |
 | `plugin_secret` | サーバープラグインの秘密の値。暗号文だけを置く (#3470) | `000119` |
 | `silent_follow` | 通知を出さずに成立させたフォローの記録 (#3466) | `000120` |
+| `drive_object_storage_migration_failure` | ドライブのファイルをオブジェクトストレージへ写す処理・写したファイルを確かめる処理・ローカルの実体を消す処理・ローカルへ戻す処理の失敗の記録 (#4180 / #4181 / #4182 / #4183) | `000144` |
+| `drive_object_storage_restored_copy` | ローカルへ戻したファイルがオブジェクトストレージに残した写しの記録。写しを消す処理と、戻した後にファイルを消したときに使う (#4197) | `000147` |
 
-Elythia の migration が作るテーブルは 123。上記 20 件と golang-migrate 台帳の
+Elythia の migration が作るテーブルは 125。上記 22 件と golang-migrate 台帳の
 `schema_migrations` を除く **102 はすべて upstream にも存在する** (TypeORM 台帳の
 `migrations` を含む)。
 

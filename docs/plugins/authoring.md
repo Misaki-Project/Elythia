@@ -622,8 +622,8 @@ func noteDelivery(ctx plugin.Context) (plugin.NoteDeliveryRegistration, error) {
 			if err := json.Unmarshal(req.Option, &opt); err != nil {
 				return fmt.Errorf("%w: %w", plugin.ErrBadNoteOption, err)
 			}
-			_, err := db.ExecContext(c, `INSERT INTO targets (note_id, mode, hosts) VALUES ($1, $2, $3)`,
-				req.NoteID, opt.Mode, strings.Join(opt.Hosts, ","))
+			_, err := db.ExecContext(c, `INSERT INTO targets (note_id, user_id, mode, hosts) VALUES ($1, $2, $3, $4)`,
+				req.NoteID, req.UserID, opt.Mode, strings.Join(opt.Hosts, ","))
 			return err
 		},
 		Targets: func(c context.Context, noteIDs []string) (map[string]plugin.DeliveryTargets, error) {
@@ -631,19 +631,36 @@ func noteDelivery(ctx plugin.Context) (plugin.NoteDeliveryRegistration, error) {
 			// noteIDs の行を読み、条件のあるノートだけを out に入れる。
 			return out, nil
 		},
+		// 省略できる。要らなくなった行を片付ける。
+		ForgetNotes: func(c context.Context, noteIDs []string) error {
+			for _, id := range noteIDs {
+				if _, err := db.ExecContext(c, `DELETE FROM targets WHERE note_id = $1`, id); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		ForgetUser: func(c context.Context, userID string) error {
+			_, err := db.ExecContext(c, `DELETE FROM targets WHERE user_id = $1`, userID)
+			return err
+		},
 	}, nil
 }
 ```
 
-- **指定は`notes/create`の`pluginOptions.<プラグイン名>`で受け取る。** 本体は中身を読まずに`Prepare`へ渡す。`Prepare`は**ノートを保存する前**に、保存するIDで呼ばれる。保存の後だと、条件を書く前に配送が走りうるため。ノートの保存に失敗すると書いた行が残るが、IDは使い回されないので他のノートには効かない
+- **指定は`notes/create`の`pluginOptions.<プラグイン名>`で受け取る。** 本体は中身を読まずに`Prepare`へ渡す。`Prepare`は**ノートを保存する前**に、保存するIDで呼ばれる。保存の後だと、条件を書く前に配送が走りうるため
 - **`Prepare`のエラーはノートを作らない。** `plugin.ErrBadNoteOption`を包んだエラーは400 `INVALID_PARAM`、それ以外は500になる。どちらも、プラグインのメッセージは利用者に返さない。`pluginOptions`に、登録されていないプラグインの名前があっても400になる (絞ったつもりの指定を黙って捨てない)。値が`null`の項目は送られなかったものとして扱い、名前も確かめない。400以外の失敗 (エラー・panic・期限切れ) は、プラグインの名前とノートのIDを付けて本体のログに残す。panicは値とスタックも残す
-- **`Targets`は配送と照会のたびに呼ばれる。** 1回に渡すIDは20件まで。条件の無いノートは返す map に入れない。**エラー・panic・5秒の期限切れは「どこにも配らない・誰にも見せない」になる**。どのノートを絞っていたかも読めないので、そのとき渡したノートは、条件を付けていないものも含めて全部が対象になる。プラグインの障害のあいだは、そのサーバーのローカルのノートが1つも連合しない。配送の再試行は無いので、障害のあいだに作られたノートは連合しないまま残る
+- **`Targets`は配送と照会のたびに呼ばれる。** 1回に渡すIDは20件まで。条件の無いノートは返す map に入れない。**エラー・panic・5秒の期限切れは「どこにも配らない・誰にも見せない」になる**。どのノートを絞っていたかも読めないので、そのとき渡したノートは、条件を付けていないものも含めて全部が対象になる。プラグインの障害のあいだは、そのサーバーのローカルのノートが1つも連合しない。配送の再試行は無いので、障害のあいだに作られたノートは連合しないまま残る。障害のあいだに止めた引用の承認のUpdateとQuoteRequestも、送り直さない (QuoteRequestは送り直しの予定も作らない)。照会は404ではなく503にする (下を参照)
+- **`ForgetNotes` / `ForgetUser`で、`Prepare`が書いた行を片付けられる (#4202)。** どちらも省略できる。`ForgetNotes`は、`Prepare`の後にノートの保存に失敗したとき (行が書かれていないことをDBのprimaryで確かめられたときだけ。読み取りのレプリカは見ない。保存の後で失敗したノートは照会されうるので、条件を残す)と、ローカルのノートを削除したとき (`notes/delete`やモデレーターによる削除など、削除のサービスを通るもの) に、そのノートのIDで呼ばれる。どちらも、作成や削除の応答を待たせないよう、別のgoroutineから呼ぶ。同時に走る呼び出しは8件までで、それを超えた分と、サーバーを止めている途中の分は呼ばずに捨てる (本体のログに残る)。返信先やリノート元の削除に伴ってDBの外部キーで消えるノートには呼ばれない。保存した`localOnly`のノートにも呼ばない (連合はしないが、OGPを隠すのに条件を使う)。`ForgetUser`は、ローカルの利用者の削除のジョブが、その利用者のノートを消し終えた後に呼ぶ。どちらも、エラー・panic・期限切れは本体のログに残すだけで、ノートの作成や削除は止めない。呼ばれなかった行が残っても、IDは使い回されないので他のノートには効かない。片付けは、まだ配送の枠を待っている作成の配送より先に走ることがあり、プラグインが複数あると、1つずつ順に片付ける途中を配送が読むこともある。本体は、条件を読んだ後でノートがまだあるかをDBのprimaryで確かめ、無ければ配らない。読んだ条件が絞っていても確かめる (片付けの途中なら、残った条件は一部のプラグインのものでしかない)。確かめないのは、読んだ条件が誰にも配らないものだったときだけ。このため、プラグインの側で片付けを遅らせる必要はない。**確かめられなかったとき (primaryの一時的な障害など) も配らない。** 条件を付けていないノートも含めてそのノートは連合せず、配送の再試行も無いので、連合しないまま残る (`Targets`の障害と同じ)
 - **期限は`Prepare` / `Targets`に渡す`context`でしか伝わらない。** 本体はプラグインの処理を途中で止められないので、`context`を見ない処理は期限を過ぎても戻るまで配送や照会を待たせる。期限を過ぎてから返った結果は、成功でも失敗として扱う
-- **ホストは利用者の`host`と比べる。** 配送ではフォロワー・宛先の利用者の`host`を見る。inboxのURLのホストではない (inboxを別のホストに置くサーバーで、判定がずれるため)。比べる前に、本体が両方を利用者の`host`と同じ形 (小文字・punycode・末尾の`.`と既定のポートを外したもの) にそろえる。`Bad.Example`・`bad.example.`・`bad.example:443`・`パイ.example`は、それぞれ`bad.example`・`xn--eckve.example`と同じに扱う。既定でないポート (`bad.example:8443`) は別のサーバーのまま扱う
+- **ホストは利用者の`host`と比べる。** 配送ではフォロワー・宛先の利用者の`host`を見る。inboxのURLのホストではない (inboxを別のホストに置くサーバーで、判定がずれるため)。比べる前に、本体が両方を利用者の`host`と同じ形 (小文字・punycode・末尾の`.`と既定のポートを外したもの) にそろえる。`Bad.Example`・`bad.example.`・`bad.example:443`・`bad.example:80`・`パイ.example`は、それぞれ`bad.example`・`xn--eckve.example`と同じに扱う (`:80`は、httpのactorの`host`がポートを外した形で持たれるため。#4202)。既定でないポート (`bad.example:8443`) は別のサーバーのまま扱う
+- **ホスト名として読めない値は、条件ごと読めないものとして扱う (#4202)。** URL (`https://bad.example`)・パスの付いた値 (`bad.example/`)・ワイルドカード (`*.bad.example`)・空文字などを1つでも含むと、そのノートはincludeでもexcludeでも、どこにも配らず誰にも見せない (照会は404)。そのまま比べると、どの利用者の`host`とも一致せず、excludeでは外したはずのサーバーへ届くため。ホスト名として読めるのは、英数字・`-`・`_`のラベルを`.`でつないだもの (IPアドレスを含む)・括弧で囲んだIPv6のアドレスで、どちらも数字のポートを付けられる。ほかのノートの条件には影響しない
+- **ホストは完全一致で比べる。** excludeに`bad.example`と書いても、`sub.bad.example`の利用者には届く (includeでも`sub.bad.example`は許さない)。管理画面のブロック (`blockedHosts`) はサブドメインも含めて止めるので、扱いが違う。サブドメインも外すときは、それぞれ書く
 - **フォロワーへの配送は、shared inboxの単位でしか分けられない。** 許すホストと許さないホストの利用者が同じshared inboxを使っていれば (1つのサーバーが複数のドメインの利用者を持つとき)、そのinboxへは送る。送らなければ許したホストにも届かないため。excludeにそのうち片方のドメインだけを入れても、外したドメインのサーバーには届く
 - **絞ったノートはrelayへ流さない。** relayは受け取ったものを加盟する全サーバーへ配り直すので、ホストで絞れない
-- **照会 (`/notes/:id`・`/notes/:id/activity`・outbox・featured) は、照会してきたサーバーのホストで判定する。** 署名を本体が持っている鍵で確かめられれば署名した利用者の`host`、確かめられなければUser-Agentに書かれたホスト (MisskeyとMastodonは自分のURLを入れる。CherryPickと同じ判定) を使う。どちらでも分からない相手は空文字になり、includeでは見せず、excludeでは見せる。署名は確かめられたが、署名した利用者が凍結・削除されているか、こちらが配送しない相手のときは、絞ったノートを1つも見せない (空文字として扱うと、外したホストが署名を付けるだけでexcludeのノートを照会できるため)。見せないときは`/notes/:id`・`/notes/:id/activity`は404、outboxとfeaturedの一覧からは外す
-- **`/notes/:id`をWebページ (HTML) として取られたときは、絞ったノートのOGP (要約・添付・作者) を出さない。** 外したサーバーがリンクカードを作るために取ると、署名もUser-Agentも無しに中身を読めるため。条件を読めないときも出さない。**埋め込み (`/embed/notes/:id`)・フィード (`/@user.rss`など)・公開のAPI (`notes/show`など) は絞らない。** 公開のノートはWebから誰でも読めるので、この機能で隠しきることはできない。絞るのは、ActivityPubで届く先と照会できる相手、OGPの3つ
+- **照会 (`/notes/:id`・`/notes/:id/activity`・引用の承認 (`/notes/:id/quote-authorizations/:authId`)・outbox・featured) は、照会してきたサーバーのホストで判定する。** 署名を本体が持っている鍵で確かめられれば署名した利用者の`host`、確かめられなければUser-Agentに書かれたホスト (MisskeyとMastodonは自分のURLを入れる。CherryPickと同じ判定) を使う。どちらでも分からない相手 (自分のホストを名乗るUser-Agentを含む) は、ログインしていない閲覧者と同じく自分のホストとして判定する (#4203)。自分のホストを条件に入れていなければ、includeでは見せず、excludeでは見せる。署名は確かめられたが、署名した利用者が凍結・削除されているか、こちらが配送しない相手のときは、絞ったノートを1つも見せない (空文字として扱うと、外したホストが署名を付けるだけでexcludeのノートを照会できるため)。見せないときは`/notes/:id`・`/notes/:id/activity`・引用の承認は404、outboxとfeaturedの一覧からは外す。引用の承認は、承認したノートと、引用したノートがこのサーバーのノートならその両方で判定する。**条件を読めないとき (`Targets`の障害) は、どれも503にする** (#4202)。404を「消えた」と扱う相手で、障害が直っても戻らなくなるため。障害は渡したノートの全部 (条件の無いものも含む) に同じく出るので、503でもどのノートを絞っているかは漏れない
+- **`/notes/:id`をWebページ (HTML) として取られたときは、絞ったノートのOGP (要約・添付・作者) を出さない。** 外したサーバーがリンクカードを作るために取ると、署名もUser-Agentも無しに中身を読めるため。条件を読めないときも出さない。条件に自分のサーバーのホストを入れても、OGPは出さないまま (下を参照)
+- **条件には自分のサーバーのホストも書ける (#4203)。** ログインしていない閲覧者には、自分のホストからの照会として同じ条件を当てる。includeに自分のホストを入れたら見せ、入れなければ見せない。excludeに入れたら見せず、入れなければ見せる。効くのは、ノートの埋め込み (`/embed/notes/:id`。文脈なしのシェルにする)・フィード (`/@user.rss`・`.atom`・`.json`。載せない)・ログインしていないときの`notes/show` (見られない公開範囲のノートと同じく、本文を伏せて`isHidden`にする)と、署名もUser-Agentのホストも無いActivityPubの照会 (上を参照)。条件を読めないときも見せない。**`Targets`の障害のあいだは、どのノートに条件があるかも読めないので、条件を付けていないノートも含めて、サーバーのローカルのノートをすべてこれらの経路で伏せる。** **ログインしているローカルの利用者と、タイムライン・検索・`users/notes`などのほかのAPI、ユーザーのタイムラインとクリップの埋め込み (`/embed/user-timeline/:user`・`/embed/clips/:clip`) には効かない。** 公開のノートは、これらの経路でWebから読めるので、この機能で隠しきることはできない。リノート元・返信先として別のノートに埋め込まれたときも絞らない。自分のホストを外したノートを引用せずにリノートすると、そのリノートの埋め込みと`notes/show`は、元のノートを本文ごと出す。自分のホストは、設定の`url`のホストを、ほかのホストと同じ形 (小文字・punycode・既定のポートを外したもの) にそろえたもの
 - **User-Agentは相手が自由に書ける。** 外したホストはUser-Agentを書き換えれば照会でき、許したホストを名乗ればincludeのノートも照会できる。照会の判定は、信頼しないサーバーへ配送しないための補助と考えること
 - 適用するのは、Create・Announce (リノート)・引用の承認に伴うUpdate・投票のUpdate(Question)・QuoteRequestの配送と、上の照会。Deleteは絞らない (中身を持たず、届いていない相手には何も起きない)
 - **登録はロールに関係なく行われる。** 条件の保存はAPIのプロセス、投票のUpdateの配送はキューのプロセスで走るため。登録 (`NoteDelivery`の呼び出し) に失敗すると起動を止める
@@ -957,6 +974,52 @@ await host.openMedia([{ id, type: 'image', blob, alt: 'Preview' }], id);
 
 `openMedia` はブラウザで表示できる画像・音声・動画MIMEだけを受け取り、ホストの
 メディアビューアへ渡す。表示用URLはビューアを閉じたときに解放される。
+`PluginMediaItem`の`isSensitive`を真にすると、ビューアの中では利用者の設定どおりに隠す。
+
+### センシティブなメディアの表示 (`MkSensitiveMedia`)
+
+カードの中に外部の画像や動画を並べるときは、`MkSensitiveMedia`で包む (#4191)。
+本体のメディア表示と同じ規則 (`nsfw`の設定、データセーバー、表示前の確認、
+センシティブの強調の枠) で隠し、押されたら出す。
+
+```vue
+<template>
+<div :class="$style.cell">
+	<MkSensitiveMedia :isSensitive="post.sensitive" type="image" :size="image.size">
+		<template #default="{ hide }">
+			<img :src="image.url" :alt="image.alt" :class="$style.image" @dblclick="hide()">
+		</template>
+	</MkSensitiveMedia>
+</div>
+</template>
+
+<script lang="ts" setup>
+import { MkSensitiveMedia } from '@/plugin-api.js';
+</script>
+
+<style lang="scss" module>
+.cell { aspect-ratio: 16 / 9; }
+.image { width: 100%; height: 100%; object-fit: cover; }
+</style>
+```
+
+- **隠している間は既定のslotを描画しない。** 中身の画像や動画は、表示が押されるまで取得されない。slotがmountされたことが「表示された」ことなので、取得や再生はslotの中の部品のmountで始めればよい
+- 根の要素は親の幅と高さに従う。隠している間も格子の高さを変えたくなければ、親に`aspect-ratio`か高さを付ける
+- `isSensitive`か利用者の設定 (`nsfw` / データセーバー) が変わると、表示した後でも既定の状態に戻す
+- props: `isSensitive` (必須)、`type` (`'image' | 'video' | 'audio'`、既定は`'image'`。隠している間の文言とアイコンに使う)、`size` (バイト数。データセーバーが有効なときに出す)、`controls` (表示した後に隠し直すボタン。既定は`true`)
+- slotには隠し直す関数`hide`を渡す
+- 表示したメディアを`host.openMedia`で開くときは、`initiallyRevealed: true`を渡す。渡さないと、ビューアの中でセンシティブなものを改めて隠し、設定によっては確認を求める
+- 確認のダイアログを待つ間に`isSensitive`か設定が変わったら、その確認では表示しない
+
+部品で足りないときは、同じ判定を`host`から呼べる。
+
+```ts
+host.shouldHideSensitiveMedia(isSensitive);        // 既定で隠すか (同期)
+await host.canRevealSensitiveMedia(isSensitive);   // 表示してよいか (確認のダイアログが出ることがある)
+```
+
+`plugin-api.ts`の最上位ではなく`host`に置いているのは、判定が設定とダイアログを読み、
+`plugin-api.ts`を読み込むだけでそれらを初期化しないためである。
 
 ### プレビュー provider
 
@@ -1031,6 +1094,39 @@ host.postForm.registerNoteOption({
 保存しようとしたときと、予約しようとしたときは、フォームが止めて知らせる。指定は投稿の後も
 フォームに残り、メニューの「リセット」では消える。端末に残る書きかけの投稿には指定も残り、
 開き直すと戻る。そのときに入っていないプラグインの指定は外し、外したことを知らせる。
+設定の「公開範囲を記憶する」(`rememberNoteVisibility`) がオンなら、送信に成功した指定を端末に
+覚え、公開範囲と同じく次に開くフォームの初期値にする (#4205)。初期値にするときは、今入っている
+プラグインの、設定済みとみなす値だけを残す。外した値があれば、書きかけの投稿と同じく外したことを
+知らせ、覚えた指定からも外す (知らせるのは一度だけ。#4202)。書きかけの投稿や削除して編集の元の
+ノートで初期値を置き換えたフォームでは、覚えた指定から外すだけで知らせない。返信・引用・チャンネルのフォームにも
+入るので、たとえば返信先のサーバーを含まない`include`の指定が残っていると、返信が相手に届かない。
+状態は、ボタンの強調でしか示さない。
+
+覚えた指定を使わないのは、呼び出し元が公開範囲を渡したとき (AiScriptのUIのフォームや共有のページで、
+公開範囲を指定したとき) と、削除して編集のときだけ。AiScriptのフォームでも共有のページでも、
+公開範囲を指定しなければ覚えた指定が入る。書きかけの投稿や下書きを復元したときは、その値
+(下書きは空) で置き換える。メニューの「リセット」では、覚えた指定も消える。
+
+覚えた指定から始まったフォームは、自分で指定を付けていなくても、下書きへの保存と予約投稿が
+上と同じく止まる。指定を外す (またはリセットする) と保存・予約できる。
+
+覚えるのは投稿フォームから送ったときだけで、フォームを開かない通常のリノートには指定を付けない
+(公開範囲の記憶は、リノートにも使われる)。フォームのアカウントの切り替えで別のアカウントとして
+投稿したときも覚えない。覚える先はログイン中のアカウントの記憶なので、別のアカウントで付けた
+指定が、今のアカウントの初期値に入ってしまうため (公開範囲の記憶は、本家と同じく覚える)。
+
+**値の形を変えるときは、古い形の値も受け付けるようにする。** 覚えた値は、初期値にするときに
+「設定済みか」(`isSet`) だけを見て、今のプラグインが受け付けるかは確かめない。プラグインを更新して
+値の形を変え、`Prepare`が古い形を`ErrBadNoteOption`で断ると、覚えた値が入ったフォームから投稿する
+たびに`notes/create`が400になる。失敗した投稿では記憶を書き換えないので、利用者が指定を外すか
+リセットするまで続く。古い形を受け付けられないなら、`isSet`で古い形を設定済みとみなさないように
+すると、初期値から外れる (外したことは利用者に知らせる)。
+
+**ボタンを出すのは、サーバーで有効なプラグインだけ** (#4202)。frontendはビルドに含めたプラグインを
+全部起動するが、サーバーで無効にした (`enabled: false`) プラグインは`pluginOptions`を受け取らないので、
+`/api/meta`の`noteDeliveryPlugins`に名前の無いプラグインの指定は、登録しても出さない。端末に残る
+書きかけの投稿と覚えた指定にそのプラグインの指定があれば、入っていないプラグインと同じく外して知らせる。
+`label`が例外を投げたときは、ボタンの説明とダイアログの題にプラグインの名前を出す。
 
 `registerNoteOption`は`PluginHost`の必須のメソッドとして足したので、テストなどで`PluginHost`を
 手で組み立てているプラグインは、`postForm`に`registerNoteOption() {}`を足さないと`vue-tsc`が
@@ -1390,8 +1486,10 @@ type Definition struct
 func (Definition) Validate() error
 
 type NoteDeliveryRegistration struct
-  Prepare func(ctx context.Context, req NoteDeliveryPrepareRequest) error
-  Targets func(ctx context.Context, ids []string) (map[string]DeliveryTargets, error)
+  Prepare     func(ctx context.Context, req NoteDeliveryPrepareRequest) error
+  Targets     func(ctx context.Context, ids []string) (map[string]DeliveryTargets, error)
+  ForgetNotes func(ctx context.Context, ids []string) error
+  ForgetUser  func(ctx context.Context, userID string) error
 
 type NoteDeliveryPrepareRequest struct
   NoteID string
@@ -1617,6 +1715,8 @@ host.preview.register(provider)
 host.api<T>(endpoint, params, { signal? })
 host.fetch(path, options?)
 host.openMedia(items, initialId?)
+host.shouldHideSensitiveMedia(isSensitive)
+host.canRevealSensitiveMedia(isSensitive)
 host.postForm.registerPasteTransform(id, transform, options?)
 host.postForm.registerNoteOption(option)
 
@@ -1633,6 +1733,7 @@ PluginPage: { path, component, navTitle?, navIcon?, admin? }
         MkA / MkUrl
         useMkSelect / definePage
         MkPluginSecrets (秘密の値の入力欄。props: plugin)
+        MkSensitiveMedia (センシティブなメディアを隠す枠。props: isSensitive / type / size / controls)
 ```
 
 ## やってはいけないこと

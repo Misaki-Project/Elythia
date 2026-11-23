@@ -2,16 +2,17 @@ package apierr
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func invoke(t *testing.T, fn func(echo.Context) error) (int, map[string]any) {
+func invoke(t *testing.T, fn func(*echo.Context) error) (int, map[string]any) {
 	t.Helper()
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -24,7 +25,7 @@ func invoke(t *testing.T, fn func(echo.Context) error) (int, map[string]any) {
 }
 
 func TestJSONInvalidParam(t *testing.T) {
-	code, body := invoke(t, func(c echo.Context) error { return JSONInvalidParam(c) })
+	code, body := invoke(t, func(c *echo.Context) error { return JSONInvalidParam(c) })
 	assert.Equal(t, http.StatusBadRequest, code)
 	errObj := body["error"].(map[string]any)
 	assert.Equal(t, "INVALID_PARAM", errObj["code"])
@@ -33,7 +34,7 @@ func TestJSONInvalidParam(t *testing.T) {
 }
 
 func TestJSONInvalidParam_CustomMessage(t *testing.T) {
-	code, body := invoke(t, func(c echo.Context) error { return JSONInvalidParam(c, "userId is required.") })
+	code, body := invoke(t, func(c *echo.Context) error { return JSONInvalidParam(c, "userId is required.") })
 	assert.Equal(t, http.StatusBadRequest, code)
 	errObj := body["error"].(map[string]any)
 	// UUID は固定 (i18n lookup 用)、message だけ override される
@@ -42,7 +43,7 @@ func TestJSONInvalidParam_CustomMessage(t *testing.T) {
 }
 
 func TestJSONInternalError(t *testing.T) {
-	code, body := invoke(t, func(c echo.Context) error { return JSONInternalError(c) })
+	code, body := invoke(t, func(c *echo.Context) error { return JSONInternalError(c) })
 	assert.Equal(t, http.StatusInternalServerError, code)
 	errObj := body["error"].(map[string]any)
 	assert.Equal(t, "INTERNAL_ERROR", errObj["code"])
@@ -51,7 +52,7 @@ func TestJSONInternalError(t *testing.T) {
 }
 
 func TestJSONInternalError_CustomMessage(t *testing.T) {
-	code, body := invoke(t, func(c echo.Context) error { return JSONInternalError(c, "queue not configured.") })
+	code, body := invoke(t, func(c *echo.Context) error { return JSONInternalError(c, "queue not configured.") })
 	assert.Equal(t, http.StatusInternalServerError, code)
 	errObj := body["error"].(map[string]any)
 	assert.Equal(t, UUIDInternalError, errObj["id"])
@@ -59,7 +60,7 @@ func TestJSONInternalError_CustomMessage(t *testing.T) {
 }
 
 func TestJSONNotFound(t *testing.T) {
-	code, body := invoke(t, func(c echo.Context) error { return JSONNotFound(c) })
+	code, body := invoke(t, func(c *echo.Context) error { return JSONNotFound(c) })
 	assert.Equal(t, http.StatusNotFound, code)
 	errObj := body["error"].(map[string]any)
 	assert.Equal(t, "NOT_FOUND", errObj["code"])
@@ -68,7 +69,7 @@ func TestJSONNotFound(t *testing.T) {
 }
 
 func TestJSONNotFound_CustomMessage(t *testing.T) {
-	code, body := invoke(t, func(c echo.Context) error { return JSONNotFound(c, "queue task not found.") })
+	code, body := invoke(t, func(c *echo.Context) error { return JSONNotFound(c, "queue task not found.") })
 	assert.Equal(t, http.StatusNotFound, code)
 	errObj := body["error"].(map[string]any)
 	assert.Equal(t, UUIDNotFound, errObj["id"])
@@ -136,7 +137,7 @@ func TestJSONGtlDisabled(t *testing.T) {
 func TestJSONCountLimitHelpers(t *testing.T) {
 	tests := []struct {
 		name string
-		fn   func(echo.Context) error
+		fn   func(*echo.Context) error
 		code string
 		uuid string
 	}{
@@ -299,7 +300,7 @@ func TestJSONRateLimitExceeded(t *testing.T) {
 // ajv envelope (#/type "must be object", default message) whatever message
 // the handler asked for, because ajv reports that violation first.
 func TestJSONInvalidParam_BodyNotObject(t *testing.T) {
-	code, body := invoke(t, func(c echo.Context) error {
+	code, body := invoke(t, func(c *echo.Context) error {
 		MarkBodyNotObject(c)
 		return JSONInvalidParam(c, "userId is required.")
 	})
@@ -312,7 +313,7 @@ func TestJSONInvalidParam_BodyNotObject(t *testing.T) {
 }
 
 func TestJSONInvalidParam_NoInfoWithoutMark(t *testing.T) {
-	_, body := invoke(t, func(c echo.Context) error { return JSONInvalidParam(c) })
+	_, body := invoke(t, func(c *echo.Context) error { return JSONInvalidParam(c) })
 	_, hasInfo := body["error"].(map[string]any)["info"]
 	assert.False(t, hasInfo)
 }
@@ -342,7 +343,7 @@ func TestMarkedInvalidParam(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			code, body := invoke(t, func(c echo.Context) error {
+			code, body := invoke(t, func(c *echo.Context) error {
 				if tt.notObj {
 					MarkBodyNotObject(c)
 				}
@@ -369,4 +370,18 @@ func TestInvalidParamCast(t *testing.T) {
 	errObj := InvalidParamCast("blocked", "boolean")["error"].(map[string]any)
 	assert.Equal(t, "0b5f1631-7c1a-41a6-b399-cce335f34d85", errObj["id"])
 	assert.Equal(t, map[string]any{"param": "blocked", "reason": "cannot cast to boolean"}, errObj["info"])
+}
+
+// TestHTTPStatusError pins that the error echo answers with a status is
+// found through wrapping, and that other errors are not taken for one
+// (#4236).
+//
+// echo の定義済みのエラーで確かめる。v5 ではこれが *echo.HTTPError ではない
+// (#4239)。
+func TestHTTPStatusError(t *testing.T) {
+	tooLarge := echo.ErrStatusRequestEntityTooLarge
+	assert.Equal(t, tooLarge, HTTPStatusError(tooLarge))
+	assert.Equal(t, tooLarge, HTTPStatusError(errors.Join(errors.New("read body"), tooLarge)))
+	assert.NoError(t, HTTPStatusError(errors.New("connection reset")))
+	assert.NoError(t, HTTPStatusError(nil))
 }

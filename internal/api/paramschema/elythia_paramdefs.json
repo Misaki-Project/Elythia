@@ -294,6 +294,66 @@
 			},
 			"meta": {}
 		},
+		"admin/drive/object-storage-migration/cleanup-copies": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/drive/object-storage-migration/purge-local": {
+			"paramDef": {
+				"type": "object",
+				"properties": {
+					"password": {
+						"type": "string"
+					},
+					"token": {
+						"type": "string"
+					},
+					"credential": {
+						"type": "object"
+					}
+				},
+				"required": [
+					"password"
+				]
+			},
+			"meta": {}
+		},
+		"admin/drive/object-storage-migration/restore": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/drive/object-storage-migration/start": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/drive/object-storage-migration/status": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
+		"admin/drive/object-storage-migration/verify": {
+			"paramDef": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			},
+			"meta": {}
+		},
 		"admin/drive/usage": {
 			"paramDef": {
 				"type": "object",

@@ -2,237 +2,284 @@
  * SPDX-FileCopyrightText: Elythia-Network
  * SPDX-License-Identifier: AGPL-3.0-only
  */
-import { afterEach, expect, test, vi } from 'vitest';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/vue';
-import { defineComponent, h } from 'vue';
-import LightboxItem from '@/components/MkLightbox.item.vue';
-// 遅延読み込み自体ではなく、実際のビジュアライザーの記述を検査する。
-import '@/components/MkLightbox.item.audio-visualizer.vue';
-import type { Content } from '@/components/MkLightbox.item.vue';
-import { prefer } from '@/preferences.js';
-import { directives } from '@/directives/index.js';
-import { components } from '@/components/index.js';
-import { preferState } from '../setup.unit.js';
-import * as pluginAPI from '@/plugin-api.js';
 
-const mocks = vi.hoisted(() => ({
-	confirm: vi.fn(async () => ({ canceled: false })),
-	popup: vi.fn(async (_component: unknown, _props: unknown, _events: unknown) => ({ dispose: vi.fn() })),
+import { afterEach, describe, expect, test, vi } from 'vitest';
+import { defineComponent, h, nextTick, reactive } from 'vue';
+import type { PropType } from 'vue';
+import { cleanup, fireEvent, render } from '@testing-library/vue';
+import MkSensitiveMedia from '@/components/MkSensitiveMedia.vue';
+import { _setSensitiveMediaImporterForTest, launchServerPlugins } from '@/plugin-api.js';
+import type { PluginHost } from '@/plugin-api.js';
+
+// 本番の PreferencesManager と同じ形にする。s は素の object で、変化を伝えるのは r の ref だけ。
+// s を reactive にすると、s を読む実装でもテストが通ってしまう。
+const prefs = vi.hoisted(() => ({
+	s: {} as Record<string, unknown>,
+	r: {} as Record<string, { value: unknown }>,
 }));
-vi.mock('@/os.js', () => ({ confirm: mocks.confirm, popupAsyncWithDialog: mocks.popup }));
+vi.mock('@/preferences.js', async () => {
+	const { ref } = await import('vue');
+	for (const [key, value] of Object.entries(defaults())) {
+		prefs.s[key] = value;
+		prefs.r[key] = ref(value);
+	}
+	return { prefer: { s: prefs.s, r: prefs.r } };
+});
 
-const original = { nsfw: prefer.s.nsfw, confirm: prefer.s.confirmWhenRevealingSensitiveMedia, native: prefer.s.useNativeUiForVideoAudioPlayer };
+function defaults(): Record<string, unknown> {
+	return {
+		nsfw: 'respect',
+		dataSaver: { media: false, avatar: false, urlPreview: false, code: false },
+		confirmWhenRevealingSensitiveMedia: false,
+		highlightSensitiveMedia: false,
+	};
+}
+
+// rewriteRawState と同じく、s を書いてから r を書く。
+function setPref(key: string, value: unknown): void {
+	prefs.s[key] = value;
+	prefs.r[key].value = value;
+}
+
+function setDataSaverMedia(media: boolean): void {
+	setPref('dataSaver', { ...(prefs.s.dataSaver as object), media });
+}
+
+const confirm = vi.hoisted(() => vi.fn(async () => ({ canceled: false })));
+vi.mock('@/os.js', () => ({ confirm }));
+
 afterEach(() => {
 	cleanup();
+	for (const [key, value] of Object.entries(defaults())) setPref(key, value);
+	confirm.mockReset();
+	confirm.mockImplementation(async () => ({ canceled: false }));
+	_setSensitiveMediaImporterForTest(null);
 	vi.restoreAllMocks();
-	preferState.nsfw = original.nsfw;
-	preferState.confirmWhenRevealingSensitiveMedia = original.confirm;
-	preferState.useNativeUiForVideoAudioPlayer = original.native;
-	mocks.confirm.mockClear();
-	mocks.popup.mockClear();
 });
 
-function renderItem(isSensitive = true, initiallyRevealed = false, content: Partial<Content> = {}) {
-	return render(LightboxItem, {
-		props: { content: { id: 'plugin-image', type: 'image', url: 'blob:plugin-image', width: 640, height: 480, isSensitive, ...content }, activated: true, initiallyRevealed, pixelatedZoom: false },
-		global: { directives, components },
+type MediaProps = { isSensitive: boolean; type?: 'image' | 'video' | 'audio'; size?: number | null; controls?: boolean };
+
+function mount(props: MediaProps, onOuterClick?: () => void) {
+	const Wrapper = defineComponent({
+		props: { media: { type: Object as PropType<MediaProps>, required: true } },
+		setup(p) {
+			return () => h('div', { 'data-testid': 'outer', onClick: onOuterClick }, [
+				h(MkSensitiveMedia, p.media, {
+					default: ({ hide }: { hide: () => void }) => h('img', { 'data-testid': 'content', src: 'https://remote.example/a.png', onClick: hide }),
+				}),
+			]);
+		},
 	});
+	const media = reactive<MediaProps>({ ...props });
+	return { view: render(Wrapper, { props: { media } }), media };
 }
 
-async function openPluginMedia(type: 'video' | 'audio', isSensitive = false, metadata: Pick<pluginAPI.PluginMediaItem, 'filename' | 'alt'> = { filename: 'download', alt: 'Media description' }) {
-	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:plugin-media');
-	const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
-	let host!: pluginAPI.PluginHost;
-	await pluginAPI.launchServerPlugins([{ name: 'example', setup: value => { host = value; } }]);
-	await host.openMedia([{
-		id: 'plugin-media', type, blob: new Blob(['media'], { type: type === 'video' ? 'video/mp4' : 'audio/mpeg' }),
-		...metadata, isSensitive,
-	}]);
-	const [component, props, events] = mocks.popup.mock.calls[0];
-	await component;
-	const { contents } = props as { contents: Content[] };
-	return { content: contents[0], revoke, close: (events as { closed(): void }).closed };
+function hiddenButton(view: ReturnType<typeof render>): HTMLElement | null {
+	return view.queryByTestId('sensitive-media-hidden');
 }
 
-function scaffoldCustomAudioBrowserAPIs() {
-	// DOMの記述とイベントを検査し、音声の復号やキャンバスの描画は行わない。
-	vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null);
-	const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
-	vi.spyOn(globalThis, 'AudioContext').mockImplementation(class {
-		state = 'running';
-		sampleRate = 48000;
-		destination = {};
-		createAnalyser() { return { connect() {}, disconnect() {}, getByteFrequencyData() {} }; }
-		createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
-		createMediaElementSource() { return { connect: (node: unknown) => node, disconnect() {} }; }
-		async close() { this.state = 'closed'; }
-	} as unknown as typeof AudioContext);
-	return { play };
-}
+describe('MkSensitiveMedia', () => {
+	test('does not render the content while sensitive media is hidden', async () => {
+		const { view } = mount({ isSensitive: true });
+		expect(hiddenButton(view)).not.toBeNull();
+		expect(view.queryByTestId('content')).toBeNull();
 
-test.each([
-	[undefined, 'Spoken description', 'Spoken description'],
-	['Drive description', 'Blob description', 'Drive description'],
-	['', 'Blob description', ''],
-	[null, 'Blob description', 'Blob description'],
-	[undefined, undefined, null],
-] as const)('default custom audio exposes effective description with comment=%s and alt=%s', async (comment, alt, expected) => {
-	preferState.nsfw = 'respect';
-	preferState.useNativeUiForVideoAudioPlayer = false;
-	const { play } = scaffoldCustomAudioBrowserAPIs();
-	const { content, revoke, close } = await openPluginMedia('audio', false, { filename: 'download.mp3', alt });
-	const file: Content['file'] = comment === undefined ? undefined : {
-		id: 'drive-audio', createdAt: '2026-10-31T00:00:00.000Z', name: 'drive.mp3', type: 'audio/mpeg',
-		md5: '0123456789abcdef0123456789abcdef', size: 1, isSensitive: false, blurhash: null, properties: {},
-		url: 'blob:drive-audio', thumbnailUrl: null, comment, folderId: null, userId: null,
-	};
-	const result = renderItem(false, false, { ...content, file });
-	await waitFor(() => expect(result.container.querySelector('canvas')).not.toBeNull());
-	const canvas = result.container.querySelector('canvas[data-gallery-click-action="media"]')!;
-	const audio = result.container.querySelector('audio')!;
-	expect(canvas).not.toBeNull();
-	expect(audio.controls).toBe(false);
-	expect(audio.getAttribute('src')).toBe('blob:plugin-media');
-	expect(canvas.getAttribute('aria-label')).toBe(expected);
-	expect(canvas.getAttribute('role')).toBe(expected ? 'img' : null);
-	if (expected) expect(result.getByRole('img', { name: expected })).toBe(canvas);
-	expect(result.container.textContent).toContain('download.mp3');
-	await fireEvent.loadedMetadata(audio);
-	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
-	expect(canvas.getAttribute('aria-label')).toBe(expected);
-	await fireEvent.click(canvas);
-	expect(play).toHaveBeenCalled();
-	expect(revoke).not.toHaveBeenCalled();
-	result.unmount();
-	close();
-	close();
-	expect(revoke.mock.calls).toEqual([['blob:plugin-media']]);
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		expect(hiddenButton(view)).toBeNull();
+		expect(view.queryByTestId('content')).not.toBeNull();
+		expect(confirm).not.toHaveBeenCalled();
+	});
+
+	test('shows non-sensitive media immediately unless data saver hides it', async () => {
+		const shown = mount({ isSensitive: false });
+		expect(shown.view.queryByTestId('content')).not.toBeNull();
+		cleanup();
+
+		setDataSaverMedia(true);
+		setPref('confirmWhenRevealingSensitiveMedia', true);
+		const { view } = mount({ isSensitive: false, size: 2048 });
+		expect(view.queryByTestId('content')).toBeNull();
+		expect(hiddenButton(view)!.textContent).toContain('2KB');
+
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		expect(view.queryByTestId('content')).not.toBeNull();
+		expect(confirm).not.toHaveBeenCalled();
+	});
+
+	test('follows the force and ignore settings', () => {
+		setPref('nsfw', 'force');
+		const forced = mount({ isSensitive: false });
+		expect(forced.view.queryByTestId('content')).toBeNull();
+		cleanup();
+
+		setPref('nsfw', 'ignore');
+		const ignored = mount({ isSensitive: true });
+		expect(ignored.view.queryByTestId('content')).not.toBeNull();
+	});
+
+	test('keeps the media hidden when the reveal confirmation is canceled', async () => {
+		setPref('confirmWhenRevealingSensitiveMedia', true);
+		confirm.mockImplementation(async () => ({ canceled: true }));
+		const { view } = mount({ isSensitive: true });
+
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		expect(confirm).toHaveBeenCalledTimes(1);
+		expect(view.queryByTestId('content')).toBeNull();
+
+		confirm.mockImplementation(async () => ({ canceled: false }));
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		expect(view.queryByTestId('content')).not.toBeNull();
+	});
+
+	test('does not reveal with a confirmation started before the settings changed', async () => {
+		setPref('confirmWhenRevealingSensitiveMedia', true);
+		let answer: (value: { canceled: boolean }) => void = () => {};
+		confirm.mockImplementation(() => new Promise(resolve => { answer = resolve; }));
+		const { view } = mount({ isSensitive: true });
+
+		await fireEvent.click(hiddenButton(view)!);
+		await fireEvent.click(hiddenButton(view)!);
+		expect(confirm).toHaveBeenCalledTimes(1);
+
+		setPref('nsfw', 'force');
+		await nextTick();
+		answer({ canceled: false });
+		await new Promise(resolve => setTimeout(resolve, 0));
+		await nextTick();
+		expect(view.queryByTestId('content')).toBeNull();
+
+		await fireEvent.click(hiddenButton(view)!);
+		expect(confirm).toHaveBeenCalledTimes(2);
+		answer({ canceled: false });
+		await new Promise(resolve => setTimeout(resolve, 0));
+		await nextTick();
+		expect(view.queryByTestId('content')).not.toBeNull();
+	});
+
+	test('hides again when the sensitivity or the settings change', async () => {
+		const { view, media } = mount({ isSensitive: false });
+		expect(view.queryByTestId('content')).not.toBeNull();
+
+		media.isSensitive = true;
+		await nextTick();
+		expect(view.queryByTestId('content')).toBeNull();
+
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		expect(view.queryByTestId('content')).not.toBeNull();
+
+		setDataSaverMedia(true);
+		await nextTick();
+		expect(view.queryByTestId('content')).toBeNull();
+
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		setPref('nsfw', 'force');
+		await nextTick();
+		expect(view.queryByTestId('content')).toBeNull();
+	});
+
+	test('can be hidden again from the button and from the slot', async () => {
+		const { view } = mount({ isSensitive: true });
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+
+		await fireEvent.click(view.getByTestId('sensitive-media-hide'));
+		expect(view.queryByTestId('content')).toBeNull();
+
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		await fireEvent.click(view.getByTestId('content'));
+		expect(view.queryByTestId('content')).toBeNull();
+	});
+
+	test('omits the hide button without controls', async () => {
+		const { view } = mount({ isSensitive: false, controls: false });
+		expect(view.queryByTestId('content')).not.toBeNull();
+		expect(view.queryByTestId('sensitive-media-hide')).toBeNull();
+	});
+
+	test('does not let the reveal click reach the surrounding card', async () => {
+		const outer = vi.fn();
+		const { view } = mount({ isSensitive: true }, outer);
+		await fireEvent.click(hiddenButton(view)!);
+		await nextTick();
+		expect(view.queryByTestId('content')).not.toBeNull();
+		await fireEvent.click(view.getByTestId('sensitive-media-hide'));
+		expect(outer).not.toHaveBeenCalled();
+	});
+
+	test('labels the hidden media by its type', () => {
+		setDataSaverMedia(true);
+		const video = mount({ isSensitive: true, type: 'video', size: 1024 });
+		expect(hiddenButton(video.view)!.textContent).toContain('Video');
+		cleanup();
+		const audio = mount({ isSensitive: false, type: 'audio' });
+		expect(hiddenButton(audio.view)!.querySelector('.ti-music')).not.toBeNull();
+	});
+
+	test('outlines sensitive media when the user asks for it', () => {
+		setPref('highlightSensitiveMedia', true);
+		const sensitive = mount({ isSensitive: true });
+		const root = sensitive.view.getByTestId('sensitive-media');
+		cleanup();
+		const plain = mount({ isSensitive: false });
+		expect(root.className).not.toBe(plain.view.getByTestId('sensitive-media').className);
+	});
 });
 
-test('default custom audio reveals its description only after sensitive confirmation', async () => {
-	preferState.nsfw = 'respect';
-	preferState.useNativeUiForVideoAudioPlayer = false;
-	preferState.confirmWhenRevealingSensitiveMedia = true;
-	scaffoldCustomAudioBrowserAPIs();
-	const { content, revoke, close } = await openPluginMedia('audio', true);
-	const result = renderItem(true, false, content);
-	const hidden = result.container.querySelector('[data-gallery-click-action="hidden"]')!;
-	expect(result.container.querySelector('canvas, audio')).toBeNull();
-	mocks.confirm.mockResolvedValueOnce({ canceled: true });
-	await fireEvent.click(hidden);
-	expect(result.container.querySelector('canvas, audio')).toBeNull();
-	await fireEvent.click(hidden);
-	await waitFor(() => expect(result.container.querySelector('canvas')).not.toBeNull());
-	const canvas = await result.findByRole('img', { name: 'Media description' });
-	expect(canvas.tagName).toBe('CANVAS');
-	await fireEvent.loadedMetadata(result.container.querySelector('audio')!);
-	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
-	expect(result.container.querySelector('img')).toBeNull();
-	result.unmount();
-	close();
-	expect(revoke.mock.calls).toEqual([['blob:plugin-media']]);
-});
+describe('plugin host sensitive media helpers', () => {
+	async function host(): Promise<PluginHost> {
+		let captured: PluginHost | undefined;
+		await launchServerPlugins([{ name: 'example', setup(value) { captured = value; } }]);
+		return captured!;
+	}
 
-test.each(['video', 'audio'] as const)('real viewer renders plugin %s metadata without a residual image thumbnail', async type => {
-	preferState.nsfw = 'respect';
-	preferState.useNativeUiForVideoAudioPlayer = true;
-	const { content, revoke, close } = await openPluginMedia(type);
-	const result = renderItem(false, false, content);
-	const media = result.container.querySelector<HTMLMediaElement>(type)!;
-	expect(media).not.toBeNull();
-	expect(media.getAttribute('src')).toBe('blob:plugin-media');
-	expect(media.getAttribute('alt')).toBe('Media description');
-	expect(media.controls).toBe(true);
-	expect(result.container.querySelector('[class*="loading"]')).not.toBeNull();
-	await fireEvent.loadedMetadata(media);
-	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
-	expect(result.container.querySelector('img')).toBeNull();
-	expect(result.container.querySelector(type)).toBe(media);
-	expect(revoke).not.toHaveBeenCalled();
-	result.unmount();
-	close();
-	close();
-	expect(revoke.mock.calls).toEqual([['blob:plugin-media']]);
-});
+	test('reports the default visibility under the user settings', async () => {
+		const h = await host();
+		expect(h.shouldHideSensitiveMedia(true)).toBe(true);
+		expect(h.shouldHideSensitiveMedia(false)).toBe(false);
 
-test.each(['video', 'audio'] as const)('real viewer keeps sensitive plugin %s behind a placeholder until confirmation', async type => {
-	preferState.nsfw = 'respect';
-	preferState.confirmWhenRevealingSensitiveMedia = true;
-	preferState.useNativeUiForVideoAudioPlayer = true;
-	const { content, close } = await openPluginMedia(type, true);
-	const result = renderItem(true, false, content);
-	const hidden = result.container.querySelector<HTMLElement>('[data-gallery-click-action="hidden"]')!;
-	expect(hidden).not.toBeNull();
-	expect(hidden.querySelector('[class*="hiddenPlaceholder"]')).not.toBeNull();
-	expect(result.container.querySelector('img, video, audio')).toBeNull();
-	mocks.confirm.mockResolvedValueOnce({ canceled: true });
-	await fireEvent.click(hidden);
-	expect(result.container.querySelector(type)).toBeNull();
-	await fireEvent.click(hidden);
-	await waitFor(() => expect(result.container.querySelector(type)).not.toBeNull());
-	expect(result.container.querySelector('[data-gallery-click-action="hidden"]')).toBeNull();
-	await fireEvent.loadedMetadata(result.container.querySelector(type)!);
-	expect(result.container.querySelector('[class*="loading"]')).toBeNull();
-	expect(result.container.querySelector('img')).toBeNull();
-	result.unmount();
-	close();
-});
+		setDataSaverMedia(true);
+		expect(h.shouldHideSensitiveMedia(false)).toBe(true);
+		setDataSaverMedia(false);
+		setPref('nsfw', 'ignore');
+		expect(h.shouldHideSensitiveMedia(true)).toBe(false);
+	});
 
-test.each([
-	[undefined, 'A red kite above a lake', 'A red kite above a lake'],
-	['Drive description', 'Blob description', 'Drive description'],
-	['', 'Blob description', ''],
-	[null, 'Blob description', 'Blob description'],
-	[undefined, undefined, null],
-] as const)('real viewer alt respects DriveFile comment=%s and Blob alt=%s', (comment, alt, expected) => {
-	preferState.nsfw = 'respect';
-	const file: Content['file'] = comment === undefined ? undefined : {
-		id: 'drive-image', createdAt: '2026-10-31T00:00:00.000Z', name: 'drive.png', type: 'image/png',
-		md5: '0123456789abcdef0123456789abcdef', size: 1, isSensitive: false, blurhash: null, properties: {},
-		url: 'blob:drive-image', thumbnailUrl: null, comment, folderId: null, userId: null,
-	};
-	const result = renderItem(false, false, { alt, file, filename: 'download.png' });
-	expect(result.container.querySelector('img[src="blob:plugin-image"]')?.getAttribute('alt')).toBe(expected);
-	expect(result.container.textContent).toContain('download.png');
-});
+	test('asks before revealing only when the user wants confirmation', async () => {
+		const h = await host();
+		expect(await h.canRevealSensitiveMedia(true)).toBe(true);
+		expect(confirm).not.toHaveBeenCalled();
 
-test('plugin-owned sensitive media hides actual image and requires confirmation before reveal', async () => {
-	preferState.nsfw = 'respect';
-	preferState.confirmWhenRevealingSensitiveMedia = true;
-	const result = renderItem();
-	expect(result.container.querySelector('img[src="blob:plugin-image"]')).toBeNull();
-	const hidden = result.container.querySelector<HTMLElement>('[data-gallery-click-action="hidden"]');
-	expect(hidden).not.toBeNull();
-	mocks.confirm.mockResolvedValueOnce({ canceled: true });
-	await fireEvent.click(hidden!);
-	expect(result.container.querySelector('img[src="blob:plugin-image"]')).toBeNull();
-	await fireEvent.click(hidden!);
-	await waitFor(() => expect(result.container.querySelector('img[src="blob:plugin-image"]')).not.toBeNull());
-});
+		setPref('confirmWhenRevealingSensitiveMedia', true);
+		confirm.mockImplementation(async () => ({ canceled: true }));
+		expect(await h.canRevealSensitiveMedia(false)).toBe(true);
+		expect(confirm).not.toHaveBeenCalled();
+		expect(await h.canRevealSensitiveMedia(true)).toBe(false);
+		expect(confirm).toHaveBeenCalledTimes(1);
+	});
 
-test.each([
-	['respect', true, false, true], ['ignore', true, false, false], ['force', false, false, true], ['respect', true, true, false],
-] as const)('lightbox respects %s, sensitive=%s and revealed=%s', (nsfw, sensitive, revealed, hidden) => {
-	preferState.nsfw = nsfw;
-	const result = renderItem(sensitive, revealed);
-	expect(result.container.querySelector('[data-gallery-click-action="hidden"]') !== null).toBe(hidden);
-	expect(result.container.querySelector('img[src="blob:plugin-image"]') !== null).toBe(!hidden);
-});
+	test('still launches every plugin and keeps media hidden when the settings module cannot load', async () => {
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		_setSensitiveMediaImporterForTest(() => Promise.reject(new Error('chunk load failed')));
+		const hosts: PluginHost[] = [];
+		await launchServerPlugins([
+			{ name: 'first', setup(value) { hosts.push(value); } },
+			{ name: 'second', setup(value) { hosts.push(value); } },
+		]);
 
-test('the exported sensitive guard hides slot content until the viewer confirms', async () => {
-	preferState.nsfw = 'respect';
-	preferState.confirmWhenRevealingSensitiveMedia = true;
-	expect(pluginAPI.MkSensitiveMediaGuard).toBeDefined();
-	const result = render(defineComponent({
-		setup: () => () => h(pluginAPI.MkSensitiveMediaGuard, { isSensitive: true, kind: 'image' }, {
-			default: () => h('img', { src: 'blob:guard-image', alt: 'plugin photo' }),
-		}),
-	}));
-	await result.findByRole('button');
-	expect(result.queryByRole('img', { name: 'plugin photo' })).toBeNull();
-	mocks.confirm.mockResolvedValueOnce({ canceled: true });
-	await fireEvent.click(result.container.querySelector('[data-sensitive-media-reveal]')!);
-	expect(result.queryByRole('img', { name: 'plugin photo' })).toBeNull();
-	await fireEvent.click(result.container.querySelector('[data-sensitive-media-reveal]')!);
-	await waitFor(() => expect(result.getByRole('img', { name: 'plugin photo' })).toBeTruthy());
+		expect(hosts.map(value => value.name)).toEqual(['first', 'second']);
+		expect(error).toHaveBeenCalled();
+		for (const value of hosts) {
+			expect(value.shouldHideSensitiveMedia(false)).toBe(true);
+			expect(await value.canRevealSensitiveMedia(true)).toBe(false);
+			expect(await value.canRevealSensitiveMedia(false)).toBe(true);
+		}
+		expect(confirm).not.toHaveBeenCalled();
+	});
 });

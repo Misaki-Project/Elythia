@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/misc/remoteurl"
@@ -55,7 +55,7 @@ type emojiLookup interface {
 // Cache-Control header mirrors upstream so the browser stops
 // re-fetching reaction images on every notification render.
 func emojiRedirectHandler(pk *entity.Packer, repo emojiLookup) echo.HandlerFunc {
-	return func(c echo.Context) error {
+	return func(c *echo.Context) error {
 		path := c.Param("path")
 
 		c.Response().Header().Set(echo.HeaderCacheControl, "public, max-age=86400")
@@ -92,7 +92,7 @@ func emojiRedirectHandler(pk *entity.Packer, repo emojiLookup) echo.HandlerFunc 
 			// 保持しうる (RFC 9111 は明示的な max-age があれば 5xx も保存できる)。
 			// DB が復旧してもその絵文字だけ壊れて見える。
 			c.Response().Header().Set(echo.HeaderCacheControl, "no-store")
-			return echo.NewHTTPError(http.StatusInternalServerError)
+			return echo.NewHTTPError(http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError))
 		}
 		if err != nil || emoji == nil {
 			if _, hasFallback := c.QueryParams()["fallback"]; hasFallback {

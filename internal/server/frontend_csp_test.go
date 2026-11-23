@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -440,7 +440,7 @@ func TestFrontendCSP_HashesCoverRenderedInlineScripts(t *testing.T) {
 		Version:                       "0.0.1-test",
 		FrontendContentSecurityPolicy: CSPModeEnforce,
 	}
-	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil, nil)
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil, nil, nil, nil)
 
 	e := echo.New()
 	rec := httptest.NewRecorder()

@@ -1,7 +1,6 @@
 package federation
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 
@@ -29,20 +28,17 @@ type PollDeliveryHook struct {
 	urls     *activitypub.URLBuilder
 	idGen    id.Generator
 	// rules はプラグインが絞った配送先 (#4199)。nil なら絞らない。
+	// Update(Question) はノートの本文を丸ごと持つので、Create と同じ相手にだけ配る。
 	rules *notedelivery.Registry
-}
-
-// SetNoteDeliveryRules wires the plugins that narrow where local notes
-// federate (#4199). Update(Question) はノートの本文を丸ごと
-// 持つので、Create と同じ相手にだけ配る。
-func (h *PollDeliveryHook) SetNoteDeliveryRules(r *notedelivery.Registry) {
-	h.rules = r
+	// notes は、条件を読んだ後にノートがまだあるかを確かめる (#4202)。
+	notes existingNoteChecker
 }
 
 // NewPollDeliveryHook constructs a PollDeliveryHook. rules is the plugins that
-// narrow where local notes federate (#4199); nil means none. 渡し忘れを
+// narrow where local notes federate (#4199); nil means none. notes tells
+// whether a note still exists once its rule is read (#4202). 渡し忘れを
 // ビルドで止めるため、構築子の引数で受ける (NewNoteDeliveryHook と同じ)。
-func NewPollDeliveryHook(renderer *activitypub.Renderer, deliver *DeliverService, userRepo repository.UserRepository, urls *activitypub.URLBuilder, idGen id.Generator, rules *notedelivery.Registry) *PollDeliveryHook {
+func NewPollDeliveryHook(renderer *activitypub.Renderer, deliver *DeliverService, userRepo repository.UserRepository, urls *activitypub.URLBuilder, idGen id.Generator, rules *notedelivery.Registry, notes repository.NoteRepository) *PollDeliveryHook {
 	return &PollDeliveryHook{
 		renderer: renderer,
 		deliver:  deliver,
@@ -50,6 +46,7 @@ func NewPollDeliveryHook(renderer *activitypub.Renderer, deliver *DeliverService
 		urls:     urls,
 		idGen:    idGen,
 		rules:    rules,
+		notes:    notes,
 	}
 }
 
@@ -111,7 +108,7 @@ func (h *PollDeliveryHook) OnLocalPollUpdated(target *model.Note) {
 		return
 	}
 
-	rule := h.rules.Rule(context.Background(), target.ID)
+	rule := liveNoteRule(h.rules, h.notes, target.ID)
 
 	activity, err := h.renderer.RenderQuestionUpdate(target, h.idGen)
 	if err != nil {
@@ -156,7 +153,7 @@ func (h *PollDeliveryHook) OnLocalPollUpdated(target *model.Note) {
 		}
 		return
 	}
-	if err := deliverToFollowersByRule(h.deliver, target.UserID, body, rule); err != nil {
+	if _, err := deliverToFollowersByRule(h.deliver, target.UserID, body, rule); err != nil {
 		slog.Warn("poll delivery: enqueue question update failed",
 			"noteId", target.ID, "err", err)
 	}

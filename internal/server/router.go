@@ -85,7 +85,7 @@ import (
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/elythia-network/elythia/internal/stream"
 	"github.com/elythia-network/elythia/plugin"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 )
 
 func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage pluginStorageOpener) {
@@ -168,6 +168,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	channelRepo := w.repos.channel
 	channelFollowingRepo := w.repos.channelFollowing
 	cachedAntenna := w.repos.cachedAntenna
+	cachedWebhook := w.repos.cachedWebhook
 	var antennaRepo repository.AntennaRepository = cachedAntenna
 	clipRepo := w.repos.clip
 	clipNoteRepo := w.repos.clipNote
@@ -565,6 +566,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	noteDeleteService.SetUserRepo(userRepo) // #1538: resolve author for moderator delete
 	noteDeleteService.SetNoteStreamHook(&noteDeleteStreamAdapter{pub: noteEventPub})
 	noteDeleteService.SetChartHook(chartHooks)
+	// 配送先を絞るプラグインが書いた条件を、ノートの削除で片付ける (#4202)。
+	noteDeleteService.SetNoteDeliveryForgetter(s.noteDelivery, s.background)
 	noteQueryService.SetFavoriteRepo(noteFavoriteRepo)
 	noteQueryService.SetThreadMutingRepo(noteThreadMutingRepo)
 	userService.SetMainStreamPublisher(mainStreamPublisher)
@@ -767,6 +770,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// push は送る直前に、ノートがまだあるかだけを primary で確かめる (#3611)。
 	notificationHook.SetNoteExistenceChecker(noteRepo)
 	webPushCache := corewebpush.NewSubscriptionCache(swSubRepo, s.redis.Default)
+	// 配信されない (Service Worker が無効・購読が無い) push は、組み立てずに捨てる (#4217)。
+	webPushService.SetGate(metaRepo, webPushCache)
 	// Web Push delivery: webpush-go の HTTPClient field に SSRF-safe client
 	// を注入して FCM / Mozilla / Apple endpoint への配送も outbound 政策
 	// (forward proxy / outgoingAddress 等) に従わせる (#638)。
@@ -1107,8 +1112,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// instance actor に見せなかった Announce の対象を、actor をフォローして
 	// いるローカルの利用者の鍵で取り直す (#3916)。連合に出していない利用者の鍵は
 	// 使わない (coreSvcs.localFederation で判定)。
+	// 鍵を見せるのは、署名付きの GET を受け入れる相手と同じく、配送を止めていない
+	// ホストだけ (インスタンスのブロック・配送停止、配送停止と受信拒否のソフトウェア)。
 	federationProcessor.SetFollowerFetchKeys(corefederation.NewLocalFollowerKeys(followingRepo, userRepo, keypairRepo, blockingRepo,
-		apURLs, coreSvcs.localFederation))
+		apURLs, coreSvcs.localFederation, corefederation.FetchKeyHostAllowed(instanceService,
+			corefederation.NewSuspendedChecker(metaRepo, instanceRepo), inboxSoftwareChecker)))
 
 	// users/show 経由で host が指定されたリモートユーザーをローカル DB に
 	// キャッシュが無くても解決できるようにする (#269)。webfinger で actor URI
@@ -1198,7 +1206,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// poll federation hook: ローカル user が remote poll に投票したら AP Note
 	// (with name + inReplyTo) を author の inbox に配信する (#690)。
 	// Update(Question) はノートを丸ごと持つので、Create と同じ相手にだけ配る (#4199)。
-	pollDeliveryHook := corefederation.NewPollDeliveryHook(apRenderer, deliverService, userRepo, apURLs, idGen, s.noteDelivery)
+	pollDeliveryHook := corefederation.NewPollDeliveryHook(apRenderer, deliverService, userRepo, apURLs, idGen, s.noteDelivery, noteRepo)
 	pollService.SetFederationHook(pollDeliveryHook)
 
 	// Relay 連携 (#161): relay actor system account + relay.Service。
@@ -1259,11 +1267,18 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// ブロックした相手の引用に出していた承認を取り消す (#3234 段階 4)。
 	blockingService.SetQuoteRevoker(corefederation.NewQuoteRevoker(quoteAuthorizationRepo, userRepo, noteRepo,
 		quoteRequestDeliveryHook, noteDeliveryHook, apURLs))
-	reactionService.SetFederationHook(corefederation.NewReactionDeliveryHook(deliverService, apRenderer, apURLs, idGen, userRepo))
+	// 配送は要求の外で積む (#4216)。
+	reactionService.SetFederationHook(asyncReactionFederationHook{
+		inner:  corefederation.NewReactionDeliveryHook(deliverService, apRenderer, apURLs, idGen, userRepo),
+		runner: newAsyncHookRunner(s.background, s.config.NoteHookConcurrency),
+	})
 	// local user が remote user を (un)block した際に Block / Undo(Block) を
 	// 相手 inbox へ配信する (#1560)。
 	blockingService.SetFederationHook(corefederation.NewBlockingDeliveryHook(deliverService, userRepo, apRenderer))
-	noteDeleteService.SetFederationHook(noteDeleteHook)
+	noteDeleteService.SetFederationHook(asyncNoteDeleteFederationHook{
+		inner:  noteDeleteHook,
+		runner: newAsyncHookRunner(s.background, s.config.NoteHookConcurrency),
+	})
 	// suspend / block されたインスタンスへは dispatch 時に配送を止める (#1404。第 2 引数)。
 	// enqueue 時の isBlockedInbox を通り抜ける retry-backoff 中・積み残しジョブも弾く。
 	// **署名鍵は payload に載せず、配送時に引く (第 3 引数)。** queue の job は
@@ -1348,9 +1363,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		deliverProcessor:             deliverProcessor,
 		inboxProcessor:               inboxProcessor,
 	})
+	// 退会で webhook の行を消した後に、有効な webhook のキャッシュを捨てる (#4218)。
+	deleteAccountProcessor.SetWebhookCache(cachedWebhook)
+	// 退会でドライブのファイルの行を消す前に、実体も消す。行だけを消すと、
+	// public-read のバケットでは消したアカウントのファイルが公開 URL から取れ続ける。
+	deleteAccountProcessor.SetDriveFileObjectDeleter(driveService)
 
 	// Health check
-	s.echo.GET("/healthz", func(c echo.Context) error {
+	s.echo.GET("/healthz", func(c *echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 	// メンテナンスの画面が「終わった」を知るための口 (#3463)。メンテナンス中は
@@ -1370,7 +1390,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// ランタイムプロファイリング用。本番では絶対に有効化してはならない。
 	if s.config.EnablePprof {
 		pprofGroup := s.echo.Group("/debug/pprof")
-		pprofGroup.GET("", func(c echo.Context) error {
+		pprofGroup.GET("", func(c *echo.Context) error {
 			return c.Redirect(http.StatusMovedPermanently, "/debug/pprof/")
 		})
 		pprofGroup.GET("/", echo.WrapHandler(http.HandlerFunc(pprof.Index)))
@@ -1379,7 +1399,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		pprofGroup.GET("/symbol", echo.WrapHandler(http.HandlerFunc(pprof.Symbol)))
 		pprofGroup.POST("/symbol", echo.WrapHandler(http.HandlerFunc(pprof.Symbol)))
 		pprofGroup.GET("/trace", echo.WrapHandler(http.HandlerFunc(pprof.Trace)))
-		pprofGroup.GET("/:name", func(c echo.Context) error {
+		pprofGroup.GET("/:name", func(c *echo.Context) error {
 			pprof.Handler(c.Param("name")).ServeHTTP(c.Response(), c.Request())
 			return nil
 		})
@@ -1401,7 +1421,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// public, max-age=... に上書きする (表は middleware.APICacheSec、#3593)。非 cacheSec の
 	// allowGet GET を中間 proxy が誤キャッシュするのを防ぐ。
 	api.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			c.Response().Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
 			return next(c)
 		}
@@ -1416,12 +1436,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 完全一致で body を採るか捨てるかを決めており、この差だけで全レスポンスが
 	// 空として扱われる。drop-in 互換のため本家に合わせる。
 	api.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			c.Response().Before(func() {
-				if c.Response().Header().Get(echo.HeaderContentType) == "application/json" {
-					c.Response().Header().Set(echo.HeaderContentType, "application/json; charset=utf-8")
-				}
-			})
+		return func(c *echo.Context) error {
+			if res := echoResponse(c); res != nil {
+				res.Before(func() {
+					if res.Header().Get(echo.HeaderContentType) == "application/json" {
+						res.Header().Set(echo.HeaderContentType, "application/json; charset=utf-8")
+					}
+				})
+			}
 			return next(c)
 		}
 	})
@@ -1502,11 +1524,13 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		return settings.ChunkSize, ok
 	}
 	metaHandler.SetChunkedUploadCapability(chunkedUploadCapability)
+	// 投稿フォームが、サーバーで有効なプラグインの指定だけを出すのに使う (#4202)。
+	metaHandler.SetNoteDeliveryPlugins(s.noteDelivery.Names)
 
 	// Frontend SPA shell — AP resource handlers fall back to this when the
 	// request prefers HTML over application/activity+json, and the final
 	// catch-all route at the bottom of RegisterRoutes uses the same handler.
-	frontend := frontendHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector, adRepo)
+	frontend := frontendHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector, adRepo, s.noteDelivery.Names)
 
 	// URL preview endpoint
 	//
@@ -1753,6 +1777,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	notesHandler.SetPiningRepo(piningRepo)
 	// notes/create の pluginOptions を受け取るプラグイン (#4199)。
 	notesHandler.SetNoteDeliveryRules(s.noteDelivery)
+	// 作成に失敗したノートの条件の片付けを、世代の停止で待たせる (#3661、#4202)。
+	notesHandler.SetBackground(s.background)
 	// first-page timeline 応答を per-viewer 短期キャッシュ (hit 時に DB + pack +
 	// encode を skip)。opt-in (enableTimelineCache / MK_ENABLETIMELINECACHE)。
 	// staleness trade-off があるため default off。
@@ -1811,6 +1837,28 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// publish 結果通知 (#1045 Phase 2-B): scheduledNotePosted (= 成功) /
 	// scheduledNotePostFailed (= 失敗) を user の通知 stream に発火する。
 	postScheduledNoteProcessor.SetNotifier(notificationService)
+
+	// ローカルに置いたドライブのファイルをオブジェクトストレージへ写す (#4180)。
+	// lock に Redis を使うので、postScheduledNote と同じくここで作る。
+	// queue の client が無い構成では、開始を断る (nil のポインタを interface に入れない)。
+	var driveStorageMigrationEnq coredrive.StorageMigrationEnqueuer
+	if s.queueClient != nil {
+		driveStorageMigrationEnq = s.queueClient
+	}
+	driveStorageMigrator := coredrive.NewStorageMigrator(repository.NewDriveStorageMigrationRepository(s.db),
+		localDriveStorage, driveStorage, driveStorageMigrationEnq,
+		coredrive.NewRedisStorageMigrationLock(s.redis.Default, s.config.Redis.KeyPrefix()))
+	driveStorageMigrationProcessor := processors.NewDriveStorageMigrationProcessor(driveStorageMigrator)
+	// 移す処理の実行中にローカルの行を消すと、並行して写した分が孤児になりうるので、
+	// 削除がオブジェクトストレージの写しも消せるようにする。lock を読めないときは
+	// 実行中とみなす (無いキーを消すジョブが積まれるだけ)。
+	driveService.SetStorageMigrationRunning(func() bool {
+		running, err := driveStorageMigrator.Running(context.Background())
+		return err != nil || running
+	})
+	// ローカルへ戻したファイルを消したら、バケットに残した写しも消す (#4197)。
+	driveService.SetRestoredCopyReleaser(driveStorageMigrator)
+	objectStorageProcessor.SetRestoredCopyReleaser(driveStorageMigrator)
 
 	// API の handler (#3694)。作るのは buildHandlers (wiring_handlers.go) で、ここでは
 	// 今までと同じ名前の別名を置く。呼ぶ位置は、移した handler の中で最初に作っていた
@@ -2215,6 +2263,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		cachedMeta:               cachedMeta,
 		emojiRepo:                emojiRepo,
 		cachedAntenna:            cachedAntenna,
+		cachedWebhook:            cachedWebhook,
 		emojiDecorationResolver:  emojiDecorationResolver,
 		ipLogService:             ipLogService,
 		roleService:              roleService,
@@ -2321,7 +2370,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// Charts API endpoints (engines + hooks already wired earlier).
 	// フロントエンドは `misskeyApiGet` (GET) でチャートを取得し、
 	// `misskeyApi` (POST) も使う場面があるので両方受ける。POST のみ登録だと
-	// GET が `api.Any("/*")` の catchall (= 200 + 空オブジェクト) に落ちて、
+	// GET が `/api/*` の catchall (= 200 + 空オブジェクト) に落ちて、
 	// 受信側で `chart.pubActive[0]` 等が `undefined` 例外を起こす (#421)。
 	chartsHandler := apicharts.NewHandler(chartCharts)
 	// /retention は chart engine ではなく集計済みテーブルを読む (#2791 で
@@ -2400,6 +2449,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		clean:                   cleanGenericProcessor,
 		chunkedUploadGC:         chunkedUploadGCProcessor,
 		objectStorage:           objectStorageProcessor,
+		driveStorageMigration:   driveStorageMigrationProcessor,
 		reactionFlush:           flushProcessor,
 		deleteAccount:           deleteAccountProcessor,
 		unfollow:                unfollowProcessor,
@@ -2735,6 +2785,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 自動では消さないので、残っていること自体を見えるようにする。
 	s.warnOrphanPluginData(context.Background(), registeredPlugins)
 	// admin/server-plugins (#2497) が返すスナップショットと残存データ検査。
+	adminHandler.SetDriveStorageMigrator(driveStorageMigrator)
+	adminHandler.SetRestoredCopyReleaser(driveStorageMigrator)
 	adminHandler.SetServerPlugins(serverPluginInfos(registeredPlugins, s.config.Plugins))
 	adminHandler.SetPluginOrphanSchemas(s.pluginOrphanSchemaLister(registeredPlugins))
 
@@ -2747,13 +2799,13 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// GET 以外は意図的に 200 + 空オブジェクトのまま。未登録エンドポイントへの
 	// 404 は Misskey 公式フロントの一部ページで例外を投げてしまうため、
 	// 実装が出揃うまで pass-through にしている。実装漏れは warn ログで検知する。
-	api.Any("/*", apiCatchall)
+	api.Group.Match(anyMethods, "/*", apiCatchall)
 
 	// clear-browser-cache — 本家が endpoint の仕組みの外で fastify.all に直接
 	// 登録する route (ApiServerService.ts)。どのメソッドでも受け、GET と POST
 	// 以外は handler が 405 を返す。endpoint ではないので、本文の検査
 	// (apiRoutes の requireObjectBody) と引数の検証を通さない (#3926)。
-	api.Any("/clear-browser-cache", meta.ClearBrowserCache)
+	api.Group.Match(anyMethods, "/clear-browser-cache", meta.ClearBrowserCache)
 
 	// フロントエンドの配信と SPA の catchall (#3901 で関数へ移した。呼ぶ位置と中の文の順は
 	// 元のまま。プラグインの準備に失敗したときの return より後)。

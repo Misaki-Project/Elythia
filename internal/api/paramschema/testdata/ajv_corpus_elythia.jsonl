@@ -1,4 +1,4 @@
-{"misskeyVersion":"2026.11.0","ajv":"8.20.0","paramdefsSha256":"8e9d75274b84160bd15122d93e5662877ff8eb088ad349388bd505938f4834ef","elythiaParamdefsSha256":"984eb91ad7c7af6e9ec8babc6b8416f386eb391e223a3ea62d92a49e222f0e90","cases":3887}
+{"misskeyVersion":"2026.11.0","ajv":"8.20.0","paramdefsSha256":"8e9d75274b84160bd15122d93e5662877ff8eb088ad349388bd505938f4834ef","elythiaParamdefsSha256":"78bbb33f30ce38b50f40ab83a2dc7eb8248dd57467dd15e07e9f5c0d2399f553","cases":3958}
 {"ep":"admin/backup/delete"}
 {"in":{"password":"hello","id":"hello"},"ok":true}
 {"in":{},"ok":false,"path":"#/required","msg":"must have required property 'password'"}
@@ -503,6 +503,83 @@
 {"in":{"password":"hello","id":{"bad":1},"credential":{"bad":1}},"ok":false,"path":"#/properties/id/type","msg":"must be string"}
 {"in":{"id":{"bad":1}},"ok":false,"path":"#/required","msg":"must have required property 'password'"}
 {"ep":"admin/database-health"}
+{"in":{},"ok":true}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"unknownProperty":1},"ok":true}
+{"ep":"admin/drive/object-storage-migration/cleanup-copies"}
+{"in":{},"ok":true}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"unknownProperty":1},"ok":true}
+{"ep":"admin/drive/object-storage-migration/purge-local"}
+{"in":{"password":"hello"},"ok":true}
+{"in":{},"ok":false,"path":"#/required","msg":"must have required property 'password'"}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"password":"hello","unknownProperty":1},"ok":true}
+{"in":{"password":null},"ok":false,"path":"#/properties/password/type","msg":"must be string"}
+{"in":{"password":123},"ok":false,"path":"#/properties/password/type","msg":"must be string"}
+{"in":{"password":true},"ok":false,"path":"#/properties/password/type","msg":"must be string"}
+{"in":{"password":[]},"ok":false,"path":"#/properties/password/type","msg":"must be string"}
+{"in":{"password":""},"ok":true}
+{"in":{"password":"x-y"},"ok":true}
+{"in":{"password":"hello","token":null},"ok":false,"path":"#/properties/token/type","msg":"must be string"}
+{"in":{"password":"hello","token":123},"ok":false,"path":"#/properties/token/type","msg":"must be string"}
+{"in":{"password":"hello","token":true},"ok":false,"path":"#/properties/token/type","msg":"must be string"}
+{"in":{"password":"hello","token":[]},"ok":false,"path":"#/properties/token/type","msg":"must be string"}
+{"in":{"password":"hello","token":""},"ok":true}
+{"in":{"password":"hello","token":"x-y"},"ok":true}
+{"in":{"password":"hello","token":"hello"},"ok":true}
+{"in":{"password":"hello","credential":null},"ok":false,"path":"#/properties/credential/type","msg":"must be object"}
+{"in":{"password":"hello","credential":[]},"ok":false,"path":"#/properties/credential/type","msg":"must be object"}
+{"in":{"password":"hello","credential":"x"},"ok":false,"path":"#/properties/credential/type","msg":"must be object"}
+{"in":{"password":"hello","credential":{"unknownProperty":1}},"ok":true}
+{"in":{"password":"hello","credential":{}},"ok":true}
+{"in":{"password":{"bad":1},"token":{"bad":1}},"ok":false,"path":"#/properties/password/type","msg":"must be string"}
+{"in":{"password":"hello","token":{"bad":1},"credential":{"bad":1}},"ok":false,"path":"#/properties/token/type","msg":"must be string"}
+{"in":{"password":"hello","credential":{"bad":1},"token":{"bad":1}},"ok":false,"path":"#/properties/token/type","msg":"must be string"}
+{"in":{"credential":{"bad":1}},"ok":false,"path":"#/required","msg":"must have required property 'password'"}
+{"ep":"admin/drive/object-storage-migration/restore"}
+{"in":{},"ok":true}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"unknownProperty":1},"ok":true}
+{"ep":"admin/drive/object-storage-migration/start"}
+{"in":{},"ok":true}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"unknownProperty":1},"ok":true}
+{"ep":"admin/drive/object-storage-migration/status"}
+{"in":{},"ok":true}
+{"in":null,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":[],"ok":false,"path":"#/type","msg":"must be object"}
+{"in":"x","ok":false,"path":"#/type","msg":"must be object"}
+{"in":1,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":true,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":1.0,"ok":false,"path":"#/type","msg":"must be object"}
+{"in":{"unknownProperty":1},"ok":true}
+{"ep":"admin/drive/object-storage-migration/verify"}
 {"in":{},"ok":true}
 {"in":null,"ok":false,"path":"#/type","msg":"must be object"}
 {"in":[],"ok":false,"path":"#/type","msg":"must be object"}

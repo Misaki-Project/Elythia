@@ -13,13 +13,14 @@ import (
 	"strings"
 
 	"github.com/elythia-network/elythia/internal/activitypub"
+	"github.com/elythia-network/elythia/internal/api/apierr"
 	"github.com/elythia-network/elythia/internal/core/federation"
 	corelocalfederation "github.com/elythia-network/elythia/internal/core/localfederation"
 	"github.com/elythia-network/elythia/internal/misc/colfit"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/queue"
 	"github.com/elythia-network/elythia/internal/repository"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 )
 
 // HostBlockChecker reports whether a host is on the blocked list and whether
@@ -271,7 +272,7 @@ func captureSignatureHeaders(req *http.Request) (headers map[string]string, comp
 // 内で従来通り verify + block + track + chart + process を実行する。これは
 // 単体テスト / 旧来配線を維持するためのもので、production 配線では
 // 構築子で渡す enqueuer 経由の async path を踏む。
-func (h *Handler) Inbox(c echo.Context) error {
+func (h *Handler) Inbox(c *echo.Context) error {
 	c.Response().Header().Set("Cache-Control", "no-store")
 	// upstream ActivityPubServerService.inbox と同じく、federation mode が "none" なら
 	// body を読む前に 403 を即返す (#1959)。per-actor の IsAllowed gate は actor が
@@ -282,12 +283,11 @@ func (h *Handler) Inbox(c echo.Context) error {
 
 	body, err := io.ReadAll(c.Request().Body)
 	if err != nil {
-		// BodyLimit (#1958) が wrap した limitedReader は 64KB 超過時に 413 HTTPError を
+		// BodyLimit (#1958) が wrap した limitedReader は 64KB 超過時に 413 のエラーを
 		// 返す。ContentLength での即時 reject は handler に到達しないが、chunked 超過は
-		// ここで read error になるため echo.HTTPError を伝播して upstream fastify と同じ
+		// ここで read error になるため、そのエラーを伝播して upstream fastify と同じ
 		// 413 を返す (それ以外の read error は従来通り 400)。
-		var he *echo.HTTPError
-		if errors.As(err, &he) {
+		if he := apierr.HTTPStatusError(err); he != nil {
 			return he
 		}
 		return c.NoContent(http.StatusBadRequest)
@@ -410,7 +410,7 @@ const maxInboxBodyReferences = 64
 
 // observeLocalInboxPathTarget preserves the path-only target policy before
 // admission. It does not parse or inspect the request body.
-func (h *Handler) observeLocalInboxPathTarget(c echo.Context, host string) error {
+func (h *Handler) observeLocalInboxPathTarget(c *echo.Context, host string) error {
 	id := c.Param("id")
 	if id == "" || h.userRepo == nil || h.localFederationObserver == nil {
 		return nil
@@ -443,7 +443,7 @@ func (h *Handler) observeLocalInboxBodyTargets(body []byte, host string) error {
 // processSynchronously runs federation.Processor.Process inline and maps
 // the outcome to an HTTP status code. Kept as a fallback for tests and
 // configurations that pass no enqueuer.
-func (h *Handler) processSynchronously(c echo.Context, body []byte) error {
+func (h *Handler) processSynchronously(c *echo.Context, body []byte) error {
 	if err := h.processor.Process(body); err != nil {
 		if errors.Is(err, federation.ErrUnsupportedActivity) {
 			// 未対応typeでも 202 Accepted を返す。

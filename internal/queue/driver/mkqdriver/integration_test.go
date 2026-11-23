@@ -1554,9 +1554,9 @@ func TestInspector_ListCompletedTasks(t *testing.T) {
 // **長い idle poll interval でもジョブ取得は遅くならないこと。**
 //
 // worker は BZPOPMIN で marker key を待ち、ジョブが積まれた時点で Lua 側が
-// marker を push するのでミリ秒で起きる。interval は「marker を取り逃した
-// 場合に気づくまで」の上限でしかない。ここが崩れると、間隔を延ばした分だけ
-// ジョブの処理が遅れる。
+// marker を push するのでミリ秒で起きる。interval で延びるのは、marker を
+// 取り逃したときに気付くまでなど (config の defaultQueueIdlePollSeconds)。
+// ここが崩れると、間隔を延ばした分だけジョブの処理が遅れる。
 func TestIdlePollInterval_DoesNotDelayPickup(t *testing.T) {
 	testutil.SkipIfNoDocker(t)
 	flushRedis(t)
@@ -2111,4 +2111,30 @@ func TestServer_HandlerWritesJobLog(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"first line", "second line"}, logs)
 	assert.Equal(t, int64(2), count)
+}
+
+// The handler's context carries the ID of the running job (driver.JobID), the
+// owner of the inbox replay guard's processing mark.
+func TestServer_HandlerSeesJobID(t *testing.T) {
+	d := newDriver(t)
+	srv := d.Server()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var got string
+	srv.Handle("test:jobid", func(ctx context.Context, _ driver.Task) error {
+		defer wg.Done()
+		got = driver.JobID(ctx)
+		return nil
+	})
+	require.NoError(t, srv.Start())
+	t.Cleanup(srv.Shutdown)
+
+	ctx := context.Background()
+	require.NoError(t, d.Client().Enqueue(ctx, "test:jobid", nil, driver.WithQueue("deliver")))
+	if !waitGroupTimeout(&wg, 5*time.Second) {
+		t.Fatal("handler not invoked within timeout")
+	}
+	id, err := testRedis.Client.Get(ctx, "bull:deliver:id").Result()
+	require.NoError(t, err)
+	assert.Equal(t, id, got)
 }

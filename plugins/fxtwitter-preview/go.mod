@@ -4,12 +4,12 @@ go 1.27.4
 
 require (
 	github.com/blezek/tga v0.0.0-20150626111426-80720cbc1017
+	github.com/elythia-network/elythia v0.0.0
 	github.com/elythia-network/mfm v0.1.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/kovidgoyal/imaging v1.8.21
-	github.com/elythia-network/elythia v0.0.0
 	golang.org/x/image v0.45.0
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 )
 
 require (

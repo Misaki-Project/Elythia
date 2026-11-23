@@ -521,6 +521,80 @@ func (c *Client) EnqueueDeleteObjectStorageFile(key string) error {
 	return c.inner.Enqueue(context.Background(), TaskTypeObjectStorageDeleteFile, body, base...)
 }
 
+// migrateLocalDriveFilesMaxRetry is the number of retries of one batch of the
+// local-to-object-storage migration. A file that fails is recorded and
+// skipped inside the batch, so a retry only covers a failure of the batch
+// itself (the database or Redis being unreachable).
+const migrateLocalDriveFilesMaxRetry = 3
+
+// EnqueueMigrateLocalDriveFiles puts one batch of the local-to-object-storage
+// migration of drive files on the queue (#4180).
+func (c *Client) EnqueueMigrateLocalDriveFiles(token, afterID string) error {
+	body := mustMarshal(MigrateLocalDriveFilesPayload{Token: token, AfterID: afterID})
+	base := []driver.EnqueueOption{
+		driver.WithQueue(ObjectStorageQueueName),
+		driver.WithMaxRetry(migrateLocalDriveFilesMaxRetry),
+		driver.WithBackoff(driver.BackoffExponential, time.Minute),
+	}
+	base = append(base, c.retentionOpts(ObjectStorageQueueName)...)
+	return c.inner.Enqueue(context.Background(), TaskTypeMigrateLocalDriveFiles, body, base...)
+}
+
+// EnqueueVerifyMigratedDriveFiles puts one batch of verifying the migrated
+// drive files on the queue (#4181). It retries like the migration.
+func (c *Client) EnqueueVerifyMigratedDriveFiles(token, afterID string) error {
+	body := mustMarshal(MigrateLocalDriveFilesPayload{Token: token, AfterID: afterID})
+	base := []driver.EnqueueOption{
+		driver.WithQueue(ObjectStorageQueueName),
+		driver.WithMaxRetry(migrateLocalDriveFilesMaxRetry),
+		driver.WithBackoff(driver.BackoffExponential, time.Minute),
+	}
+	base = append(base, c.retentionOpts(ObjectStorageQueueName)...)
+	return c.inner.Enqueue(context.Background(), TaskTypeVerifyMigratedDriveFiles, body, base...)
+}
+
+// EnqueuePurgeLocalDriveFiles puts one batch of deleting the local copies of
+// the verified drive files on the queue (#4182). It retries like the
+// migration.
+func (c *Client) EnqueuePurgeLocalDriveFiles(token, afterID string) error {
+	body := mustMarshal(MigrateLocalDriveFilesPayload{Token: token, AfterID: afterID})
+	base := []driver.EnqueueOption{
+		driver.WithQueue(ObjectStorageQueueName),
+		driver.WithMaxRetry(migrateLocalDriveFilesMaxRetry),
+		driver.WithBackoff(driver.BackoffExponential, time.Minute),
+	}
+	base = append(base, c.retentionOpts(ObjectStorageQueueName)...)
+	return c.inner.Enqueue(context.Background(), TaskTypePurgeLocalDriveFiles, body, base...)
+}
+
+// EnqueueRestoreMigratedDriveFiles puts one batch of moving the migrated
+// drive files back to the local storage on the queue (#4183). It retries
+// like the migration.
+func (c *Client) EnqueueRestoreMigratedDriveFiles(token, afterID string) error {
+	body := mustMarshal(MigrateLocalDriveFilesPayload{Token: token, AfterID: afterID})
+	base := []driver.EnqueueOption{
+		driver.WithQueue(ObjectStorageQueueName),
+		driver.WithMaxRetry(migrateLocalDriveFilesMaxRetry),
+		driver.WithBackoff(driver.BackoffExponential, time.Minute),
+	}
+	base = append(base, c.retentionOpts(ObjectStorageQueueName)...)
+	return c.inner.Enqueue(context.Background(), TaskTypeRestoreMigratedDriveFiles, body, base...)
+}
+
+// EnqueueCleanupRestoredDriveFileCopies puts one batch of deleting the copies
+// left in object storage by moving drive files back on the queue (#4197). It
+// retries like the migration.
+func (c *Client) EnqueueCleanupRestoredDriveFileCopies(token, afterKey string) error {
+	body := mustMarshal(MigrateLocalDriveFilesPayload{Token: token, AfterID: afterKey})
+	base := []driver.EnqueueOption{
+		driver.WithQueue(ObjectStorageQueueName),
+		driver.WithMaxRetry(migrateLocalDriveFilesMaxRetry),
+		driver.WithBackoff(driver.BackoffExponential, time.Minute),
+	}
+	base = append(base, c.retentionOpts(ObjectStorageQueueName)...)
+	return c.inner.Enqueue(context.Background(), TaskTypeCleanupRestoredDriveFileCopies, body, base...)
+}
+
 // EnqueueCleanRemoteFiles puts a bulk remote-cache cleanup task on the queue.
 //
 // Mirrors upstream `QueueService.createCleanRemoteFilesJob`: admin endpoint は

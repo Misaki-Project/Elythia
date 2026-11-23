@@ -20,12 +20,13 @@ import (
 	"github.com/elythia-network/elythia/internal/entity"
 	"github.com/elythia-network/elythia/internal/frontendutil"
 	"github.com/elythia-network/elythia/internal/misc/id"
+	"github.com/elythia-network/elythia/internal/misc/vary"
 	"github.com/elythia-network/elythia/internal/model"
 	"github.com/elythia-network/elythia/internal/repository"
 	"github.com/elythia-network/elythia/internal/server/middleware"
 	"github.com/elythia-network/elythia/internal/stream"
-	"github.com/labstack/echo/v4"
-	echomw "github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/echo/v5"
+	echomw "github.com/labstack/echo/v5/middleware"
 )
 
 // federationRoutesDeps holds the parts wireFederationRoutes receives from
@@ -209,10 +210,10 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 		entityPacker,   // #3796: SSR の OGP 画像のファイルを包む
 		s.noteDelivery, // #4199: 配送先を絞ったノートは OGP を出さない
 	)
-	s.echo.GET("/notes/:id", func(c echo.Context) error {
+	s.echo.GET("/notes/:id", func(c *echo.Context) error {
 		// 同一 URL が Accept 次第で HTML / AP JSON / 302 を返すので、HTML 変種
 		// (ssrMeta 側) にも Vary が要る。閉包で立てれば両分岐に載る (#2506)。
-		c.Response().Header().Set("Vary", "Accept")
+		vary.Add(c.Response().Header(), "Accept")
 		if prefersHTML(c) {
 			return ssrMeta.NotePage(c)
 		}
@@ -249,16 +250,18 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 			}
 			return entityPacker.IdenticonURL(u)
 		},
-		feedNoteHTML(feedHost))
+		feedNoteHTML(feedHost),
+		// 条件で自分のホストに見せないノートはフィードに載せない (#4203)。
+		s.noteDelivery)
 
 	// /@<acct> は AP のユーザー解決とフィードの入口を兼ねる。Echo のルータは
 	// Fastify と違い `/@:user.rss` のようなセグメント内リテラルを解釈できない
 	// ので、ここで拡張子を見て振り分ける (#2345)。
-	s.echo.GET("/@:acct", func(c echo.Context) error {
+	s.echo.GET("/@:acct", func(c *echo.Context) error {
 		// 同一 URL が Accept 次第で HTML / AP JSON / 301 を返すので、HTML 変種
 		// (ssrMeta 側) にも Vary が要る (#2506)。feed は拡張子で URL 自体が
 		// 変わるが、同じ閉包を通るので付いていて害は無い。
-		c.Response().Header().Set("Vary", "Accept")
+		vary.Add(c.Response().Header(), "Accept")
 		if handled, err := feedH.TryServe(c, c.Param("acct")); handled {
 			return err
 		}
@@ -334,7 +337,7 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 		// 本家 OAuth2ProviderService は NODE_ENV === 'test' のとき http の
 		// client_id を許可する (本番は https のみ)。TestMode を同じ用途で使う。
 		s.config.TestMode,
-		frontendConsentHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector, adRepo),
+		frontendConsentHTML(s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability, setupDetector, adRepo, s.noteDelivery.Names),
 		// code 再利用で token を revoke したとき、auth cache に残った entry で
 		// 通り続けないよう即時失効させる (RFC6749 §4.1.2)。構築子の必須の引数 (#3823)。
 		s.auth,
@@ -357,7 +360,7 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 			AllowOrigins: []string{"*"},
 			AllowMethods: []string{http.MethodPost, http.MethodOptions},
 		})(next)
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			if c.Response().Header().Get(echo.HeaderAccessControlAllowOrigin) == "" {
 				c.Response().Header().Set(echo.HeaderAccessControlAllowOrigin, "*")
 			}
@@ -365,13 +368,13 @@ func (s *Server) wireFederationRoutes(d federationRoutesDeps) (*ssrMetaHandler, 
 		}
 	}
 	s.echo.POST("/oauth/token", oauthHandler.Token, oauthCORS)
-	s.echo.OPTIONS("/oauth/token", func(c echo.Context) error {
+	s.echo.OPTIONS("/oauth/token", func(c *echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}, oauthCORS)
 	// unknown /oauth/* は 404 (client が endpoint 対応有無を判別できるよう、
 	// upstream の catch-all 同様)。明示ルートが優先されるので authorize/decision/
 	// token はここに落ちない。
-	s.echo.Any("/oauth/*", oauthHandler.NotFound)
+	s.echo.Match(anyMethods, "/oauth/*", oauthHandler.NotFound)
 
 	nodeinfoHandler.SetMetaRepo(metaRepo)
 	nodeinfoHandler.SetUsageRepos(userRepo, noteRepo)

@@ -569,6 +569,31 @@ golangci-lint: ## golangci-lint (errcheck / govet / ineffassign / staticcheck)
 	gover=$$(awk '/^go [0-9]/ {print $$2; exit}' go.mod); \
 	GOWORK=off GOTOOLCHAIN=go$$gover go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run --timeout 10m
 
+.PHONY: vulncheck
+vulncheck: ## 依存と Go の標準ライブラリの既知の脆弱性を govulncheck で検査 (CI の vulncheck job)
+	# **版を固定する。** CI は以前 `@latest` を入れていて、手元と CI で別の版が
+	# 動きえた (#4176)。CI もこの target を呼ぶので、版の定義はここ 1 箇所だけ。
+	#
+	# **許可の一覧と突き合わせる。** 関数まで届いた脆弱性 (テキストの出力の
+	# 「Your code is affected」) のうち、tools/vulncheckgate/allow.tsv に理由付きで
+	# 載せたものだけを通す。一覧に無いものと、結果に出てこなくなった一覧の行で落ちる。
+	# 一覧に載せるのは、脆弱性 DB に使っている版の修正が載っておらず、Elythia に当たらないことを確かめたものだけ
+	# (docs/ci.md の「vulncheck が落ちたとき」)。
+	#
+	# GOOS=linux は、実際に配るのが Linux だから。解析の対象にだけ効かせるため、
+	# govulncheck 自身はホストの向けにビルドしてから GOOS=linux で動かす
+	# (`GOOS=linux go run` は Linux 以外のホストで exec format error になる)。
+	# GOWORK=off・生成物の退避・toolchain の固定は golangci-lint と同じ理由
+	# (上の target のコメント)。
+	@set -e; \
+	gen=cmd/elythia/plugins_generated.go; bak=""; tmp=$$(mktemp -d); out="$$tmp/govulncheck.json"; \
+	if [ -f "$$gen" ]; then bak=$$(mktemp); cp -p "$$gen" "$$bak"; rm -f "$$gen"; fi; \
+	trap 'rm -rf "$$tmp"; if [ -n "$$bak" ]; then cp -p "$$bak" "$$gen"; rm -f "$$bak"; fi' EXIT INT TERM; \
+	gover=$$(awk '/^go [0-9]/ {print $$2; exit}' go.mod); \
+	GOWORK=off GOTOOLCHAIN=go$$gover GOBIN="$$tmp" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0; \
+	GOWORK=off GOTOOLCHAIN=go$$gover GOOS=linux "$$tmp/govulncheck" -format json ./... > "$$out"; \
+	GOWORK=off go run ./tools/vulncheckgate -allow tools/vulncheckgate/allow.tsv "$$out"
+
 .PHONY: actionlint
 actionlint: ## GitHub Actions の workflow を検査
 	# CodeQL の `actions` クエリが見るのは script injection などの**セキュリティ**で、
@@ -907,7 +932,7 @@ UDS_CONFIG=deploy/uds/config/default.yml
 # **専用のビルダーでビルドするのは mkgo だけ。** postgres (deploy/postgres-bigm) など
 # 他のサービスは既定のビルダーのまま。専用のビルダーは dockerd の image store と
 # キャッシュを見ない。postgres-bigm の base は digest で固定しているが、最初の
-# ビルドで RUN の層 (apk add と pg_bigm のビルド) を作り直すので、image が変わり
+# ビルドで RUN の層 (apk upgrade・apk add と pg_bigm のビルド) を作り直すので、image が変わり
 # うる。変われば、次の `up -d` で本番の PostgreSQL のコンテナが作り直される。
 # 既定のビルダーは手元のキャッシュを使うので、キャッシュを消していなければ、従来
 # どおり image は変わらない。
@@ -1739,7 +1764,7 @@ perm-check: ## router middleware の権限が upstream より緩くないか検�
 
 .PHONY: wiring-check
 wiring-check: ## router で配線が必要なものが外れていないか検査
-	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestPluginNotificationDispatcherIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestNotificationReceiveConfigCheckerIsWired|TestAbuseReportNotifierIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestClipsNoteRepoIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUploaderProfilesAreWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestPasswordChecksAreFailureLimited|TestPasswordFailureGuardIsWired|TestRemoteStatsGateUsesFailClosedPredicate|TestStreamRevokeIsWired|TestAvatarDecorationRoleSetsAreWired|TestPushSubscriptionCacheIsShared|TestInstanceStatsGateIsWired|TestQueueProcessorSoftwareCheckersAreWired|TestFederationHostValuesAreWired|TestAccountCreatedAtIsWired|TestReversiAvatarURLIsWired|TestHideAppUserWithoutReadIsWired|TestRevokeTokenAdmitsAppUser|TestServerStatsGateIsWired|TestOutboundTransportIsShared|TestRelationSingleStatementReadersAreWired|TestEveryRouterRelationReposHasRelation|TestServerSourcesListsPackageFilesOnly|TestServerPkgReadersCoverEveryFile|TestRouteParsersReadEveryFile|TestCollectRoutesResolvesHandlerTypes|TestCountCriticalWiringEntriesReadsEveryFile|TestAPIRouteHandlersResolve|TestAPIRouteProblemsFlagsUncheckableHandlers|TestRouteRegistrationsAcrossFiles|TestCountCriticalWiringInRejectsTwoCalls|TestPushSubscriptionCacheProblemsRequireOneFile|TestHideAppUserOrderErrorRequiresOneFile|TestAPICacheControlMountedReadsEveryFile|TestCollectRoutesHandlesBlocksAndShapes|TestAllowlistDiffReportsBothWays|TestCollectRoutesScopeRules' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestPluginNotificationDispatcherIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestNotificationReceiveConfigCheckerIsWired|TestAbuseReportNotifierIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestClipsNoteRepoIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUploaderProfilesAreWired|TestDriveUsageRouteIsRegistered|TestDriveStorageMigratorIsWired|TestDriveStorageMigrationRoutesAreRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestPasswordChecksAreFailureLimited|TestPasswordFailureGuardIsWired|TestRemoteStatsGateUsesFailClosedPredicate|TestStreamRevokeIsWired|TestAvatarDecorationRoleSetsAreWired|TestPushSubscriptionCacheIsShared|TestInstanceStatsGateIsWired|TestQueueProcessorSoftwareCheckersAreWired|TestFederationHostValuesAreWired|TestAccountCreatedAtIsWired|TestReversiAvatarURLIsWired|TestHideAppUserWithoutReadIsWired|TestRevokeTokenAdmitsAppUser|TestServerStatsGateIsWired|TestOutboundTransportIsShared|TestRelationSingleStatementReadersAreWired|TestEveryRouterRelationReposHasRelation|TestServerSourcesListsPackageFilesOnly|TestServerPkgReadersCoverEveryFile|TestRouteParsersReadEveryFile|TestCollectRoutesResolvesHandlerTypes|TestCountCriticalWiringEntriesReadsEveryFile|TestAPIRouteHandlersResolve|TestAPIRouteProblemsFlagsUncheckableHandlers|TestRouteRegistrationsAcrossFiles|TestCountCriticalWiringInRejectsTwoCalls|TestPushSubscriptionCacheProblemsRequireOneFile|TestHideAppUserOrderErrorRequiresOneFile|TestAPICacheControlMountedReadsEveryFile|TestCollectRoutesHandlesBlocksAndShapes|TestAllowlistDiffReportsBothWays|TestCollectRoutesScopeRules' -count=1 -v
 
 .PHONY: notiftype-check
 notiftype-check: ## 通知タイプの一覧が 1 箇所から導出されているか検査
